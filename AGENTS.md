@@ -41,6 +41,7 @@ AI 完成任何变更后都必须执行 Git 流程，包括代码、测试、配
 - 使用 `git status --short` 确认变更范围。
 - 运行 `mvn test`，确认单元测试全部通过。
 - 测试通过后，直接在主干分支完成提交和推送，不需要创建 PR。
+- Git 提交信息优先使用中文，除非项目已有明确英文约定或用户特别指定英文。
 
 推荐流程：
 
@@ -48,7 +49,7 @@ AI 完成任何变更后都必须执行 Git 流程，包括代码、测试、配
 git status --short
 mvn test
 git add .
-git commit -m "简短描述本次变更"
+git commit -m "补充 Git 提交信息约束"
 git push origin main
 ```
 
