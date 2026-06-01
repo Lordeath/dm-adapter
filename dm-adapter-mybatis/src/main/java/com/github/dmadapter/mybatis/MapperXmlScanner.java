@@ -24,8 +24,8 @@ public class MapperXmlScanner {
     }
 
     public List<MapperXmlFile> scan(Path projectRoot) {
-        Path resourcesRoot = projectRoot.resolve("src/main/resources");
-        if (!Files.isDirectory(resourcesRoot)) {
+        List<Path> resourcesRoots = findResourcesRoots(projectRoot);
+        if (resourcesRoots.isEmpty()) {
             return List.of();
         }
 
@@ -34,28 +34,59 @@ public class MapperXmlScanner {
             List<MapperLocationPattern> patterns = configuredMapperLocations.stream()
                     .map(MapperLocationPattern::from)
                     .toList();
-            return scanResources(resourcesRoot, relativePath -> patterns.stream().anyMatch(pattern -> pattern.matches(relativePath)));
+            return scanResources(resourcesRoots, relativePath -> patterns.stream().anyMatch(pattern -> pattern.matches(relativePath)));
         }
-        return scanResources(resourcesRoot, relativePath -> true);
+        return scanResources(resourcesRoots, relativePath -> true);
     }
 
-    private List<MapperXmlFile> scanResources(Path resourcesRoot, Predicate<String> relativePathPredicate) {
-        List<MapperXmlFile> mapperXmlFiles = new ArrayList<>();
-        try (Stream<Path> files = Files.walk(resourcesRoot)) {
-            files.filter(Files::isRegularFile)
-                    .filter(path -> path.getFileName().toString().endsWith(".xml"))
-                    .filter(path -> !normalize(resourcesRoot.relativize(path)).startsWith("mapper-dm/"))
-                    .filter(path -> relativePathPredicate.test(normalize(resourcesRoot.relativize(path))))
-                    .filter(this::isMapperXml)
-                    .sorted(Comparator.comparing(Path::toString))
-                    .forEach(path -> mapperXmlFiles.add(new MapperXmlFile(
-                            path.toAbsolutePath().normalize().toString(),
-                            normalize(resourcesRoot.relativize(path))
-                    )));
+    private List<Path> findResourcesRoots(Path projectRoot) {
+        if (!Files.isDirectory(projectRoot)) {
+            return List.of();
+        }
+        List<Path> resourcesRoots = new ArrayList<>();
+        try (Stream<Path> paths = Files.walk(projectRoot)) {
+            paths.filter(Files::isDirectory)
+                    .filter(path -> path.endsWith("src/main/resources"))
+                    .filter(path -> !isBuildOrGitPath(projectRoot, path))
+                    .sorted()
+                    .forEach(path -> resourcesRoots.add(path.toAbsolutePath().normalize()));
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to scan mapper XML files under " + resourcesRoot, e);
+            throw new IllegalStateException("Failed to find src/main/resources directories under " + projectRoot, e);
+        }
+        return resourcesRoots;
+    }
+
+    private List<MapperXmlFile> scanResources(List<Path> resourcesRoots, Predicate<String> relativePathPredicate) {
+        List<MapperXmlFile> mapperXmlFiles = new ArrayList<>();
+        for (Path resourcesRoot : resourcesRoots) {
+            try (Stream<Path> files = Files.walk(resourcesRoot)) {
+                files.filter(Files::isRegularFile)
+                        .filter(path -> path.getFileName().toString().endsWith(".xml"))
+                        .filter(path -> !normalize(resourcesRoot.relativize(path)).startsWith("mapper-dm/"))
+                        .filter(path -> relativePathPredicate.test(normalize(resourcesRoot.relativize(path))))
+                        .filter(this::isMapperXml)
+                        .sorted(Comparator.comparing(Path::toString))
+                        .forEach(path -> mapperXmlFiles.add(new MapperXmlFile(
+                                path.toAbsolutePath().normalize().toString(),
+                                resourcesRoot.toString(),
+                                normalize(resourcesRoot.relativize(path))
+                        )));
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to scan mapper XML files under " + resourcesRoot, e);
+            }
         }
         return mapperXmlFiles;
+    }
+
+    private boolean isBuildOrGitPath(Path projectRoot, Path path) {
+        String relativePath = projectRoot.toAbsolutePath().normalize()
+                .relativize(path.toAbsolutePath().normalize())
+                .toString()
+                .replace('\\', '/');
+        return relativePath.startsWith("target/")
+                || relativePath.contains("/target/")
+                || relativePath.startsWith(".git/")
+                || relativePath.contains("/.git/");
     }
 
     private boolean isMapperXml(Path path) {

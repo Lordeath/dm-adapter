@@ -47,6 +47,10 @@ public record AdapterContext(
         return projectRoot.resolve("src/main/resources");
     }
 
+    public Path defaultMapperTargetDir() {
+        return projectRoot.resolve("src/main/resources/mapper-dm");
+    }
+
     private static String normalizeDb(String value, String defaultValue) {
         if (value == null || value.isBlank()) {
             return defaultValue;

@@ -35,7 +35,7 @@ public class MapperMigrator {
 
         for (MapperXmlFile mapperXmlFile : scanResult.mapperXmlFiles()) {
             Path source = Paths.get(mapperXmlFile.path());
-            Path target = context.mapperTargetDir().resolve(toMapperDmRelativePath(mapperXmlFile.resourcesRelativePath()));
+            Path target = mapperTargetDir(context, mapperXmlFile).resolve(toMapperDmRelativePath(mapperXmlFile.resourcesRelativePath()));
             fileChanges.add(context.dryRun()
                     ? FileChange.planned(target.toString(), "CREATE", "Copy mapper XML from " + source)
                     : copyMapper(source, target));
@@ -53,6 +53,13 @@ public class MapperMigrator {
         }
 
         return new MapperMigrationResult(fileChanges, automaticConversions, manualReviewItems, warnings);
+    }
+
+    private Path mapperTargetDir(AdapterContext context, MapperXmlFile mapperXmlFile) {
+        if (!mapperXmlFile.resourcesRoot().isBlank() && context.mapperTargetDir().equals(context.defaultMapperTargetDir())) {
+            return Paths.get(mapperXmlFile.resourcesRoot()).resolve("mapper-dm");
+        }
+        return context.mapperTargetDir();
     }
 
     private FileChange copyMapper(Path source, Path target) {

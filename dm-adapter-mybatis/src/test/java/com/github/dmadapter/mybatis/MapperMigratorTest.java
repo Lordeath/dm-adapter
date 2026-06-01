@@ -63,6 +63,45 @@ class MapperMigratorTest {
     }
 
     @Test
+    void scansClasspathMapperLocationsAcrossMavenModulesAndMigratesNextToSourceModule() throws Exception {
+        writeFile("sample-system-rest/src/main/resources/application.properties", """
+                mybatis.mapperLocations=classpath*:/mapper/*.xml
+                """);
+        Path mapper = writeMapper("sample-system-base/src/main/resources/mapper/UserMapper.xml", "select NOW() from dual");
+        writeMapper("sample-system-base/src/main/resources/sqlmap/OtherMapper.xml", "select * from other");
+
+        List<MapperXmlFile> files = new MapperXmlScanner().scan(tempDir);
+
+        assertThat(files)
+                .extracting(MapperXmlFile::path)
+                .containsExactly(mapper.toAbsolutePath().normalize().toString());
+        assertThat(files.get(0).resourcesRoot())
+                .isEqualTo(tempDir.resolve("sample-system-base/src/main/resources").toAbsolutePath().normalize().toString());
+
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                files,
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path copied = tempDir.resolve("sample-system-base/src/main/resources/mapper-dm/UserMapper.xml");
+        assertThat(Files.exists(copied)).isTrue();
+        assertThat(Files.readString(copied)).contains("SYSDATE");
+        assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isFalse();
+        assertThat(result.automaticConversions()).hasSize(1);
+    }
+
+    @Test
     void dryRunReportsCopyAndSqlChangesWithoutWritingTarget() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
                 select IFNULL(name, 'n/a') from user limit #{offset}, #{size}
