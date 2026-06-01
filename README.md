@@ -7,6 +7,7 @@
 ## 当前能力
 
 - 扫描 Maven、Spring Boot、MyBatis XML mapper 项目；Spring Boot/MyBatis 识别会结合 `pom.xml` 直接声明和 `mvn dependency:tree` fallback。
+- mapper XML 优先根据项目内 `application*.properties`、`application*.yml`、`application*.yaml` 中的 `mybatis.mapperLocations` / `mybatis.mapper-locations` 等配置项定位；未配置时回退到资源目录扫描。
 - 检查 `pom.xml` 是否已有达梦 JDBC 驱动依赖。
 - `migrate` 默认复制 mapper XML 到 `src/main/resources/mapper-dm`，不覆盖原文件。
 - 生成 `application-dm.yml`，将 MyBatis mapper 指向 `classpath*:mapper-dm/**/*.xml`。

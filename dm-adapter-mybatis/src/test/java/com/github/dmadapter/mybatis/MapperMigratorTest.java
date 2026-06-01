@@ -31,6 +31,38 @@ class MapperMigratorTest {
     }
 
     @Test
+    void scansMapperXmlFromApplicationPropertiesMapperLocations() throws Exception {
+        Path selectedMapper = writeMapper("src/main/resources/mapper/selected/UserMapper.xml", "select * from user");
+        writeMapper("src/main/resources/mapper/other/OtherMapper.xml", "select * from other");
+        writeFile("config/application.properties", """
+                mybatis.mapperLocations=classpath*:mapper/selected/**/*.xml
+                """);
+
+        List<MapperXmlFile> files = new MapperXmlScanner().scan(tempDir);
+
+        assertThat(files)
+                .extracting(MapperXmlFile::path)
+                .containsExactly(selectedMapper.toAbsolutePath().normalize().toString());
+    }
+
+    @Test
+    void scansMapperXmlFromYamlMapperLocations() throws Exception {
+        Path mapper = writeMapper("src/main/resources/sqlmap/UserMapper.xml", "select * from user");
+        writeMapper("src/main/resources/mapper/OtherMapper.xml", "select * from other");
+        writeFile("src/main/resources/application.yml", """
+                mybatis:
+                  mapper-locations:
+                    - classpath*:sqlmap/*.xml
+                """);
+
+        List<MapperXmlFile> files = new MapperXmlScanner().scan(tempDir);
+
+        assertThat(files)
+                .extracting(MapperXmlFile::path)
+                .containsExactly(mapper.toAbsolutePath().normalize().toString());
+    }
+
+    @Test
     void dryRunReportsCopyAndSqlChangesWithoutWritingTarget() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
                 select IFNULL(name, 'n/a') from user limit #{offset}, #{size}
@@ -119,5 +151,12 @@ class MapperMigratorTest {
                 </mapper>
                 """.formatted(sql));
         return mapper;
+    }
+
+    private Path writeFile(String relativePath, String content) throws Exception {
+        Path file = tempDir.resolve(relativePath);
+        Files.createDirectories(file.getParent());
+        Files.writeString(file, content);
+        return file;
     }
 }

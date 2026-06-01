@@ -9,20 +9,43 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 public class MapperXmlScanner {
+    private final MapperLocationConfigScanner mapperLocationConfigScanner;
+
+    public MapperXmlScanner() {
+        this(new MapperLocationConfigScanner());
+    }
+
+    MapperXmlScanner(MapperLocationConfigScanner mapperLocationConfigScanner) {
+        this.mapperLocationConfigScanner = mapperLocationConfigScanner;
+    }
+
     public List<MapperXmlFile> scan(Path projectRoot) {
         Path resourcesRoot = projectRoot.resolve("src/main/resources");
         if (!Files.isDirectory(resourcesRoot)) {
             return List.of();
         }
 
+        List<String> configuredMapperLocations = mapperLocationConfigScanner.scan(projectRoot);
+        if (!configuredMapperLocations.isEmpty()) {
+            List<MapperLocationPattern> patterns = configuredMapperLocations.stream()
+                    .map(MapperLocationPattern::from)
+                    .toList();
+            return scanResources(resourcesRoot, relativePath -> patterns.stream().anyMatch(pattern -> pattern.matches(relativePath)));
+        }
+        return scanResources(resourcesRoot, relativePath -> true);
+    }
+
+    private List<MapperXmlFile> scanResources(Path resourcesRoot, Predicate<String> relativePathPredicate) {
         List<MapperXmlFile> mapperXmlFiles = new ArrayList<>();
         try (Stream<Path> files = Files.walk(resourcesRoot)) {
             files.filter(Files::isRegularFile)
                     .filter(path -> path.getFileName().toString().endsWith(".xml"))
                     .filter(path -> !normalize(resourcesRoot.relativize(path)).startsWith("mapper-dm/"))
+                    .filter(path -> relativePathPredicate.test(normalize(resourcesRoot.relativize(path))))
                     .filter(this::isMapperXml)
                     .sorted(Comparator.comparing(Path::toString))
                     .forEach(path -> mapperXmlFiles.add(new MapperXmlFile(
