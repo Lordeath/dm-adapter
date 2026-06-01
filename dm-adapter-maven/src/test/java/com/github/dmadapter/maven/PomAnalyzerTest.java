@@ -53,6 +53,26 @@ class PomAnalyzerTest {
         assertThat(Files.readString(pom)).isEqualTo(before);
     }
 
+    @Test
+    void detectsSpringBootAndMyBatisFromDependencyTreeWhenPomDoesNotDeclareThemDirectly() throws Exception {
+        Path pom = writePomWithCompanyStarterOnly();
+        DependencyTreeInspector dependencyTreeInspector = (projectRoot, dmDriverCoordinate) ->
+                new DependencyTreeParser().parse("""
+                        [INFO] com.example:demo:jar:0.0.1-SNAPSHOT
+                        [INFO] +- com.example:company-data-starter:jar:1.0.0:compile
+                        [INFO] |  +- org.springframework.boot:spring-boot-starter:jar:3.3.2:compile
+                        [INFO] |  \\- org.mybatis.spring.boot:mybatis-spring-boot-starter:jar:3.0.3:compile
+                        [INFO] \\- com.dameng:DmJdbcDriver18:jar:8.1.3.140:compile
+                        """, dmDriverCoordinate);
+
+        PomAnalysis analysis = new PomAnalyzer(dependencyTreeInspector).analyze(pom, DependencyCoordinate.defaultDmDriver());
+
+        assertThat(analysis.mavenProject()).isTrue();
+        assertThat(analysis.springBootProject()).isTrue();
+        assertThat(analysis.myBatisProject()).isTrue();
+        assertThat(analysis.hasDmJdbcDriver()).isTrue();
+    }
+
     private Path writePomWithoutDmDriver() throws Exception {
         Path pom = tempDir.resolve("pom.xml");
         Files.writeString(pom, """
@@ -74,6 +94,29 @@ class PomAnalyzerTest {
                             <groupId>org.mybatis.spring.boot</groupId>
                             <artifactId>mybatis-spring-boot-starter</artifactId>
                             <version>3.0.3</version>
+                        </dependency>
+                    </dependencies>
+                </project>
+                """);
+        return pom;
+    }
+
+    private Path writePomWithCompanyStarterOnly() throws Exception {
+        Path pom = tempDir.resolve("pom.xml");
+        Files.writeString(pom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>demo</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                    <dependencies>
+                        <dependency>
+                            <groupId>com.example</groupId>
+                            <artifactId>company-data-starter</artifactId>
+                            <version>1.0.0</version>
                         </dependency>
                     </dependencies>
                 </project>

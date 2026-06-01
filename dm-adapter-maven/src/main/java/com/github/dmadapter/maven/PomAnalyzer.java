@@ -17,6 +17,16 @@ import java.util.List;
 import java.util.Locale;
 
 public class PomAnalyzer {
+    private final DependencyTreeInspector dependencyTreeInspector;
+
+    public PomAnalyzer() {
+        this(new MavenDependencyTreeInspector());
+    }
+
+    PomAnalyzer(DependencyTreeInspector dependencyTreeInspector) {
+        this.dependencyTreeInspector = dependencyTreeInspector;
+    }
+
     public PomAnalysis analyze(Path pomPath, DependencyCoordinate dmDriverCoordinate) {
         if (!Files.isRegularFile(pomPath)) {
             return new PomAnalysis(false, false, false, false);
@@ -26,6 +36,12 @@ public class PomAnalyzer {
         boolean springBoot = hasSpringBootParent(model.getParent()) || dependencies.stream().anyMatch(this::isSpringBootDependency);
         boolean myBatis = dependencies.stream().anyMatch(this::isMyBatisDependency);
         boolean dmDriver = dependencies.stream().anyMatch(dependency -> isDmDriverDependency(dependency, dmDriverCoordinate));
+        if (!springBoot || !myBatis) {
+            DependencyTreeAnalysis dependencyTreeAnalysis = dependencyTreeInspector.analyze(pomPath.getParent(), dmDriverCoordinate);
+            springBoot = springBoot || dependencyTreeAnalysis.springBootProject();
+            myBatis = myBatis || dependencyTreeAnalysis.myBatisProject();
+            dmDriver = dmDriver || dependencyTreeAnalysis.hasDmJdbcDriver();
+        }
         return new PomAnalysis(true, springBoot, myBatis, dmDriver);
     }
 

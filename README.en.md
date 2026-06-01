@@ -6,7 +6,7 @@
 
 ## Current Capabilities
 
-- Scan Maven, Spring Boot, and MyBatis XML mapper projects.
+- Scan Maven, Spring Boot, and MyBatis XML mapper projects; Spring Boot/MyBatis detection combines direct `pom.xml` declarations with a `mvn dependency:tree` fallback.
 - Check whether `pom.xml` already contains a Dameng JDBC driver dependency.
 - Copy mapper XML files to `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
 - Generate `application-dm.yml` and point MyBatis mapper locations to `classpath*:mapper-dm/**/*.xml`.
