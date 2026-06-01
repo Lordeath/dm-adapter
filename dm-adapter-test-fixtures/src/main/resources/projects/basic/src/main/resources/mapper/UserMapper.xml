@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.demo.UserMapper">
+    <select id="selectUsers">
+        select IFNULL(name, 'n/a') from user limit #{offset}, #{size}
+    </select>
+    <select id="selectFormattedDate">
+        select DATE_FORMAT(created_at, '%Y-%m-%d') from user
+    </select>
+</mapper>
