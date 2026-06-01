@@ -144,8 +144,62 @@ class MapperMigratorTest {
 
         Path copied = tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml");
         assertThat(Files.exists(copied)).isTrue();
-        assertThat(Files.readString(copied)).contains("SYSDATE").contains("FETCH FIRST 5 ROWS ONLY");
+        assertThat(Files.readString(copied))
+                .contains("<!DOCTYPE mapper")
+                .contains("SYSDATE")
+                .contains("FETCH FIRST 5 ROWS ONLY")
+                .doesNotContain("standalone=\"no\"");
         assertThat(result.automaticConversions()).hasSize(1);
+    }
+
+    @Test
+    void rewritingPreservesMapperDoctypeAndUnchangedFormatting() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <resultMap id="UserResultMap" type="com.example.User">
+                        <id column="id" property="id"/>
+                    </resultMap>
+
+                    <select id="selectUsers">
+                        select NOW() from dual limit 5
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .isEqualTo("""
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                                "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                        <mapper namespace="com.example.UserMapper">
+                            <resultMap id="UserResultMap" type="com.example.User">
+                                <id column="id" property="id"/>
+                            </resultMap>
+
+                            <select id="selectUsers">
+                                select SYSDATE from dual FETCH FIRST 5 ROWS ONLY
+                            </select>
+                        </mapper>
+                        """);
     }
 
     @Test

@@ -8,18 +8,15 @@ import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerException;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MapperXmlRewriter {
     private static final Set<String> STATEMENT_TAGS = Set.of("select", "insert", "update", "delete");
@@ -28,6 +25,7 @@ public class MapperXmlRewriter {
         List<SqlChange> automaticConversions = new ArrayList<>();
         List<SqlChange> manualReviewItems = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
+        List<StatementReplacement> replacements = new ArrayList<>();
 
         Document document;
         try {
@@ -74,8 +72,7 @@ public class MapperXmlRewriter {
                         conversionResult.reason()
                 ));
             } else if (conversionResult.changed()) {
-                replaceChildrenWithText(document, statement, conversionResult.convertedSql());
-                changed = true;
+                replacements.add(new StatementReplacement(statement.getTagName(), statementId, conversionResult.convertedSql()));
                 automaticConversions.add(new SqlChange(
                         reportPath,
                         statementId,
@@ -88,8 +85,9 @@ public class MapperXmlRewriter {
             }
         }
 
+        changed = !replacements.isEmpty();
         if (changed && writeChanges) {
-            writeDocument(document, inputPath);
+            writeReplacements(inputPath, replacements);
         }
         return new MapperRewriteResult(automaticConversions, manualReviewItems, warnings);
     }
@@ -120,22 +118,95 @@ public class MapperXmlRewriter {
         return false;
     }
 
-    private void replaceChildrenWithText(Document document, Element statement, String sql) {
-        while (statement.hasChildNodes()) {
-            statement.removeChild(statement.getFirstChild());
-        }
-        statement.appendChild(document.createTextNode(sql));
-    }
-
-    private void writeDocument(Document document, Path path) {
+    private void writeReplacements(Path path, List<StatementReplacement> replacements) {
         try {
             Files.createDirectories(path.getParent());
-            Transformer transformer = TransformerFactory.newInstance().newTransformer();
-            transformer.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
-            transformer.setOutputProperty(OutputKeys.INDENT, "yes");
-            transformer.transform(new DOMSource(document), new StreamResult(path.toFile()));
-        } catch (IOException | TransformerException e) {
+            String xml = Files.readString(path, StandardCharsets.UTF_8);
+            int searchFrom = 0;
+            for (StatementReplacement replacement : replacements) {
+                StatementBody statementBody = findStatementBody(xml, replacement, searchFrom);
+                String rewrittenBody = rewrittenBody(statementBody.rawBody(), replacement.convertedSql());
+                xml = xml.substring(0, statementBody.start()) + rewrittenBody + xml.substring(statementBody.end());
+                searchFrom = statementBody.start() + rewrittenBody.length();
+            }
+            Files.writeString(path, xml, StandardCharsets.UTF_8);
+        } catch (IOException e) {
             throw new IllegalStateException("Failed to write mapper XML: " + path, e);
         }
+    }
+
+    private StatementBody findStatementBody(String xml, StatementReplacement replacement, int searchFrom) {
+        if (replacement.statementId().isBlank()) {
+            throw new IllegalStateException("Mapper statement id is required for text-preserving rewrite.");
+        }
+
+        String quotedTag = Pattern.quote(replacement.tagName());
+        String quotedId = Pattern.quote(replacement.statementId());
+        Pattern openingPattern = Pattern.compile(
+                "(?s)<\\s*" + quotedTag + "\\b(?=[^>]*\\bid\\s*=\\s*(?:\"" + quotedId + "\"|'" + quotedId + "'))[^>]*>"
+        );
+        Matcher openingMatcher = openingPattern.matcher(xml);
+        if (!openingMatcher.find(searchFrom)) {
+            throw new IllegalStateException("Failed to locate mapper statement: " + replacement.statementId());
+        }
+
+        Pattern closingPattern = Pattern.compile("(?s)</\\s*" + quotedTag + "\\s*>");
+        Matcher closingMatcher = closingPattern.matcher(xml);
+        if (!closingMatcher.find(openingMatcher.end())) {
+            throw new IllegalStateException("Failed to locate closing tag for mapper statement: " + replacement.statementId());
+        }
+
+        return new StatementBody(
+                openingMatcher.end(),
+                closingMatcher.start(),
+                xml.substring(openingMatcher.end(), closingMatcher.start())
+        );
+    }
+
+    private String rewrittenBody(String rawBody, String convertedSql) {
+        int leadingEnd = 0;
+        while (leadingEnd < rawBody.length() && Character.isWhitespace(rawBody.charAt(leadingEnd))) {
+            leadingEnd++;
+        }
+
+        int trailingStart = rawBody.length();
+        while (trailingStart > leadingEnd && Character.isWhitespace(rawBody.charAt(trailingStart - 1))) {
+            trailingStart--;
+        }
+
+        String leadingWhitespace = rawBody.substring(0, leadingEnd);
+        String trailingWhitespace = rawBody.substring(trailingStart);
+        String convertedCore = convertedSql.strip();
+        return leadingWhitespace + serializeSqlText(convertedCore, rawBody) + trailingWhitespace;
+    }
+
+    private String serializeSqlText(String sql, String rawBody) {
+        if (rawBody.contains("<![CDATA[")) {
+            return "<![CDATA[" + sql.replace("]]>", "]]]]><![CDATA[>") + "]]>";
+        }
+        return escapeXmlText(sql);
+    }
+
+    private String escapeXmlText(String text) {
+        StringBuilder escaped = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == '&') {
+                escaped.append("&amp;");
+            } else if (ch == '<') {
+                escaped.append("&lt;");
+            } else if (ch == '>') {
+                escaped.append("&gt;");
+            } else {
+                escaped.append(ch);
+            }
+        }
+        return escaped.toString();
+    }
+
+    private record StatementReplacement(String tagName, String statementId, String convertedSql) {
+    }
+
+    private record StatementBody(int start, int end, String rawBody) {
     }
 }
