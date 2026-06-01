@@ -8,6 +8,8 @@ import com.github.dmadapter.core.MapperMigrationResult;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.maven.PomModifier;
+import com.github.dmadapter.maven.PomTargetSelection;
+import com.github.dmadapter.maven.PomTargetSelector;
 import com.github.dmadapter.mybatis.MapperMigrator;
 import com.github.dmadapter.report.ReportPaths;
 import com.github.dmadapter.report.ReportWriter;
@@ -46,6 +48,7 @@ public class MigrateCommand implements Callable<Integer> {
 
     private final ProjectScanner projectScanner = new ProjectScanner();
     private final PomModifier pomModifier = new PomModifier();
+    private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
     private final MapperMigrator mapperMigrator = new MapperMigrator();
     private final DmMyBatisConfigGenerator configGenerator = new DmMyBatisConfigGenerator();
     private final ReportWriter reportWriter = new ReportWriter();
@@ -72,9 +75,14 @@ public class MigrateCommand implements Callable<Integer> {
                 warnings.add("MyBatis XML mapper usage was not fully detected; mapper migration may be incomplete.");
             }
 
-            if (!scanResult.hasDmJdbcDriver()) {
+            PomTargetSelection pomTargetSelection = pomTargetSelector.select(context.projectRoot(), scanResult.mapperXmlFiles());
+            warnings.addAll(pomTargetSelection.warnings());
+            if (pomTargetSelection.pomPaths().isEmpty()) {
+                warnings.add("No pom.xml target was found for adding Dameng JDBC driver dependency.");
+            }
+            for (Path pomPath : pomTargetSelection.pomPaths()) {
                 Optional<FileChange> pomChange = pomModifier.ensureDependency(
-                        context.pomPath(),
+                        pomPath,
                         context.dmDriverCoordinate(),
                         context.dryRun()
                 );

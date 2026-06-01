@@ -43,6 +43,22 @@ class DmAdapterCliTest {
         assertThat(Files.exists(tempDir.resolve(".dm-adapter/dm-adapter-scan-report.json"))).isTrue();
     }
 
+    @Test
+    void migrateAddsDmDriverToSpringBootModulePomInsteadOfProjectRoot() throws Exception {
+        writeMultiModuleProjectWithIndependentRootPom();
+        String rootPomBefore = Files.readString(tempDir.resolve("pom.xml"));
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve("pom.xml"))).isEqualTo(rootPomBefore);
+        assertThat(Files.readString(tempDir.resolve("sample-system-rest/pom.xml")))
+                .contains("<artifactId>DmJdbcDriver18</artifactId>");
+        assertThat(Files.readString(tempDir.resolve("sample-system-base/pom.xml")))
+                .doesNotContain("DmJdbcDriver");
+        assertThat(Files.exists(tempDir.resolve("sample-system-base/src/main/resources/mapper-dm/UserMapper.xml"))).isTrue();
+    }
+
     private void writeDemoProject() throws Exception {
         Files.writeString(tempDir.resolve("pom.xml"), """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -79,6 +95,100 @@ class DmAdapterCliTest {
                     </select>
                     <select id="selectByDate">
                         select DATE_FORMAT(created_at, '%Y-%m-%d') from user
+                    </select>
+                </mapper>
+                """);
+    }
+
+    private void writeMultiModuleProjectWithIndependentRootPom() throws Exception {
+        Files.writeString(tempDir.resolve("pom.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>sample-root</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                    <packaging>pom</packaging>
+                </project>
+                """);
+        writeRestModule();
+        writeBaseModule();
+    }
+
+    private void writeRestModule() throws Exception {
+        Path restPom = tempDir.resolve("sample-system-rest/pom.xml");
+        Files.createDirectories(restPom.getParent());
+        Files.writeString(restPom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <parent>
+                        <groupId>org.springframework.boot</groupId>
+                        <artifactId>spring-boot-starter-parent</artifactId>
+                        <version>3.3.2</version>
+                    </parent>
+                    <groupId>com.example</groupId>
+                    <artifactId>sample-system-rest</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                    <dependencies>
+                        <dependency>
+                            <groupId>org.mybatis.spring.boot</groupId>
+                            <artifactId>mybatis-spring-boot-starter</artifactId>
+                            <version>3.0.3</version>
+                        </dependency>
+                    </dependencies>
+                </project>
+                """);
+
+        Path app = tempDir.resolve("sample-system-rest/src/main/java/com/example/RestApplication.java");
+        Files.createDirectories(app.getParent());
+        Files.writeString(app, """
+                package com.example;
+
+                import org.springframework.boot.SpringApplication;
+                import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+                @SpringBootApplication
+                public class RestApplication {
+                    public static void main(String[] args) {
+                        SpringApplication.run(RestApplication.class, args);
+                    }
+                }
+                """);
+
+        Path properties = tempDir.resolve("sample-system-rest/src/main/resources/application.properties");
+        Files.createDirectories(properties.getParent());
+        Files.writeString(properties, "mybatis.mapperLocations=classpath*:/mapper/*.xml\n");
+    }
+
+    private void writeBaseModule() throws Exception {
+        Path basePom = tempDir.resolve("sample-system-base/pom.xml");
+        Files.createDirectories(basePom.getParent());
+        Files.writeString(basePom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>sample-system-base</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                </project>
+                """);
+
+        Path mapper = tempDir.resolve("sample-system-base/src/main/resources/mapper/UserMapper.xml");
+        Files.createDirectories(mapper.getParent());
+        Files.writeString(mapper, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <select id="selectUsers">
+                        select NOW() from dual
                     </select>
                 </mapper>
                 """);
