@@ -1,0 +1,58 @@
+# dm-adapter
+
+[中文](README.md) | English
+
+`dm-adapter` is a Java 17 CLI tool that helps Spring Boot + MyBatis + Maven projects add a Dameng database adaptation path with low intrusion.
+
+## Current Capabilities
+
+- Scan Maven, Spring Boot, and MyBatis XML mapper projects.
+- Check whether `pom.xml` already contains a Dameng JDBC driver dependency.
+- Copy mapper XML files to `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
+- Generate `application-dm.yml` and point MyBatis mapper locations to `classpath*:mapper-dm/**/*.xml`.
+- Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, and simple `LIMIT` pagination.
+- Mark `DATE_FORMAT`, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `GROUP_CONCAT`, `FIND_IN_SET`, and backtick-quoted identifiers for manual review.
+- Write Markdown and JSON reports under `.dm-adapter/`.
+
+## Quick Start
+
+```bash
+mvn test
+mvn -pl dm-adapter-cli -am package
+
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project ./demo
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
+```
+
+## Module Layout
+
+- `dm-adapter-cli`: Picocli commands and workflow orchestration.
+- `dm-adapter-core`: shared context, dependency coordinates, scan results, and migration report models.
+- `dm-adapter-maven`: POM parsing and Dameng JDBC dependency updates.
+- `dm-adapter-mybatis`: mapper XML scanning, copying, and SQL rewrite integration.
+- `dm-adapter-sql`: MySQL-to-Dameng SQL conversion rules.
+- `dm-adapter-report`: Markdown/JSON report writing and reading.
+- `dm-adapter-test-fixtures`: sample projects for tests.
+
+## Current Scope
+
+The first version supports Maven + Spring Boot + MyBatis XML mapper projects only, mainly for MySQL -> Dameng migration. Gradle, JPA, MyBatis annotation SQL, complex multi-datasource projects, and automatic DDL migration are out of scope. Complex SQL is preserved and reported for manual review.
+
+## Roadmap
+
+- v0.1: Harden the MVP with better dry-run reports, mapper path detection, POM formatting preservation, and CLI error messages.
+- v0.2: Expand SQL conversion coverage with more MySQL functions, pagination variants, dynamic SQL risk categories, and rule-level fixtures.
+- v0.3: Improve Spring Boot configuration generation with flexible profiles, mapper-location merge suggestions, and configurable output paths.
+- v0.4: Add stronger migration auditing, including before/after diffs, risk levels, machine-readable report schema, and CI examples.
+- Later: Evaluate Gradle, multi-datasource projects, MyBatis annotation SQL, DDL analysis, and pluggable rule extensions.
+
+## Development
+
+```bash
+mvn test
+mvn -q -DskipTests compile
+mvn -q -DskipTests package
+```
+
+See [AGENTS.md](AGENTS.md) for contribution and Git workflow rules.

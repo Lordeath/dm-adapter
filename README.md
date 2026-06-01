@@ -1,69 +1,58 @@
 # dm-adapter
 
-## 中文
+中文 | [English](README.en.md)
 
 `dm-adapter` 是一个基于 Java 17 的命令行工具，用于辅助 Spring Boot + MyBatis + Maven 项目新增达梦数据库适配路径。
 
-第一版 MVP 聚焦低侵入迁移：
+## 当前能力
 
 - 扫描 Maven、Spring Boot、MyBatis XML mapper 项目。
-- 检查项目是否已有达梦 JDBC 驱动依赖。
-- 默认复制 mapper XML 到 `src/main/resources/mapper-dm`，不覆盖原文件。
-- 对常见 MySQL SQL 写法执行保守转换。
-- 将自动转换项和需要人工确认的 SQL 写入报告。
+- 检查 `pom.xml` 是否已有达梦 JDBC 驱动依赖。
+- `migrate` 默认复制 mapper XML 到 `src/main/resources/mapper-dm`，不覆盖原文件。
+- 生成 `application-dm.yml`，将 MyBatis mapper 指向 `classpath*:mapper-dm/**/*.xml`。
+- 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、简单 `LIMIT` 分页。
+- 将 `DATE_FORMAT`、`ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、`GROUP_CONCAT`、`FIND_IN_SET`、反引号标识符等标记为人工确认。
+- 输出 Markdown 和 JSON 报告到 `.dm-adapter/`。
 
-当前支持的命令：
+## 快速开始
 
 ```bash
 mvn test
 mvn -pl dm-adapter-cli -am package
+
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 ```
 
-项目采用 Maven 多模块结构：
+## 模块结构
 
-- `dm-adapter-cli`：CLI 命令入口。
-- `dm-adapter-core`：核心模型与上下文。
-- `dm-adapter-maven`：POM 解析与依赖修改。
-- `dm-adapter-mybatis`：mapper XML 扫描、复制和重写。
+- `dm-adapter-cli`：Picocli 命令入口与流程编排。
+- `dm-adapter-core`：上下文、依赖坐标、扫描结果、迁移报告等核心模型。
+- `dm-adapter-maven`：POM 解析与达梦 JDBC 依赖修改。
+- `dm-adapter-mybatis`：mapper XML 扫描、复制和 SQL 重写接入。
 - `dm-adapter-sql`：MySQL 到达梦 SQL 转换规则。
-- `dm-adapter-report`：Markdown/JSON 报告。
-- `dm-adapter-test-fixtures`：测试 fixture。
+- `dm-adapter-report`：Markdown/JSON 报告生成与读取。
+- `dm-adapter-test-fixtures`：测试示例项目。
 
-第一版不支持 Gradle、JPA、MyBatis 注解 SQL、多数据源复杂场景和 DDL 自动迁移。
+## 当前边界
 
-## English
+第一版只支持 Maven + Spring Boot + MyBatis XML mapper 项目，主要面向 MySQL -> 达梦。暂不支持 Gradle、JPA、MyBatis 注解 SQL、多数据源复杂场景和 DDL 自动迁移。复杂 SQL 默认保留原内容并写入人工确认报告。
 
-`dm-adapter` is a Java 17 CLI tool that helps Spring Boot + MyBatis + Maven projects add a low-intrusion Dameng database adaptation path.
+## Roadmap
 
-The MVP focuses on conservative migration support:
+- v0.1：完善当前 MVP，增强 dry-run 报告、mapper 路径识别、POM 保格式写入和 CLI 错误提示。
+- v0.2：扩展 SQL 转换规则，增加更多 MySQL 函数、分页变体、动态 SQL 风险分类和规则级测试 fixture。
+- v0.3：增强 Spring Boot 配置生成，支持更灵活的 profile、mapper-location 合并建议和可配置输出目录。
+- v0.4：引入更完整的迁移审计能力，包括转换前后 diff、风险等级、可机读报告 schema 和 CI 集成示例。
+- 后续：评估 Gradle、多数据源、MyBatis 注解 SQL、DDL 辅助分析和插件化规则扩展。
 
-- Scan Maven, Spring Boot, and MyBatis XML mapper projects.
-- Check whether a Dameng JDBC dependency already exists.
-- Copy mapper XML files to `src/main/resources/mapper-dm` by default without overwriting originals.
-- Apply conservative MySQL-to-Dameng SQL rewrites.
-- Report automatic conversions and SQL items that need manual review.
-
-Common commands:
+## 开发
 
 ```bash
 mvn test
-mvn -pl dm-adapter-cli -am package
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project ./demo
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
+mvn -q -DskipTests compile
+mvn -q -DskipTests package
 ```
 
-Module layout:
-
-- `dm-adapter-cli`: CLI command entry point.
-- `dm-adapter-core`: shared models and context.
-- `dm-adapter-maven`: POM parsing and dependency updates.
-- `dm-adapter-mybatis`: mapper XML scanning, copying, and rewriting.
-- `dm-adapter-sql`: MySQL-to-Dameng SQL conversion rules.
-- `dm-adapter-report`: Markdown/JSON reports.
-- `dm-adapter-test-fixtures`: test fixtures.
-
-The first version does not support Gradle, JPA, MyBatis annotation SQL, complex multi-datasource projects, or automatic DDL migration.
+贡献和 Git 操作要求见 [AGENTS.md](AGENTS.md)。
