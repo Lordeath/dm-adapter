@@ -18,6 +18,52 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDoubleQuotedStringLiterals() {
+        SqlConversionResult result = converter.convert(
+                "select * from user where status = \"ACTIVE\" and remark = \"Bob's \\\"note\\\"\""
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select * from user where status = 'ACTIVE' and remark = 'Bob''s \"note\"'");
+        assertThat(result.appliedRules()).containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+    }
+
+    @Test
+    void convertsDoubleQuotedStringLiteralsBeforeOtherSafeRules() {
+        SqlConversionResult result = converter.convert("select IFNULL(status, \"UNKNOWN\") from user");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("select NVL(status, 'UNKNOWN') from user");
+        assertThat(result.appliedRules())
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING", "IFNULL_TO_NVL");
+    }
+
+    @Test
+    void doesNotConvertDoubleQuotesInsideSingleQuotedStringsOrComments() {
+        SqlConversionResult result = converter.convert("""
+                select '"ACTIVE"' as raw, "ACTIVE" as status -- "comment"
+                from user /* "block" */
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select '"ACTIVE"' as raw, 'ACTIVE' as status -- "comment"
+                from user /* "block" */
+                """);
+        assertThat(result.appliedRules()).containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+    }
+
+    @Test
+    void convertsDoubleQuotedStringLiteralsAfterMyBatisPlaceholders() {
+        SqlConversionResult result = converter.convert("select * from user where id = #{id} and status = \"ACTIVE\"");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("select * from user where id = #{id} and status = 'ACTIVE'");
+        assertThat(result.appliedRules()).containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+    }
+
+    @Test
     void convertsSimpleLimitWithOffset() {
         SqlConversionResult result = converter.convert("select * from user order by id limit 10, 20");
 

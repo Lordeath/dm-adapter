@@ -11,7 +11,7 @@
 - Check whether `pom.xml` already contains a Dameng JDBC driver dependency.
 - Copy mapper XML files to the source module's `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
 - Generate `application-dm.yml` and point MyBatis mapper locations to `classpath*:mapper-dm/**/*.xml`.
-- Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, and simple `LIMIT` pagination.
+- Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, and simple `LIMIT` pagination.
 - Mark `DATE_FORMAT`, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `GROUP_CONCAT`, `FIND_IN_SET`, and backtick-quoted identifiers for manual review.
 - Write Markdown and JSON reports under `.dm-adapter/`.
 

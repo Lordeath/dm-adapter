@@ -37,6 +37,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String converted = original;
         List<String> rules = new ArrayList<>();
 
+        DoubleQuotedStringConversion doubleQuotedStringConversion = convertDoubleQuotedStringLiterals(converted);
+        if (doubleQuotedStringConversion.changed()) {
+            converted = doubleQuotedStringConversion.convertedSql();
+            rules.add("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+        }
+
         Matcher ifNullMatcher = IFNULL_PATTERN.matcher(converted);
         if (ifNullMatcher.find()) {
             converted = ifNullMatcher.replaceAll("NVL(");
@@ -86,6 +92,133 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return "Backtick quoted identifiers require manual confirmation before converting to Dameng quoting rules.";
         }
         return "";
+    }
+
+    private DoubleQuotedStringConversion convertDoubleQuotedStringLiterals(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                DoubleQuotedStringLiteral literal = readDoubleQuotedStringLiteral(sql, index);
+                if (literal.closed()) {
+                    appendSingleQuotedStringLiteral(converted, literal.value());
+                    index = literal.nextIndex();
+                    changed = true;
+                } else {
+                    converted.append(sql, index, sql.length());
+                    index = sql.length();
+                }
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new DoubleQuotedStringConversion(converted.toString(), changed);
+    }
+
+    private int appendSingleQuotedString(String sql, int start, StringBuilder converted) {
+        int index = start;
+        converted.append(sql.charAt(index++));
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            converted.append(current);
+            index++;
+            if (current == '\\' && index < sql.length()) {
+                converted.append(sql.charAt(index++));
+            } else if (current == '\'') {
+                if (index < sql.length() && sql.charAt(index) == '\'') {
+                    converted.append(sql.charAt(index++));
+                } else {
+                    break;
+                }
+            }
+        }
+        return index;
+    }
+
+    private DoubleQuotedStringLiteral readDoubleQuotedStringLiteral(String sql, int start) {
+        StringBuilder value = new StringBuilder();
+        int index = start + 1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\\' && index + 1 < sql.length()) {
+                char escaped = sql.charAt(index + 1);
+                if (escaped == '"' || escaped == '\'') {
+                    value.append(escaped);
+                } else {
+                    value.append(current).append(escaped);
+                }
+                index += 2;
+            } else if (current == '"') {
+                if (index + 1 < sql.length() && sql.charAt(index + 1) == '"') {
+                    value.append(current);
+                    index += 2;
+                } else {
+                    return new DoubleQuotedStringLiteral(value.toString(), index + 1, true);
+                }
+            } else {
+                value.append(current);
+                index++;
+            }
+        }
+        return new DoubleQuotedStringLiteral("", start, false);
+    }
+
+    private void appendSingleQuotedStringLiteral(StringBuilder converted, String value) {
+        converted.append('\'');
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (current == '\'') {
+                converted.append("''");
+            } else {
+                converted.append(current);
+            }
+        }
+        converted.append('\'');
+    }
+
+    private boolean startsLineComment(String sql, int index) {
+        return sql.startsWith("--", index)
+                || (sql.charAt(index) == '#' && (index + 1 >= sql.length() || sql.charAt(index + 1) != '{'));
+    }
+
+    private int appendUntilLineEnd(String sql, int start, StringBuilder converted) {
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            converted.append(current);
+            index++;
+            if (current == '\n') {
+                break;
+            }
+        }
+        return index;
+    }
+
+    private boolean startsBlockComment(String sql, int index) {
+        return index + 1 < sql.length() && sql.charAt(index) == '/' && sql.charAt(index + 1) == '*';
+    }
+
+    private int appendUntilBlockCommentEnd(String sql, int start, StringBuilder converted) {
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            converted.append(current);
+            index++;
+            if (current == '*' && index < sql.length() && sql.charAt(index) == '/') {
+                converted.append(sql.charAt(index++));
+                break;
+            }
+        }
+        return index;
     }
 
     private LimitConversion convertLimit(String sql) {
@@ -148,6 +281,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private String maskMyBatisPlaceholders(String sql) {
         return sql.replaceAll("#\\{[^}]+}", "0")
                 .replaceAll("\\$\\{[^}]+}", "0");
+    }
+
+    private record DoubleQuotedStringConversion(String convertedSql, boolean changed) {
+    }
+
+    private record DoubleQuotedStringLiteral(String value, int nextIndex, boolean closed) {
     }
 
     private record LimitConversion(String convertedSql, String ruleName, String manualReviewReason) {
