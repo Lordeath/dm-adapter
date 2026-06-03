@@ -11,7 +11,8 @@ import picocli.CommandLine.Command;
         subcommands = {
                 ScanCommand.class,
                 MigrateCommand.class,
-                ReportCommand.class
+                ReportCommand.class,
+                GenerateValidationTestCommand.class
         }
 )
 public class DmAdapterCli implements Runnable {

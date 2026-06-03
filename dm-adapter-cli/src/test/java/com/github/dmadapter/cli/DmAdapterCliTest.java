@@ -59,6 +59,68 @@ class DmAdapterCliTest {
         assertThat(Files.exists(tempDir.resolve("sample-system-base/src/main/resources/mapper-dm/UserMapper.xml"))).isTrue();
     }
 
+    @Test
+    void generateValidationTestWritesConfigAndSpringBootTest() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        Path config = tempDir.resolve(".dm-adapter/sql-validation.yml");
+        Path test = tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java");
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(config))
+                .contains("methods:")
+                .contains("excludedMethods:")
+                .contains("com.example.UserMapper.selectUsers")
+                .contains("com.example.UserMapper.selectByDate");
+        assertThat(Files.readString(test))
+                .contains("package com.example;")
+                .contains("@SpringBootTest")
+                .contains("@ActiveProfiles(\"dm\")")
+                .contains("@Tag(\"dm-sql-validation\")")
+                .contains("@EnabledIfEnvironmentVariable")
+                .contains("PlatformTransactionManager");
+    }
+
+    @Test
+    void generateValidationTestRequiresAppModuleWhenMultipleApplicationsExist() throws Exception {
+        writeMultiModuleProjectWithIndependentRootPom();
+        writeAdditionalAppModule("another-rest", "AnotherApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(Files.exists(tempDir.resolve(".dm-adapter/sql-validation.yml"))).isFalse();
+    }
+
+    @Test
+    void generateValidationTestUsesExplicitAppModule() throws Exception {
+        writeMultiModuleProjectWithIndependentRootPom();
+        writeAdditionalAppModule("another-rest", "AnotherApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString(),
+                "--app-module",
+                "sample-system-rest"
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.exists(tempDir.resolve(".dm-adapter/sql-validation.yml"))).isTrue();
+        assertThat(Files.exists(tempDir.resolve("sample-system-rest/src/test/java/com/example/DmSqlValidationTest.java"))).isTrue();
+        assertThat(Files.exists(tempDir.resolve("another-rest/src/test/java/com/example/DmSqlValidationTest.java"))).isFalse();
+    }
+
     private void writeDemoProject() throws Exception {
         Files.writeString(tempDir.resolve("pom.xml"), """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -144,25 +206,55 @@ class DmAdapterCliTest {
                 </project>
                 """);
 
-        Path app = tempDir.resolve("sample-system-rest/src/main/java/com/example/RestApplication.java");
+        writeApplicationClass("sample-system-rest/src/main/java/com/example/RestApplication.java", "com.example", "RestApplication");
+
+        Path properties = tempDir.resolve("sample-system-rest/src/main/resources/application.properties");
+        Files.createDirectories(properties.getParent());
+        Files.writeString(properties, "mybatis.mapperLocations=classpath*:/mapper/*.xml\n");
+    }
+
+    private void writeAdditionalAppModule(String moduleName, String className) throws Exception {
+        Path pom = tempDir.resolve(moduleName + "/pom.xml");
+        Files.createDirectories(pom.getParent());
+        Files.writeString(pom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <parent>
+                        <groupId>org.springframework.boot</groupId>
+                        <artifactId>spring-boot-starter-parent</artifactId>
+                        <version>3.3.2</version>
+                    </parent>
+                    <groupId>com.example</groupId>
+                    <artifactId>%s</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                </project>
+                """.formatted(moduleName));
+        writeApplicationClass(
+                moduleName + "/src/main/java/com/example/" + className + ".java",
+                "com.example",
+                className
+        );
+    }
+
+    private void writeApplicationClass(String relativePath, String packageName, String className) throws Exception {
+        Path app = tempDir.resolve(relativePath);
         Files.createDirectories(app.getParent());
         Files.writeString(app, """
-                package com.example;
+                package %s;
 
                 import org.springframework.boot.SpringApplication;
                 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
                 @SpringBootApplication
-                public class RestApplication {
+                public class %s {
                     public static void main(String[] args) {
-                        SpringApplication.run(RestApplication.class, args);
+                        SpringApplication.run(%s.class, args);
                     }
                 }
-                """);
-
-        Path properties = tempDir.resolve("sample-system-rest/src/main/resources/application.properties");
-        Files.createDirectories(properties.getParent());
-        Files.writeString(properties, "mybatis.mapperLocations=classpath*:/mapper/*.xml\n");
+                """.formatted(packageName, className, className));
     }
 
     private void writeBaseModule() throws Exception {

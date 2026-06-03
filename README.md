@@ -13,6 +13,7 @@
 - 生成 `application-dm.yml`，将 MyBatis mapper 指向 `classpath*:mapper-dm/**/*.xml`。
 - 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页。
 - 将 `DATE_FORMAT`、`GROUP_CONCAT`、`FIND_IN_SET`、JSON 函数、时间计算/转换函数、`ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、反引号标识符等标记为人工确认。
+- 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/Spring Boot 测试类和 `.dm-adapter/sql-validation.yml` 参数模板。
 - 输出 Markdown 和 JSON 报告到 `.dm-adapter/`。
 
 ## 快速开始
@@ -24,7 +25,16 @@ mvn -pl dm-adapter-cli -am package
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo
 ```
+
+生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。需要在达梦测试环境显式运行，例如：
+
+```bash
+DM_SQL_VALIDATION=true mvn -Dtest=DmSqlValidationTest test
+```
+
+测试使用目标项目的 `dm` Spring profile 数据源配置，执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`。
 
 ## 模块结构
 

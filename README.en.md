@@ -13,6 +13,7 @@
 - Generate `application-dm.yml` and point MyBatis mapper locations to `classpath*:mapper-dm/**/*.xml`.
 - Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, and simple `LIMIT` pagination.
 - Mark `DATE_FORMAT`, `GROUP_CONCAT`, `FIND_IN_SET`, JSON functions, time calculation/conversion functions, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, and backtick-quoted identifiers for manual review.
+- Generate a Dameng test-environment SQL integration test: a JUnit/Spring Boot test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project.
 - Write Markdown and JSON reports under `.dm-adapter/`.
 
 ## Quick Start
@@ -24,7 +25,16 @@ mvn -pl dm-adapter-cli -am package
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo
 ```
+
+The generated SQL validation test does not connect to the database during ordinary `mvn test` runs. Run it explicitly in the Dameng test environment, for example:
+
+```bash
+DM_SQL_VALIDATION=true mvn -Dtest=DmSqlValidationTest test
+```
+
+The test uses the target project's `dm` Spring profile datasource configuration and writes `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`.
 
 ## Module Layout
 
