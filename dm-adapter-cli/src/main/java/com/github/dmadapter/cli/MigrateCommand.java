@@ -50,7 +50,6 @@ public class MigrateCommand implements Callable<Integer> {
     private final PomModifier pomModifier = new PomModifier();
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
     private final MapperMigrator mapperMigrator = new MapperMigrator();
-    private final DmMyBatisConfigGenerator configGenerator = new DmMyBatisConfigGenerator();
     private final ReportWriter reportWriter = new ReportWriter();
 
     @Override
@@ -88,10 +87,6 @@ public class MigrateCommand implements Callable<Integer> {
                 );
                 pomChange.ifPresent(fileChanges::add);
             }
-
-            ConfigGenerationResult configGenerationResult = configGenerator.generate(context);
-            configGenerationResult.fileChange().ifPresent(fileChanges::add);
-            warnings.addAll(configGenerationResult.warnings());
 
             MapperMigrationResult mapperMigrationResult = mapperMigrator.migrate(
                     scanResult,

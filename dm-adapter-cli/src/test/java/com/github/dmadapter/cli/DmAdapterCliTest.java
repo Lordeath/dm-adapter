@@ -44,6 +44,19 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateAddsDmDriverToRootPomWithoutGeneratingApplicationDmConfig() throws Exception {
+        writeDemoProject();
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve("pom.xml")))
+                .contains("<artifactId>DmJdbcDriver18</artifactId>");
+        assertThat(Files.exists(tempDir.resolve("src/main/resources/application-dm.yml"))).isFalse();
+        assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isTrue();
+    }
+
+    @Test
     void migrateAddsDmDriverToSpringBootModulePomInsteadOfProjectRoot() throws Exception {
         writeMultiModuleProjectWithIndependentRootPom();
         String rootPomBefore = Files.readString(tempDir.resolve("pom.xml"));
@@ -57,6 +70,8 @@ class DmAdapterCliTest {
         assertThat(Files.readString(tempDir.resolve("sample-system-base/pom.xml")))
                 .doesNotContain("DmJdbcDriver");
         assertThat(Files.exists(tempDir.resolve("sample-system-base/src/main/resources/mapper-dm/UserMapper.xml"))).isTrue();
+        assertThat(Files.exists(tempDir.resolve("src/main/resources/application-dm.yml"))).isFalse();
+        assertThat(Files.exists(tempDir.resolve("sample-system-rest/src/main/resources/application-dm.yml"))).isFalse();
     }
 
     @Test

@@ -10,7 +10,6 @@
 - mapper XML 优先根据项目内 `application*.properties`、`application*.yml`、`application*.yaml` 中的 `mybatis.mapperLocations` / `mybatis.mapper-locations` 等配置项定位；支持 `classpath*:/mapper/*.xml` 这类跨模块 classpath 配置；未配置时回退到资源目录扫描。
 - 检查 `pom.xml` 是否已有达梦 JDBC 驱动依赖。
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
-- 生成 `application-dm.yml`，将 MyBatis mapper 指向 `classpath*:mapper-dm/**/*.xml`。
 - 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页。
 - 将 `DATE_FORMAT`、`GROUP_CONCAT`、`FIND_IN_SET`、JSON 函数、时间计算/转换函数、`ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、反引号标识符等标记为人工确认。
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/Spring Boot 测试类和 `.dm-adapter/sql-validation.yml` 参数模板。
