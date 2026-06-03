@@ -12,7 +12,7 @@
 - Copy mapper XML files to the source module's `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
 - Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, and simple `LIMIT` pagination.
 - Mark `DATE_FORMAT`, `GROUP_CONCAT`, `FIND_IN_SET`, JSON functions, time calculation/conversion functions, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, and backtick-quoted identifiers for manual review.
-- Generate a Dameng test-environment SQL integration test: a JUnit/Spring Boot test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project.
+- Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project, without starting Spring Boot, ShardingSphere, MQ, or web beans.
 - Write Markdown and JSON reports under `.dm-adapter/`.
 
 ## Quick Start
@@ -30,10 +30,14 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-valid
 The generated SQL validation test does not connect to the database during ordinary `mvn test` runs. Run it explicitly in the Dameng test environment, for example:
 
 ```bash
-DM_SQL_VALIDATION=true mvn -Dtest=DmSqlValidationTest test
+DM_SQL_VALIDATION=true \
+DM_JDBC_URL=jdbc:dm://host:5236 \
+DM_DB_USERNAME=user \
+DM_DB_PASSWORD=password \
+mvn -Dtest=DmSqlValidationTest test
 ```
 
-The test uses the target project's `dm` Spring profile datasource configuration. When `--schema` is configured, the test executes `set schema "<schema>"` before each DAO invocation, which supports quoted schema names such as `sample-system`. Results are written to `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`.
+The test creates a MyBatis `SqlSessionFactory` directly from the `datasource` environment-variable placeholders in `.dm-adapter/sql-validation.yml`; it does not load the target project's Spring Boot configuration. When `--schema` is configured, the test executes `set schema "<schema>"` before each DAO invocation, which supports quoted schema names such as `sample-system`. Results are written to `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`.
 
 ## Module Layout
 
@@ -53,7 +57,7 @@ The first version supports Maven + Spring Boot + MyBatis XML mapper projects onl
 
 - v0.1: Harden the MVP with better dry-run reports, mapper path detection, POM formatting preservation, and CLI error messages.
 - v0.2: Expand SQL conversion coverage with more MySQL functions, pagination variants, dynamic SQL risk categories, and rule-level fixtures.
-- v0.3: Improve Spring Boot configuration generation with flexible profiles, mapper-location merge suggestions, and configurable output paths.
+- v0.3: Improve standalone SQL validation, mapper-location suggestions, and configurable output paths.
 - v0.4: Add stronger migration auditing, including before/after diffs, risk levels, machine-readable report schema, and CI examples.
 - Later: Evaluate Gradle, multi-datasource projects, MyBatis annotation SQL, DDL analysis, and pluggable rule extensions.
 

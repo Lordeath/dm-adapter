@@ -75,7 +75,7 @@ class DmAdapterCliTest {
     }
 
     @Test
-    void generateValidationTestWritesConfigAndSpringBootTest() throws Exception {
+    void generateValidationTestWritesConfigAndMyBatisJdbcTest() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
@@ -92,19 +92,45 @@ class DmAdapterCliTest {
         assertThat(exitCode).isZero();
         assertThat(Files.readString(config))
                 .contains("schema: \"sample-system\"")
+                .contains("datasource:")
+                .contains("url: ${DM_JDBC_URL}")
+                .contains("mapperXmlLocations:")
+                .contains("src/main/resources/mapper/**/*.xml")
                 .contains("methods:")
                 .contains("excludedMethods:")
                 .contains("com.example.UserMapper.selectUsers")
                 .contains("com.example.UserMapper.selectByDate");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
-                .contains("@SpringBootTest")
-                .contains("@ActiveProfiles(\"dm\")")
                 .contains("@Tag(\"dm-sql-validation\")")
                 .contains("@EnabledIfEnvironmentVariable")
-                .contains("PlatformTransactionManager")
+                .contains("SqlSessionFactory")
+                .contains("UnpooledDataSource")
                 .contains("set schema")
-                .contains("quotedIdentifier(config.schema)");
+                .contains("quotedIdentifier(config.schema)")
+                .doesNotContain("@SpringBootTest")
+                .doesNotContain("@ActiveProfiles")
+                .doesNotContain("PlatformTransactionManager")
+                .doesNotContain("RabbitTemplate");
+    }
+
+    @Test
+    void generateValidationTestPrefersMigratedMapperDmLocations() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int migrateExitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        int generateExitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        assertThat(migrateExitCode).isZero();
+        assertThat(generateExitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation.yml")))
+                .contains("src/main/resources/mapper-dm/**/*.xml")
+                .doesNotContain("src/main/resources/mapper/**/*.xml");
     }
 
     @Test

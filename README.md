@@ -12,7 +12,7 @@
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
 - 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页。
 - 将 `DATE_FORMAT`、`GROUP_CONCAT`、`FIND_IN_SET`、JSON 函数、时间计算/转换函数、`ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、反引号标识符等标记为人工确认。
-- 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/Spring Boot 测试类和 `.dm-adapter/sql-validation.yml` 参数模板。
+- 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类和 `.dm-adapter/sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean。
 - 输出 Markdown 和 JSON 报告到 `.dm-adapter/`。
 
 ## 快速开始
@@ -30,10 +30,14 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-valid
 生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。需要在达梦测试环境显式运行，例如：
 
 ```bash
-DM_SQL_VALIDATION=true mvn -Dtest=DmSqlValidationTest test
+DM_SQL_VALIDATION=true \
+DM_JDBC_URL=jdbc:dm://host:5236 \
+DM_DB_USERNAME=user \
+DM_DB_PASSWORD=password \
+mvn -Dtest=DmSqlValidationTest test
 ```
 
-测试使用目标项目的 `dm` Spring profile 数据源配置。配置 `--schema` 后，测试会在每次 DAO 调用前执行 `set schema "<schema>"`，可支持 `sample-system` 这类需要双引号的 schema 名。执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`。
+测试直接用 `.dm-adapter/sql-validation.yml` 中的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。配置 `--schema` 后，测试会在每次 DAO 调用前执行 `set schema "<schema>"`，可支持 `sample-system` 这类需要双引号的 schema 名。执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`。
 
 ## 模块结构
 

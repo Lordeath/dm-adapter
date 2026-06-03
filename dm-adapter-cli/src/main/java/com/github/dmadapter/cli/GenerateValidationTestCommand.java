@@ -9,13 +9,13 @@ import java.util.concurrent.Callable;
 
 @Command(
         name = "generate-validation-test",
-        description = "Generate a Spring Boot JUnit test for validating MyBatis SQL against Dameng."
+        description = "Generate a JUnit/MyBatis JDBC test for validating mapper XML SQL against Dameng."
 )
 public class GenerateValidationTestCommand implements Callable<Integer> {
     @Option(names = "--project", required = true, description = "Project root path.")
     private Path project;
 
-    @Option(names = "--app-module", description = "Spring Boot application module path, relative to project root or absolute.")
+    @Option(names = "--app-module", description = "Application module path used for generated test placement, relative to project root or absolute.")
     private Path appModule;
 
     @Option(names = "--mapper-dir", description = "Mapper XML directory used for configuration template discovery.")
