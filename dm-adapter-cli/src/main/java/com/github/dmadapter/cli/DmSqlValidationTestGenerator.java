@@ -1129,16 +1129,63 @@ class DmSqlValidationTestGenerator {
                     markdown.append("- Passed: `").append(count(records, "PASSED")).append("`\\n");
                     markdown.append("- Failed: `").append(count(records, "FAILED")).append("`\\n");
                     markdown.append("- Skipped: `").append(count(records, "SKIPPED")).append("`\\n\\n");
-                    markdown.append("| Status | Mapper Method | Parameter Source | Message |\\n");
-                    markdown.append("| --- | --- | --- | --- |\\n");
+                    appendFailureCategorySummary(markdown, records);
+                    markdown.append("## Results\\n\\n");
+                    markdown.append("| Status | Category | Mapper Method | Parameter Source | Summary | Hint |\\n");
+                    markdown.append("| --- | --- | --- | --- | --- | --- |\\n");
                     for (ValidationRecord record : records) {
                         markdown.append("| ").append(record.status)
+                                .append(" | ").append(escapeMarkdown(category(record)))
                                 .append(" | `").append(escapeMarkdown(record.key)).append("`")
                                 .append(" | ").append(escapeMarkdown(record.parameterSource))
-                                .append(" | ").append(escapeMarkdown(record.message))
+                                .append(" | ").append(escapeMarkdown(summary(record)))
+                                .append(" | ").append(escapeMarkdown(hint(record)))
                                 .append(" |\\n");
                     }
+                    appendFailureDetails(markdown, records);
                     return markdown.toString();
+                }
+
+                private void appendFailureCategorySummary(StringBuilder markdown, List<ValidationRecord> records) {
+                    Map<String, Long> countsByCategory = records.stream()
+                            .filter(record -> "FAILED".equals(record.status))
+                            .collect(Collectors.groupingBy(this::category, LinkedHashMap::new, Collectors.counting()));
+                    if (countsByCategory.isEmpty()) {
+                        return;
+                    }
+                    markdown.append("## Failure Categories\\n\\n");
+                    markdown.append("| Category | Count | Hint |\\n");
+                    markdown.append("| --- | ---: | --- |\\n");
+                    for (Map.Entry<String, Long> entry : countsByCategory.entrySet()) {
+                        markdown.append("| ").append(escapeMarkdown(entry.getKey()))
+                                .append(" | ").append(entry.getValue())
+                                .append(" | ").append(escapeMarkdown(categoryHint(entry.getKey())))
+                                .append(" |\\n");
+                    }
+                    markdown.append("\\n");
+                }
+
+                private void appendFailureDetails(StringBuilder markdown, List<ValidationRecord> records) {
+                    List<ValidationRecord> failed = records.stream()
+                            .filter(record -> "FAILED".equals(record.status))
+                            .collect(Collectors.toList());
+                    if (failed.isEmpty()) {
+                        return;
+                    }
+                    markdown.append("\\n## Failure Details\\n\\n");
+                    markdown.append("Long MyBatis messages are shortened here; the JSON report keeps the full message.\\n\\n");
+                    for (ValidationRecord record : failed) {
+                        markdown.append("<details>\\n");
+                        markdown.append("<summary>")
+                                .append(escapeHtml(category(record)))
+                                .append(" - ")
+                                .append(escapeHtml(record.key))
+                                .append("</summary>\\n\\n");
+                        markdown.append("```text\\n")
+                                .append(escapeCodeBlock(abbreviate(record.message, 4000)))
+                                .append("\\n```\\n\\n");
+                        markdown.append("</details>\\n\\n");
+                    }
                 }
 
                 private long count(List<ValidationRecord> records, String status) {
@@ -1152,8 +1199,11 @@ class DmSqlValidationTestGenerator {
                         ValidationRecord record = records.get(i);
                         json.append("    {")
                                 .append("\\"status\\": \\"").append(escapeJson(record.status)).append("\\", ")
+                                .append("\\"category\\": \\"").append(escapeJson(category(record))).append("\\", ")
                                 .append("\\"key\\": \\"").append(escapeJson(record.key)).append("\\", ")
                                 .append("\\"parameterSource\\": \\"").append(escapeJson(record.parameterSource)).append("\\", ")
+                                .append("\\"summary\\": \\"").append(escapeJson(summary(record))).append("\\", ")
+                                .append("\\"hint\\": \\"").append(escapeJson(hint(record))).append("\\", ")
                                 .append("\\"message\\": \\"").append(escapeJson(record.message)).append("\\"")
                                 .append("}");
                         if (i + 1 < records.size()) {
@@ -1163,6 +1213,135 @@ class DmSqlValidationTestGenerator {
                     }
                     json.append("  ]\\n}\\n");
                     return json.toString();
+                }
+
+                private String category(ValidationRecord record) {
+                    if ("PASSED".equals(record.status)) {
+                        return "PASSED";
+                    }
+                    if ("SKIPPED".equals(record.status)) {
+                        return "SKIPPED";
+                    }
+                    String message = record.message == null ? "" : record.message;
+                    if (containsAny(message,
+                            "No mapper XML files matched",
+                            "No mapped statements were found",
+                            "Could not find",
+                            "Failed to parse mapper XML",
+                            "Mapped statement was not registered",
+                            "Parsing error was found in mapping",
+                            "datasource.")) {
+                        return "CONFIGURATION";
+                    }
+                    if (containsAny(message,
+                            "evaluated to a null value",
+                            "Parameter '",
+                            "not found. Available parameters",
+                            "There is no getter for property",
+                            "invalid comparison:",
+                            "Could not set parameters",
+                            "primitive return type")) {
+                        return "METHOD_ARGS_OR_BINDING";
+                    }
+                    if (containsAny(message, "information_schema", "database()")) {
+                        return "MYSQL_METADATA_SQL";
+                    }
+                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的模式名")) {
+                        return "TEST_SCHEMA";
+                    }
+                    if (containsAny(message,
+                            "非空约束",
+                            "违反列[",
+                            "长度超出定义",
+                            "类型转换异常",
+                            "唯一性约束",
+                            "非法的时间日期类型数据")) {
+                        return "TEST_DATA_OR_SCHEMA";
+                    }
+                    if (containsAny(message,
+                            "语法分析出错",
+                            "标示符长度非法",
+                            "无效的数据类型",
+                            "无效的变量名",
+                            "无法解析的成员访问表达式",
+                            "有歧义的列名",
+                            "递归 WITH 子句")) {
+                        return "SQL_SYNTAX";
+                    }
+                    if (containsAny(message, "TooManyResultsException")) {
+                        return "TEST_DATA";
+                    }
+                    return "UNKNOWN_FAILURE";
+                }
+
+                private String hint(ValidationRecord record) {
+                    return "FAILED".equals(record.status) ? categoryHint(category(record)) : "";
+                }
+
+                private String categoryHint(String category) {
+                    if ("CONFIGURATION".equals(category)) {
+                        return "Check sql-validation.yml, mapper XML locations, datasource variables, type aliases, and mapper binding.";
+                    }
+                    if ("MYSQL_METADATA_SQL".equals(category)) {
+                        return "MySQL metadata SQL such as information_schema/database() needs manual Dameng rewrite.";
+                    }
+                    if ("METHOD_ARGS_OR_BINDING".equals(category)) {
+                        return "Generated sample args did not satisfy mapper dynamic SQL or @Param binding; configure method args or inspect mapper parameter names.";
+                    }
+                    if ("SQL_SYNTAX".equals(category)) {
+                        return "Dameng rejected the SQL syntax; inspect mapper-dm SQL and convert the incompatible fragment manually.";
+                    }
+                    if ("TEST_SCHEMA".equals(category)) {
+                        return "The Dameng test schema is missing a table/view/column, or object names differ from the mapper SQL.";
+                    }
+                    if ("TEST_DATA_OR_SCHEMA".equals(category)) {
+                        return "Generated test parameters or table DDL do not satisfy constraints; check identity/sequence/default values, column length, seed data, or configure method args.";
+                    }
+                    if ("TEST_DATA".equals(category)) {
+                        return "The SQL ran but the current test data does not match mapper expectations; adjust seed data or method args.";
+                    }
+                    if ("UNKNOWN_FAILURE".equals(category)) {
+                        return "Review the failure detail and decide whether it is SQL compatibility, test schema, or test data.";
+                    }
+                    return "";
+                }
+
+                private String summary(ValidationRecord record) {
+                    if (!"FAILED".equals(record.status)) {
+                        return record.message;
+                    }
+                    String compact = normalizeMessage(record.message);
+                    String dmCause = "Cause: dm.jdbc.driver.DMException:";
+                    int dmCauseIndex = compact.lastIndexOf(dmCause);
+                    if (dmCauseIndex >= 0) {
+                        compact = compact.substring(dmCauseIndex + dmCause.length()).trim();
+                    } else if (compact.startsWith("org.apache.ibatis.exceptions.PersistenceException:")) {
+                        compact = compact.substring("org.apache.ibatis.exceptions.PersistenceException:".length()).trim();
+                    }
+                    compact = beforeMarker(compact, "### SQL:");
+                    compact = beforeMarker(compact, "### Cause:");
+                    if (compact.isBlank()) {
+                        compact = normalizeMessage(record.message);
+                    }
+                    return abbreviate(compact, 360);
+                }
+
+                private String normalizeMessage(String value) {
+                    return value == null ? "" : value.replace("\\r", " ").replace("\\n", " ").replaceAll("\\\\s+", " ").trim();
+                }
+
+                private String beforeMarker(String value, String marker) {
+                    int index = value.indexOf(marker);
+                    return index >= 0 ? value.substring(0, index).trim() : value;
+                }
+
+                private boolean containsAny(String value, String... needles) {
+                    for (String needle : needles) {
+                        if (value.contains(needle)) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
 
                 private String resultSummary(Object result) {
@@ -1188,6 +1367,19 @@ class DmSqlValidationTestGenerator {
 
                 private String escapeMarkdown(String value) {
                     return value == null ? "" : value.replace("|", "\\\\|").replace("\\n", " ");
+                }
+
+                private String escapeHtml(String value) {
+                    if (value == null) {
+                        return "";
+                    }
+                    return value.replace("&", "&amp;")
+                            .replace("<", "&lt;")
+                            .replace(">", "&gt;");
+                }
+
+                private String escapeCodeBlock(String value) {
+                    return value == null ? "" : value.replace("```", "` ` `");
                 }
 
                 private String escapeJson(String value) {
