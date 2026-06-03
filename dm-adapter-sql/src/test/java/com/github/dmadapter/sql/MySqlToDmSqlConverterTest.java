@@ -3,6 +3,8 @@ package com.github.dmadapter.sql;
 import com.github.dmadapter.core.SqlConversionResult;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 class MySqlToDmSqlConverterTest {
@@ -88,6 +90,43 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isFalse();
         assertThat(result.convertedSql()).isEqualTo(result.originalSql());
         assertThat(result.reason()).contains("DATE_FORMAT");
+    }
+
+    @Test
+    void marksBacktickIdentifiersForManualReview() {
+        SqlConversionResult result = converter.convert("select `order`, `status` from `user`");
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.reason()).contains("Backtick", "double-quoted identifiers", "case sensitivity");
+    }
+
+    @Test
+    void marksMySqlSpecificFunctionsForManualReview() {
+        List<String> functionNames = List.of(
+                "DATE_ADD",
+                "DATE_SUB",
+                "STR_TO_DATE",
+                "UNIX_TIMESTAMP",
+                "FROM_UNIXTIME",
+                "TIMESTAMPDIFF",
+                "CONCAT_WS",
+                "JSON_EXTRACT",
+                "JSON_UNQUOTE",
+                "JSON_SET"
+        );
+
+        for (String functionName : functionNames) {
+            SqlConversionResult result = converter.convert("select " + functionName + "(created_at) from user");
+
+            assertThat(result.manualReviewRequired())
+                    .as(functionName + " should require manual review")
+                    .isTrue();
+            assertThat(result.changed()).isFalse();
+            assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+            assertThat(result.reason()).contains(functionName);
+        }
     }
 
     @Test

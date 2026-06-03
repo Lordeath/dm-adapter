@@ -12,7 +12,7 @@
 - Copy mapper XML files to the source module's `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
 - Generate `application-dm.yml` and point MyBatis mapper locations to `classpath*:mapper-dm/**/*.xml`.
 - Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, and simple `LIMIT` pagination.
-- Mark `DATE_FORMAT`, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, `GROUP_CONCAT`, `FIND_IN_SET`, and backtick-quoted identifiers for manual review.
+- Mark `DATE_FORMAT`, `GROUP_CONCAT`, `FIND_IN_SET`, JSON functions, time calculation/conversion functions, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, and backtick-quoted identifiers for manual review.
 - Write Markdown and JSON reports under `.dm-adapter/`.
 
 ## Quick Start

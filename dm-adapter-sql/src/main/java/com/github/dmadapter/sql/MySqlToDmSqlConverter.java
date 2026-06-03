@@ -16,6 +16,30 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern DATE_FORMAT_PATTERN = Pattern.compile("\\bDATE_FORMAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern GROUP_CONCAT_PATTERN = Pattern.compile("\\bGROUP_CONCAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern FIND_IN_SET_PATTERN = Pattern.compile("\\bFIND_IN_SET\\s*\\(", Pattern.CASE_INSENSITIVE);
+    private static final List<String> MYSQL_FUNCTIONS_REQUIRING_REVIEW = List.of(
+            "DATE_ADD",
+            "DATE_SUB",
+            "STR_TO_DATE",
+            "UNIX_TIMESTAMP",
+            "FROM_UNIXTIME",
+            "TIMESTAMPDIFF",
+            "CONCAT_WS",
+            "JSON_ARRAY",
+            "JSON_CONTAINS",
+            "JSON_EXTRACT",
+            "JSON_INSERT",
+            "JSON_KEYS",
+            "JSON_LENGTH",
+            "JSON_OBJECT",
+            "JSON_QUOTE",
+            "JSON_REMOVE",
+            "JSON_REPLACE",
+            "JSON_SEARCH",
+            "JSON_SET",
+            "JSON_TYPE",
+            "JSON_UNQUOTE",
+            "JSON_VALID"
+    );
     private static final Pattern LIMIT_COMMA_PATTERN = Pattern.compile(
             "(?is)^(?<base>.+?)\\s+LIMIT\\s+(?<offset>" + TOKEN + ")\\s*,\\s*(?<size>" + TOKEN + ")\\s*;?\\s*$");
     private static final Pattern LIMIT_OFFSET_PATTERN = Pattern.compile(
@@ -88,8 +112,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (FIND_IN_SET_PATTERN.matcher(sql).find()) {
             return "FIND_IN_SET requires manual confirmation because it is MySQL-specific.";
         }
+        String mysqlFunction = firstMySqlFunctionRequiringReview(sql);
+        if (!mysqlFunction.isBlank()) {
+            return mysqlFunction + " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
+        }
         if (sql.contains("`")) {
-            return "Backtick quoted identifiers require manual confirmation before converting to Dameng quoting rules.";
+            return "Backtick quoted identifiers require manual confirmation. Consider Dameng double-quoted identifiers only after verifying object-name case sensitivity and reserved words.";
+        }
+        return "";
+    }
+
+    private String firstMySqlFunctionRequiringReview(String sql) {
+        for (String functionName : MYSQL_FUNCTIONS_REQUIRING_REVIEW) {
+            Pattern pattern = Pattern.compile("\\b" + Pattern.quote(functionName) + "\\s*\\(", Pattern.CASE_INSENSITIVE);
+            if (pattern.matcher(sql).find()) {
+                return functionName;
+            }
         }
         return "";
     }

@@ -12,7 +12,7 @@
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
 - 生成 `application-dm.yml`，将 MyBatis mapper 指向 `classpath*:mapper-dm/**/*.xml`。
 - 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页。
-- 将 `DATE_FORMAT`、`ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、`GROUP_CONCAT`、`FIND_IN_SET`、反引号标识符等标记为人工确认。
+- 将 `DATE_FORMAT`、`GROUP_CONCAT`、`FIND_IN_SET`、JSON 函数、时间计算/转换函数、`ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、反引号标识符等标记为人工确认。
 - 输出 Markdown 和 JSON 报告到 `.dm-adapter/`。
 
 ## 快速开始

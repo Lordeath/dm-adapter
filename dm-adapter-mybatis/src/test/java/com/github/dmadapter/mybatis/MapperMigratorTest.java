@@ -230,6 +230,33 @@ class MapperMigratorTest {
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
 
+    @Test
+    void mysqlSpecificFunctionIsMarkedForManualReview() throws Exception {
+        Path mapper = writeMapper(
+                "src/main/resources/mapper/UserMapper.xml",
+                "select JSON_EXTRACT(profile, '$.name') from user"
+        );
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(true).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("JSON_EXTRACT");
+    }
+
     private Path writeMapper(String relativePath, String sql) throws Exception {
         Path mapper = tempDir.resolve(relativePath);
         Files.createDirectories(mapper.getParent());
