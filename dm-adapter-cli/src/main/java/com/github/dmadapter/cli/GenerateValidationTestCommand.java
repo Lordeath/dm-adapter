@@ -24,12 +24,15 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
     @Option(names = "--config", description = "Validation config path. Defaults to <project>/.dm-adapter/sql-validation.yml.")
     private Path config;
 
+    @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods.")
+    private String schema;
+
     private final DmSqlValidationTestGenerator generator = new DmSqlValidationTestGenerator();
 
     @Override
     public Integer call() {
         try {
-            ValidationTestGenerationResult result = generator.generate(project, appModule, mapperDir, config);
+            ValidationTestGenerationResult result = generator.generate(project, appModule, mapperDir, config, schema);
             System.out.println("Dameng SQL validation test generation completed.");
             System.out.println("Config: " + result.configPath());
             System.out.println("Test: " + result.testPath());

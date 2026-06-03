@@ -67,13 +67,16 @@ class DmAdapterCliTest {
         int exitCode = new CommandLine(new DmAdapterCli()).execute(
                 "generate-validation-test",
                 "--project",
-                tempDir.toString()
+                tempDir.toString(),
+                "--schema",
+                "sample-system"
         );
 
         Path config = tempDir.resolve(".dm-adapter/sql-validation.yml");
         Path test = tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java");
         assertThat(exitCode).isZero();
         assertThat(Files.readString(config))
+                .contains("schema: \"sample-system\"")
                 .contains("methods:")
                 .contains("excludedMethods:")
                 .contains("com.example.UserMapper.selectUsers")
@@ -84,7 +87,9 @@ class DmAdapterCliTest {
                 .contains("@ActiveProfiles(\"dm\")")
                 .contains("@Tag(\"dm-sql-validation\")")
                 .contains("@EnabledIfEnvironmentVariable")
-                .contains("PlatformTransactionManager");
+                .contains("PlatformTransactionManager")
+                .contains("set schema")
+                .contains("quotedIdentifier(config.schema)");
     }
 
     @Test

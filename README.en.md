@@ -25,7 +25,7 @@ mvn -pl dm-adapter-cli -am package
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 ```
 
 The generated SQL validation test does not connect to the database during ordinary `mvn test` runs. Run it explicitly in the Dameng test environment, for example:
@@ -34,7 +34,7 @@ The generated SQL validation test does not connect to the database during ordina
 DM_SQL_VALIDATION=true mvn -Dtest=DmSqlValidationTest test
 ```
 
-The test uses the target project's `dm` Spring profile datasource configuration and writes `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`.
+The test uses the target project's `dm` Spring profile datasource configuration. When `--schema` is configured, the test executes `set schema "<schema>"` before each DAO invocation, which supports quoted schema names such as `sample-system`. Results are written to `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`.
 
 ## Module Layout
 

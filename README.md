@@ -25,7 +25,7 @@ mvn -pl dm-adapter-cli -am package
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 ```
 
 生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。需要在达梦测试环境显式运行，例如：
@@ -34,7 +34,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-valid
 DM_SQL_VALIDATION=true mvn -Dtest=DmSqlValidationTest test
 ```
 
-测试使用目标项目的 `dm` Spring profile 数据源配置，执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`。
+测试使用目标项目的 `dm` Spring profile 数据源配置。配置 `--schema` 后，测试会在每次 DAO 调用前执行 `set schema "<schema>"`，可支持 `sample-system` 这类需要双引号的 schema 名。执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`。
 
 ## 模块结构
 
