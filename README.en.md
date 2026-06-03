@@ -37,7 +37,7 @@ DM_DB_PASSWORD=password \
 mvn -Dtest=DmSqlValidationTest test
 ```
 
-The test creates a MyBatis `SqlSessionFactory` directly from the `datasource` environment-variable placeholders in `.dm-adapter/sql-validation.yml`; it does not load the target project's Spring Boot configuration. When `--schema` is configured, the test executes `set schema "<schema>"` before each DAO invocation, which supports quoted schema names such as `sample-system`. Results are written to `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`.
+The test creates a MyBatis `SqlSessionFactory` directly from the `datasource` environment-variable placeholders in `.dm-adapter/sql-validation.yml`; it does not load the target project's Spring Boot configuration. When `--schema` is configured, the test executes `set schema "<schema>"` before each DAO invocation, which supports quoted schema names such as `sample-system`. Runtime progress is printed with the `[dm-sql-validation]` prefix, including mapper XML loading, the current mapper method, and passed/failed/skipped results. Results are written to `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`.
 
 ## Module Layout
 

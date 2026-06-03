@@ -37,7 +37,7 @@ DM_DB_PASSWORD=password \
 mvn -Dtest=DmSqlValidationTest test
 ```
 
-测试直接用 `.dm-adapter/sql-validation.yml` 中的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。配置 `--schema` 后，测试会在每次 DAO 调用前执行 `set schema "<schema>"`，可支持 `sample-system` 这类需要双引号的 schema 名。执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`。
+测试直接用 `.dm-adapter/sql-validation.yml` 中的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。配置 `--schema` 后，测试会在每次 DAO 调用前执行 `set schema "<schema>"`，可支持 `sample-system` 这类需要双引号的 schema 名。运行时控制台会输出 `[dm-sql-validation]` 前缀的进度日志，包括 mapper XML 加载数量、当前执行的 mapper 方法和通过/失败/跳过结果。执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`。
 
 ## 模块结构
 

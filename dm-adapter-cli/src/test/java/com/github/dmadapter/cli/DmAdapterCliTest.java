@@ -106,6 +106,8 @@ class DmAdapterCliTest {
                 .contains("@EnabledIfEnvironmentVariable")
                 .contains("SqlSessionFactory")
                 .contains("UnpooledDataSource")
+                .contains("[dm-sql-validation]")
+                .contains("logProgress(index, total, record")
                 .contains("set schema")
                 .contains("quotedIdentifier(config.schema)")
                 .doesNotContain("@SpringBootTest")

@@ -416,39 +416,71 @@ class DmSqlValidationTestGenerator {
                 @Test
                 void validateMappedDaoSql() throws Exception {
                     Path projectRoot = findProjectRoot();
-                    ValidationConfig config = ValidationConfig.load(projectRoot.resolve(CONFIG_PATH));
+                    Path configPath = projectRoot.resolve(CONFIG_PATH);
+                    log("Started. Project root: " + projectRoot);
+                    log("Loading config: " + configPath);
+                    ValidationConfig config = ValidationConfig.load(configPath);
                     List<ValidationRecord> records = new ArrayList<>();
 
                     try {
+                        log("Resolving mapper XML locations...");
                         List<Path> mapperXmlFiles = mapperXmlFiles(projectRoot, config);
+                        log("Matched mapper XML files: " + mapperXmlFiles.size());
                         if (mapperXmlFiles.isEmpty()) {
                             records.add(ValidationRecord.failed("(discovery)", "configuration",
                                     "No mapper XML files matched mapperXmlLocations."));
+                            log("FAILED discovery: No mapper XML files matched mapperXmlLocations.");
                         } else {
-                            SqlSessionFactory sqlSessionFactory = buildSqlSessionFactory(config, mapperXmlFiles);
+                            SqlSessionFactory sqlSessionFactory = buildSqlSessionFactory(config, mapperXmlFiles, projectRoot);
                             List<MapperMethod> mapperMethods = mapperMethods(sqlSessionFactory.getConfiguration(), mapperXmlFiles, config);
+                            log("Discovered mapper statements: " + mapperMethods.size());
                             if (mapperMethods.isEmpty()) {
                                 records.add(ValidationRecord.failed("(discovery)", "configuration",
                                         "No mapped statements were found in mapper XML files."));
+                                log("FAILED discovery: No mapped statements were found in mapper XML files.");
                             }
+                            int index = 0;
+                            int total = mapperMethods.size();
                             for (MapperMethod mapperMethod : mapperMethods) {
+                                index++;
                                 if (config.excludes(mapperMethod.key())) {
-                                    records.add(ValidationRecord.skipped(mapperMethod.key(), "excluded", "Excluded by sql-validation.yml."));
+                                    ValidationRecord record = ValidationRecord.skipped(
+                                            mapperMethod.key(),
+                                            "excluded",
+                                            "Excluded by sql-validation.yml."
+                                    );
+                                    records.add(record);
+                                    logProgress(index, total, record, 0L);
                                     continue;
                                 }
                                 ParameterResolution parameters = resolveParameters(mapperMethod, config);
                                 if (!parameters.resolved) {
-                                    records.add(ValidationRecord.skipped(mapperMethod.key(), parameters.source, parameters.message));
+                                    ValidationRecord record = ValidationRecord.skipped(mapperMethod.key(), parameters.source, parameters.message);
+                                    records.add(record);
+                                    logProgress(index, total, record, 0L);
                                     continue;
                                 }
-                                records.add(invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config));
+                                log("RUN [" + index + "/" + total + "] " + mapperMethod.key()
+                                        + " params=" + parameters.source);
+                                long startedAt = System.currentTimeMillis();
+                                ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
+                                records.add(record);
+                                logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                             }
                         }
                     } catch (Throwable e) {
-                        records.add(ValidationRecord.failed("(bootstrap)", "configuration", throwableSummary(e)));
+                        ValidationRecord record = ValidationRecord.failed("(bootstrap)", "configuration", throwableSummary(e));
+                        records.add(record);
+                        log("FAILED bootstrap: " + record.message);
                     }
 
+                    log("Writing reports...");
                     writeReports(projectRoot, records);
+                    log("Finished. Passed: " + count(records, "PASSED")
+                            + ", Failed: " + count(records, "FAILED")
+                            + ", Skipped: " + count(records, "SKIPPED"));
+                    log("Markdown report: " + projectRoot.resolve(MARKDOWN_REPORT));
+                    log("JSON report: " + projectRoot.resolve(JSON_REPORT));
                     List<ValidationRecord> failed = records.stream()
                             .filter(record -> "FAILED".equals(record.status))
                             .collect(Collectors.toList());
@@ -458,19 +490,32 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
-                private SqlSessionFactory buildSqlSessionFactory(ValidationConfig config, List<Path> mapperXmlFiles) {
+                private SqlSessionFactory buildSqlSessionFactory(
+                        ValidationConfig config,
+                        List<Path> mapperXmlFiles,
+                        Path projectRoot
+                ) {
+                    log("Building MyBatis SqlSessionFactory...");
                     Configuration configuration = new Configuration(new Environment(
                             "dm-validation",
                             new JdbcTransactionFactory(),
                             dataSource(config)
                     ));
                     for (String packageName : config.typeAliasesPackages) {
-                        configuration.getTypeAliasRegistry().registerAliases(resolvePlaceholders(packageName));
+                        String resolvedPackage = resolvePlaceholders(packageName);
+                        log("Registering type aliases package: " + resolvedPackage);
+                        configuration.getTypeAliasRegistry().registerAliases(resolvedPackage);
                     }
                     for (String packageName : config.typeHandlersPackages) {
-                        configuration.getTypeHandlerRegistry().register(resolvePlaceholders(packageName));
+                        String resolvedPackage = resolvePlaceholders(packageName);
+                        log("Registering type handlers package: " + resolvedPackage);
+                        configuration.getTypeHandlerRegistry().register(resolvedPackage);
                     }
+                    int index = 0;
                     for (Path mapperXmlFile : mapperXmlFiles) {
+                        index++;
+                        log("Parsing mapper XML [" + index + "/" + mapperXmlFiles.size() + "]: "
+                                + displayPath(projectRoot, mapperXmlFile));
                         try (InputStream inputStream = Files.newInputStream(mapperXmlFile)) {
                             XMLMapperBuilder xmlMapperBuilder = new XMLMapperBuilder(
                                     inputStream,
@@ -483,6 +528,7 @@ class DmSqlValidationTestGenerator {
                             throw new IllegalStateException("Failed to parse mapper XML: " + mapperXmlFile, e);
                         }
                     }
+                    log("MyBatis SqlSessionFactory ready.");
                     return new SqlSessionFactoryBuilder().build(configuration);
                 }
 
@@ -809,6 +855,8 @@ class DmSqlValidationTestGenerator {
                             sqlSession.rollback(true);
                             return ValidationRecord.failed(mapperMethod.key(), parameters.source, throwableSummary(e));
                         }
+                    } catch (Throwable e) {
+                        return ValidationRecord.failed(mapperMethod.key(), parameters.source, throwableSummary(e));
                     }
                 }
 
@@ -1191,8 +1239,36 @@ class DmSqlValidationTestGenerator {
                             || relativePath.contains("/.git/");
                 }
 
+                private String displayPath(Path projectRoot, Path path) {
+                    Path normalizedRoot = projectRoot.toAbsolutePath().normalize();
+                    Path normalizedPath = path.toAbsolutePath().normalize();
+                    if (normalizedPath.startsWith(normalizedRoot)) {
+                        return normalize(normalizedRoot.relativize(normalizedPath));
+                    }
+                    return normalize(normalizedPath);
+                }
+
                 private String normalize(Path path) {
                     return path.toString().replace('\\\\', '/');
+                }
+
+                private void logProgress(int index, int total, ValidationRecord record, long elapsedMillis) {
+                    String elapsed = elapsedMillis <= 0 ? "" : " (" + elapsedMillis + " ms)";
+                    String message = record.message == null || record.message.isBlank()
+                            ? ""
+                            : ": " + abbreviate(record.message, 240);
+                    log(record.status + " [" + index + "/" + total + "] " + record.key + elapsed + message);
+                }
+
+                private void log(String message) {
+                    System.out.println("[dm-sql-validation] " + message);
+                }
+
+                private String abbreviate(String value, int maxLength) {
+                    if (value == null || value.length() <= maxLength) {
+                        return value;
+                    }
+                    return value.substring(0, maxLength - 3) + "...";
                 }
 
                 private String resolvePlaceholders(String value) {
