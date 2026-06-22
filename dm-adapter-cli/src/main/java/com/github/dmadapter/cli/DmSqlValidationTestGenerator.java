@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -44,15 +45,16 @@ class DmSqlValidationTestGenerator {
         Path normalizedRoot = projectRoot.toAbsolutePath().normalize();
         ApplicationModule applicationModule = applicationModuleSelector.select(normalizedRoot, appModule);
         Path actualConfigPath = resolveProjectPath(normalizedRoot, configPath, DEFAULT_CONFIG_PATH);
-        Path testPath = testPath(applicationModule);
         List<Path> mapperXmlFiles = validationMapperXmlFiles(normalizedRoot, mapperDir);
+        List<String> mapperStatements = discoveredMapperStatements(mapperXmlFiles);
+        GeneratedTestTarget testTarget = generatedTestTarget(applicationModule, mapperStatements);
 
         List<FileChange> fileChanges = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
         writeIfMissing(
                 actualConfigPath,
                 configTemplate(
-                        discoveredMapperStatements(mapperXmlFiles),
+                        mapperStatements,
                         mapperXmlLocationPatterns(normalizedRoot, mapperDir, mapperXmlFiles),
                         schema
                 ),
@@ -60,18 +62,18 @@ class DmSqlValidationTestGenerator {
                 fileChanges,
                 warnings
         );
-        writeIfMissing(
-                testPath,
-                javaTestSource(applicationModule.packageName()),
+        writeGeneratedFile(
+                testTarget.path(),
+                javaTestSource(testTarget.packageName()),
                 "Generate Dameng SQL validation JUnit test",
                 fileChanges,
-                warnings
+                true
         );
         return new ValidationTestGenerationResult(
                 normalizedRoot,
                 applicationModule.moduleRoot(),
                 actualConfigPath,
-                testPath,
+                testTarget.path(),
                 fileChanges,
                 warnings
         );
@@ -87,15 +89,118 @@ class DmSqlValidationTestGenerator {
         return projectRoot.resolve(configuredPath).toAbsolutePath().normalize();
     }
 
-    private Path testPath(ApplicationModule applicationModule) {
-        Path testRoot = applicationModule.moduleRoot().resolve("src/test/java");
-        if (applicationModule.packageName().isBlank()) {
+    private GeneratedTestTarget generatedTestTarget(ApplicationModule applicationModule, List<String> mapperStatements) {
+        Optional<Path> existingTest = existingValidationTest(applicationModule.moduleRoot());
+        if (existingTest.isPresent()) {
+            Path testPath = existingTest.get();
+            return new GeneratedTestTarget(testPath, packageNameFromTestPath(applicationModule.moduleRoot(), testPath));
+        }
+        String packageName = applicationModule.packageName().isBlank()
+                ? inferPackageNameFromMapperStatements(mapperStatements)
+                : applicationModule.packageName();
+        return new GeneratedTestTarget(testPath(applicationModule.moduleRoot(), packageName), packageName);
+    }
+
+    private Optional<Path> existingValidationTest(Path moduleRoot) {
+        Path testRoot = moduleRoot.resolve("src/test/java");
+        if (!Files.isDirectory(testRoot)) {
+            return Optional.empty();
+        }
+        try (Stream<Path> paths = Files.walk(testRoot)) {
+            return paths.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().equals(TEST_CLASS_NAME + ".java"))
+                    .sorted()
+                    .findFirst()
+                    .map(path -> path.toAbsolutePath().normalize());
+        } catch (IOException e) {
+            throw new DmAdapterException("Failed to scan generated validation tests under " + testRoot, e);
+        }
+    }
+
+    private String packageNameFromTestPath(Path moduleRoot, Path testPath) {
+        Path testRoot = moduleRoot.resolve("src/test/java").toAbsolutePath().normalize();
+        Path parent = testPath.toAbsolutePath().normalize().getParent();
+        if (parent == null || !parent.startsWith(testRoot)) {
+            return "";
+        }
+        Path packagePath = testRoot.relativize(parent);
+        String normalizedPackagePath = normalize(packagePath);
+        if (normalizedPackagePath.isBlank()) {
+            return "";
+        }
+        return normalizedPackagePath.replace('/', '.');
+    }
+
+    private Path testPath(Path moduleRoot, String packageName) {
+        Path testRoot = moduleRoot.resolve("src/test/java");
+        if (packageName == null || packageName.isBlank()) {
             return testRoot.resolve(TEST_CLASS_NAME + ".java").toAbsolutePath().normalize();
         }
-        return testRoot.resolve(applicationModule.packageName().replace('.', '/'))
+        return testRoot.resolve(packageName.replace('.', '/'))
                 .resolve(TEST_CLASS_NAME + ".java")
                 .toAbsolutePath()
                 .normalize();
+    }
+
+    private String inferPackageNameFromMapperStatements(List<String> mapperStatements) {
+        List<String> mapperPackages = mapperStatements.stream()
+                .map(this::mapperPackageName)
+                .filter(packageName -> !packageName.isBlank())
+                .distinct()
+                .toList();
+        if (mapperPackages.isEmpty()) {
+            return "";
+        }
+        return trimMapperPackageSuffix(commonPackagePrefix(mapperPackages));
+    }
+
+    private String mapperPackageName(String mapperStatement) {
+        int methodSeparator = mapperStatement.lastIndexOf('.');
+        if (methodSeparator <= 0) {
+            return "";
+        }
+        String namespace = mapperStatement.substring(0, methodSeparator);
+        int classSeparator = namespace.lastIndexOf('.');
+        if (classSeparator <= 0) {
+            return "";
+        }
+        return namespace.substring(0, classSeparator);
+    }
+
+    private String commonPackagePrefix(List<String> packageNames) {
+        String[] common = packageNames.get(0).split("\\.");
+        int commonLength = common.length;
+        for (String packageName : packageNames.subList(1, packageNames.size())) {
+            String[] parts = packageName.split("\\.");
+            int index = 0;
+            while (index < commonLength && index < parts.length && common[index].equals(parts[index])) {
+                index++;
+            }
+            commonLength = index;
+            if (commonLength == 0) {
+                return packageNames.get(0);
+            }
+        }
+        return String.join(".", List.of(common).subList(0, commonLength));
+    }
+
+    private String trimMapperPackageSuffix(String packageName) {
+        int separator = packageName.lastIndexOf('.');
+        if (separator <= 0) {
+            return packageName;
+        }
+        String suffix = packageName.substring(separator + 1);
+        if ("dao".equals(suffix)
+                || "mapper".equals(suffix)
+                || "mappers".equals(suffix)
+                || "repository".equals(suffix)
+                || "repositories".equals(suffix)) {
+            return packageName.substring(0, separator);
+        }
+        return packageName;
+    }
+
+    private record GeneratedTestTarget(Path path, String packageName) {
     }
 
     private void writeIfMissing(
@@ -115,6 +220,41 @@ class DmSqlValidationTestGenerator {
             fileChanges.add(FileChange.applied(path.toString(), "CREATE", description));
         } catch (IOException e) {
             throw new DmAdapterException("Failed to write generated file: " + path, e);
+        }
+    }
+
+    private void writeGeneratedFile(
+            Path path,
+            String content,
+            String description,
+            List<FileChange> fileChanges,
+            boolean overwrite
+    ) {
+        try {
+            if (Files.exists(path)) {
+                if (!overwrite) {
+                    return;
+                }
+                if (hasSameContent(path, content)) {
+                    return;
+                }
+                Files.writeString(path, content, StandardCharsets.UTF_8);
+                fileChanges.add(FileChange.applied(path.toString(), "UPDATE", description));
+                return;
+            }
+            Files.createDirectories(path.getParent());
+            Files.writeString(path, content, StandardCharsets.UTF_8);
+            fileChanges.add(FileChange.applied(path.toString(), "CREATE", description));
+        } catch (IOException e) {
+            throw new DmAdapterException("Failed to write generated file: " + path, e);
+        }
+    }
+
+    private boolean hasSameContent(Path path, String content) {
+        try {
+            return Files.readString(path, StandardCharsets.UTF_8).equals(content);
+        } catch (IOException e) {
+            return false;
         }
     }
 
@@ -1893,6 +2033,9 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("information_schema") || lower.contains("database()")) {
                         return "MYSQL_METADATA_SQL";
                     }
+                    if (isSchemaObjectFailure(lower)) {
+                        return "TEST_SCHEMA_OBJECT";
+                    }
                     if (Pattern.compile("insert\\\\s+ignore\\\\s+into", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "INSERT_IGNORE";
                     }
@@ -1960,12 +2103,6 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("parameter '") && lower.contains("not found")) {
                         return "BINDING_PARAMETER_NAME";
                     }
-                    if (lower.contains("无效的表或视图名")
-                            || lower.contains("无效的列名")
-                            || lower.contains("无效的模式名")
-                            || lower.contains("无法解析的成员访问表达式")) {
-                        return "TEST_SCHEMA_OBJECT";
-                    }
                     if (containsAny(message,
                             "非空约束",
                             "违反列[",
@@ -1978,12 +2115,27 @@ class DmSqlValidationTestGenerator {
                     return category(record) + "_OTHER";
                 }
 
+                private boolean isSchemaObjectFailure(String lowerMessage) {
+                    return lowerMessage.contains("无效的表或视图名")
+                            || lowerMessage.contains("无效的列名")
+                            || lowerMessage.contains("无效的模式名")
+                            || lowerMessage.contains("无法解析的成员访问表达式");
+                }
+
                 private boolean hasJsonTableJoinWithoutCondition(String message) {
                     Pattern pattern = Pattern.compile(
-                            "\\\\b(?:inner\\\\s+)?join\\\\s+json_table\\\\s*\\\\([\\\\s\\\\S]*?\\\\)\\\\s+(?:as\\\\s+)?[A-Za-z_][A-Za-z0-9_$]*\\\\s*(?:where|group\\\\s+by|order\\\\s+by|having|limit|fetch|union|$)",
+                            "\\\\b(?<join>(?:inner\\\\s+)?join)\\\\s+json_table\\\\s*\\\\([\\\\s\\\\S]*?\\\\)\\\\s+(?:as\\\\s+)?[A-Za-z_][A-Za-z0-9_$]*\\\\s*(?:where|group\\\\s+by|order\\\\s+by|having|limit|fetch|union|$)",
                             Pattern.CASE_INSENSITIVE
                     );
-                    return pattern.matcher(message).find();
+                    Matcher matcher = pattern.matcher(message);
+                    while (matcher.find()) {
+                        int joinStart = matcher.start("join");
+                        String prefix = message.substring(Math.max(0, joinStart - 24), joinStart).toLowerCase(Locale.ROOT);
+                        if (!Pattern.compile("(?:^|\\\\b)(cross|left|right|full|natural)\\\\s*$").matcher(prefix).find()) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
 
                 private boolean isAutoParameter(ValidationRecord record) {

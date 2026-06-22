@@ -361,6 +361,8 @@ class DmAdapterCliTest {
                 .contains("MYSQL_CONVERT_UNSIGNED")
                 .contains("MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")
                 .contains("hasJsonTableJoinWithoutCondition")
+                .contains("isSchemaObjectFailure")
+                .contains("matcher.start(\"join\")")
                 .contains("MYSQL_JSON_SQL")
                 .contains("BROKEN_DYNAMIC_SQL_OR_ARGS")
                 .contains("optionalSecret(resolvePlaceholders(config.datasource.password), \"datasource.password\")")
@@ -371,6 +373,33 @@ class DmAdapterCliTest {
                 .doesNotContain("@ActiveProfiles")
                 .doesNotContain("PlatformTransactionManager")
                 .doesNotContain("RabbitTemplate");
+    }
+
+    @Test
+    void generateValidationTestUpdatesExistingGeneratedTestButKeepsExistingConfig() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+        Path config = tempDir.resolve(".dm-adapter/sql-validation.yml");
+        Path test = tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java");
+        Files.createDirectories(config.getParent());
+        Files.createDirectories(test.getParent());
+        Files.writeString(config, "schema: \"custom\"\n");
+        Files.writeString(test, "stale generated test");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString(),
+                "--schema",
+                "sample-system"
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(config)).isEqualTo("schema: \"custom\"\n");
+        assertThat(Files.readString(test))
+                .contains("package com.example;")
+                .contains("@Tag(\"dm-sql-validation\")")
+                .doesNotContain("stale generated test");
     }
 
     @Test
@@ -451,6 +480,69 @@ class DmAdapterCliTest {
         assertThat(Files.exists(tempDir.resolve(".dm-adapter/sql-validation.yml"))).isTrue();
         assertThat(Files.exists(tempDir.resolve("sample-system-rest/src/test/java/com/example/DmSqlValidationTest.java"))).isTrue();
         assertThat(Files.exists(tempDir.resolve("another-rest/src/test/java/com/example/DmSqlValidationTest.java"))).isFalse();
+    }
+
+    @Test
+    void generateValidationTestInfersPackageFromMapperNamespaceForExplicitModuleWithoutApplicationClass() throws Exception {
+        Files.writeString(tempDir.resolve("pom.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>sample-root</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                    <packaging>pom</packaging>
+                </project>
+                """);
+        Path modulePom = tempDir.resolve("sample-system-rest/pom.xml");
+        Files.createDirectories(modulePom.getParent());
+        Files.writeString(modulePom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>sample-system-rest</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                </project>
+                """);
+        Path controller = tempDir.resolve("sample-system-rest/src/main/java/com/example/hr/controller/UserController.java");
+        Path service = tempDir.resolve("sample-system-rest/src/main/java/com/example/hr/service/UserService.java");
+        Path binarySource = tempDir.resolve("sample-system-rest/src/main/java/com/example/hr/HrApp.java");
+        Path mapper = tempDir.resolve("sample-system-rest/src/main/resources/mapper-dm/UserMapper.xml");
+        Files.createDirectories(controller.getParent());
+        Files.createDirectories(service.getParent());
+        Files.createDirectories(binarySource.getParent());
+        Files.createDirectories(mapper.getParent());
+        Files.write(binarySource, new byte[] {0, 1, 2, 3, 4, 5});
+        Files.writeString(controller, "package com.example.hr.controller;\npublic class UserController {}\n");
+        Files.writeString(service, "package com.example.hr.service;\npublic class UserService {}\n");
+        Files.writeString(mapper, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.hr.dao.UserMapper">
+                    <select id="selectUsers">
+                        select id from users
+                    </select>
+                </mapper>
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString(),
+                "--app-module",
+                "sample-system-rest"
+        );
+
+        assertThat(exitCode).isZero();
+        Path generatedTest = tempDir.resolve("sample-system-rest/src/test/java/com/example/hr/DmSqlValidationTest.java");
+        assertThat(Files.exists(generatedTest)).isTrue();
+        assertThat(Files.readString(generatedTest)).contains("package com.example.hr;");
     }
 
     private void writeDemoProject() throws Exception {

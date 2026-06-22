@@ -109,6 +109,18 @@ class ValidationTestRunner {
 
         List<String> command = mavenCommand(generationResult);
         Path workingDirectory = workingDirectory(generationResult);
+        Path markdownReport = validationMarkdownReport(generationResult.projectRoot());
+        try {
+            deleteStaleValidationReports(generationResult.projectRoot());
+        } catch (IOException e) {
+            return new ValidationTestRunResult(
+                    true,
+                    1,
+                    null,
+                    List.of("Failed to remove stale validation report: " + e.getMessage()),
+                    "Failed to prepare validation report files: " + e.getMessage()
+            );
+        }
         ProcessBuilder processBuilder = new ProcessBuilder(command)
                 .directory(workingDirectory.toFile())
                 .redirectErrorStream(true);
@@ -129,7 +141,7 @@ class ValidationTestRunner {
             return new ValidationTestRunResult(
                     true,
                     exitCode,
-                    generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
+                    existingReportPath(markdownReport),
                     runDiagnostics(command, workingDirectory, mavenOutput, environment, generationResult.projectRoot()),
                     exitCode == 0
                             ? "Dameng SQL validation test passed."
@@ -151,7 +163,7 @@ class ValidationTestRunner {
             return new ValidationTestRunResult(
                     true,
                     1,
-                    generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
+                    existingReportPath(markdownReport),
                     diagnostics,
                     message
             );
@@ -160,7 +172,7 @@ class ValidationTestRunner {
             return new ValidationTestRunResult(
                     true,
                     1,
-                    generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
+                    existingReportPath(markdownReport),
                     runDiagnostics(
                             command,
                             workingDirectory,
@@ -175,7 +187,7 @@ class ValidationTestRunner {
             return new ValidationTestRunResult(
                     true,
                     1,
-                    generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
+                    existingReportPath(markdownReport),
                     runDiagnostics(command, workingDirectory, "", environment, generationResult.projectRoot()),
                     "Maven validation test was interrupted."
             );
@@ -185,6 +197,19 @@ class ValidationTestRunner {
                 destroyProcessTree(process);
             }
         }
+    }
+
+    private void deleteStaleValidationReports(Path projectRoot) throws IOException {
+        Files.deleteIfExists(validationMarkdownReport(projectRoot));
+        Files.deleteIfExists(projectRoot.resolve(".dm-adapter/sql-validation-report.json"));
+    }
+
+    private Path validationMarkdownReport(Path projectRoot) {
+        return projectRoot.resolve(".dm-adapter/sql-validation-report.md");
+    }
+
+    private Path existingReportPath(Path reportPath) {
+        return Files.isRegularFile(reportPath) ? reportPath : null;
     }
 
     List<String> mavenCommand(ValidationTestGenerationResult generationResult) {
@@ -311,7 +336,7 @@ class ValidationTestRunner {
     }
 
     private List<String> validationReportSummary(Path projectRoot) {
-        Path report = projectRoot.resolve(".dm-adapter/sql-validation-report.md");
+        Path report = validationMarkdownReport(projectRoot);
         if (!Files.isRegularFile(report)) {
             return List.of();
         }

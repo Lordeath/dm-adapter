@@ -145,8 +145,7 @@ class ValidationTestRunnerTest {
 
     @Test
     void includesValidationReportSummaryInRunOutput() throws IOException {
-        Files.createDirectories(tempDir.resolve(".dm-adapter"));
-        Files.writeString(tempDir.resolve(".dm-adapter/sql-validation-report.md"), """
+        String reportContent = """
                 # Dameng SQL Validation Report
 
                 - Passed: `790`
@@ -180,11 +179,18 @@ class ValidationTestRunnerTest {
                 | Column | Count |
                 | --- | ---: |
                 | user_name | 70 |
-                """);
+                """;
         ValidationTestRunner runner = new ValidationTestRunner(
                 Map.of(),
                 "Linux",
-                processBuilder -> processWithOutput("maven output\n", 1),
+                processBuilder -> processWithOutput("maven output\n", 1, () -> {
+                    try {
+                        Files.createDirectories(tempDir.resolve(".dm-adapter"));
+                        Files.writeString(tempDir.resolve(".dm-adapter/sql-validation-report.md"), reportContent);
+                    } catch (IOException e) {
+                        throw new AssertionError(e);
+                    }
+                }),
                 new RecordingShutdownHookRegistry()
         );
 
@@ -216,6 +222,41 @@ class ValidationTestRunnerTest {
                         "Missing Columns:",
                         "- user_name: 70"
                 );
+    }
+
+    @Test
+    void removesStaleValidationReportBeforeRunningMaven() throws IOException {
+        Files.createDirectories(tempDir.resolve(".dm-adapter"));
+        Path staleReport = tempDir.resolve(".dm-adapter/sql-validation-report.md");
+        Files.writeString(staleReport, """
+                # Dameng SQL Validation Report
+
+                - Passed: `1`
+                - Failed: `2`
+                - Skipped: `3`
+                """);
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> processWithOutput("pom failure\n", 1),
+                new RecordingShutdownHookRegistry()
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(Files.exists(staleReport)).isFalse();
+        assertThat(result.reportPath()).isNull();
+        assertThat(result.outputTail())
+                .noneSatisfy(line -> assertThat(line).contains("Validation report summary"))
+                .anySatisfy(line -> assertThat(line).contains("pom failure"));
     }
 
     @Test
@@ -319,6 +360,10 @@ class ValidationTestRunnerTest {
         return new RecordingProcess(output, exitCode, false);
     }
 
+    private static Process processWithOutput(String output, int exitCode, Runnable beforeExit) {
+        return new RecordingProcess(output, exitCode, false, beforeExit);
+    }
+
     private static class RecordingShutdownHookRegistry implements ValidationTestRunner.ShutdownHookRegistry {
         private Thread addedHook;
         private Thread removedHook;
@@ -417,13 +462,21 @@ class ValidationTestRunnerTest {
         private final byte[] bytes;
         private final int exitCode;
         private final boolean interruptOnWait;
+        private final Runnable beforeExit;
         private boolean alive = true;
         private int destroyForciblyCount;
 
         private RecordingProcess(String output, int exitCode, boolean interruptOnWait) {
+            this(output, exitCode, interruptOnWait, () -> {
+            });
+        }
+
+        private RecordingProcess(String output, int exitCode, boolean interruptOnWait, Runnable beforeExit) {
             this.bytes = output.getBytes(StandardCharsets.UTF_8);
             this.exitCode = exitCode;
             this.interruptOnWait = interruptOnWait;
+            this.beforeExit = beforeExit == null ? () -> {
+            } : beforeExit;
         }
 
         @Override
@@ -446,6 +499,7 @@ class ValidationTestRunnerTest {
             if (interruptOnWait) {
                 throw new InterruptedException("interrupted");
             }
+            beforeExit.run();
             alive = false;
             return exitCode;
         }

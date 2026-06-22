@@ -3,7 +3,6 @@ package com.github.dmadapter.cli;
 import com.github.dmadapter.core.DmAdapterException;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -48,12 +47,7 @@ class ApplicationModuleSelector {
         if (!Files.isRegularFile(pomPath)) {
             throw new DmAdapterException("Application module does not contain pom.xml: " + moduleRoot);
         }
-        List<Path> applicationClasses = findApplicationClasses(moduleRoot);
-        if (applicationClasses.isEmpty()) {
-            throw new DmAdapterException("No Spring Boot application class was found in module: " + moduleRoot);
-        }
-        Path applicationClass = applicationClasses.get(0);
-        return new ApplicationModule(moduleRoot, pomPath, applicationClass, packageName(applicationClass));
+        return new ApplicationModule(moduleRoot, pomPath, null, "");
     }
 
     private List<ApplicationModule> discoverApplicationModules(Path projectRoot) {
@@ -115,7 +109,7 @@ class ApplicationModuleSelector {
 
     private boolean looksLikeSpringBootApplication(Path javaFile) {
         try {
-            String content = Files.readString(javaFile, StandardCharsets.UTF_8);
+            String content = asciiView(Files.readAllBytes(javaFile));
             return content.contains("@SpringBootApplication") || content.contains("SpringApplication.run(");
         } catch (IOException e) {
             return false;
@@ -124,14 +118,30 @@ class ApplicationModuleSelector {
 
     private String packageName(Path javaFile) {
         try {
-            Matcher matcher = PACKAGE_PATTERN.matcher(Files.readString(javaFile, StandardCharsets.UTF_8));
+            Matcher matcher = PACKAGE_PATTERN.matcher(asciiView(Files.readAllBytes(javaFile)));
             if (matcher.find()) {
                 return matcher.group(1);
             }
             return "";
         } catch (IOException e) {
-            throw new DmAdapterException("Failed to read application class: " + javaFile, e);
+            throw new DmAdapterException("Failed to read Java source file: " + javaFile, e);
         }
+    }
+
+    private String asciiView(byte[] bytes) {
+        StringBuilder content = new StringBuilder(bytes.length);
+        for (byte sourceByte : bytes) {
+            int value = sourceByte & 0xff;
+            if (value == 0) {
+                continue;
+            }
+            if (value == '\t' || value == '\n' || value == '\r' || (value >= 32 && value <= 126)) {
+                content.append((char) value);
+            } else {
+                content.append(' ');
+            }
+        }
+        return content.toString();
     }
 
     private boolean isBuildOrGitPath(Path root, Path path) {
