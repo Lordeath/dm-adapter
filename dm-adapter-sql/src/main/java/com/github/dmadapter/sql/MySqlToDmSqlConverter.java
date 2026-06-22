@@ -24,6 +24,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
+    public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
+            "MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
@@ -62,10 +64,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "FROM_UNIXTIME",
             "TIMESTAMPDIFF",
             "CONCAT_WS",
-            "JSON_ARRAY",
-            "JSON_TABLE",
             "JSON_CONTAINS",
-            "JSON_EXTRACT",
             "JSON_INSERT",
             "JSON_KEYS",
             "JSON_LENGTH",
@@ -76,8 +75,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "JSON_SEARCH",
             "JSON_SET",
             "JSON_TYPE",
-            "JSON_UNQUOTE",
-            "JSON_VALID"
+            "JSON_UNQUOTE"
     );
     private static final Set<String> DAMENG_KEYWORDS_REQUIRING_QUOTES = Set.of(
             "ADD",
@@ -222,6 +220,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (tableAliasAsConversion.changed()) {
             converted = tableAliasAsConversion.convertedSql();
             rules.add(MYSQL_TABLE_ALIAS_AS_RULE);
+        }
+
+        GenericConversion jsonTableJoinConversion = convertJsonTableJoinWithoutCondition(converted);
+        if (jsonTableJoinConversion.changed()) {
+            converted = jsonTableJoinConversion.convertedSql();
+            rules.add(MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE);
         }
 
         UpdateSetTableOrderConversion updateSetTableOrderConversion = convertUpdateSetTableOrder(converted);
@@ -949,6 +953,95 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return false;
         }
         return findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length()) >= 0;
+    }
+
+    private GenericConversion convertJsonTableJoinWithoutCondition(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "JOIN")) {
+                JsonTableJoin join = readJsonTableJoinWithoutCondition(sql, index);
+                if (join == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, join.rewriteStartIndex());
+                    converted.append("CROSS JOIN");
+                    lastCopiedIndex = index + "JOIN".length();
+                    index = join.joinSourceEndIndex();
+                    changed = true;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private JsonTableJoin readJsonTableJoinWithoutCondition(String sql, int joinIndex) {
+        int rewriteStart = jsonTableJoinRewriteStart(sql, joinIndex);
+        if (rewriteStart < 0) {
+            return null;
+        }
+        int jsonTableStart = skipWhitespace(sql, joinIndex + "JOIN".length());
+        FunctionCall jsonTableCall = readFunctionCall(sql, jsonTableStart, "JSON_TABLE");
+        if (jsonTableCall == null) {
+            return null;
+        }
+        int sourceEnd = readOptionalTableAliasEnd(sql, jsonTableCall.endIndex());
+        int afterSource = skipWhitespace(sql, sourceEnd);
+        if (startsKeyword(sql, afterSource, "ON") || startsKeyword(sql, afterSource, "USING")) {
+            return null;
+        }
+        return new JsonTableJoin(rewriteStart, sourceEnd);
+    }
+
+    private int jsonTableJoinRewriteStart(String sql, int joinIndex) {
+        WordToken word = previousWord(sql, joinIndex);
+        if (word == null || !isOnlyWhitespace(sql, word.endIndex(), joinIndex)) {
+            return joinIndex;
+        }
+        String upper = word.text().toUpperCase(Locale.ROOT);
+        if ("INNER".equals(upper)) {
+            return word.startIndex();
+        }
+        if (Set.of("LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER").contains(upper)) {
+            return -1;
+        }
+        return joinIndex;
+    }
+
+    private int readOptionalTableAliasEnd(String sql, int relationEnd) {
+        int aliasStart = skipWhitespace(sql, relationEnd);
+        if (startsKeyword(sql, aliasStart, "AS")) {
+            int afterAs = skipWhitespace(sql, aliasStart + "AS".length());
+            IdentifierToken alias = readIdentifierToken(sql, afterAs);
+            if (alias != null && !isSqlClauseKeyword(alias.text())) {
+                return alias.endIndex();
+            }
+            return relationEnd;
+        }
+        IdentifierToken alias = readIdentifierToken(sql, aliasStart);
+        if (alias != null && !isSqlClauseKeyword(alias.text())) {
+            return alias.endIndex();
+        }
+        return relationEnd;
     }
 
     private int joinTypeStart(String sql, int joinIndex) {
@@ -2383,6 +2476,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record RegexpExpression(int startIndex, int endIndex, String replacement) {
+    }
+
+    private record JsonTableJoin(int rewriteStartIndex, int joinSourceEndIndex) {
     }
 
     private record WordToken(int startIndex, int endIndex, String text) {

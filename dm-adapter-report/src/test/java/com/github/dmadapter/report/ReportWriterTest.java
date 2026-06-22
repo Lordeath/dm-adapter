@@ -30,11 +30,11 @@ class ReportWriterTest {
         SqlChange manualReviewItem = new SqlChange(
                 "mapper/UserMapper.xml",
                 "selectUsers",
-                "select JSON_EXTRACT(profile, '$.name') from user",
-                "select JSON_EXTRACT(profile, '$.name') from user",
+                "select JSON_SET(profile, '$.name', #{name}) from user",
+                "select JSON_SET(profile, '$.name', #{name}) from user",
                 List.of(),
                 true,
-                "JSON_EXTRACT requires manual confirmation because Dameng support or syntax may differ from MySQL."
+                "JSON_SET requires manual confirmation because Dameng support or syntax may differ from MySQL."
         );
         MigrationReport report = new MigrationReport(
                 tempDir.toString(),
@@ -54,7 +54,7 @@ class ReportWriterTest {
         assertThat(Files.readString(reportPaths.markdownPath()))
                 .contains("Manual Review SQL Items")
                 .contains("mapper/UserMapper.xml")
-                .contains("JSON_EXTRACT requires manual confirmation");
+                .contains("JSON_SET requires manual confirmation");
     }
 
     @Test
