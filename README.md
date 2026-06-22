@@ -15,6 +15,14 @@
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类和 `.dm-adapter/sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean。
 - 输出 Markdown 和 JSON 报告到 `.dm-adapter/`。
 
+## 达梦特殊列名重写注意事项
+
+达梦中的 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_STARTTIME`、`VERSIONS_ENDTIME`、`VERSIONS_STARTTRXID`、`VERSIONS_ENDTRXID`、`VERSIONS_OPERATION` 属于伪列或特殊列名，业务表字段迁移到达梦时应改名。`migrate` 重写 mapper XML 时会把 SQL 中这些裸标识符追加下划线，例如 `rowid` -> `rowid_`、`trxid` -> `trxid_`。
+
+该规则是大小写不敏感的，但只处理 SQL 裸标识符；字符串常量、SQL 注释、`#{rowid}` / `${trxid}` 这类 MyBatis 参数占位符会保持原样，避免误改 Java 参数名和文本内容。
+
+达梦普通关键字/保留字不会做全量自动重命名。原因是 `SELECT`、`FROM`、`WHERE`、`ORDER`、`LIMIT` 等词同时也是 SQL 语法的一部分，盲目替换会破坏语句。若业务表字段命中普通保留字，应结合实际表结构采用改字段名、双引号标识符、连接串/客户端 `KEYWORDS` 配置或人工确认报告处理。
+
 ## 快速开始
 
 ```bash

@@ -15,6 +15,14 @@
 - Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project, without starting Spring Boot, ShardingSphere, MQ, or web beans.
 - Write Markdown and JSON reports under `.dm-adapter/`.
 
+## Dameng Special Column Rewrite Notes
+
+Dameng treats `ROWID`, `ROWNUM`, `TRXID`, `PHYROWID`, `VERSIONS_STARTTIME`, `VERSIONS_ENDTIME`, `VERSIONS_STARTTRXID`, `VERSIONS_ENDTRXID`, and `VERSIONS_OPERATION` as pseudo columns or special column names. Business table columns with these names should be renamed during migration. When `migrate` rewrites mapper XML, it suffixes matching bare SQL identifiers with an underscore, for example `rowid` -> `rowid_` and `trxid` -> `trxid_`.
+
+The rule is case-insensitive, but it only handles bare SQL identifiers. String literals, SQL comments, and MyBatis parameter placeholders such as `#{rowid}` / `${trxid}` are preserved to avoid changing Java parameter names or text values.
+
+Other ordinary Dameng keywords or reserved words are not renamed globally. Terms such as `SELECT`, `FROM`, `WHERE`, `ORDER`, and `LIMIT` are also SQL syntax, so blind replacement would break valid statements. If a business column conflicts with an ordinary reserved word, handle it according to the target schema by renaming the column, using quoted identifiers, configuring connection/client `KEYWORDS`, or reviewing the generated manual-confirmation report.
+
 ## Quick Start
 
 ```bash
