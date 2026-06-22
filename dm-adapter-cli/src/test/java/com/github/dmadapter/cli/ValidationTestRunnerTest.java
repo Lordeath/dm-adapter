@@ -68,10 +68,12 @@ class ValidationTestRunnerTest {
 
     @Test
     void includesMavenCommandAndWorkingDirectoryInRunOutput() {
+        RecordingShutdownHookRegistry shutdownHooks = new RecordingShutdownHookRegistry();
         ValidationTestRunner runner = new ValidationTestRunner(
                 Map.of(),
                 "Linux",
-                processBuilder -> processWithOutput("maven output\n", 1)
+                processBuilder -> processWithOutput("maven output\n", 1),
+                shutdownHooks
         );
 
         ValidationTestRunResult result = runner.runIfConfigured(
@@ -91,6 +93,59 @@ class ValidationTestRunnerTest {
                         .contains("-Dsurefire.failIfNoSpecifiedTests=false"))
                 .anySatisfy(line -> assertThat(line).contains("Working directory: " + tempDir))
                 .anySatisfy(line -> assertThat(line).contains("maven output"));
+        assertThat(shutdownHooks.addedHook).isSameAs(shutdownHooks.removedHook);
+    }
+
+    @Test
+    void shutdownHookDestroysMavenProcess() {
+        RecordingShutdownHookRegistry shutdownHooks = new RecordingShutdownHookRegistry();
+        shutdownHooks.runHookWhenAdded = true;
+        RecordingProcess process = new RecordingProcess("maven output\n", 143, false);
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> process,
+                shutdownHooks
+        );
+
+        runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(process.destroyForciblyCount).isEqualTo(1);
+    }
+
+    @Test
+    void destroysMavenProcessWhenInterrupted() {
+        RecordingShutdownHookRegistry shutdownHooks = new RecordingShutdownHookRegistry();
+        RecordingProcess process = new RecordingProcess("", 1, true);
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> process,
+                shutdownHooks
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(result.message()).contains("interrupted");
+        assertThat(process.destroyForciblyCount).isEqualTo(1);
+        assertThat(shutdownHooks.addedHook).isSameAs(shutdownHooks.removedHook);
+        assertThat(Thread.interrupted()).isTrue();
     }
 
     @Test
@@ -139,36 +194,94 @@ class ValidationTestRunnerTest {
     }
 
     private static Process processWithOutput(String output, int exitCode) {
-        byte[] bytes = output.getBytes(StandardCharsets.UTF_8);
-        return new Process() {
-            @Override
-            public OutputStream getOutputStream() {
-                return OutputStream.nullOutputStream();
-            }
+        return new RecordingProcess(output, exitCode, false);
+    }
 
-            @Override
-            public InputStream getInputStream() {
-                return new ByteArrayInputStream(bytes);
-            }
+    private static class RecordingShutdownHookRegistry implements ValidationTestRunner.ShutdownHookRegistry {
+        private Thread addedHook;
+        private Thread removedHook;
+        private boolean runHookWhenAdded;
 
-            @Override
-            public InputStream getErrorStream() {
-                return InputStream.nullInputStream();
+        @Override
+        public void add(Thread hook) {
+            addedHook = hook;
+            if (runHookWhenAdded) {
+                hook.run();
             }
+        }
 
-            @Override
-            public int waitFor() {
-                return exitCode;
-            }
+        @Override
+        public boolean remove(Thread hook) {
+            removedHook = hook;
+            return true;
+        }
+    }
 
-            @Override
-            public int exitValue() {
-                return exitCode;
-            }
+    private static class RecordingProcess extends Process {
+        private final byte[] bytes;
+        private final int exitCode;
+        private final boolean interruptOnWait;
+        private boolean alive = true;
+        private int destroyForciblyCount;
 
-            @Override
-            public void destroy() {
+        private RecordingProcess(String output, int exitCode, boolean interruptOnWait) {
+            this.bytes = output.getBytes(StandardCharsets.UTF_8);
+            this.exitCode = exitCode;
+            this.interruptOnWait = interruptOnWait;
+        }
+
+        @Override
+        public OutputStream getOutputStream() {
+            return OutputStream.nullOutputStream();
+        }
+
+        @Override
+        public InputStream getInputStream() {
+            return new ByteArrayInputStream(bytes);
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            return InputStream.nullInputStream();
+        }
+
+        @Override
+        public int waitFor() throws InterruptedException {
+            if (interruptOnWait) {
+                throw new InterruptedException("interrupted");
             }
-        };
+            alive = false;
+            return exitCode;
+        }
+
+        @Override
+        public int exitValue() {
+            if (alive) {
+                throw new IllegalThreadStateException();
+            }
+            return exitCode;
+        }
+
+        @Override
+        public void destroy() {
+            alive = false;
+        }
+
+        @Override
+        public Process destroyForcibly() {
+            destroyForciblyCount++;
+            alive = false;
+            return this;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return alive;
+        }
+
+        @Override
+        public ProcessHandle toHandle() {
+            throw new UnsupportedOperationException("test process has no handle");
+        }
     }
 }

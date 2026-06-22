@@ -19,12 +19,22 @@ class ValidationTestRunner {
     private final Map<String, String> processEnvironment;
     private final String osName;
     private final ProcessStarter processStarter;
+    private final ShutdownHookRegistry shutdownHookRegistry;
 
     ValidationTestRunner() {
         this(System.getenv(), System.getProperty("os.name", ""), ProcessBuilder::start);
     }
 
     ValidationTestRunner(Map<String, String> processEnvironment, String osName, ProcessStarter processStarter) {
+        this(processEnvironment, osName, processStarter, new RuntimeShutdownHookRegistry());
+    }
+
+    ValidationTestRunner(
+            Map<String, String> processEnvironment,
+            String osName,
+            ProcessStarter processStarter,
+            ShutdownHookRegistry shutdownHookRegistry
+    ) {
         this.processEnvironment = Map.copyOf(processEnvironment == null ? Map.of() : processEnvironment);
         this.osName = osName == null ? "" : osName;
         if (processStarter == null) {
@@ -32,11 +42,34 @@ class ValidationTestRunner {
         } else {
             this.processStarter = processStarter;
         }
+        if (shutdownHookRegistry == null) {
+            this.shutdownHookRegistry = new RuntimeShutdownHookRegistry();
+        } else {
+            this.shutdownHookRegistry = shutdownHookRegistry;
+        }
     }
 
     @FunctionalInterface
     interface ProcessStarter {
         Process start(ProcessBuilder processBuilder) throws IOException;
+    }
+
+    interface ShutdownHookRegistry {
+        void add(Thread hook);
+
+        boolean remove(Thread hook);
+    }
+
+    private static class RuntimeShutdownHookRegistry implements ShutdownHookRegistry {
+        @Override
+        public void add(Thread hook) {
+            Runtime.getRuntime().addShutdownHook(hook);
+        }
+
+        @Override
+        public boolean remove(Thread hook) {
+            return Runtime.getRuntime().removeShutdownHook(hook);
+        }
     }
 
     ValidationTestRunResult runIfConfigured(
@@ -56,10 +89,15 @@ class ValidationTestRunner {
         ProcessBuilder processBuilder = new ProcessBuilder(command)
                 .directory(workingDirectory.toFile())
                 .redirectErrorStream(true);
+        Process process = null;
+        Thread shutdownHook = null;
+        boolean completed = false;
         try {
-            Process process = processStarter.start(processBuilder);
+            process = processStarter.start(processBuilder);
+            shutdownHook = registerShutdownHook(process);
             String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             int exitCode = process.waitFor();
+            completed = true;
             return new ValidationTestRunResult(
                     true,
                     exitCode,
@@ -70,13 +108,18 @@ class ValidationTestRunner {
                             : "Dameng SQL validation test exited with code " + exitCode + "."
             );
         } catch (IOException e) {
-            List<String> diagnostics = startFailureDiagnostics(generationResult, command, workingDirectory, e);
+            List<String> diagnostics = process == null
+                    ? startFailureDiagnostics(generationResult, command, workingDirectory, e)
+                    : runDiagnostics(command, workingDirectory, e.getClass().getSimpleName() + ": " + e.getMessage(), environment);
+            String message = process == null
+                    ? "Failed to start Maven validation test: " + e.getMessage()
+                    : "Failed to read Maven validation output: " + e.getMessage();
             return new ValidationTestRunResult(
                     true,
                     1,
                     generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
                     diagnostics,
-                    "Failed to start Maven validation test: " + e.getMessage()
+                    message
             );
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -87,6 +130,11 @@ class ValidationTestRunner {
                     runDiagnostics(command, workingDirectory, "", environment),
                     "Maven validation test was interrupted."
             );
+        } finally {
+            removeShutdownHook(shutdownHook);
+            if (!completed && process != null && process.isAlive()) {
+                destroyProcessTree(process);
+            }
         }
     }
 
@@ -104,6 +152,66 @@ class ValidationTestRunner {
         command.add("-Dsurefire.failIfNoSpecifiedTests=false");
         command.add("test");
         return command;
+    }
+
+    private Thread registerShutdownHook(Process process) {
+        Thread hook = new Thread(() -> destroyProcessTree(process), "dm-adapter-maven-validation-shutdown");
+        try {
+            shutdownHookRegistry.add(hook);
+            return hook;
+        } catch (IllegalStateException e) {
+            destroyProcessTree(process);
+            return null;
+        }
+    }
+
+    private void removeShutdownHook(Thread shutdownHook) {
+        if (shutdownHook == null) {
+            return;
+        }
+        try {
+            shutdownHookRegistry.remove(shutdownHook);
+        } catch (IllegalStateException e) {
+            // JVM shutdown is already in progress; the hook will handle process cleanup.
+        }
+    }
+
+    private void destroyProcessTree(Process process) {
+        try {
+            ProcessHandle handle = process.toHandle();
+            List<ProcessHandle> processes = new ArrayList<>(handle.descendants().toList());
+            processes.add(handle);
+            destroyProcessHandles(processes, false);
+            destroyProcessHandles(processes, true);
+        } catch (RuntimeException e) {
+            destroyProcess(process);
+        }
+    }
+
+    private void destroyProcessHandles(List<ProcessHandle> processes, boolean forcibly) {
+        for (int i = processes.size() - 1; i >= 0; i--) {
+            ProcessHandle process = processes.get(i);
+            try {
+                if (!process.isAlive()) {
+                    continue;
+                }
+                if (forcibly) {
+                    process.destroyForcibly();
+                } else {
+                    process.destroy();
+                }
+            } catch (RuntimeException e) {
+                // Continue killing the rest of the Maven process tree.
+            }
+        }
+    }
+
+    private void destroyProcess(Process process) {
+        try {
+            process.destroyForcibly();
+        } catch (RuntimeException e) {
+            // Nothing else can be done if the JVM cannot destroy this process.
+        }
     }
 
     private List<String> runDiagnostics(
