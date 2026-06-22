@@ -485,19 +485,22 @@ class DmSqlValidationTestGenerator {
                                     logProgress(index, total, record, 0L);
                                     continue;
                                 }
-                                ParameterResolution parameters = resolveParameters(mapperMethod, config);
-                                if (!parameters.resolved) {
-                                    ValidationRecord record = ValidationRecord.skipped(mapperMethod.key(), parameters.source, parameters.message);
+                                List<ParameterResolution> parameterVariants = resolveParameterVariants(mapperMethod, config);
+                                for (ParameterResolution parameters : parameterVariants) {
+                                    String recordKey = parameters.recordKey(mapperMethod.key());
+                                    if (!parameters.resolved) {
+                                        ValidationRecord record = ValidationRecord.skipped(recordKey, parameters.source, parameters.message);
+                                        records.add(record);
+                                        logProgress(index, total, record, 0L);
+                                        continue;
+                                    }
+                                    log("RUN [" + index + "/" + total + "] " + recordKey
+                                            + " params=" + parameters.source);
+                                    long startedAt = System.currentTimeMillis();
+                                    ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
                                     records.add(record);
-                                    logProgress(index, total, record, 0L);
-                                    continue;
+                                    logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                                 }
-                                log("RUN [" + index + "/" + total + "] " + mapperMethod.key()
-                                        + " params=" + parameters.source);
-                                long startedAt = System.currentTimeMillis();
-                                ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
-                                records.add(record);
-                                logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                             }
                         }
                     } catch (Throwable e) {
@@ -776,7 +779,7 @@ class DmSqlValidationTestGenerator {
                             if (node instanceof Element element && isStatementElement(element)) {
                                 String id = element.getAttribute("id");
                                 if (id != null && !id.isBlank()) {
-                                    statements.add(new MapperStatement(namespace, id));
+                                    statements.add(new MapperStatement(namespace, id, setBranchParameterVariants(element)));
                                 }
                             }
                         }
@@ -793,18 +796,76 @@ class DmSqlValidationTestGenerator {
                             || "delete".equals(element.getTagName());
                 }
 
-                private ParameterResolution resolveParameters(MapperMethod mapperMethod, ValidationConfig config) {
+                private List<SetBranchParameterVariant> setBranchParameterVariants(Element statement) {
+                    if (!"update".equals(statement.getTagName())) {
+                        return List.of();
+                    }
+                    Map<String, BranchCollector> collectors = new LinkedHashMap<>();
+                    collectSetBranchParameterVariants(statement, collectors);
+                    return collectors.values().stream()
+                            .filter(BranchCollector::valid)
+                            .max(Comparator.comparingInt(BranchCollector::size))
+                            .map(BranchCollector::variants)
+                            .orElse(List.of());
+                }
+
+                private void collectSetBranchParameterVariants(Element element, Map<String, BranchCollector> collectors) {
+                    if ("if".equals(element.getTagName())) {
+                        BranchCondition condition = branchCondition(element.getAttribute("test"));
+                        if (condition != null) {
+                            BranchCollector collector = collectors.computeIfAbsent(
+                                    condition.parameterName,
+                                    BranchCollector::new
+                            );
+                            collector.add(condition.literal, startsWithSet(element.getTextContent()));
+                        }
+                    }
+                    NodeList children = element.getChildNodes();
+                    for (int i = 0; i < children.getLength(); i++) {
+                        if (children.item(i) instanceof Element child) {
+                            collectSetBranchParameterVariants(child, collectors);
+                        }
+                    }
+                }
+
+                private BranchCondition branchCondition(String test) {
+                    if (test == null || test.isBlank()) {
+                        return null;
+                    }
+                    Matcher leftLiteral = Pattern.compile(
+                            "^\\\\s*'([^']+)'\\\\s*==\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*$"
+                    ).matcher(test);
+                    if (leftLiteral.matches()) {
+                        return new BranchCondition(leftLiteral.group(2), leftLiteral.group(1));
+                    }
+                    Matcher rightLiteral = Pattern.compile(
+                            "^\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*==\\\\s*'([^']+)'\\\\s*$"
+                    ).matcher(test);
+                    if (rightLiteral.matches()) {
+                        return new BranchCondition(rightLiteral.group(1), rightLiteral.group(2));
+                    }
+                    return null;
+                }
+
+                private boolean startsWithSet(String text) {
+                    return text != null && text.stripLeading().toLowerCase(Locale.ROOT).startsWith("set ");
+                }
+
+                private List<ParameterResolution> resolveParameterVariants(MapperMethod mapperMethod, ValidationConfig config) {
                     List<String> configuredArgs = config.methodArgs.get(mapperMethod.key());
                     if (mapperMethod.isUnmapped()) {
-                        return ParameterResolution.unresolved("configuration", "Mapped statement was not registered by MyBatis.");
+                        return List.of(ParameterResolution.unresolved("configuration", "Mapped statement was not registered by MyBatis."));
                     }
                     if (mapperMethod.method != null) {
                         if (configuredArgs != null) {
-                            return configuredParameters(mapperMethod, configuredArgs);
+                            return List.of(configuredParameters(mapperMethod, configuredArgs));
                         }
-                        return generatedParameters(mapperMethod);
+                        ParameterResolution parameters = generatedParameters(mapperMethod);
+                        return parameters.resolved
+                                ? setBranchParameterVariants(mapperMethod, parameters)
+                                : List.of(parameters);
                     }
-                    return statementParameters(mapperMethod, configuredArgs);
+                    return List.of(statementParameters(mapperMethod, configuredArgs));
                 }
 
                 private ParameterResolution configuredParameters(MapperMethod mapperMethod, List<String> configuredArgs) {
@@ -839,6 +900,42 @@ class DmSqlValidationTestGenerator {
                         args[i] = value.value;
                     }
                     return ParameterResolution.resolved("auto", args);
+                }
+
+                private List<ParameterResolution> setBranchParameterVariants(
+                        MapperMethod mapperMethod,
+                        ParameterResolution baseParameters
+                ) {
+                    if (mapperMethod.statement.setBranchParameterVariants.isEmpty()) {
+                        return List.of(baseParameters);
+                    }
+                    List<ParameterResolution> variants = new ArrayList<>();
+                    Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
+                    Type[] genericTypes = mapperMethod.method.getGenericParameterTypes();
+                    for (SetBranchParameterVariant variant : mapperMethod.statement.setBranchParameterVariants) {
+                        int parameterIndex = parameterIndex(mapperMethod.method, variant.parameterName);
+                        if (parameterIndex < 0) {
+                            continue;
+                        }
+                        ValueResult value = convertScalar(variant.literal, parameterTypes[parameterIndex], genericTypes[parameterIndex]);
+                        if (!value.resolved) {
+                            continue;
+                        }
+                        Object[] args = baseParameters.args.clone();
+                        args[parameterIndex] = value.value;
+                        String label = variant.parameterName + "=" + variant.literal;
+                        variants.add(ParameterResolution.resolved(baseParameters.source + ":" + label, args, label));
+                    }
+                    return variants.isEmpty() ? List.of(baseParameters) : variants;
+                }
+
+                private int parameterIndex(Method method, String parameterName) {
+                    for (int i = 0; i < method.getParameterCount(); i++) {
+                        if (parameterName(method, i).equals(parameterName)) {
+                            return i;
+                        }
+                    }
+                    return -1;
                 }
 
                 private String parameterName(Method method, int index) {
@@ -897,16 +994,16 @@ class DmSqlValidationTestGenerator {
                                     ? invokeMappedStatement(sqlSession, mapperMethod, parameters.args.length == 0 ? null : parameters.args[0])
                                     : invokeReflectively(sqlSession, mapperMethod, parameters.args);
                             sqlSession.rollback(true);
-                            return ValidationRecord.passed(mapperMethod.key(), parameters.source, resultSummary(result));
+                            return ValidationRecord.passed(parameters.recordKey(mapperMethod.key()), parameters.source, resultSummary(result));
                         } catch (MapperInvocationException e) {
                             sqlSession.rollback(true);
-                            return ValidationRecord.failed(mapperMethod.key(), parameters.source, throwableSummary(e.getCause()));
+                            return ValidationRecord.failed(parameters.recordKey(mapperMethod.key()), parameters.source, throwableSummary(e.getCause()));
                         } catch (Throwable e) {
                             sqlSession.rollback(true);
-                            return ValidationRecord.failed(mapperMethod.key(), parameters.source, throwableSummary(e));
+                            return ValidationRecord.failed(parameters.recordKey(mapperMethod.key()), parameters.source, throwableSummary(e));
                         }
                     } catch (Throwable e) {
-                        return ValidationRecord.failed(mapperMethod.key(), parameters.source, throwableSummary(e));
+                        return ValidationRecord.failed(parameters.recordKey(mapperMethod.key()), parameters.source, throwableSummary(e));
                     }
                 }
 
@@ -2316,14 +2413,67 @@ class DmSqlValidationTestGenerator {
                 private static final class MapperStatement {
                     private final String namespace;
                     private final String id;
+                    private final List<SetBranchParameterVariant> setBranchParameterVariants;
 
-                    private MapperStatement(String namespace, String id) {
+                    private MapperStatement(String namespace, String id, List<SetBranchParameterVariant> setBranchParameterVariants) {
                         this.namespace = namespace;
                         this.id = id;
+                        this.setBranchParameterVariants = List.copyOf(setBranchParameterVariants == null
+                                ? List.of()
+                                : setBranchParameterVariants);
                     }
 
                     private String key() {
                         return namespace + "." + id;
+                    }
+                }
+
+                private static final class BranchCondition {
+                    private final String parameterName;
+                    private final String literal;
+
+                    private BranchCondition(String parameterName, String literal) {
+                        this.parameterName = parameterName;
+                        this.literal = literal;
+                    }
+                }
+
+                private static final class BranchCollector {
+                    private final String parameterName;
+                    private final LinkedHashSet<String> literals = new LinkedHashSet<>();
+                    private boolean valid = true;
+
+                    private BranchCollector(String parameterName) {
+                        this.parameterName = parameterName;
+                    }
+
+                    private void add(String literal, boolean startsWithSet) {
+                        literals.add(literal);
+                        valid = valid && startsWithSet;
+                    }
+
+                    private boolean valid() {
+                        return valid && !literals.isEmpty();
+                    }
+
+                    private int size() {
+                        return literals.size();
+                    }
+
+                    private List<SetBranchParameterVariant> variants() {
+                        return literals.stream()
+                                .map(literal -> new SetBranchParameterVariant(parameterName, literal))
+                                .collect(Collectors.toList());
+                    }
+                }
+
+                private static final class SetBranchParameterVariant {
+                    private final String parameterName;
+                    private final String literal;
+
+                    private SetBranchParameterVariant(String parameterName, String literal) {
+                        this.parameterName = parameterName;
+                        this.literal = literal;
                     }
                 }
 
@@ -2384,20 +2534,30 @@ class DmSqlValidationTestGenerator {
                     private final String source;
                     private final Object[] args;
                     private final String message;
+                    private final String label;
 
-                    private ParameterResolution(boolean resolved, String source, Object[] args, String message) {
+                    private ParameterResolution(boolean resolved, String source, Object[] args, String message, String label) {
                         this.resolved = resolved;
                         this.source = source;
                         this.args = args;
                         this.message = message;
+                        this.label = label == null ? "" : label;
                     }
 
                     static ParameterResolution resolved(String source, Object[] args) {
-                        return new ParameterResolution(true, source, args, "");
+                        return resolved(source, args, "");
+                    }
+
+                    static ParameterResolution resolved(String source, Object[] args, String label) {
+                        return new ParameterResolution(true, source, args, "", label);
                     }
 
                     static ParameterResolution unresolved(String source, String message) {
-                        return new ParameterResolution(false, source, new Object[0], message);
+                        return new ParameterResolution(false, source, new Object[0], message, "");
+                    }
+
+                    private String recordKey(String mapperKey) {
+                        return label.isBlank() ? mapperKey : mapperKey + " [" + label + "]";
                     }
                 }
 
