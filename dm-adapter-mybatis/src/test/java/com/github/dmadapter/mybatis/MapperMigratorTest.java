@@ -11,6 +11,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -180,14 +181,18 @@ class MapperMigratorTest {
         MapperMigrationResult result = new MapperMigrator().migrate(
                 scanResult,
                 AdapterContext.builder(tempDir).dryRun(false).build(),
-                new MySqlToDmSqlConverter()
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.UserMapper.updateExtend", List.of("foreignerKeyId"))
+                )
         );
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
                 .contains("MERGE INTO ns_organization_and_employees_extend t")
                 .contains("ON (t.foreignerKeyId = s.foreignerKeyId)")
-                .contains("WHEN MATCHED THEN UPDATE SET t.key = s.key")
+                .contains("WHEN MATCHED THEN UPDATE SET t.\"key\" = s.\"key\"")
                 .doesNotContain("ON DUPLICATE KEY UPDATE");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
@@ -386,7 +391,11 @@ class MapperMigratorTest {
         MapperMigrationResult result = new MapperMigrator().migrate(
                 scanResult,
                 AdapterContext.builder(tempDir).dryRun(false).build(),
-                new MySqlToDmSqlConverter()
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.UserMapper.updateExtend", List.of("foreignerKeyId"))
+                )
         );
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));

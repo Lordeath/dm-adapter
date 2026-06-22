@@ -1604,11 +1604,21 @@ class DmSqlValidationTestGenerator {
                             "UPDATE_SET_TABLE_ORDER",
                             "TRAILING_COMMA",
                             "INSERT_FOREACH_MISSING_VALUES",
-                            "MYSQL_UPDATE_JOIN")) {
+                            "MYSQL_UPDATE_JOIN",
+                            "MYSQL_DATE_ADD_INTERVAL",
+                            "MYSQL_CONVERT_UNSIGNED")) {
                         markdown.append("- Re-run dm-adapter migrate and then this validation test; these patterns have strict automatic mapper-dm rewrites.\\n");
+                    }
+                    if (containsAnyPattern(countsByPattern,
+                            "ON_DUPLICATE_KEY_UPDATE",
+                            "INSERT_IGNORE")) {
+                        markdown.append("- Fill .dm-adapter/sql-rewrite.yml keyColumns for ON DUPLICATE KEY UPDATE / INSERT IGNORE rewrites, rerun migrate, and validate again.\\n");
                     }
                     if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")) {
                         markdown.append("- Align the Dameng test schema for missing tables, views, columns, or object-name differences before treating these as SQL rewrite failures.\\n");
+                    }
+                    if (countsByPattern.containsKey("BROKEN_DYNAMIC_SQL_OR_ARGS")) {
+                        markdown.append("- Inspect the mapper dynamic SQL branch and generated sample args; failures such as missing commas, empty conditions, or illegal dynamic placeholders are usually mapper-shape or validation-argument issues.\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "NULL_COLLECTION_PARAMETER",
@@ -1621,15 +1631,13 @@ class DmSqlValidationTestGenerator {
                         markdown.append("- Configure method args in sql-validation.yml, or inspect mapper @Param names when XML parameter names differ from Java method parameters.\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
-                            "ON_DUPLICATE_KEY_UPDATE",
-                            "INSERT_IGNORE",
                             "MYSQL_GROUP_CONCAT",
-                            "MYSQL_FIND_IN_SET",
                             "MYSQL_CONCAT_WS",
+                            "MYSQL_JSON_SQL",
                             "REGEXP_OPERATOR",
                             "MYSQL_METADATA_SQL",
                             "SQL_SYNTAX_OTHER")) {
-                        markdown.append("- Manually review complex SQL patterns such as ON DUPLICATE KEY UPDATE, REGEXP, MySQL metadata queries, and other uncategorized Dameng syntax failures.\\n");
+                        markdown.append("- Manually review complex SQL patterns such as GROUP_CONCAT, JSON SQL, REGEXP, MySQL metadata queries, and other uncategorized Dameng syntax failures.\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "TEST_DATA_OR_CONSTRAINT",
@@ -1775,11 +1783,18 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("\\\\bgroup_concat\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_GROUP_CONCAT";
                     }
-                    if (Pattern.compile("\\\\bfind_in_set\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
-                        return "MYSQL_FIND_IN_SET";
-                    }
                     if (Pattern.compile("\\\\bconcat_ws\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_CONCAT_WS";
+                    }
+                    if (Pattern.compile("\\\\bdate_add\\\\s*\\\\([\\\\s\\\\S]*?\\\\binterval\\\\s+[^,)]*\\\\s+(year|month|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_DATE_ADD_INTERVAL";
+                    }
+                    if (Pattern.compile("\\\\bconvert\\\\s*\\\\([\\\\s\\\\S]*?\\\\bunsigned\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_CONVERT_UNSIGNED";
+                    }
+                    if (Pattern.compile("\\\\bjson_(?:array|contains|extract|insert|keys|length|object|quote|remove|replace|search|set|table|type|unquote|valid)\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("\\\\bcast\\\\s*\\\\([\\\\s\\\\S]*?\\\\s+as\\\\s+json\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_JSON_SQL";
                     }
                     if (Pattern.compile("\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bjoin\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_UPDATE_JOIN";
@@ -1798,6 +1813,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Pattern.compile("order\\\\s+by\\\\s+test(?:\\\\s+test)?", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "GENERATED_ORDER_PARAMETER";
+                    }
+                    if (Pattern.compile("(?i)(\\\\band\\\\s*\\\\(\\\\s*\\\\)|,\\\\s*where\\\\b|\\\\bwhere\\\\s+and\\\\b|\\\\bset\\\\s+where\\\\b|\\\\?\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\s*=)").matcher(message).find()) {
+                        return "BROKEN_DYNAMIC_SQL_OR_ARGS";
                     }
                     if (Pattern.compile("update\\\\s+set\\\\s+[a-z_][a-z0-9_]*", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "UPDATE_SET_TABLE_ORDER";
