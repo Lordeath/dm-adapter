@@ -1696,7 +1696,8 @@ class DmSqlValidationTestGenerator {
                             "INSERT_FOREACH_MISSING_VALUES",
                             "MYSQL_UPDATE_JOIN",
                             "MYSQL_DATE_ADD_INTERVAL",
-                            "MYSQL_CONVERT_UNSIGNED")) {
+                            "MYSQL_CONVERT_UNSIGNED",
+                            "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")) {
                         markdown.append("- Re-run dm-adapter migrate and then this validation test; these patterns have strict automatic mapper-dm rewrites.\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
@@ -1907,6 +1908,9 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("\\\\bconvert\\\\s*\\\\([\\\\s\\\\S]*?\\\\bunsigned\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_CONVERT_UNSIGNED";
                     }
+                    if (hasJsonTableJoinWithoutCondition(message)) {
+                        return "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON";
+                    }
                     if (Pattern.compile("\\\\bjson_(?:array|contains|extract|insert|keys|length|object|quote|remove|replace|search|set|table|type|unquote|valid)\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bcast\\\\s*\\\\([\\\\s\\\\S]*?\\\\s+as\\\\s+json\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_JSON_SQL";
@@ -1972,6 +1976,14 @@ class DmSqlValidationTestGenerator {
                         return "TEST_DATA_OR_CONSTRAINT";
                     }
                     return category(record) + "_OTHER";
+                }
+
+                private boolean hasJsonTableJoinWithoutCondition(String message) {
+                    Pattern pattern = Pattern.compile(
+                            "\\\\b(?:inner\\\\s+)?join\\\\s+json_table\\\\s*\\\\([\\\\s\\\\S]*?\\\\)\\\\s+(?:as\\\\s+)?[A-Za-z_][A-Za-z0-9_$]*\\\\s*(?:where|group\\\\s+by|order\\\\s+by|having|limit|fetch|union|$)",
+                            Pattern.CASE_INSENSITIVE
+                    );
+                    return pattern.matcher(message).find();
                 }
 
                 private boolean isAutoParameter(ValidationRecord record) {

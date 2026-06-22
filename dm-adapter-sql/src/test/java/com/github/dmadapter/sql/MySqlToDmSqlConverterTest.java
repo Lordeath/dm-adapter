@@ -219,14 +219,14 @@ class MySqlToDmSqlConverterTest {
     @Test
     void keepsSafeConversionsWhenRemainingSqlNeedsManualReview() {
         SqlConversionResult result = converter.convert(
-                "select `user`, JSON_EXTRACT(payload, '$.name') from audit_log limit 1"
+                "select `user`, JSON_SET(payload, '$.name', 'x') from audit_log limit 1"
         );
 
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select \"user\", JSON_EXTRACT(payload, '$.name') from audit_log FETCH FIRST 1 ROWS ONLY");
-        assertThat(result.reason()).contains("JSON_EXTRACT");
+                .isEqualTo("select \"user\", JSON_SET(payload, '$.name', 'x') from audit_log FETCH FIRST 1 ROWS ONLY");
+        assertThat(result.reason()).contains("JSON_SET");
         assertThat(result.appliedRules())
                 .containsExactly(
                         MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
@@ -495,6 +495,129 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsJsonTableInnerJoinWithoutConditionToCrossJoin() {
+        SqlConversionResult result = converter.convert("""
+                select w.id, jt.salaryId, jt.money
+                from ns_user_salary_temp_wide w
+                inner join JSON_TABLE(
+                    case when JSON_VALID(w.salaryDetailJson) then cast(w.salaryDetailJson as json) else JSON_ARRAY() end,
+                    '$[*]' columns (
+                        salaryId bigint path '$.salaryId',
+                        money decimal(18,2) path '$.money'
+                    )
+                ) jt
+                where w.createUserId = #{createUserId}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select w.id, jt.salaryId, jt.money
+                from ns_user_salary_temp_wide w
+                CROSS JOIN JSON_TABLE(
+                    case when JSON_VALID(w.salaryDetailJson) then cast(w.salaryDetailJson as json) else JSON_ARRAY() end,
+                    '$[*]' columns (
+                        salaryId bigint path '$.salaryId',
+                        money decimal(18,2) path '$.money'
+                    )
+                ) jt
+                where w.createUserId = #{createUserId}
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE);
+    }
+
+    @Test
+    void convertsBareJsonTableJoinWithoutConditionToCrossJoin() {
+        SqlConversionResult result = converter.convert("""
+                select w.id, jt.salaryId
+                from ns_user_salary_temp_wide w
+                join JSON_TABLE(w.salaryDetailJson, '$[*]' columns (salaryId bigint path '$.salaryId')) jt
+                order by w.id
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).contains(
+                "CROSS JOIN JSON_TABLE(w.salaryDetailJson, '$[*]' columns (salaryId bigint path '$.salaryId')) jt"
+        );
+    }
+
+    @Test
+    void keepsJsonTableJoinThatAlreadyHasCondition() {
+        String sql = """
+                select w.id, jt.salaryId
+                from ns_user_salary_temp_wide w
+                inner join JSON_TABLE(w.salaryDetailJson, '$[*]' columns (salaryId bigint path '$.salaryId')) jt on 1 = 1
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
+    void keepsOuterAndCrossJsonTableJoinsUnchanged() {
+        List<String> sqlItems = List.of(
+                """
+                        select w.id, jt.salaryId
+                        from ns_user_salary_temp_wide w
+                        left join JSON_TABLE(w.salaryDetailJson, '$[*]' columns (salaryId bigint path '$.salaryId')) jt on 1 = 1
+                        """,
+                """
+                        select w.id, jt.salaryId
+                        from ns_user_salary_temp_wide w
+                        cross join JSON_TABLE(w.salaryDetailJson, '$[*]' columns (salaryId bigint path '$.salaryId')) jt
+                        """
+        );
+
+        for (String sql : sqlItems) {
+            SqlConversionResult result = converter.convert(sql);
+
+            assertThat(result.changed()).isFalse();
+            assertThat(result.manualReviewRequired()).isFalse();
+            assertThat(result.convertedSql()).isEqualTo(sql);
+        }
+    }
+
+    @Test
+    void doesNotConvertJsonTableJoinInsideStringsOrComments() {
+        SqlConversionResult result = converter.convert("""
+                select 'inner join JSON_TABLE(profile, ''$[*]'' columns (id int path ''$.id'')) jt' as sample
+                from ns_user_salary_temp_wide w
+                -- inner join JSON_TABLE(profile, '$[*]' columns (id int path '$.id')) jt
+                inner join JSON_TABLE(w.salaryDetailJson, '$[*]' columns (salaryId bigint path '$.salaryId')) jt
+                where w.id = #{id}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("'inner join JSON_TABLE(profile, ''$[*]'' columns (id int path ''$.id'')) jt' as sample")
+                .contains("-- inner join JSON_TABLE(profile, '$[*]' columns (id int path '$.id')) jt")
+                .contains("CROSS JOIN JSON_TABLE(w.salaryDetailJson, '$[*]' columns (salaryId bigint path '$.salaryId')) jt");
+    }
+
+    @Test
+    void verifiedDamengJsonFunctionsDoNotRequireManualReview() {
+        List<String> sqlItems = List.of(
+                "select JSON_VALID(profile) from user_profile",
+                "select JSON_ARRAY(1, 'x') from dual",
+                "select JSON_EXTRACT(profile, '$.name') from user_profile",
+                "select * from JSON_TABLE('[{\"id\":1}]', '$[*]' columns (id int path '$.id')) jt"
+        );
+
+        for (String sql : sqlItems) {
+            SqlConversionResult result = converter.convert(sql);
+
+            assertThat(result.changed()).isFalse();
+            assertThat(result.manualReviewRequired()).isFalse();
+            assertThat(result.convertedSql()).isEqualTo(sql);
+        }
+    }
+
+    @Test
     void marksMySqlSpecificFunctionsForManualReview() {
         List<String> functionNames = List.of(
                 "DATE_SUB",
@@ -503,7 +626,6 @@ class MySqlToDmSqlConverterTest {
                 "FROM_UNIXTIME",
                 "TIMESTAMPDIFF",
                 "CONCAT_WS",
-                "JSON_EXTRACT",
                 "JSON_UNQUOTE",
                 "JSON_SET"
         );

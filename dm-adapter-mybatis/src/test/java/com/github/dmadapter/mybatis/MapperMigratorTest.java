@@ -359,7 +359,7 @@ class MapperMigratorTest {
                 <mapper namespace="com.example.AuditMapper">
                     <select id="selectAudit" resultType="map">
                         <if test="enabled != null">
-                            select `user`, JSON_EXTRACT(payload, '$.name') from audit_log limit 1
+                            select `user`, JSON_SET(payload, '$.name', 'x') from audit_log limit 1
                         </if>
                     </select>
                 </mapper>
@@ -383,7 +383,7 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AuditMapper.xml"));
         assertThat(rewritten)
-                .contains("select \"user\", JSON_EXTRACT(payload, '$.name') from audit_log FETCH FIRST 1 ROWS ONLY");
+                .contains("select \"user\", JSON_SET(payload, '$.name', 'x') from audit_log FETCH FIRST 1 ROWS ONLY");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(
@@ -392,7 +392,7 @@ class MapperMigratorTest {
                 );
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason())
-                .contains("dynamic XML", "JSON_EXTRACT");
+                .contains("dynamic XML", "JSON_SET");
     }
 
     @Test
@@ -875,7 +875,7 @@ class MapperMigratorTest {
     void mysqlSpecificFunctionIsMarkedForManualReview() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",
-                "select JSON_EXTRACT(profile, '$.name') from user"
+                "select JSON_SET(profile, '$.name', #{name}) from user"
         );
         ProjectScanResult scanResult = new ProjectScanResult(
                 true,
@@ -895,7 +895,50 @@ class MapperMigratorTest {
 
         assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("JSON_EXTRACT");
+        assertThat(result.manualReviewItems().get(0).reason()).contains("JSON_SET");
+    }
+
+    @Test
+    void migrationRewritesJsonTableInnerJoinToCrossJoin() throws Exception {
+        Path mapper = writeMapper(
+                "src/main/resources/mapper/SalaryManagementMapper.xml",
+                """
+                        select w.id, jt.salaryId, jt.money
+                        from ns_user_salary_temp_wide w
+                        inner join JSON_TABLE(
+                            case when JSON_VALID(w.salaryDetailJson) then cast(w.salaryDetailJson as json) else JSON_ARRAY() end,
+                            '$[*]' columns (
+                                salaryId bigint path '$.salaryId',
+                                money decimal(18,2) path '$.money'
+                            )
+                        ) jt
+                        where w.createUserId = #{createUserId}
+                        """
+        );
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/SalaryManagementMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/SalaryManagementMapper.xml"));
+        assertThat(rewritten)
+                .contains("CROSS JOIN JSON_TABLE")
+                .doesNotContain("inner join JSON_TABLE");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     private Path writeMapper(String relativePath, String sql) throws Exception {

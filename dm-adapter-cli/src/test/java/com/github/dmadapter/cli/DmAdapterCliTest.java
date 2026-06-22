@@ -359,6 +359,8 @@ class DmAdapterCliTest {
                 .contains("MYSQL_GROUP_CONCAT")
                 .contains("MYSQL_DATE_ADD_INTERVAL")
                 .contains("MYSQL_CONVERT_UNSIGNED")
+                .contains("MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")
+                .contains("hasJsonTableJoinWithoutCondition")
                 .contains("MYSQL_JSON_SQL")
                 .contains("BROKEN_DYNAMIC_SQL_OR_ARGS")
                 .contains("optionalSecret(resolvePlaceholders(config.datasource.password), \"datasource.password\")")
