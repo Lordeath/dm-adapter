@@ -20,6 +20,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
+    public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
+            "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
 
     private static final int DM_AES128_ECB_ALGORITHM_ID = 513;
     private static final String AES_ENCRYPT = "AES_ENCRYPT";
@@ -234,6 +236,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (limitConversion.convertedSql() != null) {
             converted = limitConversion.convertedSql();
             rules.add(limitConversion.ruleName());
+        }
+
+        GenericConversion onDuplicateKeyUpdateConversion = convertOnDuplicateKeyUpdate(converted);
+        if (onDuplicateKeyUpdateConversion.changed()) {
+            converted = onDuplicateKeyUpdateConversion.convertedSql();
+            rules.add(MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
         }
 
         String unsupportedReason = unsupportedReason(converted);
@@ -697,6 +705,311 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return end;
+    }
+
+    private GenericConversion convertOnDuplicateKeyUpdate(String sql) {
+        OnDuplicateKeyInsert insert = readOnDuplicateKeyInsert(sql);
+        if (insert == null) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<UpdateAssignment> updateAssignments = readOnDuplicateKeyUpdateAssignments(insert.updateClause());
+        if (updateAssignments.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        boolean allAssignmentsUseInsertColumns = updateAssignments.stream()
+                .allMatch(assignment -> insert.columns().stream()
+                        .anyMatch(column -> column.name().key().equals(assignment.column().key())));
+        if (!allAssignmentsUseInsertColumns) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<InsertColumn> matchColumns = new ArrayList<>();
+        for (InsertColumn column : insert.columns()) {
+            boolean updated = updateAssignments.stream()
+                    .anyMatch(assignment -> assignment.column().key().equals(column.name().key()));
+            if (!updated) {
+                matchColumns.add(column);
+            }
+        }
+        if (matchColumns.size() != 1) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        StringBuilder converted = new StringBuilder(sql.length() + 128);
+        converted.append(sql, 0, insert.insertIndex());
+        converted.append("MERGE INTO ")
+                .append(insert.tableName())
+                .append(" t\n")
+                .append("USING (\n")
+                .append("    SELECT ");
+        for (int i = 0; i < insert.columns().size(); i++) {
+            InsertColumn column = insert.columns().get(i);
+            if (i > 0) {
+                converted.append(", ");
+            }
+            converted.append(column.value())
+                    .append(" AS ")
+                    .append(column.name().text());
+        }
+        converted.append(" FROM dual\n")
+                .append(") s\n");
+        InsertColumn matchColumn = matchColumns.get(0);
+        converted.append("ON (t.")
+                .append(matchColumn.name().text())
+                .append(" = s.")
+                .append(matchColumn.name().text())
+                .append(")\n")
+                .append("WHEN MATCHED THEN UPDATE SET ");
+        for (int i = 0; i < updateAssignments.size(); i++) {
+            UpdateAssignment assignment = updateAssignments.get(i);
+            if (i > 0) {
+                converted.append(", ");
+            }
+            converted.append("t.")
+                    .append(assignment.column().text())
+                    .append(" = s.")
+                    .append(assignment.sourceColumn().text());
+        }
+        converted.append("\nWHEN NOT MATCHED THEN INSERT (");
+        for (int i = 0; i < insert.columns().size(); i++) {
+            if (i > 0) {
+                converted.append(", ");
+            }
+            converted.append(insert.columns().get(i).name().text());
+        }
+        converted.append(") VALUES (");
+        for (int i = 0; i < insert.columns().size(); i++) {
+            if (i > 0) {
+                converted.append(", ");
+            }
+            converted.append("s.").append(insert.columns().get(i).name().text());
+        }
+        converted.append(")");
+        converted.append(sql.substring(insert.statementEnd()));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private OnDuplicateKeyInsert readOnDuplicateKeyInsert(String sql) {
+        int insertIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, insertIndex, "INSERT")) {
+            return null;
+        }
+        int index = skipWhitespace(sql, insertIndex + "INSERT".length());
+        if (startsKeyword(sql, index, "IGNORE")) {
+            return null;
+        }
+        if (!startsKeyword(sql, index, "INTO")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "INTO".length());
+        int columnOpenIndex = findTopLevelChar(sql, '(', index);
+        if (columnOpenIndex < 0) {
+            return null;
+        }
+        String tableName = sql.substring(index, columnOpenIndex).trim();
+        if (tableName.isBlank() || containsMyBatisPlaceholder(tableName) || containsWhitespaceOutsideQuotedText(tableName)) {
+            return null;
+        }
+        int columnCloseIndex = findMatchingParen(sql, columnOpenIndex);
+        if (columnCloseIndex < 0) {
+            return null;
+        }
+
+        List<IdentifierName> columnNames = readInsertColumns(sql.substring(columnOpenIndex + 1, columnCloseIndex));
+        if (columnNames.isEmpty()) {
+            return null;
+        }
+
+        index = skipWhitespace(sql, columnCloseIndex + 1);
+        if (!startsKeyword(sql, index, "VALUES")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "VALUES".length());
+        if (index >= sql.length() || sql.charAt(index) != '(') {
+            return null;
+        }
+        int valuesCloseIndex = findMatchingParen(sql, index);
+        if (valuesCloseIndex < 0) {
+            return null;
+        }
+        List<TopLevelArgument> values = splitTopLevelArguments(sql.substring(index + 1, valuesCloseIndex));
+        if (values.size() != columnNames.size()) {
+            return null;
+        }
+
+        index = skipWhitespace(sql, valuesCloseIndex + 1);
+        if (!startsKeyword(sql, index, "ON")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "ON".length());
+        if (!startsKeyword(sql, index, "DUPLICATE")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "DUPLICATE".length());
+        if (!startsKeyword(sql, index, "KEY")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "KEY".length());
+        if (!startsKeyword(sql, index, "UPDATE")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "UPDATE".length());
+
+        int statementEnd = stripTrailingSemicolon(sql);
+        if (index >= statementEnd) {
+            return null;
+        }
+
+        List<InsertColumn> columns = new ArrayList<>();
+        for (int i = 0; i < columnNames.size(); i++) {
+            String value = values.get(i).text().trim();
+            if (value.isBlank()) {
+                return null;
+            }
+            columns.add(new InsertColumn(columnNames.get(i), value));
+        }
+        return new OnDuplicateKeyInsert(insertIndex, statementEnd, tableName, columns, sql.substring(index, statementEnd));
+    }
+
+    private List<IdentifierName> readInsertColumns(String columnList) {
+        List<IdentifierName> columns = new ArrayList<>();
+        for (TopLevelArgument column : splitTopLevelArguments(columnList)) {
+            IdentifierName columnName = readIdentifierName(column.text(), false);
+            if (columnName == null || columns.stream().anyMatch(existing -> existing.key().equals(columnName.key()))) {
+                return List.of();
+            }
+            columns.add(columnName);
+        }
+        return columns;
+    }
+
+    private List<UpdateAssignment> readOnDuplicateKeyUpdateAssignments(String updateClause) {
+        List<UpdateAssignment> assignments = new ArrayList<>();
+        for (TopLevelArgument assignment : splitTopLevelArguments(updateClause)) {
+            UpdateAssignment parsed = readOnDuplicateKeyUpdateAssignment(assignment.text());
+            if (parsed == null
+                    || assignments.stream().anyMatch(existing -> existing.column().key().equals(parsed.column().key()))) {
+                return List.of();
+            }
+            assignments.add(parsed);
+        }
+        return assignments;
+    }
+
+    private UpdateAssignment readOnDuplicateKeyUpdateAssignment(String assignment) {
+        int equalsIndex = findTopLevelChar(assignment, '=', 0);
+        if (equalsIndex < 0) {
+            return null;
+        }
+        IdentifierName targetColumn = readIdentifierName(assignment.substring(0, equalsIndex), true);
+        if (targetColumn == null) {
+            return null;
+        }
+
+        FunctionCall valuesCall = readOnlyFunctionCall(assignment.substring(equalsIndex + 1).trim(), "VALUES");
+        if (valuesCall == null) {
+            return null;
+        }
+        List<TopLevelArgument> valuesArguments = splitTopLevelArguments(valuesCall.body());
+        if (valuesArguments.size() != 1) {
+            return null;
+        }
+        IdentifierName sourceColumn = readIdentifierName(valuesArguments.get(0).text(), false);
+        if (sourceColumn == null || !sourceColumn.key().equals(targetColumn.key())) {
+            return null;
+        }
+        return new UpdateAssignment(targetColumn, sourceColumn);
+    }
+
+    private IdentifierName readIdentifierName(String expression, boolean allowQualifier) {
+        String trimmed = expression.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+
+        int index = 0;
+        IdentifierToken token = readIdentifierToken(trimmed, index);
+        if (token == null) {
+            return null;
+        }
+        IdentifierToken lastToken = token;
+        index = skipWhitespace(trimmed, token.endIndex());
+        while (index < trimmed.length() && trimmed.charAt(index) == '.') {
+            if (!allowQualifier) {
+                return null;
+            }
+            index = skipWhitespace(trimmed, index + 1);
+            token = readIdentifierToken(trimmed, index);
+            if (token == null) {
+                return null;
+            }
+            lastToken = token;
+            index = skipWhitespace(trimmed, token.endIndex());
+        }
+        if (index != trimmed.length()) {
+            return null;
+        }
+        return new IdentifierName(lastToken.text(), identifierKey(lastToken.text()));
+    }
+
+    private String identifierKey(String identifier) {
+        String trimmed = identifier.trim();
+        if (trimmed.length() >= 2 && trimmed.charAt(0) == '"' && trimmed.charAt(trimmed.length() - 1) == '"') {
+            trimmed = trimmed.substring(1, trimmed.length() - 1).replace("\"\"", "\"");
+        }
+        return trimmed.toLowerCase(Locale.ROOT);
+    }
+
+    private boolean containsWhitespaceOutsideQuotedText(String value) {
+        int index = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '"') {
+                index = skipDoubleQuotedText(value, index);
+            } else if (Character.isWhitespace(current)) {
+                return true;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private int findTopLevelChar(String sql, char target, int start) {
+        int depth = 0;
+        int index = Math.max(0, start);
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                if (target == '(' && depth == 0) {
+                    return index;
+                }
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (current == target && depth == 0) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
     }
 
     private GenericConversion quoteDamengKeywordIdentifiers(String sql) {
@@ -1637,6 +1950,27 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record JoinSource(String sourceSql, String conditionSql) {
+    }
+
+    private record IdentifierName(String text, String key) {
+    }
+
+    private record InsertColumn(IdentifierName name, String value) {
+    }
+
+    private record UpdateAssignment(IdentifierName column, IdentifierName sourceColumn) {
+    }
+
+    private record OnDuplicateKeyInsert(
+            int insertIndex,
+            int statementEnd,
+            String tableName,
+            List<InsertColumn> columns,
+            String updateClause
+    ) {
+        private OnDuplicateKeyInsert {
+            columns = List.copyOf(columns == null ? List.of() : columns);
+        }
     }
 
     private record BacktickIdentifier(String value, int nextIndex, boolean closed) {
