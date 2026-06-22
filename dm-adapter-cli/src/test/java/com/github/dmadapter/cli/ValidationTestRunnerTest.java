@@ -97,6 +97,81 @@ class ValidationTestRunnerTest {
     }
 
     @Test
+    void includesValidationReportSummaryInRunOutput() throws IOException {
+        Files.createDirectories(tempDir.resolve(".dm-adapter"));
+        Files.writeString(tempDir.resolve(".dm-adapter/sql-validation-report.md"), """
+                # Dameng SQL Validation Report
+
+                - Passed: `790`
+                - Failed: `451`
+                - Skipped: `234`
+
+                ## Failure Categories
+
+                | Category | Count | Hint |
+                | --- | ---: | --- |
+                | TEST_SCHEMA | 336 | Align schema. |
+                | SQL_SYNTAX | 45 | Rewrite SQL. |
+
+                ## Failure Patterns
+
+                | Pattern | Count |
+                | --- | ---: |
+                | TEST_SCHEMA_OBJECT | 336 |
+                | MYSQL_JSON_SQL | 5 |
+
+                ## Schema Object Hotspots
+
+                ### Missing Tables/Views
+
+                | Object | Count |
+                | --- | ---: |
+                | ns_attendance_machine_management | 26 |
+
+                ### Missing Columns
+
+                | Column | Count |
+                | --- | ---: |
+                | user_name | 70 |
+                """);
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> processWithOutput("maven output\n", 1),
+                new RecordingShutdownHookRegistry()
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(result.outputTail())
+                .contains(
+                        "Validation report summary:",
+                        "- Passed: `790`",
+                        "- Failed: `451`",
+                        "- Skipped: `234`",
+                        "Failure Categories:",
+                        "- TEST_SCHEMA: 336",
+                        "- SQL_SYNTAX: 45",
+                        "Failure Patterns:",
+                        "- TEST_SCHEMA_OBJECT: 336",
+                        "- MYSQL_JSON_SQL: 5",
+                        "Schema Object Hotspots:",
+                        "Missing Tables/Views:",
+                        "- ns_attendance_machine_management: 26",
+                        "Missing Columns:",
+                        "- user_name: 70"
+                );
+    }
+
+    @Test
     void shutdownHookDestroysMavenProcess() {
         RecordingShutdownHookRegistry shutdownHooks = new RecordingShutdownHookRegistry();
         shutdownHooks.runHookWhenAdded = true;

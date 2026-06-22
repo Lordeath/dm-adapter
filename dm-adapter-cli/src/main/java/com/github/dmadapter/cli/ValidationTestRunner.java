@@ -15,6 +15,7 @@ import java.util.Set;
 
 class ValidationTestRunner {
     private static final int MAX_PATH_CANDIDATES = 20;
+    private static final int REPORT_SECTION_ROW_LIMIT = 8;
 
     private final Map<String, String> processEnvironment;
     private final String osName;
@@ -102,7 +103,7 @@ class ValidationTestRunner {
                     true,
                     exitCode,
                     generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
-                    runDiagnostics(command, workingDirectory, output, environment),
+                    runDiagnostics(command, workingDirectory, output, environment, generationResult.projectRoot()),
                     exitCode == 0
                             ? "Dameng SQL validation test passed."
                             : "Dameng SQL validation test exited with code " + exitCode + "."
@@ -110,7 +111,13 @@ class ValidationTestRunner {
         } catch (IOException e) {
             List<String> diagnostics = process == null
                     ? startFailureDiagnostics(generationResult, command, workingDirectory, e)
-                    : runDiagnostics(command, workingDirectory, e.getClass().getSimpleName() + ": " + e.getMessage(), environment);
+                    : runDiagnostics(
+                            command,
+                            workingDirectory,
+                            e.getClass().getSimpleName() + ": " + e.getMessage(),
+                            environment,
+                            generationResult.projectRoot()
+                    );
             String message = process == null
                     ? "Failed to start Maven validation test: " + e.getMessage()
                     : "Failed to read Maven validation output: " + e.getMessage();
@@ -127,7 +134,7 @@ class ValidationTestRunner {
                     true,
                     1,
                     generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
-                    runDiagnostics(command, workingDirectory, "", environment),
+                    runDiagnostics(command, workingDirectory, "", environment, generationResult.projectRoot()),
                     "Maven validation test was interrupted."
             );
         } finally {
@@ -218,13 +225,126 @@ class ValidationTestRunner {
             List<String> command,
             Path workingDirectory,
             String output,
-            DmValidationEnvironment environment
+            DmValidationEnvironment environment,
+            Path projectRoot
     ) {
         List<String> diagnostics = new ArrayList<>();
         diagnostics.add("Maven command: " + command);
         diagnostics.add("Working directory: " + workingDirectory);
+        diagnostics.addAll(validationReportSummary(projectRoot));
         diagnostics.addAll(tail(redact(output, environment), 40));
         return diagnostics;
+    }
+
+    private List<String> validationReportSummary(Path projectRoot) {
+        Path report = projectRoot.resolve(".dm-adapter/sql-validation-report.md");
+        if (!Files.isRegularFile(report)) {
+            return List.of();
+        }
+        try {
+            String markdown = Files.readString(report, StandardCharsets.UTF_8);
+            List<String> summary = new ArrayList<>();
+            summary.add("Validation report summary:");
+            appendCountLine(summary, markdown, "- Passed:");
+            appendCountLine(summary, markdown, "- Failed:");
+            appendCountLine(summary, markdown, "- Skipped:");
+            appendReportSectionSummary(summary, markdown, "Failure Categories");
+            appendReportSectionSummary(summary, markdown, "Failure Patterns");
+            appendReportSectionSummary(summary, markdown, "Schema Object Hotspots");
+            return summary.size() == 1 ? List.of() : summary;
+        } catch (IOException e) {
+            return List.of("Validation report summary unavailable: " + e.getMessage());
+        }
+    }
+
+    private void appendCountLine(List<String> summary, String markdown, String prefix) {
+        for (String line : markdown.split("\\R")) {
+            if (line.startsWith(prefix)) {
+                summary.add(line);
+                return;
+            }
+        }
+    }
+
+    private void appendReportSectionSummary(List<String> summary, String markdown, String heading) {
+        List<String> lines = sectionLines(markdown, "## " + heading);
+        if (lines.isEmpty()) {
+            return;
+        }
+        summary.add(heading + ":");
+        int rowsInCurrentTable = 0;
+        boolean omittedCurrentTableRows = false;
+        for (String line : lines) {
+            if (line.startsWith("### ")) {
+                summary.add(line.substring("### ".length()) + ":");
+                rowsInCurrentTable = 0;
+                omittedCurrentTableRows = false;
+                continue;
+            }
+            String compactRow = compactMarkdownTableRow(line);
+            if (compactRow.isBlank()) {
+                continue;
+            }
+            if (rowsInCurrentTable < REPORT_SECTION_ROW_LIMIT) {
+                summary.add(compactRow);
+            } else if (!omittedCurrentTableRows) {
+                summary.add("- ...");
+                omittedCurrentTableRows = true;
+            }
+            rowsInCurrentTable++;
+        }
+    }
+
+    private List<String> sectionLines(String markdown, String heading) {
+        String[] lines = markdown.split("\\R");
+        List<String> section = new ArrayList<>();
+        boolean inSection = false;
+        for (String line : lines) {
+            if (line.equals(heading)) {
+                inSection = true;
+                continue;
+            }
+            if (inSection && line.startsWith("## ")) {
+                break;
+            }
+            if (inSection) {
+                section.add(line);
+            }
+        }
+        return section;
+    }
+
+    private String compactMarkdownTableRow(String line) {
+        if (!line.startsWith("|") || line.contains("---")) {
+            return "";
+        }
+        List<String> cells = markdownTableCells(line);
+        if (cells.size() < 2 || isTableHeader(cells.get(0))) {
+            return "";
+        }
+        return "- " + cells.get(0) + ": " + cells.get(1);
+    }
+
+    private List<String> markdownTableCells(String line) {
+        String trimmed = line.trim();
+        if (trimmed.startsWith("|")) {
+            trimmed = trimmed.substring(1);
+        }
+        if (trimmed.endsWith("|")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        List<String> cells = new ArrayList<>();
+        for (String cell : trimmed.split("\\|")) {
+            cells.add(cell.trim());
+        }
+        return cells;
+    }
+
+    private boolean isTableHeader(String value) {
+        return "Category".equals(value)
+                || "Pattern".equals(value)
+                || "Object".equals(value)
+                || "Column".equals(value);
     }
 
     private Path workingDirectory(ValidationTestGenerationResult generationResult) {

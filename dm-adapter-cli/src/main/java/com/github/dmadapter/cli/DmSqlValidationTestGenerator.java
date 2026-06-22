@@ -1531,6 +1531,7 @@ class DmSqlValidationTestGenerator {
                     appendUsageFilterSummary(markdown, records, usageFilterReport);
                     appendFailureCategorySummary(markdown, records);
                     appendFailurePatternSummary(markdown, records);
+                    appendSchemaObjectSummary(markdown, records);
                     appendSuggestedNextActions(markdown, records);
                     markdown.append("## Results\\n\\n");
                     markdown.append("| Status | Category | Pattern | Mapper Method | Parameter Source | Summary | Hint |\\n");
@@ -1596,6 +1597,88 @@ class DmSqlValidationTestGenerator {
                         markdown.append("| ").append(escapeMarkdown(entry.getKey()))
                                 .append(" | ").append(entry.getValue())
                                 .append(" |\\n");
+                    }
+                    markdown.append("\\n");
+                }
+
+                private void appendSchemaObjectSummary(StringBuilder markdown, List<ValidationRecord> records) {
+                    Map<String, Long> missingTables = schemaIssueCounts(records, "无效的表或视图名");
+                    Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名");
+                    if (missingTables.isEmpty() && missingColumns.isEmpty()) {
+                        return;
+                    }
+                    markdown.append("## Schema Object Hotspots\\n\\n");
+                    appendCountSummary(markdown, "Missing Tables/Views", "Object", missingTables, 20);
+                    appendCountSummary(markdown, "Missing Columns", "Column", missingColumns, 30);
+                }
+
+                private Map<String, Long> schemaIssueCounts(List<ValidationRecord> records, String marker) {
+                    Map<String, Long> counts = new LinkedHashMap<>();
+                    for (ValidationRecord record : records) {
+                        if (!"FAILED".equals(record.status)) {
+                            continue;
+                        }
+                        for (String value : bracketedValuesAfterMarker(record.message, marker)) {
+                            counts.merge(value, 1L, Long::sum);
+                        }
+                    }
+                    return counts.entrySet().stream()
+                            .sorted(Map.Entry.<String, Long>comparingByValue(Comparator.reverseOrder())
+                                    .thenComparing(Map.Entry.comparingByKey()))
+                            .collect(Collectors.toMap(
+                                    Map.Entry::getKey,
+                                    Map.Entry::getValue,
+                                    (left, right) -> left,
+                                    LinkedHashMap::new
+                            ));
+                }
+
+                private List<String> bracketedValuesAfterMarker(String message, String marker) {
+                    if (message == null || marker == null || marker.isBlank()) {
+                        return List.of();
+                    }
+                    List<String> values = new ArrayList<>();
+                    int searchFrom = 0;
+                    while (searchFrom < message.length()) {
+                        int markerIndex = message.indexOf(marker, searchFrom);
+                        if (markerIndex < 0) {
+                            break;
+                        }
+                        int start = message.indexOf('[', markerIndex + marker.length());
+                        int end = start < 0 ? -1 : message.indexOf(']', start + 1);
+                        if (start >= 0 && end > start + 1) {
+                            values.add(message.substring(start + 1, end).trim());
+                            searchFrom = end + 1;
+                        } else {
+                            searchFrom = markerIndex + marker.length();
+                        }
+                    }
+                    return values;
+                }
+
+                private void appendCountSummary(
+                        StringBuilder markdown,
+                        String title,
+                        String nameHeader,
+                        Map<String, Long> counts,
+                        int limit
+                ) {
+                    if (counts.isEmpty()) {
+                        return;
+                    }
+                    markdown.append("### ").append(title).append("\\n\\n");
+                    markdown.append("| ").append(nameHeader).append(" | Count |\\n");
+                    markdown.append("| --- | ---: |\\n");
+                    int index = 0;
+                    for (Map.Entry<String, Long> entry : counts.entrySet()) {
+                        if (index >= limit) {
+                            markdown.append("| ... | ").append(counts.size() - limit).append(" more |\\n");
+                            break;
+                        }
+                        markdown.append("| ").append(escapeMarkdown(entry.getKey()))
+                                .append(" | ").append(entry.getValue())
+                                .append(" |\\n");
+                        index++;
                     }
                     markdown.append("\\n");
                 }
@@ -1697,6 +1780,8 @@ class DmSqlValidationTestGenerator {
                     appendJsonCountMap(json, "failureCategories", failureCategoryCounts(records));
                     json.append(",\\n");
                     appendJsonCountMap(json, "failurePatterns", failurePatternCounts(records));
+                    json.append(",\\n");
+                    appendSchemaObjectHotspotsJson(json, records);
                     json.append(",\\n  \\"records\\": [\\n");
                     for (int i = 0; i < records.size(); i++) {
                         ValidationRecord record = records.get(i);
@@ -1750,6 +1835,29 @@ class DmSqlValidationTestGenerator {
 
                 private void appendJsonCountMap(StringBuilder json, String key, Map<String, Long> counts) {
                     json.append("  \\"").append(key).append("\\": [");
+                    int index = 0;
+                    for (Map.Entry<String, Long> entry : counts.entrySet()) {
+                        if (index > 0) {
+                            json.append(", ");
+                        }
+                        json.append("{\\"name\\": \\"").append(escapeJson(entry.getKey()))
+                                .append("\\", \\"count\\": ").append(entry.getValue())
+                                .append("}");
+                        index++;
+                    }
+                    json.append("]");
+                }
+
+                private void appendSchemaObjectHotspotsJson(StringBuilder json, List<ValidationRecord> records) {
+                    json.append("  \\"schemaObjectHotspots\\": {");
+                    appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(records, "无效的表或视图名"));
+                    json.append(", ");
+                    appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名"));
+                    json.append("}");
+                }
+
+                private void appendJsonCountArray(StringBuilder json, String key, Map<String, Long> counts) {
+                    json.append("\\"").append(key).append("\\": [");
                     int index = 0;
                     for (Map.Entry<String, Long> entry : counts.entrySet()) {
                         if (index > 0) {
