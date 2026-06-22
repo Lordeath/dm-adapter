@@ -153,6 +153,49 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesStaticOnDuplicateKeyUpdateToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="updateExtend">
+                        INSERT INTO ns_organization_and_employees_extend (foreignerKeyId, key)
+                        VALUES (#{foreignerKeyId}, #{key})
+                        ON DUPLICATE KEY UPDATE key = VALUES(key)
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_organization_and_employees_extend t")
+                .contains("ON (t.foreignerKeyId = s.foreignerKeyId)")
+                .contains("WHEN MATCHED THEN UPDATE SET t.key = s.key")
+                .doesNotContain("ON DUPLICATE KEY UPDATE");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void migrationRenamesDamengReservedColumnNamesInMapperSql() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",
@@ -256,6 +299,48 @@ class MapperMigratorTest {
                 new MySqlToDmSqlConverter()
         );
 
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
+    void dynamicOnDuplicateKeyUpdateIsNotRewrittenToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="insertBatch">
+                        insert into sample_user(id, name)
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.id}, #{item.name})
+                        </foreach>
+                        on duplicate key update name = values(name)
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("on duplicate key update name = values(name)")
+                .doesNotContain("MERGE INTO");
+        assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }

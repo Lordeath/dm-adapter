@@ -426,9 +426,103 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void marksOnDuplicateKeyUpdateForManualReview() {
+    void convertsOnDuplicateKeyUpdateToDamengMerge() {
+        SqlConversionResult result = converter.convert("""
+                insert into ns_organization_and_employees_extend(foreignerKeyId, key)
+                values(#{foreignerKeyId}, #{key})
+                on duplicate key update key = values(key)
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                MERGE INTO ns_organization_and_employees_extend t
+                USING (
+                    SELECT #{foreignerKeyId} AS foreignerKeyId, #{key} AS key FROM dual
+                ) s
+                ON (t.foreignerKeyId = s.foreignerKeyId)
+                WHEN MATCHED THEN UPDATE SET t.key = s.key
+                WHEN NOT MATCHED THEN INSERT (foreignerKeyId, key) VALUES (s.foreignerKeyId, s.key)
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
+    void convertsOnDuplicateKeyUpdateWithJdbcPlaceholdersToDamengMerge() {
+        SqlConversionResult result = converter.convert("""
+                INSERT INTO ns_organization_and_employees_extend (
+                    foreignerKeyId,
+                    key
+                )
+                VALUES (
+                    #{foreignerKeyId, jdbcType=VARCHAR},
+                    #{key, jdbcType=VARCHAR}
+                )
+                ON DUPLICATE KEY UPDATE
+                    key = VALUES(key)
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).contains(
+                "SELECT #{foreignerKeyId, jdbcType=VARCHAR} AS foreignerKeyId, #{key, jdbcType=VARCHAR} AS key FROM dual",
+                "ON (t.foreignerKeyId = s.foreignerKeyId)",
+                "WHEN MATCHED THEN UPDATE SET t.key = s.key"
+        );
+    }
+
+    @Test
+    void marksOnDuplicateKeyUpdateWithMultipleCandidateKeysForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                insert into user(id, tenant_id, name) values(1, 2, 'a')
+                on duplicate key update name = values(name)
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("ON DUPLICATE KEY UPDATE");
+    }
+
+    @Test
+    void marksOnDuplicateKeyUpdateComplexAssignmentsForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                insert into user(id, count) values(1, 2)
+                on duplicate key update count = count + values(count)
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("ON DUPLICATE KEY UPDATE");
+    }
+
+    @Test
+    void marksOnDuplicateKeyUpdateAssignmentsOutsideInsertColumnsForManualReview() {
         SqlConversionResult result = converter.convert("""
                 insert into user(id, name) values(1, 'a')
+                on duplicate key update name = values(name), updated_at = values(updated_at)
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("ON DUPLICATE KEY UPDATE");
+    }
+
+    @Test
+    void marksOnDuplicateKeyUpdateWithDynamicTableForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                insert into ${tableName}(id, name) values(1, 'a')
+                on duplicate key update name = values(name)
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("ON DUPLICATE KEY UPDATE");
+    }
+
+    @Test
+    void marksMultiRowOnDuplicateKeyUpdateForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                insert into user(id, name) values(1, 'a'), (2, 'b')
                 on duplicate key update name = values(name)
                 """);
 
