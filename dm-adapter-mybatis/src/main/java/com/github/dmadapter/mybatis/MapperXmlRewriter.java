@@ -160,15 +160,6 @@ public class MapperXmlRewriter {
                 continue;
             }
             if (hasElementChild(statement)) {
-                manualReviewItems.add(new SqlChange(
-                        reportPath,
-                        statementKey,
-                        originalSql,
-                        originalSql,
-                        List.of(),
-                        true,
-                        "Statement contains dynamic XML elements and requires manual confirmation."
-                ));
                 if (xml == null) {
                     xml = readXml(inputPath);
                 }
@@ -181,6 +172,15 @@ public class MapperXmlRewriter {
                                 sqlConverter,
                                 rewriteConfig
                         );
+                manualReviewItems.add(new SqlChange(
+                        reportPath,
+                        statementKey,
+                        dynamicBodyConversion.originalBody(),
+                        dynamicBodyConversion.convertedBody(),
+                        dynamicBodyConversion.appliedRules(),
+                        true,
+                        dynamicXmlManualReviewReason(dynamicBodyConversion.manualReviewReasons())
+                ));
                 if (dynamicBodyConversion.changed()) {
                     replacements.add(StatementReplacement.dynamicBody(
                             statement.getTagName(),
@@ -203,17 +203,7 @@ public class MapperXmlRewriter {
             String tableName = extractInsertTableName(originalSql);
             SqlConversionResult conversionResult =
                     sqlConverter.convert(originalSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
-            if (conversionResult.manualReviewRequired()) {
-                manualReviewItems.add(new SqlChange(
-                        reportPath,
-                        statementKey,
-                        conversionResult.originalSql(),
-                        conversionResult.convertedSql(),
-                        conversionResult.appliedRules(),
-                        true,
-                        conversionResult.reason()
-                ));
-            } else if (conversionResult.changed()) {
+            if (conversionResult.changed()) {
                 replacements.add(StatementReplacement.staticSql(
                         statement.getTagName(),
                         statementId,
@@ -229,6 +219,17 @@ public class MapperXmlRewriter {
                         ""
                 ));
             }
+            if (conversionResult.manualReviewRequired()) {
+                manualReviewItems.add(new SqlChange(
+                        reportPath,
+                        statementKey,
+                        conversionResult.originalSql(),
+                        conversionResult.convertedSql(),
+                        conversionResult.appliedRules(),
+                        true,
+                        conversionResult.reason()
+                ));
+            }
         }
 
         changed = !replacements.isEmpty();
@@ -242,6 +243,14 @@ public class MapperXmlRewriter {
         return "Mapper XML statement <" + tagName + "> is missing required id attribute in "
                 + reportPath
                 + ". dm-adapter cannot safely locate this statement for text-preserving rewrite; add an id to the MyBatis statement or exclude this XML from mapper-locations if it is not a mapper.";
+    }
+
+    private String dynamicXmlManualReviewReason(List<String> manualReviewReasons) {
+        String baseReason = "Statement contains dynamic XML elements and requires manual confirmation.";
+        if (manualReviewReasons == null || manualReviewReasons.isEmpty()) {
+            return baseReason;
+        }
+        return baseReason + " Additional SQL review: " + String.join("; ", manualReviewReasons);
     }
 
     private String statementKey(String namespace, String statementId) {
@@ -384,6 +393,7 @@ public class MapperXmlRewriter {
     ) {
         StringBuilder convertedBody = new StringBuilder(rawBody.length());
         List<String> appliedRules = new ArrayList<>();
+        List<String> manualReviewReasons = new ArrayList<>();
         boolean changed = false;
         int index = 0;
         while (index < rawBody.length()) {
@@ -402,6 +412,7 @@ public class MapperXmlRewriter {
                 );
                 convertedBody.append(toCdata(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
+                addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
                 changed = changed || conversion.changed();
                 index = cdataEnd + "]]>".length();
             } else if (rawBody.startsWith("<!--", index)) {
@@ -427,6 +438,7 @@ public class MapperXmlRewriter {
                 TextSegmentConversion conversion = convertTextSegment(text, statementKey, sqlConverter, rewriteConfig);
                 convertedBody.append(conversion.convertedText());
                 addAppliedRules(appliedRules, conversion.appliedRules());
+                addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
                 changed = changed || conversion.changed();
                 index = textEnd;
             }
@@ -444,7 +456,13 @@ public class MapperXmlRewriter {
             addAppliedRules(appliedRules, structuralConversion.appliedRules());
             changed = true;
         }
-        return new DynamicBodyConversion(rawBody, changed ? rewrittenBody : rawBody, appliedRules, changed);
+        return new DynamicBodyConversion(
+                rawBody,
+                changed ? rewrittenBody : rawBody,
+                appliedRules,
+                manualReviewReasons,
+                changed
+        );
     }
 
     private DynamicBodyConversion convertDynamicXmlStructure(
@@ -455,7 +473,7 @@ public class MapperXmlRewriter {
             SqlRewriteConfig rewriteConfig
     ) {
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
-            return new DynamicBodyConversion(body, body, List.of(), false);
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
 
         List<String> appliedRules = new ArrayList<>();
@@ -491,7 +509,7 @@ public class MapperXmlRewriter {
                 appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
                 converted = dynamicUpdateJoin;
             }
-            return new DynamicBodyConversion(body, converted, appliedRules, !appliedRules.isEmpty());
+            return new DynamicBodyConversion(body, converted, appliedRules, List.of(), !appliedRules.isEmpty());
         }
 
         String withMissingValues = addMissingBatchInsertValues(converted);
@@ -505,7 +523,7 @@ public class MapperXmlRewriter {
             appliedRules.add(MYBATIS_FOREACH_TRAILING_COMMA_RULE);
         }
         converted = withoutTrailingCommas;
-        return new DynamicBodyConversion(body, converted, appliedRules, !appliedRules.isEmpty());
+        return new DynamicBodyConversion(body, converted, appliedRules, List.of(), !appliedRules.isEmpty());
     }
 
     private String convertForeachOnDuplicateKeyUpdate(
@@ -1208,12 +1226,16 @@ public class MapperXmlRewriter {
     ) {
         SqlConversionResult conversionResult =
                 sqlConverter.convert(text, rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(text)));
-        if (conversionResult.manualReviewRequired() || !conversionResult.changed()) {
-            return new TextSegmentConversion(text, List.of(), false);
+        List<String> manualReviewReasons = conversionResult.manualReviewRequired()
+                ? List.of(conversionResult.reason())
+                : List.of();
+        if (!conversionResult.changed()) {
+            return new TextSegmentConversion(text, List.of(), manualReviewReasons, false);
         }
         return new TextSegmentConversion(
                 conversionResult.convertedSql(),
                 conversionResult.appliedRules(),
+                manualReviewReasons,
                 true
         );
     }
@@ -1222,6 +1244,14 @@ public class MapperXmlRewriter {
         for (String rule : rulesToAdd) {
             if (!appliedRules.contains(rule)) {
                 appliedRules.add(rule);
+            }
+        }
+    }
+
+    private void addManualReviewReasons(List<String> reasons, List<String> reasonsToAdd) {
+        for (String reason : reasonsToAdd) {
+            if (reason != null && !reason.isBlank() && !reasons.contains(reason)) {
+                reasons.add(reason);
             }
         }
     }
@@ -1303,16 +1333,24 @@ public class MapperXmlRewriter {
             String originalBody,
             String convertedBody,
             List<String> appliedRules,
+            List<String> manualReviewReasons,
             boolean changed
     ) {
         DynamicBodyConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+            manualReviewReasons = List.copyOf(manualReviewReasons == null ? List.of() : manualReviewReasons);
         }
     }
 
-    private record TextSegmentConversion(String convertedText, List<String> appliedRules, boolean changed) {
+    private record TextSegmentConversion(
+            String convertedText,
+            List<String> appliedRules,
+            List<String> manualReviewReasons,
+            boolean changed
+    ) {
         TextSegmentConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+            manualReviewReasons = List.copyOf(manualReviewReasons == null ? List.of() : manualReviewReasons);
         }
     }
 }

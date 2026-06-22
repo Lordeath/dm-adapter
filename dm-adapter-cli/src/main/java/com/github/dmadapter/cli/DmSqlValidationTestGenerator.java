@@ -1956,7 +1956,10 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("parameter '") && lower.contains("not found")) {
                         return "BINDING_PARAMETER_NAME";
                     }
-                    if (lower.contains("无效的表或视图名") || lower.contains("无效的列名") || lower.contains("无效的模式名")) {
+                    if (lower.contains("无效的表或视图名")
+                            || lower.contains("无效的列名")
+                            || lower.contains("无效的模式名")
+                            || lower.contains("无法解析的成员访问表达式")) {
                         return "TEST_SCHEMA_OBJECT";
                     }
                     if (containsAny(message,
@@ -2015,7 +2018,7 @@ class DmSqlValidationTestGenerator {
                     if (containsAny(message, "information_schema", "database()")) {
                         return "MYSQL_METADATA_SQL";
                     }
-                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的模式名")) {
+                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的模式名", "无法解析的成员访问表达式")) {
                         return "TEST_SCHEMA";
                     }
                     if (containsAny(message,

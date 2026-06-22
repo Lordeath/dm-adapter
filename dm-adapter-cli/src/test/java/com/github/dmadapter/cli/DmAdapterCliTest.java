@@ -335,6 +335,7 @@ class DmAdapterCliTest {
                 .contains("includedMethods")
                 .contains("TEST_DATA_OR_SCHEMA")
                 .contains("METHOD_ARGS_OR_BINDING")
+                .contains("无法解析的成员访问表达式")
                 .contains("summary")
                 .contains("failurePattern")
                 .contains("failurePatterns")
