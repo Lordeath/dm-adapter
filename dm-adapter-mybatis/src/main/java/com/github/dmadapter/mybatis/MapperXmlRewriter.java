@@ -23,6 +23,8 @@ public class MapperXmlRewriter {
     public static final String MYBATIS_FOREACH_TRAILING_COMMA_RULE = "MYBATIS_FOREACH_TRAILING_COMMA";
     public static final String MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
+    public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE =
+            "MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Pattern INSERT_TRIM_THEN_FOREACH_PATTERN = Pattern.compile(
@@ -52,6 +54,17 @@ public class MapperXmlRewriter {
                     + "\\)\\s*on\\s+duplicate\\s+key\\s+update\\s*"
                     + "(?<updateForeach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
                     + "(?<trailing>;?\\s*)$"
+    );
+    private static final Pattern DYNAMIC_UPDATE_JOIN_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)update\\s+"
+                    + "(?<target>[\\s\\S]+?)\\s+"
+                    + "(?:(?:inner|left|right)\\s+)?join\\s+"
+                    + "(?<joinSource>[\\s\\S]+?)\\s+on\\s+"
+                    + "(?<joinCondition>[\\s\\S]+?)"
+                    + "(?<setBlocks>(?:\\s*<if\\b[^>]*>\\s*set\\b[\\s\\S]*?</if\\s*>)+)"
+                    + "\\s*where\\b"
+                    + "(?<whereClause>[\\s\\S]*?)"
+                    + "(?<trailing>\\s*)$"
     );
     private static final Pattern FOREACH_TAG_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)</foreach\\s*>\\s*$"
@@ -355,6 +368,11 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
+            String dynamicUpdateJoin = convertDynamicUpdateJoin(converted);
+            if (!dynamicUpdateJoin.equals(converted)) {
+                appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+                converted = dynamicUpdateJoin;
+            }
             return new DynamicBodyConversion(body, converted, appliedRules, !appliedRules.isEmpty());
         }
 
@@ -528,6 +546,69 @@ public class MapperXmlRewriter {
                 .append(")")
                 .append(matcher.group("trailing"));
         return converted.toString();
+    }
+
+    private String convertDynamicUpdateJoin(String body) {
+        Matcher matcher = DYNAMIC_UPDATE_JOIN_PATTERN.matcher(body);
+        if (!matcher.matches()) {
+            return body;
+        }
+
+        String target = matcher.group("target").strip();
+        String joinSource = matcher.group("joinSource").strip();
+        String joinCondition = matcher.group("joinCondition").strip();
+        String setBlocks = matcher.group("setBlocks");
+        String whereClause = matcher.group("whereClause").strip();
+        if (target.isBlank()
+                || joinSource.isBlank()
+                || joinCondition.isBlank()
+                || whereClause.isBlank()
+                || containsJoinKeyword(target)
+                || containsJoinKeyword(joinSource)
+                || containsJoinKeyword(joinCondition)
+                || setBlocksContainMultipleSetStatements(setBlocks)) {
+            return body;
+        }
+
+        String leading = matcher.group("leading");
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        StringBuilder converted = new StringBuilder(body.length() + 64);
+        converted.append(leading)
+                .append("update ")
+                .append(target)
+                .append(setBlocks)
+                .append("\n")
+                .append(baseIndent)
+                .append("from ")
+                .append(joinSource)
+                .append("\n")
+                .append(baseIndent)
+                .append("where\n")
+                .append(childIndent)
+                .append(joinCondition)
+                .append("\n")
+                .append(childIndent)
+                .append("and ")
+                .append(whereClause)
+                .append(matcher.group("trailing"));
+        return converted.toString();
+    }
+
+    private boolean containsJoinKeyword(String value) {
+        return Pattern.compile("\\bjoin\\b", Pattern.CASE_INSENSITIVE).matcher(value).find();
+    }
+
+    private boolean setBlocksContainMultipleSetStatements(String setBlocks) {
+        Matcher matcher = Pattern.compile("\\bset\\b", Pattern.CASE_INSENSITIVE).matcher(setBlocks);
+        int count = 0;
+        while (matcher.find()) {
+            count++;
+            if (count > 1 && !setBlocks.substring(0, matcher.start()).contains("</if")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private ForeachBlock readForeach(String block) {

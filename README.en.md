@@ -10,7 +10,7 @@
 - Resolve mapper XML files from `mybatis.mapperLocations` / `mybatis.mapper-locations` and related keys in project `application*.properties`, `application*.yml`, and `application*.yaml` files first; support cross-module classpath patterns such as `classpath*:/mapper/*.xml`; fall back to resource directory scanning when not configured.
 - Check whether `pom.xml` already contains a Dameng JDBC driver dependency.
 - Copy mapper XML files to the source module's `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
-- Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, simple `LIMIT` pagination, and suffix Dameng special column names such as `ROWID`, `ROWNUM`, `TRXID`, `PHYROWID`, and `VERSIONS_*` with an underscore.
+- Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, simple `LIMIT` pagination, `FROM/JOIN ... AS alias` -> `FROM/JOIN ... alias`, and suffix Dameng special column names such as `ROWID`, `ROWNUM`, `TRXID`, `PHYROWID`, and `VERSIONS_*` with an underscore.
 - Mark `DATE_FORMAT`, `GROUP_CONCAT`, `FIND_IN_SET`, JSON functions, time calculation/conversion functions, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, and backtick-quoted identifiers for manual review.
 - Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project, without starting Spring Boot, ShardingSphere, MQ, or web beans.
 - Write Markdown and JSON reports under `.dm-adapter/`.

@@ -19,6 +19,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
+    public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
@@ -190,6 +191,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (updateJoinConversion.changed()) {
             converted = updateJoinConversion.convertedSql();
             rules.add(MYSQL_UPDATE_JOIN_RULE);
+        }
+
+        GenericConversion tableAliasAsConversion = removeAsFromTableAliases(converted);
+        if (tableAliasAsConversion.changed()) {
+            converted = tableAliasAsConversion.convertedSql();
+            rules.add(MYSQL_TABLE_ALIAS_AS_RULE);
         }
 
         UpdateSetTableOrderConversion updateSetTableOrderConversion = convertUpdateSetTableOrder(converted);
@@ -660,6 +667,129 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion removeAsFromTableAliases(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "FROM")) {
+                AliasAsRemoval removal = readTableAliasAsRemoval(sql, index, "FROM");
+                if (removal == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, removal.asIndex());
+                    converted.append(sql, removal.aliasStartIndex(), removal.aliasEndIndex());
+                    lastCopiedIndex = removal.aliasEndIndex();
+                    index = removal.aliasEndIndex();
+                    changed = true;
+                }
+            } else if (startsKeyword(sql, index, "JOIN")) {
+                AliasAsRemoval removal = readTableAliasAsRemoval(sql, index, "JOIN");
+                if (removal == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, removal.asIndex());
+                    converted.append(sql, removal.aliasStartIndex(), removal.aliasEndIndex());
+                    lastCopiedIndex = removal.aliasEndIndex();
+                    index = removal.aliasEndIndex();
+                    changed = true;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private AliasAsRemoval readTableAliasAsRemoval(String sql, int keywordIndex, String keyword) {
+        int relationStart = skipWhitespace(sql, keywordIndex + keyword.length());
+        int relationEnd;
+        if (relationStart < sql.length() && sql.charAt(relationStart) == '(') {
+            relationEnd = findMatchingParen(sql, relationStart);
+            if (relationEnd < 0) {
+                return null;
+            }
+            relationEnd++;
+        } else {
+            IdentifierToken relation = readQualifiedIdentifierToken(sql, relationStart);
+            if (relation == null) {
+                return null;
+            }
+            relationEnd = relation.endIndex();
+        }
+        int asIndex = skipWhitespace(sql, relationEnd);
+        if (!startsKeyword(sql, asIndex, "AS")) {
+            return null;
+        }
+        int aliasStart = skipWhitespace(sql, asIndex + "AS".length());
+        IdentifierToken alias = readIdentifierToken(sql, aliasStart);
+        if (alias == null || isSqlClauseKeyword(alias.text())) {
+            return null;
+        }
+        return new AliasAsRemoval(asIndex, aliasStart, alias.endIndex());
+    }
+
+    private IdentifierToken readQualifiedIdentifierToken(String sql, int start) {
+        IdentifierToken first = readIdentifierToken(sql, start);
+        if (first == null) {
+            return null;
+        }
+        int end = first.endIndex();
+        int cursor = skipWhitespace(sql, end);
+        if (cursor < sql.length() && sql.charAt(cursor) == '.') {
+            int secondStart = skipWhitespace(sql, cursor + 1);
+            IdentifierToken second = readIdentifierToken(sql, secondStart);
+            if (second == null) {
+                return null;
+            }
+            end = second.endIndex();
+        }
+        return new IdentifierToken(sql.substring(start, end), end);
+    }
+
+    private boolean isSqlClauseKeyword(String value) {
+        String upper = unquoteIdentifier(value).toUpperCase(Locale.ROOT);
+        return Set.of(
+                "WHERE",
+                "ON",
+                "INNER",
+                "LEFT",
+                "RIGHT",
+                "FULL",
+                "JOIN",
+                "GROUP",
+                "ORDER",
+                "HAVING",
+                "LIMIT",
+                "FETCH",
+                "UNION"
+        ).contains(upper);
+    }
+
+    private String unquoteIdentifier(String value) {
+        String trimmed = value == null ? "" : value.trim();
+        if (trimmed.length() >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+            return trimmed.substring(1, trimmed.length() - 1).replace("\"\"", "\"");
+        }
+        return trimmed;
     }
 
     private boolean containsMysqlUpdateJoin(String sql) {
@@ -1947,6 +2077,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record Operand(int startIndex, int endIndex, String text) {
+    }
+
+    private record AliasAsRemoval(int asIndex, int aliasStartIndex, int aliasEndIndex) {
     }
 
     private record JoinSource(String sourceSql, String conditionSql) {

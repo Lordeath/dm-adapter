@@ -790,7 +790,12 @@ class DmSqlValidationTestGenerator {
                             if (node instanceof Element element && isStatementElement(element)) {
                                 String id = element.getAttribute("id");
                                 if (id != null && !id.isBlank()) {
-                                    statements.add(new MapperStatement(namespace, id, setBranchParameterVariants(element)));
+                                    statements.add(new MapperStatement(
+                                            namespace,
+                                            id,
+                                            setBranchParameterVariants(element),
+                                            dynamicIdentifierMetadata(element)
+                                    ));
                                 }
                             }
                         }
@@ -818,6 +823,94 @@ class DmSqlValidationTestGenerator {
                             .max(Comparator.comparingInt(BranchCollector::size))
                             .map(BranchCollector::variants)
                             .orElse(List.of());
+                }
+
+                private DynamicIdentifierMetadata dynamicIdentifierMetadata(Element statement) {
+                    DynamicIdentifierMetadata metadata = new DynamicIdentifierMetadata();
+                    collectDynamicIdentifierMetadata(statement, new LinkedHashMap<>(), metadata);
+                    return metadata;
+                }
+
+                private void collectDynamicIdentifierMetadata(
+                        Node node,
+                        Map<String, String> foreachCollections,
+                        DynamicIdentifierMetadata metadata
+                ) {
+                    if (node instanceof Element element) {
+                        Map<String, String> currentForeachCollections = foreachCollections;
+                        if ("foreach".equals(element.getTagName())) {
+                            String item = element.getAttribute("item");
+                            String collection = element.getAttribute("collection");
+                            if (item != null && !item.isBlank() && collection != null && !collection.isBlank()) {
+                                currentForeachCollections = new LinkedHashMap<>(foreachCollections);
+                                currentForeachCollections.put(item, collection);
+                            }
+                        }
+                        NodeList children = element.getChildNodes();
+                        for (int i = 0; i < children.getLength(); i++) {
+                            collectDynamicIdentifierMetadata(children.item(i), currentForeachCollections, metadata);
+                        }
+                        return;
+                    }
+                    if (node == null
+                            || (node.getNodeType() != Node.TEXT_NODE && node.getNodeType() != Node.CDATA_SECTION_NODE)) {
+                        return;
+                    }
+                    String text = node.getTextContent();
+                    Matcher dynamicMatcher = Pattern.compile("\\\\$\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*}").matcher(text);
+                    while (dynamicMatcher.find()) {
+                        addDynamicIdentifierExpression(dynamicMatcher.group(1), foreachCollections, metadata);
+                    }
+                    Matcher valueMatcher = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)").matcher(text);
+                    while (valueMatcher.find()) {
+                        addValueExpression(valueMatcher.group(1), foreachCollections, metadata);
+                    }
+                }
+
+                private void addDynamicIdentifierExpression(
+                        String expression,
+                        Map<String, String> foreachCollections,
+                        DynamicIdentifierMetadata metadata
+                ) {
+                    List<String> parts = pathParts(expression);
+                    if (parts.isEmpty()) {
+                        return;
+                    }
+                    String collection = foreachCollections.get(parts.get(0));
+                    if (collection != null && parts.size() > 1) {
+                        metadata.addCollectionDefault(collection, parts.get(1), "ID");
+                        return;
+                    }
+                    if (parts.size() == 1) {
+                        metadata.addDynamicIdentifierName(parts.get(0));
+                    } else {
+                        metadata.addDynamicIdentifierName(parts.get(parts.size() - 1));
+                    }
+                }
+
+                private void addValueExpression(
+                        String expression,
+                        Map<String, String> foreachCollections,
+                        DynamicIdentifierMetadata metadata
+                ) {
+                    List<String> parts = pathParts(expression);
+                    if (parts.size() < 2) {
+                        return;
+                    }
+                    String collection = foreachCollections.get(parts.get(0));
+                    if (collection != null && metadata.hasCollectionDefault(collection)) {
+                        metadata.addCollectionDefault(collection, parts.get(1), defaultString(parts.get(1)));
+                    }
+                }
+
+                private List<String> pathParts(String expression) {
+                    if (expression == null || expression.isBlank()) {
+                        return List.of();
+                    }
+                    return Pattern.compile("\\\\.")
+                            .splitAsStream(expression.trim())
+                            .filter(part -> !part.isBlank())
+                            .collect(Collectors.toList());
                 }
 
                 private void collectSetBranchParameterVariants(Element element, Map<String, BranchCollector> collectors) {
@@ -904,7 +997,13 @@ class DmSqlValidationTestGenerator {
                     Type[] genericTypes = mapperMethod.method.getGenericParameterTypes();
                     Object[] args = new Object[parameterTypes.length];
                     for (int i = 0; i < parameterTypes.length; i++) {
-                        ValueResult value = defaultValue(parameterName(mapperMethod.method, i), parameterTypes[i], genericTypes[i], 0);
+                        ValueResult value = defaultValue(
+                                parameterName(mapperMethod.method, i),
+                                parameterTypes[i],
+                                genericTypes[i],
+                                0,
+                                mapperMethod.statement
+                        );
                         if (!value.resolved) {
                             return ParameterResolution.unresolved("auto", value.message);
                         }
@@ -986,7 +1085,7 @@ class DmSqlValidationTestGenerator {
                     if (mapperMethod.parameterType == null || Object.class.equals(mapperMethod.parameterType) || Void.TYPE.equals(mapperMethod.parameterType)) {
                         return ParameterResolution.resolved("auto", new Object[] { null });
                     }
-                    ValueResult value = defaultValue(mapperMethod.parameterType, mapperMethod.parameterType, 0);
+                    ValueResult value = defaultValue(mapperMethod.parameterType, mapperMethod.parameterType, 0, mapperMethod.statement);
                     return value.resolved
                             ? ParameterResolution.resolved("auto", new Object[] { value.value })
                             : ParameterResolution.unresolved("auto", value.message);
@@ -1126,12 +1225,31 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private ValueResult defaultValue(Class<?> targetType, Type genericType, int depth) {
-                    return defaultValue("", targetType, genericType, depth);
+                    return defaultValue("", targetType, genericType, depth, null);
                 }
 
                 private ValueResult defaultValue(String valueName, Class<?> targetType, Type genericType, int depth) {
+                    return defaultValue(valueName, targetType, genericType, depth, null);
+                }
+
+                private ValueResult defaultValue(
+                        Class<?> targetType,
+                        Type genericType,
+                        int depth,
+                        MapperStatement statement
+                ) {
+                    return defaultValue("", targetType, genericType, depth, statement);
+                }
+
+                private ValueResult defaultValue(
+                        String valueName,
+                        Class<?> targetType,
+                        Type genericType,
+                        int depth,
+                        MapperStatement statement
+                ) {
                     if (String.class.equals(targetType)) {
-                        return ValueResult.resolved(defaultString(valueName));
+                        return ValueResult.resolved(defaultString(valueName, statement));
                     }
                     if (Integer.class.equals(targetType) || int.class.equals(targetType)) {
                         return ValueResult.resolved(1);
@@ -1183,13 +1301,19 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Optional.class.equals(targetType)) {
                         Type nestedType = firstGenericArgument(genericType);
-                        ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1);
+                        ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1, statement);
                         return nestedValue.resolved
                                 ? ValueResult.resolved(Optional.ofNullable(nestedValue.value))
                                 : ValueResult.resolved(Optional.empty());
                     }
                     if (targetType.isArray()) {
-                        ValueResult componentValue = defaultValue(valueName, targetType.getComponentType(), targetType.getComponentType(), depth + 1);
+                        ValueResult componentValue = defaultValue(
+                                valueName,
+                                targetType.getComponentType(),
+                                targetType.getComponentType(),
+                                depth + 1,
+                                statement
+                        );
                         if (!componentValue.resolved) {
                             return componentValue;
                         }
@@ -1204,8 +1328,18 @@ class DmSqlValidationTestGenerator {
                             }
                             return ValueResult.resolved(new ArrayList<>());
                         }
+                        Map<String, Object> collectionElementDefault = statement == null
+                                ? Map.of()
+                                : statement.collectionElementDefault(valueName);
+                        if (!collectionElementDefault.isEmpty()) {
+                            Map<String, Object> elementValue = new LinkedHashMap<>(collectionElementDefault);
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>(List.of(elementValue)));
+                            }
+                            return ValueResult.resolved(new ArrayList<>(List.of(elementValue)));
+                        }
                         Type nestedType = firstGenericArgument(genericType);
-                        ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1);
+                        ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1, statement);
                         if (!nestedValue.resolved) {
                             return nestedValue;
                         }
@@ -1216,7 +1350,14 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Map.class.isAssignableFrom(targetType)) {
                         Map<String, Object> value = new LinkedHashMap<>();
-                        value.put("key", "test");
+                        Map<String, Object> configuredDefaults = statement == null
+                                ? Map.of()
+                                : statement.collectionElementDefault(valueName);
+                        if (configuredDefaults.isEmpty()) {
+                            value.put("key", "test");
+                        } else {
+                            value.putAll(configuredDefaults);
+                        }
                         return ValueResult.resolved(value);
                     }
                     if (targetType.isEnum()) {
@@ -1228,13 +1369,20 @@ class DmSqlValidationTestGenerator {
                     if (depth > 1) {
                         return ValueResult.unresolved("Nested object is too complex for generated parameters: " + targetType.getName());
                     }
-                    return instantiatePojo(targetType, depth);
+                    return instantiatePojo(targetType, depth, statement);
                 }
 
                 private String defaultString(String valueName) {
+                    return defaultString(valueName, null);
+                }
+
+                private String defaultString(String valueName, MapperStatement statement) {
                     String normalized = normalizeName(valueName);
                     if (isOrderFieldName(normalized) || isOrderDirectionName(normalized)) {
                         return "";
+                    }
+                    if (statement != null && statement.dynamicIdentifierParameter(valueName)) {
+                        return "ID";
                     }
                     if (isDynamicIdentifierName(normalized)) {
                         return "ID";
@@ -1291,7 +1439,7 @@ class DmSqlValidationTestGenerator {
                             : valueName.replace("_", "").replace("-", "").toLowerCase(Locale.ROOT);
                 }
 
-                private ValueResult instantiatePojo(Class<?> targetType, int depth) {
+                private ValueResult instantiatePojo(Class<?> targetType, int depth, MapperStatement statement) {
                     if (targetType.isInterface() || Modifier.isAbstract(targetType.getModifiers())) {
                         return ValueResult.unresolved("Cannot instantiate parameter type: " + targetType.getName());
                     }
@@ -1306,7 +1454,13 @@ class DmSqlValidationTestGenerator {
                                 if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers)) {
                                     continue;
                                 }
-                                ValueResult fieldValue = defaultValue(field.getName(), field.getType(), field.getGenericType(), depth + 1);
+                                ValueResult fieldValue = defaultValue(
+                                        field.getName(),
+                                        field.getType(),
+                                        field.getGenericType(),
+                                        depth + 1,
+                                        statement
+                                );
                                 if (fieldValue.resolved) {
                                     field.setAccessible(true);
                                     field.set(instance, fieldValue.value);
@@ -1449,7 +1603,8 @@ class DmSqlValidationTestGenerator {
                     if (containsAnyPattern(countsByPattern,
                             "UPDATE_SET_TABLE_ORDER",
                             "TRAILING_COMMA",
-                            "INSERT_FOREACH_MISSING_VALUES")) {
+                            "INSERT_FOREACH_MISSING_VALUES",
+                            "MYSQL_UPDATE_JOIN")) {
                         markdown.append("- Re-run dm-adapter migrate and then this validation test; these patterns have strict automatic mapper-dm rewrites.\\n");
                     }
                     if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")) {
@@ -1458,12 +1613,19 @@ class DmSqlValidationTestGenerator {
                     if (containsAnyPattern(countsByPattern,
                             "NULL_COLLECTION_PARAMETER",
                             "BINDING_PARAMETER_NAME",
-                            "METHOD_ARGS_OR_BINDING_OTHER")
+                            "METHOD_ARGS_OR_BINDING_OTHER",
+                            "DYNAMIC_IDENTIFIER_PARAMETER",
+                            "RAW_SQL_PARAMETER",
+                            "GENERATED_ORDER_PARAMETER")
                             || countsByCategory.containsKey("METHOD_ARGS_OR_BINDING")) {
                         markdown.append("- Configure method args in sql-validation.yml, or inspect mapper @Param names when XML parameter names differ from Java method parameters.\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "ON_DUPLICATE_KEY_UPDATE",
+                            "INSERT_IGNORE",
+                            "MYSQL_GROUP_CONCAT",
+                            "MYSQL_FIND_IN_SET",
+                            "MYSQL_CONCAT_WS",
                             "REGEXP_OPERATOR",
                             "MYSQL_METADATA_SQL",
                             "SQL_SYNTAX_OTHER")) {
@@ -1607,6 +1769,33 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("information_schema") || lower.contains("database()")) {
                         return "MYSQL_METADATA_SQL";
                     }
+                    if (Pattern.compile("insert\\\\s+ignore\\\\s+into", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "INSERT_IGNORE";
+                    }
+                    if (Pattern.compile("\\\\bgroup_concat\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_GROUP_CONCAT";
+                    }
+                    if (Pattern.compile("\\\\bfind_in_set\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_FIND_IN_SET";
+                    }
+                    if (Pattern.compile("\\\\bconcat_ws\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_CONCAT_WS";
+                    }
+                    if (Pattern.compile("\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bjoin\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_UPDATE_JOIN";
+                    }
+                    if (isAutoParameter(record) && Pattern.compile("(?i)(\\\\bselect\\\\s+distinct\\\\s+from\\\\b|\\\\b[a-z_][a-z0-9_]*\\\\.1\\\\b|\\\\[\\\\.1])").matcher(message).find()) {
+                        return "DYNAMIC_IDENTIFIER_PARAMETER";
+                    }
+                    if (isAutoParameter(record) && Pattern.compile("(?m)^### SQL:\\\\s*test\\\\s*$").matcher(message).find()) {
+                        return "RAW_SQL_PARAMETER";
+                    }
+                    if (lower.contains("有歧义的列名")) {
+                        return "AMBIGUOUS_COLUMN";
+                    }
+                    if (Pattern.compile("\\\\bselect\\\\s+(?:distinct\\\\s+)?from\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "EMPTY_SELECT_LIST";
+                    }
                     if (Pattern.compile("order\\\\s+by\\\\s+test(?:\\\\s+test)?", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "GENERATED_ORDER_PARAMETER";
                     }
@@ -1647,6 +1836,10 @@ class DmSqlValidationTestGenerator {
                         return "TEST_DATA_OR_CONSTRAINT";
                     }
                     return category(record) + "_OTHER";
+                }
+
+                private boolean isAutoParameter(ValidationRecord record) {
+                    return record.parameterSource != null && record.parameterSource.startsWith("auto");
                 }
 
                 private boolean containsAnyPattern(Map<String, Long> countsByPattern, String... patterns) {
@@ -2425,17 +2618,75 @@ class DmSqlValidationTestGenerator {
                     private final String namespace;
                     private final String id;
                     private final List<SetBranchParameterVariant> setBranchParameterVariants;
+                    private final DynamicIdentifierMetadata dynamicIdentifierMetadata;
 
-                    private MapperStatement(String namespace, String id, List<SetBranchParameterVariant> setBranchParameterVariants) {
+                    private MapperStatement(
+                            String namespace,
+                            String id,
+                            List<SetBranchParameterVariant> setBranchParameterVariants,
+                            DynamicIdentifierMetadata dynamicIdentifierMetadata
+                    ) {
                         this.namespace = namespace;
                         this.id = id;
                         this.setBranchParameterVariants = List.copyOf(setBranchParameterVariants == null
                                 ? List.of()
                                 : setBranchParameterVariants);
+                        this.dynamicIdentifierMetadata = dynamicIdentifierMetadata == null
+                                ? new DynamicIdentifierMetadata()
+                                : dynamicIdentifierMetadata;
                     }
 
                     private String key() {
                         return namespace + "." + id;
+                    }
+
+                    private boolean dynamicIdentifierParameter(String valueName) {
+                        return dynamicIdentifierMetadata.dynamicIdentifierParameter(valueName);
+                    }
+
+                    private Map<String, Object> collectionElementDefault(String valueName) {
+                        return dynamicIdentifierMetadata.collectionElementDefault(valueName);
+                    }
+                }
+
+                private static final class DynamicIdentifierMetadata {
+                    private final Set<String> dynamicIdentifierNames = new LinkedHashSet<>();
+                    private final Map<String, Map<String, Object>> collectionElementDefaults = new LinkedHashMap<>();
+
+                    private void addDynamicIdentifierName(String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        if (!normalized.isBlank()) {
+                            dynamicIdentifierNames.add(normalized);
+                        }
+                    }
+
+                    private void addCollectionDefault(String collectionName, String propertyName, Object value) {
+                        String normalizedCollectionName = normalizeMetadataName(collectionName);
+                        if (normalizedCollectionName.isBlank() || propertyName == null || propertyName.isBlank()) {
+                            return;
+                        }
+                        collectionElementDefaults
+                                .computeIfAbsent(normalizedCollectionName, ignored -> new LinkedHashMap<>())
+                                .putIfAbsent(propertyName, value);
+                    }
+
+                    private boolean hasCollectionDefault(String collectionName) {
+                        return collectionElementDefaults.containsKey(normalizeMetadataName(collectionName));
+                    }
+
+                    private boolean dynamicIdentifierParameter(String valueName) {
+                        return dynamicIdentifierNames.contains(normalizeMetadataName(valueName));
+                    }
+
+                    private Map<String, Object> collectionElementDefault(String valueName) {
+                        Map<String, Object> defaults = collectionElementDefaults.get(normalizeMetadataName(valueName));
+                        return defaults == null ? Map.of() : defaults;
+                    }
+
+                    private static String normalizeMetadataName(String valueName) {
+                        return valueName == null
+                                ? ""
+                                : valueName.replace("_", "").replace("-", "").toLowerCase(Locale.ROOT);
                     }
                 }
 

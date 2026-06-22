@@ -336,6 +336,29 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesAsFromTableAliasesOnly() {
+        SqlConversionResult result = converter.convert("""
+                SELECT
+                    t1.user_id AS userId,
+                    t1.user_order AS userOrder
+                FROM ns_system_user_dd AS t1
+                LEFT JOIN ns_system_organization AS t2 ON t1.organization_id = t2.organization_id
+                WHERE t1.is_change = 0
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT
+                    t1.user_id AS userId,
+                    t1.user_order AS userOrder
+                FROM ns_system_user_dd t1
+                LEFT JOIN ns_system_organization t2 ON t1.organization_id = t2.organization_id
+                WHERE t1.is_change = 0
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_TABLE_ALIAS_AS_RULE);
+    }
+
+    @Test
     void convertsMysqlUpdateJoinToDamengUpdateFrom() {
         SqlConversionResult result = converter.convert("""
                 update ys_organization y inner join (

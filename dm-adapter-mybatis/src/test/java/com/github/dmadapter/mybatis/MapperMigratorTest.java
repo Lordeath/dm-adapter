@@ -511,6 +511,109 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateJoinWithSetBranchesIsRewrittenToUpdateFrom() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateByNsOrgByLevel">
+                        update
+                            ns_system_entry_org eo
+                            inner JOIN ns_system_organization o ON eo.${entryOrgParentId} = o.organization_parent_id
+                            AND eo.${entryOrgName} = o.ORGANIZATION_NAME
+                            AND o.is_deleted = 0
+                        <if test="'secondaryDepartment' ==  entryOrgLevel">
+                            set eo.secondaryDepartmentId = o.organization_id
+                        </if>
+                        <if test="'tertiaryDepartment' ==  entryOrgLevel">
+                            set eo.tertiaryDepartmentId = o.organization_id
+                        </if>
+                        WHERE
+                            eo.deleteFlag = 0
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("update ns_system_entry_org eo")
+                .contains("<if test=\"'secondaryDepartment' ==  entryOrgLevel\">")
+                .contains("set eo.secondaryDepartmentId = o.organization_id")
+                .contains("from ns_system_organization o")
+                .contains("where")
+                .contains("eo.${entryOrgParentId} = o.organization_parent_id")
+                .contains("and eo.deleteFlag = 0")
+                .doesNotContain("inner JOIN ns_system_organization");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
+    void dynamicUpdateJoinWithMultipleJoinsIsNotRewritten() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateComplex">
+                        update ys_organization a
+                        inner join ys_organization b on a.parent_id = b.id
+                        inner join ys_organization c on a.scope_id = c.id
+                        <if test="'x' == level">
+                            set a.parent_id = c.id
+                        </if>
+                        where a.is_deleted = 0
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("inner join ys_organization b")
+                .contains("inner join ys_organization c")
+                .doesNotContain("from ys_organization b");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicSqlTextNodesRewriteDoubleQuotedStringLiterals() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
