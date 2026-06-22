@@ -46,17 +46,31 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--mapper-dir", description = "Target mapper directory. Defaults to src/main/resources/mapper-dm.")
     private Path mapperDir;
 
+    @Option(names = "--generate-validation-test", description = "Generate the Dameng SQL validation test after migration.")
+    private boolean generateValidationTest;
+
+    @Option(names = "--app-module", description = "Application module path used for generated validation test placement; implies --generate-validation-test.")
+    private Path appModule;
+
+    @Option(names = "--config", description = "Validation config path; implies --generate-validation-test. Defaults to <project>/.dm-adapter/sql-validation.yml.")
+    private Path config;
+
+    @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods in the generated validation test; implies --generate-validation-test.")
+    private String schema;
+
     private final ProjectScanner projectScanner = new ProjectScanner();
     private final PomModifier pomModifier = new PomModifier();
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
     private final MapperMigrator mapperMigrator = new MapperMigrator();
     private final ReportWriter reportWriter = new ReportWriter();
+    private final DmSqlValidationTestGenerator validationTestGenerator = new DmSqlValidationTestGenerator();
 
     @Override
     public Integer call() {
         try {
             AdapterContext context = buildContext();
             validateSupportedDatabases(context);
+            validateValidationTestGeneration(context);
             ProjectScanResult scanResult = projectScanner.scan(context);
 
             List<FileChange> fileChanges = new ArrayList<>();
@@ -108,6 +122,16 @@ public class MigrateCommand implements Callable<Integer> {
                     warnings
             );
             printMigrationSummary(context, scanResult, mapperMigrationResult, fileChanges, reportPaths);
+            if (validationTestGenerationRequested()) {
+                ValidationTestGenerationResult validationResult = validationTestGenerator.generate(
+                        context.projectRoot(),
+                        appModule,
+                        mapperDir,
+                        config,
+                        schema
+                );
+                GenerateValidationTestCommand.printResult(validationResult);
+            }
             return 0;
         } catch (Exception e) {
             CliLogger.error("Migration failed: " + e.getMessage());
@@ -133,6 +157,16 @@ public class MigrateCommand implements Callable<Integer> {
         if (!"dm".equals(context.targetDb())) {
             throw new DmAdapterException("MVP only supports --target-db dm.");
         }
+    }
+
+    private void validateValidationTestGeneration(AdapterContext context) {
+        if (validationTestGenerationRequested() && context.dryRun()) {
+            throw new DmAdapterException("Validation test generation cannot be used with --dry-run because it writes files.");
+        }
+    }
+
+    private boolean validationTestGenerationRequested() {
+        return generateValidationTest || appModule != null || config != null || (schema != null && !schema.isBlank());
     }
 
     private ReportPaths writeReport(
