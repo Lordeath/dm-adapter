@@ -16,7 +16,7 @@ class ProjectScanner {
     private final MapperXmlScanner mapperXmlScanner;
 
     ProjectScanner() {
-        this(new PomAnalyzer(), new MapperXmlScanner());
+        this(new PomAnalyzer(line -> CliLogger.info("[mvn] " + line)), new MapperXmlScanner());
     }
 
     ProjectScanner(PomAnalyzer pomAnalyzer, MapperXmlScanner mapperXmlScanner) {

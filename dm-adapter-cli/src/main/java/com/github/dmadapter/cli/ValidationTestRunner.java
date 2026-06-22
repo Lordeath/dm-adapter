@@ -1,7 +1,11 @@
 package com.github.dmadapter.cli;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
@@ -12,6 +16,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 
 class ValidationTestRunner {
     private static final int MAX_PATH_CANDIDATES = 20;
@@ -21,6 +30,7 @@ class ValidationTestRunner {
     private final String osName;
     private final ProcessStarter processStarter;
     private final ShutdownHookRegistry shutdownHookRegistry;
+    private final Consumer<String> mavenOutputConsumer;
 
     ValidationTestRunner() {
         this(System.getenv(), System.getProperty("os.name", ""), ProcessBuilder::start);
@@ -36,6 +46,16 @@ class ValidationTestRunner {
             ProcessStarter processStarter,
             ShutdownHookRegistry shutdownHookRegistry
     ) {
+        this(processEnvironment, osName, processStarter, shutdownHookRegistry, CliLogger::info);
+    }
+
+    ValidationTestRunner(
+            Map<String, String> processEnvironment,
+            String osName,
+            ProcessStarter processStarter,
+            ShutdownHookRegistry shutdownHookRegistry,
+            Consumer<String> mavenOutputConsumer
+    ) {
         this.processEnvironment = Map.copyOf(processEnvironment == null ? Map.of() : processEnvironment);
         this.osName = osName == null ? "" : osName;
         if (processStarter == null) {
@@ -48,6 +68,8 @@ class ValidationTestRunner {
         } else {
             this.shutdownHookRegistry = shutdownHookRegistry;
         }
+        this.mavenOutputConsumer = mavenOutputConsumer == null ? line -> {
+        } : mavenOutputConsumer;
     }
 
     @FunctionalInterface
@@ -94,16 +116,21 @@ class ValidationTestRunner {
         Thread shutdownHook = null;
         boolean completed = false;
         try {
+            publishMavenOutput("Running Maven validation test: " + command);
             process = processStarter.start(processBuilder);
             shutdownHook = registerShutdownHook(process);
-            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            Process runningProcess = process;
+            CompletableFuture<String> output = CompletableFuture.supplyAsync(
+                    () -> readMavenOutput(runningProcess.getInputStream(), environment)
+            );
             int exitCode = process.waitFor();
+            String mavenOutput = output.get(5, TimeUnit.SECONDS);
             completed = true;
             return new ValidationTestRunResult(
                     true,
                     exitCode,
                     generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
-                    runDiagnostics(command, workingDirectory, output, environment, generationResult.projectRoot()),
+                    runDiagnostics(command, workingDirectory, mavenOutput, environment, generationResult.projectRoot()),
                     exitCode == 0
                             ? "Dameng SQL validation test passed."
                             : "Dameng SQL validation test exited with code " + exitCode + "."
@@ -127,6 +154,21 @@ class ValidationTestRunner {
                     generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
                     diagnostics,
                     message
+            );
+        } catch (ExecutionException | TimeoutException e) {
+            String readFailure = mavenOutputReadFailure(e);
+            return new ValidationTestRunResult(
+                    true,
+                    1,
+                    generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
+                    runDiagnostics(
+                            command,
+                            workingDirectory,
+                            readFailure,
+                            environment,
+                            generationResult.projectRoot()
+                    ),
+                    "Failed to read Maven validation output: " + readFailure
             );
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -219,6 +261,38 @@ class ValidationTestRunner {
         } catch (RuntimeException e) {
             // Nothing else can be done if the JVM cannot destroy this process.
         }
+    }
+
+    private String readMavenOutput(InputStream inputStream, DmValidationEnvironment environment) {
+        StringBuilder output = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append('\n');
+                publishMavenOutput(redact(line, environment));
+            }
+            return output.toString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private void publishMavenOutput(String line) {
+        mavenOutputConsumer.accept("[mvn] " + line);
+    }
+
+    private String mavenOutputReadFailure(Exception exception) {
+        Throwable cause = exception;
+        if (exception instanceof ExecutionException && exception.getCause() != null) {
+            cause = exception.getCause();
+        }
+        if (cause instanceof UncheckedIOException && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        String message = cause.getMessage();
+        return message == null || message.isBlank()
+                ? cause.getClass().getSimpleName()
+                : cause.getClass().getSimpleName() + ": " + message;
     }
 
     private List<String> runDiagnostics(

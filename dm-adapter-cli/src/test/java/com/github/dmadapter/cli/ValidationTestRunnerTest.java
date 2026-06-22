@@ -7,11 +7,16 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PipedInputStream;
+import java.io.PipedOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -94,6 +99,48 @@ class ValidationTestRunnerTest {
                 .anySatisfy(line -> assertThat(line).contains("Working directory: " + tempDir))
                 .anySatisfy(line -> assertThat(line).contains("maven output"));
         assertThat(shutdownHooks.addedHook).isSameAs(shutdownHooks.removedHook);
+    }
+
+    @Test
+    void streamsMavenOutputBeforeProcessExitsAndRedactsSecrets() throws Exception {
+        List<String> streamedLines = new ArrayList<>();
+        CountDownLatch redactedLineStreamed = new CountDownLatch(1);
+        StreamingProcess process = new StreamingProcess(
+                "connecting jdbc:dm://localhost:5236 app_user secret\n",
+                redactedLineStreamed
+        );
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> process,
+                new RecordingShutdownHookRegistry(),
+                line -> {
+                    streamedLines.add(line);
+                    if (line.contains("connecting ****** ****** ******")) {
+                        redactedLineStreamed.countDown();
+                    }
+                }
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "app_user",
+                        "DM_DB_PASSWORD", "secret"
+                ))
+        );
+
+        assertThat(result.message()).contains("passed");
+        assertThat(process.outputObservedBeforeExit).isTrue();
+        assertThat(streamedLines)
+                .anySatisfy(line -> assertThat(line).contains("[mvn] Running Maven validation test: [mvn"))
+                .anySatisfy(line -> assertThat(line).contains("[mvn] connecting ****** ****** ******"));
+        assertThat(String.join("\n", streamedLines))
+                .doesNotContain("jdbc:dm://localhost:5236")
+                .doesNotContain("app_user")
+                .doesNotContain("secret");
     }
 
     @Test
@@ -289,6 +336,80 @@ class ValidationTestRunnerTest {
         public boolean remove(Thread hook) {
             removedHook = hook;
             return true;
+        }
+    }
+
+    private static class StreamingProcess extends Process {
+        private final PipedInputStream inputStream;
+        private final PipedOutputStream outputStream;
+        private final String output;
+        private final CountDownLatch outputObserved;
+        private boolean alive = true;
+        private boolean outputObservedBeforeExit;
+
+        private StreamingProcess(String output, CountDownLatch outputObserved) throws IOException {
+            this.inputStream = new PipedInputStream();
+            this.outputStream = new PipedOutputStream(inputStream);
+            this.output = output;
+            this.outputObserved = outputObserved;
+        }
+
+        @Override
+        public OutputStream getOutputStream() {
+            return OutputStream.nullOutputStream();
+        }
+
+        @Override
+        public InputStream getInputStream() {
+            return inputStream;
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            return InputStream.nullInputStream();
+        }
+
+        @Override
+        public int waitFor() throws InterruptedException {
+            try {
+                outputStream.write(output.getBytes(StandardCharsets.UTF_8));
+                outputStream.flush();
+                outputObservedBeforeExit = outputObserved.await(2, TimeUnit.SECONDS);
+                outputStream.close();
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+            alive = false;
+            return 0;
+        }
+
+        @Override
+        public int exitValue() {
+            if (alive) {
+                throw new IllegalThreadStateException();
+            }
+            return 0;
+        }
+
+        @Override
+        public void destroy() {
+            alive = false;
+        }
+
+        @Override
+        public Process destroyForcibly() {
+            alive = false;
+            return this;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return alive;
+        }
+
+        @Override
+        public ProcessHandle toHandle() {
+            throw new UnsupportedOperationException("test process has no handle");
         }
     }
 
