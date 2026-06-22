@@ -11,9 +11,9 @@
 - 检查 `pom.xml` 是否已有达梦 JDBC 驱动依赖。
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
 - 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页、`DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`、`CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`、`FROM/JOIN ... AS 别名` -> `FROM/JOIN ... 别名`，并将 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦特殊列名重命名为追加下划线形式。
-- 支持通过 `.dm-adapter/sql-rewrite.yml` 的 `keyColumns` 配置，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；未配置时保持原 SQL 并生成配置模板。
+- 支持通过 `.dm-adapter/sql-rewrite.yml` 的 `keyColumns` 配置，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；配置达梦验证环境变量后，`migrate` 会优先从测试库主键/唯一键元数据自动推断并维护该配置，无法确认时保留原 SQL 并写入报告。
 - 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore、反引号标识符等标记为人工确认。
-- 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类和 `.dm-adapter/sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean。
+- 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类和 `.dm-adapter/sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean；若 `DM_SQL_VALIDATION=true` 且连接环境变量齐全，生成后会自动执行一次验证测试并输出报告路径。
 - 输出 Markdown 和 JSON 报告到 `.dm-adapter/`。
 
 ## 达梦特殊列名重写注意事项
@@ -35,14 +35,14 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 
-# 需要将 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写为 MERGE 时，先填写生成的 keyColumns 配置再重跑 migrate。
+# 需要将 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写为 MERGE 时，可通过 sql-rewrite.yml 显式配置 keyColumns。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --rewrite-config .dm-adapter/sql-rewrite.yml
 
 # 也可以在 migrate 后自动生成 SQL 验证测试；传入 --app-module、--schema 或 --config 会自动触发生成。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 
-生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。需要在达梦测试环境显式运行，例如：
+生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。配置以下环境变量后，`generate-validation-test` 会在生成后自动运行一次；也可以在达梦测试环境中手动运行：
 
 ```bash
 DM_SQL_VALIDATION=true \
@@ -53,6 +53,8 @@ mvn -Dtest=DmSqlValidationTest test
 ```
 
 测试直接用 `.dm-adapter/sql-validation.yml` 中的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。配置 `--schema` 后，测试会在每次 DAO 调用前执行 `set schema "<schema>"`，可支持 `sample-system` 这类需要双引号的 schema 名。运行时控制台会输出 `[dm-sql-validation]` 前缀的进度日志，包括 mapper XML 加载数量、当前执行的 mapper 方法和通过/失败/跳过结果。执行结果写入 `.dm-adapter/sql-validation-report.md` 和 `.dm-adapter/sql-validation-report.json`，报告会按 SQL 兼容、测试库结构、测试数据/约束等类别汇总失败，并把长错误放到详情区。
+
+同一组环境变量也会被 `migrate` 用于只读读取达梦元数据：优先使用 CLI `--schema` / `.dm-adapter/sql-validation.yml` 中的 `schema`，其次使用 JDBC URL 的 `schema` 参数、连接默认 schema 或用户名。自动推断只写入表名、方法名和 `keyColumns`，不会把连接串、用户名或密码写入仓库文件。
 
 ## 模块结构
 

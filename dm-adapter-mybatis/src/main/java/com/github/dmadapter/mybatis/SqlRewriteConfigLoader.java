@@ -38,12 +38,16 @@ public class SqlRewriteConfigLoader {
                 currentName = "";
                 continue;
             }
-            if (indent == 2 && "upsertKeys".equals(section) && "tables:".equals(trimmed)) {
+            if (indent == 2
+                    && ("upsertKeys".equals(section) || "tables".equals(section) || "methods".equals(section))
+                    && "tables:".equals(trimmed)) {
                 section = "tables";
                 currentName = "";
                 continue;
             }
-            if (indent == 2 && "upsertKeys".equals(section) && "methods:".equals(trimmed)) {
+            if (indent == 2
+                    && ("upsertKeys".equals(section) || "tables".equals(section) || "methods".equals(section))
+                    && "methods:".equals(trimmed)) {
                 section = "methods";
                 currentName = "";
                 continue;

@@ -67,7 +67,14 @@ class DmSqlValidationTestGenerator {
                 fileChanges,
                 warnings
         );
-        return new ValidationTestGenerationResult(actualConfigPath, testPath, fileChanges, warnings);
+        return new ValidationTestGenerationResult(
+                normalizedRoot,
+                applicationModule.moduleRoot(),
+                actualConfigPath,
+                testPath,
+                fileChanges,
+                warnings
+        );
     }
 
     private Path resolveProjectPath(Path projectRoot, Path configuredPath, String defaultRelativePath) {
