@@ -143,7 +143,8 @@ class DmAdapterCliTest {
                 .contains("includedMethods:")
                 .contains("excludedMethods:")
                 .contains("com.example.UserMapper.selectUsers")
-                .contains("com.example.UserMapper.selectByDate");
+                .contains("com.example.UserMapper.selectByDate")
+                .contains("com.example.UserMapper.updateByLevel");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
                 .contains("@Tag(\"dm-sql-validation\")")
@@ -173,6 +174,11 @@ class DmAdapterCliTest {
                 .contains("failurePatterns")
                 .contains("INSERT_FOREACH_MISSING_VALUES")
                 .contains("containsAnyPattern")
+                .contains("resolveParameterVariants")
+                .contains("setBranchParameterVariants")
+                .contains("SetBranchParameterVariant")
+                .contains("BranchCollector")
+                .contains("recordKey(mapperMethod.key())")
                 .contains("parameterName")
                 .contains("defaultString")
                 .contains("set schema")
@@ -300,6 +306,18 @@ class DmAdapterCliTest {
                     <select id="selectByDate">
                         select DATE_FORMAT(created_at, '%Y-%m-%d') from user
                     </select>
+                    <update id="updateByLevel">
+                        update user_org
+                        <if test="'primaryDepartment' == entryOrgLevel">
+                            set primary_department_id = #{item.primaryDepartmentId}
+                            where primary_department = #{item.primaryDepartment}
+                        </if>
+                        <if test="'secondaryDepartment' == entryOrgLevel">
+                            set secondary_department_id = #{item.secondaryDepartmentId}
+                            where secondary_department = #{item.secondaryDepartment}
+                        </if>
+                        and audit_status = 1
+                    </update>
                 </mapper>
                 """);
     }
