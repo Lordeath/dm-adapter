@@ -259,6 +259,8 @@ class DmAdapterCliTest {
                 .contains("recordKey(mapperMethod.key())")
                 .contains("parameterName")
                 .contains("defaultString")
+                .contains("optionalSecret(resolvePlaceholders(config.datasource.password), \"datasource.password\")")
+                .contains("references an unresolved placeholder")
                 .contains("set schema")
                 .contains("quotedIdentifier(config.schema)")
                 .doesNotContain("@SpringBootTest")
