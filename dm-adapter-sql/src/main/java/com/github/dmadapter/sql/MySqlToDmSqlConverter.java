@@ -79,6 +79,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add("NOW_TO_SYSDATE");
         }
 
+        DamengReservedColumnRenamer.RenameResult renameResult =
+                DamengReservedColumnRenamer.renameBareIdentifiers(converted);
+        if (renameResult.changed()) {
+            converted = renameResult.convertedSql();
+            rules.add(DamengReservedColumnRenamer.RULE_NAME);
+        }
+
         LimitConversion limitConversion = convertLimit(converted);
         if (limitConversion.manualReviewReason() != null) {
             return SqlConversionResult.manualReview(original, limitConversion.manualReviewReason());

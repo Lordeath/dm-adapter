@@ -66,6 +66,47 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void renamesDamengReservedColumnNames() {
+        SqlConversionResult result = converter.convert("""
+                select rowid, ROWNUM, TRXID, phyrowid, versions_starttime, versions_endtime,
+                       versions_starttrxid, versions_endtrxid, versions_operation
+                from user
+                where u.rowid = #{rowid} and rownum = #{rownum} and trxid = ${trxid}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select rowid_, ROWNUM_, TRXID_, phyrowid_, versions_starttime_, versions_endtime_,
+                       versions_starttrxid_, versions_endtrxid_, versions_operation_
+                from user
+                where u.rowid_ = #{rowid} and rownum_ = #{rownum} and trxid_ = ${trxid}
+                """);
+        assertThat(result.appliedRules()).containsExactly("DAMENG_RESERVED_COLUMN_RENAME");
+    }
+
+    @Test
+    void doesNotRenameReservedColumnNamesInsideStringsCommentsOrPlaceholders() {
+        SqlConversionResult result = converter.convert("""
+                select rowid from user
+                where note = 'rowid trxid'
+                  and id = #{rowid}
+                  and name = ${trxid}
+                -- rowid comment
+                /* trxid comment */
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select rowid_ from user
+                where note = 'rowid trxid'
+                  and id = #{rowid}
+                  and name = ${trxid}
+                -- rowid comment
+                /* trxid comment */
+                """);
+    }
+
+    @Test
     void convertsSimpleLimitWithOffset() {
         SqlConversionResult result = converter.convert("select * from user order by id limit 10, 20");
 

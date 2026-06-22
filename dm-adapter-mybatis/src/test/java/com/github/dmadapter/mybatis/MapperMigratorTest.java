@@ -153,6 +153,36 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRenamesDamengReservedColumnNamesInMapperSql() throws Exception {
+        Path mapper = writeMapper(
+                "src/main/resources/mapper/UserMapper.xml",
+                "select rowid, trxid, rownum from user where rowid = #{rowid} and trxid = #{trxid}"
+        );
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path copied = tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml");
+        assertThat(Files.readString(copied))
+                .contains("select rowid_, trxid_, rownum_ from user where rowid_ = #{rowid} and trxid_ = #{trxid}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly("DAMENG_RESERVED_COLUMN_RENAME");
+    }
+
+    @Test
     void rewritingPreservesMapperDoctypeAndUnchangedFormatting() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
