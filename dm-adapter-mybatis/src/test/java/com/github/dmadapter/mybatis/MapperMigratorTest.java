@@ -346,6 +346,171 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicMapOnDuplicateKeyUpdateIsRewrittenToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateExtend">
+                        <if test="dynamicMap != null and !dynamicMap.isEmpty()">
+                            INSERT INTO ns_organization_and_employees_extend (foreignerKeyId
+                            <foreach collection="dynamicMap.keys" item="key" open="," separator=",">
+                                ${key}
+                            </foreach>
+                            )
+                            VALUES (#{userId, jdbcType=BIGINT}
+                            <foreach collection="dynamicMap.values" item="value" open="," separator=",">
+                                #{value}
+                            </foreach>
+                            )
+                            ON DUPLICATE KEY UPDATE
+                            <foreach collection="dynamicMap" index="key" item="value" separator=",">
+                                ${key} = VALUES(${key})
+                            </foreach>
+                        </if>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("<if test=\"dynamicMap != null and !dynamicMap.isEmpty()\">")
+                .contains("MERGE INTO ns_organization_and_employees_extend t")
+                .contains("SELECT #{userId, jdbcType=BIGINT} AS foreignerKeyId")
+                .contains("<foreach collection=\"dynamicMap\" index=\"key\" item=\"value\">")
+                .contains(", #{value} AS ${key}")
+                .contains("ON (t.foreignerKeyId = s.foreignerKeyId)")
+                .contains("t.${key} = s.${key}")
+                .contains("s.${key}")
+                .doesNotContain("ON DUPLICATE KEY UPDATE")
+                .doesNotContain("VALUES(${key})");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
+    void dynamicMapOnDuplicateKeyUpdateWithDifferentMapNamesIsNotRewrittenToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateExtend">
+                        INSERT INTO ns_organization_and_employees_extend (foreignerKeyId
+                        <foreach collection="dynamicMap.keys" item="key" open="," separator=",">
+                            ${key}
+                        </foreach>
+                        )
+                        VALUES (#{userId, jdbcType=BIGINT}
+                        <foreach collection="otherMap.values" item="value" open="," separator=",">
+                            #{value}
+                        </foreach>
+                        )
+                        ON DUPLICATE KEY UPDATE
+                        <foreach collection="dynamicMap" index="key" item="value" separator=",">
+                            ${key} = VALUES(${key})
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("ON DUPLICATE KEY UPDATE")
+                .doesNotContain("MERGE INTO");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
+    void dynamicMapOnDuplicateKeyUpdateWithNonValuesAssignmentIsNotRewrittenToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateExtend">
+                        INSERT INTO ns_organization_and_employees_extend (foreignerKeyId
+                        <foreach collection="dynamicMap.keys" item="key" open="," separator=",">
+                            ${key}
+                        </foreach>
+                        )
+                        VALUES (#{userId, jdbcType=BIGINT}
+                        <foreach collection="dynamicMap.values" item="value" open="," separator=",">
+                            #{value}
+                        </foreach>
+                        )
+                        ON DUPLICATE KEY UPDATE
+                        <foreach collection="dynamicMap" index="key" item="value" separator=",">
+                            ${key} = #{value}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("ON DUPLICATE KEY UPDATE")
+                .doesNotContain("MERGE INTO");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicSqlTextNodesRewriteDoubleQuotedStringLiterals() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
