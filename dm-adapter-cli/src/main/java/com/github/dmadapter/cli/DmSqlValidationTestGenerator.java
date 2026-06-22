@@ -390,6 +390,7 @@ class DmSqlValidationTestGenerator {
             import java.time.LocalDate;
             import java.time.LocalDateTime;
             import java.time.LocalTime;
+            import java.time.format.DateTimeFormatter;
             import java.util.ArrayList;
             import java.util.Collection;
             import java.util.Comparator;
@@ -416,6 +417,8 @@ class DmSqlValidationTestGenerator {
                 private static final String MARKDOWN_REPORT = ".dm-adapter/sql-validation-report.md";
                 private static final String JSON_REPORT = ".dm-adapter/sql-validation-report.json";
                 private static final Pattern PLACEHOLDER = Pattern.compile("\\\\$\\\\{([^}]+)}");
+                private static final DateTimeFormatter LOG_TIMESTAMP_FORMATTER =
+                        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
                 @Test
                 void validateMappedDaoSql() throws Exception {
@@ -1647,7 +1650,8 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private void log(String message) {
-                    System.out.println("[dm-sql-validation] " + message);
+                    System.out.println("[" + LocalDateTime.now().format(LOG_TIMESTAMP_FORMATTER)
+                            + "] [dm-sql-validation] " + message);
                 }
 
                 private String abbreviate(String value, int maxLength) {

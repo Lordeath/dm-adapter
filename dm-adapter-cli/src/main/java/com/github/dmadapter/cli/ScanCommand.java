@@ -35,16 +35,16 @@ public class ScanCommand implements Callable<Integer> {
                     .build();
             ProjectScanResult scanResult = projectScanner.scan(context);
             ReportPaths reportPaths = reportWriter.writeScanReport(scanResult, context.reportDir());
-            System.out.println("Scan completed.");
-            System.out.println("Maven project: " + scanResult.mavenProject());
-            System.out.println("Spring Boot project: " + scanResult.springBootProject());
-            System.out.println("MyBatis XML project: " + scanResult.myBatisProject());
-            System.out.println("Has Dameng JDBC driver: " + scanResult.hasDmJdbcDriver());
-            System.out.println("Mapper XML files: " + scanResult.mapperXmlFiles().size());
-            System.out.println("Report: " + reportPaths.markdownPath());
+            CliLogger.info("Scan completed.");
+            CliLogger.info("Maven project: " + scanResult.mavenProject());
+            CliLogger.info("Spring Boot project: " + scanResult.springBootProject());
+            CliLogger.info("MyBatis XML project: " + scanResult.myBatisProject());
+            CliLogger.info("Has Dameng JDBC driver: " + scanResult.hasDmJdbcDriver());
+            CliLogger.info("Mapper XML files: " + scanResult.mapperXmlFiles().size());
+            CliLogger.info("Report: " + reportPaths.markdownPath());
             return 0;
         } catch (Exception e) {
-            System.err.println("Scan failed: " + e.getMessage());
+            CliLogger.error("Scan failed: " + e.getMessage());
             return 1;
         }
     }

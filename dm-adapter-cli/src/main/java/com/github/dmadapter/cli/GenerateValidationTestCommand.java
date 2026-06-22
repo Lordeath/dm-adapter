@@ -33,19 +33,19 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
     public Integer call() {
         try {
             ValidationTestGenerationResult result = generator.generate(project, appModule, mapperDir, config, schema);
-            System.out.println("Dameng SQL validation test generation completed.");
-            System.out.println("Config: " + result.configPath());
-            System.out.println("Test: " + result.testPath());
-            System.out.println("File changes: " + result.fileChanges().size());
+            CliLogger.info("Dameng SQL validation test generation completed.");
+            CliLogger.info("Config: " + result.configPath());
+            CliLogger.info("Test: " + result.testPath());
+            CliLogger.info("File changes: " + result.fileChanges().size());
             for (FileChange fileChange : result.fileChanges()) {
-                System.out.println("- " + fileChange.changeType() + " " + fileChange.path());
+                CliLogger.info("- " + fileChange.changeType() + " " + fileChange.path());
             }
             for (String warning : result.warnings()) {
-                System.out.println("Warning: " + warning);
+                CliLogger.info("Warning: " + warning);
             }
             return 0;
         } catch (Exception e) {
-            System.err.println("Validation test generation failed: " + e.getMessage());
+            CliLogger.error("Validation test generation failed: " + e.getMessage());
             return 1;
         }
     }
