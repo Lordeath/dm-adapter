@@ -84,6 +84,20 @@ public class MapperXmlRewriter {
         for (Element statement : statementElements(document)) {
             String statementId = statement.getAttribute("id");
             String originalSql = statement.getTextContent();
+            if (statementId.isBlank()) {
+                String reason = missingStatementIdReason(reportPath, statement.getTagName());
+                manualReviewItems.add(new SqlChange(
+                        reportPath,
+                        "(missing id: <" + statement.getTagName() + ">)",
+                        originalSql,
+                        originalSql,
+                        List.of(),
+                        true,
+                        reason
+                ));
+                warnings.add(reason);
+                continue;
+            }
             if (hasElementChild(statement)) {
                 manualReviewItems.add(new SqlChange(
                         reportPath,
@@ -153,6 +167,12 @@ public class MapperXmlRewriter {
             writeReplacements(inputPath, replacements);
         }
         return new MapperRewriteResult(automaticConversions, manualReviewItems, warnings);
+    }
+
+    private String missingStatementIdReason(String reportPath, String tagName) {
+        return "Mapper XML statement <" + tagName + "> is missing required id attribute in "
+                + reportPath
+                + ". dm-adapter cannot safely locate this statement for text-preserving rewrite; add an id to the MyBatis statement or exclude this XML from mapper-locations if it is not a mapper.";
     }
 
     private String readXml(Path path) {
