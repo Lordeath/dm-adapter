@@ -73,8 +73,55 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("user_password = to_base64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,'XXXXXXXX')) ,");
-        assertThat(result.appliedRules()).containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+                .isEqualTo("user_password = TO_BASE64(SF_ENCRYPT_CHAR(#{userPassword, jdbcType=VARCHAR }, 513, 'XXXXXXXX', NULL)) ,");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
+                );
+    }
+
+    @Test
+    void convertsBase64WrappedAesDecryptToDamengAes128Ecb() {
+        SqlConversionResult result = converter.convert(
+                "select AES_DECRYPT(FROM_BASE64(user_password), 'XXXXXXXX') from user"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select SF_DECRYPT_TO_CHAR(FROM_BASE64(user_password), 513, 'XXXXXXXX', NULL) from user");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE);
+    }
+
+    @Test
+    void marksUnsupportedAesFormsForManualReview() {
+        List<String> sqlItems = List.of(
+                "select AES_ENCRYPT(name, 'XXXXXXXX') from user",
+                "select TO_BASE64(AES_ENCRYPT(name, #{aesKey})) from user",
+                "select AES_DECRYPT(password, 'XXXXXXXX') from user"
+        );
+
+        for (String sql : sqlItems) {
+            SqlConversionResult result = converter.convert(sql);
+
+            assertThat(result.manualReviewRequired()).isTrue();
+            assertThat(result.changed()).isFalse();
+            assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+            assertThat(result.reason()).contains("Base64-wrapped AES password SQL");
+        }
+    }
+
+    @Test
+    void doesNotTreatAesTextInsideStringsOrCommentsAsFunctionCalls() {
+        SqlConversionResult result = converter.convert("""
+                select 'AES_DECRYPT(FROM_BASE64(user_password), ''XXXXXXXX'')' as sample
+                -- AES_ENCRYPT(name, 'XXXXXXXX')
+                from user
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isFalse();
     }
 
     @Test

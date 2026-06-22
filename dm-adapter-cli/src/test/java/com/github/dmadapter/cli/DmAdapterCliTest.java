@@ -75,6 +75,44 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateRewritesAesPasswordSqlAndRedactsReports() throws Exception {
+        writeDemoProject();
+        Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <select id="selectPassword">
+                        select AES_DECRYPT(FROM_BASE64(user_password), 'REAL_SECRET') from user
+                    </select>
+                    <update id="updatePassword">
+                        update user
+                        set user_password = TO_BASE64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR}, 'REAL_SECRET'))
+                        where user_id = #{userId}
+                    </update>
+                </mapper>
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+
+        assertThat(exitCode).isZero();
+        String migratedMapper = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(migratedMapper)
+                .contains("SF_DECRYPT_TO_CHAR(FROM_BASE64(user_password), 513, 'REAL_SECRET', NULL)")
+                .contains("TO_BASE64(SF_ENCRYPT_CHAR(#{userPassword, jdbcType=VARCHAR}, 513, 'REAL_SECRET', NULL))");
+        String markdown = Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md"));
+        String json = Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.json"));
+        assertThat(markdown)
+                .contains("AES128_ECB")
+                .contains("RESET_REQUIRED")
+                .contains("'******'")
+                .doesNotContain("REAL_SECRET");
+        assertThat(json)
+                .contains("'******'")
+                .doesNotContain("REAL_SECRET");
+    }
+
+    @Test
     void generateValidationTestWritesConfigAndMyBatisJdbcTest() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");

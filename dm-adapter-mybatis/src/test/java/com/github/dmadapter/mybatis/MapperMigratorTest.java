@@ -298,11 +298,14 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
                 .contains("<if test=\"userPassword != null\">")
-                .contains("AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,'XXXXXXXX')")
+                .contains("TO_BASE64(SF_ENCRYPT_CHAR(#{userPassword, jdbcType=VARCHAR }, 513, 'XXXXXXXX', NULL))")
                 .doesNotContain(",\"XXXXXXXX\"");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
+                );
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }

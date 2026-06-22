@@ -95,6 +95,9 @@ public class MigrateCommand implements Callable<Integer> {
             );
             fileChanges.addAll(mapperMigrationResult.fileChanges());
             warnings.addAll(mapperMigrationResult.warnings());
+            if (hasAesBase64Conversion(mapperMigrationResult)) {
+                warnings.addAll(aesBase64ConversionWarnings());
+            }
 
             ReportPaths reportPaths = writeReport(
                     context,
@@ -152,6 +155,20 @@ public class MigrateCommand implements Callable<Integer> {
                 warnings
         );
         return reportWriter.writeMigrationReport(report, context.reportDir());
+    }
+
+    private boolean hasAesBase64Conversion(MapperMigrationResult mapperMigrationResult) {
+        return mapperMigrationResult.automaticConversions().stream()
+                .flatMap(sqlChange -> sqlChange.appliedRules().stream())
+                .anyMatch(MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE::equals);
+    }
+
+    private List<String> aesBase64ConversionWarnings() {
+        return List.of(
+                "AES password SQL was rewritten to Dameng AES128_ECB with cipher ID 513. Verify the target database with: SELECT CYT_ID, CYT_NAME FROM V$CIPHERS WHERE CYT_NAME = 'AES128_ECB';",
+                "AES128_ECB rewrite keeps existing SQL-layer encryption behavior for compatibility; it is not a password-storage security upgrade, and old MySQL ciphertext is not guaranteed to decrypt on Dameng.",
+                "Legacy password handling template (manual, not executed): UPDATE user_table SET user_password = TO_BASE64(SF_ENCRYPT_CHAR('RESET_REQUIRED', 513, '<AES_KEY>', NULL)) WHERE user_password IS NOT NULL;"
+        );
     }
 
     private void printMigrationSummary(

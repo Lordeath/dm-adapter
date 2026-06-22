@@ -10,6 +10,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MySqlToDmSqlConverter implements SqlConverter {
+    public static final String MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE = "MYSQL_AES_BASE64_TO_DM_AES128_ECB";
+
+    private static final int DM_AES128_ECB_ALGORITHM_ID = 513;
+    private static final String AES_ENCRYPT = "AES_ENCRYPT";
+    private static final String AES_DECRYPT = "AES_DECRYPT";
+    private static final String FROM_BASE64 = "FROM_BASE64";
+    private static final String TO_BASE64 = "TO_BASE64";
+    private static final String AES_MANUAL_REVIEW_REASON =
+            "AES_ENCRYPT/AES_DECRYPT is present but only Base64-wrapped AES password SQL is supported for automatic Dameng rewrite.";
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOW_PATTERN = Pattern.compile("\\bNOW\\s*\\(\\s*\\)", Pattern.CASE_INSENSITIVE);
@@ -79,6 +88,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add("NOW_TO_SYSDATE");
         }
 
+        AesBase64Conversion aesBase64Conversion = convertBase64Aes(converted);
+        if (aesBase64Conversion.changed()) {
+            converted = aesBase64Conversion.convertedSql();
+            rules.add(MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE);
+        }
+
         DamengReservedColumnRenamer.RenameResult renameResult =
                 DamengReservedColumnRenamer.renameBareIdentifiers(converted);
         if (renameResult.changed()) {
@@ -119,6 +134,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (FIND_IN_SET_PATTERN.matcher(sql).find()) {
             return "FIND_IN_SET requires manual confirmation because it is MySQL-specific.";
         }
+        if (containsAesFunction(sql)) {
+            AesBase64Conversion aesBase64Conversion = convertBase64Aes(sql);
+            if (!aesBase64Conversion.changed() || containsAesFunction(aesBase64Conversion.convertedSql())) {
+                return AES_MANUAL_REVIEW_REASON;
+            }
+        }
         String mysqlFunction = firstMySqlFunctionRequiringReview(sql);
         if (!mysqlFunction.isBlank()) {
             return mysqlFunction + " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
@@ -127,6 +148,282 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return "Backtick quoted identifiers require manual confirmation. Consider Dameng double-quoted identifiers only after verifying object-name case sensitivity and reserved words.";
         }
         return "";
+    }
+
+    private boolean containsAesFunction(String sql) {
+        return containsFunction(sql, AES_ENCRYPT) || containsFunction(sql, AES_DECRYPT);
+    }
+
+    private AesBase64Conversion convertBase64Aes(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, TO_BASE64)) {
+                FunctionCall functionCall = readFunctionCall(sql, index, TO_BASE64);
+                String replacement = functionCall == null ? null : rewriteToBase64AesEncrypt(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else if (startsFunction(sql, index, AES_DECRYPT)) {
+                FunctionCall functionCall = readFunctionCall(sql, index, AES_DECRYPT);
+                String replacement = functionCall == null ? null : rewriteAesDecrypt(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new AesBase64Conversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteToBase64AesEncrypt(FunctionCall toBase64Call) {
+        List<TopLevelArgument> toBase64Arguments = splitTopLevelArguments(toBase64Call.body());
+        if (toBase64Arguments.size() != 1) {
+            return null;
+        }
+
+        FunctionCall aesEncryptCall = readOnlyFunctionCall(toBase64Arguments.get(0).text(), AES_ENCRYPT);
+        if (aesEncryptCall == null) {
+            return null;
+        }
+        List<TopLevelArgument> aesEncryptArguments = splitTopLevelArguments(aesEncryptCall.body());
+        if (aesEncryptArguments.size() != 2) {
+            return null;
+        }
+
+        String plainText = aesEncryptArguments.get(0).text().trim();
+        String key = normalizedStringLiteral(aesEncryptArguments.get(1).text());
+        if (plainText.isBlank() || key == null) {
+            return null;
+        }
+        return "TO_BASE64(SF_ENCRYPT_CHAR("
+                + plainText
+                + ", "
+                + DM_AES128_ECB_ALGORITHM_ID
+                + ", "
+                + key
+                + ", NULL))";
+    }
+
+    private String rewriteAesDecrypt(FunctionCall aesDecryptCall) {
+        List<TopLevelArgument> aesDecryptArguments = splitTopLevelArguments(aesDecryptCall.body());
+        if (aesDecryptArguments.size() != 2) {
+            return null;
+        }
+
+        FunctionCall fromBase64Call = readOnlyFunctionCall(aesDecryptArguments.get(0).text(), FROM_BASE64);
+        if (fromBase64Call == null) {
+            return null;
+        }
+        List<TopLevelArgument> fromBase64Arguments = splitTopLevelArguments(fromBase64Call.body());
+        if (fromBase64Arguments.size() != 1) {
+            return null;
+        }
+
+        String cipherText = fromBase64Arguments.get(0).text().trim();
+        String key = normalizedStringLiteral(aesDecryptArguments.get(1).text());
+        if (cipherText.isBlank() || key == null) {
+            return null;
+        }
+        return "SF_DECRYPT_TO_CHAR(FROM_BASE64("
+                + cipherText
+                + "), "
+                + DM_AES128_ECB_ALGORITHM_ID
+                + ", "
+                + key
+                + ", NULL)";
+    }
+
+    private FunctionCall readOnlyFunctionCall(String expression, String functionName) {
+        int leadingWhitespace = leadingWhitespaceLength(expression);
+        FunctionCall functionCall = readFunctionCall(expression, leadingWhitespace, functionName);
+        if (functionCall == null || !expression.substring(functionCall.endIndex()).isBlank()) {
+            return null;
+        }
+        return functionCall;
+    }
+
+    private int leadingWhitespaceLength(String value) {
+        int index = 0;
+        while (index < value.length() && Character.isWhitespace(value.charAt(index))) {
+            index++;
+        }
+        return index;
+    }
+
+    private boolean containsFunction(String sql, String functionName) {
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsFunction(sql, index, functionName)) {
+                return true;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private FunctionCall readFunctionCall(String sql, int functionNameStart, String functionName) {
+        if (!startsFunction(sql, functionNameStart, functionName)) {
+            return null;
+        }
+        int openParenIndex = functionNameStart + functionName.length();
+        while (openParenIndex < sql.length() && Character.isWhitespace(sql.charAt(openParenIndex))) {
+            openParenIndex++;
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return null;
+        }
+        return new FunctionCall(
+                functionNameStart,
+                openParenIndex,
+                closeParenIndex,
+                closeParenIndex + 1,
+                sql.substring(openParenIndex + 1, closeParenIndex)
+        );
+    }
+
+    private boolean startsFunction(String sql, int index, String functionName) {
+        if (index > 0 && isIdentifierPart(sql.charAt(index - 1))) {
+            return false;
+        }
+        if (index + functionName.length() > sql.length()
+                || !sql.regionMatches(true, index, functionName, 0, functionName.length())) {
+            return false;
+        }
+        int afterName = index + functionName.length();
+        if (afterName < sql.length() && isIdentifierPart(sql.charAt(afterName))) {
+            return false;
+        }
+        while (afterName < sql.length() && Character.isWhitespace(sql.charAt(afterName))) {
+            afterName++;
+        }
+        return afterName < sql.length() && sql.charAt(afterName) == '(';
+    }
+
+    private int findMatchingParen(String sql, int openParenIndex) {
+        int depth = 0;
+        int index = openParenIndex;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth--;
+                if (depth == 0) {
+                    return index;
+                }
+                index++;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private List<TopLevelArgument> splitTopLevelArguments(String body) {
+        List<TopLevelArgument> arguments = new ArrayList<>();
+        int depth = 0;
+        int argumentStart = 0;
+        int index = 0;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(body, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(body, index);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (startsLineComment(body, index)) {
+                index = skipUntilLineEnd(body, index);
+            } else if (startsBlockComment(body, index)) {
+                index = skipUntilBlockCommentEnd(body, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (current == ',' && depth == 0) {
+                arguments.add(new TopLevelArgument(body.substring(argumentStart, index), argumentStart, index));
+                index++;
+                argumentStart = index;
+            } else {
+                index++;
+            }
+        }
+        arguments.add(new TopLevelArgument(body.substring(argumentStart), argumentStart, body.length()));
+        return arguments;
+    }
+
+    private String normalizedStringLiteral(String expression) {
+        String trimmed = expression.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (trimmed.charAt(0) == '\'') {
+            SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(trimmed, 0);
+            return literal.closed() && literal.nextIndex() == trimmed.length() ? trimmed : null;
+        }
+        if (trimmed.charAt(0) == '"') {
+            DoubleQuotedStringLiteral literal = readDoubleQuotedStringLiteral(trimmed, 0);
+            if (!literal.closed() || literal.nextIndex() != trimmed.length()) {
+                return null;
+            }
+            StringBuilder singleQuoted = new StringBuilder();
+            appendSingleQuotedStringLiteral(singleQuoted, literal.value());
+            return singleQuoted.toString();
+        }
+        return null;
     }
 
     private String firstMySqlFunctionRequiringReview(String sql) {
@@ -189,6 +486,29 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return index;
     }
 
+    private SingleQuotedStringLiteral readSingleQuotedStringLiteral(String sql, int start) {
+        StringBuilder value = new StringBuilder();
+        int index = start + 1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\\' && index + 1 < sql.length()) {
+                value.append(current).append(sql.charAt(index + 1));
+                index += 2;
+            } else if (current == '\'') {
+                if (index + 1 < sql.length() && sql.charAt(index + 1) == '\'') {
+                    value.append(current);
+                    index += 2;
+                } else {
+                    return new SingleQuotedStringLiteral(value.toString(), index + 1, true);
+                }
+            } else {
+                value.append(current);
+                index++;
+            }
+        }
+        return new SingleQuotedStringLiteral("", start, false);
+    }
+
     private DoubleQuotedStringLiteral readDoubleQuotedStringLiteral(String sql, int start) {
         StringBuilder value = new StringBuilder();
         int index = start + 1;
@@ -215,6 +535,94 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new DoubleQuotedStringLiteral("", start, false);
+    }
+
+    private int appendDoubleQuotedText(String sql, int start, StringBuilder converted) {
+        int end = skipDoubleQuotedText(sql, start);
+        converted.append(sql, start, end);
+        return end;
+    }
+
+    private boolean startsMyBatisPlaceholder(String sql, int index) {
+        return index + 1 < sql.length()
+                && (sql.charAt(index) == '#' || sql.charAt(index) == '$')
+                && sql.charAt(index + 1) == '{';
+    }
+
+    private int appendMyBatisPlaceholder(String sql, int start, StringBuilder converted) {
+        int end = skipMyBatisPlaceholder(sql, start);
+        converted.append(sql, start, end);
+        return end;
+    }
+
+    private int skipSingleQuotedString(String sql, int start) {
+        int index = start + 1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '\\' && index < sql.length()) {
+                index++;
+            } else if (current == '\'') {
+                if (index < sql.length() && sql.charAt(index) == '\'') {
+                    index++;
+                } else {
+                    break;
+                }
+            }
+        }
+        return index;
+    }
+
+    private int skipDoubleQuotedText(String sql, int start) {
+        int index = start + 1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '\\' && index < sql.length()) {
+                index++;
+            } else if (current == '"') {
+                if (index < sql.length() && sql.charAt(index) == '"') {
+                    index++;
+                } else {
+                    break;
+                }
+            }
+        }
+        return index;
+    }
+
+    private int skipMyBatisPlaceholder(String sql, int start) {
+        int end = sql.indexOf('}', start + 2);
+        return end < 0 ? sql.length() : end + 1;
+    }
+
+    private int skipUntilLineEnd(String sql, int start) {
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '\n') {
+                break;
+            }
+        }
+        return index;
+    }
+
+    private int skipUntilBlockCommentEnd(String sql, int start) {
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '*' && index < sql.length() && sql.charAt(index) == '/') {
+                index++;
+                break;
+            }
+        }
+        return index;
+    }
+
+    private boolean isIdentifierPart(char value) {
+        return Character.isLetterOrDigit(value) || value == '_';
     }
 
     private void appendSingleQuotedStringLiteral(StringBuilder converted, String value) {
@@ -329,6 +737,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record DoubleQuotedStringConversion(String convertedSql, boolean changed) {
+    }
+
+    private record AesBase64Conversion(String convertedSql, boolean changed) {
+    }
+
+    private record FunctionCall(int startIndex, int openParenIndex, int closeParenIndex, int endIndex, String body) {
+    }
+
+    private record TopLevelArgument(String text, int startIndex, int endIndex) {
+    }
+
+    private record SingleQuotedStringLiteral(String value, int nextIndex, boolean closed) {
     }
 
     private record DoubleQuotedStringLiteral(String value, int nextIndex, boolean closed) {

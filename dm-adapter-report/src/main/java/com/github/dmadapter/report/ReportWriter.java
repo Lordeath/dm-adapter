@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 public class ReportWriter {
@@ -31,10 +32,11 @@ public class ReportWriter {
 
     public ReportPaths writeMigrationReport(MigrationReport report, Path reportDir) throws IOException {
         Files.createDirectories(reportDir);
+        MigrationReport redactedReport = redactSensitiveSql(report);
         Path markdownPath = reportDir.resolve(MIGRATION_REPORT_MARKDOWN);
         Path jsonPath = reportDir.resolve(MIGRATION_REPORT_JSON);
-        Files.writeString(markdownPath, migrationMarkdown(report), StandardCharsets.UTF_8);
-        objectMapper.writerWithDefaultPrettyPrinter().writeValue(jsonPath.toFile(), report);
+        Files.writeString(markdownPath, migrationMarkdown(redactedReport), StandardCharsets.UTF_8);
+        objectMapper.writerWithDefaultPrettyPrinter().writeValue(jsonPath.toFile(), redactedReport);
         return new ReportPaths(markdownPath, jsonPath);
     }
 
@@ -128,5 +130,330 @@ public class ReportWriter {
             return compact;
         }
         return compact.substring(0, 237) + "...";
+    }
+
+    private MigrationReport redactSensitiveSql(MigrationReport report) {
+        return new MigrationReport(
+                report.projectRoot(),
+                report.sourceDb(),
+                report.targetDb(),
+                report.dryRun(),
+                report.scanResult(),
+                report.changedFiles(),
+                redactSqlChanges(report.autoConvertedSqlItems()),
+                redactSqlChanges(report.manualReviewSqlItems()),
+                report.riskWarnings()
+        );
+    }
+
+    private List<SqlChange> redactSqlChanges(List<SqlChange> sqlChanges) {
+        return sqlChanges.stream()
+                .map(sqlChange -> new SqlChange(
+                        sqlChange.file(),
+                        sqlChange.statementId(),
+                        redactSql(sqlChange.originalSql()),
+                        redactSql(sqlChange.convertedSql()),
+                        sqlChange.appliedRules(),
+                        sqlChange.manualReviewRequired(),
+                        sqlChange.reason()
+                ))
+                .toList();
+    }
+
+    private String redactSql(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql;
+        }
+        String redacted = redactFunctionArgument(sql, "AES_ENCRYPT", 1);
+        redacted = redactFunctionArgument(redacted, "AES_DECRYPT", 1);
+        redacted = redactFunctionArgument(redacted, "SF_ENCRYPT_CHAR", 2);
+        redacted = redactFunctionArgument(redacted, "SF_DECRYPT_TO_CHAR", 2);
+        return redacted;
+    }
+
+    private String redactFunctionArgument(String sql, String functionName, int argumentIndex) {
+        StringBuilder redacted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                int end = skipSingleQuotedString(sql, index);
+                redacted.append(sql, index, end);
+                index = end;
+            } else if (current == '"') {
+                int end = skipDoubleQuotedText(sql, index);
+                redacted.append(sql, index, end);
+                index = end;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                int end = skipMyBatisPlaceholder(sql, index);
+                redacted.append(sql, index, end);
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                int end = skipUntilLineEnd(sql, index);
+                redacted.append(sql, index, end);
+                index = end;
+            } else if (startsBlockComment(sql, index)) {
+                int end = skipUntilBlockCommentEnd(sql, index);
+                redacted.append(sql, index, end);
+                index = end;
+            } else if (startsFunction(sql, index, functionName)) {
+                FunctionCall functionCall = readFunctionCall(sql, index, functionName);
+                String replacement = functionCall == null
+                        ? null
+                        : redactFunctionCallArgument(sql, functionCall, argumentIndex);
+                if (replacement == null) {
+                    redacted.append(current);
+                    index++;
+                } else {
+                    redacted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                redacted.append(current);
+                index++;
+            }
+        }
+        return changed ? redacted.toString() : sql;
+    }
+
+    private String redactFunctionCallArgument(String sql, FunctionCall functionCall, int argumentIndex) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(functionCall.body());
+        if (argumentIndex >= arguments.size()) {
+            return null;
+        }
+        TopLevelArgument argument = arguments.get(argumentIndex);
+        if (!isStringLiteral(argument.text())) {
+            return null;
+        }
+        String body = functionCall.body().substring(0, argument.startIndex())
+                + "'******'"
+                + functionCall.body().substring(argument.endIndex());
+        return sql.substring(functionCall.startIndex(), functionCall.openParenIndex() + 1)
+                + body
+                + sql.substring(functionCall.closeParenIndex(), functionCall.endIndex());
+    }
+
+    private FunctionCall readFunctionCall(String sql, int functionNameStart, String functionName) {
+        if (!startsFunction(sql, functionNameStart, functionName)) {
+            return null;
+        }
+        int openParenIndex = functionNameStart + functionName.length();
+        while (openParenIndex < sql.length() && Character.isWhitespace(sql.charAt(openParenIndex))) {
+            openParenIndex++;
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return null;
+        }
+        return new FunctionCall(
+                functionNameStart,
+                openParenIndex,
+                closeParenIndex,
+                closeParenIndex + 1,
+                sql.substring(openParenIndex + 1, closeParenIndex)
+        );
+    }
+
+    private boolean startsFunction(String sql, int index, String functionName) {
+        if (index > 0 && isIdentifierPart(sql.charAt(index - 1))) {
+            return false;
+        }
+        if (index + functionName.length() > sql.length()
+                || !sql.regionMatches(true, index, functionName, 0, functionName.length())) {
+            return false;
+        }
+        int afterName = index + functionName.length();
+        if (afterName < sql.length() && isIdentifierPart(sql.charAt(afterName))) {
+            return false;
+        }
+        while (afterName < sql.length() && Character.isWhitespace(sql.charAt(afterName))) {
+            afterName++;
+        }
+        return afterName < sql.length() && sql.charAt(afterName) == '(';
+    }
+
+    private int findMatchingParen(String sql, int openParenIndex) {
+        int depth = 0;
+        int index = openParenIndex;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth--;
+                if (depth == 0) {
+                    return index;
+                }
+                index++;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private List<TopLevelArgument> splitTopLevelArguments(String body) {
+        List<TopLevelArgument> arguments = new ArrayList<>();
+        int depth = 0;
+        int argumentStart = 0;
+        int index = 0;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(body, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(body, index);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (startsLineComment(body, index)) {
+                index = skipUntilLineEnd(body, index);
+            } else if (startsBlockComment(body, index)) {
+                index = skipUntilBlockCommentEnd(body, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (current == ',' && depth == 0) {
+                arguments.add(new TopLevelArgument(body.substring(argumentStart, index), argumentStart, index));
+                index++;
+                argumentStart = index;
+            } else {
+                index++;
+            }
+        }
+        arguments.add(new TopLevelArgument(body.substring(argumentStart), argumentStart, body.length()));
+        return arguments;
+    }
+
+    private boolean isStringLiteral(String expression) {
+        String trimmed = expression.trim();
+        if (trimmed.isEmpty()) {
+            return false;
+        }
+        if (trimmed.charAt(0) == '\'') {
+            return closedSingleQuotedStringEnd(trimmed, 0) == trimmed.length();
+        }
+        if (trimmed.charAt(0) == '"') {
+            return closedDoubleQuotedTextEnd(trimmed, 0) == trimmed.length();
+        }
+        return false;
+    }
+
+    private int skipSingleQuotedString(String sql, int start) {
+        int end = closedSingleQuotedStringEnd(sql, start);
+        return end < 0 ? sql.length() : end;
+    }
+
+    private int closedSingleQuotedStringEnd(String sql, int start) {
+        int index = start + 1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '\\' && index < sql.length()) {
+                index++;
+            } else if (current == '\'') {
+                if (index < sql.length() && sql.charAt(index) == '\'') {
+                    index++;
+                } else {
+                    return index;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private int skipDoubleQuotedText(String sql, int start) {
+        int end = closedDoubleQuotedTextEnd(sql, start);
+        return end < 0 ? sql.length() : end;
+    }
+
+    private int closedDoubleQuotedTextEnd(String sql, int start) {
+        int index = start + 1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '\\' && index < sql.length()) {
+                index++;
+            } else if (current == '"') {
+                if (index < sql.length() && sql.charAt(index) == '"') {
+                    index++;
+                } else {
+                    return index;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private boolean startsMyBatisPlaceholder(String sql, int index) {
+        return index + 1 < sql.length()
+                && (sql.charAt(index) == '#' || sql.charAt(index) == '$')
+                && sql.charAt(index + 1) == '{';
+    }
+
+    private int skipMyBatisPlaceholder(String sql, int start) {
+        int end = sql.indexOf('}', start + 2);
+        return end < 0 ? sql.length() : end + 1;
+    }
+
+    private boolean startsLineComment(String sql, int index) {
+        return sql.startsWith("--", index)
+                || (sql.charAt(index) == '#' && (index + 1 >= sql.length() || sql.charAt(index + 1) != '{'));
+    }
+
+    private int skipUntilLineEnd(String sql, int start) {
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '\n') {
+                break;
+            }
+        }
+        return index;
+    }
+
+    private boolean startsBlockComment(String sql, int index) {
+        return index + 1 < sql.length() && sql.charAt(index) == '/' && sql.charAt(index + 1) == '*';
+    }
+
+    private int skipUntilBlockCommentEnd(String sql, int start) {
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            index++;
+            if (current == '*' && index < sql.length() && sql.charAt(index) == '/') {
+                index++;
+                break;
+            }
+        }
+        return index;
+    }
+
+    private boolean isIdentifierPart(char value) {
+        return Character.isLetterOrDigit(value) || value == '_';
+    }
+
+    private record FunctionCall(int startIndex, int openParenIndex, int closeParenIndex, int endIndex, String body) {
+    }
+
+    private record TopLevelArgument(String text, int startIndex, int endIndex) {
     }
 }
