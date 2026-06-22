@@ -28,6 +28,15 @@ public class MapperMigrator {
     }
 
     public MapperMigrationResult migrate(ProjectScanResult scanResult, AdapterContext context, SqlConverter sqlConverter) {
+        return migrate(scanResult, context, sqlConverter, SqlRewriteConfig.empty());
+    }
+
+    public MapperMigrationResult migrate(
+            ProjectScanResult scanResult,
+            AdapterContext context,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig
+    ) {
         List<FileChange> fileChanges = new ArrayList<>();
         List<SqlChange> automaticConversions = new ArrayList<>();
         List<SqlChange> manualReviewItems = new ArrayList<>();
@@ -45,7 +54,8 @@ public class MapperMigrator {
                     rewriteInput,
                     target.toString(),
                     !context.dryRun(),
-                    sqlConverter
+                    sqlConverter,
+                    rewriteConfig
             );
             automaticConversions.addAll(rewriteResult.automaticConversions());
             manualReviewItems.addAll(rewriteResult.manualReviewItems());

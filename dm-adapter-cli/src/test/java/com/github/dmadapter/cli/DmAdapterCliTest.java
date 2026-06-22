@@ -194,6 +194,88 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateWritesRewriteConfigTemplateForUnconfiguredUpsertAndInsertIgnore() throws Exception {
+        writeDemoProject();
+        Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="updateExtend">
+                        INSERT INTO user_extend (user_id, key_name)
+                        VALUES (#{userId}, #{keyName})
+                        ON DUPLICATE KEY UPDATE key_name = VALUES(key_name)
+                    </insert>
+                    <insert id="insertRolePerm">
+                        insert ignore into role_perm (role_id, perm_id)
+                        values (#{roleId}, #{permId})
+                    </insert>
+                </mapper>
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+
+        Path rewriteConfig = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        assertThat(exitCode).isZero();
+        assertThat(Files.exists(rewriteConfig)).isTrue();
+        assertThat(Files.readString(rewriteConfig))
+                .contains("upsertKeys:")
+                .contains("\"user_extend\":")
+                .contains("\"role_perm\":")
+                .contains("\"com.example.UserMapper.updateExtend\":")
+                .contains("\"com.example.UserMapper.insertRolePerm\":")
+                .contains("keyColumns: []");
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .contains("ON DUPLICATE KEY UPDATE")
+                .contains("insert ignore into role_perm")
+                .doesNotContain("MERGE INTO");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
+                .contains("requires configured keyColumns")
+                .contains("INSERT IGNORE requires configured keyColumns");
+    }
+
+    @Test
+    void migrateUsesExplicitRewriteConfigForUpsertMerge() throws Exception {
+        writeDemoProject();
+        Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="updateExtend">
+                        INSERT INTO user_extend (user_id, key_name)
+                        VALUES (#{userId}, #{keyName})
+                        ON DUPLICATE KEY UPDATE key_name = VALUES(key_name)
+                    </insert>
+                </mapper>
+                """);
+        Path rewriteConfig = tempDir.resolve("rewrite.yml");
+        Files.writeString(rewriteConfig, """
+                upsertKeys:
+                  tables:
+                    user_extend:
+                      keyColumns: [user_id]
+                  methods:
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "migrate",
+                "--project",
+                tempDir.toString(),
+                "--rewrite-config",
+                rewriteConfig.toString()
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .contains("MERGE INTO user_extend t")
+                .contains("ON (t.user_id = s.user_id)")
+                .contains("WHEN MATCHED THEN UPDATE SET t.key_name = s.key_name")
+                .doesNotContain("ON DUPLICATE KEY UPDATE");
+        assertThat(Files.exists(tempDir.resolve(".dm-adapter/sql-rewrite.yml"))).isFalse();
+    }
+
+    @Test
     void generateValidationTestWritesConfigAndMyBatisJdbcTest() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
@@ -268,7 +350,10 @@ class DmAdapterCliTest {
                 .contains("MYSQL_UPDATE_JOIN")
                 .contains("INSERT_IGNORE")
                 .contains("MYSQL_GROUP_CONCAT")
-                .contains("MYSQL_FIND_IN_SET")
+                .contains("MYSQL_DATE_ADD_INTERVAL")
+                .contains("MYSQL_CONVERT_UNSIGNED")
+                .contains("MYSQL_JSON_SQL")
+                .contains("BROKEN_DYNAMIC_SQL_OR_ARGS")
                 .contains("optionalSecret(resolvePlaceholders(config.datasource.password), \"datasource.password\")")
                 .contains("references an unresolved placeholder")
                 .contains("set schema")

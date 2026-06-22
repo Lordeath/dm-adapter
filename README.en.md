@@ -10,8 +10,9 @@
 - Resolve mapper XML files from `mybatis.mapperLocations` / `mybatis.mapper-locations` and related keys in project `application*.properties`, `application*.yml`, and `application*.yaml` files first; support cross-module classpath patterns such as `classpath*:/mapper/*.xml`; fall back to resource directory scanning when not configured.
 - Check whether `pom.xml` already contains a Dameng JDBC driver dependency.
 - Copy mapper XML files to the source module's `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
-- Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, simple `LIMIT` pagination, `FROM/JOIN ... AS alias` -> `FROM/JOIN ... alias`, and suffix Dameng special column names such as `ROWID`, `ROWNUM`, `TRXID`, `PHYROWID`, and `VERSIONS_*` with an underscore.
-- Mark `DATE_FORMAT`, `GROUP_CONCAT`, `FIND_IN_SET`, JSON functions, time calculation/conversion functions, `ON DUPLICATE KEY UPDATE`, `REPLACE INTO`, and backtick-quoted identifiers for manual review.
+- Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, simple `LIMIT` pagination, `DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`, `CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`, `FROM/JOIN ... AS alias` -> `FROM/JOIN ... alias`, and suffix Dameng special column names such as `ROWID`, `ROWNUM`, `TRXID`, `PHYROWID`, and `VERSIONS_*` with an underscore.
+- Rewrite configurable `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` statements to Dameng `MERGE` when `.dm-adapter/sql-rewrite.yml` provides trusted `keyColumns`; otherwise keep the SQL unchanged and generate a config template.
+- Mark `GROUP_CONCAT`, JSON functions, complex time calculation/conversion functions, `REPLACE INTO`, upsert/ignore SQL without safe key-column configuration, and backtick-quoted identifiers for manual review.
 - Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project, without starting Spring Boot, ShardingSphere, MQ, or web beans.
 - Write Markdown and JSON reports under `.dm-adapter/`.
 
@@ -33,6 +34,9 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
+
+# Fill the generated keyColumns config before rerunning migrate for ON DUPLICATE KEY UPDATE / INSERT IGNORE -> MERGE rewrites.
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --rewrite-config .dm-adapter/sql-rewrite.yml
 
 # You can also generate the SQL validation test after migrate; --app-module, --schema, or --config implies generation.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system

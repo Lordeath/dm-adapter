@@ -17,6 +17,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_DATE_SUB_NOW_DAY_RULE = "MYSQL_DATE_SUB_NOW_DAY_TO_DM";
     public static final String MYSQL_REGEXP_OPERATOR_RULE = "MYSQL_REGEXP_OPERATOR_TO_REGEXP_LIKE";
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
+    public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
+    public static final String MYSQL_DATE_ADD_INTERVAL_RULE = "MYSQL_DATE_ADD_INTERVAL_TO_DATEADD";
+    public static final String MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE = "MYSQL_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
@@ -34,9 +37,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOW_PATTERN = Pattern.compile("\\bNOW\\s*\\(\\s*\\)", Pattern.CASE_INSENSITIVE);
-    private static final Pattern DATE_FORMAT_PATTERN = Pattern.compile("\\bDATE_FORMAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern GROUP_CONCAT_PATTERN = Pattern.compile("\\bGROUP_CONCAT\\s*\\(", Pattern.CASE_INSENSITIVE);
-    private static final Pattern FIND_IN_SET_PATTERN = Pattern.compile("\\bFIND_IN_SET\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern INSERT_IGNORE_PATTERN = Pattern.compile(
             "\\bINSERT\\s+IGNORE\\s+INTO\\b",
             Pattern.CASE_INSENSITIVE
@@ -47,11 +48,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern INTERVAL_DAY_PATTERN = Pattern.compile(
             "(?is)^\\s*INTERVAL\\s+(.+?)\\s+DAY\\s*$"
     );
+    private static final Pattern MYSQL_INTERVAL_PATTERN = Pattern.compile(
+            "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\\s*$"
+    );
     private static final Pattern CTE_ALIAS_PATTERN = Pattern.compile(
             "(?is).*\\s+AS\\s+(\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
     );
     private static final List<String> MYSQL_FUNCTIONS_REQUIRING_REVIEW = List.of(
-            "DATE_ADD",
             "DATE_SUB",
             "STR_TO_DATE",
             "UNIX_TIMESTAMP",
@@ -59,6 +62,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "TIMESTAMPDIFF",
             "CONCAT_WS",
             "JSON_ARRAY",
+            "JSON_TABLE",
             "JSON_CONTAINS",
             "JSON_EXTRACT",
             "JSON_INSERT",
@@ -100,6 +104,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "INTO",
             "IS",
             "JOIN",
+            "KEY",
             "LEFT",
             "LEVEL",
             "LIKE",
@@ -115,6 +120,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "SELECT",
             "SET",
             "START",
+            "STATE",
             "TABLE",
             "TIME",
             "TIMESTAMP",
@@ -123,6 +129,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "UPDATE",
             "USER",
             "VALUES",
+            "VERIFY",
             "VIEW",
             "WHERE",
             "WITH"
@@ -144,6 +151,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     @Override
     public SqlConversionResult convert(String sql) {
+        return convert(sql, List.of());
+    }
+
+    @Override
+    public SqlConversionResult convert(String sql, List<String> upsertKeyColumns) {
         if (sql == null || sql.isBlank()) {
             return SqlConversionResult.unchanged(sql == null ? "" : sql);
         }
@@ -169,10 +181,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_DATE_SUB_NOW_DAY_RULE);
         }
 
+        GenericConversion dateAddIntervalConversion = convertDateAddInterval(converted);
+        if (dateAddIntervalConversion.changed()) {
+            converted = dateAddIntervalConversion.convertedSql();
+            rules.add(MYSQL_DATE_ADD_INTERVAL_RULE);
+        }
+
         GenericConversion unsignedCastConversion = convertUnsignedCasts(converted);
         if (unsignedCastConversion.changed()) {
             converted = unsignedCastConversion.convertedSql();
             rules.add(MYSQL_CAST_UNSIGNED_RULE);
+        }
+
+        GenericConversion unsignedConvertConversion = convertUnsignedConvertFunctions(converted);
+        if (unsignedConvertConversion.changed()) {
+            converted = unsignedConvertConversion.convertedSql();
+            rules.add(MYSQL_CONVERT_UNSIGNED_RULE);
         }
 
         GenericConversion withRecursiveConversion = addRecursiveCteColumnAliases(converted);
@@ -245,7 +269,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(limitConversion.ruleName());
         }
 
-        GenericConversion onDuplicateKeyUpdateConversion = convertOnDuplicateKeyUpdate(converted);
+        GenericConversion insertIgnoreConversion = convertInsertIgnore(converted, upsertKeyColumns);
+        if (insertIgnoreConversion.changed()) {
+            converted = insertIgnoreConversion.convertedSql();
+            rules.add(MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE);
+        }
+
+        GenericConversion onDuplicateKeyUpdateConversion = convertOnDuplicateKeyUpdate(converted, upsertKeyColumns);
         if (onDuplicateKeyUpdateConversion.changed()) {
             converted = onDuplicateKeyUpdateConversion.convertedSql();
             rules.add(MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
@@ -265,20 +295,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private String unsupportedReason(String sql) {
         String upper = sql.toUpperCase(Locale.ROOT);
-        if (DATE_FORMAT_PATTERN.matcher(sql).find()) {
-            return "DATE_FORMAT requires manual confirmation because format tokens may not map 1:1 to Dameng.";
-        }
         if (upper.contains("ON DUPLICATE KEY UPDATE")) {
-            return "ON DUPLICATE KEY UPDATE has no safe automatic Dameng rewrite in MVP.";
+            return "ON DUPLICATE KEY UPDATE requires configured keyColumns for safe Dameng MERGE rewrite.";
         }
         if (upper.contains("REPLACE INTO")) {
             return "REPLACE INTO has no safe automatic Dameng rewrite in MVP.";
         }
         if (GROUP_CONCAT_PATTERN.matcher(sql).find()) {
             return "GROUP_CONCAT requires manual confirmation for Dameng aggregate syntax.";
-        }
-        if (FIND_IN_SET_PATTERN.matcher(sql).find()) {
-            return "FIND_IN_SET requires manual confirmation because it is MySQL-specific.";
         }
         if (upper.contains("INFORMATION_SCHEMA") || upper.contains("DATABASE()")) {
             return "MySQL metadata SQL such as information_schema/database() requires manual Dameng rewrite.";
@@ -287,7 +311,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return "REGEXP requires manual confirmation because Dameng regular-expression syntax may differ from MySQL.";
         }
         if (INSERT_IGNORE_PATTERN.matcher(sql).find()) {
-            return "INSERT IGNORE changes duplicate-key behavior and requires manual Dameng rewrite.";
+            return "INSERT IGNORE requires configured keyColumns for safe Dameng MERGE rewrite.";
         }
         if (containsMysqlUpdateJoin(sql)) {
             return "MySQL UPDATE JOIN is present but not simple enough for automatic Dameng UPDATE FROM rewrite.";
@@ -356,6 +380,59 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return "(SYSDATE - " + amount + ")";
     }
 
+    private GenericConversion convertDateAddInterval(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "DATE_ADD")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "DATE_ADD");
+                String replacement = functionCall == null ? null : rewriteDateAddInterval(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteDateAddInterval(FunctionCall dateAddCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(dateAddCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String dateExpression = arguments.get(0).text().trim();
+        Matcher matcher = MYSQL_INTERVAL_PATTERN.matcher(arguments.get(1).text());
+        if (dateExpression.isBlank() || !matcher.matches()) {
+            return null;
+        }
+        String amount = matcher.group(1).trim();
+        String unit = matcher.group(2).toUpperCase(Locale.ROOT);
+        if (amount.isBlank()) {
+            return null;
+        }
+        return "DATEADD(" + unit + ", " + amount + ", " + dateExpression + ")";
+    }
+
     private boolean isNowExpression(String expression) {
         String trimmed = expression.trim();
         return "SYSDATE".equalsIgnoreCase(trimmed) || readOnlyFunctionCall(trimmed, "NOW") != null;
@@ -403,6 +480,54 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         String expression = matcher.group(1).trim();
         if (expression.isBlank()) {
+            return null;
+        }
+        return "CAST(" + expression + " AS BIGINT)";
+    }
+
+    private GenericConversion convertUnsignedConvertFunctions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "CONVERT")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CONVERT");
+                String replacement = functionCall == null ? null : rewriteUnsignedConvert(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteUnsignedConvert(FunctionCall convertCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(convertCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String expression = arguments.get(0).text().trim();
+        String targetType = arguments.get(1).text().trim();
+        if (expression.isBlank() || !targetType.matches("(?is)UNSIGNED(?:\\s+INTEGER)?")) {
             return null;
         }
         return "CAST(" + expression + " AS BIGINT)";
@@ -789,6 +914,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (trimmed.length() >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
             return trimmed.substring(1, trimmed.length() - 1).replace("\"\"", "\"");
         }
+        if (trimmed.length() >= 2 && trimmed.startsWith("`") && trimmed.endsWith("`")) {
+            return trimmed.substring(1, trimmed.length() - 1).replace("``", "`");
+        }
         return trimmed;
     }
 
@@ -837,9 +965,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return end;
     }
 
-    private GenericConversion convertOnDuplicateKeyUpdate(String sql) {
+    private GenericConversion convertInsertIgnore(String sql, List<String> keyColumns) {
+        InsertValues insert = readInsertValues(sql, true);
+        if (insert == null || normalizedKeyColumns(keyColumns).isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = mergeSql(insert, List.of(), keyColumns);
+        return converted == null ? GenericConversion.unchanged(sql) : new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertOnDuplicateKeyUpdate(String sql, List<String> keyColumns) {
         OnDuplicateKeyInsert insert = readOnDuplicateKeyInsert(sql);
-        if (insert == null) {
+        if (insert == null || normalizedKeyColumns(keyColumns).isEmpty()) {
             return GenericConversion.unchanged(sql);
         }
 
@@ -855,20 +992,36 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return GenericConversion.unchanged(sql);
         }
 
-        List<InsertColumn> matchColumns = new ArrayList<>();
-        for (InsertColumn column : insert.columns()) {
-            boolean updated = updateAssignments.stream()
-                    .anyMatch(assignment -> assignment.column().key().equals(column.name().key()));
-            if (!updated) {
-                matchColumns.add(column);
-            }
+        String converted = mergeSql(insert.toInsertValues(), updateAssignments, keyColumns);
+        return converted == null ? GenericConversion.unchanged(sql) : new GenericConversion(converted, true);
+    }
+
+    private String mergeSql(InsertValues insert, List<UpdateAssignment> updateAssignments, List<String> keyColumns) {
+        List<String> normalizedKeys = normalizedKeyColumns(keyColumns);
+        if (normalizedKeys.isEmpty()) {
+            return null;
         }
-        if (matchColumns.size() != 1) {
-            return GenericConversion.unchanged(sql);
+        List<InsertColumn> matchColumns = new ArrayList<>();
+        for (String keyColumn : normalizedKeys) {
+            InsertColumn matchColumn = insert.columns().stream()
+                    .filter(column -> column.name().key().equals(keyColumn))
+                    .findFirst()
+                    .orElse(null);
+            if (matchColumn == null) {
+                return null;
+            }
+            matchColumns.add(matchColumn);
+        }
+        List<UpdateAssignment> effectiveAssignments = updateAssignments.stream()
+                .filter(assignment -> normalizedKeys.stream().noneMatch(key -> key.equals(assignment.column().key())))
+                .toList();
+        if (effectiveAssignments.stream().anyMatch(assignment -> insert.columns().stream()
+                .noneMatch(column -> column.name().key().equals(assignment.column().key())))) {
+            return null;
         }
 
-        StringBuilder converted = new StringBuilder(sql.length() + 128);
-        converted.append(sql, 0, insert.insertIndex());
+        StringBuilder converted = new StringBuilder(insert.statementEnd() + 128);
+        converted.append(insert.prefix());
         converted.append("MERGE INTO ")
                 .append(insert.tableName())
                 .append(" t\n")
@@ -881,53 +1034,116 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
             converted.append(column.value())
                     .append(" AS ")
-                    .append(column.name().text());
+                    .append(dmIdentifier(column.name().text()));
         }
         converted.append(" FROM dual\n")
                 .append(") s\n");
-        InsertColumn matchColumn = matchColumns.get(0);
-        converted.append("ON (t.")
-                .append(matchColumn.name().text())
-                .append(" = s.")
-                .append(matchColumn.name().text())
-                .append(")\n")
-                .append("WHEN MATCHED THEN UPDATE SET ");
-        for (int i = 0; i < updateAssignments.size(); i++) {
-            UpdateAssignment assignment = updateAssignments.get(i);
+        converted.append("ON (");
+        for (int i = 0; i < matchColumns.size(); i++) {
+            InsertColumn matchColumn = matchColumns.get(i);
             if (i > 0) {
-                converted.append(", ");
+                converted.append(" AND ");
             }
-            converted.append("t.")
-                    .append(assignment.column().text())
-                    .append(" = s.")
-                    .append(assignment.sourceColumn().text());
+            converted.append(qualifiedIdentifier("t", matchColumn.name()))
+                    .append(" = ")
+                    .append(qualifiedIdentifier("s", matchColumn.name()));
         }
-        converted.append("\nWHEN NOT MATCHED THEN INSERT (");
+        converted.append(")\n");
+        if (!effectiveAssignments.isEmpty()) {
+            converted.append("WHEN MATCHED THEN UPDATE SET ");
+            for (int i = 0; i < effectiveAssignments.size(); i++) {
+                UpdateAssignment assignment = effectiveAssignments.get(i);
+                if (i > 0) {
+                    converted.append(", ");
+                }
+                converted.append(qualifiedIdentifier("t", assignment.column()))
+                        .append(" = ")
+                        .append(qualifiedIdentifier("s", assignment.sourceColumn()));
+            }
+            converted.append("\n");
+        }
+        converted.append("WHEN NOT MATCHED THEN INSERT (");
         for (int i = 0; i < insert.columns().size(); i++) {
             if (i > 0) {
                 converted.append(", ");
             }
-            converted.append(insert.columns().get(i).name().text());
+            converted.append(dmIdentifier(insert.columns().get(i).name().text()));
         }
         converted.append(") VALUES (");
         for (int i = 0; i < insert.columns().size(); i++) {
             if (i > 0) {
                 converted.append(", ");
             }
-            converted.append("s.").append(insert.columns().get(i).name().text());
+            converted.append(qualifiedIdentifier("s", insert.columns().get(i).name()));
         }
         converted.append(")");
-        converted.append(sql.substring(insert.statementEnd()));
-        return new GenericConversion(converted.toString(), true);
+        converted.append(insert.suffix());
+        return converted.toString();
+    }
+
+    private List<String> normalizedKeyColumns(List<String> keyColumns) {
+        if (keyColumns == null || keyColumns.isEmpty()) {
+            return List.of();
+        }
+        List<String> normalized = new ArrayList<>();
+        for (String keyColumn : keyColumns) {
+            if (keyColumn == null || keyColumn.isBlank()) {
+                continue;
+            }
+            normalized.add(identifierKey(keyColumn));
+        }
+        return normalized;
+    }
+
+    private String qualifiedIdentifier(String qualifier, IdentifierName identifierName) {
+        return qualifier + "." + dmIdentifier(identifierName.text());
+    }
+
+    private String dmIdentifier(String identifier) {
+        return toDamengIdentifier(unquoteIdentifier(identifier));
     }
 
     private OnDuplicateKeyInsert readOnDuplicateKeyInsert(String sql) {
+        InsertValues insert = readInsertValues(sql, false);
+        if (insert == null) {
+            return null;
+        }
+        int index = skipWhitespace(sql, insert.valuesCloseIndex() + 1);
+        if (!startsKeyword(sql, index, "ON")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "ON".length());
+        if (!startsKeyword(sql, index, "DUPLICATE")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "DUPLICATE".length());
+        if (!startsKeyword(sql, index, "KEY")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "KEY".length());
+        if (!startsKeyword(sql, index, "UPDATE")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "UPDATE".length());
+
+        int statementEnd = stripTrailingSemicolon(sql);
+        if (index >= statementEnd) {
+            return null;
+        }
+        return new OnDuplicateKeyInsert(insert, sql.substring(index, statementEnd));
+    }
+
+    private InsertValues readInsertValues(String sql, boolean requireIgnore) {
         int insertIndex = leadingWhitespaceLength(sql);
         if (!startsKeyword(sql, insertIndex, "INSERT")) {
             return null;
         }
         int index = skipWhitespace(sql, insertIndex + "INSERT".length());
-        if (startsKeyword(sql, index, "IGNORE")) {
+        boolean ignore = startsKeyword(sql, index, "IGNORE");
+        if (ignore) {
+            index = skipWhitespace(sql, index + "IGNORE".length());
+        }
+        if (ignore != requireIgnore) {
             return null;
         }
         if (!startsKeyword(sql, index, "INTO")) {
@@ -969,26 +1185,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
 
-        index = skipWhitespace(sql, valuesCloseIndex + 1);
-        if (!startsKeyword(sql, index, "ON")) {
-            return null;
-        }
-        index = skipWhitespace(sql, index + "ON".length());
-        if (!startsKeyword(sql, index, "DUPLICATE")) {
-            return null;
-        }
-        index = skipWhitespace(sql, index + "DUPLICATE".length());
-        if (!startsKeyword(sql, index, "KEY")) {
-            return null;
-        }
-        index = skipWhitespace(sql, index + "KEY".length());
-        if (!startsKeyword(sql, index, "UPDATE")) {
-            return null;
-        }
-        index = skipWhitespace(sql, index + "UPDATE".length());
-
         int statementEnd = stripTrailingSemicolon(sql);
-        if (index >= statementEnd) {
+        if (requireIgnore && !sql.substring(valuesCloseIndex + 1, statementEnd).isBlank()) {
             return null;
         }
 
@@ -1000,7 +1198,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
             columns.add(new InsertColumn(columnNames.get(i), value));
         }
-        return new OnDuplicateKeyInsert(insertIndex, statementEnd, tableName, columns, sql.substring(index, statementEnd));
+        return new InsertValues(
+                insertIndex,
+                valuesCloseIndex,
+                statementEnd,
+                sql.substring(0, insertIndex),
+                sql.substring(statementEnd),
+                tableName,
+                columns
+        );
     }
 
     private List<IdentifierName> readInsertColumns(String columnList) {
@@ -2094,15 +2300,30 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private record UpdateAssignment(IdentifierName column, IdentifierName sourceColumn) {
     }
 
-    private record OnDuplicateKeyInsert(
+    private record InsertValues(
             int insertIndex,
+            int valuesCloseIndex,
             int statementEnd,
+            String prefix,
+            String suffix,
             String tableName,
-            List<InsertColumn> columns,
+            List<InsertColumn> columns
+    ) {
+        private InsertValues {
+            columns = List.copyOf(columns == null ? List.of() : columns);
+        }
+    }
+
+    private record OnDuplicateKeyInsert(
+            InsertValues insertValues,
             String updateClause
     ) {
-        private OnDuplicateKeyInsert {
-            columns = List.copyOf(columns == null ? List.of() : columns);
+        private List<InsertColumn> columns() {
+            return insertValues.columns();
+        }
+
+        private InsertValues toInsertValues() {
+            return insertValues;
         }
     }
 

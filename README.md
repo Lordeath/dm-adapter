@@ -10,8 +10,9 @@
 - mapper XML 优先根据项目内 `application*.properties`、`application*.yml`、`application*.yaml` 中的 `mybatis.mapperLocations` / `mybatis.mapper-locations` 等配置项定位；支持 `classpath*:/mapper/*.xml` 这类跨模块 classpath 配置；未配置时回退到资源目录扫描。
 - 检查 `pom.xml` 是否已有达梦 JDBC 驱动依赖。
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
-- 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页、`FROM/JOIN ... AS 别名` -> `FROM/JOIN ... 别名`，并将 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦特殊列名重命名为追加下划线形式。
-- 将 `DATE_FORMAT`、`GROUP_CONCAT`、`FIND_IN_SET`、JSON 函数、时间计算/转换函数、`ON DUPLICATE KEY UPDATE`、`REPLACE INTO`、反引号标识符等标记为人工确认。
+- 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页、`DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`、`CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`、`FROM/JOIN ... AS 别名` -> `FROM/JOIN ... 别名`，并将 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦特殊列名重命名为追加下划线形式。
+- 支持通过 `.dm-adapter/sql-rewrite.yml` 的 `keyColumns` 配置，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；未配置时保持原 SQL 并生成配置模板。
+- 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore、反引号标识符等标记为人工确认。
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类和 `.dm-adapter/sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean。
 - 输出 Markdown 和 JSON 报告到 `.dm-adapter/`。
 
@@ -33,6 +34,9 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
+
+# 需要将 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写为 MERGE 时，先填写生成的 keyColumns 配置再重跑 migrate。
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --rewrite-config .dm-adapter/sql-rewrite.yml
 
 # 也可以在 migrate 后自动生成 SQL 验证测试；传入 --app-module、--schema 或 --config 会自动触发生成。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system

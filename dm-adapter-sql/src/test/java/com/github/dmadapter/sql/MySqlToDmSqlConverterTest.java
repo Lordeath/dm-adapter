@@ -183,13 +183,36 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void marksDateFormatForManualReview() {
+    void leavesDateFormatNativeAndStillAppliesOtherSafeRules() {
         SqlConversionResult result = converter.convert("select DATE_FORMAT(created_at, '%Y-%m-%d') from user");
 
-        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.changed()).isFalse();
         assertThat(result.convertedSql()).isEqualTo(result.originalSql());
-        assertThat(result.reason()).contains("DATE_FORMAT");
+    }
+
+    @Test
+    void convertsMysqlDateAddIntervalToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select DATE_ADD(CONCAT(DATE(checkDate), ' ', onOffTime), INTERVAL 120 MINUTE) from record"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATEADD(MINUTE, 120, CONCAT(DATE(checkDate), ' ', onOffTime)) from record");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlConvertUnsignedToBigintCast() {
+        SqlConversionResult result = converter.convert(
+                "select max(CONVERT(REPLACE(serialNumber, #{prefix}, ''), UNSIGNED)) from ns_assessment_plan"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select max(CAST(REPLACE(serialNumber, #{prefix}, '') AS BIGINT)) from ns_assessment_plan");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONVERT_UNSIGNED_RULE);
     }
 
     @Test
@@ -424,7 +447,6 @@ class MySqlToDmSqlConverterTest {
     @Test
     void marksMySqlSpecificFunctionsForManualReview() {
         List<String> functionNames = List.of(
-                "DATE_ADD",
                 "DATE_SUB",
                 "STR_TO_DATE",
                 "UNIX_TIMESTAMP",
@@ -454,18 +476,18 @@ class MySqlToDmSqlConverterTest {
                 insert into ns_organization_and_employees_extend(foreignerKeyId, key)
                 values(#{foreignerKeyId}, #{key})
                 on duplicate key update key = values(key)
-                """);
+                """, List.of("foreignerKeyId"));
 
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql()).isEqualTo("""
                 MERGE INTO ns_organization_and_employees_extend t
                 USING (
-                    SELECT #{foreignerKeyId} AS foreignerKeyId, #{key} AS key FROM dual
+                    SELECT #{foreignerKeyId} AS foreignerKeyId, #{key} AS "key" FROM dual
                 ) s
                 ON (t.foreignerKeyId = s.foreignerKeyId)
-                WHEN MATCHED THEN UPDATE SET t.key = s.key
-                WHEN NOT MATCHED THEN INSERT (foreignerKeyId, key) VALUES (s.foreignerKeyId, s.key)
+                WHEN MATCHED THEN UPDATE SET t."key" = s."key"
+                WHEN NOT MATCHED THEN INSERT (foreignerKeyId, "key") VALUES (s.foreignerKeyId, s."key")
                 """);
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
@@ -484,13 +506,13 @@ class MySqlToDmSqlConverterTest {
                 )
                 ON DUPLICATE KEY UPDATE
                     key = VALUES(key)
-                """);
+                """, List.of("foreignerKeyId"));
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).contains(
-                "SELECT #{foreignerKeyId, jdbcType=VARCHAR} AS foreignerKeyId, #{key, jdbcType=VARCHAR} AS key FROM dual",
+                "SELECT #{foreignerKeyId, jdbcType=VARCHAR} AS foreignerKeyId, #{key, jdbcType=VARCHAR} AS \"key\" FROM dual",
                 "ON (t.foreignerKeyId = s.foreignerKeyId)",
-                "WHEN MATCHED THEN UPDATE SET t.key = s.key"
+                "WHEN MATCHED THEN UPDATE SET t.\"key\" = s.\"key\""
         );
     }
 
