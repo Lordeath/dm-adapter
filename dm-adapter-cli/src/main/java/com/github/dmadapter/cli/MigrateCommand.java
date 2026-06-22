@@ -121,7 +121,7 @@ public class MigrateCommand implements Callable<Integer> {
                     mapperMigrationResult.manualReviewItems(),
                     warnings
             );
-            printMigrationSummary(context, scanResult, mapperMigrationResult, fileChanges, reportPaths);
+            printMigrationSummary(context, scanResult, mapperMigrationResult, fileChanges, warnings, reportPaths);
             if (validationTestGenerationRequested()) {
                 ValidationTestGenerationResult validationResult = validationTestGenerator.generate(
                         context.projectRoot(),
@@ -210,6 +210,7 @@ public class MigrateCommand implements Callable<Integer> {
             ProjectScanResult scanResult,
             MapperMigrationResult mapperMigrationResult,
             List<FileChange> fileChanges,
+            List<String> warnings,
             ReportPaths reportPaths
     ) {
         CliLogger.info("Migration " + (context.dryRun() ? "dry-run" : "completed") + ".");
@@ -219,5 +220,9 @@ public class MigrateCommand implements Callable<Integer> {
         CliLogger.info("Automatic SQL conversions: " + mapperMigrationResult.automaticConversions().size());
         CliLogger.info("Manual review SQL items: " + mapperMigrationResult.manualReviewItems().size());
         CliLogger.info("Report: " + reportPaths.markdownPath());
+        if (!warnings.isEmpty()) {
+            CliLogger.info("Warnings:");
+            warnings.forEach(warning -> CliLogger.info("- " + warning));
+        }
     }
 }

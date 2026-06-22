@@ -673,6 +673,48 @@ class MapperMigratorTest {
     }
 
     @Test
+    void missingMapperStatementIdIsReportedForManualReview() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <select resultType="string">
+                        select NOW() from dual
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .contains("select NOW() from dual")
+                .doesNotContain("SYSDATE");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).statementId()).isEqualTo("(missing id: <select>)");
+        assertThat(result.manualReviewItems().get(0).reason())
+                .contains("missing required id attribute")
+                .contains("text-preserving rewrite");
+        assertThat(result.warnings()).hasSize(1);
+        assertThat(result.warnings().get(0)).contains("missing required id attribute");
+    }
+
+    @Test
     void mysqlSpecificFunctionIsMarkedForManualReview() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",

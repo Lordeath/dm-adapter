@@ -60,6 +60,41 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migratePrintsMapperStructureWarnings() throws Exception {
+        writeDemoProject();
+        Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <select resultType="string">
+                        select NOW() from dual
+                    </select>
+                </mapper>
+                """);
+        PrintStream originalOut = System.out;
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+
+        int exitCode;
+        try (PrintStream capturedOut = new PrintStream(stdout, true, StandardCharsets.UTF_8)) {
+            System.setOut(capturedOut);
+            exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        } finally {
+            System.setOut(originalOut);
+        }
+
+        assertThat(exitCode).isZero();
+        String output = stdout.toString(StandardCharsets.UTF_8);
+        assertThat(output)
+                .contains("Warnings:")
+                .contains("Mapper XML statement <select> is missing required id attribute")
+                .contains("text-preserving rewrite");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
+                .contains("(missing id: <select>)")
+                .contains("missing required id attribute");
+    }
+
+    @Test
     void migrateAddsDmDriverToSpringBootModulePomInsteadOfProjectRoot() throws Exception {
         writeMultiModuleProjectWithIndependentRootPom();
         String rootPomBefore = Files.readString(tempDir.resolve("pom.xml"));
