@@ -15,12 +15,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.Consumer;
 
 public class PomAnalyzer {
     private final DependencyTreeInspector dependencyTreeInspector;
 
     public PomAnalyzer() {
         this(new MavenDependencyTreeInspector());
+    }
+
+    public PomAnalyzer(Consumer<String> mavenOutputConsumer) {
+        this(new MavenDependencyTreeInspector(mavenOutputConsumer));
     }
 
     PomAnalyzer(DependencyTreeInspector dependencyTreeInspector) {
