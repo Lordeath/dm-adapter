@@ -250,6 +250,155 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDateSubNowIntervalDayToDamengDateSubtraction() {
+        SqlConversionResult result = converter.convert("""
+                delete from ns_system_log_detail
+                where create_time < date_sub(now(), interval #{expireDays, jdbcType=INTEGER} day)
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                delete from ns_system_log_detail
+                where create_time < (SYSDATE - #{expireDays, jdbcType=INTEGER})
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_NOW_DAY_RULE);
+    }
+
+    @Test
+    void convertsMysqlRegexpOperatorsToRegexpLike() {
+        SqlConversionResult result = converter.convert("""
+                update ys_organization y
+                set is_deleted = 1
+                where organization_path NOT REGEXP #{REGEXP}
+                  and code REGEXP '^[0-9]+$'
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ys_organization y
+                set is_deleted = 1
+                where NOT REGEXP_LIKE(organization_path, #{REGEXP})
+                  and REGEXP_LIKE(code, '^[0-9]+$')
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_REGEXP_OPERATOR_RULE);
+    }
+
+    @Test
+    void convertsUnsignedCastAndAddsRecursiveCteColumnAliases() {
+        SqlConversionResult result = converter.convert("""
+                WITH RECURSIVE OrganizationHierarchy AS (
+                    SELECT
+                        organization_id,
+                        organization_parent_id,
+                        0 AS organization_level,
+                        organization_name
+                    FROM ns_system_organization
+                    UNION ALL
+                    SELECT
+                        o.organization_id,
+                        o.organization_parent_id,
+                        oh.organization_level + 1 AS organization_level,
+                        o.organization_name
+                    FROM ns_system_organization o
+                    INNER JOIN OrganizationHierarchy oh ON o.organization_id = oh.organization_parent_id
+                )
+                SELECT CAST(organization_id AS UNSIGNED) AS organization_id
+                FROM OrganizationHierarchy
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).contains(
+                "WITH RECURSIVE OrganizationHierarchy(organization_id, organization_parent_id, organization_level, organization_name) AS ("
+        );
+        assertThat(result.convertedSql()).contains("CAST(organization_id AS BIGINT) AS organization_id");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_CAST_UNSIGNED_RULE,
+                        MySqlToDmSqlConverter.MYSQL_WITH_RECURSIVE_ALIAS_RULE
+                );
+    }
+
+    @Test
+    void quotesDamengKeywordColumnIdentifiers() {
+        SqlConversionResult result = converter.convert("""
+                select id, message, dimension, create_time
+                from receive_org
+                where y.desc = 'x' and #{item.dimension} is not null
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select id, message, "DIMENSION", create_time
+                from receive_org
+                where y."DESC" = 'x' and #{item.dimension} is not null
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+    }
+
+    @Test
+    void convertsMysqlUpdateJoinToDamengUpdateFrom() {
+        SqlConversionResult result = converter.convert("""
+                update ys_organization y inner join (
+                    select a.organization_id
+                    from ys_organization a
+                    left join ys_organization b on a.sync_organization_parent_id=b.sync_organization_id
+                    where b.is_deleted=1 and a.is_deleted=0
+                ) c
+                set y.is_deleted =1
+                where y.organization_id =c.organization_id and y.sync_organization_parent_id is not null
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ys_organization y set y.is_deleted =1 from (
+                    select a.organization_id
+                    from ys_organization a
+                    left join ys_organization b on a.sync_organization_parent_id=b.sync_organization_id
+                    where b.is_deleted=1 and a.is_deleted=0
+                ) c where y.organization_id =c.organization_id and y.sync_organization_parent_id is not null
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void convertsMysqlUpdateJoinOnConditionToDamengUpdateFromWhereCondition() {
+        SqlConversionResult result = converter.convert("""
+                update ns_system_pre_organization y inner join (
+                    select a.organization_id from ns_system_pre_organization a
+                ) c on c.organization_id = y.organization_id
+                set y.sync_flag=2,y.desc = 'NsOrgParentNotExist'
+                where y.organization_id =c.organization_id
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ns_system_pre_organization y set y.sync_flag=2,y."DESC" = 'NsOrgParentNotExist' from (
+                    select a.organization_id from ns_system_pre_organization a
+                ) c where c.organization_id = y.organization_id and y.organization_id =c.organization_id
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
+                        MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE
+                );
+    }
+
+    @Test
+    void marksComplexMultiJoinUpdateForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                update ys_role_permission_exp yrpe
+                inner join ns_core_resourcebutton ncrb on yrpe.button_id = ncrb.id
+                inner join ns_core_funcinfo f on f.id = ncrb.funcinfo_id
+                set yrpe.func_name = f.funcinfo_funcname
+                where yrpe.enterprise_id = #{enterpriseId}
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("UPDATE JOIN");
+    }
+
+    @Test
     void marksMySqlSpecificFunctionsForManualReview() {
         List<String> functionNames = List.of(
                 "DATE_ADD",
@@ -302,12 +451,21 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void marksRegexpForManualReview() {
-        SqlConversionResult result = converter.convert("select * from user where code REGEXP '^[0-9]+$'");
+    void marksIncompleteRegexpForManualReviewWhenItCannotBeConvertedSafely() {
+        SqlConversionResult result = converter.convert("select * from user where code REGEXP");
 
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.changed()).isFalse();
         assertThat(result.reason()).contains("REGEXP");
+    }
+
+    @Test
+    void marksInsertIgnoreForManualReview() {
+        SqlConversionResult result = converter.convert("insert ignore into user(id, name) values(1, 'a')");
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("INSERT IGNORE");
     }
 
     @Test

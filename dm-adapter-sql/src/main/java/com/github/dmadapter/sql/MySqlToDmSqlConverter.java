@@ -14,6 +14,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE = "MYSQL_AES_BASE64_TO_DM_AES128_ECB";
     public static final String MYSQL_BACKTICK_IDENTIFIER_RULE = "MYSQL_BACKTICK_IDENTIFIER_TO_DM";
     public static final String UPDATE_SET_TABLE_ORDER_RULE = "UPDATE_SET_TABLE_ORDER_TO_STANDARD_UPDATE";
+    public static final String MYSQL_DATE_SUB_NOW_DAY_RULE = "MYSQL_DATE_SUB_NOW_DAY_TO_DM";
+    public static final String MYSQL_REGEXP_OPERATOR_RULE = "MYSQL_REGEXP_OPERATOR_TO_REGEXP_LIKE";
+    public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
+    public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
+    public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
+    public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
 
     private static final int DM_AES128_ECB_ALGORITHM_ID = 513;
     private static final String AES_ENCRYPT = "AES_ENCRYPT";
@@ -28,7 +34,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern DATE_FORMAT_PATTERN = Pattern.compile("\\bDATE_FORMAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern GROUP_CONCAT_PATTERN = Pattern.compile("\\bGROUP_CONCAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern FIND_IN_SET_PATTERN = Pattern.compile("\\bFIND_IN_SET\\s*\\(", Pattern.CASE_INSENSITIVE);
-    private static final Pattern REGEXP_PATTERN = Pattern.compile("\\bREGEXP\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern INSERT_IGNORE_PATTERN = Pattern.compile(
+            "\\bINSERT\\s+IGNORE\\s+INTO\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern CAST_UNSIGNED_BODY_PATTERN = Pattern.compile(
+            "(?is)^\\s*(.+?)\\s+AS\\s+UNSIGNED(?:\\s+INTEGER)?\\s*$"
+    );
+    private static final Pattern INTERVAL_DAY_PATTERN = Pattern.compile(
+            "(?is)^\\s*INTERVAL\\s+(.+?)\\s+DAY\\s*$"
+    );
+    private static final Pattern CTE_ALIAS_PATTERN = Pattern.compile(
+            "(?is).*\\s+AS\\s+(\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
+    );
     private static final List<String> MYSQL_FUNCTIONS_REQUIRING_REVIEW = List.of(
             "DATE_ADD",
             "DATE_SUB",
@@ -127,11 +145,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return SqlConversionResult.unchanged(sql == null ? "" : sql);
         }
         String original = sql;
-        String unsupportedReason = unsupportedReason(original);
-        if (!unsupportedReason.isBlank()) {
-            return SqlConversionResult.manualReview(original, unsupportedReason);
-        }
-
         String converted = original;
         List<String> rules = new ArrayList<>();
 
@@ -145,6 +158,36 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (backtickIdentifierConversion.changed()) {
             converted = backtickIdentifierConversion.convertedSql();
             rules.add(MYSQL_BACKTICK_IDENTIFIER_RULE);
+        }
+
+        GenericConversion dateSubConversion = convertDateSubNowDay(converted);
+        if (dateSubConversion.changed()) {
+            converted = dateSubConversion.convertedSql();
+            rules.add(MYSQL_DATE_SUB_NOW_DAY_RULE);
+        }
+
+        GenericConversion unsignedCastConversion = convertUnsignedCasts(converted);
+        if (unsignedCastConversion.changed()) {
+            converted = unsignedCastConversion.convertedSql();
+            rules.add(MYSQL_CAST_UNSIGNED_RULE);
+        }
+
+        GenericConversion withRecursiveConversion = addRecursiveCteColumnAliases(converted);
+        if (withRecursiveConversion.changed()) {
+            converted = withRecursiveConversion.convertedSql();
+            rules.add(MYSQL_WITH_RECURSIVE_ALIAS_RULE);
+        }
+
+        GenericConversion regexpConversion = convertRegexpOperators(converted);
+        if (regexpConversion.changed()) {
+            converted = regexpConversion.convertedSql();
+            rules.add(MYSQL_REGEXP_OPERATOR_RULE);
+        }
+
+        GenericConversion updateJoinConversion = convertMysqlUpdateJoin(converted);
+        if (updateJoinConversion.changed()) {
+            converted = updateJoinConversion.convertedSql();
+            rules.add(MYSQL_UPDATE_JOIN_RULE);
         }
 
         UpdateSetTableOrderConversion updateSetTableOrderConversion = convertUpdateSetTableOrder(converted);
@@ -178,6 +221,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(DamengReservedColumnRenamer.RULE_NAME);
         }
 
+        GenericConversion keywordQuoteConversion = quoteDamengKeywordIdentifiers(converted);
+        if (keywordQuoteConversion.changed()) {
+            converted = keywordQuoteConversion.convertedSql();
+            rules.add(DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+        }
+
         LimitConversion limitConversion = convertLimit(converted);
         if (limitConversion.manualReviewReason() != null) {
             return SqlConversionResult.manualReview(original, limitConversion.manualReviewReason());
@@ -185,6 +234,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (limitConversion.convertedSql() != null) {
             converted = limitConversion.convertedSql();
             rules.add(limitConversion.ruleName());
+        }
+
+        String unsupportedReason = unsupportedReason(converted);
+        if (!unsupportedReason.isBlank()) {
+            return SqlConversionResult.manualReview(original, unsupportedReason);
         }
 
         parseIfPossible(converted);
@@ -214,8 +268,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (upper.contains("INFORMATION_SCHEMA") || upper.contains("DATABASE()")) {
             return "MySQL metadata SQL such as information_schema/database() requires manual Dameng rewrite.";
         }
-        if (REGEXP_PATTERN.matcher(sql).find()) {
+        if (containsKeywordOutsideIgnoredText(sql, "REGEXP")) {
             return "REGEXP requires manual confirmation because Dameng regular-expression syntax may differ from MySQL.";
+        }
+        if (INSERT_IGNORE_PATTERN.matcher(sql).find()) {
+            return "INSERT IGNORE changes duplicate-key behavior and requires manual Dameng rewrite.";
+        }
+        if (containsMysqlUpdateJoin(sql)) {
+            return "MySQL UPDATE JOIN is present but not simple enough for automatic Dameng UPDATE FROM rewrite.";
         }
         if (containsAesFunction(sql)) {
             AesBase64Conversion aesBase64Conversion = convertBase64Aes(sql);
@@ -228,6 +288,460 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return mysqlFunction + " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
         }
         return "";
+    }
+
+    private GenericConversion convertDateSubNowDay(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "DATE_SUB")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "DATE_SUB");
+                String replacement = functionCall == null ? null : rewriteDateSubNowDay(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteDateSubNowDay(FunctionCall dateSubCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(dateSubCall.body());
+        if (arguments.size() != 2 || !isNowExpression(arguments.get(0).text())) {
+            return null;
+        }
+        Matcher matcher = INTERVAL_DAY_PATTERN.matcher(arguments.get(1).text());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String amount = matcher.group(1).trim();
+        if (amount.isBlank()) {
+            return null;
+        }
+        return "(SYSDATE - " + amount + ")";
+    }
+
+    private boolean isNowExpression(String expression) {
+        String trimmed = expression.trim();
+        return "SYSDATE".equalsIgnoreCase(trimmed) || readOnlyFunctionCall(trimmed, "NOW") != null;
+    }
+
+    private GenericConversion convertUnsignedCasts(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "CAST")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CAST");
+                String replacement = functionCall == null ? null : rewriteUnsignedCast(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteUnsignedCast(FunctionCall castCall) {
+        Matcher matcher = CAST_UNSIGNED_BODY_PATTERN.matcher(castCall.body());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String expression = matcher.group(1).trim();
+        if (expression.isBlank()) {
+            return null;
+        }
+        return "CAST(" + expression + " AS BIGINT)";
+    }
+
+    private GenericConversion addRecursiveCteColumnAliases(String sql) {
+        int withIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, withIndex, "WITH")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int recursiveIndex = skipWhitespace(sql, withIndex + "WITH".length());
+        if (!startsKeyword(sql, recursiveIndex, "RECURSIVE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int cteNameStart = skipWhitespace(sql, recursiveIndex + "RECURSIVE".length());
+        IdentifierToken cteName = readIdentifierToken(sql, cteNameStart);
+        if (cteName == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        int afterCteName = skipWhitespace(sql, cteName.endIndex());
+        if (afterCteName < sql.length() && sql.charAt(afterCteName) == '(') {
+            return GenericConversion.unchanged(sql);
+        }
+        if (!startsKeyword(sql, afterCteName, "AS")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = skipWhitespace(sql, afterCteName + "AS".length());
+        if (openParenIndex >= sql.length() || sql.charAt(openParenIndex) != '(') {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        List<String> aliases = inferCteColumnAliases(sql.substring(openParenIndex + 1, closeParenIndex));
+        if (aliases.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = sql.substring(0, cteName.endIndex())
+                + "("
+                + String.join(", ", aliases)
+                + ")"
+                + sql.substring(cteName.endIndex());
+        return new GenericConversion(converted, true);
+    }
+
+    private List<String> inferCteColumnAliases(String cteBody) {
+        int selectIndex = findTopLevelKeyword(cteBody, "SELECT", 0);
+        if (selectIndex < 0) {
+            return List.of();
+        }
+        int fromIndex = findTopLevelKeyword(cteBody, "FROM", selectIndex + "SELECT".length());
+        if (fromIndex < 0) {
+            return List.of();
+        }
+        String selectList = cteBody.substring(selectIndex + "SELECT".length(), fromIndex);
+        List<String> aliases = new ArrayList<>();
+        for (TopLevelArgument item : splitTopLevelArguments(selectList)) {
+            String alias = inferSelectItemAlias(item.text());
+            if (alias == null || alias.isBlank()) {
+                return List.of();
+            }
+            aliases.add(alias);
+        }
+        return aliases;
+    }
+
+    private String inferSelectItemAlias(String selectItem) {
+        String trimmed = selectItem.trim();
+        Matcher aliasMatcher = CTE_ALIAS_PATTERN.matcher(trimmed);
+        if (aliasMatcher.matches()) {
+            return aliasMatcher.group(1).trim();
+        }
+        int dotIndex = trimmed.lastIndexOf('.');
+        String candidate = dotIndex >= 0 ? trimmed.substring(dotIndex + 1).trim() : trimmed;
+        if (isSimpleIdentifier(candidate)) {
+            return candidate;
+        }
+        return null;
+    }
+
+    private GenericConversion convertRegexpOperators(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "REGEXP")) {
+                RegexpExpression expression = readRegexpExpression(sql, index);
+                if (expression != null && expression.startIndex() >= lastCopiedIndex) {
+                    converted.append(sql, lastCopiedIndex, expression.startIndex());
+                    converted.append(expression.replacement());
+                    index = expression.endIndex();
+                    lastCopiedIndex = expression.endIndex();
+                    changed = true;
+                } else {
+                    index++;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private RegexpExpression readRegexpExpression(String sql, int regexpIndex) {
+        int leftEnd = regexpIndex;
+        boolean negated = false;
+        WordToken previousWord = previousWord(sql, regexpIndex);
+        if (previousWord != null
+                && "NOT".equalsIgnoreCase(previousWord.text())
+                && isOnlyWhitespace(sql, previousWord.endIndex(), regexpIndex)) {
+            negated = true;
+            leftEnd = previousWord.startIndex();
+        }
+        Operand left = readLeftOperand(sql, leftEnd);
+        Operand right = readRightOperand(sql, regexpIndex + "REGEXP".length());
+        if (left == null || right == null) {
+            return null;
+        }
+        String replacement = (negated ? "NOT " : "")
+                + "REGEXP_LIKE("
+                + left.text().trim()
+                + ", "
+                + right.text().trim()
+                + ")";
+        return new RegexpExpression(left.startIndex(), right.endIndex(), replacement);
+    }
+
+    private Operand readLeftOperand(String sql, int endExclusive) {
+        int end = skipWhitespaceBackward(sql, endExclusive);
+        if (end <= 0) {
+            return null;
+        }
+        int start;
+        if (sql.charAt(end - 1) == ')') {
+            start = findMatchingOpenParenBackward(sql, end - 1);
+            if (start < 0) {
+                return null;
+            }
+            start = readFunctionNameStartBeforeParen(sql, start);
+        } else {
+            start = end;
+            while (start > 0 && isOperandIdentifierChar(sql.charAt(start - 1))) {
+                start--;
+            }
+        }
+        String text = sql.substring(start, end);
+        return text.isBlank() ? null : new Operand(start, end, text);
+    }
+
+    private Operand readRightOperand(String sql, int startInclusive) {
+        int start = skipWhitespace(sql, startInclusive);
+        if (start >= sql.length()) {
+            return null;
+        }
+        int end;
+        char current = sql.charAt(start);
+        if (startsMyBatisPlaceholder(sql, start)) {
+            end = skipMyBatisPlaceholder(sql, start);
+        } else if (current == '\'') {
+            end = skipSingleQuotedString(sql, start);
+        } else if (current == '"') {
+            end = skipDoubleQuotedText(sql, start);
+        } else if (current == '(') {
+            int close = findMatchingParen(sql, start);
+            if (close < 0) {
+                return null;
+            }
+            end = close + 1;
+        } else {
+            end = start;
+            while (end < sql.length() && !isRegexpRightBoundary(sql, end)) {
+                end++;
+            }
+        }
+        String text = sql.substring(start, end);
+        return text.isBlank() ? null : new Operand(start, end, text);
+    }
+
+    private boolean isRegexpRightBoundary(String sql, int index) {
+        char current = sql.charAt(index);
+        if (current == ')' || current == ',' || current == ';') {
+            return true;
+        }
+        return Character.isWhitespace(current)
+                && (startsKeyword(sql, skipWhitespace(sql, index), "AND")
+                || startsKeyword(sql, skipWhitespace(sql, index), "OR")
+                || startsKeyword(sql, skipWhitespace(sql, index), "ORDER")
+                || startsKeyword(sql, skipWhitespace(sql, index), "GROUP")
+                || startsKeyword(sql, skipWhitespace(sql, index), "LIMIT"));
+    }
+
+    private GenericConversion convertMysqlUpdateJoin(String sql) {
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int joinIndex = findTopLevelKeyword(sql, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int setIndex = findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length());
+        if (setIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int joinTypeStart = joinTypeStart(sql, joinIndex);
+        String target = sql.substring(updateIndex + "UPDATE".length(), joinTypeStart).trim();
+        String joinSource = sql.substring(joinIndex + "JOIN".length(), setIndex).trim();
+        if (target.isBlank() || joinSource.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
+        int statementEnd = stripTrailingSemicolon(sql);
+        String setClause = sql.substring(setIndex + "SET".length(), whereIndex < 0 ? statementEnd : whereIndex).trim();
+        String whereClause = whereIndex < 0 ? "" : sql.substring(whereIndex + "WHERE".length(), statementEnd).trim();
+        if (setClause.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        JoinSource splitJoin = splitJoinSource(joinSource);
+        if (splitJoin.sourceSql().isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        if (findTopLevelKeyword(splitJoin.sourceSql(), "JOIN", 0) >= 0
+                || findTopLevelKeyword(splitJoin.conditionSql(), "JOIN", 0) >= 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        List<String> whereParts = new ArrayList<>();
+        if (!splitJoin.conditionSql().isBlank()) {
+            whereParts.add(splitJoin.conditionSql());
+        }
+        if (!whereClause.isBlank()) {
+            whereParts.add(whereClause);
+        }
+
+        StringBuilder converted = new StringBuilder(sql.length());
+        converted.append(sql, 0, updateIndex)
+                .append("update ")
+                .append(target)
+                .append(" set ")
+                .append(setClause)
+                .append(" from ")
+                .append(splitJoin.sourceSql());
+        if (!whereParts.isEmpty()) {
+            converted.append(" where ").append(String.join(" and ", whereParts));
+        }
+        converted.append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private boolean containsMysqlUpdateJoin(String sql) {
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return false;
+        }
+        int joinIndex = findTopLevelKeyword(sql, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return false;
+        }
+        return findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length()) >= 0;
+    }
+
+    private int joinTypeStart(String sql, int joinIndex) {
+        WordToken word = previousWord(sql, joinIndex);
+        if (word == null || !isOnlyWhitespace(sql, word.endIndex(), joinIndex)) {
+            return joinIndex;
+        }
+        String upper = word.text().toUpperCase(Locale.ROOT);
+        return Set.of("INNER", "LEFT", "RIGHT", "FULL", "CROSS").contains(upper) ? word.startIndex() : joinIndex;
+    }
+
+    private JoinSource splitJoinSource(String joinSource) {
+        int onIndex = findTopLevelKeyword(joinSource, "ON", 0);
+        if (onIndex < 0) {
+            return new JoinSource(joinSource.strip(), "");
+        }
+        String source = joinSource.substring(0, onIndex).strip();
+        String condition = joinSource.substring(onIndex + "ON".length()).strip();
+        return new JoinSource(source, condition);
+    }
+
+    private int stripTrailingSemicolon(String sql) {
+        int end = sql.length();
+        while (end > 0 && Character.isWhitespace(sql.charAt(end - 1))) {
+            end--;
+        }
+        if (end > 0 && sql.charAt(end - 1) == ';') {
+            end--;
+            while (end > 0 && Character.isWhitespace(sql.charAt(end - 1))) {
+                end--;
+            }
+        }
+        return end;
+    }
+
+    private GenericConversion quoteDamengKeywordIdentifiers(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (isIdentifierStart(current)) {
+                int end = index + 1;
+                while (end < sql.length() && isIdentifierPart(sql.charAt(end))) {
+                    end++;
+                }
+                String identifier = sql.substring(index, end);
+                String quoted = quoteDamengKeywordIdentifierIfNeeded(sql, index, identifier);
+                converted.append(quoted);
+                changed = changed || !quoted.equals(identifier);
+                index = end;
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String quoteDamengKeywordIdentifierIfNeeded(String sql, int startIndex, String identifier) {
+        String upper = identifier.toUpperCase(Locale.ROOT);
+        if ("DIMENSION".equals(upper)) {
+            return "\"DIMENSION\"";
+        }
+        if ("DESC".equals(upper) && previousNonWhitespace(sql, startIndex) == '.') {
+            return "\"DESC\"";
+        }
+        return identifier;
     }
 
     private UpdateSetTableOrderConversion convertUpdateSetTableOrder(String sql) {
@@ -384,6 +898,29 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             } else if (startsBlockComment(sql, index)) {
                 index = skipUntilBlockCommentEnd(sql, index);
             } else if (startsFunction(sql, index, functionName)) {
+                return true;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private boolean containsKeywordOutsideIgnoredText(String sql, String keyword) {
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, keyword)) {
                 return true;
             } else {
                 index++;
@@ -804,6 +1341,159 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return index;
     }
 
+    private int skipWhitespace(String sql, int start) {
+        int index = start;
+        while (index < sql.length() && Character.isWhitespace(sql.charAt(index))) {
+            index++;
+        }
+        return index;
+    }
+
+    private int skipWhitespaceBackward(String sql, int endExclusive) {
+        int index = Math.min(endExclusive, sql.length());
+        while (index > 0 && Character.isWhitespace(sql.charAt(index - 1))) {
+            index--;
+        }
+        return index;
+    }
+
+    private boolean startsKeyword(String sql, int index, String keyword) {
+        if (index < 0 || index + keyword.length() > sql.length()) {
+            return false;
+        }
+        if (index > 0 && isIdentifierPart(sql.charAt(index - 1))) {
+            return false;
+        }
+        if (!sql.regionMatches(true, index, keyword, 0, keyword.length())) {
+            return false;
+        }
+        int afterKeyword = index + keyword.length();
+        return afterKeyword >= sql.length() || !isIdentifierPart(sql.charAt(afterKeyword));
+    }
+
+    private int findTopLevelKeyword(String sql, String keyword, int start) {
+        int depth = 0;
+        int index = Math.max(0, start);
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == 0 && startsKeyword(sql, index, keyword)) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private IdentifierToken readIdentifierToken(String sql, int start) {
+        if (start >= sql.length()) {
+            return null;
+        }
+        if (sql.charAt(start) == '"') {
+            int end = skipDoubleQuotedText(sql, start);
+            return end > start + 1 ? new IdentifierToken(sql.substring(start, end), end) : null;
+        }
+        if (!isIdentifierStart(sql.charAt(start))) {
+            return null;
+        }
+        int end = start + 1;
+        while (end < sql.length() && isIdentifierPart(sql.charAt(end))) {
+            end++;
+        }
+        return new IdentifierToken(sql.substring(start, end), end);
+    }
+
+    private WordToken previousWord(String sql, int beforeIndex) {
+        int end = skipWhitespaceBackward(sql, beforeIndex);
+        if (end <= 0 || !isIdentifierPart(sql.charAt(end - 1))) {
+            return null;
+        }
+        int start = end - 1;
+        while (start > 0 && isIdentifierPart(sql.charAt(start - 1))) {
+            start--;
+        }
+        return new WordToken(start, end, sql.substring(start, end));
+    }
+
+    private boolean isOnlyWhitespace(String sql, int start, int end) {
+        for (int i = start; i < end; i++) {
+            if (!Character.isWhitespace(sql.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int findMatchingOpenParenBackward(String sql, int closeParenIndex) {
+        int depth = 0;
+        int index = closeParenIndex;
+        while (index >= 0) {
+            char current = sql.charAt(index);
+            if (current == ')') {
+                depth++;
+                index--;
+            } else if (current == '(') {
+                depth--;
+                if (depth == 0) {
+                    return index;
+                }
+                index--;
+            } else {
+                index--;
+            }
+        }
+        return -1;
+    }
+
+    private int readFunctionNameStartBeforeParen(String sql, int openParenIndex) {
+        if (openParenIndex <= 0 || Character.isWhitespace(sql.charAt(openParenIndex - 1))) {
+            return openParenIndex;
+        }
+        int start = openParenIndex;
+        while (start > 0 && isIdentifierPart(sql.charAt(start - 1))) {
+            start--;
+        }
+        return start;
+    }
+
+    private boolean isOperandIdentifierChar(char value) {
+        return Character.isLetterOrDigit(value)
+                || value == '_'
+                || value == '$'
+                || value == '.'
+                || value == '"';
+    }
+
+    private char previousNonWhitespace(String sql, int beforeIndex) {
+        int index = beforeIndex - 1;
+        while (index >= 0 && Character.isWhitespace(sql.charAt(index))) {
+            index--;
+        }
+        return index >= 0 ? sql.charAt(index) : '\0';
+    }
+
+    private boolean isIdentifierStart(char value) {
+        return Character.isLetter(value) || value == '_';
+    }
+
     private boolean isIdentifierPart(char value) {
         return Character.isLetterOrDigit(value) || value == '_';
     }
@@ -926,6 +1616,27 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record UpdateSetTableOrderConversion(String convertedSql, boolean changed) {
+    }
+
+    private record GenericConversion(String convertedSql, boolean changed) {
+        private static GenericConversion unchanged(String sql) {
+            return new GenericConversion(sql, false);
+        }
+    }
+
+    private record IdentifierToken(String text, int endIndex) {
+    }
+
+    private record RegexpExpression(int startIndex, int endIndex, String replacement) {
+    }
+
+    private record WordToken(int startIndex, int endIndex, String text) {
+    }
+
+    private record Operand(int startIndex, int endIndex, String text) {
+    }
+
+    private record JoinSource(String sourceSql, String conditionSql) {
     }
 
     private record BacktickIdentifier(String value, int nextIndex, boolean closed) {
