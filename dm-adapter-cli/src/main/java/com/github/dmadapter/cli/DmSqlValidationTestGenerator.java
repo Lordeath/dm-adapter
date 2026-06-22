@@ -154,12 +154,21 @@ class DmSqlValidationTestGenerator {
                 typeHandlersPackages:
                   # - com.example.mybatis.typehandler
 
+                # Skip mapper methods that are not referenced by project target/classes bytecode.
+                usageFilterEnabled: true
+                usageClassDirectories:
+                  # - newsee-system-base/target/classes
+
                 # Configure sample method arguments by mapperClass.method.
                 # Missing methods are invoked with conservative generated parameters when possible.
                 methods:
                   # com.example.UserMapper.selectById:
                   #   args:
                   #     - 1
+
+                # Methods listed here are always executed even if usage filtering cannot find a bytecode reference.
+                includedMethods:
+                  # - com.example.UserMapper.selectById
 
                 # Methods listed here are skipped by the generated integration test.
                 excludedMethods:
@@ -366,6 +375,7 @@ class DmSqlValidationTestGenerator {
 
             import javax.xml.XMLConstants;
             import javax.xml.parsers.DocumentBuilderFactory;
+            import java.io.DataInputStream;
             import java.io.IOException;
             import java.io.InputStream;
             import java.io.Reader;
@@ -428,6 +438,7 @@ class DmSqlValidationTestGenerator {
                     log("Loading config: " + configPath);
                     ValidationConfig config = ValidationConfig.load(configPath);
                     List<ValidationRecord> records = new ArrayList<>();
+                    UsageFilterReport usageFilterReport = UsageFilterReport.disabled();
 
                     try {
                         log("Resolving mapper XML locations...");
@@ -446,6 +457,9 @@ class DmSqlValidationTestGenerator {
                                         "No mapped statements were found in mapper XML files."));
                                 log("FAILED discovery: No mapped statements were found in mapper XML files.");
                             }
+                            UsageFilter usageFilter = MapperUsageIndex.build(projectRoot, config, mapperMethods);
+                            usageFilterReport = usageFilter.report();
+                            log("Usage filter: " + usageFilterReport.summary());
                             int index = 0;
                             int total = mapperMethods.size();
                             for (MapperMethod mapperMethod : mapperMethods) {
@@ -455,6 +469,17 @@ class DmSqlValidationTestGenerator {
                                             mapperMethod.key(),
                                             "excluded",
                                             "Excluded by sql-validation.yml."
+                                    );
+                                    records.add(record);
+                                    logProgress(index, total, record, 0L);
+                                    continue;
+                                }
+                                if (usageFilter.unused(mapperMethod, config)) {
+                                    ValidationRecord record = ValidationRecord.skipped(
+                                            mapperMethod.key(),
+                                            "unused",
+                                            "No project class references mapper method " + mapperMethod.key()
+                                                    + "; skipped by usage filter."
                                     );
                                     records.add(record);
                                     logProgress(index, total, record, 0L);
@@ -482,7 +507,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     log("Writing reports...");
-                    writeReports(projectRoot, records);
+                    writeReports(projectRoot, records, usageFilterReport);
                     log("Finished. Passed: " + count(records, "PASSED")
                             + ", Failed: " + count(records, "FAILED")
                             + ", Skipped: " + count(records, "SKIPPED"));
@@ -1216,20 +1241,25 @@ class DmSqlValidationTestGenerator {
                     throw new IllegalStateException("Could not find " + CONFIG_PATH + " from working directory.");
                 }
 
-                private void writeReports(Path projectRoot, List<ValidationRecord> records) throws IOException {
+                private void writeReports(
+                        Path projectRoot,
+                        List<ValidationRecord> records,
+                        UsageFilterReport usageFilterReport
+                ) throws IOException {
                     Files.createDirectories(projectRoot.resolve(".dm-adapter"));
-                    Files.writeString(projectRoot.resolve(MARKDOWN_REPORT), markdown(records), StandardCharsets.UTF_8);
-                    Files.writeString(projectRoot.resolve(JSON_REPORT), json(records), StandardCharsets.UTF_8);
+                    Files.writeString(projectRoot.resolve(MARKDOWN_REPORT), markdown(records, usageFilterReport), StandardCharsets.UTF_8);
+                    Files.writeString(projectRoot.resolve(JSON_REPORT), json(records, usageFilterReport), StandardCharsets.UTF_8);
                 }
 
                 """,
             """
-                private String markdown(List<ValidationRecord> records) {
+                private String markdown(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
                     StringBuilder markdown = new StringBuilder();
                     markdown.append("# Dameng SQL Validation Report\\n\\n");
                     markdown.append("- Passed: `").append(count(records, "PASSED")).append("`\\n");
                     markdown.append("- Failed: `").append(count(records, "FAILED")).append("`\\n");
                     markdown.append("- Skipped: `").append(count(records, "SKIPPED")).append("`\\n\\n");
+                    appendUsageFilterSummary(markdown, records, usageFilterReport);
                     appendFailureCategorySummary(markdown, records);
                     appendFailurePatternSummary(markdown, records);
                     appendSuggestedNextActions(markdown, records);
@@ -1248,6 +1278,24 @@ class DmSqlValidationTestGenerator {
                     }
                     appendFailureDetails(markdown, records);
                     return markdown.toString();
+                }
+
+                private void appendUsageFilterSummary(
+                        StringBuilder markdown,
+                        List<ValidationRecord> records,
+                        UsageFilterReport usageFilterReport
+                ) {
+                    markdown.append("## Usage Filter\\n\\n");
+                    markdown.append("- Enabled: `").append(usageFilterReport.enabled).append("`\\n");
+                    markdown.append("- Available: `").append(usageFilterReport.available).append("`\\n");
+                    markdown.append("- Class directories: `").append(usageFilterReport.classDirectoryCount).append("`\\n");
+                    markdown.append("- Class files scanned: `").append(usageFilterReport.classFileCount).append("`\\n");
+                    markdown.append("- Referenced mapper methods: `").append(usageFilterReport.referencedMethodCount).append("`\\n");
+                    markdown.append("- Skipped as unused: `").append(unusedSkippedCount(records)).append("`\\n");
+                    for (String warning : usageFilterReport.warnings) {
+                        markdown.append("- Warning: ").append(escapeMarkdown(warning)).append("\\n");
+                    }
+                    markdown.append("\\n");
                 }
 
                 private void appendFailureCategorySummary(StringBuilder markdown, List<ValidationRecord> records) {
@@ -1351,7 +1399,7 @@ class DmSqlValidationTestGenerator {
                     return records.stream().filter(record -> status.equals(record.status)).count();
                 }
 
-                private String json(List<ValidationRecord> records) {
+                private String json(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
                     StringBuilder json = new StringBuilder();
                     json.append("{\\n");
                     json.append("  \\"summary\\": {")
@@ -1359,6 +1407,8 @@ class DmSqlValidationTestGenerator {
                             .append("\\"failed\\": ").append(count(records, "FAILED")).append(", ")
                             .append("\\"skipped\\": ").append(count(records, "SKIPPED"))
                             .append("},\\n");
+                    appendUsageFilterJson(json, records, usageFilterReport);
+                    json.append(",\\n");
                     appendJsonCountMap(json, "failureCategories", failureCategoryCounts(records));
                     json.append(",\\n");
                     appendJsonCountMap(json, "failurePatterns", failurePatternCounts(records));
@@ -1382,6 +1432,35 @@ class DmSqlValidationTestGenerator {
                     }
                     json.append("  ]\\n}\\n");
                     return json.toString();
+                }
+
+                private void appendUsageFilterJson(
+                        StringBuilder json,
+                        List<ValidationRecord> records,
+                        UsageFilterReport usageFilterReport
+                ) {
+                    json.append("  \\"usageFilter\\": {")
+                            .append("\\"enabled\\": ").append(usageFilterReport.enabled).append(", ")
+                            .append("\\"available\\": ").append(usageFilterReport.available).append(", ")
+                            .append("\\"classDirectoryCount\\": ").append(usageFilterReport.classDirectoryCount).append(", ")
+                            .append("\\"classFileCount\\": ").append(usageFilterReport.classFileCount).append(", ")
+                            .append("\\"referencedMethodCount\\": ").append(usageFilterReport.referencedMethodCount).append(", ")
+                            .append("\\"skippedAsUnused\\": ").append(unusedSkippedCount(records)).append(", ")
+                            .append("\\"warnings\\": [");
+                    for (int i = 0; i < usageFilterReport.warnings.size(); i++) {
+                        if (i > 0) {
+                            json.append(", ");
+                        }
+                        json.append("\\"").append(escapeJson(usageFilterReport.warnings.get(i))).append("\\"");
+                    }
+                    json.append("]}");
+                }
+
+                private long unusedSkippedCount(List<ValidationRecord> records) {
+                    return records.stream()
+                            .filter(record -> "SKIPPED".equals(record.status))
+                            .filter(record -> "unused".equals(record.parameterSource))
+                            .count();
                 }
 
                 private void appendJsonCountMap(StringBuilder json, String key, Map<String, Long> counts) {
@@ -1743,13 +1822,324 @@ class DmSqlValidationTestGenerator {
 
                 """,
             """
+                private static final class MapperUsageIndex {
+                    private static UsageFilter build(
+                            Path projectRoot,
+                            ValidationConfig config,
+                            List<MapperMethod> mapperMethods
+                    ) {
+                        if (!config.usageFilterEnabled) {
+                            return UsageFilter.disabled();
+                        }
+                        List<String> warnings = new ArrayList<>();
+                        List<Path> classDirectories;
+                        try {
+                            classDirectories = usageClassDirectories(projectRoot, config);
+                        } catch (IOException e) {
+                            warnings.add("Failed to discover usage class directories: " + e.getMessage());
+                            return UsageFilter.unavailable(new UsageFilterReport(true, false, 0, 0, 0, warnings));
+                        }
+                        if (classDirectories.isEmpty()) {
+                            warnings.add("No target/classes directories were found; usage filter is disabled for this run.");
+                            return UsageFilter.unavailable(new UsageFilterReport(true, false, 0, 0, 0, warnings));
+                        }
+
+                        Map<String, String> ownerMethodToStatement = new LinkedHashMap<>();
+                        Set<String> statementKeys = new LinkedHashSet<>();
+                        Set<String> mapperInternalNames = new LinkedHashSet<>();
+                        for (MapperMethod mapperMethod : mapperMethods) {
+                            String owner = mapperMethod.statement.namespace.replace('.', '/');
+                            ownerMethodToStatement.put(owner + "#" + mapperMethod.statement.id, mapperMethod.key());
+                            statementKeys.add(mapperMethod.key());
+                            mapperInternalNames.add(owner);
+                        }
+
+                        List<Path> classFiles;
+                        try {
+                            classFiles = classFiles(classDirectories);
+                        } catch (IOException e) {
+                            warnings.add("Failed to scan usage class files: " + e.getMessage());
+                            return UsageFilter.unavailable(new UsageFilterReport(true, false, classDirectories.size(), 0, 0, warnings));
+                        }
+                        if (classFiles.isEmpty()) {
+                            warnings.add("No .class files were found under usage class directories; usage filter is disabled for this run.");
+                            return UsageFilter.unavailable(new UsageFilterReport(true, false, classDirectories.size(), 0, 0, warnings));
+                        }
+
+                        Set<String> referencedStatements = new LinkedHashSet<>();
+                        for (Path classFile : classFiles) {
+                            try {
+                                referencedStatements.addAll(scanClassFile(
+                                        classFile,
+                                        ownerMethodToStatement,
+                                        statementKeys,
+                                        mapperInternalNames
+                                ));
+                            } catch (Exception e) {
+                                if (warnings.size() < 10) {
+                                    warnings.add("Failed to inspect class file " + classFile + ": " + e.getMessage());
+                                }
+                            }
+                        }
+                        UsageFilterReport report = new UsageFilterReport(
+                                true,
+                                true,
+                                classDirectories.size(),
+                                classFiles.size(),
+                                referencedStatements.size(),
+                                warnings
+                        );
+                        return UsageFilter.available(referencedStatements, report);
+                    }
+
+                    private static List<Path> usageClassDirectories(Path projectRoot, ValidationConfig config) throws IOException {
+                        if (!config.usageClassDirectories.isEmpty()) {
+                            List<Path> directories = new ArrayList<>();
+                            for (String configuredDirectory : config.usageClassDirectories) {
+                                Path directory = resolveProjectPath(projectRoot, configuredDirectory);
+                                if (Files.isDirectory(directory)) {
+                                    directories.add(directory.toAbsolutePath().normalize());
+                                }
+                            }
+                            return directories;
+                        }
+                        try (var paths = Files.walk(projectRoot)) {
+                            return paths.filter(Files::isDirectory)
+                                    .filter(path -> path.getFileName() != null)
+                                    .filter(path -> "classes".equals(path.getFileName().toString()))
+                                    .filter(path -> path.getParent() != null
+                                            && path.getParent().getFileName() != null
+                                            && "target".equals(path.getParent().getFileName().toString()))
+                                    .filter(path -> !path.toString().contains("test-classes"))
+                                    .sorted()
+                                    .collect(Collectors.toList());
+                        }
+                    }
+
+                    private static List<Path> classFiles(List<Path> classDirectories) throws IOException {
+                        List<Path> classFiles = new ArrayList<>();
+                        for (Path classDirectory : classDirectories) {
+                            try (var paths = Files.walk(classDirectory)) {
+                                classFiles.addAll(paths.filter(Files::isRegularFile)
+                                        .filter(path -> path.getFileName().toString().endsWith(".class"))
+                                        .sorted()
+                                        .collect(Collectors.toList()));
+                            }
+                        }
+                        return classFiles;
+                    }
+
+                    private static Set<String> scanClassFile(
+                            Path classFile,
+                            Map<String, String> ownerMethodToStatement,
+                            Set<String> statementKeys,
+                            Set<String> mapperInternalNames
+                    ) throws IOException {
+                        try (DataInputStream input = new DataInputStream(Files.newInputStream(classFile))) {
+                            if (input.readInt() != 0xCAFEBABE) {
+                                return Set.of();
+                            }
+                            input.readUnsignedShort();
+                            input.readUnsignedShort();
+                            int constantPoolCount = input.readUnsignedShort();
+                            String[] utf8 = new String[constantPoolCount];
+                            int[] classNameIndexes = new int[constantPoolCount];
+                            int[] stringIndexes = new int[constantPoolCount];
+                            MemberRef[] memberRefs = new MemberRef[constantPoolCount];
+                            NameAndType[] nameAndTypes = new NameAndType[constantPoolCount];
+
+                            for (int i = 1; i < constantPoolCount; i++) {
+                                int tag = input.readUnsignedByte();
+                                switch (tag) {
+                                    case 1 -> utf8[i] = input.readUTF();
+                                    case 3, 4 -> input.readInt();
+                                    case 5, 6 -> {
+                                        input.readLong();
+                                        i++;
+                                    }
+                                    case 7 -> classNameIndexes[i] = input.readUnsignedShort();
+                                    case 8 -> stringIndexes[i] = input.readUnsignedShort();
+                                    case 9 -> {
+                                        input.readUnsignedShort();
+                                        input.readUnsignedShort();
+                                    }
+                                    case 10, 11 -> memberRefs[i] = new MemberRef(
+                                            input.readUnsignedShort(),
+                                            input.readUnsignedShort()
+                                    );
+                                    case 12 -> nameAndTypes[i] = new NameAndType(
+                                            input.readUnsignedShort(),
+                                            input.readUnsignedShort()
+                                    );
+                                    case 15 -> {
+                                        input.readUnsignedByte();
+                                        input.readUnsignedShort();
+                                    }
+                                    case 16, 19, 20 -> input.readUnsignedShort();
+                                    case 17, 18 -> {
+                                        input.readUnsignedShort();
+                                        input.readUnsignedShort();
+                                    }
+                                    default -> throw new IOException("Unsupported class constant pool tag: " + tag);
+                                }
+                            }
+
+                            input.readUnsignedShort();
+                            int thisClassIndex = input.readUnsignedShort();
+                            String thisClass = className(classNameIndexes, utf8, thisClassIndex);
+                            if (mapperInternalNames.contains(thisClass)) {
+                                return Set.of();
+                            }
+
+                            Set<String> referencedStatements = new LinkedHashSet<>();
+                            for (MemberRef memberRef : memberRefs) {
+                                if (memberRef == null) {
+                                    continue;
+                                }
+                                NameAndType nameAndType = nameAndTypes[memberRef.nameAndTypeIndex];
+                                if (nameAndType == null) {
+                                    continue;
+                                }
+                                String owner = className(classNameIndexes, utf8, memberRef.classIndex);
+                                String methodName = utf8[nameAndType.nameIndex];
+                                String statement = ownerMethodToStatement.get(owner + "#" + methodName);
+                                if (statement != null) {
+                                    referencedStatements.add(statement);
+                                }
+                            }
+                            for (int stringIndex : stringIndexes) {
+                                if (stringIndex <= 0 || stringIndex >= utf8.length) {
+                                    continue;
+                                }
+                                String value = utf8[stringIndex];
+                                if (statementKeys.contains(value)) {
+                                    referencedStatements.add(value);
+                                }
+                            }
+                            return referencedStatements;
+                        }
+                    }
+
+                    private static String className(int[] classNameIndexes, String[] utf8, int classIndex) {
+                        if (classIndex <= 0 || classIndex >= classNameIndexes.length) {
+                            return "";
+                        }
+                        int nameIndex = classNameIndexes[classIndex];
+                        return nameIndex > 0 && nameIndex < utf8.length ? utf8[nameIndex] : "";
+                    }
+
+                    private static Path resolveProjectPath(Path projectRoot, String location) {
+                        Path path = Path.of(location);
+                        if (path.isAbsolute()) {
+                            return path.toAbsolutePath().normalize();
+                        }
+                        return projectRoot.resolve(location).toAbsolutePath().normalize();
+                    }
+                }
+
+                private static final class UsageFilter {
+                    private final boolean available;
+                    private final Set<String> referencedStatements;
+                    private final UsageFilterReport report;
+
+                    private UsageFilter(boolean available, Set<String> referencedStatements, UsageFilterReport report) {
+                        this.available = available;
+                        this.referencedStatements = referencedStatements;
+                        this.report = report;
+                    }
+
+                    private static UsageFilter disabled() {
+                        return new UsageFilter(false, Set.of(), UsageFilterReport.disabled());
+                    }
+
+                    private static UsageFilter unavailable(UsageFilterReport report) {
+                        return new UsageFilter(false, Set.of(), report);
+                    }
+
+                    private static UsageFilter available(Set<String> referencedStatements, UsageFilterReport report) {
+                        return new UsageFilter(true, referencedStatements, report);
+                    }
+
+                    private boolean unused(MapperMethod mapperMethod, ValidationConfig config) {
+                        return available
+                                && !config.includes(mapperMethod.key())
+                                && !referencedStatements.contains(mapperMethod.key());
+                    }
+
+                    private UsageFilterReport report() {
+                        return report;
+                    }
+                }
+
+                private static final class UsageFilterReport {
+                    private final boolean enabled;
+                    private final boolean available;
+                    private final int classDirectoryCount;
+                    private final int classFileCount;
+                    private final int referencedMethodCount;
+                    private final List<String> warnings;
+
+                    private UsageFilterReport(
+                            boolean enabled,
+                            boolean available,
+                            int classDirectoryCount,
+                            int classFileCount,
+                            int referencedMethodCount,
+                            List<String> warnings
+                    ) {
+                        this.enabled = enabled;
+                        this.available = available;
+                        this.classDirectoryCount = classDirectoryCount;
+                        this.classFileCount = classFileCount;
+                        this.referencedMethodCount = referencedMethodCount;
+                        this.warnings = List.copyOf(warnings == null ? List.of() : warnings);
+                    }
+
+                    private static UsageFilterReport disabled() {
+                        return new UsageFilterReport(false, false, 0, 0, 0, List.of());
+                    }
+
+                    private String summary() {
+                        return "enabled=" + enabled
+                                + ", available=" + available
+                                + ", classDirectories=" + classDirectoryCount
+                                + ", classFiles=" + classFileCount
+                                + ", referencedMethods=" + referencedMethodCount;
+                    }
+                }
+
+                private static final class MemberRef {
+                    private final int classIndex;
+                    private final int nameAndTypeIndex;
+
+                    private MemberRef(int classIndex, int nameAndTypeIndex) {
+                        this.classIndex = classIndex;
+                        this.nameAndTypeIndex = nameAndTypeIndex;
+                    }
+                }
+
+                private static final class NameAndType {
+                    private final int nameIndex;
+                    private final int descriptorIndex;
+
+                    private NameAndType(int nameIndex, int descriptorIndex) {
+                        this.nameIndex = nameIndex;
+                        this.descriptorIndex = descriptorIndex;
+                    }
+                }
+
+                """,
+            """
                 private static final class ValidationConfig {
                     private String schema = "";
+                    private boolean usageFilterEnabled = true;
                     private final DatasourceConfig datasource = new DatasourceConfig();
                     private final List<String> mapperXmlLocations = new ArrayList<>();
+                    private final List<String> usageClassDirectories = new ArrayList<>();
                     private final List<String> typeAliasesPackages = new ArrayList<>();
                     private final List<String> typeHandlersPackages = new ArrayList<>();
                     private final Map<String, List<String>> methodArgs = new LinkedHashMap<>();
+                    private final Set<String> includedMethods = new LinkedHashSet<>();
                     private final Set<String> excludedMethods = new LinkedHashSet<>();
 
                     static ValidationConfig load(Path path) throws IOException {
@@ -1770,6 +2160,14 @@ class DmSqlValidationTestGenerator {
                                 currentMethod = null;
                                 continue;
                             }
+                            if (!line.startsWith(" ") && trimmed.startsWith("usageFilterEnabled:")) {
+                                config.usageFilterEnabled = Boolean.parseBoolean(
+                                        config.scalar(trimmed.substring("usageFilterEnabled:".length()))
+                                );
+                                section = "";
+                                currentMethod = null;
+                                continue;
+                            }
                             if (!line.startsWith(" ") && "datasource:".equals(trimmed)) {
                                 section = "datasource";
                                 currentMethod = null;
@@ -1777,6 +2175,11 @@ class DmSqlValidationTestGenerator {
                             }
                             if (!line.startsWith(" ") && "mapperXmlLocations:".equals(trimmed)) {
                                 section = "mapperXmlLocations";
+                                currentMethod = null;
+                                continue;
+                            }
+                            if (!line.startsWith(" ") && "usageClassDirectories:".equals(trimmed)) {
+                                section = "usageClassDirectories";
                                 currentMethod = null;
                                 continue;
                             }
@@ -1795,6 +2198,11 @@ class DmSqlValidationTestGenerator {
                                 currentMethod = null;
                                 continue;
                             }
+                            if (!line.startsWith(" ") && "includedMethods:".equals(trimmed)) {
+                                section = "includedMethods";
+                                currentMethod = null;
+                                continue;
+                            }
                             if (!line.startsWith(" ") && "excludedMethods:".equals(trimmed)) {
                                 section = "excludedMethods";
                                 currentMethod = null;
@@ -1808,12 +2216,20 @@ class DmSqlValidationTestGenerator {
                                 config.mapperXmlLocations.add(config.scalar(trimmed.substring(2)));
                                 continue;
                             }
+                            if ("usageClassDirectories".equals(section) && trimmed.startsWith("- ")) {
+                                config.usageClassDirectories.add(config.scalar(trimmed.substring(2)));
+                                continue;
+                            }
                             if ("typeAliasesPackages".equals(section) && trimmed.startsWith("- ")) {
                                 config.typeAliasesPackages.add(config.scalar(trimmed.substring(2)));
                                 continue;
                             }
                             if ("typeHandlersPackages".equals(section) && trimmed.startsWith("- ")) {
                                 config.typeHandlersPackages.add(config.scalar(trimmed.substring(2)));
+                                continue;
+                            }
+                            if ("includedMethods".equals(section) && trimmed.startsWith("- ")) {
+                                config.includedMethods.add(config.scalar(trimmed.substring(2)));
                                 continue;
                             }
                             if ("excludedMethods".equals(section) && trimmed.startsWith("- ")) {
@@ -1841,6 +2257,14 @@ class DmSqlValidationTestGenerator {
                         }
                         int lastDot = methodKey.lastIndexOf('.');
                         return lastDot > 0 && excludedMethods.contains(methodKey.substring(0, lastDot) + ".*");
+                    }
+
+                    boolean includes(String methodKey) {
+                        if (methodArgs.containsKey(methodKey) || includedMethods.contains(methodKey)) {
+                            return true;
+                        }
+                        int lastDot = methodKey.lastIndexOf('.');
+                        return lastDot > 0 && includedMethods.contains(methodKey.substring(0, lastDot) + ".*");
                     }
 
                     private String scalar(String value) {
