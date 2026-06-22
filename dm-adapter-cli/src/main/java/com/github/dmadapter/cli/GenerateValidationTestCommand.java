@@ -66,7 +66,7 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
             CliLogger.info("Validation report: " + result.reportPath());
         }
         if (!result.outputTail().isEmpty()) {
-            CliLogger.info("Validation Maven output tail:");
+            CliLogger.info("Validation Maven diagnostics/output:");
             for (String line : result.outputTail()) {
                 CliLogger.info(line);
             }
