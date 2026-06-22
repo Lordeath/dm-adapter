@@ -78,6 +78,49 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateGeneratesValidationTestWhenValidationOptionsArePresent() throws Exception {
+        writeMultiModuleProjectWithIndependentRootPom();
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "migrate",
+                "--project",
+                tempDir.toString(),
+                "--app-module",
+                "sample-system-rest",
+                "--schema",
+                "newsee-system"
+        );
+
+        Path config = tempDir.resolve(".dm-adapter/sql-validation.yml");
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve("sample-system-rest/pom.xml")))
+                .contains("<artifactId>DmJdbcDriver18</artifactId>");
+        assertThat(Files.exists(tempDir.resolve("sample-system-base/src/main/resources/mapper-dm/UserMapper.xml"))).isTrue();
+        assertThat(Files.exists(tempDir.resolve("sample-system-rest/src/test/java/com/example/DmSqlValidationTest.java"))).isTrue();
+        assertThat(Files.readString(config))
+                .contains("schema: \"newsee-system\"")
+                .contains("sample-system-base/src/main/resources/mapper-dm/**/*.xml")
+                .doesNotContain("sample-system-base/src/main/resources/mapper/**/*.xml");
+    }
+
+    @Test
+    void migrateDryRunRejectsValidationTestGeneration() throws Exception {
+        writeDemoProject();
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "migrate",
+                "--project",
+                tempDir.toString(),
+                "--dry-run",
+                "--generate-validation-test"
+        );
+
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(Files.exists(tempDir.resolve(".dm-adapter/sql-validation.yml"))).isFalse();
+        assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isFalse();
+    }
+
+    @Test
     void migrateRewritesAesPasswordSqlAndRedactsReports() throws Exception {
         writeDemoProject();
         Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """

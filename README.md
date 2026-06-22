@@ -33,6 +33,9 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar scan --project
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
+
+# 也可以在 migrate 后自动生成 SQL 验证测试；传入 --app-module、--schema 或 --config 会自动触发生成。
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 
 生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。需要在达梦测试环境显式运行，例如：
