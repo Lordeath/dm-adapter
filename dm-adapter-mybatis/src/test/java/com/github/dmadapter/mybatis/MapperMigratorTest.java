@@ -311,6 +311,60 @@ class MapperMigratorTest {
     }
 
     @Test
+    void rewritesBacktickIdentifiersInSqlFragmentsAndDynamicSqlText() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <sql id="UserColumns">
+                        u.`id`, u.`user_name`, u.`order`
+                    </sql>
+                    <select id="selectUsers">
+                        select <include refid="UserColumns"/>
+                        from `sys_user` u
+                        <where>
+                            u.`enabled` = "Y"
+                            <if test="fieldName != null">
+                                and `${fieldName}` = #{fieldValue}
+                            </if>
+                        </where>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("u.id, u.user_name, u.\"order\"")
+                .contains("from sys_user u")
+                .contains("u.enabled = 'Y'")
+                .contains("and ${fieldName} = #{fieldValue}")
+                .doesNotContain("`");
+        assertThat(result.automaticConversions()).hasSize(2);
+        assertThat(result.automaticConversions())
+                .allSatisfy(sqlChange -> assertThat(sqlChange.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE));
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void mysqlSpecificFunctionIsMarkedForManualReview() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",

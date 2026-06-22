@@ -193,13 +193,41 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void marksBacktickIdentifiersForManualReview() {
-        SqlConversionResult result = converter.convert("select `order`, `status` from `user`");
+    void convertsBacktickIdentifiers() {
+        SqlConversionResult result = converter.convert(
+                "select u.`id`, u.`user_name`, `${item.fieldName}` from `sys_user` u where u.`enabled` = \"Y\""
+        );
 
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.changed()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
-        assertThat(result.reason()).contains("Backtick", "double-quoted identifiers", "case sensitivity");
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select u.id, u.user_name, ${item.fieldName} from sys_user u where u.enabled = 'Y'");
+        assertThat(result.appliedRules())
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
+    }
+
+    @Test
+    void quotesBacktickIdentifiersThatAreReservedOrContainSpecialCharacters() {
+        SqlConversionResult result = converter.convert("select `order`, `newsee-system`.`user-table` from `user`");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("select \"order\", \"newsee-system\".\"user-table\" from \"user\"");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
+    }
+
+    @Test
+    void doesNotConvertBackticksInsideStringsOrComments() {
+        SqlConversionResult result = converter.convert("""
+                select '`order`' as raw, `status` -- `comment`
+                from user /* `block` */
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select '`order`' as raw, status -- `comment`
+                from user /* `block` */
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
     }
 
     @Test
@@ -239,6 +267,28 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.changed()).isFalse();
         assertThat(result.reason()).contains("ON DUPLICATE KEY UPDATE");
+    }
+
+    @Test
+    void marksMysqlMetadataSqlForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                select column_name
+                from information_schema.columns
+                where table_schema = database()
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("information_schema", "database()");
+    }
+
+    @Test
+    void marksRegexpForManualReview() {
+        SqlConversionResult result = converter.convert("select * from user where code REGEXP '^[0-9]+$'");
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("REGEXP");
     }
 
     @Test

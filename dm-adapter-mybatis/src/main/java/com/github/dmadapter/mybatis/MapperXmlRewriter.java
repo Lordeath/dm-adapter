@@ -19,7 +19,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MapperXmlRewriter {
-    private static final Set<String> STATEMENT_TAGS = Set.of("select", "insert", "update", "delete");
+    private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
 
     public MapperRewriteResult rewrite(Path inputPath, String reportPath, boolean writeChanges, SqlConverter sqlConverter) {
         List<SqlChange> automaticConversions = new ArrayList<>();
@@ -136,7 +136,7 @@ public class MapperXmlRewriter {
         NodeList children = root.getChildNodes();
         for (int i = 0; i < children.getLength(); i++) {
             Node node = children.item(i);
-            if (node instanceof Element element && STATEMENT_TAGS.contains(element.getTagName())) {
+            if (node instanceof Element element && SQL_TEXT_TAGS.contains(element.getTagName())) {
                 elements.add(element);
             }
         }

@@ -6,11 +6,13 @@ import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE = "MYSQL_AES_BASE64_TO_DM_AES128_ECB";
+    public static final String MYSQL_BACKTICK_IDENTIFIER_RULE = "MYSQL_BACKTICK_IDENTIFIER_TO_DM";
 
     private static final int DM_AES128_ECB_ALGORITHM_ID = 513;
     private static final String AES_ENCRYPT = "AES_ENCRYPT";
@@ -25,6 +27,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern DATE_FORMAT_PATTERN = Pattern.compile("\\bDATE_FORMAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern GROUP_CONCAT_PATTERN = Pattern.compile("\\bGROUP_CONCAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern FIND_IN_SET_PATTERN = Pattern.compile("\\bFIND_IN_SET\\s*\\(", Pattern.CASE_INSENSITIVE);
+    private static final Pattern REGEXP_PATTERN = Pattern.compile("\\bREGEXP\\b", Pattern.CASE_INSENSITIVE);
     private static final List<String> MYSQL_FUNCTIONS_REQUIRING_REVIEW = List.of(
             "DATE_ADD",
             "DATE_SUB",
@@ -48,6 +51,59 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "JSON_TYPE",
             "JSON_UNQUOTE",
             "JSON_VALID"
+    );
+    private static final Set<String> DAMENG_KEYWORDS_REQUIRING_QUOTES = Set.of(
+            "ADD",
+            "ALTER",
+            "AND",
+            "AS",
+            "ASC",
+            "BETWEEN",
+            "BY",
+            "COMMENT",
+            "CONNECT",
+            "CREATE",
+            "DATE",
+            "DELETE",
+            "DESC",
+            "DROP",
+            "FROM",
+            "FULL",
+            "GROUP",
+            "IN",
+            "INDEX",
+            "INNER",
+            "INSERT",
+            "INTERVAL",
+            "INTO",
+            "IS",
+            "JOIN",
+            "LEFT",
+            "LEVEL",
+            "LIKE",
+            "NOT",
+            "NULL",
+            "ON",
+            "OR",
+            "ORDER",
+            "OUTER",
+            "PRIOR",
+            "RIGHT",
+            "ROW",
+            "SELECT",
+            "SET",
+            "START",
+            "TABLE",
+            "TIME",
+            "TIMESTAMP",
+            "TYPE",
+            "UNION",
+            "UPDATE",
+            "USER",
+            "VALUES",
+            "VIEW",
+            "WHERE",
+            "WITH"
     );
     private static final Pattern LIMIT_COMMA_PATTERN = Pattern.compile(
             "(?is)^(?<base>.+?)\\s+LIMIT\\s+(?<offset>" + TOKEN + ")\\s*,\\s*(?<size>" + TOKEN + ")\\s*;?\\s*$");
@@ -74,6 +130,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (doubleQuotedStringConversion.changed()) {
             converted = doubleQuotedStringConversion.convertedSql();
             rules.add("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+        }
+
+        BacktickIdentifierConversion backtickIdentifierConversion = convertBacktickIdentifiers(converted);
+        if (backtickIdentifierConversion.changed()) {
+            converted = backtickIdentifierConversion.convertedSql();
+            rules.add(MYSQL_BACKTICK_IDENTIFIER_RULE);
         }
 
         Matcher ifNullMatcher = IFNULL_PATTERN.matcher(converted);
@@ -134,6 +196,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (FIND_IN_SET_PATTERN.matcher(sql).find()) {
             return "FIND_IN_SET requires manual confirmation because it is MySQL-specific.";
         }
+        if (upper.contains("INFORMATION_SCHEMA") || upper.contains("DATABASE()")) {
+            return "MySQL metadata SQL such as information_schema/database() requires manual Dameng rewrite.";
+        }
+        if (REGEXP_PATTERN.matcher(sql).find()) {
+            return "REGEXP requires manual confirmation because Dameng regular-expression syntax may differ from MySQL.";
+        }
         if (containsAesFunction(sql)) {
             AesBase64Conversion aesBase64Conversion = convertBase64Aes(sql);
             if (!aesBase64Conversion.changed() || containsAesFunction(aesBase64Conversion.convertedSql())) {
@@ -143,9 +211,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String mysqlFunction = firstMySqlFunctionRequiringReview(sql);
         if (!mysqlFunction.isBlank()) {
             return mysqlFunction + " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
-        }
-        if (sql.contains("`")) {
-            return "Backtick quoted identifiers require manual confirmation. Consider Dameng double-quoted identifiers only after verifying object-name case sensitivity and reserved words.";
         }
         return "";
     }
@@ -466,6 +531,95 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new DoubleQuotedStringConversion(converted.toString(), changed);
     }
 
+    private BacktickIdentifierConversion convertBacktickIdentifiers(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                if (!identifier.closed()) {
+                    converted.append(sql, index, sql.length());
+                    index = sql.length();
+                } else {
+                    converted.append(toDamengIdentifier(identifier.value()));
+                    index = identifier.nextIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new BacktickIdentifierConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private BacktickIdentifier readBacktickIdentifier(String sql, int start) {
+        StringBuilder value = new StringBuilder();
+        int index = start + 1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '`') {
+                if (index + 1 < sql.length() && sql.charAt(index + 1) == '`') {
+                    value.append(current);
+                    index += 2;
+                } else {
+                    return new BacktickIdentifier(value.toString(), index + 1, true);
+                }
+            } else {
+                value.append(current);
+                index++;
+            }
+        }
+        return new BacktickIdentifier("", start, false);
+    }
+
+    private String toDamengIdentifier(String identifier) {
+        if (containsMyBatisPlaceholder(identifier)) {
+            return identifier;
+        }
+        if (isSimpleIdentifier(identifier) && !isDamengKeywordRequiringQuotes(identifier)) {
+            return identifier;
+        }
+        return quoteDamengIdentifier(identifier);
+    }
+
+    private boolean containsMyBatisPlaceholder(String value) {
+        return value.contains("${") || value.contains("#{");
+    }
+
+    private boolean isSimpleIdentifier(String value) {
+        if (value.isBlank() || !(Character.isLetter(value.charAt(0)) || value.charAt(0) == '_')) {
+            return false;
+        }
+        for (int i = 1; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (!(Character.isLetterOrDigit(current) || current == '_')) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isDamengKeywordRequiringQuotes(String identifier) {
+        return DAMENG_KEYWORDS_REQUIRING_QUOTES.contains(identifier.toUpperCase(Locale.ROOT));
+    }
+
+    private String quoteDamengIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
     private int appendSingleQuotedString(String sql, int start, StringBuilder converted) {
         int index = start;
         converted.append(sql.charAt(index++));
@@ -737,6 +891,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record DoubleQuotedStringConversion(String convertedSql, boolean changed) {
+    }
+
+    private record BacktickIdentifierConversion(String convertedSql, boolean changed) {
+    }
+
+    private record BacktickIdentifier(String value, int nextIndex, boolean closed) {
     }
 
     private record AesBase64Conversion(String convertedSql, boolean changed) {
