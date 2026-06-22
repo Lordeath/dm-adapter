@@ -19,15 +19,13 @@ import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -75,8 +73,11 @@ public class MigrateCommand implements Callable<Integer> {
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
     private final MapperMigrator mapperMigrator = new MapperMigrator();
     private final SqlRewriteConfigLoader sqlRewriteConfigLoader = new SqlRewriteConfigLoader();
+    private final SqlRewriteConfigUpdater sqlRewriteConfigUpdater = new SqlRewriteConfigUpdater();
+    private final DamengMetadataReader damengMetadataReader = new DamengMetadataReader();
     private final ReportWriter reportWriter = new ReportWriter();
     private final DmSqlValidationTestGenerator validationTestGenerator = new DmSqlValidationTestGenerator();
+    private final ValidationTestRunner validationTestRunner = new ValidationTestRunner();
 
     @Override
     public Integer call() {
@@ -117,15 +118,34 @@ public class MigrateCommand implements Callable<Integer> {
 
             Path rewriteConfigPath = rewriteConfigPath(context);
             SqlRewriteConfig loadedRewriteConfig = sqlRewriteConfigLoader.load(rewriteConfigPath);
+            MySqlToDmSqlConverter sqlConverter = new MySqlToDmSqlConverter();
+            MapperMigrationResult previewMigrationResult = mapperMigrator.migrate(
+                    scanResult,
+                    previewContext(context),
+                    sqlConverter,
+                    loadedRewriteConfig
+            );
+            List<RewriteConfigCandidate> rewriteConfigCandidates = rewriteConfigCandidates(previewMigrationResult);
+            MetadataLookupResult metadataLookupResult = metadataForRewriteCandidates(context, rewriteConfigCandidates);
+            warnings.addAll(metadataLookupResult.warnings());
+            SqlRewriteConfigUpdate rewriteConfigUpdate = sqlRewriteConfigUpdater.update(
+                    context,
+                    rewriteConfigPath,
+                    loadedRewriteConfig,
+                    rewriteConfigCandidates,
+                    metadataLookupResult.metadataByTable(),
+                    metadataLookupResult.available()
+            );
+            rewriteConfigUpdate.fileChange().ifPresent(fileChanges::add);
+            warnings.addAll(rewriteConfigUpdate.warnings());
+
             MapperMigrationResult mapperMigrationResult = mapperMigrator.migrate(
                     scanResult,
                     context,
-                    new MySqlToDmSqlConverter(),
-                    loadedRewriteConfig
+                    sqlConverter,
+                    rewriteConfigUpdate.rewriteConfig()
             );
             fileChanges.addAll(mapperMigrationResult.fileChanges());
-            ensureRewriteConfigTemplate(context, rewriteConfigPath, mapperMigrationResult)
-                    .ifPresent(fileChanges::add);
             warnings.addAll(mapperMigrationResult.warnings());
             if (hasAesBase64Conversion(mapperMigrationResult)) {
                 warnings.addAll(aesBase64ConversionWarnings());
@@ -149,6 +169,9 @@ public class MigrateCommand implements Callable<Integer> {
                         schema
                 );
                 GenerateValidationTestCommand.printResult(validationResult);
+                GenerateValidationTestCommand.printValidationRunResult(
+                        validationTestRunner.runIfConfigured(validationResult, DmValidationEnvironment.fromSystem())
+                );
             }
             return 0;
         } catch (Exception e) {
@@ -195,41 +218,9 @@ public class MigrateCommand implements Callable<Integer> {
                         : context.projectRoot().resolve(rewriteConfig).toAbsolutePath().normalize());
     }
 
-    private Optional<FileChange> ensureRewriteConfigTemplate(
-            AdapterContext context,
-            Path rewriteConfigPath,
-            MapperMigrationResult mapperMigrationResult
-    ) {
-        if (Files.exists(rewriteConfigPath)) {
-            return Optional.empty();
-        }
-        List<RewriteConfigCandidate> candidates = rewriteConfigCandidates(mapperMigrationResult);
-        if (candidates.isEmpty()) {
-            return Optional.empty();
-        }
-        String template = rewriteConfigTemplate(candidates);
-        if (context.dryRun()) {
-            return Optional.of(FileChange.planned(
-                    rewriteConfigPath.toString(),
-                    "CREATE",
-                    "Create SQL rewrite config template for configured upsert/insert-ignore keyColumns"
-            ));
-        }
-        try {
-            Files.createDirectories(rewriteConfigPath.getParent());
-            Files.writeString(rewriteConfigPath, template, StandardCharsets.UTF_8);
-            return Optional.of(FileChange.applied(
-                    rewriteConfigPath.toString(),
-                    "CREATE",
-                    "Created SQL rewrite config template for configured upsert/insert-ignore keyColumns"
-            ));
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to write SQL rewrite config template: " + rewriteConfigPath, e);
-        }
-    }
-
     private List<RewriteConfigCandidate> rewriteConfigCandidates(MapperMigrationResult mapperMigrationResult) {
         List<RewriteConfigCandidate> candidates = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
         for (com.github.dmadapter.core.SqlChange sqlChange : mapperMigrationResult.manualReviewItems()) {
             String sql = sqlChange.originalSql() == null ? "" : sqlChange.originalSql();
             String lower = sql.toLowerCase();
@@ -249,46 +240,149 @@ public class MigrateCommand implements Callable<Integer> {
             if (methodKey == null || methodKey.isBlank() || methodKey.startsWith("(")) {
                 continue;
             }
-            candidates.add(new RewriteConfigCandidate(methodKey, tableName));
+            String key = methodKey + "|" + DamengMetadataReader.normalizeTableName(tableName);
+            if (seen.add(key)) {
+                candidates.add(new RewriteConfigCandidate(methodKey, tableName, extractInsertColumns(sql, tableName)));
+            }
         }
         return candidates;
     }
 
-    private String rewriteConfigTemplate(List<RewriteConfigCandidate> candidates) {
-        Map<String, Boolean> tables = new LinkedHashMap<>();
-        Map<String, Boolean> methods = new LinkedHashMap<>();
-        for (RewriteConfigCandidate candidate : candidates) {
-            tables.putIfAbsent(candidate.tableName(), true);
-            methods.putIfAbsent(candidate.methodKey(), true);
-        }
-        StringBuilder template = new StringBuilder();
-        template.append("# dm-adapter SQL rewrite config.\n")
-                .append("# Fill keyColumns for MySQL ON DUPLICATE KEY UPDATE / INSERT IGNORE rewrites, then rerun migrate.\n")
-                .append("upsertKeys:\n")
-                .append("  tables:\n");
-        for (String table : tables.keySet()) {
-            template.append("    \"").append(escapeYamlKey(table)).append("\":\n")
-                    .append("      keyColumns: []\n");
-        }
-        template.append("  methods:\n");
-        for (String method : methods.keySet()) {
-            template.append("    \"").append(escapeYamlKey(method)).append("\":\n")
-                    .append("      keyColumns: []\n");
-        }
-        return template.toString();
-    }
-
-    private String escapeYamlKey(String value) {
-        return value.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
     private String extractInsertTableName(String sql) {
         Matcher matcher = Pattern.compile(
-                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+([^\\s(]+)\\s*\\("
+                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+([^\\s(<]+)"
         ).matcher(sql == null ? "" : sql);
         return matcher.find()
                 ? matcher.group(1).replace("`", "").replace("\"", "").trim()
                 : "";
+    }
+
+    private List<String> extractInsertColumns(String sql, String tableName) {
+        if (sql == null || sql.isBlank() || tableName == null || tableName.isBlank()) {
+            return List.of();
+        }
+        Matcher matcher = Pattern.compile(
+                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+"
+                        + Pattern.quote(tableName)
+                        + "\\s*(?<tail>[\\s\\S]*)"
+        ).matcher(sql);
+        if (!matcher.find()) {
+            return List.of();
+        }
+        String tail = matcher.group("tail");
+        String columnList = parenthesizedColumnList(tail).orElseGet(() -> looseColumnList(tail));
+        if (columnList.isBlank()) {
+            return List.of();
+        }
+        return splitColumns(columnList);
+    }
+
+    private Optional<String> parenthesizedColumnList(String text) {
+        int open = text.indexOf('(');
+        if (open < 0) {
+            return Optional.empty();
+        }
+        int depth = 0;
+        for (int i = open; i < text.length(); i++) {
+            char current = text.charAt(i);
+            if (current == '(') {
+                depth++;
+            } else if (current == ')') {
+                depth--;
+                if (depth == 0) {
+                    return Optional.of(text.substring(open + 1, i));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private String looseColumnList(String text) {
+        Matcher valuesMatcher = Pattern.compile("(?is)\\bvalues\\b").matcher(text);
+        if (!valuesMatcher.find()) {
+            return "";
+        }
+        return text.substring(0, valuesMatcher.start());
+    }
+
+    private List<String> splitColumns(String columnList) {
+        List<String> columns = new ArrayList<>();
+        for (String part : columnList.split(",")) {
+            String column = part.replace("`", "").replace("\"", "").trim();
+            if (column.matches("[A-Za-z_][A-Za-z0-9_]*")) {
+                columns.add(column);
+            }
+        }
+        return columns;
+    }
+
+    private AdapterContext previewContext(AdapterContext context) {
+        return AdapterContext.builder(context.projectRoot())
+                .sourceDb(context.sourceDb())
+                .targetDb(context.targetDb())
+                .dryRun(true)
+                .dmDriverCoordinate(context.dmDriverCoordinate())
+                .reportDir(context.reportDir())
+                .mapperTargetDir(context.mapperTargetDir())
+                .build();
+    }
+
+    private MetadataLookupResult metadataForRewriteCandidates(
+            AdapterContext context,
+            List<RewriteConfigCandidate> candidates
+    ) {
+        if (candidates.isEmpty()) {
+            return new MetadataLookupResult(Map.of(), false, List.of());
+        }
+        DmValidationEnvironment environment = DmValidationEnvironment.fromSystem();
+        if (!environment.validationEnabled()) {
+            return new MetadataLookupResult(Map.of(), false, List.of());
+        }
+        if (!environment.ready()) {
+            return new MetadataLookupResult(
+                    Map.of(),
+                    false,
+                    List.of("DM_SQL_VALIDATION is true but metadata inference was skipped because required variables are missing: "
+                            + environment.missingVariables())
+            );
+        }
+        try {
+            Optional<String> configuredSchema = configuredSchema(context);
+            Map<String, TableKeyMetadata> metadata = damengMetadataReader.readTableKeys(
+                    environment,
+                    configuredSchema,
+                    candidates.stream().map(RewriteConfigCandidate::tableName).distinct().toList()
+            );
+            return new MetadataLookupResult(metadata, true, List.of());
+        } catch (Exception e) {
+            return new MetadataLookupResult(
+                    Map.of(),
+                    false,
+                    List.of("Dameng metadata inference was skipped: " + redact(e.getMessage(), environment))
+            );
+        }
+    }
+
+    private Optional<String> configuredSchema(AdapterContext context) {
+        if (schema != null && !schema.isBlank()) {
+            return Optional.of(schema.trim());
+        }
+        return DmValidationConfigReader.schema(context.projectRoot(), config);
+    }
+
+    private String redact(String message, DmValidationEnvironment environment) {
+        String redacted = message == null ? "" : message;
+        redacted = redactValue(redacted, environment.jdbcUrl());
+        redacted = redactValue(redacted, environment.username());
+        redacted = redactValue(redacted, environment.password());
+        return redacted;
+    }
+
+    private String redactValue(String message, String value) {
+        if (value == null || value.isBlank()) {
+            return message;
+        }
+        return message.replace(value, "******");
     }
 
     private ReportPaths writeReport(
@@ -348,6 +442,14 @@ public class MigrateCommand implements Callable<Integer> {
         }
     }
 
-    private record RewriteConfigCandidate(String methodKey, String tableName) {
+    private record MetadataLookupResult(
+            Map<String, TableKeyMetadata> metadataByTable,
+            boolean available,
+            List<String> warnings
+    ) {
+        private MetadataLookupResult {
+            metadataByTable = Map.copyOf(metadataByTable == null ? Map.of() : metadataByTable);
+            warnings = List.copyOf(warnings == null ? List.of() : warnings);
+        }
     }
 }

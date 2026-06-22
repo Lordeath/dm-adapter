@@ -6,6 +6,8 @@ import java.nio.file.Path;
 import java.util.List;
 
 record ValidationTestGenerationResult(
+        Path projectRoot,
+        Path appModuleRoot,
         Path configPath,
         Path testPath,
         List<FileChange> fileChanges,

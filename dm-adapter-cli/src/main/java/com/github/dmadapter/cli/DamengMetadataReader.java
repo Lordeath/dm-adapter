@@ -1,0 +1,255 @@
+package com.github.dmadapter.cli;
+
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+class DamengMetadataReader {
+    Map<String, TableKeyMetadata> readTableKeys(
+            DmValidationEnvironment environment,
+            Optional<String> configuredSchema,
+            Collection<String> tableNames
+    ) {
+        if (tableNames == null || tableNames.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            Class.forName("dm.jdbc.driver.DmDriver");
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("Dameng JDBC driver was not found on the CLI classpath.", e);
+        }
+
+        try (Connection connection = DriverManager.getConnection(
+                environment.jdbcUrl(),
+                environment.username(),
+                environment.password()
+        )) {
+            List<String> schemaCandidates = schemaCandidates(connection, environment, configuredSchema);
+            Map<String, TableKeyMetadata> metadata = new LinkedHashMap<>();
+            for (String tableName : tableNames) {
+                QualifiedTable qualifiedTable = QualifiedTable.parse(tableName);
+                List<String> tableSchemas = qualifiedTable.schema().isBlank()
+                        ? schemaCandidates
+                        : List.of(qualifiedTable.schema());
+                TableKeyMetadata tableMetadata = readTableKeys(connection.getMetaData(), tableSchemas, qualifiedTable.table());
+                metadata.put(normalizeTableName(tableName), tableMetadata);
+            }
+            return metadata;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read Dameng table metadata: " + e.getMessage(), e);
+        }
+    }
+
+    private List<String> schemaCandidates(
+            Connection connection,
+            DmValidationEnvironment environment,
+            Optional<String> configuredSchema
+    ) {
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        configuredSchema.filter(schema -> !schema.isBlank()).ifPresent(candidates::add);
+        schemaFromJdbcUrl(environment.jdbcUrl()).ifPresent(candidates::add);
+        try {
+            String currentSchema = connection.getSchema();
+            if (currentSchema != null && !currentSchema.isBlank()) {
+                candidates.add(currentSchema);
+            }
+        } catch (SQLException | AbstractMethodError ignored) {
+            // Older drivers may not implement getSchema; username is still a useful fallback.
+        }
+        if (!environment.username().isBlank()) {
+            candidates.add(environment.username());
+        }
+        if (candidates.isEmpty()) {
+            return List.of();
+        }
+        return candidates.stream().flatMap(schema -> nameVariants(schema).stream()).distinct().toList();
+    }
+
+    private Optional<String> schemaFromJdbcUrl(String jdbcUrl) {
+        if (jdbcUrl == null || jdbcUrl.isBlank()) {
+            return Optional.empty();
+        }
+        int question = jdbcUrl.indexOf('?');
+        if (question < 0 || question == jdbcUrl.length() - 1) {
+            return Optional.empty();
+        }
+        String query = jdbcUrl.substring(question + 1);
+        for (String part : query.split("[;&]")) {
+            int equals = part.indexOf('=');
+            if (equals <= 0) {
+                continue;
+            }
+            String name = part.substring(0, equals).trim();
+            String value = part.substring(equals + 1).trim();
+            if ("schema".equalsIgnoreCase(name) && !value.isBlank()) {
+                return Optional.of(decodeUrlValue(value));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private String decodeUrlValue(String value) {
+        try {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return value;
+        }
+    }
+
+    private TableKeyMetadata readTableKeys(DatabaseMetaData databaseMetaData, List<String> schemaCandidates, String tableName)
+            throws SQLException {
+        for (String schema : schemaCandidates.isEmpty() ? List.of("") : schemaCandidates) {
+            for (String tableVariant : nameVariants(tableName)) {
+                TableKeyMetadata metadata = readTableKeys(databaseMetaData, blankToNull(schema), tableVariant);
+                if (!metadata.constraints().isEmpty()) {
+                    return metadata;
+                }
+            }
+        }
+        return new TableKeyMetadata(tableName, List.of());
+    }
+
+    private TableKeyMetadata readTableKeys(DatabaseMetaData databaseMetaData, String schema, String tableName)
+            throws SQLException {
+        List<TableConstraint> constraints = new ArrayList<>();
+        Optional<TableConstraint> primaryKey = primaryKey(databaseMetaData, schema, tableName);
+        primaryKey.ifPresent(constraints::add);
+        constraints.addAll(uniqueKeys(databaseMetaData, schema, tableName, primaryKey));
+        return new TableKeyMetadata(tableName, constraints);
+    }
+
+    private Optional<TableConstraint> primaryKey(DatabaseMetaData databaseMetaData, String schema, String tableName)
+            throws SQLException {
+        Map<Short, String> columnsByPosition = new LinkedHashMap<>();
+        String keyName = "";
+        try (ResultSet resultSet = databaseMetaData.getPrimaryKeys(null, schema, tableName)) {
+            while (resultSet.next()) {
+                String columnName = resultSet.getString("COLUMN_NAME");
+                if (columnName == null || columnName.isBlank()) {
+                    continue;
+                }
+                short position = resultSet.getShort("KEY_SEQ");
+                columnsByPosition.put(position, columnName);
+                String pkName = resultSet.getString("PK_NAME");
+                if (keyName.isBlank() && pkName != null) {
+                    keyName = pkName;
+                }
+            }
+        }
+        List<String> columns = orderedColumns(columnsByPosition);
+        if (columns.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(new TableConstraint(keyName, TableConstraint.ConstraintType.PRIMARY_KEY, columns));
+    }
+
+    private List<TableConstraint> uniqueKeys(
+            DatabaseMetaData databaseMetaData,
+            String schema,
+            String tableName,
+            Optional<TableConstraint> primaryKey
+    ) throws SQLException {
+        Map<String, Map<Short, String>> columnsByIndex = new LinkedHashMap<>();
+        try (ResultSet resultSet = databaseMetaData.getIndexInfo(null, schema, tableName, true, false)) {
+            while (resultSet.next()) {
+                boolean nonUnique = resultSet.getBoolean("NON_UNIQUE");
+                short type = resultSet.getShort("TYPE");
+                String columnName = resultSet.getString("COLUMN_NAME");
+                if (nonUnique
+                        || type == DatabaseMetaData.tableIndexStatistic
+                        || columnName == null
+                        || columnName.isBlank()) {
+                    continue;
+                }
+                String indexName = resultSet.getString("INDEX_NAME");
+                if (indexName == null || indexName.isBlank()) {
+                    indexName = "(unique)";
+                }
+                short position = resultSet.getShort("ORDINAL_POSITION");
+                columnsByIndex.computeIfAbsent(indexName, ignored -> new LinkedHashMap<>())
+                        .put(position, columnName);
+            }
+        }
+
+        Set<String> primaryKeyColumns = primaryKey
+                .map(key -> normalizedColumns(key.columns()))
+                .orElse(Set.of());
+        List<TableConstraint> uniqueKeys = new ArrayList<>();
+        for (Map.Entry<String, Map<Short, String>> entry : columnsByIndex.entrySet()) {
+            List<String> columns = orderedColumns(entry.getValue());
+            if (columns.isEmpty() || normalizedColumns(columns).equals(primaryKeyColumns)) {
+                continue;
+            }
+            uniqueKeys.add(new TableConstraint(entry.getKey(), TableConstraint.ConstraintType.UNIQUE_KEY, columns));
+        }
+        return uniqueKeys;
+    }
+
+    private List<String> orderedColumns(Map<Short, String> columnsByPosition) {
+        return columnsByPosition.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(Map.Entry::getValue)
+                .toList();
+    }
+
+    private Set<String> normalizedColumns(List<String> columns) {
+        return columns.stream()
+                .map(DamengMetadataReader::normalizeIdentifier)
+                .collect(LinkedHashSet::new, LinkedHashSet::add, LinkedHashSet::addAll);
+    }
+
+    private static List<String> nameVariants(String name) {
+        String normalized = stripQuotes(name);
+        if (normalized.isBlank()) {
+            return List.of();
+        }
+        LinkedHashSet<String> variants = new LinkedHashSet<>();
+        variants.add(normalized);
+        variants.add(normalized.toUpperCase(Locale.ROOT));
+        variants.add(normalized.toLowerCase(Locale.ROOT));
+        return List.copyOf(variants);
+    }
+
+    static String normalizeTableName(String tableName) {
+        QualifiedTable table = QualifiedTable.parse(tableName);
+        return table.table().toLowerCase(Locale.ROOT);
+    }
+
+    static String normalizeIdentifier(String identifier) {
+        return stripQuotes(identifier).toLowerCase(Locale.ROOT);
+    }
+
+    private static String stripQuotes(String value) {
+        return value == null ? "" : value.trim()
+                .replace("`", "")
+                .replace("\"", "");
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    private record QualifiedTable(String schema, String table) {
+        static QualifiedTable parse(String tableName) {
+            String normalized = stripQuotes(tableName);
+            int dot = normalized.lastIndexOf('.');
+            if (dot > 0 && dot < normalized.length() - 1) {
+                return new QualifiedTable(normalized.substring(0, dot).trim(), normalized.substring(dot + 1).trim());
+            }
+            return new QualifiedTable("", normalized.trim());
+        }
+    }
+}

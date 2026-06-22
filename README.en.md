@@ -11,9 +11,9 @@
 - Check whether `pom.xml` already contains a Dameng JDBC driver dependency.
 - Copy mapper XML files to the source module's `src/main/resources/mapper-dm` during `migrate` without overwriting originals.
 - Apply conservative SQL rewrites: `IFNULL` -> `NVL`, `NOW()` -> `SYSDATE`, double-quoted string literals -> single-quoted string literals, simple `LIMIT` pagination, `DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`, `CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`, `FROM/JOIN ... AS alias` -> `FROM/JOIN ... alias`, and suffix Dameng special column names such as `ROWID`, `ROWNUM`, `TRXID`, `PHYROWID`, and `VERSIONS_*` with an underscore.
-- Rewrite configurable `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` statements to Dameng `MERGE` when `.dm-adapter/sql-rewrite.yml` provides trusted `keyColumns`; otherwise keep the SQL unchanged and generate a config template.
+- Rewrite configurable `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` statements to Dameng `MERGE` when `.dm-adapter/sql-rewrite.yml` provides trusted `keyColumns`; when Dameng validation environment variables are configured, `migrate` can infer and maintain that config from test-database primary/unique metadata, leaving unresolved SQL unchanged and reported.
 - Mark `GROUP_CONCAT`, JSON functions, complex time calculation/conversion functions, `REPLACE INTO`, upsert/ignore SQL without safe key-column configuration, and backtick-quoted identifiers for manual review.
-- Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project, without starting Spring Boot, ShardingSphere, MQ, or web beans.
+- Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class plus a `.dm-adapter/sql-validation.yml` parameter template in the target project, without starting Spring Boot, ShardingSphere, MQ, or web beans; when `DM_SQL_VALIDATION=true` and connection variables are complete, generation also runs the validation test once and prints the report path.
 - Write Markdown and JSON reports under `.dm-adapter/`.
 
 ## Dameng Special Column Rewrite Notes
@@ -35,14 +35,14 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 
-# Fill the generated keyColumns config before rerunning migrate for ON DUPLICATE KEY UPDATE / INSERT IGNORE -> MERGE rewrites.
+# Use sql-rewrite.yml to explicitly configure keyColumns for ON DUPLICATE KEY UPDATE / INSERT IGNORE -> MERGE rewrites.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --rewrite-config .dm-adapter/sql-rewrite.yml
 
 # You can also generate the SQL validation test after migrate; --app-module, --schema, or --config implies generation.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 
-The generated SQL validation test does not connect to the database during ordinary `mvn test` runs. Run it explicitly in the Dameng test environment, for example:
+The generated SQL validation test does not connect to the database during ordinary `mvn test` runs. With the following environment variables, `generate-validation-test` runs it once after generation; you can also run it manually in the Dameng test environment:
 
 ```bash
 DM_SQL_VALIDATION=true \
@@ -53,6 +53,8 @@ mvn -Dtest=DmSqlValidationTest test
 ```
 
 The test creates a MyBatis `SqlSessionFactory` directly from the `datasource` environment-variable placeholders in `.dm-adapter/sql-validation.yml`; it does not load the target project's Spring Boot configuration. When `--schema` is configured, the test executes `set schema "<schema>"` before each DAO invocation, which supports quoted schema names such as `sample-system`. Runtime progress is printed with the `[dm-sql-validation]` prefix, including mapper XML loading, the current mapper method, and passed/failed/skipped results. Results are written to `.dm-adapter/sql-validation-report.md` plus `.dm-adapter/sql-validation-report.json`; the report groups failures by SQL compatibility, test schema, test data/constraints, and keeps long errors in a details section.
+
+The same environment variables are also used by `migrate` for read-only Dameng metadata inference. Schema resolution prefers CLI `--schema` / `.dm-adapter/sql-validation.yml`, then the JDBC URL `schema` parameter, then the connection default schema or username. Inference only writes table names, method names, and `keyColumns`; it never stores JDBC URLs, usernames, or passwords in repository files.
 
 ## Module Layout
 

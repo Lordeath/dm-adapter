@@ -28,12 +28,14 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
     private String schema;
 
     private final DmSqlValidationTestGenerator generator = new DmSqlValidationTestGenerator();
+    private final ValidationTestRunner validationTestRunner = new ValidationTestRunner();
 
     @Override
     public Integer call() {
         try {
             ValidationTestGenerationResult result = generator.generate(project, appModule, mapperDir, config, schema);
             printResult(result);
+            printValidationRunResult(validationTestRunner.runIfConfigured(result, DmValidationEnvironment.fromSystem()));
             return 0;
         } catch (Exception e) {
             CliLogger.error("Validation test generation failed: " + e.getMessage());
@@ -51,6 +53,23 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
         }
         for (String warning : result.warnings()) {
             CliLogger.info("Warning: " + warning);
+        }
+    }
+
+    static void printValidationRunResult(ValidationTestRunResult result) {
+        if (!result.attempted()) {
+            CliLogger.info(result.message());
+            return;
+        }
+        CliLogger.info(result.message());
+        if (result.reportPath() != null) {
+            CliLogger.info("Validation report: " + result.reportPath());
+        }
+        if (!result.outputTail().isEmpty()) {
+            CliLogger.info("Validation Maven output tail:");
+            for (String line : result.outputTail()) {
+                CliLogger.info(line);
+            }
         }
     }
 }
