@@ -25,4 +25,13 @@ public record SqlConversionResult(
     public static SqlConversionResult manualReview(String sql, String reason) {
         return new SqlConversionResult(sql, sql, false, true, reason, List.of());
     }
+
+    public static SqlConversionResult changedWithManualReview(
+            String originalSql,
+            String convertedSql,
+            List<String> appliedRules,
+            String reason
+    ) {
+        return new SqlConversionResult(originalSql, convertedSql, true, true, reason, appliedRules);
+    }
 }

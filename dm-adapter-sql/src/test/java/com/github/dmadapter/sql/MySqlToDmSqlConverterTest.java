@@ -204,6 +204,37 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsGroupConcatSeparatorToListaggOrderedByExpression() {
+        SqlConversionResult result = converter.convert(
+                "select GROUP_CONCAT(message SEPARATOR ' 、 ') as message, userId from log group by userId"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select LISTAGG(message, ' 、 ') WITHIN GROUP (ORDER BY message) as message, userId from log group by userId");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
+    void keepsSafeConversionsWhenRemainingSqlNeedsManualReview() {
+        SqlConversionResult result = converter.convert(
+                "select `user`, JSON_EXTRACT(payload, '$.name') from audit_log limit 1"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select \"user\", JSON_EXTRACT(payload, '$.name') from audit_log FETCH FIRST 1 ROWS ONLY");
+        assertThat(result.reason()).contains("JSON_EXTRACT");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                        "LIMIT_TO_DM_FETCH"
+                );
+    }
+
+    @Test
     void convertsMysqlConvertUnsignedToBigintCast() {
         SqlConversionResult result = converter.convert(
                 "select max(CONVERT(REPLACE(serialNumber, #{prefix}, ''), UNSIGNED)) from ns_assessment_plan"
@@ -354,6 +385,25 @@ class MySqlToDmSqlConverterTest {
                 select id, message, "DIMENSION", create_time
                 from receive_org
                 where y."DESC" = 'x' and #{item.dimension} is not null
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+    }
+
+    @Test
+    void quotesDamengKeywordQualifiedColumnIdentifiers() {
+        SqlConversionResult result = converter.convert("""
+                select id
+                from ns_workcheck_log
+                where ub.systemUserId = ns_workcheck_log.user
+                  and record.state = #{state}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select id
+                from ns_workcheck_log
+                where ub.systemUserId = ns_workcheck_log."user"
+                  and record."state" = #{state}
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
     }
@@ -514,6 +564,26 @@ class MySqlToDmSqlConverterTest {
                 "ON (t.foreignerKeyId = s.foreignerKeyId)",
                 "WHEN MATCHED THEN UPDATE SET t.\"key\" = s.\"key\""
         );
+    }
+
+    @Test
+    void convertsOnDuplicateKeyUpdateWithDamengKeywordColumnsToDoubleQuotedMergeIdentifiers() {
+        SqlConversionResult result = converter.convert("""
+                insert into ns_attendance_record(id, state, verify)
+                values(#{id}, #{state}, #{verify})
+                on duplicate key update state = values(state), verify = values(verify)
+                """, List.of("id"));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains(
+                        "SELECT #{id} AS id, #{state} AS \"state\", #{verify} AS \"verify\" FROM dual",
+                        "WHEN MATCHED THEN UPDATE SET t.\"state\" = s.\"state\", t.\"verify\" = s.\"verify\"",
+                        "WHEN NOT MATCHED THEN INSERT (id, \"state\", \"verify\") VALUES (s.id, s.\"state\", s.\"verify\")"
+                )
+                .doesNotContain("AS 'state'")
+                .doesNotContain("s.'state'");
     }
 
     @Test
