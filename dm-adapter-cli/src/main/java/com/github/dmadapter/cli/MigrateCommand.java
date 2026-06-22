@@ -110,7 +110,7 @@ public class MigrateCommand implements Callable<Integer> {
             printMigrationSummary(context, scanResult, mapperMigrationResult, fileChanges, reportPaths);
             return 0;
         } catch (Exception e) {
-            System.err.println("Migration failed: " + e.getMessage());
+            CliLogger.error("Migration failed: " + e.getMessage());
             return 1;
         }
     }
@@ -178,12 +178,12 @@ public class MigrateCommand implements Callable<Integer> {
             List<FileChange> fileChanges,
             ReportPaths reportPaths
     ) {
-        System.out.println("Migration " + (context.dryRun() ? "dry-run" : "completed") + ".");
-        System.out.println("Maven project: " + scanResult.mavenProject());
-        System.out.println("Mapper XML files: " + scanResult.mapperXmlFiles().size());
-        System.out.println("File changes: " + fileChanges.size());
-        System.out.println("Automatic SQL conversions: " + mapperMigrationResult.automaticConversions().size());
-        System.out.println("Manual review SQL items: " + mapperMigrationResult.manualReviewItems().size());
-        System.out.println("Report: " + reportPaths.markdownPath());
+        CliLogger.info("Migration " + (context.dryRun() ? "dry-run" : "completed") + ".");
+        CliLogger.info("Maven project: " + scanResult.mavenProject());
+        CliLogger.info("Mapper XML files: " + scanResult.mapperXmlFiles().size());
+        CliLogger.info("File changes: " + fileChanges.size());
+        CliLogger.info("Automatic SQL conversions: " + mapperMigrationResult.automaticConversions().size());
+        CliLogger.info("Manual review SQL items: " + mapperMigrationResult.manualReviewItems().size());
+        CliLogger.info("Report: " + reportPaths.markdownPath());
     }
 }

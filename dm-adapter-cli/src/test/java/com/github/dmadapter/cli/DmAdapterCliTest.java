@@ -4,6 +4,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -145,6 +148,7 @@ class DmAdapterCliTest {
                 .contains("SqlSessionFactory")
                 .contains("UnpooledDataSource")
                 .contains("[dm-sql-validation]")
+                .contains("LOG_TIMESTAMP_FORMATTER")
                 .contains("logProgress(index, total, record")
                 .contains("Failure Categories")
                 .contains("Failure Patterns")
@@ -160,6 +164,33 @@ class DmAdapterCliTest {
                 .doesNotContain("@ActiveProfiles")
                 .doesNotContain("PlatformTransactionManager")
                 .doesNotContain("RabbitTemplate");
+    }
+
+    @Test
+    void generateValidationTestPrintsTimestampedConsoleOutput() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+        PrintStream originalOut = System.out;
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+
+        int exitCode;
+        try (PrintStream capturedOut = new PrintStream(stdout, true, StandardCharsets.UTF_8)) {
+            System.setOut(capturedOut);
+            exitCode = new CommandLine(new DmAdapterCli()).execute(
+                    "generate-validation-test",
+                    "--project",
+                    tempDir.toString()
+            );
+        } finally {
+            System.setOut(originalOut);
+        }
+
+        assertThat(exitCode).isZero();
+        String output = stdout.toString(StandardCharsets.UTF_8);
+        assertThat(output)
+                .containsPattern("(?m)^\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\] Dameng SQL validation test generation completed\\.$")
+                .containsPattern("(?m)^\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\] Config: .+sql-validation\\.yml$")
+                .containsPattern("(?m)^\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\] - CREATE .+DmSqlValidationTest\\.java$");
     }
 
     @Test
