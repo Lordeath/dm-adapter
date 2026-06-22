@@ -64,7 +64,7 @@ class ValidationTestRunner {
                     true,
                     exitCode,
                     generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
-                    tail(redact(output, environment), 40),
+                    runDiagnostics(command, workingDirectory, output, environment),
                     exitCode == 0
                             ? "Dameng SQL validation test passed."
                             : "Dameng SQL validation test exited with code " + exitCode + "."
@@ -84,7 +84,7 @@ class ValidationTestRunner {
                     true,
                     1,
                     generationResult.projectRoot().resolve(".dm-adapter/sql-validation-report.md"),
-                    List.of(),
+                    runDiagnostics(command, workingDirectory, "", environment),
                     "Maven validation test was interrupted."
             );
         }
@@ -101,8 +101,22 @@ class ValidationTestRunner {
             command.add("-am");
         }
         command.add("-Dtest=" + DmSqlValidationTestGenerator.TEST_CLASS_NAME);
+        command.add("-Dsurefire.failIfNoSpecifiedTests=false");
         command.add("test");
         return command;
+    }
+
+    private List<String> runDiagnostics(
+            List<String> command,
+            Path workingDirectory,
+            String output,
+            DmValidationEnvironment environment
+    ) {
+        List<String> diagnostics = new ArrayList<>();
+        diagnostics.add("Maven command: " + command);
+        diagnostics.add("Working directory: " + workingDirectory);
+        diagnostics.addAll(tail(redact(output, environment), 40));
+        return diagnostics;
     }
 
     private Path workingDirectory(ValidationTestGenerationResult generationResult) {

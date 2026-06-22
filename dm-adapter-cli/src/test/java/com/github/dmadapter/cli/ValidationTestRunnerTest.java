@@ -3,7 +3,11 @@ package com.github.dmadapter.cli;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -57,6 +61,39 @@ class ValidationTestRunnerTest {
     }
 
     @Test
+    void allowsReactorModulesWithoutGeneratedValidationTest() {
+        assertThat(new ValidationTestRunner().mavenCommand(generationResult()))
+                .contains("-Dsurefire.failIfNoSpecifiedTests=false");
+    }
+
+    @Test
+    void includesMavenCommandAndWorkingDirectoryInRunOutput() {
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> processWithOutput("maven output\n", 1)
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(result.attempted()).isTrue();
+        assertThat(result.outputTail())
+                .anySatisfy(line -> assertThat(line)
+                        .contains("Maven command: [mvn")
+                        .contains("-Dsurefire.failIfNoSpecifiedTests=false"))
+                .anySatisfy(line -> assertThat(line).contains("Working directory: " + tempDir))
+                .anySatisfy(line -> assertThat(line).contains("maven output"));
+    }
+
+    @Test
     void includesDiagnosticsWhenMavenProcessCannotStart() {
         ValidationTestRunner runner = new ValidationTestRunner(
                 Map.of(
@@ -99,5 +136,39 @@ class ValidationTestRunnerTest {
                 List.of(),
                 List.of()
         );
+    }
+
+    private static Process processWithOutput(String output, int exitCode) {
+        byte[] bytes = output.getBytes(StandardCharsets.UTF_8);
+        return new Process() {
+            @Override
+            public OutputStream getOutputStream() {
+                return OutputStream.nullOutputStream();
+            }
+
+            @Override
+            public InputStream getInputStream() {
+                return new ByteArrayInputStream(bytes);
+            }
+
+            @Override
+            public InputStream getErrorStream() {
+                return InputStream.nullInputStream();
+            }
+
+            @Override
+            public int waitFor() {
+                return exitCode;
+            }
+
+            @Override
+            public int exitValue() {
+                return exitCode;
+            }
+
+            @Override
+            public void destroy() {
+            }
+        };
     }
 }
