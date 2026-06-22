@@ -43,6 +43,7 @@ public class MapperXmlRewriter {
             return new MapperRewriteResult(automaticConversions, manualReviewItems, warnings);
         }
 
+        String xml = null;
         boolean changed = false;
         for (Element statement : statementElements(document)) {
             String statementId = statement.getAttribute("id");
@@ -57,6 +58,28 @@ public class MapperXmlRewriter {
                         true,
                         "Statement contains dynamic XML elements and requires manual confirmation."
                 ));
+                if (xml == null) {
+                    xml = readXml(inputPath);
+                }
+                StatementBody statementBody = findStatementBody(xml, statement.getTagName(), statementId, 0);
+                DynamicBodyConversion dynamicBodyConversion =
+                        convertDynamicXmlTextSegments(statementBody.rawBody(), sqlConverter);
+                if (dynamicBodyConversion.changed()) {
+                    replacements.add(StatementReplacement.dynamicBody(
+                            statement.getTagName(),
+                            statementId,
+                            dynamicBodyConversion.convertedBody()
+                    ));
+                    automaticConversions.add(new SqlChange(
+                            reportPath,
+                            statementId,
+                            dynamicBodyConversion.originalBody(),
+                            dynamicBodyConversion.convertedBody(),
+                            dynamicBodyConversion.appliedRules(),
+                            false,
+                            ""
+                    ));
+                }
                 continue;
             }
 
@@ -72,7 +95,11 @@ public class MapperXmlRewriter {
                         conversionResult.reason()
                 ));
             } else if (conversionResult.changed()) {
-                replacements.add(new StatementReplacement(statement.getTagName(), statementId, conversionResult.convertedSql()));
+                replacements.add(StatementReplacement.staticSql(
+                        statement.getTagName(),
+                        statementId,
+                        conversionResult.convertedSql()
+                ));
                 automaticConversions.add(new SqlChange(
                         reportPath,
                         statementId,
@@ -90,6 +117,14 @@ public class MapperXmlRewriter {
             writeReplacements(inputPath, replacements);
         }
         return new MapperRewriteResult(automaticConversions, manualReviewItems, warnings);
+    }
+
+    private String readXml(Path path) {
+        try {
+            return Files.readString(path, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to read mapper XML: " + path, e);
+        }
     }
 
     private List<Element> statementElements(Document document) {
@@ -124,8 +159,15 @@ public class MapperXmlRewriter {
             String xml = Files.readString(path, StandardCharsets.UTF_8);
             int searchFrom = 0;
             for (StatementReplacement replacement : replacements) {
-                StatementBody statementBody = findStatementBody(xml, replacement, searchFrom);
-                String rewrittenBody = rewrittenBody(statementBody.rawBody(), replacement.convertedSql());
+                StatementBody statementBody = findStatementBody(
+                        xml,
+                        replacement.tagName(),
+                        replacement.statementId(),
+                        searchFrom
+                );
+                String rewrittenBody = replacement.convertedBody() == null
+                        ? rewrittenBody(statementBody.rawBody(), replacement.convertedSql())
+                        : replacement.convertedBody();
                 xml = xml.substring(0, statementBody.start()) + rewrittenBody + xml.substring(statementBody.end());
                 searchFrom = statementBody.start() + rewrittenBody.length();
             }
@@ -135,25 +177,25 @@ public class MapperXmlRewriter {
         }
     }
 
-    private StatementBody findStatementBody(String xml, StatementReplacement replacement, int searchFrom) {
-        if (replacement.statementId().isBlank()) {
+    private StatementBody findStatementBody(String xml, String tagName, String statementId, int searchFrom) {
+        if (statementId.isBlank()) {
             throw new IllegalStateException("Mapper statement id is required for text-preserving rewrite.");
         }
 
-        String quotedTag = Pattern.quote(replacement.tagName());
-        String quotedId = Pattern.quote(replacement.statementId());
+        String quotedTag = Pattern.quote(tagName);
+        String quotedId = Pattern.quote(statementId);
         Pattern openingPattern = Pattern.compile(
                 "(?s)<\\s*" + quotedTag + "\\b(?=[^>]*\\bid\\s*=\\s*(?:\"" + quotedId + "\"|'" + quotedId + "'))[^>]*>"
         );
         Matcher openingMatcher = openingPattern.matcher(xml);
         if (!openingMatcher.find(searchFrom)) {
-            throw new IllegalStateException("Failed to locate mapper statement: " + replacement.statementId());
+            throw new IllegalStateException("Failed to locate mapper statement: " + statementId);
         }
 
         Pattern closingPattern = Pattern.compile("(?s)</\\s*" + quotedTag + "\\s*>");
         Matcher closingMatcher = closingPattern.matcher(xml);
         if (!closingMatcher.find(openingMatcher.end())) {
-            throw new IllegalStateException("Failed to locate closing tag for mapper statement: " + replacement.statementId());
+            throw new IllegalStateException("Failed to locate closing tag for mapper statement: " + statementId);
         }
 
         return new StatementBody(
@@ -187,6 +229,78 @@ public class MapperXmlRewriter {
         return escapeXmlText(sql);
     }
 
+    private DynamicBodyConversion convertDynamicXmlTextSegments(String rawBody, SqlConverter sqlConverter) {
+        StringBuilder convertedBody = new StringBuilder(rawBody.length());
+        List<String> appliedRules = new ArrayList<>();
+        boolean changed = false;
+        int index = 0;
+        while (index < rawBody.length()) {
+            if (rawBody.startsWith("<![CDATA[", index)) {
+                int cdataEnd = rawBody.indexOf("]]>", index + "<![CDATA[".length());
+                if (cdataEnd < 0) {
+                    convertedBody.append(rawBody, index, rawBody.length());
+                    break;
+                }
+                String content = rawBody.substring(index + "<![CDATA[".length(), cdataEnd);
+                TextSegmentConversion conversion = convertTextSegment(content, sqlConverter);
+                convertedBody.append(toCdata(conversion.convertedText()));
+                addAppliedRules(appliedRules, conversion.appliedRules());
+                changed = changed || conversion.changed();
+                index = cdataEnd + "]]>".length();
+            } else if (rawBody.startsWith("<!--", index)) {
+                int commentEnd = rawBody.indexOf("-->", index + "<!--".length());
+                if (commentEnd < 0) {
+                    convertedBody.append(rawBody, index, rawBody.length());
+                    break;
+                }
+                convertedBody.append(rawBody, index, commentEnd + "-->".length());
+                index = commentEnd + "-->".length();
+            } else if (rawBody.charAt(index) == '<') {
+                int tagEnd = rawBody.indexOf('>', index + 1);
+                if (tagEnd < 0) {
+                    convertedBody.append(rawBody, index, rawBody.length());
+                    break;
+                }
+                convertedBody.append(rawBody, index, tagEnd + 1);
+                index = tagEnd + 1;
+            } else {
+                int nextTag = rawBody.indexOf('<', index);
+                int textEnd = nextTag < 0 ? rawBody.length() : nextTag;
+                String text = rawBody.substring(index, textEnd);
+                TextSegmentConversion conversion = convertTextSegment(text, sqlConverter);
+                convertedBody.append(conversion.convertedText());
+                addAppliedRules(appliedRules, conversion.appliedRules());
+                changed = changed || conversion.changed();
+                index = textEnd;
+            }
+        }
+        return new DynamicBodyConversion(rawBody, changed ? convertedBody.toString() : rawBody, appliedRules, changed);
+    }
+
+    private TextSegmentConversion convertTextSegment(String text, SqlConverter sqlConverter) {
+        SqlConversionResult conversionResult = sqlConverter.convert(text);
+        if (conversionResult.manualReviewRequired() || !conversionResult.changed()) {
+            return new TextSegmentConversion(text, List.of(), false);
+        }
+        return new TextSegmentConversion(
+                conversionResult.convertedSql(),
+                conversionResult.appliedRules(),
+                true
+        );
+    }
+
+    private void addAppliedRules(List<String> appliedRules, List<String> rulesToAdd) {
+        for (String rule : rulesToAdd) {
+            if (!appliedRules.contains(rule)) {
+                appliedRules.add(rule);
+            }
+        }
+    }
+
+    private String toCdata(String text) {
+        return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>";
+    }
+
     private String escapeXmlText(String text) {
         StringBuilder escaped = new StringBuilder(text.length());
         for (int i = 0; i < text.length(); i++) {
@@ -204,9 +318,33 @@ public class MapperXmlRewriter {
         return escaped.toString();
     }
 
-    private record StatementReplacement(String tagName, String statementId, String convertedSql) {
+    private record StatementReplacement(String tagName, String statementId, String convertedSql, String convertedBody) {
+        private static StatementReplacement staticSql(String tagName, String statementId, String convertedSql) {
+            return new StatementReplacement(tagName, statementId, convertedSql, null);
+        }
+
+        private static StatementReplacement dynamicBody(String tagName, String statementId, String convertedBody) {
+            return new StatementReplacement(tagName, statementId, null, convertedBody);
+        }
     }
 
     private record StatementBody(int start, int end, String rawBody) {
+    }
+
+    private record DynamicBodyConversion(
+            String originalBody,
+            String convertedBody,
+            List<String> appliedRules,
+            boolean changed
+    ) {
+        DynamicBodyConversion {
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+        }
+    }
+
+    private record TextSegmentConversion(String convertedText, List<String> appliedRules, boolean changed) {
+        TextSegmentConversion {
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+        }
     }
 }

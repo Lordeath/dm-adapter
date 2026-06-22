@@ -66,6 +66,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDoubleQuotedStringLiteralInAesEncryptExpression() {
+        SqlConversionResult result = converter.convert(
+                "user_password = to_base64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,\"XXXXXXXX\")) ,"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("user_password = to_base64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,'XXXXXXXX')) ,");
+        assertThat(result.appliedRules()).containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+    }
+
+    @Test
     void renamesDamengReservedColumnNames() {
         SqlConversionResult result = converter.convert("""
                 select rowid, ROWNUM, TRXID, phyrowid, versions_starttime, versions_endtime,

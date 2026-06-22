@@ -261,6 +261,53 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicSqlTextNodesRewriteDoubleQuotedStringLiterals() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updatePassword">
+                        update sys_user
+                        <set>
+                            <if test="userPassword != null">
+                                user_password = to_base64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,"XXXXXXXX")) ,
+                            </if>
+                        </set>
+                        where user_id = #{userId}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("<if test=\"userPassword != null\">")
+                .contains("AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,'XXXXXXXX')")
+                .doesNotContain(",\"XXXXXXXX\"");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void mysqlSpecificFunctionIsMarkedForManualReview() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",
