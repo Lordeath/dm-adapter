@@ -201,6 +201,59 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesForeachOnDuplicateKeyUpdateWithBacktickKeywordColumnsToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.AttendanceRecordMapper">
+                    <insert id="batchInsertOrUpdateAttendanceRecord" parameterType="java.util.List">
+                        <foreach collection="list" item="record" separator=";">
+                            INSERT INTO ns_attendance_record (id, `state`, createTime)
+                            VALUES (#{record.id}, #{record.state}, now())
+                            ON DUPLICATE KEY UPDATE
+                            id = VALUES(id)
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/AttendanceRecordMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/AttendanceRecordMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.AttendanceRecordMapper.batchInsertOrUpdateAttendanceRecord", List.of("id"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AttendanceRecordMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_attendance_record t")
+                .contains("SELECT #{record.id} AS id, #{record.state} AS \"state\", SYSDATE AS createTime FROM dual")
+                .contains("WHEN NOT MATCHED THEN INSERT (id, \"state\", createTime) VALUES (s.id, s.\"state\", s.createTime)")
+                .doesNotContain("ON DUPLICATE KEY UPDATE")
+                .doesNotContain("AS 'state'")
+                .doesNotContain("s.'state'");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void migrationRenamesDamengReservedColumnNamesInMapperSql() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",

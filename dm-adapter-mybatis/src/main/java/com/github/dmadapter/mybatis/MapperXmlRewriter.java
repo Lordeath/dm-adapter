@@ -541,11 +541,41 @@ public class MapperXmlRewriter {
         if (keyColumns.isEmpty()) {
             return body;
         }
-        SqlConversionResult conversion = sqlConverter.convert(foreach.body(), keyColumns);
+        SqlConversionResult conversion = sqlConverter.convert(
+                restoreDoubleQuotedIdentifiersForSqlConverter(foreach.body()),
+                keyColumns
+        );
         if (conversion.manualReviewRequired() || !conversion.changed()) {
             return body;
         }
         return foreach.withBody(conversion.convertedSql()).toXml();
+    }
+
+    private String restoreDoubleQuotedIdentifiersForSqlConverter(String sql) {
+        StringBuilder restored = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                int next = appendQuoted(sql, index, restored, '\'');
+                index = next;
+            } else if (current == '"') {
+                QuotedText quoted = readQuotedText(sql, index, '"');
+                if (!quoted.closed()) {
+                    restored.append(sql, index, sql.length());
+                    index = sql.length();
+                } else {
+                    restored.append('`').append(quoted.value().replace("`", "``")).append('`');
+                    index = quoted.nextIndex();
+                    changed = true;
+                }
+            } else {
+                restored.append(current);
+                index++;
+            }
+        }
+        return changed ? restored.toString() : sql;
     }
 
     private String convertBatchOnDuplicateKeyUpdate(String body, String statementKey, SqlRewriteConfig rewriteConfig) {
@@ -1083,6 +1113,36 @@ public class MapperXmlRewriter {
         return -1;
     }
 
+    private int appendQuoted(String value, int start, StringBuilder target, char quote) {
+        QuotedText quoted = readQuotedText(value, start, quote);
+        if (!quoted.closed()) {
+            target.append(value, start, value.length());
+            return value.length();
+        }
+        target.append(value, start, quoted.nextIndex());
+        return quoted.nextIndex();
+    }
+
+    private QuotedText readQuotedText(String value, int start, char quote) {
+        StringBuilder content = new StringBuilder();
+        int index = start + 1;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            index++;
+            if (current == quote) {
+                if (index < value.length() && value.charAt(index) == quote) {
+                    content.append(current);
+                    index++;
+                } else {
+                    return new QuotedText(content.toString(), index, true);
+                }
+            } else {
+                content.append(current);
+            }
+        }
+        return new QuotedText("", start, false);
+    }
+
     private int skipQuoted(String value, int start, char quote) {
         int index = start + 1;
         while (index < value.length()) {
@@ -1340,6 +1400,9 @@ public class MapperXmlRewriter {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
             manualReviewReasons = List.copyOf(manualReviewReasons == null ? List.of() : manualReviewReasons);
         }
+    }
+
+    private record QuotedText(String value, int nextIndex, boolean closed) {
     }
 
     private record TextSegmentConversion(
