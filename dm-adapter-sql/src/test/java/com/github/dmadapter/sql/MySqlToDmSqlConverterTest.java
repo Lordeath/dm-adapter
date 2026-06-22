@@ -231,6 +231,25 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsUpdateSetTableOrderToStandardUpdate() {
+        SqlConversionResult result = converter.convert("""
+                update set ns_core_dictionaryitem
+                del_status = 1,
+                update_time = #{updateTime}
+                where ID = #{id}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ns_core_dictionaryitem set
+                del_status = 1,
+                update_time = #{updateTime}
+                where ID = #{id}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.UPDATE_SET_TABLE_ORDER_RULE);
+    }
+
+    @Test
     void marksMySqlSpecificFunctionsForManualReview() {
         List<String> functionNames = List.of(
                 "DATE_ADD",

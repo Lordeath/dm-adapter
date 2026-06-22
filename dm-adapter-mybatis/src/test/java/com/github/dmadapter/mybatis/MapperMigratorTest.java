@@ -311,6 +311,64 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicBatchInsertAddsValuesAndRemovesForeachTrailingComma() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert into sample_user
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            id,
+                            name,
+                        </trim>
+                        <foreach collection="list" item="item" separator=",">
+                            (
+                            #{item.id},
+                            #{item.name},
+                            )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("""
+                                </trim>
+                                values
+                                <foreach collection="list" item="item" separator=",">
+                        """)
+                .contains("#{item.id},\n            #{item.name}\n            )")
+                .doesNotContain("#{item.name},\n            )");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(
+                        MapperXmlRewriter.MYBATIS_BATCH_INSERT_ADD_VALUES_RULE,
+                        MapperXmlRewriter.MYBATIS_FOREACH_TRAILING_COMMA_RULE
+                );
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void rewritesBacktickIdentifiersInSqlFragmentsAndDynamicSqlText() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

@@ -13,6 +13,7 @@ import java.util.regex.Pattern;
 public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE = "MYSQL_AES_BASE64_TO_DM_AES128_ECB";
     public static final String MYSQL_BACKTICK_IDENTIFIER_RULE = "MYSQL_BACKTICK_IDENTIFIER_TO_DM";
+    public static final String UPDATE_SET_TABLE_ORDER_RULE = "UPDATE_SET_TABLE_ORDER_TO_STANDARD_UPDATE";
 
     private static final int DM_AES128_ECB_ALGORITHM_ID = 513;
     private static final String AES_ENCRYPT = "AES_ENCRYPT";
@@ -111,6 +112,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^(?<base>.+?)\\s+LIMIT\\s+(?<size>" + TOKEN + ")\\s+OFFSET\\s+(?<offset>" + TOKEN + ")\\s*;?\\s*$");
     private static final Pattern LIMIT_SIZE_PATTERN = Pattern.compile(
             "(?is)^(?<base>.+?)\\s+LIMIT\\s+(?<size>" + TOKEN + ")\\s*;?\\s*$");
+    private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\")";
+    private static final Pattern UPDATE_SET_TABLE_ORDER_PATTERN = Pattern.compile(
+            "(?is)^(\\s*)update\\s+set\\s+("
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?)(\\s+)(.+)$"
+    );
 
     @Override
     public SqlConversionResult convert(String sql) {
@@ -136,6 +145,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (backtickIdentifierConversion.changed()) {
             converted = backtickIdentifierConversion.convertedSql();
             rules.add(MYSQL_BACKTICK_IDENTIFIER_RULE);
+        }
+
+        UpdateSetTableOrderConversion updateSetTableOrderConversion = convertUpdateSetTableOrder(converted);
+        if (updateSetTableOrderConversion.changed()) {
+            converted = updateSetTableOrderConversion.convertedSql();
+            rules.add(UPDATE_SET_TABLE_ORDER_RULE);
         }
 
         Matcher ifNullMatcher = IFNULL_PATTERN.matcher(converted);
@@ -213,6 +228,20 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return mysqlFunction + " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
         }
         return "";
+    }
+
+    private UpdateSetTableOrderConversion convertUpdateSetTableOrder(String sql) {
+        Matcher matcher = UPDATE_SET_TABLE_ORDER_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return new UpdateSetTableOrderConversion(sql, false);
+        }
+        String converted = matcher.group(1)
+                + "update "
+                + matcher.group(2)
+                + " set"
+                + matcher.group(3)
+                + matcher.group(4);
+        return new UpdateSetTableOrderConversion(converted, true);
     }
 
     private boolean containsAesFunction(String sql) {
@@ -894,6 +923,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record BacktickIdentifierConversion(String convertedSql, boolean changed) {
+    }
+
+    private record UpdateSetTableOrderConversion(String convertedSql, boolean changed) {
     }
 
     private record BacktickIdentifier(String value, int nextIndex, boolean closed) {

@@ -19,7 +19,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MapperXmlRewriter {
+    public static final String MYBATIS_BATCH_INSERT_ADD_VALUES_RULE = "MYBATIS_BATCH_INSERT_ADD_VALUES";
+    public static final String MYBATIS_FOREACH_TRAILING_COMMA_RULE = "MYBATIS_FOREACH_TRAILING_COMMA";
+
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
+    private static final Pattern INSERT_TRIM_THEN_FOREACH_PATTERN = Pattern.compile(
+            "(?is)(\\binsert\\s+into\\b[\\s\\S]*?</trim>)(\\s*)(<foreach\\b)"
+    );
+    private static final Pattern FOREACH_BLOCK_PATTERN = Pattern.compile("(?is)<foreach\\b[^>]*>[\\s\\S]*?</foreach>");
+    private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
 
     public MapperRewriteResult rewrite(Path inputPath, String reportPath, boolean writeChanges, SqlConverter sqlConverter) {
         List<SqlChange> automaticConversions = new ArrayList<>();
@@ -63,7 +71,7 @@ public class MapperXmlRewriter {
                 }
                 StatementBody statementBody = findStatementBody(xml, statement.getTagName(), statementId, 0);
                 DynamicBodyConversion dynamicBodyConversion =
-                        convertDynamicXmlTextSegments(statementBody.rawBody(), sqlConverter);
+                        convertDynamicXmlTextSegments(statement.getTagName(), statementBody.rawBody(), sqlConverter);
                 if (dynamicBodyConversion.changed()) {
                     replacements.add(StatementReplacement.dynamicBody(
                             statement.getTagName(),
@@ -229,7 +237,7 @@ public class MapperXmlRewriter {
         return escapeXmlText(sql);
     }
 
-    private DynamicBodyConversion convertDynamicXmlTextSegments(String rawBody, SqlConverter sqlConverter) {
+    private DynamicBodyConversion convertDynamicXmlTextSegments(String statementTagName, String rawBody, SqlConverter sqlConverter) {
         StringBuilder convertedBody = new StringBuilder(rawBody.length());
         List<String> appliedRules = new ArrayList<>();
         boolean changed = false;
@@ -274,7 +282,67 @@ public class MapperXmlRewriter {
                 index = textEnd;
             }
         }
-        return new DynamicBodyConversion(rawBody, changed ? convertedBody.toString() : rawBody, appliedRules, changed);
+        String rewrittenBody = convertedBody.toString();
+        DynamicBodyConversion structuralConversion = convertDynamicXmlStructure(statementTagName, rewrittenBody);
+        if (structuralConversion.changed()) {
+            rewrittenBody = structuralConversion.convertedBody();
+            addAppliedRules(appliedRules, structuralConversion.appliedRules());
+            changed = true;
+        }
+        return new DynamicBodyConversion(rawBody, changed ? rewrittenBody : rawBody, appliedRules, changed);
+    }
+
+    private DynamicBodyConversion convertDynamicXmlStructure(String statementTagName, String body) {
+        if (!"insert".equals(statementTagName)) {
+            return new DynamicBodyConversion(body, body, List.of(), false);
+        }
+
+        List<String> appliedRules = new ArrayList<>();
+        String converted = addMissingBatchInsertValues(body);
+        if (!converted.equals(body)) {
+            appliedRules.add(MYBATIS_BATCH_INSERT_ADD_VALUES_RULE);
+        }
+
+        String withoutTrailingCommas = removeForeachTrailingCommas(converted);
+        if (!withoutTrailingCommas.equals(converted)) {
+            appliedRules.add(MYBATIS_FOREACH_TRAILING_COMMA_RULE);
+        }
+        converted = withoutTrailingCommas;
+        return new DynamicBodyConversion(body, converted, appliedRules, !appliedRules.isEmpty());
+    }
+
+    private String addMissingBatchInsertValues(String body) {
+        Matcher matcher = INSERT_TRIM_THEN_FOREACH_PATTERN.matcher(body);
+        StringBuffer converted = new StringBuffer(body.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            String whitespace = matcher.group(2);
+            String separator = whitespace.isEmpty() ? " " : whitespace;
+            matcher.appendReplacement(
+                    converted,
+                    Matcher.quoteReplacement(matcher.group(1) + separator + "values" + separator + matcher.group(3))
+            );
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return changed ? converted.toString() : body;
+    }
+
+    private String removeForeachTrailingCommas(String body) {
+        Matcher matcher = FOREACH_BLOCK_PATTERN.matcher(body);
+        StringBuilder converted = new StringBuilder(body.length());
+        boolean changed = false;
+        int index = 0;
+        while (matcher.find()) {
+            converted.append(body, index, matcher.start());
+            String foreachBlock = matcher.group();
+            String rewrittenBlock = TRAILING_COMMA_BEFORE_PAREN_PATTERN.matcher(foreachBlock).replaceAll("$1");
+            converted.append(rewrittenBlock);
+            changed = changed || !rewrittenBlock.equals(foreachBlock);
+            index = matcher.end();
+        }
+        converted.append(body, index, body.length());
+        return changed ? converted.toString() : body;
     }
 
     private TextSegmentConversion convertTextSegment(String text, SqlConverter sqlConverter) {

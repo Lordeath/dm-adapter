@@ -1232,12 +1232,14 @@ class DmSqlValidationTestGenerator {
                     markdown.append("- Skipped: `").append(count(records, "SKIPPED")).append("`\\n\\n");
                     appendFailureCategorySummary(markdown, records);
                     appendFailurePatternSummary(markdown, records);
+                    appendSuggestedNextActions(markdown, records);
                     markdown.append("## Results\\n\\n");
-                    markdown.append("| Status | Category | Mapper Method | Parameter Source | Summary | Hint |\\n");
-                    markdown.append("| --- | --- | --- | --- | --- | --- |\\n");
+                    markdown.append("| Status | Category | Pattern | Mapper Method | Parameter Source | Summary | Hint |\\n");
+                    markdown.append("| --- | --- | --- | --- | --- | --- | --- |\\n");
                     for (ValidationRecord record : records) {
                         markdown.append("| ").append(record.status)
                                 .append(" | ").append(escapeMarkdown(category(record)))
+                                .append(" | ").append(escapeMarkdown(failurePattern(record)))
                                 .append(" | `").append(escapeMarkdown(record.key)).append("`")
                                 .append(" | ").append(escapeMarkdown(record.parameterSource))
                                 .append(" | ").append(escapeMarkdown(summary(record)))
@@ -1281,6 +1283,45 @@ class DmSqlValidationTestGenerator {
                     markdown.append("\\n");
                 }
 
+                private void appendSuggestedNextActions(StringBuilder markdown, List<ValidationRecord> records) {
+                    Map<String, Long> countsByPattern = failurePatternCounts(records);
+                    Map<String, Long> countsByCategory = failureCategoryCounts(records);
+                    if (countsByPattern.isEmpty() && countsByCategory.isEmpty()) {
+                        return;
+                    }
+                    markdown.append("## Suggested Next Actions\\n\\n");
+                    if (containsAnyPattern(countsByPattern,
+                            "UPDATE_SET_TABLE_ORDER",
+                            "TRAILING_COMMA",
+                            "INSERT_FOREACH_MISSING_VALUES")) {
+                        markdown.append("- Re-run dm-adapter migrate and then this validation test; these patterns have strict automatic mapper-dm rewrites.\\n");
+                    }
+                    if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")) {
+                        markdown.append("- Align the Dameng test schema for missing tables, views, columns, or object-name differences before treating these as SQL rewrite failures.\\n");
+                    }
+                    if (containsAnyPattern(countsByPattern,
+                            "NULL_COLLECTION_PARAMETER",
+                            "BINDING_PARAMETER_NAME",
+                            "METHOD_ARGS_OR_BINDING_OTHER")
+                            || countsByCategory.containsKey("METHOD_ARGS_OR_BINDING")) {
+                        markdown.append("- Configure method args in sql-validation.yml, or inspect mapper @Param names when XML parameter names differ from Java method parameters.\\n");
+                    }
+                    if (containsAnyPattern(countsByPattern,
+                            "ON_DUPLICATE_KEY_UPDATE",
+                            "REGEXP_OPERATOR",
+                            "MYSQL_METADATA_SQL",
+                            "SQL_SYNTAX_OTHER")) {
+                        markdown.append("- Manually review complex SQL patterns such as ON DUPLICATE KEY UPDATE, REGEXP, MySQL metadata queries, and other uncategorized Dameng syntax failures.\\n");
+                    }
+                    if (containsAnyPattern(countsByPattern,
+                            "TEST_DATA_OR_CONSTRAINT",
+                            "TEST_DATA_OTHER")
+                            || countsByCategory.containsKey("TEST_DATA_OR_SCHEMA")) {
+                        markdown.append("- Adjust generated sample data, seed data, defaults, or constraints for data-related validation failures.\\n");
+                    }
+                    markdown.append("\\n");
+                }
+
                 private void appendFailureDetails(StringBuilder markdown, List<ValidationRecord> records) {
                     List<ValidationRecord> failed = records.stream()
                             .filter(record -> "FAILED".equals(record.status))
@@ -1294,6 +1335,8 @@ class DmSqlValidationTestGenerator {
                         markdown.append("<details>\\n");
                         markdown.append("<summary>")
                                 .append(escapeHtml(category(record)))
+                                .append(" / ")
+                                .append(escapeHtml(failurePattern(record)))
                                 .append(" - ")
                                 .append(escapeHtml(record.key))
                                 .append("</summary>\\n\\n");
@@ -1325,6 +1368,7 @@ class DmSqlValidationTestGenerator {
                         json.append("    {")
                                 .append("\\"status\\": \\"").append(escapeJson(record.status)).append("\\", ")
                                 .append("\\"category\\": \\"").append(escapeJson(category(record))).append("\\", ")
+                                .append("\\"failurePattern\\": \\"").append(escapeJson(failurePattern(record))).append("\\", ")
                                 .append("\\"key\\": \\"").append(escapeJson(record.key)).append("\\", ")
                                 .append("\\"parameterSource\\": \\"").append(escapeJson(record.parameterSource)).append("\\", ")
                                 .append("\\"summary\\": \\"").append(escapeJson(summary(record))).append("\\", ")
@@ -1368,6 +1412,9 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private String failurePattern(ValidationRecord record) {
+                    if (!"FAILED".equals(record.status)) {
+                        return "";
+                    }
                     String message = normalizeMessage(record.message);
                     String lower = message.toLowerCase(Locale.ROOT);
                     if (lower.contains("information_schema") || lower.contains("database()")) {
@@ -1381,6 +1428,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (lower.contains("on duplicate key update")) {
                         return "ON_DUPLICATE_KEY_UPDATE";
+                    }
+                    if (Pattern.compile("insert\\\\s+into\\\\b[\\\\s\\\\S]*?\\\\)\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "INSERT_FOREACH_MISSING_VALUES";
                     }
                     if (Pattern.compile("\\\\bregexp\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "REGEXP_OPERATOR";
@@ -1410,6 +1460,15 @@ class DmSqlValidationTestGenerator {
                         return "TEST_DATA_OR_CONSTRAINT";
                     }
                     return category(record) + "_OTHER";
+                }
+
+                private boolean containsAnyPattern(Map<String, Long> countsByPattern, String... patterns) {
+                    for (String pattern : patterns) {
+                        if (countsByPattern.containsKey(pattern)) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
 
                 private String category(ValidationRecord record) {
