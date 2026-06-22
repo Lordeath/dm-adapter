@@ -343,7 +343,8 @@ class DmSqlValidationTestGenerator {
         return TEST_TEMPLATE.replace("__PACKAGE_DECLARATION__", packageDeclaration);
     }
 
-    private static final String TEST_TEMPLATE = """
+    private static final String TEST_TEMPLATE = String.join("",
+            """
             __PACKAGE_DECLARATION__import org.apache.ibatis.builder.xml.XMLMapperBuilder;
             import org.apache.ibatis.datasource.unpooled.UnpooledDataSource;
             import org.apache.ibatis.mapping.Environment;
@@ -368,12 +369,14 @@ class DmSqlValidationTestGenerator {
             import java.io.IOException;
             import java.io.InputStream;
             import java.io.Reader;
+            import java.lang.annotation.Annotation;
             import java.lang.reflect.Array;
             import java.lang.reflect.Constructor;
             import java.lang.reflect.Field;
             import java.lang.reflect.InvocationTargetException;
             import java.lang.reflect.Method;
             import java.lang.reflect.Modifier;
+            import java.lang.reflect.Parameter;
             import java.lang.reflect.ParameterizedType;
             import java.lang.reflect.Type;
             import java.math.BigDecimal;
@@ -394,6 +397,7 @@ class DmSqlValidationTestGenerator {
             import java.util.LinkedHashMap;
             import java.util.LinkedHashSet;
             import java.util.List;
+            import java.util.Locale;
             import java.util.Map;
             import java.util.Optional;
             import java.util.Properties;
@@ -800,7 +804,7 @@ class DmSqlValidationTestGenerator {
                     Type[] genericTypes = mapperMethod.method.getGenericParameterTypes();
                     Object[] args = new Object[parameterTypes.length];
                     for (int i = 0; i < parameterTypes.length; i++) {
-                        ValueResult value = defaultValue(parameterTypes[i], genericTypes[i], 0);
+                        ValueResult value = defaultValue(parameterName(mapperMethod.method, i), parameterTypes[i], genericTypes[i], 0);
                         if (!value.resolved) {
                             return ParameterResolution.unresolved("auto", value.message);
                         }
@@ -809,6 +813,24 @@ class DmSqlValidationTestGenerator {
                     return ParameterResolution.resolved("auto", args);
                 }
 
+                private String parameterName(Method method, int index) {
+                    Parameter parameter = method.getParameters()[index];
+                    for (Annotation annotation : parameter.getAnnotations()) {
+                        if ("org.apache.ibatis.annotations.Param".equals(annotation.annotationType().getName())) {
+                            try {
+                                Object value = annotation.annotationType().getMethod("value").invoke(annotation);
+                                if (value instanceof String name && !name.isBlank()) {
+                                    return name;
+                                }
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    }
+                    return parameter.getName();
+                }
+
+                """,
+            """
                 private ParameterResolution statementParameters(MapperMethod mapperMethod, List<String> configuredArgs) {
                     if (configuredArgs != null && configuredArgs.size() > 1) {
                         Map<String, Object> namedParameters = new LinkedHashMap<>();
@@ -968,8 +990,12 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private ValueResult defaultValue(Class<?> targetType, Type genericType, int depth) {
+                    return defaultValue("", targetType, genericType, depth);
+                }
+
+                private ValueResult defaultValue(String valueName, Class<?> targetType, Type genericType, int depth) {
                     if (String.class.equals(targetType)) {
-                        return ValueResult.resolved("test");
+                        return ValueResult.resolved(defaultString(valueName));
                     }
                     if (Integer.class.equals(targetType) || int.class.equals(targetType)) {
                         return ValueResult.resolved(1);
@@ -1021,13 +1047,13 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Optional.class.equals(targetType)) {
                         Type nestedType = firstGenericArgument(genericType);
-                        ValueResult nestedValue = defaultValue(rawClass(nestedType), nestedType, depth + 1);
+                        ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1);
                         return nestedValue.resolved
                                 ? ValueResult.resolved(Optional.ofNullable(nestedValue.value))
                                 : ValueResult.resolved(Optional.empty());
                     }
                     if (targetType.isArray()) {
-                        ValueResult componentValue = defaultValue(targetType.getComponentType(), targetType.getComponentType(), depth + 1);
+                        ValueResult componentValue = defaultValue(valueName, targetType.getComponentType(), targetType.getComponentType(), depth + 1);
                         if (!componentValue.resolved) {
                             return componentValue;
                         }
@@ -1036,8 +1062,14 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(array);
                     }
                     if (Collection.class.isAssignableFrom(targetType)) {
+                        if (shouldUseEmptyCollection(valueName)) {
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>());
+                            }
+                            return ValueResult.resolved(new ArrayList<>());
+                        }
                         Type nestedType = firstGenericArgument(genericType);
-                        ValueResult nestedValue = defaultValue(rawClass(nestedType), nestedType, depth + 1);
+                        ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1);
                         if (!nestedValue.resolved) {
                             return nestedValue;
                         }
@@ -1063,6 +1095,66 @@ class DmSqlValidationTestGenerator {
                     return instantiatePojo(targetType, depth);
                 }
 
+                private String defaultString(String valueName) {
+                    String normalized = normalizeName(valueName);
+                    if (isOrderFieldName(normalized) || isOrderDirectionName(normalized)) {
+                        return "";
+                    }
+                    if (isDynamicIdentifierName(normalized)) {
+                        return "ID";
+                    }
+                    if (normalized.endsWith("id")
+                            || normalized.endsWith("ids")
+                            || normalized.contains("userid")
+                            || normalized.contains("enterpriseid")
+                            || normalized.contains("organizationid")) {
+                        return "1";
+                    }
+                    if (normalized.contains("code")) {
+                        return "CODE";
+                    }
+                    if (normalized.contains("date") || normalized.contains("time")) {
+                        return "2024-01-01 00:00:00";
+                    }
+                    if (normalized.contains("comparison")) {
+                        return "EQUAL";
+                    }
+                    return "test";
+                }
+
+                private boolean shouldUseEmptyCollection(String valueName) {
+                    String normalized = normalizeName(valueName);
+                    return "filterlist".equals(normalized)
+                            || "filters".equals(normalized)
+                            || "sorts".equals(normalized)
+                            || "orders".equals(normalized);
+                }
+
+                private boolean isOrderFieldName(String normalizedName) {
+                    return normalizedName.contains("orderfield")
+                            || normalizedName.contains("sortfield")
+                            || normalizedName.contains("orderbyfield");
+                }
+
+                private boolean isOrderDirectionName(String normalizedName) {
+                    return "orderby".equals(normalizedName)
+                            || normalizedName.contains("orderdirection")
+                            || normalizedName.contains("sortdirection")
+                            || normalizedName.endsWith("direction");
+                }
+
+                private boolean isDynamicIdentifierName(String normalizedName) {
+                    return normalizedName.contains("fieldunderlinename")
+                            || normalizedName.endsWith("fieldname")
+                            || normalizedName.endsWith("columnname");
+                }
+
+                private String normalizeName(String valueName) {
+                    return valueName == null
+                            ? ""
+                            : valueName.replace("_", "").replace("-", "").toLowerCase(Locale.ROOT);
+                }
+
                 private ValueResult instantiatePojo(Class<?> targetType, int depth) {
                     if (targetType.isInterface() || Modifier.isAbstract(targetType.getModifiers())) {
                         return ValueResult.unresolved("Cannot instantiate parameter type: " + targetType.getName());
@@ -1071,16 +1163,20 @@ class DmSqlValidationTestGenerator {
                         Constructor<?> constructor = targetType.getDeclaredConstructor();
                         constructor.setAccessible(true);
                         Object instance = constructor.newInstance();
-                        for (Field field : targetType.getDeclaredFields()) {
-                            int modifiers = field.getModifiers();
-                            if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers)) {
-                                continue;
+                        Class<?> currentType = targetType;
+                        while (currentType != null && !Object.class.equals(currentType)) {
+                            for (Field field : currentType.getDeclaredFields()) {
+                                int modifiers = field.getModifiers();
+                                if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers)) {
+                                    continue;
+                                }
+                                ValueResult fieldValue = defaultValue(field.getName(), field.getType(), field.getGenericType(), depth + 1);
+                                if (fieldValue.resolved) {
+                                    field.setAccessible(true);
+                                    field.set(instance, fieldValue.value);
+                                }
                             }
-                            ValueResult fieldValue = defaultValue(field.getType(), field.getGenericType(), depth + 1);
-                            if (fieldValue.resolved) {
-                                field.setAccessible(true);
-                                field.set(instance, fieldValue.value);
-                            }
+                            currentType = currentType.getSuperclass();
                         }
                         return ValueResult.resolved(instance);
                     } catch (Exception e) {
@@ -1123,6 +1219,8 @@ class DmSqlValidationTestGenerator {
                     Files.writeString(projectRoot.resolve(JSON_REPORT), json(records), StandardCharsets.UTF_8);
                 }
 
+                """,
+            """
                 private String markdown(List<ValidationRecord> records) {
                     StringBuilder markdown = new StringBuilder();
                     markdown.append("# Dameng SQL Validation Report\\n\\n");
@@ -1130,6 +1228,7 @@ class DmSqlValidationTestGenerator {
                     markdown.append("- Failed: `").append(count(records, "FAILED")).append("`\\n");
                     markdown.append("- Skipped: `").append(count(records, "SKIPPED")).append("`\\n\\n");
                     appendFailureCategorySummary(markdown, records);
+                    appendFailurePatternSummary(markdown, records);
                     markdown.append("## Results\\n\\n");
                     markdown.append("| Status | Category | Mapper Method | Parameter Source | Summary | Hint |\\n");
                     markdown.append("| --- | --- | --- | --- | --- | --- |\\n");
@@ -1147,9 +1246,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private void appendFailureCategorySummary(StringBuilder markdown, List<ValidationRecord> records) {
-                    Map<String, Long> countsByCategory = records.stream()
-                            .filter(record -> "FAILED".equals(record.status))
-                            .collect(Collectors.groupingBy(this::category, LinkedHashMap::new, Collectors.counting()));
+                    Map<String, Long> countsByCategory = failureCategoryCounts(records);
                     if (countsByCategory.isEmpty()) {
                         return;
                     }
@@ -1160,6 +1257,22 @@ class DmSqlValidationTestGenerator {
                         markdown.append("| ").append(escapeMarkdown(entry.getKey()))
                                 .append(" | ").append(entry.getValue())
                                 .append(" | ").append(escapeMarkdown(categoryHint(entry.getKey())))
+                                .append(" |\\n");
+                    }
+                    markdown.append("\\n");
+                }
+
+                private void appendFailurePatternSummary(StringBuilder markdown, List<ValidationRecord> records) {
+                    Map<String, Long> countsByPattern = failurePatternCounts(records);
+                    if (countsByPattern.isEmpty()) {
+                        return;
+                    }
+                    markdown.append("## Failure Patterns\\n\\n");
+                    markdown.append("| Pattern | Count |\\n");
+                    markdown.append("| --- | ---: |\\n");
+                    for (Map.Entry<String, Long> entry : countsByPattern.entrySet()) {
+                        markdown.append("| ").append(escapeMarkdown(entry.getKey()))
+                                .append(" | ").append(entry.getValue())
                                 .append(" |\\n");
                     }
                     markdown.append("\\n");
@@ -1194,7 +1307,16 @@ class DmSqlValidationTestGenerator {
 
                 private String json(List<ValidationRecord> records) {
                     StringBuilder json = new StringBuilder();
-                    json.append("{\\n  \\"records\\": [\\n");
+                    json.append("{\\n");
+                    json.append("  \\"summary\\": {")
+                            .append("\\"passed\\": ").append(count(records, "PASSED")).append(", ")
+                            .append("\\"failed\\": ").append(count(records, "FAILED")).append(", ")
+                            .append("\\"skipped\\": ").append(count(records, "SKIPPED"))
+                            .append("},\\n");
+                    appendJsonCountMap(json, "failureCategories", failureCategoryCounts(records));
+                    json.append(",\\n");
+                    appendJsonCountMap(json, "failurePatterns", failurePatternCounts(records));
+                    json.append(",\\n  \\"records\\": [\\n");
                     for (int i = 0; i < records.size(); i++) {
                         ValidationRecord record = records.get(i);
                         json.append("    {")
@@ -1213,6 +1335,78 @@ class DmSqlValidationTestGenerator {
                     }
                     json.append("  ]\\n}\\n");
                     return json.toString();
+                }
+
+                private void appendJsonCountMap(StringBuilder json, String key, Map<String, Long> counts) {
+                    json.append("  \\"").append(key).append("\\": [");
+                    int index = 0;
+                    for (Map.Entry<String, Long> entry : counts.entrySet()) {
+                        if (index > 0) {
+                            json.append(", ");
+                        }
+                        json.append("{\\"name\\": \\"").append(escapeJson(entry.getKey()))
+                                .append("\\", \\"count\\": ").append(entry.getValue())
+                                .append("}");
+                        index++;
+                    }
+                    json.append("]");
+                }
+
+                private Map<String, Long> failureCategoryCounts(List<ValidationRecord> records) {
+                    return records.stream()
+                            .filter(record -> "FAILED".equals(record.status))
+                            .collect(Collectors.groupingBy(this::category, LinkedHashMap::new, Collectors.counting()));
+                }
+
+                private Map<String, Long> failurePatternCounts(List<ValidationRecord> records) {
+                    return records.stream()
+                            .filter(record -> "FAILED".equals(record.status))
+                            .collect(Collectors.groupingBy(this::failurePattern, LinkedHashMap::new, Collectors.counting()));
+                }
+
+                private String failurePattern(ValidationRecord record) {
+                    String message = normalizeMessage(record.message);
+                    String lower = message.toLowerCase(Locale.ROOT);
+                    if (lower.contains("information_schema") || lower.contains("database()")) {
+                        return "MYSQL_METADATA_SQL";
+                    }
+                    if (Pattern.compile("order\\\\s+by\\\\s+test(?:\\\\s+test)?", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "GENERATED_ORDER_PARAMETER";
+                    }
+                    if (Pattern.compile("update\\\\s+set\\\\s+[a-z_][a-z0-9_]*", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "UPDATE_SET_TABLE_ORDER";
+                    }
+                    if (lower.contains("on duplicate key update")) {
+                        return "ON_DUPLICATE_KEY_UPDATE";
+                    }
+                    if (Pattern.compile("\\\\bregexp\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "REGEXP_OPERATOR";
+                    }
+                    if (lower.contains("标示符长度非法")) {
+                        return "DOUBLE_QUOTED_IDENTIFIER_OR_STRING";
+                    }
+                    if (Pattern.compile(",\\\\s*\\\\)").matcher(message).find()) {
+                        return "TRAILING_COMMA";
+                    }
+                    if (lower.contains("evaluated to a null value")) {
+                        return "NULL_COLLECTION_PARAMETER";
+                    }
+                    if (lower.contains("parameter '") && lower.contains("not found")) {
+                        return "BINDING_PARAMETER_NAME";
+                    }
+                    if (lower.contains("无效的表或视图名") || lower.contains("无效的列名") || lower.contains("无效的模式名")) {
+                        return "TEST_SCHEMA_OBJECT";
+                    }
+                    if (containsAny(message,
+                            "非空约束",
+                            "违反列[",
+                            "长度超出定义",
+                            "类型转换异常",
+                            "唯一性约束",
+                            "非法的时间日期类型数据")) {
+                        return "TEST_DATA_OR_CONSTRAINT";
+                    }
+                    return category(record) + "_OTHER";
                 }
 
                 private String category(ValidationRecord record) {
@@ -1484,6 +1678,8 @@ class DmSqlValidationTestGenerator {
                     return resolved.toString();
                 }
 
+                """,
+            """
                 private static final class ValidationConfig {
                     private String schema = "";
                     private final DatasourceConfig datasource = new DatasourceConfig();
@@ -1770,5 +1966,5 @@ class DmSqlValidationTestGenerator {
                     }
                 }
             }
-            """;
+            """);
 }
