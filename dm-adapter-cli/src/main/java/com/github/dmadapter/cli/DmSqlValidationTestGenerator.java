@@ -572,7 +572,7 @@ class DmSqlValidationTestGenerator {
                     dataSource.setDriver(required(resolvePlaceholders(config.datasource.driverClassName), "datasource.driverClassName"));
                     dataSource.setUrl(required(resolvePlaceholders(config.datasource.url), "datasource.url"));
                     dataSource.setUsername(required(resolvePlaceholders(config.datasource.username), "datasource.username"));
-                    dataSource.setPassword(resolvePlaceholders(config.datasource.password));
+                    dataSource.setPassword(optionalSecret(resolvePlaceholders(config.datasource.password), "datasource.password"));
                     return dataSource;
                 }
 
@@ -580,6 +580,17 @@ class DmSqlValidationTestGenerator {
                     if (value == null || value.isBlank() || value.contains("${")) {
                         throw new IllegalStateException(key + " is required. Configure it in " + CONFIG_PATH
                                 + " or provide the referenced environment variable.");
+                    }
+                    return value;
+                }
+
+                private String optionalSecret(String value, String key) {
+                    if (value == null) {
+                        return "";
+                    }
+                    if (value.contains("${")) {
+                        throw new IllegalStateException(key + " references an unresolved placeholder. Configure it in "
+                                + CONFIG_PATH + " or provide the referenced environment variable.");
                     }
                     return value;
                 }
