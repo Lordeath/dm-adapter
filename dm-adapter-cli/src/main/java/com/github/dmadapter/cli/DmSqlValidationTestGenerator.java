@@ -1887,6 +1887,7 @@ class DmSqlValidationTestGenerator {
                             "TRAILING_COMMA",
                             "INSERT_FOREACH_MISSING_VALUES",
                             "MYSQL_UPDATE_JOIN",
+                            "MYSQL_DATE_SUB_INTERVAL",
                             "MYSQL_DATE_ADD_INTERVAL",
                             "MYSQL_CONVERT_UNSIGNED",
                             "MYSQL_CONVERT_DECIMAL",
@@ -2117,8 +2118,11 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("\\\\bconcat_ws\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_CONCAT_WS";
                     }
-                    if (Pattern.compile("\\\\bdate_add\\\\s*\\\\([\\\\s\\\\S]*?\\\\binterval\\\\s+[^,)]*\\\\s+(year|month|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
-                            || Pattern.compile("\\\\+\\\\s*interval\\\\s+[^\\\\s]+\\\\s+(year|month|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                    if (Pattern.compile("\\\\bdate_sub\\\\s*\\\\([\\\\s\\\\S]*?\\\\binterval\\\\s+[^,)]*\\\\s+(year|month|week|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_DATE_SUB_INTERVAL";
+                    }
+                    if (Pattern.compile("\\\\bdate_add\\\\s*\\\\([\\\\s\\\\S]*?\\\\binterval\\\\s+[^,)]*\\\\s+(year|month|week|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("\\\\+\\\\s*interval\\\\s+[^\\\\s]+\\\\s+(year|month|week|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_DATE_ADD_INTERVAL";
                     }
                     if (Pattern.compile("\\\\bconvert\\\\s*\\\\([\\\\s\\\\S]*?\\\\bunsigned\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {

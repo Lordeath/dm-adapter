@@ -14,7 +14,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE = "MYSQL_AES_BASE64_TO_DM_AES128_ECB";
     public static final String MYSQL_BACKTICK_IDENTIFIER_RULE = "MYSQL_BACKTICK_IDENTIFIER_TO_DM";
     public static final String UPDATE_SET_TABLE_ORDER_RULE = "UPDATE_SET_TABLE_ORDER_TO_STANDARD_UPDATE";
-    public static final String MYSQL_DATE_SUB_NOW_DAY_RULE = "MYSQL_DATE_SUB_NOW_DAY_TO_DM";
+    public static final String MYSQL_DATE_SUB_INTERVAL_RULE = "MYSQL_DATE_SUB_INTERVAL_TO_DATEADD";
+    public static final String MYSQL_DATE_SUB_NOW_DAY_RULE = MYSQL_DATE_SUB_INTERVAL_RULE;
     public static final String MYSQL_REGEXP_OPERATOR_RULE = "MYSQL_REGEXP_OPERATOR_TO_REGEXP_LIKE";
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
@@ -56,17 +57,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern DECIMAL_TARGET_TYPE_PATTERN = Pattern.compile(
             "(?is)^\\s*DECIMAL\\s*\\(\\s*\\d+\\s*,\\s*\\d+\\s*\\)\\s*$"
     );
-    private static final Pattern INTERVAL_DAY_PATTERN = Pattern.compile(
-            "(?is)^\\s*INTERVAL\\s+(.+?)\\s+DAY\\s*$"
-    );
     private static final Pattern MYSQL_INTERVAL_PATTERN = Pattern.compile(
-            "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\\s*$"
+            "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)\\s*$"
     );
     private static final Pattern SIMPLE_INTERVAL_AMOUNT_PATTERN = Pattern.compile(
-            "(?is)^-?(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})$"
+            "(?is)^[+-]?(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})$"
     );
     private static final List<String> MYSQL_INTERVAL_UNITS =
-            List.of("YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND");
+            List.of("YEAR", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE", "SECOND");
     private static final List<String> MYSQL_SELECT_MODIFIERS_TO_REMOVE = List.of(
             "SQL_BIG_RESULT",
             "SQL_SMALL_RESULT",
@@ -223,10 +221,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_SELECT_MODIFIER_REMOVAL_RULE);
         }
 
-        GenericConversion dateSubConversion = convertDateSubNowDay(converted);
+        GenericConversion dateSubConversion = convertDateSubInterval(converted);
         if (dateSubConversion.changed()) {
             converted = dateSubConversion.convertedSql();
-            rules.add(MYSQL_DATE_SUB_NOW_DAY_RULE);
+            rules.add(MYSQL_DATE_SUB_INTERVAL_RULE);
         }
 
         GenericConversion dateAddIntervalConversion = convertDateAddInterval(converted);
@@ -509,7 +507,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 && MYSQL_SELECT_MODIFIER_CONTEXT_WORDS.contains(previousWord.text().toUpperCase(Locale.ROOT));
     }
 
-    private GenericConversion convertDateSubNowDay(String sql) {
+    private GenericConversion convertDateSubInterval(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -527,7 +525,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = appendUntilBlockCommentEnd(sql, index, converted);
             } else if (startsFunction(sql, index, "DATE_SUB")) {
                 FunctionCall functionCall = readFunctionCall(sql, index, "DATE_SUB");
-                String replacement = functionCall == null ? null : rewriteDateSubNowDay(functionCall);
+                String replacement = functionCall == null ? null : rewriteDateSubInterval(functionCall);
                 if (replacement == null) {
                     converted.append(current);
                     index++;
@@ -544,27 +542,23 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
-    private String rewriteDateSubNowDay(FunctionCall dateSubCall) {
+    private String rewriteDateSubInterval(FunctionCall dateSubCall) {
         List<TopLevelArgument> arguments = splitTopLevelArguments(dateSubCall.body());
         if (arguments.size() != 2) {
             return null;
         }
-        Matcher matcher = INTERVAL_DAY_PATTERN.matcher(arguments.get(1).text());
+        Matcher matcher = MYSQL_INTERVAL_PATTERN.matcher(arguments.get(1).text());
         if (!matcher.matches()) {
             return null;
         }
         String amount = matcher.group(1).trim();
-        if (amount.isBlank()) {
-            return null;
-        }
+        String unit = matcher.group(2).toUpperCase(Locale.ROOT);
         String dateExpression = arguments.get(0).text().trim();
-        if (isCurDateExpression(dateExpression)) {
-            return "DATEADD(DAY, " + negatedIntervalAmount(amount) + ", " + dateExpression + ")";
-        }
-        if (!isNowExpression(dateExpression)) {
+        if (amount.isBlank() || dateExpression.isBlank()) {
             return null;
         }
-        return "(SYSDATE - " + amount + ")";
+        String dmDateExpression = isNowExpression(dateExpression) ? "SYSDATE" : dateExpression;
+        return "DATEADD(" + unit + ", " + negatedIntervalAmount(amount) + ", " + dmDateExpression + ")";
     }
 
     private GenericConversion convertDateAddInterval(String sql) {
@@ -786,6 +780,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String trimmed = amount.trim();
         if (trimmed.startsWith("-")) {
             return trimmed.substring(1).trim();
+        }
+        if (trimmed.startsWith("+")) {
+            return "-" + trimmed.substring(1).trim();
         }
         if (SIMPLE_INTERVAL_AMOUNT_PATTERN.matcher(trimmed).matches()) {
             return "-" + trimmed;

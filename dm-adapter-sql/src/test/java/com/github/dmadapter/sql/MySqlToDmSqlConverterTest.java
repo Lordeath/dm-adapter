@@ -458,9 +458,9 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 delete from ns_system_log_detail
-                where create_time < (SYSDATE - #{expireDays, jdbcType=INTEGER})
+                where create_time < DATEADD(DAY, -#{expireDays, jdbcType=INTEGER}, SYSDATE)
                 """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_NOW_DAY_RULE);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE);
     }
 
     @Test
@@ -477,7 +477,7 @@ class MySqlToDmSqlConverterTest {
                 set serviceEndDate = DATEADD(DAY, -1, CURDATE())
                 where id = #{id}
                 """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_NOW_DAY_RULE);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE);
     }
 
     @Test
@@ -489,7 +489,26 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
                 .isEqualTo("select DATEADD(DAY, -#{days, jdbcType=INTEGER}, CURDATE())");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_NOW_DAY_RULE);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE);
+    }
+
+    @Test
+    void convertsDateSubWeekAndMonthIntervalsWithSignedAmountsToDateadd() {
+        SqlConversionResult result = converter.convert("""
+                select date_sub(CURDATE(), interval -1 week) as weekEnd,
+                       date_sub(CURDATE(), interval -1 month) as monthEnd,
+                       date_sub(ohhi.end_time, interval +1 month) as unavailableStart
+                from owner_house_result ohhi
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select DATEADD(WEEK, 1, CURDATE()) as weekEnd,
+                       DATEADD(MONTH, 1, CURDATE()) as monthEnd,
+                       DATEADD(MONTH, -1, ohhi.end_time) as unavailableStart
+                from owner_house_result ohhi
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE);
     }
 
     @Test
