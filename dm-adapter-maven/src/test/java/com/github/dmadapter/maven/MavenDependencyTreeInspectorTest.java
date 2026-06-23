@@ -42,14 +42,66 @@ class MavenDependencyTreeInspectorTest {
                 .anySatisfy(line -> assertThat(line).contains("mybatis-spring-boot-starter"));
     }
 
+    @Test
+    void usesMvnCmdOnWindows() {
+        String originalOsName = System.getProperty("os.name");
+        List<List<String>> commands = new ArrayList<>();
+        try {
+            System.setProperty("os.name", "Windows 11");
+            MavenDependencyTreeInspector inspector = new MavenDependencyTreeInspector(
+                    processBuilder -> {
+                        commands.add(processBuilder.command());
+                        return new RecordingProcess("", 1);
+                    },
+                    line -> {
+                    }
+            );
+
+            inspector.analyze(tempDir, DependencyCoordinate.defaultDmDriver());
+
+            assertThat(commands).hasSize(1);
+            assertThat(commands.get(0).get(0)).isEqualTo("mvn.cmd");
+        } finally {
+            if (originalOsName == null) {
+                System.clearProperty("os.name");
+            } else {
+                System.setProperty("os.name", originalOsName);
+            }
+        }
+    }
+
+    @Test
+    void killsDependencyTreeProcessWhenTimeout() {
+        List<String> streamedLines = new ArrayList<>();
+        RecordingProcess process = new RecordingProcess("", 0, false);
+        MavenDependencyTreeInspector inspector = new MavenDependencyTreeInspector(
+                processBuilder -> process,
+                streamedLines::add
+        );
+
+        DependencyTreeAnalysis analysis = inspector.analyze(tempDir, DependencyCoordinate.defaultDmDriver());
+
+        assertThat(analysis.springBootProject()).isFalse();
+        assertThat(process.destroyForciblyCount).isGreaterThan(0);
+        assertThat(streamedLines)
+                .anySatisfy(line -> assertThat(line).contains("Maven dependency tree timed out"));
+    }
+
     private static class RecordingProcess extends Process {
         private final byte[] bytes;
         private final int exitCode;
+        private final boolean completeOnTimedWait;
         private boolean alive = true;
+        private int destroyForciblyCount;
 
         private RecordingProcess(String output, int exitCode) {
+            this(output, exitCode, true);
+        }
+
+        private RecordingProcess(String output, int exitCode, boolean completeOnTimedWait) {
             this.bytes = output.getBytes(StandardCharsets.UTF_8);
             this.exitCode = exitCode;
+            this.completeOnTimedWait = completeOnTimedWait;
         }
 
         @Override
@@ -75,6 +127,9 @@ class MavenDependencyTreeInspectorTest {
 
         @Override
         public boolean waitFor(long timeout, TimeUnit unit) {
+            if (!completeOnTimedWait) {
+                return false;
+            }
             alive = false;
             return true;
         }
@@ -94,6 +149,7 @@ class MavenDependencyTreeInspectorTest {
 
         @Override
         public Process destroyForcibly() {
+            destroyForciblyCount++;
             alive = false;
             return this;
         }
@@ -101,6 +157,11 @@ class MavenDependencyTreeInspectorTest {
         @Override
         public boolean isAlive() {
             return alive;
+        }
+
+        @Override
+        public ProcessHandle toHandle() {
+            throw new UnsupportedOperationException("test process has no handle");
         }
     }
 }

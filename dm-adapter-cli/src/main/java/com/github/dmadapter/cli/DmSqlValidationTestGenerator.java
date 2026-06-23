@@ -1010,6 +1010,12 @@ class DmSqlValidationTestGenerator {
                                 currentForeachCollections.put(item, collection);
                             }
                         }
+                        if ("if".equals(element.getTagName()) || "when".equals(element.getTagName())) {
+                            BranchCondition condition = branchCondition(element.getAttribute("test"));
+                            if (condition != null) {
+                                metadata.addDefaultValue(condition.parameterName, condition.literal);
+                            }
+                        }
                         NodeList children = element.getChildNodes();
                         for (int i = 0; i < children.getLength(); i++) {
                             collectDynamicIdentifierMetadata(children.item(i), currentForeachCollections, metadata);
@@ -1114,15 +1120,17 @@ class DmSqlValidationTestGenerator {
                         return null;
                     }
                     Matcher leftLiteral = Pattern.compile(
-                            "^\\\\s*'([^']+)'\\\\s*==\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*$"
+                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*'([^']+)'\\\\s*==\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)",
+                            Pattern.CASE_INSENSITIVE
                     ).matcher(test);
-                    if (leftLiteral.matches()) {
+                    if (leftLiteral.find()) {
                         return new BranchCondition(leftLiteral.group(2), leftLiteral.group(1));
                     }
                     Matcher rightLiteral = Pattern.compile(
-                            "^\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*==\\\\s*'([^']+)'\\\\s*$"
+                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*==\\\\s*'([^']+)'",
+                            Pattern.CASE_INSENSITIVE
                     ).matcher(test);
-                    if (rightLiteral.matches()) {
+                    if (rightLiteral.find()) {
                         return new BranchCondition(rightLiteral.group(1), rightLiteral.group(2));
                     }
                     return null;
@@ -1527,13 +1535,17 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Map.class.isAssignableFrom(targetType)) {
                         Map<String, Object> value = new LinkedHashMap<>();
+                        if (statement != null) {
+                            value.putAll(statement.defaultValues());
+                        }
                         Map<String, Object> configuredDefaults = statement == null
                                 ? Map.of()
                                 : statement.collectionElementDefault(valueName);
-                        if (configuredDefaults.isEmpty()) {
-                            value.put("key", "test");
-                        } else {
+                        if (!configuredDefaults.isEmpty()) {
                             value.putAll(configuredDefaults);
+                        }
+                        if (value.isEmpty()) {
+                            value.put("key", "test");
                         }
                         return ValueResult.resolved(value);
                     }
@@ -3097,6 +3109,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.defaultValue(valueName);
                     }
 
+                    private Map<String, Object> defaultValues() {
+                        return dynamicIdentifierMetadata.defaultValues();
+                    }
+
                     private boolean generatedKeyProperty(String valueName) {
                         String normalized = DynamicIdentifierMetadata.normalizeMetadataName(valueName);
                         return generatedKeyProperties.stream()
@@ -3109,6 +3125,7 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> dynamicIdentifierNames = new LinkedHashSet<>();
                     private final Map<String, Map<String, Object>> collectionElementDefaults = new LinkedHashMap<>();
                     private final Map<String, Object> defaultValues = new LinkedHashMap<>();
+                    private final Map<String, Object> namedDefaultValues = new LinkedHashMap<>();
 
                     private void addDynamicIdentifierName(String valueName) {
                         String normalized = normalizeMetadataName(valueName);
@@ -3131,6 +3148,7 @@ class DmSqlValidationTestGenerator {
                         String normalizedPropertyName = normalizeMetadataName(propertyName);
                         if (!normalizedPropertyName.isBlank()) {
                             defaultValues.putIfAbsent(normalizedPropertyName, value);
+                            namedDefaultValues.putIfAbsent(propertyName, value);
                         }
                     }
 
@@ -3149,6 +3167,10 @@ class DmSqlValidationTestGenerator {
 
                     private Object defaultValue(String valueName) {
                         return defaultValues.get(normalizeMetadataName(valueName));
+                    }
+
+                    private Map<String, Object> defaultValues() {
+                        return Map.copyOf(namedDefaultValues);
                     }
 
                     private static String normalizeMetadataName(String valueName) {

@@ -1,7 +1,6 @@
 package com.github.dmadapter.sql;
 
 import com.github.dmadapter.core.SqlConversionResult;
-import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -384,7 +383,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return manualReviewResult(original, converted, rules, unsupportedReason);
         }
 
-        parseIfPossible(converted);
         if (rules.isEmpty()) {
             return SqlConversionResult.unchanged(original);
         }
@@ -3332,19 +3330,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private String stripTrailingWhitespace(String value) {
         return value.replaceFirst("\\s+$", "");
-    }
-
-    private void parseIfPossible(String sql) {
-        try {
-            CCJSqlParserUtil.parse(maskMyBatisPlaceholders(sql));
-        } catch (Exception ignored) {
-            // Parsing is an aid for future expansion. MVP rules remain conservative and deterministic.
-        }
-    }
-
-    private String maskMyBatisPlaceholders(String sql) {
-        return sql.replaceAll("#\\{[^}]+}", "0")
-                .replaceAll("\\$\\{[^}]+}", "0");
     }
 
     private record DoubleQuotedStringConversion(String convertedSql, boolean changed) {

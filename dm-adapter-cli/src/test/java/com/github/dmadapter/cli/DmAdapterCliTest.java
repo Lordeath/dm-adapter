@@ -355,6 +355,8 @@ class DmAdapterCliTest {
                 .contains("dynamicIdentifierParameter")
                 .contains("defaultValueForJdbcType")
                 .contains("jdbcType(valueMatcher.group(2))")
+                .contains("metadata.addDefaultValue(condition.parameterName, condition.literal)")
+                .contains("statement.defaultValues()")
                 .contains("recordKey(mapperMethod.key())")
                 .contains("parameterName")
                 .contains("defaultString")
