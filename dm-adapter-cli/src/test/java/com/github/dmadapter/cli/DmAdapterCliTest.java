@@ -363,6 +363,7 @@ class DmAdapterCliTest {
                 .contains("MYSQL_UPDATE_JOIN")
                 .contains("INSERT_IGNORE")
                 .contains("MYSQL_GROUP_CONCAT")
+                .contains("MYSQL_DATE_SUB_INTERVAL")
                 .contains("MYSQL_DATE_ADD_INTERVAL")
                 .contains("\\\\+\\\\s*interval")
                 .contains("MYSQL_CONVERT_UNSIGNED")
