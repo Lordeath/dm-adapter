@@ -252,6 +252,92 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlImplicitInnerJoinToCrossJoin() {
+        SqlConversionResult result = converter.convert("""
+                select base.house_id
+                from owner_house_base_info base
+                         inner join owner_customer_family_info family
+                         inner join owner_customer_result customer
+                                    on base.house_id = family.house_id
+                                       and family.owner_id = customer.owner_id
+                limit #{offset},#{rows}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select base.house_id
+                from owner_house_base_info base
+                         CROSS JOIN owner_customer_family_info family
+                         inner join owner_customer_result customer
+                                    on base.house_id = family.house_id
+                                       and family.owner_id = customer.owner_id OFFSET #{offset} ROWS FETCH NEXT #{rows} ROWS ONLY""");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_IMPLICIT_CROSS_JOIN_RULE, "LIMIT_OFFSET_TO_DM_FETCH");
+    }
+
+    @Test
+    void keepsJoinWithConditionUnchanged() {
+        SqlConversionResult result = converter.convert("""
+                select *
+                from owner_house_base_info base
+                inner join owner_house_result result on base.house_id = result.house_id
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void convertsMysqlTemporaryTableAsSelectToDamengGlobalTemporaryTable() {
+        SqlConversionResult result = converter.convert("""
+                drop table if exists tmp_relationship_owner_20200204;
+                create TEMPORARY table tmp_relationship_owner_20200204
+                SELECT rs.owner_id, rs.house_id
+                FROM owner_house_relationship rs
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                drop table if exists tmp_relationship_owner_20200204;
+                CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT rs.owner_id, rs.house_id
+                FROM owner_house_relationship rs
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+    }
+
+    @Test
+    void keepsTemporaryTableWithExplicitColumnsUnchanged() {
+        SqlConversionResult result = converter.convert("""
+                create temporary table tmp_owner (
+                    id bigint,
+                    owner_name varchar(100)
+                )
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void quotesDamengKeywordTableAliasAndReferences() {
+        SqlConversionResult result = converter.convert("""
+                SELECT base.precinct_id, SUM(cluster.manage_area) AS inpipeArea
+                FROM owner_house_base_info base
+                LEFT JOIN owner_house_cluster_info cluster ON base.house_id = cluster.house_id
+                WHERE base.cluster_id IS NOT NULL
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT base.precinct_id, SUM("cluster".manage_area) AS inpipeArea
+                FROM owner_house_base_info base
+                LEFT JOIN owner_house_cluster_info "cluster" ON base.house_id = "cluster".house_id
+                WHERE base.cluster_id IS NOT NULL
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE);
+    }
+
+    @Test
     void doesNotApplyMysqlSyntaxCleanupInsideStringsOrComments() {
         String sql = """
                 select 'SQL_BIG_RESULT force index(idx) insert into t (a) value (1)' as sample
