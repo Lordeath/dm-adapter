@@ -1894,6 +1894,9 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_SELECT_MODIFIER",
                             "MYSQL_INSERT_VALUE_KEYWORD",
                             "MYSQL_INDEX_HINT",
+                            "MYSQL_IMPLICIT_CROSS_JOIN",
+                            "MYSQL_TEMPORARY_TABLE_AS_SELECT",
+                            "DAMENG_KEYWORD_TABLE_ALIAS",
                             "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")) {
                         markdown.append("- 重新执行 dm-adapter migrate，然后再次运行本验证测试；这些模式已有严格的 mapper-dm 自动改写规则。\\n");
                     }
@@ -2106,6 +2109,12 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_USER_VARIABLE";
                     }
+                    if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
+                        return "DYNAMIC_IDENTIFIER_PARAMETER";
+                    }
+                    if (lower.contains("sql语句为null或空值") || hasBrokenDynamicSqlShape(message)) {
+                        return "BROKEN_DYNAMIC_SQL_OR_ARGS";
+                    }
                     if (isSchemaObjectFailure(lower)) {
                         return "TEST_SCHEMA_OBJECT";
                     }
@@ -2130,6 +2139,15 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasJsonTableJoinWithoutCondition(message)) {
                         return "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON";
+                    }
+                    if (hasMysqlImplicitCrossJoin(message)) {
+                        return "MYSQL_IMPLICIT_CROSS_JOIN";
+                    }
+                    if (Pattern.compile("\\\\bcreate\\\\s+(?:global\\\\s+)?temporary\\\\s+table\\\\s+[^\\\\s(]+\\\\s+(?:as\\\\s+)?select\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_TEMPORARY_TABLE_AS_SELECT";
+                    }
+                    if (Pattern.compile("\\\\b(?:from|join)\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\s+cluster\\\\b|\\\\bcluster\\\\s*\\\\.", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "DAMENG_KEYWORD_TABLE_ALIAS";
                     }
                     if (Pattern.compile("\\\\bjson_(?:array|contains|extract|insert|keys|length|object|quote|remove|replace|search|set|table|type|unquote|valid)\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bcast\\\\s*\\\\([\\\\s\\\\S]*?\\\\s+as\\\\s+json\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
@@ -2209,6 +2227,35 @@ class DmSqlValidationTestGenerator {
                 private boolean isMysqlMetadataSql(String message) {
                     return Pattern.compile("\\\\binformation_schema\\\\b|\\\\bdatabase\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("(?im)^### SQL:\\\\s*describe\\\\b").matcher(message).find();
+                }
+
+                private boolean hasGeneratedDynamicIdentifierPlaceholder(String message) {
+                    return Pattern.compile("(?im)^### SQL:\\\\s*ID\\\\s*$").matcher(message).find()
+                            || Pattern.compile("\\\\b(?:from|join|update|into|table)\\\\s+ID\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("\\\\bID\\\\s*=", Pattern.CASE_INSENSITIVE).matcher(message).find();
+                }
+
+                private boolean hasBrokenDynamicSqlShape(String message) {
+                    return Pattern.compile("\\\\bselect\\\\s*,", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile(",\\\\s*from\\\\s+dual\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("\\\\bupdate\\\\s+[A-Za-z_][A-Za-z0-9_$]*(?:\\\\s+[A-Za-z_][A-Za-z0-9_$]*)?\\\\s+where\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("(?i)(\\\\band\\\\s*\\\\(\\\\s*\\\\)|,\\\\s*where\\\\b|\\\\bwhere\\\\s+and\\\\b|\\\\bset\\\\s+where\\\\b|\\\\?\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\s*=)").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(message).find();
+                }
+
+                private boolean hasMysqlImplicitCrossJoin(String message) {
+                    Pattern pattern = Pattern.compile(
+                            "\\\\b(?:inner\\\\s+)?join\\\\s+[^\\\\s()]+(?:\\\\s+(?:as\\\\s+)?[A-Za-z_][A-Za-z0-9_$]*)?\\\\s+(?:inner\\\\s+)?join\\\\b",
+                            Pattern.CASE_INSENSITIVE
+                    );
+                    Matcher matcher = pattern.matcher(message);
+                    while (matcher.find()) {
+                        String joinFragment = matcher.group();
+                        if (!Pattern.compile("\\\\b(?:on|using)\\\\b", Pattern.CASE_INSENSITIVE).matcher(joinFragment).find()) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
 
                 private boolean hasJsonTableJoinWithoutCondition(String message) {
