@@ -54,6 +54,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern MYSQL_INTERVAL_PATTERN = Pattern.compile(
             "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\\s*$"
     );
+    private static final List<String> MYSQL_INTERVAL_UNITS =
+            List.of("YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND");
     private static final Pattern CTE_ALIAS_PATTERN = Pattern.compile(
             "(?is).*\\s+AS\\s+(\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
     );
@@ -404,6 +406,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertDateAddInterval(String sql) {
+        GenericConversion functionConversion = convertDateAddFunctionInterval(sql);
+        GenericConversion additionConversion = convertDateIntervalAddition(functionConversion.convertedSql());
+        return new GenericConversion(
+                additionConversion.convertedSql(),
+                functionConversion.changed() || additionConversion.changed()
+        );
+    }
+
+    private GenericConversion convertDateAddFunctionInterval(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -436,6 +447,150 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertDateIntervalAddition(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '+') {
+                DateIntervalAddition addition = readDateIntervalAddition(sql, index);
+                if (addition == null || addition.leftExpression().startIndex() < lastCopiedIndex) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, addition.leftExpression().startIndex());
+                    converted.append("DATEADD(")
+                            .append(addition.intervalExpression().unit())
+                            .append(", ")
+                            .append(addition.intervalExpression().amount())
+                            .append(", ")
+                            .append(addition.leftExpression().text())
+                            .append(")");
+                    lastCopiedIndex = addition.intervalExpression().endIndex();
+                    index = lastCopiedIndex;
+                    changed = true;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private DateIntervalAddition readDateIntervalAddition(String sql, int plusIndex) {
+        DateExpression leftExpression = readDateExpressionBeforePlus(sql, plusIndex);
+        IntervalExpression intervalExpression = readIntervalExpressionAfterPlus(sql, plusIndex);
+        if (leftExpression == null || intervalExpression == null) {
+            return null;
+        }
+        return new DateIntervalAddition(leftExpression, intervalExpression);
+    }
+
+    private DateExpression readDateExpressionBeforePlus(String sql, int plusIndex) {
+        int end = skipWhitespaceBackward(sql, plusIndex);
+        if (end <= 0) {
+            return null;
+        }
+        int start;
+        char previous = sql.charAt(end - 1);
+        if (previous == ')') {
+            int openParenIndex = findMatchingOpenParenBackward(sql, end - 1);
+            if (openParenIndex < 0) {
+                return null;
+            }
+            start = readExpressionNameStartBeforeParen(sql, openParenIndex);
+        } else if (previous == '}') {
+            start = readMyBatisPlaceholderStartBackward(sql, end);
+            if (start < 0) {
+                return null;
+            }
+        } else {
+            start = end - 1;
+            while (start > 0 && isOperandIdentifierChar(sql.charAt(start - 1))) {
+                start--;
+            }
+        }
+        String expression = sql.substring(start, end).trim();
+        if (expression.isBlank() || expression.endsWith("+") || expression.endsWith("-")) {
+            return null;
+        }
+        return new DateExpression(start, end, expression);
+    }
+
+    private IntervalExpression readIntervalExpressionAfterPlus(String sql, int plusIndex) {
+        int intervalStart = skipWhitespace(sql, plusIndex + 1);
+        if (!startsKeyword(sql, intervalStart, "INTERVAL")) {
+            return null;
+        }
+        int amountStart = skipWhitespace(sql, intervalStart + "INTERVAL".length());
+        if (amountStart >= sql.length()) {
+            return null;
+        }
+        int depth = 0;
+        int index = amountStart;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                if (current == '(') {
+                    depth++;
+                    index++;
+                } else if (current == ')') {
+                    if (depth == 0) {
+                        return null;
+                    }
+                    depth--;
+                    index++;
+                } else {
+                    String unit = intervalUnitAt(sql, index);
+                    if (depth == 0 && unit != null) {
+                        int amountEnd = skipWhitespaceBackward(sql, index);
+                        String amount = sql.substring(amountStart, amountEnd).trim();
+                        if (amount.isBlank()) {
+                            return null;
+                        }
+                        return new IntervalExpression(amount, unit, index + unit.length());
+                    }
+                    index++;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String intervalUnitAt(String sql, int index) {
+        for (String unit : MYSQL_INTERVAL_UNITS) {
+            if (startsKeyword(sql, index, unit)) {
+                return unit;
+            }
+        }
+        return null;
     }
 
     private String rewriteDateAddInterval(FunctionCall dateAddCall) {
@@ -2322,6 +2477,28 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return start;
     }
 
+    private int readExpressionNameStartBeforeParen(String sql, int openParenIndex) {
+        int end = skipWhitespaceBackward(sql, openParenIndex);
+        if (end <= 0 || !isIdentifierPart(sql.charAt(end - 1))) {
+            return openParenIndex;
+        }
+        int start = end - 1;
+        while (start > 0 && isIdentifierPart(sql.charAt(start - 1))) {
+            start--;
+        }
+        return start;
+    }
+
+    private int readMyBatisPlaceholderStartBackward(String sql, int endExclusive) {
+        int start = sql.lastIndexOf("#{", endExclusive - 1);
+        int dollarStart = sql.lastIndexOf("${", endExclusive - 1);
+        start = Math.max(start, dollarStart);
+        if (start < 0 || sql.indexOf('}', start + 2) != endExclusive - 1) {
+            return -1;
+        }
+        return start;
+    }
+
     private boolean isOperandIdentifierChar(char value) {
         return Character.isLetterOrDigit(value)
                 || value == '_'
@@ -2536,6 +2713,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record FunctionCall(int startIndex, int openParenIndex, int closeParenIndex, int endIndex, String body) {
+    }
+
+    private record DateExpression(int startIndex, int endIndex, String text) {
+    }
+
+    private record IntervalExpression(String amount, String unit, int endIndex) {
+    }
+
+    private record DateIntervalAddition(DateExpression leftExpression, IntervalExpression intervalExpression) {
     }
 
     private record TopLevelArgument(String text, int startIndex, int endIndex) {

@@ -358,6 +358,7 @@ class DmAdapterCliTest {
                 .contains("INSERT_IGNORE")
                 .contains("MYSQL_GROUP_CONCAT")
                 .contains("MYSQL_DATE_ADD_INTERVAL")
+                .contains("\\\\+\\\\s*interval")
                 .contains("MYSQL_CONVERT_UNSIGNED")
                 .contains("MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")
                 .contains("hasJsonTableJoinWithoutCondition")

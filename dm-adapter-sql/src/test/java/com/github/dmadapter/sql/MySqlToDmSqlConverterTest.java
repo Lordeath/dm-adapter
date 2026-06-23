@@ -204,6 +204,49 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlIntervalAdditionToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select count(distinct date(create_time)) monthLoginDayCount "
+                        + "from app_login_log "
+                        + "where create_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') "
+                        + "and DATE_FORMAT(CURDATE(), '%Y-%m-01') + INTERVAL 1 MONTH > create_time"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select count(distinct date(create_time)) monthLoginDayCount "
+                        + "from app_login_log "
+                        + "where create_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01') "
+                        + "and DATEADD(MONTH, 1, DATE_FORMAT(CURDATE(), '%Y-%m-01')) > create_time");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlIntervalAdditionWithMyBatisAmountToDateadd() {
+        SqlConversionResult result = converter.convert("select created_at + INTERVAL #{days} DAY from login_log");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATEADD(DAY, #{days}, created_at) from login_log");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
+    void doesNotConvertMysqlIntervalAdditionInsideStringsOrComments() {
+        String sql = """
+                select 'created_at + INTERVAL 1 DAY' as sample
+                -- created_at + INTERVAL 1 DAY
+                /* created_at + INTERVAL 1 DAY */
+                from login_log
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
     void convertsGroupConcatSeparatorToListaggOrderedByExpression() {
         SqlConversionResult result = converter.convert(
                 "select GROUP_CONCAT(message SEPARATOR ' 、 ') as message, userId from log group by userId"
