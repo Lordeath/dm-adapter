@@ -15,7 +15,7 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
     @Option(names = "--project", required = true, description = "Project root path.")
     private Path project;
 
-    @Option(names = "--app-module", description = "Application module path used for generated test placement, relative to project root or absolute.")
+    @Option(names = "--app-module", description = "Application module path or Maven artifactId used for generated test placement.")
     private Path appModule;
 
     @Option(names = "--mapper-dir", description = "Mapper XML directory used for configuration template discovery.")

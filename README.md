@@ -38,7 +38,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-valid
 # 需要将 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写为 MERGE 时，可通过 sql-rewrite.yml 显式配置 keyColumns。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --rewrite-config .dm-adapter/sql-rewrite.yml
 
-# 也可以在 migrate 后自动生成 SQL 验证测试；传入 --app-module、--schema 或 --config 会自动触发生成。
+# 也可以在 migrate 后自动生成 SQL 验证测试；--app-module 可传模块路径或 Maven artifactId，传入 --app-module、--schema 或 --config 会自动触发生成。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 

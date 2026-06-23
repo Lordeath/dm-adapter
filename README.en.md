@@ -38,7 +38,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-valid
 # Use sql-rewrite.yml to explicitly configure keyColumns for ON DUPLICATE KEY UPDATE / INSERT IGNORE -> MERGE rewrites.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --rewrite-config .dm-adapter/sql-rewrite.yml
 
-# You can also generate the SQL validation test after migrate; --app-module, --schema, or --config implies generation.
+# You can also generate the SQL validation test after migrate; --app-module accepts a module path or Maven artifactId, and --app-module, --schema, or --config implies generation.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 
