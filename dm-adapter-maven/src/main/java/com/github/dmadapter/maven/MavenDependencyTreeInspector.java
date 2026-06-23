@@ -55,18 +55,26 @@ final class MavenDependencyTreeInspector implements DependencyTreeInspector {
             processBuilder.directory(projectRoot.toFile());
             processBuilder.redirectErrorStream(true);
             process = processStarter.start(processBuilder);
+            Thread shutdownHook = registerShutdownHook(process);
             Process runningProcess = process;
             CompletableFuture<String> output = CompletableFuture.supplyAsync(() -> readOutput(runningProcess.getInputStream()));
-            boolean completed = process.waitFor(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
-            if (!completed) {
-                process.destroyForcibly();
-                return DependencyTreeAnalysis.empty();
+            try {
+                boolean completed = process.waitFor(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+                if (!completed) {
+                    outputConsumer.accept("Maven dependency tree timed out after " + TIMEOUT.toSeconds()
+                            + " seconds; continuing with POM-only detection.");
+                    destroyProcessTree(process);
+                    output.cancel(true);
+                    return DependencyTreeAnalysis.empty();
+                }
+                String mavenOutput = output.get(1, TimeUnit.SECONDS);
+                if (process.exitValue() != 0) {
+                    return DependencyTreeAnalysis.empty();
+                }
+                return parser.parse(mavenOutput, dmDriverCoordinate);
+            } finally {
+                removeShutdownHook(shutdownHook);
             }
-            String mavenOutput = output.get(1, TimeUnit.SECONDS);
-            if (process.exitValue() != 0) {
-                return DependencyTreeAnalysis.empty();
-            }
-            return parser.parse(mavenOutput, dmDriverCoordinate);
         } catch (IOException | ExecutionException | TimeoutException e) {
             return DependencyTreeAnalysis.empty();
         } catch (InterruptedException e) {
@@ -74,7 +82,7 @@ final class MavenDependencyTreeInspector implements DependencyTreeInspector {
             return DependencyTreeAnalysis.empty();
         } finally {
             if (process != null && process.isAlive()) {
-                process.destroyForcibly();
+                destroyProcessTree(process);
             }
         }
     }
@@ -85,13 +93,73 @@ final class MavenDependencyTreeInspector implements DependencyTreeInspector {
         if (Files.isRegularFile(wrapper)) {
             command.add(isWindows() ? wrapper.toString() : "./mvnw");
         } else {
-            command.add("mvn");
+            command.add(isWindows() ? "mvn.cmd" : "mvn");
         }
         command.add("-DskipTests");
         command.add("-Dstyle.color=never");
         command.add("dependency:tree");
         command.add("-DoutputType=text");
         return command;
+    }
+
+    private Thread registerShutdownHook(Process process) {
+        Thread hook = new Thread(() -> destroyProcessTree(process), "dm-adapter-maven-dependency-tree-shutdown");
+        try {
+            Runtime.getRuntime().addShutdownHook(hook);
+            return hook;
+        } catch (IllegalStateException e) {
+            destroyProcessTree(process);
+            return null;
+        }
+    }
+
+    private void removeShutdownHook(Thread shutdownHook) {
+        if (shutdownHook == null) {
+            return;
+        }
+        try {
+            Runtime.getRuntime().removeShutdownHook(shutdownHook);
+        } catch (IllegalStateException e) {
+            // JVM shutdown is already in progress; the hook will handle process cleanup.
+        }
+    }
+
+    private void destroyProcessTree(Process process) {
+        try {
+            ProcessHandle handle = process.toHandle();
+            List<ProcessHandle> processes = new ArrayList<>(handle.descendants().toList());
+            processes.add(handle);
+            destroyProcessHandles(processes, false);
+            destroyProcessHandles(processes, true);
+        } catch (RuntimeException e) {
+            destroyProcess(process);
+        }
+    }
+
+    private void destroyProcessHandles(List<ProcessHandle> processes, boolean forcibly) {
+        for (int i = processes.size() - 1; i >= 0; i--) {
+            ProcessHandle process = processes.get(i);
+            try {
+                if (!process.isAlive()) {
+                    continue;
+                }
+                if (forcibly) {
+                    process.destroyForcibly();
+                } else {
+                    process.destroy();
+                }
+            } catch (RuntimeException e) {
+                // Continue killing the rest of the Maven process tree.
+            }
+        }
+    }
+
+    private void destroyProcess(Process process) {
+        try {
+            process.destroyForcibly();
+        } catch (RuntimeException e) {
+            // Nothing else can be done if the JVM cannot destroy this process.
+        }
     }
 
     private boolean isWindows() {
