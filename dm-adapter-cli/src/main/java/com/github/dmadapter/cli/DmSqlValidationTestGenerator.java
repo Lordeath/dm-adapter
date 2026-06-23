@@ -1889,6 +1889,10 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_UPDATE_JOIN",
                             "MYSQL_DATE_ADD_INTERVAL",
                             "MYSQL_CONVERT_UNSIGNED",
+                            "MYSQL_CONVERT_DECIMAL",
+                            "MYSQL_SELECT_MODIFIER",
+                            "MYSQL_INSERT_VALUE_KEYWORD",
+                            "MYSQL_INDEX_HINT",
                             "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")) {
                         markdown.append("- 重新执行 dm-adapter migrate，然后再次运行本验证测试；这些模式已有严格的 mapper-dm 自动改写规则。\\n");
                     }
@@ -1919,6 +1923,7 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_JSON_SQL",
                             "REGEXP_OPERATOR",
                             "MYSQL_METADATA_SQL",
+                            "MYSQL_USER_VARIABLE",
                             "SQL_SYNTAX_OTHER")) {
                         markdown.append("- 人工复核 GROUP_CONCAT、JSON SQL、REGEXP、MySQL 元数据查询，以及其他未分类的达梦语法失败等复杂 SQL 模式。\\n");
                     }
@@ -2082,8 +2087,23 @@ class DmSqlValidationTestGenerator {
                     }
                     String message = normalizeMessage(record.message);
                     String lower = message.toLowerCase(Locale.ROOT);
-                    if (lower.contains("information_schema") || lower.contains("database()")) {
+                    if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
+                    }
+                    if (Pattern.compile("\\\\bsql_(?:big|small)_result\\\\b|\\\\bsql_calc_found_rows\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_SELECT_MODIFIER";
+                    }
+                    if (Pattern.compile("\\\\bforce\\\\s+index\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_INDEX_HINT";
+                    }
+                    if (Pattern.compile("\\\\binsert\\\\s+into\\\\b[\\\\s\\\\S]*?\\\\)\\\\s+value\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_INSERT_VALUE_KEYWORD";
+                    }
+                    if (Pattern.compile("\\\\bconvert\\\\s*\\\\([\\\\s\\\\S]*?,\\\\s*decimal\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_CONVERT_DECIMAL";
+                    }
+                    if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_USER_VARIABLE";
                     }
                     if (isSchemaObjectFailure(lower)) {
                         return "TEST_SCHEMA_OBJECT";
@@ -2182,6 +2202,11 @@ class DmSqlValidationTestGenerator {
                             || lowerMessage.contains("无法解析的成员访问表达式");
                 }
 
+                private boolean isMysqlMetadataSql(String message) {
+                    return Pattern.compile("\\\\binformation_schema\\\\b|\\\\bdatabase\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("(?im)^### SQL:\\\\s*describe\\\\b").matcher(message).find();
+                }
+
                 private boolean hasJsonTableJoinWithoutCondition(String message) {
                     Pattern pattern = Pattern.compile(
                             "\\\\b(?<join>(?:inner\\\\s+)?join)\\\\s+json_table\\\\s*\\\\([\\\\s\\\\S]*?\\\\)\\\\s+(?:as\\\\s+)?[A-Za-z_][A-Za-z0-9_$]*\\\\s*(?:where|group\\\\s+by|order\\\\s+by|having|limit|fetch|union|$)",
@@ -2239,7 +2264,7 @@ class DmSqlValidationTestGenerator {
                             "primitive return type")) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
-                    if (containsAny(message, "information_schema", "database()")) {
+                    if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
                     }
                     if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的模式名", "无法解析的成员访问表达式")) {

@@ -192,6 +192,81 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlSingleQuotedAliasesToDamengIdentifiers() {
+        SqlConversionResult result = converter.convert(
+                "SELECT t.precinct_code AS 'precinctThirdId', COUNT(*) as 'houseCount' FROM biz_house_info t"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT t.precinct_code AS \"precinctThirdId\", COUNT(*) as \"houseCount\" FROM biz_house_info t");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+    }
+
+    @Test
+    void removesMysqlSelectModifiers() {
+        SqlConversionResult result = converter.convert(
+                "select SQL_BIG_RESULT precinct_id, SUM(charging_area) from owner_house_result group by precinct_id"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select precinct_id, SUM(charging_area) from owner_house_result group by precinct_id");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SELECT_MODIFIER_REMOVAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlConvertDecimalToCast() {
+        SqlConversionResult result = converter.convert(
+                "SELECT CONVERT(NVL(SUM(charging_area),0), DECIMAL(16,6)) as chargingArea from owner_house_result"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT CAST(NVL(SUM(charging_area),0) AS DECIMAL(16,6)) as chargingArea from owner_house_result");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONVERT_DECIMAL_RULE);
+    }
+
+    @Test
+    void removesMysqlForceIndexHints() {
+        SqlConversionResult result = converter.convert(
+                "SELECT * FROM owner_house_relationship force index(idx_houseId) WHERE house_id = #{houseId}"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT * FROM owner_house_relationship WHERE house_id = #{houseId}");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_INDEX_HINT_REMOVAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlSingularInsertValueKeywordToValues() {
+        SqlConversionResult result = converter.convert(
+                "insert into owner_customer_bank_account (owner_id, account_name) value (#{ownerId}, #{accountName})"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("insert into owner_customer_bank_account (owner_id, account_name) VALUES (#{ownerId}, #{accountName})");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_INSERT_VALUE_TO_VALUES_RULE);
+    }
+
+    @Test
+    void doesNotApplyMysqlSyntaxCleanupInsideStringsOrComments() {
+        String sql = """
+                select 'SQL_BIG_RESULT force index(idx) insert into t (a) value (1)' as sample
+                from audit_log
+                where note = 'AS ''ownerId'''
+                -- force index(idx)
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
     void convertsMysqlDateAddIntervalToDateadd() {
         SqlConversionResult result = converter.convert(
                 "select DATE_ADD(CONCAT(DATE(checkDate), ' ', onOffTime), INTERVAL 120 MINUTE) from record"

@@ -26,6 +26,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
     public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
             "MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN";
+    public static final String MYSQL_SINGLE_QUOTED_ALIAS_RULE = "MYSQL_SINGLE_QUOTED_ALIAS_TO_DM_IDENTIFIER";
+    public static final String MYSQL_INSERT_VALUE_TO_VALUES_RULE = "MYSQL_INSERT_VALUE_TO_VALUES";
+    public static final String MYSQL_INDEX_HINT_REMOVAL_RULE = "MYSQL_INDEX_HINT_REMOVED";
+    public static final String MYSQL_CONVERT_DECIMAL_RULE = "MYSQL_CONVERT_DECIMAL_TO_CAST";
+    public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
@@ -48,6 +53,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern CAST_UNSIGNED_BODY_PATTERN = Pattern.compile(
             "(?is)^\\s*(.+?)\\s+AS\\s+UNSIGNED(?:\\s+INTEGER)?\\s*$"
     );
+    private static final Pattern DECIMAL_TARGET_TYPE_PATTERN = Pattern.compile(
+            "(?is)^\\s*DECIMAL\\s*\\(\\s*\\d+\\s*,\\s*\\d+\\s*\\)\\s*$"
+    );
     private static final Pattern INTERVAL_DAY_PATTERN = Pattern.compile(
             "(?is)^\\s*INTERVAL\\s+(.+?)\\s+DAY\\s*$"
     );
@@ -59,6 +67,30 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     );
     private static final List<String> MYSQL_INTERVAL_UNITS =
             List.of("YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND");
+    private static final List<String> MYSQL_SELECT_MODIFIERS_TO_REMOVE = List.of(
+            "SQL_BIG_RESULT",
+            "SQL_SMALL_RESULT",
+            "SQL_BUFFER_RESULT",
+            "SQL_CALC_FOUND_ROWS",
+            "SQL_CACHE",
+            "SQL_NO_CACHE",
+            "HIGH_PRIORITY",
+            "STRAIGHT_JOIN"
+    );
+    private static final Set<String> MYSQL_SELECT_MODIFIER_CONTEXT_WORDS = Set.of(
+            "SELECT",
+            "ALL",
+            "DISTINCT",
+            "DISTINCTROW",
+            "SQL_BIG_RESULT",
+            "SQL_SMALL_RESULT",
+            "SQL_BUFFER_RESULT",
+            "SQL_CALC_FOUND_ROWS",
+            "SQL_CACHE",
+            "SQL_NO_CACHE",
+            "HIGH_PRIORITY",
+            "STRAIGHT_JOIN"
+    );
     private static final Pattern CTE_ALIAS_PATTERN = Pattern.compile(
             "(?is).*\\s+AS\\s+(\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
     );
@@ -179,6 +211,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_BACKTICK_IDENTIFIER_RULE);
         }
 
+        GenericConversion singleQuotedAliasConversion = convertSingleQuotedAliases(converted);
+        if (singleQuotedAliasConversion.changed()) {
+            converted = singleQuotedAliasConversion.convertedSql();
+            rules.add(MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+        }
+
+        GenericConversion selectModifierConversion = removeMysqlSelectModifiers(converted);
+        if (selectModifierConversion.changed()) {
+            converted = selectModifierConversion.convertedSql();
+            rules.add(MYSQL_SELECT_MODIFIER_REMOVAL_RULE);
+        }
+
         GenericConversion dateSubConversion = convertDateSubNowDay(converted);
         if (dateSubConversion.changed()) {
             converted = dateSubConversion.convertedSql();
@@ -201,6 +245,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (unsignedConvertConversion.changed()) {
             converted = unsignedConvertConversion.convertedSql();
             rules.add(MYSQL_CONVERT_UNSIGNED_RULE);
+        }
+
+        GenericConversion decimalConvertConversion = convertDecimalConvertFunctions(converted);
+        if (decimalConvertConversion.changed()) {
+            converted = decimalConvertConversion.convertedSql();
+            rules.add(MYSQL_CONVERT_DECIMAL_RULE);
         }
 
         GenericConversion withRecursiveConversion = addRecursiveCteColumnAliases(converted);
@@ -231,6 +281,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (jsonTableJoinConversion.changed()) {
             converted = jsonTableJoinConversion.convertedSql();
             rules.add(MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE);
+        }
+
+        GenericConversion indexHintConversion = removeMysqlIndexHints(converted);
+        if (indexHintConversion.changed()) {
+            converted = indexHintConversion.convertedSql();
+            rules.add(MYSQL_INDEX_HINT_REMOVAL_RULE);
         }
 
         UpdateSetTableOrderConversion updateSetTableOrderConversion = convertUpdateSetTableOrder(converted);
@@ -283,6 +339,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (limitConversion.convertedSql() != null) {
             converted = limitConversion.convertedSql();
             rules.add(limitConversion.ruleName());
+        }
+
+        GenericConversion insertValueConversion = convertSingularInsertValueKeyword(converted);
+        if (insertValueConversion.changed()) {
+            converted = insertValueConversion.convertedSql();
+            rules.add(MYSQL_INSERT_VALUE_TO_VALUES_RULE);
         }
 
         GenericConversion insertIgnoreConversion = convertInsertIgnore(converted, upsertKeyColumns);
@@ -355,6 +417,96 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return mysqlFunction + " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
         }
         return "";
+    }
+
+    private GenericConversion convertSingleQuotedAliases(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(sql, index);
+                if (literal.closed() && isAsAliasPosition(sql, index) && !literal.value().isBlank()) {
+                    converted.append(quoteDamengIdentifier(literal.value()));
+                    index = literal.nextIndex();
+                    changed = true;
+                } else {
+                    index = appendSingleQuotedString(sql, index, converted);
+                }
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private boolean isAsAliasPosition(String sql, int quoteIndex) {
+        WordToken previousWord = previousWord(sql, quoteIndex);
+        return previousWord != null
+                && "AS".equalsIgnoreCase(previousWord.text())
+                && isOnlyWhitespace(sql, previousWord.endIndex(), quoteIndex);
+    }
+
+    private GenericConversion removeMysqlSelectModifiers(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                KeywordReplacement modifier = readMysqlSelectModifierRemoval(sql, index);
+                if (modifier == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, modifier.startIndex());
+                    lastCopiedIndex = modifier.endIndex();
+                    index = modifier.endIndex();
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private KeywordReplacement readMysqlSelectModifierRemoval(String sql, int index) {
+        for (String modifier : MYSQL_SELECT_MODIFIERS_TO_REMOVE) {
+            if (startsKeyword(sql, index, modifier) && isMysqlSelectModifierContext(sql, index)) {
+                return new KeywordReplacement(index, skipWhitespace(sql, index + modifier.length()));
+            }
+        }
+        return null;
+    }
+
+    private boolean isMysqlSelectModifierContext(String sql, int index) {
+        WordToken previousWord = previousWord(sql, index);
+        return previousWord != null
+                && isOnlyWhitespace(sql, previousWord.endIndex(), index)
+                && MYSQL_SELECT_MODIFIER_CONTEXT_WORDS.contains(previousWord.text().toUpperCase(Locale.ROOT));
     }
 
     private GenericConversion convertDateSubNowDay(String sql) {
@@ -734,6 +886,54 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return "CAST(" + expression + " AS BIGINT)";
+    }
+
+    private GenericConversion convertDecimalConvertFunctions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "CONVERT")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CONVERT");
+                String replacement = functionCall == null ? null : rewriteDecimalConvert(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteDecimalConvert(FunctionCall convertCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(convertCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String expression = arguments.get(0).text().trim();
+        String targetType = arguments.get(1).text().trim();
+        if (expression.isBlank() || !DECIMAL_TARGET_TYPE_PATTERN.matcher(targetType).matches()) {
+            return null;
+        }
+        return "CAST(" + expression + " AS " + targetType + ")";
     }
 
     private GenericConversion addRecursiveCteColumnAliases(String sql) {
@@ -1224,6 +1424,61 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return relationEnd;
     }
 
+    private GenericConversion removeMysqlIndexHints(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                KeywordReplacement hint = readMysqlForceIndexHintRemoval(sql, index);
+                if (hint == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, hint.startIndex());
+                    lastCopiedIndex = hint.endIndex();
+                    index = hint.endIndex();
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private KeywordReplacement readMysqlForceIndexHintRemoval(String sql, int index) {
+        if (!startsKeyword(sql, index, "FORCE")) {
+            return null;
+        }
+        int cursor = skipWhitespace(sql, index + "FORCE".length());
+        if (!startsKeyword(sql, cursor, "INDEX")) {
+            return null;
+        }
+        cursor = skipWhitespace(sql, cursor + "INDEX".length());
+        if (cursor >= sql.length() || sql.charAt(cursor) != '(') {
+            return null;
+        }
+        int closeParenIndex = findMatchingParen(sql, cursor);
+        if (closeParenIndex < 0) {
+            return null;
+        }
+        return new KeywordReplacement(index, skipWhitespace(sql, closeParenIndex + 1));
+    }
+
     private int joinTypeStart(String sql, int joinIndex) {
         WordToken word = previousWord(sql, joinIndex);
         if (word == null || !isOnlyWhitespace(sql, word.endIndex(), joinIndex)) {
@@ -1255,6 +1510,68 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return end;
+    }
+
+    private GenericConversion convertSingularInsertValueKeyword(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "INSERT")) {
+                KeywordReplacement keyword = readSingularInsertValueKeyword(sql, index);
+                if (keyword == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, keyword.startIndex());
+                    converted.append("VALUES");
+                    lastCopiedIndex = keyword.endIndex();
+                    index = keyword.endIndex();
+                    changed = true;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private KeywordReplacement readSingularInsertValueKeyword(String sql, int insertIndex) {
+        int index = skipWhitespace(sql, insertIndex + "INSERT".length());
+        if (startsKeyword(sql, index, "IGNORE")) {
+            index = skipWhitespace(sql, index + "IGNORE".length());
+        }
+        if (!startsKeyword(sql, index, "INTO")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "INTO".length());
+        int columnOpenIndex = findTopLevelChar(sql, '(', index);
+        if (columnOpenIndex < 0) {
+            return null;
+        }
+        int columnCloseIndex = findMatchingParen(sql, columnOpenIndex);
+        if (columnCloseIndex < 0) {
+            return null;
+        }
+        int valueIndex = skipWhitespace(sql, columnCloseIndex + 1);
+        return startsKeyword(sql, valueIndex, "VALUE")
+                ? new KeywordReplacement(valueIndex, valueIndex + "VALUE".length())
+                : null;
     }
 
     private GenericConversion convertInsertIgnore(String sql, List<String> keyColumns) {
@@ -2686,6 +3003,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record JsonTableJoin(int rewriteStartIndex, int joinSourceEndIndex) {
+    }
+
+    private record KeywordReplacement(int startIndex, int endIndex) {
     }
 
     private record WordToken(int startIndex, int endIndex, String text) {
