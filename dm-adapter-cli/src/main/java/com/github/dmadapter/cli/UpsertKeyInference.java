@@ -11,6 +11,10 @@ final class UpsertKeyInference {
             return Optional.of(InferenceResult.unresolved("No primary key or unique key metadata was found for table "
                     + candidate.tableName() + "."));
         }
+        if (normalizedColumns(candidate.insertColumns()).isEmpty()) {
+            return Optional.of(InferenceResult.unresolved("Could not determine INSERT columns for "
+                    + candidate.methodKey() + "; keyColumns must be configured manually."));
+        }
 
         List<TableConstraint> usablePrimaryKeys = usableConstraints(candidate, metadata.primaryKeys());
         if (usablePrimaryKeys.size() == 1) {
@@ -44,8 +48,7 @@ final class UpsertKeyInference {
         Set<String> insertedColumns = normalizedColumns(candidate.insertColumns());
         return constraints.stream()
                 .filter(constraint -> !constraint.columns().isEmpty())
-                .filter(constraint -> insertedColumns.isEmpty()
-                        || insertedColumns.containsAll(normalizedColumns(constraint.columns())))
+                .filter(constraint -> insertedColumns.containsAll(normalizedColumns(constraint.columns())))
                 .toList();
     }
 

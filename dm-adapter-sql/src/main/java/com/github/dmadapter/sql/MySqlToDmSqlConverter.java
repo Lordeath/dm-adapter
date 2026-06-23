@@ -54,6 +54,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern MYSQL_INTERVAL_PATTERN = Pattern.compile(
             "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\\s*$"
     );
+    private static final Pattern SIMPLE_INTERVAL_AMOUNT_PATTERN = Pattern.compile(
+            "(?is)^-?(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})$"
+    );
     private static final List<String> MYSQL_INTERVAL_UNITS =
             List.of("YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND");
     private static final Pattern CTE_ALIAS_PATTERN = Pattern.compile(
@@ -391,7 +394,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private String rewriteDateSubNowDay(FunctionCall dateSubCall) {
         List<TopLevelArgument> arguments = splitTopLevelArguments(dateSubCall.body());
-        if (arguments.size() != 2 || !isNowExpression(arguments.get(0).text())) {
+        if (arguments.size() != 2) {
             return null;
         }
         Matcher matcher = INTERVAL_DAY_PATTERN.matcher(arguments.get(1).text());
@@ -400,6 +403,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         String amount = matcher.group(1).trim();
         if (amount.isBlank()) {
+            return null;
+        }
+        String dateExpression = arguments.get(0).text().trim();
+        if (isCurDateExpression(dateExpression)) {
+            return "DATEADD(DAY, " + negatedIntervalAmount(amount) + ", " + dateExpression + ")";
+        }
+        if (!isNowExpression(dateExpression)) {
             return null;
         }
         return "(SYSDATE - " + amount + ")";
@@ -614,6 +624,21 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private boolean isNowExpression(String expression) {
         String trimmed = expression.trim();
         return "SYSDATE".equalsIgnoreCase(trimmed) || readOnlyFunctionCall(trimmed, "NOW") != null;
+    }
+
+    private boolean isCurDateExpression(String expression) {
+        return readOnlyFunctionCall(expression.trim(), "CURDATE") != null;
+    }
+
+    private String negatedIntervalAmount(String amount) {
+        String trimmed = amount.trim();
+        if (trimmed.startsWith("-")) {
+            return trimmed.substring(1).trim();
+        }
+        if (SIMPLE_INTERVAL_AMOUNT_PATTERN.matcher(trimmed).matches()) {
+            return "-" + trimmed;
+        }
+        return "(0 - " + trimmed + ")";
     }
 
     private GenericConversion convertUnsignedCasts(String sql) {
@@ -1727,7 +1752,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             expressionEnd = Math.min(expressionEnd, separatorIndex);
         }
         String expression = body.substring(0, expressionEnd).trim();
-        if (expression.isBlank() || startsKeyword(expression, leadingWhitespaceLength(expression), "DISTINCT")) {
+        boolean distinct = false;
+        if (startsKeyword(expression, leadingWhitespaceLength(expression), "DISTINCT")) {
+            distinct = true;
+            expression = expression.substring(leadingWhitespaceLength(expression) + "DISTINCT".length()).trim();
+        }
+        if (expression.isBlank()) {
             return null;
         }
         if (splitTopLevelArguments(expression).size() != 1) {
@@ -1744,7 +1774,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (orderBy.isBlank()) {
             orderBy = expression;
         }
-        return "LISTAGG(" + expression + ", " + separator + ") WITHIN GROUP (ORDER BY " + orderBy + ")";
+        return "LISTAGG(" + (distinct ? "DISTINCT " : "") + expression + ", " + separator + ") WITHIN GROUP (ORDER BY " + orderBy + ")";
     }
 
     private UpdateSetTableOrderConversion convertUpdateSetTableOrder(String sql) {

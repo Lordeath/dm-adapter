@@ -260,6 +260,33 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDistinctGroupConcatCaseExpressionToListaggDistinct() {
+        SqlConversionResult result = converter.convert("""
+                select GROUP_CONCAT(DISTINCT case when o.isValid = 1 then p.productName else NULL end) as productList
+                from ns_soss_enterprise e
+                group by e.enterpriseID
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select LISTAGG(DISTINCT case when o.isValid = 1 then p.productName else NULL end, ',') WITHIN GROUP (ORDER BY case when o.isValid = 1 then p.productName else NULL end) as productList
+                from ns_soss_enterprise e
+                group by e.enterpriseID
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
+    void doesNotConvertGroupConcatWithMultipleTopLevelExpressions() {
+        SqlConversionResult result = converter.convert("select GROUP_CONCAT(first_name, last_name) from user");
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("GROUP_CONCAT");
+    }
+
+    @Test
     void keepsSafeConversionsWhenRemainingSqlNeedsManualReview() {
         SqlConversionResult result = converter.convert(
                 "select `user`, JSON_SET(payload, '$.name', 'x') from audit_log limit 1"
@@ -358,6 +385,35 @@ class MySqlToDmSqlConverterTest {
                 delete from ns_system_log_detail
                 where create_time < (SYSDATE - #{expireDays, jdbcType=INTEGER})
                 """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_NOW_DAY_RULE);
+    }
+
+    @Test
+    void convertsDateSubCurdateIntervalDayToDateadd() {
+        SqlConversionResult result = converter.convert("""
+                update ns_soss_saas_order
+                set serviceEndDate = DATE_SUB(CURDATE(), INTERVAL 1 DAY)
+                where id = #{id}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ns_soss_saas_order
+                set serviceEndDate = DATEADD(DAY, -1, CURDATE())
+                where id = #{id}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_NOW_DAY_RULE);
+    }
+
+    @Test
+    void convertsDateSubCurdateIntervalDayWithMyBatisAmountToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select DATE_SUB(CURDATE(), INTERVAL #{days, jdbcType=INTEGER} DAY)"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATEADD(DAY, -#{days, jdbcType=INTEGER}, CURDATE())");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_NOW_DAY_RULE);
     }
 
