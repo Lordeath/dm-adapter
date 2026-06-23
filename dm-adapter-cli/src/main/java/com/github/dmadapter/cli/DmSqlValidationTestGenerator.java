@@ -1881,7 +1881,7 @@ class DmSqlValidationTestGenerator {
                     if (countsByPattern.isEmpty() && countsByCategory.isEmpty()) {
                         return;
                     }
-                    markdown.append("## Suggested Next Actions\\n\\n");
+                    markdown.append("## 建议后续处理\\n\\n");
                     if (containsAnyPattern(countsByPattern,
                             "UPDATE_SET_TABLE_ORDER",
                             "TRAILING_COMMA",
@@ -1890,18 +1890,18 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_DATE_ADD_INTERVAL",
                             "MYSQL_CONVERT_UNSIGNED",
                             "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")) {
-                        markdown.append("- Re-run dm-adapter migrate and then this validation test; these patterns have strict automatic mapper-dm rewrites.\\n");
+                        markdown.append("- 重新执行 dm-adapter migrate，然后再次运行本验证测试；这些模式已有严格的 mapper-dm 自动改写规则。\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "ON_DUPLICATE_KEY_UPDATE",
                             "INSERT_IGNORE")) {
-                        markdown.append("- Fill .dm-adapter/sql-rewrite.yml keyColumns for ON DUPLICATE KEY UPDATE / INSERT IGNORE rewrites, rerun migrate, and validate again.\\n");
+                        markdown.append("- 为 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写补充 .dm-adapter/sql-rewrite.yml 中的 keyColumns，重新执行 migrate 后再验证。\\n");
                     }
                     if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")) {
-                        markdown.append("- Align the Dameng test schema for missing tables, views, columns, or object-name differences before treating these as SQL rewrite failures.\\n");
+                        markdown.append("- 先对齐达梦测试 schema 中缺失的表、视图、字段或对象命名差异，再将其视为 SQL 改写失败。\\n");
                     }
                     if (countsByPattern.containsKey("BROKEN_DYNAMIC_SQL_OR_ARGS")) {
-                        markdown.append("- Inspect the mapper dynamic SQL branch and generated sample args; failures such as missing commas, empty conditions, or illegal dynamic placeholders are usually mapper-shape or validation-argument issues.\\n");
+                        markdown.append("- 检查 mapper 动态 SQL 分支和生成的示例参数；缺少逗号、空条件、非法动态占位符等问题通常属于 mapper 结构或验证参数问题。\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "NULL_COLLECTION_PARAMETER",
@@ -1911,7 +1911,7 @@ class DmSqlValidationTestGenerator {
                             "RAW_SQL_PARAMETER",
                             "GENERATED_ORDER_PARAMETER")
                             || countsByCategory.containsKey("METHOD_ARGS_OR_BINDING")) {
-                        markdown.append("- Configure method args in sql-validation.yml, or inspect mapper @Param names when XML parameter names differ from Java method parameters.\\n");
+                        markdown.append("- 在 sql-validation.yml 配置方法参数；当 XML 参数名与 Java 方法参数不一致时，检查 mapper 的 @Param 名称。\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "MYSQL_GROUP_CONCAT",
@@ -1920,13 +1920,13 @@ class DmSqlValidationTestGenerator {
                             "REGEXP_OPERATOR",
                             "MYSQL_METADATA_SQL",
                             "SQL_SYNTAX_OTHER")) {
-                        markdown.append("- Manually review complex SQL patterns such as GROUP_CONCAT, JSON SQL, REGEXP, MySQL metadata queries, and other uncategorized Dameng syntax failures.\\n");
+                        markdown.append("- 人工复核 GROUP_CONCAT、JSON SQL、REGEXP、MySQL 元数据查询，以及其他未分类的达梦语法失败等复杂 SQL 模式。\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "TEST_DATA_OR_CONSTRAINT",
                             "TEST_DATA_OTHER")
                             || countsByCategory.containsKey("TEST_DATA_OR_SCHEMA")) {
-                        markdown.append("- Adjust generated sample data, seed data, defaults, or constraints for data-related validation failures.\\n");
+                        markdown.append("- 调整生成的示例数据、种子数据、默认值或约束，以处理数据相关的验证失败。\\n");
                     }
                     markdown.append("\\n");
                 }
