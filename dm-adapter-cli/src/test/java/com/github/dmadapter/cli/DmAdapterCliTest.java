@@ -491,6 +491,122 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void generateValidationTestUsesRootPomWhenAppModuleMatchesArtifactId() throws Exception {
+        writeDemoProject();
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString(),
+                "--app-module",
+                "demo"
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.exists(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"))).isTrue();
+    }
+
+    @Test
+    void generateValidationTestUsesModuleWhenAppModuleMatchesArtifactIdInsteadOfDirectoryName() throws Exception {
+        Files.writeString(tempDir.resolve("pom.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>sample-root</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                    <packaging>pom</packaging>
+                </project>
+                """);
+        Path modulePom = tempDir.resolve("fastdfs-service/pom.xml");
+        Files.createDirectories(modulePom.getParent());
+        Files.writeString(modulePom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>newsee-fastdfs</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                </project>
+                """);
+        writeApplicationClass(
+                "fastdfs-service/src/main/java/com/example/fastdfs/FastdfsApplication.java",
+                "com.example.fastdfs",
+                "FastdfsApplication"
+        );
+        Path mapper = tempDir.resolve("fastdfs-service/src/main/resources/mapper/FileMapper.xml");
+        Files.createDirectories(mapper.getParent());
+        Files.writeString(mapper, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.fastdfs.dao.FileMapper">
+                    <select id="selectFiles">
+                        select id from files
+                    </select>
+                </mapper>
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString(),
+                "--app-module",
+                "newsee-fastdfs"
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.exists(tempDir.resolve("fastdfs-service/src/test/java/com/example/fastdfs/DmSqlValidationTest.java"))).isTrue();
+        assertThat(Files.exists(tempDir.resolve("newsee-fastdfs/src/test/java/com/example/fastdfs/DmSqlValidationTest.java"))).isFalse();
+    }
+
+    @Test
+    void generateValidationTestFailsWhenAppModuleArtifactIdMatchesMultiplePoms() throws Exception {
+        Files.writeString(tempDir.resolve("pom.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>sample-root</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                    <packaging>pom</packaging>
+                </project>
+                """);
+        writeDuplicateArtifactModule("first-module", "duplicate-app");
+        writeDuplicateArtifactModule("second-module", "duplicate-app");
+        PrintStream originalErr = System.err;
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        int exitCode;
+        try (PrintStream capturedErr = new PrintStream(stderr, true, StandardCharsets.UTF_8)) {
+            System.setErr(capturedErr);
+            exitCode = new CommandLine(new DmAdapterCli()).execute(
+                    "generate-validation-test",
+                    "--project",
+                    tempDir.toString(),
+                    "--app-module",
+                    "duplicate-app"
+            );
+        } finally {
+            System.setErr(originalErr);
+        }
+
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(stderr.toString(StandardCharsets.UTF_8))
+                .contains("Application module artifactId matched multiple pom.xml files for 'duplicate-app'")
+                .contains("first-module/pom.xml")
+                .contains("second-module/pom.xml")
+                .contains("Pass an explicit module path.");
+        assertThat(Files.exists(tempDir.resolve(".dm-adapter/sql-validation.yml"))).isFalse();
+    }
+
+    @Test
     void generateValidationTestInfersPackageFromMapperNamespaceForExplicitModuleWithoutApplicationClass() throws Exception {
         Files.writeString(tempDir.resolve("pom.xml"), """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -681,6 +797,22 @@ class DmAdapterCliTest {
                 "com.example",
                 className
         );
+    }
+
+    private void writeDuplicateArtifactModule(String moduleName, String artifactId) throws Exception {
+        Path pom = tempDir.resolve(moduleName + "/pom.xml");
+        Files.createDirectories(pom.getParent());
+        Files.writeString(pom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"
+                         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>%s</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                </project>
+                """.formatted(artifactId));
     }
 
     private void writeApplicationClass(String relativePath, String packageName, String className) throws Exception {

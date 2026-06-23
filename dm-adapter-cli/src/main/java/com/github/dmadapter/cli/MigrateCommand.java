@@ -59,7 +59,7 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--generate-validation-test", description = "Generate the Dameng SQL validation test after migration.")
     private boolean generateValidationTest;
 
-    @Option(names = "--app-module", description = "Application module path used for generated validation test placement; implies --generate-validation-test.")
+    @Option(names = "--app-module", description = "Application module path or Maven artifactId used for generated validation test placement; implies --generate-validation-test.")
     private Path appModule;
 
     @Option(names = "--config", description = "Validation config path; implies --generate-validation-test. Defaults to <project>/.dm-adapter/sql-validation.yml.")
