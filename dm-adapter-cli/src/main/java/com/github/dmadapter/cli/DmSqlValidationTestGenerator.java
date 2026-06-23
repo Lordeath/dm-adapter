@@ -941,7 +941,8 @@ class DmSqlValidationTestGenerator {
                                             namespace,
                                             id,
                                             setBranchParameterVariants(element),
-                                            dynamicIdentifierMetadata(element)
+                                            dynamicIdentifierMetadata(element),
+                                            generatedKeyProperties(element)
                                     ));
                                 }
                             }
@@ -957,6 +958,22 @@ class DmSqlValidationTestGenerator {
                             || "insert".equals(element.getTagName())
                             || "update".equals(element.getTagName())
                             || "delete".equals(element.getTagName());
+                }
+
+                private Set<String> generatedKeyProperties(Element statement) {
+                    if (!"insert".equals(statement.getTagName())
+                            || !"true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys"))) {
+                        return Set.of();
+                    }
+                    String keyProperty = statement.getAttribute("keyProperty");
+                    if (keyProperty == null || keyProperty.isBlank()) {
+                        return Set.of();
+                    }
+                    return Pattern.compile("[,\\\\s]+")
+                            .splitAsStream(keyProperty.trim())
+                            .map(String::trim)
+                            .filter(value -> !value.isBlank())
+                            .collect(Collectors.toCollection(LinkedHashSet::new));
                 }
 
                 private List<SetBranchParameterVariant> setBranchParameterVariants(Element statement) {
@@ -1008,9 +1025,9 @@ class DmSqlValidationTestGenerator {
                     while (dynamicMatcher.find()) {
                         addDynamicIdentifierExpression(dynamicMatcher.group(1), foreachCollections, metadata);
                     }
-                    Matcher valueMatcher = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)").matcher(text);
+                    Matcher valueMatcher = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)}").matcher(text);
                     while (valueMatcher.find()) {
-                        addValueExpression(valueMatcher.group(1), foreachCollections, metadata);
+                        addValueExpression(valueMatcher.group(1), jdbcType(valueMatcher.group(2)), foreachCollections, metadata);
                     }
                 }
 
@@ -1037,17 +1054,30 @@ class DmSqlValidationTestGenerator {
 
                 private void addValueExpression(
                         String expression,
+                        String jdbcType,
                         Map<String, String> foreachCollections,
                         DynamicIdentifierMetadata metadata
                 ) {
                     List<String> parts = pathParts(expression);
+                    if (!parts.isEmpty() && jdbcType != null && !jdbcType.isBlank()) {
+                        metadata.addDefaultValue(parts.get(parts.size() - 1), defaultValueForJdbcType(parts.get(parts.size() - 1), jdbcType));
+                    }
                     if (parts.size() < 2) {
                         return;
                     }
                     String collection = foreachCollections.get(parts.get(0));
                     if (collection != null && metadata.hasCollectionDefault(collection)) {
-                        metadata.addCollectionDefault(collection, parts.get(1), defaultString(parts.get(1)));
+                        Object defaultValue = jdbcType == null || jdbcType.isBlank()
+                                ? defaultString(parts.get(1))
+                                : defaultValueForJdbcType(parts.get(1), jdbcType);
+                        metadata.addCollectionDefault(collection, parts.get(1), defaultValue);
                     }
+                }
+
+                private String jdbcType(String placeholderTail) {
+                    Matcher matcher = Pattern.compile("(?i)(?:^|,)\\\\s*jdbcType\\\\s*=\\\\s*([A-Za-z0-9_]+)")
+                            .matcher(placeholderTail == null ? "" : placeholderTail);
+                    return matcher.find() ? matcher.group(1).toUpperCase(Locale.ROOT) : "";
                 }
 
                 private List<String> pathParts(String expression) {
@@ -1534,6 +1564,10 @@ class DmSqlValidationTestGenerator {
                     if (isDynamicIdentifierName(normalized)) {
                         return "ID";
                     }
+                    Object configuredDefault = statement == null ? null : statement.defaultValue(valueName);
+                    if (configuredDefault != null) {
+                        return String.valueOf(configuredDefault);
+                    }
                     if (normalized.endsWith("id")
                             || normalized.endsWith("ids")
                             || normalized.contains("userid")
@@ -1551,6 +1585,19 @@ class DmSqlValidationTestGenerator {
                         return "EQUAL";
                     }
                     return "test";
+                }
+
+                private Object defaultValueForJdbcType(String valueName, String jdbcType) {
+                    String normalizedJdbcType = jdbcType == null ? "" : jdbcType.toUpperCase(Locale.ROOT);
+                    return switch (normalizedJdbcType) {
+                        case "BIGINT" -> 1L;
+                        case "INTEGER", "INT", "SMALLINT", "TINYINT" -> 1;
+                        case "DOUBLE", "FLOAT", "REAL" -> 1D;
+                        case "DECIMAL", "NUMERIC" -> BigDecimal.ONE;
+                        case "BIT", "BOOLEAN" -> true;
+                        case "DATE", "TIME", "TIMESTAMP", "DATETIME" -> "2024-01-01 00:00:00";
+                        default -> defaultString(valueName);
+                    };
                 }
 
                 private boolean shouldUseEmptyCollection(String valueName) {
@@ -1599,6 +1646,11 @@ class DmSqlValidationTestGenerator {
                             for (Field field : currentType.getDeclaredFields()) {
                                 int modifiers = field.getModifiers();
                                 if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers)) {
+                                    continue;
+                                }
+                                if (statement != null
+                                        && statement.generatedKeyProperty(field.getName())
+                                        && !field.getType().isPrimitive()) {
                                     continue;
                                 }
                                 ValueResult fieldValue = defaultValue(
@@ -2077,6 +2129,11 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("order\\\\s+by\\\\s+test(?:\\\\s+test)?", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "GENERATED_ORDER_PARAMETER";
                     }
+                    if (lower.contains("列表不匹配")
+                            || lower.contains("重复的列名")
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(message).find()) {
+                        return "BROKEN_DYNAMIC_SQL_OR_ARGS";
+                    }
                     if (Pattern.compile("(?i)(\\\\band\\\\s*\\\\(\\\\s*\\\\)|,\\\\s*where\\\\b|\\\\bwhere\\\\s+and\\\\b|\\\\bset\\\\s+where\\\\b|\\\\?\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\s*=)").matcher(message).find()) {
                         return "BROKEN_DYNAMIC_SQL_OR_ARGS";
                     }
@@ -2110,7 +2167,9 @@ class DmSqlValidationTestGenerator {
                             "长度超出定义",
                             "类型转换异常",
                             "唯一性约束",
-                            "非法的时间日期类型数据")) {
+                            "非法的时间日期类型数据",
+                            "SET IDENTITY_INSERT",
+                            "自增列")) {
                         return "TEST_DATA_OR_CONSTRAINT";
                     }
                     return category(record) + "_OTHER";
@@ -2192,11 +2251,15 @@ class DmSqlValidationTestGenerator {
                             "长度超出定义",
                             "类型转换异常",
                             "唯一性约束",
-                            "非法的时间日期类型数据")) {
+                            "非法的时间日期类型数据",
+                            "SET IDENTITY_INSERT",
+                            "自增列")) {
                         return "TEST_DATA_OR_SCHEMA";
                     }
                     if (containsAny(message,
                             "语法分析出错",
+                            "列表不匹配",
+                            "重复的列名",
                             "标示符长度非法",
                             "无效的数据类型",
                             "无效的变量名",
@@ -2920,12 +2983,14 @@ class DmSqlValidationTestGenerator {
                     private final String id;
                     private final List<SetBranchParameterVariant> setBranchParameterVariants;
                     private final DynamicIdentifierMetadata dynamicIdentifierMetadata;
+                    private final Set<String> generatedKeyProperties;
 
                     private MapperStatement(
                             String namespace,
                             String id,
                             List<SetBranchParameterVariant> setBranchParameterVariants,
-                            DynamicIdentifierMetadata dynamicIdentifierMetadata
+                            DynamicIdentifierMetadata dynamicIdentifierMetadata,
+                            Set<String> generatedKeyProperties
                     ) {
                         this.namespace = namespace;
                         this.id = id;
@@ -2935,6 +3000,9 @@ class DmSqlValidationTestGenerator {
                         this.dynamicIdentifierMetadata = dynamicIdentifierMetadata == null
                                 ? new DynamicIdentifierMetadata()
                                 : dynamicIdentifierMetadata;
+                        this.generatedKeyProperties = Set.copyOf(generatedKeyProperties == null
+                                ? Set.of()
+                                : generatedKeyProperties);
                     }
 
                     private String key() {
@@ -2948,11 +3016,23 @@ class DmSqlValidationTestGenerator {
                     private Map<String, Object> collectionElementDefault(String valueName) {
                         return dynamicIdentifierMetadata.collectionElementDefault(valueName);
                     }
+
+                    private Object defaultValue(String valueName) {
+                        return dynamicIdentifierMetadata.defaultValue(valueName);
+                    }
+
+                    private boolean generatedKeyProperty(String valueName) {
+                        String normalized = DynamicIdentifierMetadata.normalizeMetadataName(valueName);
+                        return generatedKeyProperties.stream()
+                                .map(DynamicIdentifierMetadata::normalizeMetadataName)
+                                .anyMatch(normalized::equals);
+                    }
                 }
 
                 private static final class DynamicIdentifierMetadata {
                     private final Set<String> dynamicIdentifierNames = new LinkedHashSet<>();
                     private final Map<String, Map<String, Object>> collectionElementDefaults = new LinkedHashMap<>();
+                    private final Map<String, Object> defaultValues = new LinkedHashMap<>();
 
                     private void addDynamicIdentifierName(String valueName) {
                         String normalized = normalizeMetadataName(valueName);
@@ -2971,6 +3051,13 @@ class DmSqlValidationTestGenerator {
                                 .putIfAbsent(propertyName, value);
                     }
 
+                    private void addDefaultValue(String propertyName, Object value) {
+                        String normalizedPropertyName = normalizeMetadataName(propertyName);
+                        if (!normalizedPropertyName.isBlank()) {
+                            defaultValues.putIfAbsent(normalizedPropertyName, value);
+                        }
+                    }
+
                     private boolean hasCollectionDefault(String collectionName) {
                         return collectionElementDefaults.containsKey(normalizeMetadataName(collectionName));
                     }
@@ -2982,6 +3069,10 @@ class DmSqlValidationTestGenerator {
                     private Map<String, Object> collectionElementDefault(String valueName) {
                         Map<String, Object> defaults = collectionElementDefaults.get(normalizeMetadataName(valueName));
                         return defaults == null ? Map.of() : defaults;
+                    }
+
+                    private Object defaultValue(String valueName) {
+                        return defaultValues.get(normalizeMetadataName(valueName));
                     }
 
                     private static String normalizeMetadataName(String valueName) {

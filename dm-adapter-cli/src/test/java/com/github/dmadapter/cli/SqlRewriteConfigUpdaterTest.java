@@ -117,4 +117,36 @@ class SqlRewriteConfigUpdaterTest {
                 .contains("\"com.example.UserMapper.insertIgnore\":")
                 .contains("keyColumns: []");
     }
+
+    @Test
+    void doesNotInferKeyColumnsWhenInsertColumnsCannotBeParsed() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.RecentlyUsedMapper.insertOrUpdate",
+                "ns_recently_used",
+                List.of()
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("ns_recently_used", List.of(
+                new TableConstraint("PK_RECENTLY_USED", TableConstraint.ConstraintType.PRIMARY_KEY, List.of("id"))
+        ));
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(candidate),
+                Map.of("ns_recently_used", metadata),
+                true
+        );
+
+        assertThat(update.rewriteConfig().keyColumnsFor(candidate.methodKey(), candidate.tableName())).isEmpty();
+        assertThat(update.warnings())
+                .anySatisfy(warning -> assertThat(warning)
+                        .contains("Could not determine INSERT columns")
+                        .contains("com.example.RecentlyUsedMapper.insertOrUpdate"));
+        assertThat(Files.readString(config))
+                .contains("\"ns_recently_used\":")
+                .contains("\"com.example.RecentlyUsedMapper.insertOrUpdate\":")
+                .contains("keyColumns: []");
+    }
 }
