@@ -33,8 +33,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_INSERT_VALUE_TO_VALUES_RULE = "MYSQL_INSERT_VALUE_TO_VALUES";
     public static final String MYSQL_INDEX_HINT_REMOVAL_RULE = "MYSQL_INDEX_HINT_REMOVED";
     public static final String MYSQL_CONVERT_DECIMAL_RULE = "MYSQL_CONVERT_DECIMAL_TO_CAST";
+    public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
+    public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
 
@@ -254,6 +256,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_CONVERT_DECIMAL_RULE);
         }
 
+        GenericConversion gbkOrderConversion = convertMysqlGbkOrderBy(converted);
+        if (gbkOrderConversion.changed()) {
+            converted = gbkOrderConversion.convertedSql();
+            rules.add(MYSQL_CONVERT_GBK_ORDER_RULE);
+        }
+
         GenericConversion temporaryTableConversion = convertMysqlTemporaryTableAsSelect(converted);
         if (temporaryTableConversion.changed()) {
             converted = temporaryTableConversion.convertedSql();
@@ -349,6 +357,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (groupConcatConversion.changed()) {
             converted = groupConcatConversion.convertedSql();
             rules.add(MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+        }
+
+        GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
+        if (updateOrderLimitConversion.changed()) {
+            converted = updateOrderLimitConversion.convertedSql();
+            rules.add(MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE);
         }
 
         LimitConversion limitConversion = convertLimit(converted);
@@ -951,6 +965,67 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return "CAST(" + expression + " AS " + targetType + ")";
+    }
+
+    private GenericConversion convertMysqlGbkOrderBy(String sql) {
+        int orderIndex = findTopLevelKeyword(sql, "ORDER", 0);
+        if (orderIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int byIndex = skipWhitespace(sql, orderIndex + "ORDER".length());
+        if (!startsKeyword(sql, byIndex, "BY")) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = byIndex + "BY".length();
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsFunction(sql, index, "CONVERT")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CONVERT");
+                String replacement = functionCall == null ? null : rewriteGbkOrderConvert(functionCall);
+                if (replacement == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, functionCall.startIndex());
+                    converted.append(replacement);
+                    lastCopiedIndex = functionCall.endIndex();
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private String rewriteGbkOrderConvert(FunctionCall convertCall) {
+        Matcher matcher = Pattern.compile("(?is)^\\s*(.+?)\\s+USING\\s+GBK\\s*$").matcher(convertCall.body());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String expression = matcher.group(1).trim();
+        if (expression.isBlank()) {
+            return null;
+        }
+        return "NLSSORT(" + expression + ", 'NLS_SORT=SCHINESE_PINYIN_M')";
     }
 
     private GenericConversion convertMysqlTemporaryTableAsSelect(String sql) {
@@ -1588,6 +1663,70 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return false;
         }
         return findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length()) >= 0;
+    }
+
+    private GenericConversion convertMysqlUpdateOrderLimitOne(String sql) {
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int setIndex = findTopLevelKeyword(sql, "SET", updateIndex + "UPDATE".length());
+        if (setIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
+        if (whereIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int orderIndex = findTopLevelKeyword(sql, "ORDER", whereIndex + "WHERE".length());
+        if (orderIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int byIndex = skipWhitespace(sql, orderIndex + "ORDER".length());
+        if (!startsKeyword(sql, byIndex, "BY")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int limitIndex = findTopLevelKeyword(sql, "LIMIT", byIndex + "BY".length());
+        if (limitIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        if (!isOnlyLimitOne(sql.substring(limitIndex + "LIMIT".length(), statementEnd))) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        int tableStart = skipWhitespace(sql, updateIndex + "UPDATE".length());
+        IdentifierToken table = readQualifiedIdentifierToken(sql, tableStart);
+        if (table == null || skipWhitespace(sql, table.endIndex()) != setIndex) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableName = table.text();
+        String setClause = sql.substring(setIndex + "SET".length(), whereIndex).trim();
+        String whereClause = sql.substring(whereIndex + "WHERE".length(), orderIndex).trim();
+        String orderClause = sql.substring(byIndex + "BY".length(), limitIndex).trim();
+        if (setClause.isBlank() || whereClause.isBlank() || orderClause.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        StringBuilder converted = new StringBuilder(sql.length() + whereClause.length() + orderClause.length() + 80);
+        converted.append(sql, 0, updateIndex)
+                .append("update ")
+                .append(tableName)
+                .append(" set ")
+                .append(setClause)
+                .append(" where ROWID in (select rid from (select ROWID rid from ")
+                .append(tableName)
+                .append(" where ")
+                .append(whereClause)
+                .append(" order by ")
+                .append(orderClause)
+                .append(") where ROWNUM <= 1)")
+                .append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private boolean isOnlyLimitOne(String limitTail) {
+        return "1".equals(limitTail == null ? "" : limitTail.trim());
     }
 
     private GenericConversion convertImplicitCrossJoins(String sql) {
