@@ -306,7 +306,8 @@ class DmAdapterCliTest {
                 .contains("com.example.UserMapper.selectByDate")
                 .contains("com.example.UserMapper.updateByLevel")
                 .contains("com.example.UserMapper.dayClosingByIds")
-                .contains("com.example.UserMapper.getBatchOpenBillChargeItem");
+                .contains("com.example.UserMapper.getBatchOpenBillChargeItem")
+                .contains("com.example.UserMapper.selectApprovalStateByPaymentIds");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
                 .contains("@Tag(\"dm-sql-validation\")")
@@ -368,6 +369,11 @@ class DmAdapterCliTest {
                 .contains("collectionParameterNames")
                 .contains("nonEmptyCollectionParameter")
                 .contains("defaultCollectionParameter")
+                .contains("loadColumnMetadata")
+                .contains("DbColumnMetadata")
+                .contains("inOperatorColumnReference")
+                .contains("collectionColumnType")
+                .contains("defaultCollectionElementForColumnType")
                 .contains("hasDefaultParameterMap")
                 .contains("generatedKeyProperties")
                 .contains("generatedKeyProperty")
@@ -791,6 +797,18 @@ class DmAdapterCliTest {
                             #{orderNo}
                         </foreach>
                         group by charge_item_id
+                    </select>
+                    <select id="selectApprovalStateByPaymentIds">
+                        select approval_state as approvalState, payment_ids as paymentIds
+                        from ns_process_relevance_deposit_refund refund
+                        where refund.precinct_id in
+                        <foreach collection="precinctIds" item="item" open="(" close=")" separator=",">
+                            #{item}
+                        </foreach>
+                        and refund.payment_ids in
+                        <foreach collection="paymentIds" item="item" open="(" close=")" separator=",">
+                            #{item}
+                        </foreach>
                     </select>
                 </mapper>
                 """);
