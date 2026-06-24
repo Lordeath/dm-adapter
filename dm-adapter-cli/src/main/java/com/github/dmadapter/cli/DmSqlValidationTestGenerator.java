@@ -574,6 +574,17 @@ class DmSqlValidationTestGenerator {
                 private static final String MARKDOWN_REPORT = ".dm-adapter/sql-validation-report.md";
                 private static final String JSON_REPORT = ".dm-adapter/sql-validation-report.json";
                 private static final Pattern PLACEHOLDER = Pattern.compile("\\\\$\\\\{([^}]+)}");
+                private static final Set<String> DEFAULT_COLLECTION_PARAMETER_NAMES = Set.of(
+                        "primarykeylist",
+                        "removeitemids",
+                        "ids",
+                        "chargeitemids",
+                        "ordernolist",
+                        "accountbooklist",
+                        "allitem",
+                        "chargedetailids",
+                        "owneridlist"
+                );
                 private static final DateTimeFormatter LOG_TIMESTAMP_FORMATTER =
                         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
                 private ValidationConfig currentConfig = new ValidationConfig();
@@ -1007,6 +1018,7 @@ class DmSqlValidationTestGenerator {
                         if ("foreach".equals(element.getTagName())) {
                             String item = element.getAttribute("item");
                             String collection = element.getAttribute("collection");
+                            metadata.addCollectionParameterName(collection);
                             if (item != null && !item.isBlank() && collection != null && !collection.isBlank()) {
                                 currentForeachCollections = new LinkedHashMap<>(foreachCollections);
                                 currentForeachCollections.put(item, collection);
@@ -1268,6 +1280,10 @@ class DmSqlValidationTestGenerator {
                         return value.resolved
                                 ? ParameterResolution.resolved("configured", new Object[] { value.value })
                                 : ParameterResolution.unresolved("configured", value.message);
+                    }
+                    if ((mapperMethod.parameterType == null || Object.class.equals(mapperMethod.parameterType))
+                            && mapperMethod.statement.hasDefaultParameterMap()) {
+                        return ParameterResolution.resolved("auto", new Object[] { defaultParameterMap(mapperMethod.statement) });
                     }
                     if (mapperMethod.parameterType == null || Object.class.equals(mapperMethod.parameterType) || Void.TYPE.equals(mapperMethod.parameterType)) {
                         return ParameterResolution.resolved("auto", new Object[] { null });
@@ -1536,13 +1552,7 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(new ArrayList<>(List.of(nestedValue.value)));
                     }
                     if (Map.class.isAssignableFrom(targetType)) {
-                        Map<String, Object> value = new LinkedHashMap<>();
-                        if (statement != null) {
-                            value.putAll(statement.defaultValues());
-                            for (String dynamicIdentifierName : statement.dynamicIdentifierNames()) {
-                                value.putIfAbsent(dynamicIdentifierName, defaultDynamicIdentifier(dynamicIdentifierName));
-                            }
-                        }
+                        Map<String, Object> value = defaultParameterMap(statement);
                         Map<String, Object> configuredDefaults = statement == null
                                 ? Map.of()
                                 : statement.collectionElementDefault(valueName);
@@ -1564,6 +1574,50 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.unresolved("Nested object is too complex for generated parameters: " + targetType.getName());
                     }
                     return instantiatePojo(targetType, depth, statement);
+                }
+
+                private Map<String, Object> defaultParameterMap(MapperStatement statement) {
+                    Map<String, Object> value = new LinkedHashMap<>();
+                    if (statement != null) {
+                        value.putAll(statement.defaultValues());
+                        for (String dynamicIdentifierName : statement.dynamicIdentifierNames()) {
+                            value.putIfAbsent(dynamicIdentifierName, defaultDynamicIdentifier(dynamicIdentifierName));
+                        }
+                        for (String collectionName : statement.collectionParameterNames()) {
+                            value.putIfAbsent(collectionName, defaultCollectionParameter(collectionName, statement));
+                        }
+                    }
+                    return value;
+                }
+
+                private Object defaultCollectionParameter(String collectionName, MapperStatement statement) {
+                    if (shouldUseEmptyCollection(collectionName)) {
+                        return new ArrayList<>();
+                    }
+                    Map<String, Object> collectionElementDefault = statement == null
+                            ? Map.of()
+                            : statement.collectionElementDefault(collectionName);
+                    if (!collectionElementDefault.isEmpty()) {
+                        return new ArrayList<>(List.of(new LinkedHashMap<>(collectionElementDefault)));
+                    }
+                    return new ArrayList<>(List.of(defaultCollectionElement(collectionName)));
+                }
+
+                private Object defaultCollectionElement(String collectionName) {
+                    String normalized = normalizeName(collectionName);
+                    if (normalized.contains("orderno")
+                            || normalized.contains("billno")
+                            || normalized.contains("bankno")
+                            || normalized.contains("code")
+                            || normalized.contains("accountbook")) {
+                        return "CODE";
+                    }
+                    if (normalized.endsWith("id")
+                            || normalized.endsWith("ids")
+                            || normalized.contains("key")) {
+                        return 1L;
+                    }
+                    return "test";
                 }
 
                 private String defaultString(String valueName) {
@@ -1926,13 +1980,15 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_DATE_ADD_INTERVAL",
                             "MYSQL_CONVERT_UNSIGNED",
                             "MYSQL_CONVERT_DECIMAL",
+                            "MYSQL_CONVERT_GBK_ORDER",
                             "MYSQL_SELECT_MODIFIER",
                             "MYSQL_INSERT_VALUE_KEYWORD",
                             "MYSQL_INDEX_HINT",
                             "MYSQL_IMPLICIT_CROSS_JOIN",
                             "MYSQL_TEMPORARY_TABLE_AS_SELECT",
                             "DAMENG_KEYWORD_TABLE_ALIAS",
-                            "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON")) {
+                            "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON",
+                            "MYSQL_UPDATE_ORDER_LIMIT")) {
                         markdown.append("- 重新执行 dm-adapter migrate，然后再次运行本验证测试；这些模式已有严格的 mapper-dm 自动改写规则。\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
@@ -2171,6 +2227,12 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Pattern.compile("\\\\bconvert\\\\s*\\\\([\\\\s\\\\S]*?\\\\bunsigned\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_CONVERT_UNSIGNED";
+                    }
+                    if (Pattern.compile("\\\\border\\\\s+by\\\\b[\\\\s\\\\S]*?\\\\bconvert\\\\s*\\\\([\\\\s\\\\S]*?\\\\s+using\\\\s+gbk\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_CONVERT_GBK_ORDER";
+                    }
+                    if (Pattern.compile("\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\border\\\\s+by\\\\b[\\\\s\\\\S]*?\\\\blimit\\\\s+\\\\d+\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_UPDATE_ORDER_LIMIT";
                     }
                     if (hasJsonTableJoinWithoutCondition(message)) {
                         return "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON";
@@ -3140,6 +3202,16 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.dynamicIdentifierNames();
                     }
 
+                    private Set<String> collectionParameterNames() {
+                        return dynamicIdentifierMetadata.collectionParameterNames();
+                    }
+
+                    private boolean hasDefaultParameterMap() {
+                        return !defaultValues().isEmpty()
+                                || !dynamicIdentifierNames().isEmpty()
+                                || !collectionParameterNames().isEmpty();
+                    }
+
                     private boolean generatedKeyProperty(String valueName) {
                         String normalized = DynamicIdentifierMetadata.normalizeMetadataName(valueName);
                         return generatedKeyProperties.stream()
@@ -3151,6 +3223,8 @@ class DmSqlValidationTestGenerator {
                 private static final class DynamicIdentifierMetadata {
                     private final Set<String> dynamicIdentifierNames = new LinkedHashSet<>();
                     private final Set<String> namedDynamicIdentifierNames = new LinkedHashSet<>();
+                    private final Set<String> collectionParameterNames = new LinkedHashSet<>();
+                    private final Set<String> namedCollectionParameterNames = new LinkedHashSet<>();
                     private final Map<String, Map<String, Object>> collectionElementDefaults = new LinkedHashMap<>();
                     private final Map<String, Object> defaultValues = new LinkedHashMap<>();
                     private final Map<String, Object> namedDefaultValues = new LinkedHashMap<>();
@@ -3161,6 +3235,15 @@ class DmSqlValidationTestGenerator {
                             dynamicIdentifierNames.add(normalized);
                             namedDynamicIdentifierNames.add(valueName);
                         }
+                    }
+
+                    private void addCollectionParameterName(String collectionName) {
+                        String normalizedCollectionName = normalizeMetadataName(collectionName);
+                        if (!DEFAULT_COLLECTION_PARAMETER_NAMES.contains(normalizedCollectionName)) {
+                            return;
+                        }
+                        collectionParameterNames.add(normalizedCollectionName);
+                        namedCollectionParameterNames.add(collectionName);
                     }
 
                     private void addCollectionDefault(String collectionName, String propertyName, Object value) {
@@ -3204,6 +3287,10 @@ class DmSqlValidationTestGenerator {
 
                     private Set<String> dynamicIdentifierNames() {
                         return Set.copyOf(namedDynamicIdentifierNames);
+                    }
+
+                    private Set<String> collectionParameterNames() {
+                        return Set.copyOf(namedCollectionParameterNames);
                     }
 
                     private static String normalizeMetadataName(String valueName) {

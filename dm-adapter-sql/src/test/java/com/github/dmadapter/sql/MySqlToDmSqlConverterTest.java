@@ -228,6 +228,30 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlGbkOrderConvertToDamengNlssort() {
+        SqlConversionResult result = converter.convert(
+                "select id from NS_Payment_ChargePayment ORDER BY CreateTime DESC,CONVERT(ChargeItem USING GBK) asc"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select id from NS_Payment_ChargePayment ORDER BY CreateTime DESC,NLSSORT(ChargeItem, 'NLS_SORT=SCHINESE_PINYIN_M') asc");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONVERT_GBK_ORDER_RULE);
+    }
+
+    @Test
+    void doesNotConvertMysqlGbkConvertOutsideOrderByOrInsideIgnoredText() {
+        SqlConversionResult result = converter.convert("""
+                select CONVERT(name USING GBK) as raw, 'ORDER BY CONVERT(name USING GBK)' as text
+                from users
+                -- order by CONVERT(name USING GBK)
+                order by name
+                """);
+
+        assertThat(result.changed()).isFalse();
+    }
+
+    @Test
     void removesMysqlForceIndexHints() {
         SqlConversionResult result = converter.convert(
                 "SELECT * FROM owner_house_relationship force index(idx_houseId) WHERE house_id = #{houseId}"
@@ -756,6 +780,40 @@ class MySqlToDmSqlConverterTest {
                         MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
                         MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE
                 );
+    }
+
+    @Test
+    void convertsSimpleMysqlUpdateOrderLimitOneToDamengRowidSubquery() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE ns_bill_billsharing
+                SET customerId = #{customerId},
+                    payTime = #{payTime}
+                where customerId = #{oldCustomerId} order by createTime desc limit 1
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ns_bill_billsharing set customerId = #{customerId},
+                    payTime = #{payTime} where ROWID in (select rid from (select ROWID rid from ns_bill_billsharing where customerId = #{oldCustomerId} order by createTime desc) where ROWNUM <= 1)
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE);
+    }
+
+    @Test
+    void doesNotConvertUnsafeMysqlUpdateOrderLimitShapes() {
+        SqlConversionResult joinResult = converter.convert(
+                "update user u join dept d on u.dept_id = d.id set u.name = #{name} where d.id = #{id} order by u.id limit 1"
+        );
+        SqlConversionResult aliasResult = converter.convert(
+                "update user u set name = #{name} where id = #{id} order by id limit 1"
+        );
+        SqlConversionResult multiLimitResult = converter.convert(
+                "update user set name = #{name} where id > #{id} order by id limit 2"
+        );
+
+        assertThat(joinResult.manualReviewRequired()).isTrue();
+        assertThat(aliasResult.manualReviewRequired()).isTrue();
+        assertThat(multiLimitResult.manualReviewRequired()).isTrue();
     }
 
     @Test
