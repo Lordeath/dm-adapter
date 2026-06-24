@@ -559,7 +559,9 @@ class DmSqlValidationTestGenerator {
                         "removeitemids",
                         "ids",
                         "chargeitemids",
+                        "ordernos",
                         "ordernolist",
+                        "orders",
                         "accountbooklist",
                         "allitem",
                         "chargedetailids",
@@ -998,7 +1000,11 @@ class DmSqlValidationTestGenerator {
                         if ("foreach".equals(element.getTagName())) {
                             String item = element.getAttribute("item");
                             String collection = element.getAttribute("collection");
-                            metadata.addCollectionParameterName(collection);
+                            boolean nonEmptyCollection = shouldUseNonEmptyForeachCollection(collection, item, element);
+                            metadata.addCollectionParameterName(collection, nonEmptyCollection);
+                            if (nonEmptyCollection) {
+                                metadata.addNonEmptyCollectionParameterName(collection);
+                            }
                             if (item != null && !item.isBlank() && collection != null && !collection.isBlank()) {
                                 currentForeachCollections = new LinkedHashMap<>(foreachCollections);
                                 currentForeachCollections.put(item, collection);
@@ -1007,7 +1013,7 @@ class DmSqlValidationTestGenerator {
                         if ("if".equals(element.getTagName()) || "when".equals(element.getTagName())) {
                             BranchCondition condition = branchCondition(element.getAttribute("test"));
                             if (condition != null) {
-                                metadata.addDefaultValue(condition.parameterName, condition.literal);
+                                metadata.addDefaultValue(condition.parameterName, condition.defaultValue);
                             }
                         }
                         NodeList children = element.getChildNodes();
@@ -1118,16 +1124,73 @@ class DmSqlValidationTestGenerator {
                             Pattern.CASE_INSENSITIVE
                     ).matcher(test);
                     if (leftLiteral.find()) {
-                        return new BranchCondition(leftLiteral.group(2), leftLiteral.group(1));
+                        return new BranchCondition(leftLiteral.group(2), leftLiteral.group(1), leftLiteral.group(1));
                     }
                     Matcher rightLiteral = Pattern.compile(
                             "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*==\\\\s*'([^']+)'",
                             Pattern.CASE_INSENSITIVE
                     ).matcher(test);
                     if (rightLiteral.find()) {
-                        return new BranchCondition(rightLiteral.group(1), rightLiteral.group(2));
+                        return new BranchCondition(rightLiteral.group(1), rightLiteral.group(2), rightLiteral.group(2));
+                    }
+                    Matcher numericEquals = Pattern.compile(
+                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*==\\\\s*(-?\\\\d+)",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(test);
+                    if (numericEquals.find()) {
+                        return new BranchCondition(
+                                numericEquals.group(1),
+                                numericEquals.group(2),
+                                Integer.parseInt(numericEquals.group(2))
+                        );
+                    }
+                    Matcher numericNotEquals = Pattern.compile(
+                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*!=\\\\s*(-?\\\\d+)",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(test);
+                    if (numericNotEquals.find()) {
+                        int forbiddenValue = Integer.parseInt(numericNotEquals.group(2));
+                        int defaultValue = forbiddenValue == 0 ? 1 : 0;
+                        return new BranchCondition(numericNotEquals.group(1), String.valueOf(defaultValue), defaultValue);
                     }
                     return null;
+                }
+
+                private boolean shouldUseNonEmptyForeachCollection(String collection, String item, Element element) {
+                    String normalizedCollection = normalizeName(collection);
+                    String normalizedItem = normalizeName(item);
+                    return isBusinessCollectionName(normalizedCollection)
+                            || isBusinessCollectionItemName(normalizedItem)
+                            || followsInOperator(element);
+                }
+
+                private boolean isBusinessCollectionName(String normalizedName) {
+                    return normalizedName.contains("orderno")
+                            || normalizedName.contains("billno")
+                            || normalizedName.contains("code")
+                            || normalizedName.contains("accountbook")
+                            || normalizedName.endsWith("id")
+                            || normalizedName.endsWith("ids")
+                            || normalizedName.contains("key");
+                }
+
+                private boolean isBusinessCollectionItemName(String normalizedName) {
+                    return isBusinessCollectionName(normalizedName);
+                }
+
+                private boolean followsInOperator(Element element) {
+                    StringBuilder textBefore = new StringBuilder();
+                    Node previous = element.getPreviousSibling();
+                    while (previous != null && textBefore.length() < 200) {
+                        if (previous.getNodeType() == Node.TEXT_NODE || previous.getNodeType() == Node.CDATA_SECTION_NODE) {
+                            textBefore.insert(0, previous.getTextContent());
+                        } else if (previous instanceof Element) {
+                            break;
+                        }
+                        previous = previous.getPreviousSibling();
+                    }
+                    String compact = Pattern.compile("\\\\s+").matcher(textBefore.toString()).replaceAll(" ").trim();
+                    return Pattern.compile("(?i)(?:^|\\\\s)(?:not\\\\s+)?in\\\\s*$").matcher(compact).find();
                 }
 
                 private boolean startsWithSet(String text) {
@@ -1571,14 +1634,15 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object defaultCollectionParameter(String collectionName, MapperStatement statement) {
-                    if (shouldUseEmptyCollection(collectionName)) {
-                        return new ArrayList<>();
-                    }
                     Map<String, Object> collectionElementDefault = statement == null
                             ? Map.of()
                             : statement.collectionElementDefault(collectionName);
                     if (!collectionElementDefault.isEmpty()) {
                         return new ArrayList<>(List.of(new LinkedHashMap<>(collectionElementDefault)));
+                    }
+                    if (shouldUseEmptyCollection(collectionName)
+                            && (statement == null || !statement.nonEmptyCollectionParameter(collectionName))) {
+                        return new ArrayList<>();
                     }
                     return new ArrayList<>(List.of(defaultCollectionElement(collectionName)));
                 }
@@ -1586,6 +1650,7 @@ class DmSqlValidationTestGenerator {
                 private Object defaultCollectionElement(String collectionName) {
                     String normalized = normalizeName(collectionName);
                     if (normalized.contains("orderno")
+                            || "orders".equals(normalized)
                             || normalized.contains("billno")
                             || normalized.contains("bankno")
                             || normalized.contains("code")
@@ -3186,6 +3251,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.collectionParameterNames();
                     }
 
+                    private boolean nonEmptyCollectionParameter(String valueName) {
+                        return dynamicIdentifierMetadata.nonEmptyCollectionParameter(valueName);
+                    }
+
                     private boolean hasDefaultParameterMap() {
                         return !defaultValues().isEmpty()
                                 || !dynamicIdentifierNames().isEmpty()
@@ -3205,6 +3274,7 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> namedDynamicIdentifierNames = new LinkedHashSet<>();
                     private final Set<String> collectionParameterNames = new LinkedHashSet<>();
                     private final Set<String> namedCollectionParameterNames = new LinkedHashSet<>();
+                    private final Set<String> nonEmptyCollectionParameterNames = new LinkedHashSet<>();
                     private final Map<String, Map<String, Object>> collectionElementDefaults = new LinkedHashMap<>();
                     private final Map<String, Object> defaultValues = new LinkedHashMap<>();
                     private final Map<String, Object> namedDefaultValues = new LinkedHashMap<>();
@@ -3218,12 +3288,24 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private void addCollectionParameterName(String collectionName) {
+                        addCollectionParameterName(collectionName, false);
+                    }
+
+                    private void addCollectionParameterName(String collectionName, boolean force) {
                         String normalizedCollectionName = normalizeMetadataName(collectionName);
-                        if (!DEFAULT_COLLECTION_PARAMETER_NAMES.contains(normalizedCollectionName)) {
+                        if (normalizedCollectionName.isBlank()
+                                || (!force && !DEFAULT_COLLECTION_PARAMETER_NAMES.contains(normalizedCollectionName))) {
                             return;
                         }
                         collectionParameterNames.add(normalizedCollectionName);
                         namedCollectionParameterNames.add(collectionName);
+                    }
+
+                    private void addNonEmptyCollectionParameterName(String collectionName) {
+                        String normalizedCollectionName = normalizeMetadataName(collectionName);
+                        if (!normalizedCollectionName.isBlank()) {
+                            nonEmptyCollectionParameterNames.add(normalizedCollectionName);
+                        }
                     }
 
                     private void addCollectionDefault(String collectionName, String propertyName, Object value) {
@@ -3250,6 +3332,10 @@ class DmSqlValidationTestGenerator {
 
                     private boolean dynamicIdentifierParameter(String valueName) {
                         return dynamicIdentifierNames.contains(normalizeMetadataName(valueName));
+                    }
+
+                    private boolean nonEmptyCollectionParameter(String valueName) {
+                        return nonEmptyCollectionParameterNames.contains(normalizeMetadataName(valueName));
                     }
 
                     private Map<String, Object> collectionElementDefault(String valueName) {
@@ -3283,10 +3369,12 @@ class DmSqlValidationTestGenerator {
                 private static final class BranchCondition {
                     private final String parameterName;
                     private final String literal;
+                    private final Object defaultValue;
 
-                    private BranchCondition(String parameterName, String literal) {
+                    private BranchCondition(String parameterName, String literal, Object defaultValue) {
                         this.parameterName = parameterName;
                         this.literal = literal;
+                        this.defaultValue = defaultValue;
                     }
                 }
 
