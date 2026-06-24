@@ -377,6 +377,9 @@ class DmAdapterCliTest {
                 .contains("defaultValueForJdbcType")
                 .contains("jdbcType(valueMatcher.group(2))")
                 .contains("metadata.addDefaultValue(condition.parameterName, condition.defaultValue)")
+                .contains("addSetAssignmentDefaults")
+                .contains("looksLikeSetAssignment")
+                .contains("defaultValueForSetParameter")
                 .contains("numericNotEquals")
                 .contains("statement.defaultValues()")
                 .contains("defaultDynamicIdentifier")
@@ -768,8 +771,11 @@ class DmAdapterCliTest {
                     <update id="dayClosingByIds" parameterType="java.util.Map">
                         update payment
                         <set>
-                            <if test="isDayClosing != null and isDayClosing != 0">
-                                is_day_closing = #{isDayClosing},
+                            <if test="closingDay != null and isDayClosing != 0">
+                                closing_day = #{closingDay},
+                            </if>
+                            <if test="isDayClosing == 0">
+                                closing_day = null,
                             </if>
                         </set>
                         where id in
