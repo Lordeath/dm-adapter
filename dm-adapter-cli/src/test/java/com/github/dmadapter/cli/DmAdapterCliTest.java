@@ -307,7 +307,8 @@ class DmAdapterCliTest {
                 .contains("com.example.UserMapper.updateByLevel")
                 .contains("com.example.UserMapper.dayClosingByIds")
                 .contains("com.example.UserMapper.getBatchOpenBillChargeItem")
-                .contains("com.example.UserMapper.selectApprovalStateByPaymentIds");
+                .contains("com.example.UserMapper.selectApprovalStateByPaymentIds")
+                .contains("com.example.UserMapper.deleteByLogical");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
                 .contains("@Tag(\"dm-sql-validation\")")
@@ -374,6 +375,10 @@ class DmAdapterCliTest {
                 .contains("inOperatorColumnReference")
                 .contains("collectionColumnType")
                 .contains("defaultCollectionElementForColumnType")
+                .contains("mapParameterValue")
+                .contains("defaultValueForDirectParameter")
+                .contains("isDeletionFlagName")
+                .contains("isNumericParameterName")
                 .contains("hasDefaultParameterMap")
                 .contains("generatedKeyProperties")
                 .contains("generatedKeyProperty")
@@ -810,6 +815,13 @@ class DmAdapterCliTest {
                             #{item}
                         </foreach>
                     </select>
+                    <delete id="deleteByLogical" parameterType="com.alibaba.fastjson.JSONObject">
+                        update bill_detail set is_delete = #{isDelete}
+                        where id in
+                        <foreach collection="ids" item="item" open="(" close=")" separator=",">
+                            ${item}
+                        </foreach>
+                    </delete>
                 </mapper>
                 """);
     }
