@@ -413,7 +413,7 @@ class DmAdapterCliTest {
     }
 
     @Test
-    void generateValidationTestUpdatesExistingGeneratedTestButKeepsExistingConfig() throws Exception {
+    void generateValidationTestUpdatesExistingGeneratedFiles() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
         Path config = tempDir.resolve(".dm-adapter/sql-validation.yml");
@@ -432,7 +432,10 @@ class DmAdapterCliTest {
         );
 
         assertThat(exitCode).isZero();
-        assertThat(Files.readString(config)).isEqualTo("schema: \"custom\"\n");
+        assertThat(Files.readString(config))
+                .contains("schema: \"sample-system\"")
+                .contains("mapperXmlLocations:")
+                .doesNotContain("schema: \"custom\"");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
                 .contains("@Tag(\"dm-sql-validation\")")
