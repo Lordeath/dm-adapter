@@ -28,6 +28,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE =
             "MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM";
+    private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
+            "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Set<String> DAMENG_IDENTIFIER_QUOTES = Set.of(
@@ -408,7 +410,8 @@ public class MapperXmlRewriter {
                         content,
                         statementKey,
                         sqlConverter,
-                        rewriteConfig
+                        rewriteConfig,
+                        isDynamicWhereTag(nextTagName(rawBody, cdataEnd + "]]>".length()))
                 );
                 convertedBody.append(toCdata(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -435,7 +438,13 @@ public class MapperXmlRewriter {
                 int nextTag = rawBody.indexOf('<', index);
                 int textEnd = nextTag < 0 ? rawBody.length() : nextTag;
                 String text = rawBody.substring(index, textEnd);
-                TextSegmentConversion conversion = convertTextSegment(text, statementKey, sqlConverter, rewriteConfig);
+                TextSegmentConversion conversion = convertTextSegment(
+                        text,
+                        statementKey,
+                        sqlConverter,
+                        rewriteConfig,
+                        isDynamicWhereTag(nextTagName(rawBody, textEnd))
+                );
                 convertedBody.append(conversion.convertedText());
                 addAppliedRules(appliedRules, conversion.appliedRules());
                 addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
@@ -1282,8 +1291,17 @@ public class MapperXmlRewriter {
             String text,
             String statementKey,
             SqlConverter sqlConverter,
-            SqlRewriteConfig rewriteConfig
+            SqlRewriteConfig rewriteConfig,
+            boolean followedByDynamicWhere
     ) {
+        if (followedByDynamicWhere && isUpdateJoinWithoutWhere(text)) {
+            return new TextSegmentConversion(
+                    text,
+                    List.of(),
+                    List.of(DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON),
+                    false
+            );
+        }
         SqlConversionResult conversionResult =
                 sqlConverter.convert(text, rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(text)));
         List<String> manualReviewReasons = conversionResult.manualReviewRequired()
@@ -1298,6 +1316,49 @@ public class MapperXmlRewriter {
                 manualReviewReasons,
                 true
         );
+    }
+
+    private String nextTagName(String rawBody, int startIndex) {
+        int index = startIndex;
+        while (index < rawBody.length()) {
+            while (index < rawBody.length() && Character.isWhitespace(rawBody.charAt(index))) {
+                index++;
+            }
+            if (rawBody.startsWith("<!--", index)) {
+                int commentEnd = rawBody.indexOf("-->", index + "<!--".length());
+                if (commentEnd < 0) {
+                    return "";
+                }
+                index = commentEnd + "-->".length();
+                continue;
+            }
+            if (index >= rawBody.length() || rawBody.charAt(index) != '<') {
+                return "";
+            }
+            if (index + 1 < rawBody.length() && rawBody.charAt(index + 1) == '/') {
+                return "";
+            }
+            int nameStart = index + 1;
+            int nameEnd = nameStart;
+            while (nameEnd < rawBody.length()) {
+                char current = rawBody.charAt(nameEnd);
+                if (!Character.isLetterOrDigit(current) && current != '_' && current != '-') {
+                    break;
+                }
+                nameEnd++;
+            }
+            return rawBody.substring(nameStart, nameEnd).toLowerCase();
+        }
+        return "";
+    }
+
+    private boolean isDynamicWhereTag(String tagName) {
+        return "where".equals(tagName);
+    }
+
+    private boolean isUpdateJoinWithoutWhere(String text) {
+        Matcher matcher = Pattern.compile("(?is)^\\s*update\\b[\\s\\S]*\\bjoin\\b[\\s\\S]*\\bset\\b").matcher(text);
+        return matcher.find() && !Pattern.compile("(?is)\\bwhere\\b").matcher(text).find();
     }
 
     private void addAppliedRules(List<String> appliedRules, List<String> rulesToAdd) {

@@ -994,6 +994,52 @@ class MapperMigratorTest {
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
+    @Test
+    void skipsTextSegmentUpdateJoinWhenFollowedByDynamicWhere() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateBalance">
+                        update ns_payment_prepayment npp
+                        INNER JOIN ns_payment_prepaymentdetail nppd on npp.Id = nppd.RefPrePaymentID
+                        set npp.Balance = npp.Balance + nppd.OccurBalance
+                        <where>
+                            nppd.ChargePaymentID = #{id}
+                        </where>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("INNER JOIN ns_payment_prepaymentdetail")
+                .contains("<where>")
+                .doesNotContain(" from ns_payment_prepaymentdetail nppd where npp.Id = nppd.RefPrePaymentID");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason())
+                .contains("MyBatis <where>")
+                .contains("duplicate WHERE");
+    }
+
     private Path writeMapper(String relativePath, String sql) throws Exception {
         Path mapper = tempDir.resolve(relativePath);
         Files.createDirectories(mapper.getParent());
