@@ -991,17 +991,19 @@ class DmSqlValidationTestGenerator {
 
                 private DynamicIdentifierMetadata dynamicIdentifierMetadata(Element statement) {
                     DynamicIdentifierMetadata metadata = new DynamicIdentifierMetadata();
-                    collectDynamicIdentifierMetadata(statement, new LinkedHashMap<>(), metadata);
+                    collectDynamicIdentifierMetadata(statement, new LinkedHashMap<>(), metadata, false);
                     return metadata;
                 }
 
                 private void collectDynamicIdentifierMetadata(
                         Node node,
                         Map<String, String> foreachCollections,
-                        DynamicIdentifierMetadata metadata
+                        DynamicIdentifierMetadata metadata,
+                        boolean insideSet
                 ) {
                     if (node instanceof Element element) {
                         Map<String, String> currentForeachCollections = foreachCollections;
+                        boolean currentInsideSet = insideSet || "set".equals(element.getTagName());
                         if ("foreach".equals(element.getTagName())) {
                             String item = element.getAttribute("item");
                             String collection = element.getAttribute("collection");
@@ -1020,10 +1022,13 @@ class DmSqlValidationTestGenerator {
                             if (condition != null) {
                                 metadata.addDefaultValue(condition.parameterName, condition.defaultValue);
                             }
+                            if (currentInsideSet) {
+                                addSetAssignmentDefaults(element, currentForeachCollections, metadata);
+                            }
                         }
                         NodeList children = element.getChildNodes();
                         for (int i = 0; i < children.getLength(); i++) {
-                            collectDynamicIdentifierMetadata(children.item(i), currentForeachCollections, metadata);
+                            collectDynamicIdentifierMetadata(children.item(i), currentForeachCollections, metadata, currentInsideSet);
                         }
                         return;
                     }
@@ -1083,6 +1088,50 @@ class DmSqlValidationTestGenerator {
                                 : defaultValueForJdbcType(parts.get(1), jdbcType);
                         metadata.addCollectionDefault(collection, parts.get(1), defaultValue);
                     }
+                }
+
+                private void addSetAssignmentDefaults(
+                        Element element,
+                        Map<String, String> foreachCollections,
+                        DynamicIdentifierMetadata metadata
+                ) {
+                    String text = element.getTextContent();
+                    if (!looksLikeSetAssignment(text)) {
+                        return;
+                    }
+                    Matcher valueMatcher = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)}")
+                            .matcher(text);
+                    while (valueMatcher.find()) {
+                        List<String> parts = pathParts(valueMatcher.group(1));
+                        if (parts.isEmpty() || foreachCollections.containsKey(parts.get(0))) {
+                            continue;
+                        }
+                        String propertyName = parts.size() == 1 ? parts.get(0) : parts.get(parts.size() - 1);
+                        metadata.addDefaultValue(
+                                propertyName,
+                                defaultValueForSetParameter(propertyName, jdbcType(valueMatcher.group(2)))
+                        );
+                    }
+                }
+
+                private boolean looksLikeSetAssignment(String text) {
+                    if (text == null || text.isBlank()) {
+                        return false;
+                    }
+                    return Pattern.compile("(?is)(?:^|[,\\\\s])[A-Za-z_][A-Za-z0-9_.$]*\\\\s*=\\\\s*#\\\\{")
+                            .matcher(text)
+                            .find();
+                }
+
+                private Object defaultValueForSetParameter(String valueName, String jdbcType) {
+                    if (jdbcType != null && !jdbcType.isBlank()) {
+                        return defaultValueForJdbcType(valueName, jdbcType);
+                    }
+                    String normalized = normalizeName(valueName);
+                    if (normalized.endsWith("day") || normalized.contains("date") || normalized.contains("time")) {
+                        return "2024-01-01 00:00:00";
+                    }
+                    return defaultString(valueName);
                 }
 
                 private String jdbcType(String placeholderTail) {
