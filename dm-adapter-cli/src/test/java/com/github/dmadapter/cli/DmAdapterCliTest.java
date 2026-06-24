@@ -304,7 +304,9 @@ class DmAdapterCliTest {
                 .contains("excludedMethods:")
                 .contains("com.example.UserMapper.selectUsers")
                 .contains("com.example.UserMapper.selectByDate")
-                .contains("com.example.UserMapper.updateByLevel");
+                .contains("com.example.UserMapper.updateByLevel")
+                .contains("com.example.UserMapper.dayClosingByIds")
+                .contains("com.example.UserMapper.getBatchOpenBillChargeItem");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
                 .contains("@Tag(\"dm-sql-validation\")")
@@ -351,8 +353,14 @@ class DmAdapterCliTest {
                 .contains("DEFAULT_COLLECTION_PARAMETER_NAMES")
                 .contains("\"primarykeylist\"")
                 .contains("\"removeitemids\"")
-                .contains("metadata.addCollectionParameterName(collection)")
+                .contains("\"orders\"")
+                .contains("\"ordernos\"")
+                .contains("metadata.addCollectionParameterName(collection, nonEmptyCollection)")
+                .contains("metadata.addNonEmptyCollectionParameterName(collection)")
+                .contains("shouldUseNonEmptyForeachCollection")
+                .contains("followsInOperator")
                 .contains("collectionParameterNames")
+                .contains("nonEmptyCollectionParameter")
                 .contains("defaultCollectionParameter")
                 .contains("hasDefaultParameterMap")
                 .contains("generatedKeyProperties")
@@ -362,7 +370,8 @@ class DmAdapterCliTest {
                 .contains("dynamicIdentifierParameter")
                 .contains("defaultValueForJdbcType")
                 .contains("jdbcType(valueMatcher.group(2))")
-                .contains("metadata.addDefaultValue(condition.parameterName, condition.literal)")
+                .contains("metadata.addDefaultValue(condition.parameterName, condition.defaultValue)")
+                .contains("numericNotEquals")
                 .contains("statement.defaultValues()")
                 .contains("defaultDynamicIdentifier")
                 .contains("statement.dynamicIdentifierNames()")
@@ -750,6 +759,27 @@ class DmAdapterCliTest {
                         </if>
                         and audit_status = 1
                     </update>
+                    <update id="dayClosingByIds" parameterType="java.util.Map">
+                        update payment
+                        <set>
+                            <if test="isDayClosing != null and isDayClosing != 0">
+                                is_day_closing = #{isDayClosing},
+                            </if>
+                        </set>
+                        where id in
+                        <foreach collection="ids" item="item" open="(" close=")" separator=",">
+                            #{item}
+                        </foreach>
+                    </update>
+                    <select id="getBatchOpenBillChargeItem">
+                        select charge_item_id, charge_item
+                        from payment
+                        where order_no in
+                        <foreach collection="orders" item="orderNo" open="(" close=")" separator=",">
+                            #{orderNo}
+                        </foreach>
+                        group by charge_item_id
+                    </select>
                 </mapper>
                 """);
     }
