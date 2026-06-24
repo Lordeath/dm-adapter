@@ -1107,25 +1107,80 @@ class DmSqlValidationTestGenerator {
                         DynamicIdentifierMetadata metadata
                 ) {
                     List<String> parts = pathParts(expression);
-                    if (!parts.isEmpty() && jdbcType != null && !jdbcType.isBlank()) {
-                        metadata.addDefaultValue(parts.get(parts.size() - 1), defaultValueForJdbcType(parts.get(parts.size() - 1), jdbcType));
-                    }
-                    if (parts.size() == 1) {
-                        String collection = foreachCollections.get(parts.get(0));
-                        if (collection != null && jdbcType != null && !jdbcType.isBlank()) {
-                            metadata.addCollectionScalarDefault(collection, defaultValueForJdbcType(collection, jdbcType));
-                        }
-                    }
-                    if (parts.size() < 2) {
+                    if (parts.isEmpty()) {
                         return;
                     }
                     String collection = foreachCollections.get(parts.get(0));
-                    if (collection != null && metadata.hasCollectionDefault(collection)) {
-                        Object defaultValue = jdbcType == null || jdbcType.isBlank()
-                                ? defaultString(parts.get(1))
-                                : defaultValueForJdbcType(parts.get(1), jdbcType);
-                        metadata.addCollectionDefault(collection, parts.get(1), defaultValue);
+                    if (collection != null) {
+                        if (parts.size() == 1
+                                && jdbcType != null
+                                && !jdbcType.isBlank()) {
+                            metadata.addCollectionScalarDefault(collection, defaultValueForJdbcType(collection, jdbcType));
+                        }
+                        if (parts.size() > 1 && metadata.hasCollectionDefault(collection)) {
+                            Object defaultValue = jdbcType == null || jdbcType.isBlank()
+                                    ? defaultString(parts.get(1))
+                                    : defaultValueForJdbcType(parts.get(1), jdbcType);
+                            metadata.addCollectionDefault(collection, parts.get(1), defaultValue);
+                        }
+                        return;
                     }
+                    if (parts.size() == 1) {
+                        metadata.addDefaultValue(parts.get(0), defaultValueForDirectParameter(parts.get(0), jdbcType));
+                        return;
+                    }
+                    if (jdbcType != null && !jdbcType.isBlank()) {
+                        metadata.addDefaultValue(parts.get(parts.size() - 1), defaultValueForJdbcType(parts.get(parts.size() - 1), jdbcType));
+                    }
+                }
+
+                private Object defaultValueForDirectParameter(String valueName, String jdbcType) {
+                    if (jdbcType != null && !jdbcType.isBlank()) {
+                        return defaultValueForJdbcType(valueName, jdbcType);
+                    }
+                    String normalized = normalizeName(valueName);
+                    if (isDeletionFlagName(normalized)) {
+                        return 1;
+                    }
+                    if (normalized.endsWith("id")
+                            || normalized.endsWith("ids")
+                            || normalized.contains("userid")
+                            || normalized.contains("enterpriseid")
+                            || normalized.contains("organizationid")) {
+                        return 1L;
+                    }
+                    if (isNumericParameterName(normalized)) {
+                        return 1;
+                    }
+                    if (normalized.contains("code")) {
+                        return "CODE";
+                    }
+                    if (normalized.contains("date")
+                            || normalized.contains("time")
+                            || normalized.endsWith("day")) {
+                        return "2024-01-01 00:00:00";
+                    }
+                    return defaultString(valueName);
+                }
+
+                private boolean isDeletionFlagName(String normalizedName) {
+                    return "isdelete".equals(normalizedName)
+                            || "isdeleted".equals(normalizedName)
+                            || "deleteflag".equals(normalizedName)
+                            || "deletedflag".equals(normalizedName)
+                            || "isdeleteflag".equals(normalizedName);
+                }
+
+                private boolean isNumericParameterName(String normalizedName) {
+                    return "offset".equals(normalizedName)
+                            || "limit".equals(normalizedName)
+                            || "size".equals(normalizedName)
+                            || "pagesize".equals(normalizedName)
+                            || "pagenum".equals(normalizedName)
+                            || "pageindex".equals(normalizedName)
+                            || "page".equals(normalizedName)
+                            || normalizedName.endsWith("count")
+                            || normalizedName.endsWith("index");
                 }
 
                 private void addSetAssignmentDefaults(
@@ -1815,7 +1870,7 @@ class DmSqlValidationTestGenerator {
                         if (value.isEmpty()) {
                             value.put("key", "test");
                         }
-                        return ValueResult.resolved(value);
+                        return ValueResult.resolved(mapParameterValue(targetType, value));
                     }
                     if (targetType.isEnum()) {
                         Object[] constants = targetType.getEnumConstants();
@@ -1827,6 +1882,26 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.unresolved("Nested object is too complex for generated parameters: " + targetType.getName());
                     }
                     return instantiatePojo(targetType, depth, statement);
+                }
+
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                private Object mapParameterValue(Class<?> targetType, Map<String, Object> value) {
+                    if (Map.class.equals(targetType)
+                            || targetType.isInterface()
+                            || Modifier.isAbstract(targetType.getModifiers())) {
+                        return value;
+                    }
+                    try {
+                        Constructor<?> constructor = targetType.getDeclaredConstructor();
+                        constructor.setAccessible(true);
+                        Object instance = constructor.newInstance();
+                        if (instance instanceof Map map) {
+                            map.putAll(value);
+                            return instance;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    return value;
                 }
 
                 private Map<String, Object> defaultParameterMap(MapperStatement statement) {
