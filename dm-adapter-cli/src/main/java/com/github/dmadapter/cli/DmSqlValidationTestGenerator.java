@@ -576,6 +576,7 @@ class DmSqlValidationTestGenerator {
                 private static final Pattern PLACEHOLDER = Pattern.compile("\\\\$\\\\{([^}]+)}");
                 private static final DateTimeFormatter LOG_TIMESTAMP_FORMATTER =
                         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+                private ValidationConfig currentConfig = new ValidationConfig();
 
                 @Test
                 void validateMappedDaoSql() throws Exception {
@@ -584,6 +585,7 @@ class DmSqlValidationTestGenerator {
                     log("Started. Project root: " + projectRoot);
                     log("Loading config: " + configPath);
                     ValidationConfig config = ValidationConfig.load(configPath);
+                    currentConfig = config;
                     List<ValidationRecord> records = new ArrayList<>();
                     UsageFilterReport usageFilterReport = UsageFilterReport.disabled();
 
@@ -1537,6 +1539,9 @@ class DmSqlValidationTestGenerator {
                         Map<String, Object> value = new LinkedHashMap<>();
                         if (statement != null) {
                             value.putAll(statement.defaultValues());
+                            for (String dynamicIdentifierName : statement.dynamicIdentifierNames()) {
+                                value.putIfAbsent(dynamicIdentifierName, defaultDynamicIdentifier(dynamicIdentifierName));
+                            }
                         }
                         Map<String, Object> configuredDefaults = statement == null
                                 ? Map.of()
@@ -1571,10 +1576,10 @@ class DmSqlValidationTestGenerator {
                         return "";
                     }
                     if (statement != null && statement.dynamicIdentifierParameter(valueName)) {
-                        return "ID";
+                        return defaultDynamicIdentifier(valueName);
                     }
                     if (isDynamicIdentifierName(normalized)) {
-                        return "ID";
+                        return defaultDynamicIdentifier(valueName);
                     }
                     Object configuredDefault = statement == null ? null : statement.defaultValue(valueName);
                     if (configuredDefault != null) {
@@ -1597,6 +1602,24 @@ class DmSqlValidationTestGenerator {
                         return "EQUAL";
                     }
                     return "test";
+                }
+
+                private String defaultDynamicIdentifier(String valueName) {
+                    String normalized = normalizeName(valueName);
+                    if (isSchemaIdentifierName(normalized)
+                            && currentConfig != null
+                            && currentConfig.schema != null
+                            && !currentConfig.schema.isBlank()) {
+                        return quotedIdentifier(currentConfig.schema);
+                    }
+                    return "ID";
+                }
+
+                private boolean isSchemaIdentifierName(String normalized) {
+                    return "schema".equals(normalized)
+                            || "schemaname".equals(normalized)
+                            || "database".equals(normalized)
+                            || "databasename".equals(normalized);
                 }
 
                 private Object defaultValueForJdbcType(String valueName, String jdbcType) {
@@ -3113,6 +3136,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.defaultValues();
                     }
 
+                    private Set<String> dynamicIdentifierNames() {
+                        return dynamicIdentifierMetadata.dynamicIdentifierNames();
+                    }
+
                     private boolean generatedKeyProperty(String valueName) {
                         String normalized = DynamicIdentifierMetadata.normalizeMetadataName(valueName);
                         return generatedKeyProperties.stream()
@@ -3123,6 +3150,7 @@ class DmSqlValidationTestGenerator {
 
                 private static final class DynamicIdentifierMetadata {
                     private final Set<String> dynamicIdentifierNames = new LinkedHashSet<>();
+                    private final Set<String> namedDynamicIdentifierNames = new LinkedHashSet<>();
                     private final Map<String, Map<String, Object>> collectionElementDefaults = new LinkedHashMap<>();
                     private final Map<String, Object> defaultValues = new LinkedHashMap<>();
                     private final Map<String, Object> namedDefaultValues = new LinkedHashMap<>();
@@ -3131,6 +3159,7 @@ class DmSqlValidationTestGenerator {
                         String normalized = normalizeMetadataName(valueName);
                         if (!normalized.isBlank()) {
                             dynamicIdentifierNames.add(normalized);
+                            namedDynamicIdentifierNames.add(valueName);
                         }
                     }
 
@@ -3171,6 +3200,10 @@ class DmSqlValidationTestGenerator {
 
                     private Map<String, Object> defaultValues() {
                         return Map.copyOf(namedDefaultValues);
+                    }
+
+                    private Set<String> dynamicIdentifierNames() {
+                        return Set.copyOf(namedDynamicIdentifierNames);
                     }
 
                     private static String normalizeMetadataName(String valueName) {
