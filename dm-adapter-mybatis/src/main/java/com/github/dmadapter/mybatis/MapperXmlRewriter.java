@@ -14,7 +14,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -28,6 +30,10 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE =
             "MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM";
+    public static final String MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE =
+            "MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
+    public static final String MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE =
+            "MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE";
     private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
             "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
 
@@ -104,6 +110,15 @@ public class MapperXmlRewriter {
     );
     private static final Pattern FOREACH_TAG_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)</foreach\\s*>\\s*$"
+    );
+    private static final Set<String> AGGREGATE_FUNCTIONS = Set.of(
+            "AVG",
+            "COUNT",
+            "GROUP_CONCAT",
+            "LISTAGG",
+            "MAX",
+            "MIN",
+            "SUM"
     );
 
     public MapperRewriteResult rewrite(Path inputPath, String reportPath, boolean writeChanges, SqlConverter sqlConverter) {
@@ -427,7 +442,7 @@ public class MapperXmlRewriter {
                 convertedBody.append(rawBody, index, commentEnd + "-->".length());
                 index = commentEnd + "-->".length();
             } else if (rawBody.charAt(index) == '<') {
-                int tagEnd = rawBody.indexOf('>', index + 1);
+                int tagEnd = findXmlTagEnd(rawBody, index);
                 if (tagEnd < 0) {
                     convertedBody.append(rawBody, index, rawBody.length());
                     break;
@@ -481,12 +496,18 @@ public class MapperXmlRewriter {
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig
     ) {
-        if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
-            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
-        }
-
         List<String> appliedRules = new ArrayList<>();
         String converted = body;
+
+        DynamicHavingConversion havingConversion = convertDynamicHavingClauses(converted);
+        if (havingConversion.changed()) {
+            converted = havingConversion.convertedBody();
+            addAppliedRules(appliedRules, havingConversion.appliedRules());
+        }
+
+        if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
+            return new DynamicBodyConversion(body, converted, appliedRules, List.of(), !appliedRules.isEmpty());
+        }
 
         String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
         if (!foreachMerge.equals(converted)) {
@@ -533,6 +554,943 @@ public class MapperXmlRewriter {
         }
         converted = withoutTrailingCommas;
         return new DynamicBodyConversion(body, converted, appliedRules, List.of(), !appliedRules.isEmpty());
+    }
+
+    private DynamicHavingConversion convertDynamicHavingClauses(String body) {
+        String converted = body;
+        List<String> appliedRules = new ArrayList<>();
+        boolean changed = false;
+        int guard = 0;
+        while (guard < 100) {
+            ScopeHavingConversion scopeConversion = convertFirstDynamicHavingScope(converted);
+            if (!scopeConversion.changed()) {
+                break;
+            }
+            converted = scopeConversion.convertedBody();
+            addAppliedRules(appliedRules, scopeConversion.appliedRules());
+            changed = true;
+            guard++;
+        }
+        return new DynamicHavingConversion(body, converted, appliedRules, changed);
+    }
+
+    private ScopeHavingConversion convertFirstDynamicHavingScope(String body) {
+        SqlView view = sqlView(body);
+        List<SelectScope> scopes = selectScopes(view.text());
+        for (int i = scopes.size() - 1; i >= 0; i--) {
+            SelectScope scope = scopes.get(i);
+            ScopeHavingConversion havingConversion = convertRegularHavingInScope(body, view.text(), scope);
+            if (havingConversion.changed()) {
+                return havingConversion;
+            }
+            ScopeHavingConversion trimConversion = convertTrimHavingInScope(body, scope);
+            if (trimConversion.changed()) {
+                return trimConversion;
+            }
+        }
+        return ScopeHavingConversion.unchanged(body);
+    }
+
+    private ScopeHavingConversion convertRegularHavingInScope(String body, String view, SelectScope scope) {
+        if (scope.havingIndex() < 0 || scope.groupIndex() < 0) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        Map<String, String> aggregateAliases = aggregateSelectAliases(
+                body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
+        );
+        int havingStart = scope.havingIndex() + "HAVING".length();
+        String havingContent = body.substring(havingStart, scope.havingEnd());
+        TextRewrite aliasRewrite = replaceAggregateAliases(havingContent, aggregateAliases);
+        HavingRewrite havingRewrite = rewriteHavingContent(aliasRewrite.text(), aggregateAliases);
+        boolean aliasChanged = aliasRewrite.changed();
+        boolean movedConditions = !havingRewrite.movedConditions().isBlank();
+        if (!aliasChanged && !movedConditions) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+
+        String converted = body;
+        if (movedConditions) {
+            String remainingHaving = havingRewrite.remainingHaving();
+            if (remainingHaving.isBlank()) {
+                converted = converted.substring(0, scope.havingIndex())
+                        + converted.substring(scope.havingEnd());
+            } else {
+                converted = converted.substring(0, havingStart)
+                        + remainingHaving
+                        + converted.substring(scope.havingEnd());
+            }
+            converted = insertMovedHavingConditions(
+                    converted,
+                    scope,
+                    havingRewrite.movedConditions()
+            );
+        } else {
+            converted = converted.substring(0, havingStart)
+                    + aliasRewrite.text()
+                    + converted.substring(scope.havingEnd());
+        }
+
+        List<String> rules = new ArrayList<>();
+        if (aliasChanged) {
+            rules.add(MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        }
+        if (movedConditions) {
+            rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        }
+        return new ScopeHavingConversion(converted, rules, true);
+    }
+
+    private ScopeHavingConversion convertTrimHavingInScope(String body, SelectScope scope) {
+        if (scope.groupIndex() < 0) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        Map<String, String> aggregateAliases = aggregateSelectAliases(
+                body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
+        );
+        if (aggregateAliases.isEmpty()) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        TrimBlock trimBlock = firstHavingTrimBlock(body, scope.groupIndex(), scope.scopeEnd());
+        if (trimBlock == null) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        String content = body.substring(trimBlock.contentStart(), trimBlock.contentEnd());
+        TextRewrite aliasRewrite = replaceAggregateAliases(content, aggregateAliases);
+        if (!aliasRewrite.changed()) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        String converted = body.substring(0, trimBlock.contentStart())
+                + aliasRewrite.text()
+                + body.substring(trimBlock.contentEnd());
+        return new ScopeHavingConversion(
+                converted,
+                List.of(MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE),
+                true
+        );
+    }
+
+    private HavingRewrite rewriteHavingContent(String havingContent, Map<String, String> aggregateAliases) {
+        List<ConditionPart> parts = splitTopLevelAndConditions(havingContent);
+        if (parts.isEmpty()) {
+            return new HavingRewrite(havingContent, "", false);
+        }
+        List<String> kept = new ArrayList<>();
+        List<String> moved = new ArrayList<>();
+        for (ConditionPart part : parts) {
+            String condition = part.text();
+            if (isMovableSimpleHavingCondition(condition, aggregateAliases)) {
+                moved.add(condition);
+            } else {
+                kept.add(condition);
+            }
+        }
+        if (moved.isEmpty()) {
+            return new HavingRewrite(havingContent, "", false);
+        }
+        return new HavingRewrite(
+                joinHavingConditions(kept, havingContent),
+                joinMovedConditions(moved, false),
+                true
+        );
+    }
+
+    private List<ConditionPart> splitTopLevelAndConditions(String value) {
+        List<ConditionPart> parts = new ArrayList<>();
+        int start = 0;
+        int depth = 0;
+        int xmlDepth = 0;
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? value.length() : end + "-->".length();
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int end = value.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? value.length() : end + "]]>".length();
+            } else if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                if (tag == null) {
+                    index++;
+                } else {
+                    if (!tag.selfClosing() && !"include".equalsIgnoreCase(tag.name())) {
+                        xmlDepth += tag.closing() ? -1 : 1;
+                        if (xmlDepth < 0) {
+                            xmlDepth = 0;
+                        }
+                    }
+                    index = tag.endIndex();
+                }
+            } else if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (value.charAt(index) == '(') {
+                depth++;
+                index++;
+            } else if (value.charAt(index) == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == 0 && xmlDepth == 0 && isKeywordAt(value, index, "AND")) {
+                parts.add(new ConditionPart(value.substring(start, index)));
+                index += "AND".length();
+                start = index;
+            } else {
+                index++;
+            }
+        }
+        parts.add(new ConditionPart(value.substring(start)));
+        return parts;
+    }
+
+    private boolean isMovableSimpleHavingCondition(String condition, Map<String, String> aggregateAliases) {
+        String normalized = stripXmlMarkup(condition);
+        if (normalized.isBlank()) {
+            return false;
+        }
+        if (normalized.contains("${")
+                || containsAggregateFunction(normalized)
+                || containsKeyword(normalized, "OR")
+                || containsKeyword(normalized, "SELECT")
+                || containsKeyword(normalized, "EXISTS")) {
+            return false;
+        }
+        for (String alias : aggregateAliases.keySet()) {
+            if (containsKeyword(normalized, alias)) {
+                return false;
+            }
+        }
+        return containsComparisonOperator(normalized);
+    }
+
+    private String stripXmlMarkup(String value) {
+        StringBuilder stripped = new StringBuilder(value.length());
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? value.length() : end + "-->".length();
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int end = value.indexOf("]]>", index + "<![CDATA[".length());
+                if (end < 0) {
+                    stripped.append(value, index + "<![CDATA[".length(), value.length());
+                    index = value.length();
+                } else {
+                    stripped.append(value, index + "<![CDATA[".length(), end);
+                    index = end + "]]>".length();
+                }
+            } else if (value.charAt(index) == '<') {
+                int end = findXmlTagEnd(value, index);
+                index = end < 0 ? value.length() : end + 1;
+                stripped.append(' ');
+            } else {
+                stripped.append(value.charAt(index));
+                index++;
+            }
+        }
+        return stripped.toString();
+    }
+
+    private boolean containsComparisonOperator(String value) {
+        String view = sqlView(value).text();
+        if (view.contains("=") || view.contains(">") || view.contains("<")) {
+            return true;
+        }
+        return containsKeyword(view, "IN")
+                || containsKeyword(view, "LIKE")
+                || containsKeyword(view, "IS");
+    }
+
+    private String joinHavingConditions(List<String> conditions, String originalHavingContent) {
+        if (conditions.isEmpty()) {
+            return "";
+        }
+        String indent = indentationOfFirstContentLine(originalHavingContent);
+        StringBuilder joined = new StringBuilder();
+        for (int i = 0; i < conditions.size(); i++) {
+            String condition = removeLeadingBooleanConnector(conditions.get(i)).strip();
+            if (condition.isBlank()) {
+                continue;
+            }
+            if (joined.isEmpty()) {
+                joined.append("\n").append(indent).append(condition);
+            } else {
+                joined.append("\n").append(indent).append("AND ").append(condition);
+            }
+        }
+        return joined.toString();
+    }
+
+    private String joinMovedConditions(List<String> conditions, boolean prefixAnd) {
+        StringBuilder joined = new StringBuilder();
+        for (String condition : conditions) {
+            String normalized = removeLeadingBooleanConnector(condition).strip();
+            if (normalized.isBlank()) {
+                continue;
+            }
+            if (!joined.isEmpty()) {
+                joined.append("\nand ");
+            } else if (prefixAnd) {
+                joined.append("and ");
+            }
+            joined.append(normalized);
+        }
+        return joined.toString();
+    }
+
+    private String insertMovedHavingConditions(
+            String body,
+            SelectScope originalScope,
+            String movedConditions
+    ) {
+        SqlView currentView = sqlView(body);
+        List<SelectScope> scopes = selectScopes(currentView.text());
+        SelectScope scope = matchingScope(scopes, originalScope.selectIndex());
+        if (scope == null || scope.groupIndex() < 0) {
+            return body;
+        }
+        MyBatisWhereBlock whereBlock = findMyBatisWhereBlock(body, scope.fromIndex(), scope.groupIndex());
+        if (whereBlock != null) {
+            String indent = indentationOfLastLine(body.substring(0, whereBlock.closingStart()));
+            String insertion = "\n" + indent + indentBlock(joinMovedConditions(List.of(movedConditions), true), indent);
+            return body.substring(0, whereBlock.closingStart())
+                    + insertion
+                    + body.substring(whereBlock.closingStart());
+        }
+
+        int whereIndex = findTopLevelKeyword(currentView.text(), "WHERE", scope.fromIndex(), scope.groupIndex(), scope.depth());
+        if (whereIndex >= 0) {
+            String indent = indentationOfLastLine(body.substring(0, scope.groupIndex()));
+            String insertion = "\n" + indent + indentBlock(joinMovedConditions(List.of(movedConditions), true), indent);
+            return body.substring(0, scope.groupIndex())
+                    + insertion
+                    + body.substring(scope.groupIndex());
+        }
+
+        String groupIndent = indentationOfLastLine(body.substring(0, scope.groupIndex()));
+        String conditionIndent = groupIndent + "    ";
+        String insertion = "\n"
+                + groupIndent
+                + "WHERE\n"
+                + conditionIndent
+                + indentBlock(removeLeadingBooleanConnector(movedConditions).strip(), conditionIndent);
+        return body.substring(0, scope.groupIndex()) + insertion + "\n" + groupIndent + body.substring(scope.groupIndex());
+    }
+
+    private SelectScope matchingScope(List<SelectScope> scopes, int originalSelectIndex) {
+        for (SelectScope scope : scopes) {
+            if (scope.selectIndex() == originalSelectIndex) {
+                return scope;
+            }
+        }
+        return null;
+    }
+
+    private String indentBlock(String block, String indent) {
+        String[] lines = block.split("\\R", -1);
+        StringBuilder indented = new StringBuilder(block.length() + lines.length * indent.length());
+        for (int i = 0; i < lines.length; i++) {
+            if (i > 0) {
+                indented.append("\n").append(indent);
+            }
+            indented.append(lines[i].stripTrailing());
+        }
+        return indented.toString();
+    }
+
+    private String indentationOfFirstContentLine(String value) {
+        String[] lines = value.split("\\R", -1);
+        for (String line : lines) {
+            if (!line.isBlank()) {
+                return indentationOfLine(line);
+            }
+        }
+        return indentationOfLastLine(value);
+    }
+
+    private String indentationOfLine(String line) {
+        int index = 0;
+        while (index < line.length() && Character.isWhitespace(line.charAt(index))) {
+            index++;
+        }
+        return line.substring(0, index);
+    }
+
+    private String removeLeadingBooleanConnector(String value) {
+        String stripped = value == null ? "" : value.stripLeading();
+        if (startsWithKeyword(stripped, "AND")) {
+            return stripped.substring("AND".length()).stripLeading();
+        }
+        if (startsWithKeyword(stripped, "OR")) {
+            return stripped.substring("OR".length()).stripLeading();
+        }
+        return stripped;
+    }
+
+    private MyBatisWhereBlock findMyBatisWhereBlock(String body, int start, int end) {
+        int index = start;
+        while (index >= 0 && index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                return null;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && "where".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "where", end);
+                if (closingStart < 0) {
+                    return null;
+                }
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                return new MyBatisWhereBlock(tagStart, tag.endIndex(), closingStart, closingEnd < 0 ? closingStart : closingEnd + 1);
+            }
+            index = tag.endIndex();
+        }
+        return null;
+    }
+
+    private int findClosingTag(String body, int start, String tagName, int end) {
+        int index = start;
+        int depth = 1;
+        while (index >= 0 && index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                return -1;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (tagName.equalsIgnoreCase(tag.name())) {
+                if (tag.closing()) {
+                    depth--;
+                    if (depth == 0) {
+                        return tagStart;
+                    }
+                } else if (!tag.selfClosing()) {
+                    depth++;
+                }
+            }
+            index = tag.endIndex();
+        }
+        return -1;
+    }
+
+    private TrimBlock firstHavingTrimBlock(String body, int start, int end) {
+        int index = start;
+        while (index >= 0 && index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                return null;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && "trim".equalsIgnoreCase(tag.name())) {
+                String prefix = xmlAttribute(body.substring(tagStart, tag.endIndex()), "prefix");
+                if ("HAVING".equalsIgnoreCase(prefix)) {
+                    int closingStart = findClosingTag(body, tag.endIndex(), "trim", end);
+                    if (closingStart < 0) {
+                        return null;
+                    }
+                    int closingEnd = body.indexOf('>', closingStart + 1);
+                    return new TrimBlock(tagStart, tag.endIndex(), closingStart, closingEnd < 0 ? closingStart : closingEnd + 1);
+                }
+            }
+            index = tag.endIndex();
+        }
+        return null;
+    }
+
+    private TextRewrite replaceAggregateAliases(String value, Map<String, String> aggregateAliases) {
+        if (aggregateAliases.isEmpty()) {
+            return new TextRewrite(value, false);
+        }
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? value.length() : end + "-->".length();
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int end = value.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? value.length() : end + "]]>".length();
+            } else if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (isIdentifierStart(value.charAt(index))) {
+                IdentifierToken token = readIdentifierToken(value, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                String expression = aggregateAliases.get(identifierKey(token.text()));
+                char previous = previousNonWhitespace(value, index);
+                if (expression != null && previous != '.' && previous != '(') {
+                    replacements.add(new TextReplacement(index, token.endIndex(), "(" + expression + ")"));
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(value, replacements);
+    }
+
+    private TextRewrite applyTextReplacements(String value, List<TextReplacement> replacements) {
+        if (replacements.isEmpty()) {
+            return new TextRewrite(value, false);
+        }
+        StringBuilder converted = new StringBuilder(value.length());
+        int index = 0;
+        for (TextReplacement replacement : replacements) {
+            converted.append(value, index, replacement.startIndex());
+            converted.append(replacement.replacement());
+            index = replacement.endIndex();
+        }
+        converted.append(value, index, value.length());
+        return new TextRewrite(converted.toString(), true);
+    }
+
+    private Map<String, String> aggregateSelectAliases(String selectList) {
+        Map<String, String> aliases = new LinkedHashMap<>();
+        for (String item : splitTopLevelComma(selectList)) {
+            AggregateAlias aggregateAlias = aggregateSelectAlias(item);
+            if (aggregateAlias != null) {
+                aliases.putIfAbsent(identifierKey(aggregateAlias.alias()), aggregateAlias.expression());
+            }
+        }
+        return aliases;
+    }
+
+    private AggregateAlias aggregateSelectAlias(String selectItem) {
+        String trimmed = selectItem == null ? "" : selectItem.trim();
+        if (trimmed.isBlank() || trimmed.contains("<")) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?is)^(.+?)\\s+(?:AS\\s+)?(" + DM_IDENTIFIER + ")\\s*$")
+                .matcher(trimmed);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String expression = matcher.group(1).trim();
+        String alias = matcher.group(2).trim();
+        if (expression.isBlank()
+                || alias.isBlank()
+                || isSqlClauseKeyword(alias)
+                || !containsAggregateFunction(expression)) {
+            return null;
+        }
+        return new AggregateAlias(expression, alias);
+    }
+
+    private boolean containsAggregateFunction(String value) {
+        int index = 0;
+        while (index < value.length()) {
+            if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (isIdentifierStart(value.charAt(index))) {
+                IdentifierToken token = readIdentifierToken(value, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                int afterToken = skipWhitespace(value, token.endIndex());
+                if (afterToken < value.length()
+                        && value.charAt(afterToken) == '('
+                        && AGGREGATE_FUNCTIONS.contains(unquoteIdentifier(token.text()).toUpperCase())) {
+                    return true;
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private List<SelectScope> selectScopes(String view) {
+        List<SelectScope> scopes = new ArrayList<>();
+        int depth = 0;
+        int index = 0;
+        while (index < view.length()) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (isKeywordAt(view, index, "SELECT")) {
+                int fromIndex = findTopLevelKeyword(view, "FROM", index + "SELECT".length(), view.length(), depth);
+                if (fromIndex >= 0) {
+                    int scopeEnd = findSelectEnd(view, fromIndex + "FROM".length(), depth);
+                    int groupIndex = findTopLevelGroupBy(view, fromIndex + "FROM".length(), scopeEnd, depth);
+                    int havingIndex = groupIndex < 0
+                            ? -1
+                            : findTopLevelKeyword(view, "HAVING", groupIndex + "GROUP".length(), scopeEnd, depth);
+                    int havingEnd = havingIndex < 0
+                            ? -1
+                            : findClauseEnd(view, havingIndex + "HAVING".length(), scopeEnd, depth);
+                    scopes.add(new SelectScope(index, fromIndex, groupIndex, havingIndex, havingEnd, scopeEnd, depth));
+                }
+                index += "SELECT".length();
+            } else {
+                index++;
+            }
+        }
+        return scopes;
+    }
+
+    private int findSelectEnd(String view, int start, int targetDepth) {
+        int depth = depthAt(view, start);
+        int index = start;
+        while (index < view.length()) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth == targetDepth) {
+                    return index;
+                }
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == targetDepth && isKeywordAt(view, index, "UNION")) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return view.length();
+    }
+
+    private int findClauseEnd(String view, int start, int end, int targetDepth) {
+        int depth = depthAt(view, start);
+        int index = start;
+        while (index < end) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth == targetDepth) {
+                    return index;
+                }
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == targetDepth
+                    && (isKeywordAt(view, index, "ORDER")
+                    || isKeywordAt(view, index, "LIMIT")
+                    || isKeywordAt(view, index, "OFFSET")
+                    || isKeywordAt(view, index, "FETCH")
+                    || isKeywordAt(view, index, "UNION"))) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return end;
+    }
+
+    private int findTopLevelKeyword(String view, String keyword, int start, int end, int targetDepth) {
+        int depth = depthAt(view, start);
+        int index = start;
+        while (index < end) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == targetDepth && isKeywordAt(view, index, keyword)) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private int findTopLevelGroupBy(String view, int start, int end, int targetDepth) {
+        int depth = depthAt(view, start);
+        int index = start;
+        while (index < end) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == targetDepth && isKeywordAt(view, index, "GROUP")) {
+                int afterGroup = skipWhitespace(view, index + "GROUP".length());
+                if (isKeywordAt(view, afterGroup, "BY")) {
+                    return index;
+                }
+                index += "GROUP".length();
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private int depthAt(String view, int end) {
+        int depth = 0;
+        int index = 0;
+        while (index < end && index < view.length()) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+            } else if (current == ')' && depth > 0) {
+                depth--;
+            }
+            index++;
+        }
+        return depth;
+    }
+
+    private SqlView sqlView(String value) {
+        char[] chars = value.toCharArray();
+        int index = 0;
+        while (index < chars.length) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                int next = end < 0 ? chars.length : end + "-->".length();
+                maskRange(chars, index, next);
+                index = next;
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int contentStart = index + "<![CDATA[".length();
+                int end = value.indexOf("]]>", contentStart);
+                maskRange(chars, index, contentStart);
+                if (end < 0) {
+                    index = chars.length;
+                } else {
+                    maskRange(chars, end, end + "]]>".length());
+                    index = end + "]]>".length();
+                }
+            } else if (value.startsWith("--", index)) {
+                int end = value.indexOf('\n', index + 2);
+                int next = end < 0 ? chars.length : end;
+                maskRange(chars, index, next);
+                index = next;
+            } else if (value.startsWith("/*", index)) {
+                int end = value.indexOf("*/", index + 2);
+                int next = end < 0 ? chars.length : end + 2;
+                maskRange(chars, index, next);
+                index = next;
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                int next = skipMyBatisPlaceholder(value, index);
+                maskRange(chars, index, next);
+                index = next;
+            } else if (chars[index] == '\'' || chars[index] == '"') {
+                int next = skipQuoted(value, index, chars[index]);
+                maskRange(chars, index, next);
+                index = next;
+            } else if (chars[index] == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                if (tag == null) {
+                    index++;
+                } else {
+                    maskRange(chars, index, tag.endIndex());
+                    index = tag.endIndex();
+                }
+            } else {
+                index++;
+            }
+        }
+        return new SqlView(new String(chars));
+    }
+
+    private void maskRange(char[] chars, int start, int end) {
+        for (int i = start; i < end && i < chars.length; i++) {
+            if (chars[i] != '\n' && chars[i] != '\r') {
+                chars[i] = ' ';
+            }
+        }
+    }
+
+    private XmlTag readXmlTag(String value, int start) {
+        if (start >= value.length() || value.charAt(start) != '<') {
+            return null;
+        }
+        if (value.startsWith("<!--", start) || value.startsWith("<![CDATA[", start)) {
+            return null;
+        }
+        int end = findXmlTagEnd(value, start);
+        if (end < 0) {
+            return null;
+        }
+        int nameStart = start + 1;
+        boolean closing = false;
+        if (nameStart < end && value.charAt(nameStart) == '/') {
+            closing = true;
+            nameStart++;
+        }
+        while (nameStart < end && Character.isWhitespace(value.charAt(nameStart))) {
+            nameStart++;
+        }
+        int nameEnd = nameStart;
+        while (nameEnd < end) {
+            char current = value.charAt(nameEnd);
+            if (!Character.isLetterOrDigit(current) && current != '_' && current != '-') {
+                break;
+            }
+            nameEnd++;
+        }
+        if (nameEnd == nameStart) {
+            return null;
+        }
+        String tagText = value.substring(start, end + 1).stripTrailing();
+        return new XmlTag(
+                value.substring(nameStart, nameEnd),
+                closing,
+                tagText.endsWith("/>"),
+                end + 1
+        );
+    }
+
+    private int findXmlTagEnd(String value, int start) {
+        char quote = '\0';
+        int index = start + 1;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (quote != '\0') {
+                if (current == quote) {
+                    quote = '\0';
+                }
+            } else if (current == '\'' || current == '"') {
+                quote = current;
+            } else if (current == '>') {
+                return index;
+            }
+            index++;
+        }
+        return -1;
+    }
+
+    private boolean containsKeyword(String value, String keyword) {
+        int index = 0;
+        while (index < value.length()) {
+            if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (isKeywordAt(value, index, keyword)) {
+                return true;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private boolean startsWithKeyword(String value, String keyword) {
+        return isKeywordAt(value, 0, keyword);
+    }
+
+    private boolean isKeywordAt(String value, int index, String keyword) {
+        if (index < 0 || index + keyword.length() > value.length()) {
+            return false;
+        }
+        if (!value.regionMatches(true, index, keyword, 0, keyword.length())) {
+            return false;
+        }
+        int before = index - 1;
+        int after = index + keyword.length();
+        return (before < 0 || !isIdentifierPart(value.charAt(before)))
+                && (after >= value.length() || !isIdentifierPart(value.charAt(after)));
+    }
+
+    private IdentifierToken readIdentifierToken(String value, int start) {
+        if (start >= value.length()) {
+            return null;
+        }
+        char current = value.charAt(start);
+        if (current == '"' || current == '`') {
+            int end = skipQuoted(value, start, current);
+            if (end <= start + 1 || end > value.length()) {
+                return null;
+            }
+            return new IdentifierToken(value.substring(start, end), end);
+        }
+        if (!isIdentifierStart(current)) {
+            return null;
+        }
+        int index = start + 1;
+        while (index < value.length() && isIdentifierPart(value.charAt(index))) {
+            index++;
+        }
+        return new IdentifierToken(value.substring(start, index), index);
+    }
+
+    private boolean isIdentifierStart(char current) {
+        return Character.isLetter(current) || current == '_';
+    }
+
+    private boolean isIdentifierPart(char current) {
+        return Character.isLetterOrDigit(current) || current == '_' || current == '$';
+    }
+
+    private char previousNonWhitespace(String value, int index) {
+        int previous = index - 1;
+        while (previous >= 0 && Character.isWhitespace(value.charAt(previous))) {
+            previous--;
+        }
+        return previous < 0 ? '\0' : value.charAt(previous);
+    }
+
+    private int skipWhitespace(String value, int index) {
+        int current = index;
+        while (current < value.length() && Character.isWhitespace(value.charAt(current))) {
+            current++;
+        }
+        return current;
+    }
+
+    private String identifierKey(String identifier) {
+        return unquoteIdentifier(identifier).toLowerCase();
+    }
+
+    private boolean isSqlClauseKeyword(String value) {
+        return Set.of(
+                "FROM",
+                "WHERE",
+                "GROUP",
+                "HAVING",
+                "ORDER",
+                "LIMIT",
+                "OFFSET",
+                "FETCH",
+                "UNION",
+                "JOIN",
+                "ON"
+        ).contains(unquoteIdentifier(value).toUpperCase());
     }
 
     private String convertForeachOnDuplicateKeyUpdate(
@@ -1057,7 +2015,7 @@ public class MapperXmlRewriter {
             } else if (startsMyBatisPlaceholder(value, index)) {
                 index = skipMyBatisPlaceholder(value, index);
             } else if (current == '<') {
-                int tagEnd = value.indexOf('>', index + 1);
+                int tagEnd = findXmlTagEnd(value, index);
                 index = tagEnd < 0 ? value.length() : tagEnd + 1;
             } else if (current == '(') {
                 depth++;
@@ -1104,7 +2062,7 @@ public class MapperXmlRewriter {
             } else if (startsMyBatisPlaceholder(value, index)) {
                 index = skipMyBatisPlaceholder(value, index);
             } else if (current == '<') {
-                int tagEnd = value.indexOf('>', index + 1);
+                int tagEnd = findXmlTagEnd(value, index);
                 index = tagEnd < 0 ? value.length() : tagEnd + 1;
             } else if (current == '(') {
                 depth++;
@@ -1435,6 +2393,68 @@ public class MapperXmlRewriter {
         private String toXml() {
             return openingWithSeparator(separator) + body + "</foreach>";
         }
+    }
+
+    private record DynamicHavingConversion(
+            String originalBody,
+            String convertedBody,
+            List<String> appliedRules,
+            boolean changed
+    ) {
+        DynamicHavingConversion {
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+        }
+    }
+
+    private record ScopeHavingConversion(String convertedBody, List<String> appliedRules, boolean changed) {
+        ScopeHavingConversion {
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+        }
+
+        private static ScopeHavingConversion unchanged(String body) {
+            return new ScopeHavingConversion(body, List.of(), false);
+        }
+    }
+
+    private record SelectScope(
+            int selectIndex,
+            int fromIndex,
+            int groupIndex,
+            int havingIndex,
+            int havingEnd,
+            int scopeEnd,
+            int depth
+    ) {
+    }
+
+    private record SqlView(String text) {
+    }
+
+    private record TrimBlock(int openingStart, int contentStart, int contentEnd, int closingEnd) {
+    }
+
+    private record MyBatisWhereBlock(int openingStart, int openingEnd, int closingStart, int closingEnd) {
+    }
+
+    private record HavingRewrite(String remainingHaving, String movedConditions, boolean changed) {
+    }
+
+    private record ConditionPart(String text) {
+    }
+
+    private record TextRewrite(String text, boolean changed) {
+    }
+
+    private record TextReplacement(int startIndex, int endIndex, String replacement) {
+    }
+
+    private record AggregateAlias(String expression, String alias) {
+    }
+
+    private record IdentifierToken(String text, int endIndex) {
+    }
+
+    private record XmlTag(String name, boolean closing, boolean selfClosing, int endIndex) {
     }
 
     private record StatementReplacement(String tagName, String statementId, String convertedSql, String convertedBody) {
