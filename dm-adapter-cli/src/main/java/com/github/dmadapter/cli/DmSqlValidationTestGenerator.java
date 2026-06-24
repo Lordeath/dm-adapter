@@ -51,7 +51,7 @@ class DmSqlValidationTestGenerator {
 
         List<FileChange> fileChanges = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
-        writeIfMissing(
+        writeGeneratedFile(
                 actualConfigPath,
                 configTemplate(
                         mapperStatements,
@@ -60,7 +60,7 @@ class DmSqlValidationTestGenerator {
                 ),
                 "Generate Dameng SQL validation parameter configuration",
                 fileChanges,
-                warnings
+                true
         );
         writeGeneratedFile(
                 testTarget.path(),
@@ -201,26 +201,6 @@ class DmSqlValidationTestGenerator {
     }
 
     private record GeneratedTestTarget(Path path, String packageName) {
-    }
-
-    private void writeIfMissing(
-            Path path,
-            String content,
-            String description,
-            List<FileChange> fileChanges,
-            List<String> warnings
-    ) {
-        if (Files.exists(path)) {
-            warnings.add("Skipped generation because file already exists: " + path);
-            return;
-        }
-        try {
-            Files.createDirectories(path.getParent());
-            Files.writeString(path, content, StandardCharsets.UTF_8);
-            fileChanges.add(FileChange.applied(path.toString(), "CREATE", description));
-        } catch (IOException e) {
-            throw new DmAdapterException("Failed to write generated file: " + path, e);
-        }
     }
 
     private void writeGeneratedFile(
