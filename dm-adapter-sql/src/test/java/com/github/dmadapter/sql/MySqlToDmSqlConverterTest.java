@@ -494,6 +494,52 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsNotFindInSetToEqualsZero() {
+        SqlConversionResult result = converter.convert("""
+                select orderNo, group_concat(callStatus) allCallStatus
+                from ns_bill_order_pay_info
+                group by orderNo
+                having !find_in_set('1', allCallStatus)
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select orderNo, LISTAGG(callStatus, ',') WITHIN GROUP (ORDER BY callStatus) allCallStatus
+                from ns_bill_order_pay_info
+                group by orderNo
+                having find_in_set('1', (LISTAGG(callStatus, ',') WITHIN GROUP (ORDER BY callStatus))) = 0
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE,
+                        MySqlToDmSqlConverter.MYSQL_HAVING_AGGREGATE_ALIAS_RULE,
+                        MySqlToDmSqlConverter.MYSQL_NOT_FIND_IN_SET_RULE
+                );
+    }
+
+    @Test
+    void convertsNotFindInSetOutsideHavingWithoutChangingCommentsOrStrings() {
+        String sql = """
+                select * from bill
+                where ! FIND_IN_SET(#{status}, status_list)
+                  and note = '!find_in_set(1, x)'
+                  -- !find_in_set(1, x)
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select * from bill
+                where FIND_IN_SET(#{status}, status_list) = 0
+                  and note = '!find_in_set(1, x)'
+                  -- !find_in_set(1, x)
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_NOT_FIND_IN_SET_RULE);
+    }
+
+    @Test
     void convertsBacktickQuotedHavingAggregateAliasWithoutChangingStringLiterals() {
         SqlConversionResult result = converter.convert("""
                 select SUM(amount) AS `totalAmount`, item_id

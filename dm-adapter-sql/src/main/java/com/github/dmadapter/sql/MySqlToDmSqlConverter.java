@@ -27,6 +27,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
     public static final String MYSQL_HAVING_AGGREGATE_ALIAS_RULE = "MYSQL_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
+    public static final String MYSQL_NOT_FIND_IN_SET_RULE = "MYSQL_NOT_FIND_IN_SET_TO_EQUALS_ZERO";
     public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
             "MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN";
     public static final String MYSQL_IMPLICIT_CROSS_JOIN_RULE = "MYSQL_IMPLICIT_CROSS_JOIN_TO_DM";
@@ -366,6 +367,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (havingAggregateAliasConversion.changed()) {
             converted = havingAggregateAliasConversion.convertedSql();
             rules.add(MYSQL_HAVING_AGGREGATE_ALIAS_RULE);
+        }
+
+        GenericConversion notFindInSetConversion = convertNotFindInSet(converted);
+        if (notFindInSetConversion.changed()) {
+            converted = notFindInSetConversion.convertedSql();
+            rules.add(MYSQL_NOT_FIND_IN_SET_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -2640,6 +2647,41 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return false;
+    }
+
+    private GenericConversion convertNotFindInSet(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (current == '!') {
+                int functionStart = skipWhitespace(sql, index + 1);
+                FunctionCall functionCall = readFunctionCall(sql, functionStart, "FIND_IN_SET");
+                if (functionCall == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(sql, functionStart, functionCall.endIndex()).append(" = 0");
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
     private int firstTopLevelKeyword(String sql, int start, String... keywords) {
