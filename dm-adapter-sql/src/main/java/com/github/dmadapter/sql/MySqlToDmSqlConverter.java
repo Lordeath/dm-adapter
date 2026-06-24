@@ -3,8 +3,10 @@ package com.github.dmadapter.sql;
 import com.github.dmadapter.core.SqlConversionResult;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -24,6 +26,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
+    public static final String MYSQL_HAVING_AGGREGATE_ALIAS_RULE = "MYSQL_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
             "MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN";
     public static final String MYSQL_IMPLICIT_CROSS_JOIN_RULE = "MYSQL_IMPLICIT_CROSS_JOIN_TO_DM";
@@ -357,6 +360,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (groupConcatConversion.changed()) {
             converted = groupConcatConversion.convertedSql();
             rules.add(MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+        }
+
+        GenericConversion havingAggregateAliasConversion = convertHavingAggregateAliases(converted);
+        if (havingAggregateAliasConversion.changed()) {
+            converted = havingAggregateAliasConversion.convertedSql();
+            rules.add(MYSQL_HAVING_AGGREGATE_ALIAS_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -2508,6 +2517,142 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return identifier;
     }
 
+    private GenericConversion convertHavingAggregateAliases(String sql) {
+        int selectIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, selectIndex, "SELECT")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int fromIndex = findTopLevelKeyword(sql, "FROM", selectIndex + "SELECT".length());
+        if (fromIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int havingIndex = findTopLevelKeyword(sql, "HAVING", fromIndex + "FROM".length());
+        if (havingIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        Map<String, String> aggregateAliases = aggregateSelectAliases(
+                sql.substring(selectIndex + "SELECT".length(), fromIndex)
+        );
+        if (aggregateAliases.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        int havingStart = havingIndex + "HAVING".length();
+        int havingEnd = firstTopLevelKeyword(
+                sql,
+                havingStart,
+                "ORDER",
+                "LIMIT",
+                "OFFSET",
+                "FETCH",
+                "UNION"
+        );
+        if (havingEnd < 0) {
+            havingEnd = sql.length();
+        }
+
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = havingStart;
+        while (index < havingEnd) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '"' || isIdentifierStart(current)) {
+                IdentifierToken token = readIdentifierToken(sql, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                String expression = aggregateAliases.get(identifierKey(token.text()));
+                if (expression != null && previousNonWhitespace(sql, index) != '.') {
+                    replacements.add(new TextReplacement(index, token.endIndex(), "(" + expression + ")"));
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(sql, replacements);
+    }
+
+    private Map<String, String> aggregateSelectAliases(String selectList) {
+        Map<String, String> aliases = new LinkedHashMap<>();
+        for (TopLevelArgument item : splitTopLevelArguments(selectList)) {
+            AggregateAlias aggregateAlias = aggregateSelectAlias(item.text());
+            if (aggregateAlias != null) {
+                aliases.putIfAbsent(identifierKey(aggregateAlias.alias()), aggregateAlias.expression());
+            }
+        }
+        return aliases;
+    }
+
+    private AggregateAlias aggregateSelectAlias(String selectItem) {
+        String trimmed = selectItem == null ? "" : selectItem.trim();
+        if (trimmed.isBlank()) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?is)^(.+?)\\s+(?:AS\\s+)?(" + DM_IDENTIFIER + ")\\s*$")
+                .matcher(trimmed);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String expression = matcher.group(1).trim();
+        String alias = matcher.group(2).trim();
+        if (expression.isBlank() || alias.isBlank() || isSqlClauseKeyword(alias)) {
+            return null;
+        }
+        if (!containsAggregateFunction(expression)) {
+            return null;
+        }
+        return new AggregateAlias(expression, alias);
+    }
+
+    private boolean containsAggregateFunction(String sql) {
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsFunction(sql, index, "SUM")
+                    || startsFunction(sql, index, "COUNT")
+                    || startsFunction(sql, index, "AVG")
+                    || startsFunction(sql, index, "MIN")
+                    || startsFunction(sql, index, "MAX")
+                    || startsFunction(sql, index, "LISTAGG")) {
+                return true;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private int firstTopLevelKeyword(String sql, int start, String... keywords) {
+        int result = -1;
+        for (String keyword : keywords) {
+            int index = findTopLevelKeyword(sql, keyword, start);
+            if (index >= 0 && (result < 0 || index < result)) {
+                result = index;
+            }
+        }
+        return result;
+    }
+
     private GenericConversion convertGroupConcat(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
@@ -3517,6 +3662,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record IdentifierName(String text, String key) {
+    }
+
+    private record AggregateAlias(String expression, String alias) {
     }
 
     private record InsertColumn(IdentifierName name, String value) {

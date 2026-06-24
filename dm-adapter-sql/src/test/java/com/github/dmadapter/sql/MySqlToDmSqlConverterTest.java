@@ -472,6 +472,73 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsHavingAggregateAliasToAggregateExpression() {
+        SqlConversionResult result = converter.convert("""
+                select sum(invoicedFee-checkFee) offAmount,ChargeItemName,ChargeItemID,taxRate
+                from ns_develop_vacancy_detail
+                where deleteFlag = 0
+                GROUP BY ChargeItemID,taxRate
+                Having offAmount > 0
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select sum(invoicedFee-checkFee) offAmount,ChargeItemName,ChargeItemID,taxRate
+                from ns_develop_vacancy_detail
+                where deleteFlag = 0
+                GROUP BY ChargeItemID,taxRate
+                Having (sum(invoicedFee-checkFee)) > 0
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_HAVING_AGGREGATE_ALIAS_RULE);
+    }
+
+    @Test
+    void convertsBacktickQuotedHavingAggregateAliasWithoutChangingStringLiterals() {
+        SqlConversionResult result = converter.convert("""
+                select SUM(amount) AS `totalAmount`, item_id
+                from bill
+                group by item_id
+                having `totalAmount` > 0 and remark <> 'totalAmount'
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select SUM(amount) AS totalAmount, item_id
+                from bill
+                group by item_id
+                having (SUM(amount)) > 0 and remark <> 'totalAmount'
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                        MySqlToDmSqlConverter.MYSQL_HAVING_AGGREGATE_ALIAS_RULE
+                );
+    }
+
+    @Test
+    void doesNotConvertNonAggregateHavingAliasOrNestedSelectAlias() {
+        String nonAggregateAlias = """
+                select amount offAmount, item_id
+                from bill
+                group by amount, item_id
+                having offAmount > 0
+                """;
+        String nestedHavingAlias = """
+                select *
+                from (
+                    select sum(amount) offAmount, item_id
+                    from bill
+                    group by item_id
+                    having offAmount > 0
+                ) t
+                """;
+
+        assertThat(converter.convert(nonAggregateAlias).changed()).isFalse();
+        assertThat(converter.convert(nestedHavingAlias).changed()).isFalse();
+    }
+
+    @Test
     void keepsSafeConversionsWhenRemainingSqlNeedsManualReview() {
         SqlConversionResult result = converter.convert(
                 "select `user`, JSON_SET(payload, '$.name', 'x') from audit_log limit 1"
