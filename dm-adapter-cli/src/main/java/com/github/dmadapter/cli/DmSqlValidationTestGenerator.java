@@ -631,7 +631,12 @@ class DmSqlValidationTestGenerator {
                                 for (ParameterResolution parameters : parameterVariants) {
                                     String recordKey = parameters.recordKey(mapperMethod.key());
                                     if (!parameters.resolved) {
-                                        ValidationRecord record = ValidationRecord.skipped(recordKey, parameters.source, parameters.message);
+                                        ValidationRecord record = ValidationRecord.skipped(
+                                                recordKey,
+                                                parameters.source,
+                                                parametersSummary(parameters),
+                                                parameters.message
+                                        );
                                         records.add(record);
                                         logProgress(index, total, record, 0L);
                                         continue;
@@ -1350,16 +1355,36 @@ class DmSqlValidationTestGenerator {
                                     ? invokeMappedStatement(sqlSession, mapperMethod, parameters.args.length == 0 ? null : parameters.args[0])
                                     : invokeReflectively(sqlSession, mapperMethod, parameters.args);
                             sqlSession.rollback(true);
-                            return ValidationRecord.passed(parameters.recordKey(mapperMethod.key()), parameters.source, resultSummary(result));
+                            return ValidationRecord.passed(
+                                    parameters.recordKey(mapperMethod.key()),
+                                    parameters.source,
+                                    parametersSummary(parameters),
+                                    resultSummary(result)
+                            );
                         } catch (MapperInvocationException e) {
                             sqlSession.rollback(true);
-                            return ValidationRecord.failed(parameters.recordKey(mapperMethod.key()), parameters.source, throwableSummary(e.getCause()));
+                            return ValidationRecord.failed(
+                                    parameters.recordKey(mapperMethod.key()),
+                                    parameters.source,
+                                    parametersSummary(parameters),
+                                    throwableSummary(e.getCause())
+                            );
                         } catch (Throwable e) {
                             sqlSession.rollback(true);
-                            return ValidationRecord.failed(parameters.recordKey(mapperMethod.key()), parameters.source, throwableSummary(e));
+                            return ValidationRecord.failed(
+                                    parameters.recordKey(mapperMethod.key()),
+                                    parameters.source,
+                                    parametersSummary(parameters),
+                                    throwableSummary(e)
+                            );
                         }
                     } catch (Throwable e) {
-                        return ValidationRecord.failed(parameters.recordKey(mapperMethod.key()), parameters.source, throwableSummary(e));
+                        return ValidationRecord.failed(
+                                parameters.recordKey(mapperMethod.key()),
+                                parameters.source,
+                                parametersSummary(parameters),
+                                throwableSummary(e)
+                        );
                     }
                 }
 
@@ -1860,14 +1885,15 @@ class DmSqlValidationTestGenerator {
                     appendSchemaObjectSummary(markdown, records);
                     appendSuggestedNextActions(markdown, records);
                     markdown.append("## Results\\n\\n");
-                    markdown.append("| Status | Category | Pattern | Mapper Method | Parameter Source | Summary | Hint |\\n");
-                    markdown.append("| --- | --- | --- | --- | --- | --- | --- |\\n");
+                    markdown.append("| Status | Category | Pattern | Mapper Method | Parameter Source | Parameters | Summary | Hint |\\n");
+                    markdown.append("| --- | --- | --- | --- | --- | --- | --- | --- |\\n");
                     for (ValidationRecord record : records) {
                         markdown.append("| ").append(record.status)
                                 .append(" | ").append(escapeMarkdown(category(record)))
                                 .append(" | ").append(escapeMarkdown(failurePattern(record)))
                                 .append(" | `").append(escapeMarkdown(record.key)).append("`")
                                 .append(" | ").append(escapeMarkdown(record.parameterSource))
+                                .append(" | ").append(escapeMarkdown(abbreviate(record.parameterSummary, 240)))
                                 .append(" | ").append(escapeMarkdown(summary(record)))
                                 .append(" | ").append(escapeMarkdown(hint(record)))
                                 .append(" |\\n");
@@ -2094,6 +2120,11 @@ class DmSqlValidationTestGenerator {
                                 .append(" - ")
                                 .append(escapeHtml(record.key))
                                 .append("</summary>\\n\\n");
+                        if (record.parameterSummary != null && !record.parameterSummary.isBlank()) {
+                            markdown.append("Parameters: `")
+                                    .append(escapeMarkdown(record.parameterSummary))
+                                    .append("`\\n\\n");
+                        }
                         markdown.append("```text\\n")
                                 .append(escapeCodeBlock(abbreviate(record.message, 4000)))
                                 .append("\\n```\\n\\n");
@@ -2129,6 +2160,7 @@ class DmSqlValidationTestGenerator {
                                 .append("\\"failurePattern\\": \\"").append(escapeJson(failurePattern(record))).append("\\", ")
                                 .append("\\"key\\": \\"").append(escapeJson(record.key)).append("\\", ")
                                 .append("\\"parameterSource\\": \\"").append(escapeJson(record.parameterSource)).append("\\", ")
+                                .append("\\"parameterSummary\\": \\"").append(escapeJson(record.parameterSummary)).append("\\", ")
                                 .append("\\"summary\\": \\"").append(escapeJson(summary(record))).append("\\", ")
                                 .append("\\"hint\\": \\"").append(escapeJson(hint(record))).append("\\", ")
                                 .append("\\"message\\": \\"").append(escapeJson(record.message)).append("\\"")
@@ -2560,6 +2592,147 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return false;
+                }
+
+                private String parametersSummary(ParameterResolution parameters) {
+                    if (parameters == null || !parameters.resolved || parameters.args == null || parameters.args.length == 0) {
+                        return "";
+                    }
+                    if (parameters.args.length == 1) {
+                        return valueSummary(parameters.args[0], 0, "arg0");
+                    }
+                    StringBuilder summary = new StringBuilder("[");
+                    for (int i = 0; i < parameters.args.length; i++) {
+                        if (i > 0) {
+                            summary.append(", ");
+                        }
+                        summary.append("arg").append(i).append("=").append(valueSummary(parameters.args[i], 0, "arg" + i));
+                    }
+                    return summary.append("]").toString();
+                }
+
+                private String valueSummary(Object value, int depth, String valueName) {
+                    if (isSensitiveName(valueName)) {
+                        return "<redacted>";
+                    }
+                    if (value == null) {
+                        return "null";
+                    }
+                    if (depth > 2) {
+                        return value.getClass().getSimpleName() + "{...}";
+                    }
+                    if (value instanceof CharSequence text) {
+                        return '"' + abbreviate(normalizeParameterText(text.toString()), 120) + '"';
+                    }
+                    if (value instanceof Number || value instanceof Boolean || value instanceof Enum<?>) {
+                        return String.valueOf(value);
+                    }
+                    if (value instanceof Date
+                            || value instanceof java.time.temporal.TemporalAccessor
+                            || value instanceof UUID) {
+                        return String.valueOf(value);
+                    }
+                    Class<?> valueType = value.getClass();
+                    if (valueType.isArray()) {
+                        int length = Array.getLength(value);
+                        StringBuilder summary = new StringBuilder("[");
+                        int limit = Math.min(length, 5);
+                        for (int i = 0; i < limit; i++) {
+                            if (i > 0) {
+                                summary.append(", ");
+                            }
+                            summary.append(valueSummary(Array.get(value, i), depth + 1, valueName));
+                        }
+                        if (length > limit) {
+                            summary.append(", ... ").append(length - limit).append(" more");
+                        }
+                        return summary.append("]").toString();
+                    }
+                    if (value instanceof Collection<?> collection) {
+                        StringBuilder summary = new StringBuilder("[");
+                        int index = 0;
+                        for (Object item : collection) {
+                            if (index >= 5) {
+                                summary.append(index == 0 ? "" : ", ").append("... ").append(collection.size() - index).append(" more");
+                                break;
+                            }
+                            if (index > 0) {
+                                summary.append(", ");
+                            }
+                            summary.append(valueSummary(item, depth + 1, valueName));
+                            index++;
+                        }
+                        return summary.append("]").toString();
+                    }
+                    if (value instanceof Map<?, ?> map) {
+                        StringBuilder summary = new StringBuilder("{");
+                        int index = 0;
+                        for (Map.Entry<?, ?> entry : map.entrySet()) {
+                            if (index >= 8) {
+                                summary.append(index == 0 ? "" : ", ").append("... ").append(map.size() - index).append(" more");
+                                break;
+                            }
+                            if (index > 0) {
+                                summary.append(", ");
+                            }
+                            String key = String.valueOf(entry.getKey());
+                            summary.append(key).append("=").append(valueSummary(entry.getValue(), depth + 1, key));
+                            index++;
+                        }
+                        return summary.append("}").toString();
+                    }
+                    if (valueType.getName().startsWith("java.")) {
+                        return abbreviate(normalizeParameterText(String.valueOf(value)), 160);
+                    }
+                    return pojoSummary(value, depth, valueName);
+                }
+
+                private String pojoSummary(Object value, int depth, String valueName) {
+                    StringBuilder summary = new StringBuilder(value.getClass().getSimpleName()).append("{");
+                    int count = 0;
+                    Class<?> currentType = value.getClass();
+                    while (currentType != null && !Object.class.equals(currentType) && count < 8) {
+                        for (Field field : currentType.getDeclaredFields()) {
+                            if (count >= 8) {
+                                break;
+                            }
+                            if (Modifier.isStatic(field.getModifiers())) {
+                                continue;
+                            }
+                            if (count > 0) {
+                                summary.append(", ");
+                            }
+                            summary.append(field.getName()).append("=");
+                            try {
+                                if (!field.canAccess(value)) {
+                                    field.setAccessible(true);
+                                }
+                                summary.append(valueSummary(field.get(value), depth + 1, field.getName()));
+                            } catch (Exception e) {
+                                summary.append("<unreadable>");
+                            }
+                            count++;
+                        }
+                        currentType = currentType.getSuperclass();
+                    }
+                    if (currentType != null && !Object.class.equals(currentType)) {
+                        summary.append(count == 0 ? "" : ", ").append("...");
+                    }
+                    return summary.append("}").toString();
+                }
+
+                private boolean isSensitiveName(String valueName) {
+                    String normalized = valueName == null ? "" : valueName.toLowerCase(Locale.ROOT);
+                    return normalized.contains("password")
+                            || normalized.contains("passwd")
+                            || normalized.contains("secret")
+                            || normalized.contains("token")
+                            || normalized.contains("credential")
+                            || normalized.contains("privatekey");
+                }
+
+                private String normalizeParameterText(String value) {
+                    return value == null ? "" : value.replace("\\r", "\\\\r").replace("\\n", "\\\\n");
                 }
 
                 private String resultSummary(Object result) {
@@ -3525,12 +3698,24 @@ class DmSqlValidationTestGenerator {
                     private final String status;
                     private final String key;
                     private final String parameterSource;
+                    private final String parameterSummary;
                     private final String message;
 
                     private ValidationRecord(String status, String key, String parameterSource, String message) {
+                        this(status, key, parameterSource, "", message);
+                    }
+
+                    private ValidationRecord(
+                            String status,
+                            String key,
+                            String parameterSource,
+                            String parameterSummary,
+                            String message
+                    ) {
                         this.status = status;
                         this.key = key;
                         this.parameterSource = parameterSource;
+                        this.parameterSummary = parameterSummary == null ? "" : parameterSummary;
                         this.message = message;
                     }
 
@@ -3538,12 +3723,24 @@ class DmSqlValidationTestGenerator {
                         return new ValidationRecord("PASSED", key, parameterSource, message);
                     }
 
+                    static ValidationRecord passed(String key, String parameterSource, String parameterSummary, String message) {
+                        return new ValidationRecord("PASSED", key, parameterSource, parameterSummary, message);
+                    }
+
                     static ValidationRecord failed(String key, String parameterSource, String message) {
                         return new ValidationRecord("FAILED", key, parameterSource, message);
                     }
 
+                    static ValidationRecord failed(String key, String parameterSource, String parameterSummary, String message) {
+                        return new ValidationRecord("FAILED", key, parameterSource, parameterSummary, message);
+                    }
+
                     static ValidationRecord skipped(String key, String parameterSource, String message) {
                         return new ValidationRecord("SKIPPED", key, parameterSource, message);
+                    }
+
+                    static ValidationRecord skipped(String key, String parameterSource, String parameterSummary, String message) {
+                        return new ValidationRecord("SKIPPED", key, parameterSource, parameterSummary, message);
                     }
                 }
 
