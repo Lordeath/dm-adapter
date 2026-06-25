@@ -93,6 +93,50 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
+    void preservesValidationArgsWhenMaintainingRewriteConfig() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        Files.createDirectories(config.getParent());
+        Files.writeString(config, """
+                upsertKeys:
+                  tables:
+                    "user_extend":
+                      keyColumns: []
+                  methods:
+                    {}
+
+                validationArgs:
+                  methods:
+                    "com.example.UserMapper.selectById":
+                      params:
+                        id: "1"
+                """);
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.UserMapper.updateExtend",
+                "user_extend",
+                List.of("user_id", "key_name")
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("user_extend", List.of(
+                new TableConstraint("PK_USER_EXTEND", TableConstraint.ConstraintType.PRIMARY_KEY, List.of("user_id"))
+        ));
+
+        updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(candidate),
+                Map.of("user_extend", metadata),
+                true
+        );
+
+        assertThat(Files.readString(config))
+                .contains("validationArgs:")
+                .contains("\"com.example.UserMapper.selectById\":")
+                .contains("id: \"1\"")
+                .contains("\"com.example.UserMapper.updateExtend\":")
+                .contains("keyColumns: [\"user_id\"]");
+    }
+
+    @Test
     void keepsEmptyKeyColumnsWhenMetadataIsUnavailable() throws Exception {
         Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
