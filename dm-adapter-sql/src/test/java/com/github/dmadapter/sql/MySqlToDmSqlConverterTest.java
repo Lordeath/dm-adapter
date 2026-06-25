@@ -417,6 +417,34 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlMakeDateToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select MAKEDATE(EXTRACT(YEAR FROM #{day}), 1) from dual"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATEADD(DAY, 1 - 1, TO_DATE(CONCAT(EXTRACT(YEAR FROM #{day}), '-01-01'), 'YYYY-MM-DD')) from dual");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE);
+    }
+
+    @Test
+    void convertsMysqlQuarterMakeDateExpressionAfterIntervalRewrite() {
+        SqlConversionResult result = converter.convert(
+                "select DATE_FORMAT(LAST_DAY(MAKEDATE(EXTRACT(YEAR FROM #{day}), 1) + INTERVAL QUARTER (#{day}) * 3-1 MONTH),'%Y-%m-%d 23:59:59')"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATE_FORMAT(LAST_DAY(DATEADD(MONTH, QUARTER (#{day}) * 3-1, DATEADD(DAY, 1 - 1, TO_DATE(CONCAT(EXTRACT(YEAR FROM #{day}), '-01-01'), 'YYYY-MM-DD')))),'%Y-%m-%d 23:59:59')");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE,
+                        MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE
+                );
+    }
+
+    @Test
     void doesNotConvertMysqlIntervalAdditionInsideStringsOrComments() {
         String sql = """
                 select 'created_at + INTERVAL 1 DAY' as sample
@@ -896,6 +924,20 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void leavesMysqlUpdateJoinThatSetsJoinedTableForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                update ns_quality_check_schedule_task a
+                join ns_quality_check_schedule_task_user u on a.ID = u.checkScheduleTaskID
+                set u.checkUserID = #{userId}, a.transferType = 1
+                where a.ID = #{id}
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("UPDATE JOIN");
+    }
+
+    @Test
     void convertsSimpleMysqlUpdateOrderLimitOneToDamengRowidSubquery() {
         SqlConversionResult result = converter.convert("""
                 UPDATE ns_bill_billsharing
@@ -1229,6 +1271,22 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.changed()).isFalse();
         assertThat(result.reason()).contains("information_schema", "database()");
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaColumnsQueryToAllTabColumns() {
+        SqlConversionResult result = converter.convert("""
+                SELECT column_name FROM information_schema.COLUMNS
+                WHERE TABLE_NAME =? and TABLE_SCHEMA='newsee-quality'
+                ORDER BY ORDINAL_POSITION asc
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('newsee-quality') ORDER BY COLUMN_ID ASC");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
     }
 
     @Test
