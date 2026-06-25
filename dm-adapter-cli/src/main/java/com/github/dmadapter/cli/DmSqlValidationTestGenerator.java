@@ -520,6 +520,7 @@ class DmSqlValidationTestGenerator {
             import java.lang.reflect.Type;
             import java.math.BigDecimal;
             import java.math.BigInteger;
+            import java.nio.charset.Charset;
             import java.nio.charset.StandardCharsets;
             import java.nio.file.Files;
             import java.nio.file.Path;
@@ -598,6 +599,10 @@ class DmSqlValidationTestGenerator {
                     return Collections.unmodifiableList(new ArrayList<>(values));
                 }
 
+                private static <T> Set<T> copySet(Collection<? extends T> values) {
+                    return Collections.unmodifiableSet(new LinkedHashSet<>(values));
+                }
+
                 private static <K, V> Map<K, V> copyMap(Map<? extends K, ? extends V> values) {
                     return Collections.unmodifiableMap(new LinkedHashMap<>(values));
                 }
@@ -608,6 +613,10 @@ class DmSqlValidationTestGenerator {
 
                 private static void writeString(Path path, String content) throws IOException {
                     Files.write(path, content.getBytes(StandardCharsets.UTF_8));
+                }
+
+                private static void writeString(Path path, String content, Charset charset) throws IOException {
+                    Files.write(path, content.getBytes(charset));
                 }
 
                 public static void main(String[] args) throws Exception {
@@ -1540,7 +1549,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean startsWithSet(String text) {
-                    return text != null && text.stripLeading().toLowerCase(Locale.ROOT).startsWith("set ");
+                    return text != null && text.trim().toLowerCase(Locale.ROOT).startsWith("set ");
                 }
 
                 private List<ParameterResolution> resolveParameterVariants(MapperMethod mapperMethod, ValidationConfig config) {
@@ -3725,7 +3734,7 @@ class DmSqlValidationTestGenerator {
                             }
                             summary.append(field.getName()).append("=");
                             try {
-                                if (!field.canAccess(value)) {
+                                if (!field.isAccessible()) {
                                     field.setAccessible(true);
                                 }
                                 summary.append(valueSummary(field.get(value), depth + 1, field.getName()));
@@ -4602,7 +4611,7 @@ class DmSqlValidationTestGenerator {
                         this.dynamicIdentifierMetadata = dynamicIdentifierMetadata == null
                                 ? new DynamicIdentifierMetadata()
                                 : dynamicIdentifierMetadata;
-                        this.generatedKeyProperties = Set.copyOf(generatedKeyProperties == null
+                        this.generatedKeyProperties = copySet(generatedKeyProperties == null
                                 ? setOf()
                                 : generatedKeyProperties);
                     }
@@ -4833,11 +4842,11 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private Set<String> dynamicIdentifierNames() {
-                        return Set.copyOf(namedDynamicIdentifierNames);
+                        return copySet(namedDynamicIdentifierNames);
                     }
 
                     private Set<String> collectionParameterNames() {
-                        return Set.copyOf(namedCollectionParameterNames);
+                        return copySet(namedCollectionParameterNames);
                     }
 
                     private String valueExpressionName(int index, String fallbackName) {
