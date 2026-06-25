@@ -109,14 +109,14 @@ class ValidationTestRunnerTest {
     }
 
     @Test
-    void runsGeneratedMainWhenSurefireSkipsTests() {
+    void runsGeneratedMainWhenSurefireSkipsTests() throws IOException {
         List<List<String>> commands = new ArrayList<>();
         List<Process> processes = new ArrayList<>();
         processes.add(processWithOutput("[INFO] Tests are skipped.\n", 0));
         processes.add(processWithOutput("classpath ready\n", 0, () -> {
             try {
                 Files.createDirectories(tempDir.resolve(".dm-adapter"));
-                Files.writeString(tempDir.resolve(".dm-adapter/sql-validation-classpath.txt"), "dependency.jar");
+                Files.writeString(tempDir.resolve(".dm-adapter/sql-validation-classpath.txt"), "dependency with space.jar");
             } catch (IOException e) {
                 throw new AssertionError(e);
             }
@@ -152,8 +152,15 @@ class ValidationTestRunnerTest {
                 .contains("test-compile")
                 .contains("dependency:build-classpath")
                 .contains("-Dmdep.includeScope=test");
+        assertThat(commands.get(2)).hasSize(2);
+        assertThat(commands.get(2).get(1))
+                .startsWith("@")
+                .endsWith("sql-validation-java.args");
         assertThat(commands.get(2))
+                .noneSatisfy(argument -> assertThat(argument).contains("dependency with space.jar"));
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation-java.args")))
                 .contains("-cp")
+                .contains("dependency with space.jar")
                 .contains("DmSqlValidationTest");
         assertThat(result.outputTail())
                 .anySatisfy(line -> assertThat(line).contains("Maven fallback command: [mvn"))

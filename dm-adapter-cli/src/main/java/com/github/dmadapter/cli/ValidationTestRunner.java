@@ -258,6 +258,7 @@ class ValidationTestRunner {
         Files.deleteIfExists(validationMarkdownReport(projectRoot));
         Files.deleteIfExists(projectRoot.resolve(".dm-adapter/sql-validation-report.json"));
         Files.deleteIfExists(validationClasspathFile(projectRoot));
+        Files.deleteIfExists(validationJavaArgsFile(projectRoot));
     }
 
     private Path validationMarkdownReport(Path projectRoot) {
@@ -266,6 +267,10 @@ class ValidationTestRunner {
 
     private Path validationClasspathFile(Path projectRoot) {
         return projectRoot.resolve(".dm-adapter/sql-validation-classpath.txt");
+    }
+
+    private Path validationJavaArgsFile(Path projectRoot) {
+        return projectRoot.resolve(".dm-adapter/sql-validation-java.args");
     }
 
     private Path existingReportPath(Path reportPath) {
@@ -314,10 +319,60 @@ class ValidationTestRunner {
     List<String> javaValidationCommand(ValidationTestGenerationResult generationResult) throws IOException {
         List<String> command = new ArrayList<>();
         command.add(javaExecutable());
-        command.add("-cp");
-        command.add(validationRuntimeClasspath(generationResult));
-        command.add(validationMainClass(generationResult));
+        command.add("@" + writeValidationJavaArgsFile(generationResult));
         return command;
+    }
+
+    private Path writeValidationJavaArgsFile(ValidationTestGenerationResult generationResult) throws IOException {
+        Path argsFile = validationJavaArgsFile(generationResult.projectRoot());
+        Files.createDirectories(argsFile.getParent());
+        List<String> args = List.of(
+                "-cp",
+                validationRuntimeClasspath(generationResult),
+                validationMainClass(generationResult)
+        );
+        Files.writeString(argsFile, javaArgumentFileContent(args), StandardCharsets.UTF_8);
+        return argsFile;
+    }
+
+    private String javaArgumentFileContent(List<String> args) {
+        StringBuilder content = new StringBuilder();
+        for (String arg : args) {
+            content.append(javaArgumentFileToken(arg)).append(System.lineSeparator());
+        }
+        return content.toString();
+    }
+
+    private String javaArgumentFileToken(String arg) {
+        String value = arg == null ? "" : arg;
+        if (!requiresJavaArgumentFileQuoting(value)) {
+            return value;
+        }
+        StringBuilder token = new StringBuilder("\"");
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (current == '\\' || current == '"') {
+                token.append('\\');
+            }
+            if (current == '\r' || current == '\n') {
+                token.append(' ');
+            } else {
+                token.append(current);
+            }
+        }
+        return token.append('"').toString();
+    }
+
+    private boolean requiresJavaArgumentFileQuoting(String arg) {
+        if (arg.isBlank() || arg.contains("#")) {
+            return true;
+        }
+        for (int i = 0; i < arg.length(); i++) {
+            if (Character.isWhitespace(arg.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String javaExecutable() {
