@@ -429,6 +429,34 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlSubdateToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select SUBDATE(#{day}, WEEKDAY(#{day})) from dual"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATEADD(DAY, (0 - WEEKDAY(#{day})), #{day}) from dual");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE);
+    }
+
+    @Test
+    void convertsMysqlDateAddSubdateCombinationToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select DATE_ADD(SUBDATE(#{day},WEEKDAY(#{day})),INTERVAL 6 DAY) from dual"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATEADD(DAY, 6, DATEADD(DAY, (0 - WEEKDAY(#{day})), #{day})) from dual");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE,
+                        MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE
+                );
+    }
+
+    @Test
     void convertsMysqlQuarterMakeDateExpressionAfterIntervalRewrite() {
         SqlConversionResult result = converter.convert(
                 "select DATE_FORMAT(LAST_DAY(MAKEDATE(EXTRACT(YEAR FROM #{day}), 1) + INTERVAL QUARTER (#{day}) * 3-1 MONTH),'%Y-%m-%d 23:59:59')"
@@ -1287,6 +1315,28 @@ class MySqlToDmSqlConverterTest {
                 .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('newsee-quality') ORDER BY COLUMN_ID ASC");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
+    void castsNumericLocateNeedleWhenSearchingConcatExpression() {
+        SqlConversionResult result = converter.convert(
+                "select * from schedule where LOCATE(#{precinctId}, concat(',', s3.precinctID, ',')) > 0"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select * from schedule where LOCATE(CAST(#{precinctId} AS VARCHAR(64)), concat(',', s3.precinctID, ',')) > 0");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_LOCATE_NUMERIC_NEEDLE_RULE);
+    }
+
+    @Test
+    void leavesStringLocateNeedleUnchanged() {
+        SqlConversionResult result = converter.convert(
+                "select * from user where LOCATE(#{mainSearch}, userName) > 0"
+        );
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("select * from user where LOCATE(#{mainSearch}, userName) > 0");
     }
 
     @Test
