@@ -21,6 +21,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_DATE_ADD_INTERVAL_RULE = "MYSQL_DATE_ADD_INTERVAL_TO_DATEADD";
+    public static final String MYSQL_SUBDATE_RULE = "MYSQL_SUBDATE_TO_DATEADD";
+    public static final String MYSQL_LOCATE_NUMERIC_NEEDLE_RULE = "MYSQL_LOCATE_NUMERIC_NEEDLE_CAST";
     public static final String MYSQL_MAKEDATE_RULE = "MYSQL_MAKEDATE_TO_DATEADD";
     public static final String MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE =
             "MYSQL_INFORMATION_SCHEMA_COLUMNS_TO_ALL_TAB_COLUMNS";
@@ -260,6 +262,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_DATE_SUB_INTERVAL_RULE);
         }
 
+        GenericConversion subDateConversion = convertSubDateFunctions(converted);
+        if (subDateConversion.changed()) {
+            converted = subDateConversion.convertedSql();
+            rules.add(MYSQL_SUBDATE_RULE);
+        }
+
         GenericConversion dateAddIntervalConversion = convertDateAddInterval(converted);
         if (dateAddIntervalConversion.changed()) {
             converted = dateAddIntervalConversion.convertedSql();
@@ -433,6 +441,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (booleanOperatorConversion.changed()) {
             converted = booleanOperatorConversion.convertedSql();
             rules.add(MYSQL_BOOLEAN_OPERATOR_RULE);
+        }
+
+        GenericConversion locateNumericNeedleConversion = convertLocateNumericNeedle(converted);
+        if (locateNumericNeedleConversion.changed()) {
+            converted = locateNumericNeedleConversion.convertedSql();
+            rules.add(MYSQL_LOCATE_NUMERIC_NEEDLE_RULE);
         }
 
         GenericConversion informationSchemaColumnsConversion = convertInformationSchemaColumns(converted);
@@ -675,6 +689,54 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         String dmDateExpression = isNowExpression(dateExpression) ? "SYSDATE" : dateExpression;
         return "DATEADD(" + unit + ", " + negatedIntervalAmount(amount) + ", " + dmDateExpression + ")";
+    }
+
+    private GenericConversion convertSubDateFunctions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "SUBDATE")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "SUBDATE");
+                String replacement = functionCall == null ? null : rewriteSubDate(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteSubDate(FunctionCall subDateCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(subDateCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String dateExpression = arguments.get(0).text().trim();
+        String dayExpression = arguments.get(1).text().trim();
+        if (dateExpression.isBlank() || dayExpression.isBlank()) {
+            return null;
+        }
+        return "DATEADD(DAY, " + negatedIntervalAmount(dayExpression) + ", " + dateExpression + ")";
     }
 
     private GenericConversion convertDateAddInterval(String sql) {
@@ -1402,6 +1464,83 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + ") ORDER BY COLUMN_ID"
                 + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
         return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertLocateNumericNeedle(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "LOCATE")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "LOCATE");
+                String replacement = functionCall == null ? null : rewriteLocateNumericNeedle(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteLocateNumericNeedle(FunctionCall locateCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(locateCall.body());
+        if (arguments.size() < 2) {
+            return null;
+        }
+        String needle = arguments.get(0).text().trim();
+        String haystack = arguments.get(1).text().trim();
+        if (!isNumericMyBatisPlaceholder(needle) || readOnlyFunctionCall(haystack, "CONCAT") == null) {
+            return null;
+        }
+        StringBuilder replacement = new StringBuilder("LOCATE(CAST(")
+                .append(needle)
+                .append(" AS VARCHAR(64)), ")
+                .append(haystack);
+        for (int i = 2; i < arguments.size(); i++) {
+            replacement.append(", ").append(arguments.get(i).text().trim());
+        }
+        return replacement.append(")").toString();
+    }
+
+    private boolean isNumericMyBatisPlaceholder(String expression) {
+        String trimmed = expression == null ? "" : expression.trim();
+        if (!trimmed.startsWith("#{") || !trimmed.endsWith("}")) {
+            return false;
+        }
+        String body = trimmed.substring(2, trimmed.length() - 1).trim();
+        int commaIndex = body.indexOf(',');
+        String propertyName = (commaIndex >= 0 ? body.substring(0, commaIndex) : body).trim();
+        String normalized = propertyName.replace("_", "").replace("-", "").replace(".", "").toLowerCase(Locale.ROOT);
+        return normalized.endsWith("id")
+                || normalized.endsWith("ids")
+                || normalized.contains("userid")
+                || normalized.contains("enterpriseid")
+                || normalized.contains("organizationid")
+                || normalized.contains("precinctid")
+                || normalized.endsWith("type")
+                || normalized.endsWith("status")
+                || normalized.endsWith("flag")
+                || normalized.endsWith("count")
+                || normalized.endsWith("index");
     }
 
     private GenericConversion addRecursiveCteColumnAliases(String sql) {
