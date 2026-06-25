@@ -216,6 +216,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlImplicitSingleQuotedAliasAfterSubqueryExpression() {
+        SqlConversionResult result = converter.convert(
+                "select (select count(tmp.id_) from role_auth tmp where tmp.menu_alias_ = menu.alias_) 'checked' from menu"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select (select count(tmp.id_) from role_auth tmp where tmp.menu_alias_ = menu.alias_) AS \"checked\" from menu");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+    }
+
+    @Test
     void removesMysqlSelectModifiers() {
         SqlConversionResult result = converter.convert(
                 "select SQL_BIG_RESULT precinct_id, SUM(charging_area) from owner_house_result group by precinct_id"
