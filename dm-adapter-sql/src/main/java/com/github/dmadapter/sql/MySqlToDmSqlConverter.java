@@ -28,6 +28,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
     public static final String MYSQL_HAVING_AGGREGATE_ALIAS_RULE = "MYSQL_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYSQL_NOT_FIND_IN_SET_RULE = "MYSQL_NOT_FIND_IN_SET_TO_EQUALS_ZERO";
+    public static final String MYSQL_STR_TO_DATE_YEARMONTH_RULE = "MYSQL_STR_TO_DATE_YEARMONTH_TO_TO_DATE";
+    public static final String MYSQL_PERIOD_DIFF_YEARMONTH_RULE = "MYSQL_PERIOD_DIFF_YEARMONTH_TO_DATEDIFF";
+    public static final String MYSQL_COUNT_CONDITION_OR_NULL_RULE = "MYSQL_COUNT_CONDITION_OR_NULL_TO_CASE";
+    public static final String MYSQL_NOT_ISNULL_RULE = "MYSQL_NOT_ISNULL_TO_CASE";
+    public static final String MYSQL_BOOLEAN_OPERATOR_RULE = "MYSQL_BOOLEAN_OPERATOR_TO_WORD_OPERATOR";
     public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
             "MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN";
     public static final String MYSQL_IMPLICIT_CROSS_JOIN_RULE = "MYSQL_IMPLICIT_CROSS_JOIN_TO_DM";
@@ -158,6 +163,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "ORDER",
             "OUTER",
             "PRIOR",
+            "REVERSE",
             "RIGHT",
             "ROW",
             "SELECT",
@@ -240,6 +246,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (dateAddIntervalConversion.changed()) {
             converted = dateAddIntervalConversion.convertedSql();
             rules.add(MYSQL_DATE_ADD_INTERVAL_RULE);
+        }
+
+        GenericConversion strToDateYearMonthConversion = convertStrToDateYearMonth(converted);
+        if (strToDateYearMonthConversion.changed()) {
+            converted = strToDateYearMonthConversion.convertedSql();
+            rules.add(MYSQL_STR_TO_DATE_YEARMONTH_RULE);
+        }
+
+        GenericConversion periodDiffYearMonthConversion = convertPeriodDiffYearMonth(converted);
+        if (periodDiffYearMonthConversion.changed()) {
+            converted = periodDiffYearMonthConversion.convertedSql();
+            rules.add(MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
         }
 
         GenericConversion unsignedCastConversion = convertUnsignedCasts(converted);
@@ -373,6 +391,24 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (notFindInSetConversion.changed()) {
             converted = notFindInSetConversion.convertedSql();
             rules.add(MYSQL_NOT_FIND_IN_SET_RULE);
+        }
+
+        GenericConversion notIsNullConversion = convertNotIsNull(converted);
+        if (notIsNullConversion.changed()) {
+            converted = notIsNullConversion.convertedSql();
+            rules.add(MYSQL_NOT_ISNULL_RULE);
+        }
+
+        GenericConversion countConditionOrNullConversion = convertCountConditionOrNull(converted);
+        if (countConditionOrNullConversion.changed()) {
+            converted = countConditionOrNullConversion.convertedSql();
+            rules.add(MYSQL_COUNT_CONDITION_OR_NULL_RULE);
+        }
+
+        GenericConversion booleanOperatorConversion = convertBooleanOperatorsInIfConditions(converted);
+        if (booleanOperatorConversion.changed()) {
+            converted = booleanOperatorConversion.convertedSql();
+            rules.add(MYSQL_BOOLEAN_OPERATOR_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -612,12 +648,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertDateAddInterval(String sql) {
-        GenericConversion functionConversion = convertDateAddFunctionInterval(sql);
-        GenericConversion additionConversion = convertDateIntervalAddition(functionConversion.convertedSql());
-        return new GenericConversion(
-                additionConversion.convertedSql(),
-                functionConversion.changed() || additionConversion.changed()
-        );
+        String converted = sql;
+        boolean changed = false;
+        for (int pass = 0; pass < 8; pass++) {
+            GenericConversion functionConversion = convertDateAddFunctionInterval(converted);
+            GenericConversion additionConversion = convertDateIntervalAddition(functionConversion.convertedSql());
+            if (!functionConversion.changed() && !additionConversion.changed()) {
+                break;
+            }
+            converted = additionConversion.convertedSql();
+            changed = true;
+        }
+        return new GenericConversion(converted, changed);
     }
 
     private GenericConversion convertDateAddFunctionInterval(String sql) {
@@ -815,6 +857,117 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return "DATEADD(" + unit + ", " + amount + ", " + dateExpression + ")";
+    }
+
+    private GenericConversion convertStrToDateYearMonth(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "STR_TO_DATE")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "STR_TO_DATE");
+                String replacement = functionCall == null ? null : rewriteStrToDateYearMonth(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteStrToDateYearMonth(FunctionCall strToDateCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(strToDateCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String format = normalizedStringLiteral(arguments.get(1).text());
+        if (!"'%Y%m'".equalsIgnoreCase(format)) {
+            return null;
+        }
+        String expression = arguments.get(0).text().trim();
+        if (expression.isBlank()) {
+            return null;
+        }
+        return "TO_DATE(" + expression + ", 'YYYYMM')";
+    }
+
+    private GenericConversion convertPeriodDiffYearMonth(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "PERIOD_DIFF")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "PERIOD_DIFF");
+                String replacement = functionCall == null ? null : rewritePeriodDiffYearMonth(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewritePeriodDiffYearMonth(FunctionCall periodDiffCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(periodDiffCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String left = yearMonthExtractExpression(arguments.get(0).text());
+        String right = yearMonthExtractExpression(arguments.get(1).text());
+        if (left == null || right == null) {
+            return null;
+        }
+        return "DATEDIFF(MONTH, " + right + ", " + left + ")";
+    }
+
+    private String yearMonthExtractExpression(String expression) {
+        String trimmed = expression.trim();
+        int start = leadingWhitespaceLength(trimmed);
+        FunctionCall extractCall = readFunctionCall(trimmed, start, "EXTRACT");
+        if (extractCall == null || skipWhitespace(trimmed, extractCall.endIndex()) != trimmed.length()) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?is)^\\s*YEAR_MONTH\\s+FROM\\s+(.+?)\\s*$")
+                .matcher(extractCall.body());
+        return matcher.matches() ? matcher.group(1).trim() : null;
     }
 
     private boolean isNowExpression(String expression) {
@@ -1961,7 +2114,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             } else if (startsBlockComment(sql, index)) {
                 index = skipUntilBlockCommentEnd(sql, index);
             } else {
-                KeywordReplacement hint = readMysqlForceIndexHintRemoval(sql, index);
+                KeywordReplacement hint = readMysqlIndexHintRemoval(sql, index);
                 if (hint == null) {
                     index++;
                 } else {
@@ -1979,11 +2132,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(converted.toString(), true);
     }
 
-    private KeywordReplacement readMysqlForceIndexHintRemoval(String sql, int index) {
-        if (!startsKeyword(sql, index, "FORCE")) {
+    private KeywordReplacement readMysqlIndexHintRemoval(String sql, int index) {
+        String hintKeyword = mysqlIndexHintKeyword(sql, index);
+        if (hintKeyword == null) {
             return null;
         }
-        int cursor = skipWhitespace(sql, index + "FORCE".length());
+        int cursor = skipWhitespace(sql, index + hintKeyword.length());
         if (!startsKeyword(sql, cursor, "INDEX")) {
             return null;
         }
@@ -1996,6 +2150,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return new KeywordReplacement(index, skipWhitespace(sql, closeParenIndex + 1));
+    }
+
+    private String mysqlIndexHintKeyword(String sql, int index) {
+        for (String keyword : List.of("FORCE", "USE", "IGNORE")) {
+            if (startsKeyword(sql, index, keyword)) {
+                return keyword;
+            }
+        }
+        return null;
     }
 
     private int joinTypeStart(String sql, int joinIndex) {
@@ -2518,6 +2681,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if ("DESC".equals(upper) && previousNonWhitespace(sql, startIndex) == '.') {
             return "\"DESC\"";
         }
+        if ("REVERSE".equals(upper) && nextNonWhitespace(sql, startIndex + identifier.length()) != '(') {
+            return quoteDamengIdentifier(identifier);
+        }
         if (previousNonWhitespace(sql, startIndex) == '.' && isDamengKeywordRequiringQuotes(identifier)) {
             return quoteDamengIdentifier(identifier);
         }
@@ -2682,6 +2848,178 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertNotIsNull(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (current == '!') {
+                int functionStart = skipWhitespace(sql, index + 1);
+                FunctionCall functionCall = readFunctionCall(sql, functionStart, "ISNULL");
+                if (functionCall == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append("CASE WHEN ")
+                            .append(sql, functionStart, functionCall.endIndex())
+                            .append(" THEN 0 ELSE 1 END");
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertCountConditionOrNull(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "COUNT")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "COUNT");
+                String replacement = functionCall == null ? null : rewriteCountConditionOrNull(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteCountConditionOrNull(FunctionCall countCall) {
+        String body = countCall.body();
+        int orIndex = findTopLevelKeyword(body, "OR", 0);
+        if (orIndex < 0) {
+            return null;
+        }
+        String condition = body.substring(0, orIndex).trim();
+        String right = body.substring(orIndex + "OR".length()).trim();
+        if (condition.isBlank() || !"NULL".equalsIgnoreCase(right)) {
+            return null;
+        }
+        return "COUNT(CASE WHEN " + condition + " THEN 1 END)";
+    }
+
+    private GenericConversion convertBooleanOperatorsInIfConditions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "IF")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "IF");
+                String replacement = functionCall == null ? null : rewriteIfBooleanOperators(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteIfBooleanOperators(FunctionCall ifCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(ifCall.body());
+        if (arguments.size() != 3) {
+            return null;
+        }
+        GenericConversion condition = convertBooleanOperators(arguments.get(0).text());
+        if (!condition.changed()) {
+            return null;
+        }
+        return "IF(" + condition.convertedSql().trim()
+                + ", " + arguments.get(1).text().trim()
+                + ", " + arguments.get(2).text().trim()
+                + ")";
+    }
+
+    private GenericConversion convertBooleanOperators(String expression) {
+        StringBuilder converted = new StringBuilder(expression.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < expression.length()) {
+            char current = expression.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(expression, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(expression, index, converted);
+            } else if (startsMyBatisPlaceholder(expression, index)) {
+                index = appendMyBatisPlaceholder(expression, index, converted);
+            } else if (startsLineComment(expression, index)) {
+                index = appendUntilLineEnd(expression, index, converted);
+            } else if (startsBlockComment(expression, index)) {
+                index = appendUntilBlockCommentEnd(expression, index, converted);
+            } else if (index + 1 < expression.length()
+                    && expression.charAt(index) == '|'
+                    && expression.charAt(index + 1) == '|') {
+                converted.append("OR");
+                index += 2;
+                changed = true;
+            } else if (index + 1 < expression.length()
+                    && expression.charAt(index) == '&'
+                    && expression.charAt(index + 1) == '&') {
+                converted.append("AND");
+                index += 2;
+                changed = true;
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : expression, changed);
     }
 
     private int firstTopLevelKeyword(String sql, int start, String... keywords) {
@@ -3550,6 +3888,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             index--;
         }
         return index >= 0 ? sql.charAt(index) : '\0';
+    }
+
+    private char nextNonWhitespace(String sql, int afterIndex) {
+        int index = afterIndex;
+        while (index < sql.length() && Character.isWhitespace(sql.charAt(index))) {
+            index++;
+        }
+        return index < sql.length() ? sql.charAt(index) : '\0';
     }
 
     private boolean isIdentifierStart(char value) {
