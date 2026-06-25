@@ -83,6 +83,18 @@ class ValidationTestRunner {
         boolean remove(Thread hook);
     }
 
+    private record ProcessExecutionResult(
+            List<String> command,
+            Path workingDirectory,
+            int exitCode,
+            String output
+    ) {
+        private ProcessExecutionResult {
+            command = List.copyOf(command);
+            output = output == null ? "" : output;
+        }
+    }
+
     private static class RuntimeShutdownHookRegistry implements ShutdownHookRegistry {
         @Override
         public void add(Thread hook) {
@@ -121,45 +133,67 @@ class ValidationTestRunner {
                     "Failed to prepare validation report files: " + e.getMessage()
             );
         }
-        ProcessBuilder processBuilder = new ProcessBuilder(command)
-                .directory(workingDirectory.toFile())
-                .redirectErrorStream(true);
-        Process process = null;
-        Thread shutdownHook = null;
-        boolean completed = false;
+        List<ProcessExecutionResult> executions = new ArrayList<>();
+        List<String> currentCommand = command;
+        Path currentWorkingDirectory = workingDirectory;
         try {
-            publishMavenOutput("Running Maven validation test: " + command);
-            process = processStarter.start(processBuilder);
-            shutdownHook = registerShutdownHook(process);
-            Process runningProcess = process;
-            CompletableFuture<String> output = CompletableFuture.supplyAsync(
-                    () -> readMavenOutput(runningProcess.getInputStream(), environment)
+            ProcessExecutionResult mavenExecution = executeProcess(
+                    command,
+                    workingDirectory,
+                    environment,
+                    "Running Maven validation test: "
             );
-            int exitCode = process.waitFor();
-            String mavenOutput = output.get(5, TimeUnit.SECONDS);
-            completed = true;
+            executions.add(mavenExecution);
+            ProcessExecutionResult effectiveExecution = mavenExecution;
+            if (mavenExecution.exitCode() == 0 && mavenTestsWereSkipped(mavenExecution.output())) {
+                publishMavenOutput("Maven reported tests are skipped; running generated validation main directly.");
+                Files.createDirectories(generationResult.projectRoot().resolve(".dm-adapter"));
+                currentCommand = mavenClasspathCommand(generationResult);
+                currentWorkingDirectory = workingDirectory;
+                ProcessExecutionResult classpathExecution = executeProcess(
+                        currentCommand,
+                        currentWorkingDirectory,
+                        environment,
+                        "Preparing validation classpath with Maven: "
+                );
+                executions.add(classpathExecution);
+                effectiveExecution = classpathExecution;
+                if (classpathExecution.exitCode() == 0) {
+                    currentCommand = javaValidationCommand(generationResult);
+                    currentWorkingDirectory = generationResult.appModuleRoot();
+                    ProcessExecutionResult javaExecution = executeProcess(
+                            currentCommand,
+                            currentWorkingDirectory,
+                            environment,
+                            "Running generated validation main: "
+                    );
+                    executions.add(javaExecution);
+                    effectiveExecution = javaExecution;
+                }
+            }
+            int exitCode = effectiveExecution.exitCode();
+            String combinedOutput = combinedOutput(executions);
             return new ValidationTestRunResult(
                     true,
                     exitCode,
                     existingReportPath(markdownReport),
-                    runDiagnostics(command, workingDirectory, mavenOutput, environment, generationResult.projectRoot()),
+                    runDiagnostics(executions, combinedOutput, environment, generationResult.projectRoot()),
                     exitCode == 0
                             ? "Dameng SQL validation test passed."
                             : "Dameng SQL validation test exited with code " + exitCode + "."
             );
         } catch (IOException e) {
-            List<String> diagnostics = process == null
-                    ? startFailureDiagnostics(generationResult, command, workingDirectory, e)
+            List<String> diagnostics = executions.isEmpty()
+                    ? startFailureDiagnostics(generationResult, currentCommand, currentWorkingDirectory, e)
                     : runDiagnostics(
-                            command,
-                            workingDirectory,
-                            e.getClass().getSimpleName() + ": " + e.getMessage(),
+                            executions,
+                            combinedOutput(executions) + e.getClass().getSimpleName() + ": " + e.getMessage(),
                             environment,
                             generationResult.projectRoot()
                     );
-            String message = process == null
+            String message = executions.isEmpty()
                     ? "Failed to start Maven validation test: " + e.getMessage()
-                    : "Failed to read Maven validation output: " + e.getMessage();
+                    : "Failed to continue validation test run: " + e.getMessage();
             return new ValidationTestRunResult(
                     true,
                     1,
@@ -173,13 +207,7 @@ class ValidationTestRunner {
                     true,
                     1,
                     existingReportPath(markdownReport),
-                    runDiagnostics(
-                            command,
-                            workingDirectory,
-                            readFailure,
-                            environment,
-                            generationResult.projectRoot()
-                    ),
+                    runDiagnostics(executions, combinedOutput(executions) + readFailure, environment, generationResult.projectRoot()),
                     "Failed to read Maven validation output: " + readFailure
             );
         } catch (InterruptedException e) {
@@ -188,9 +216,36 @@ class ValidationTestRunner {
                     true,
                     1,
                     existingReportPath(markdownReport),
-                    runDiagnostics(command, workingDirectory, "", environment, generationResult.projectRoot()),
+                    runDiagnostics(executions, combinedOutput(executions), environment, generationResult.projectRoot()),
                     "Maven validation test was interrupted."
             );
+        }
+    }
+
+    private ProcessExecutionResult executeProcess(
+            List<String> command,
+            Path workingDirectory,
+            DmValidationEnvironment environment,
+            String description
+    ) throws IOException, InterruptedException, ExecutionException, TimeoutException {
+        ProcessBuilder processBuilder = new ProcessBuilder(command)
+                .directory(workingDirectory.toFile())
+                .redirectErrorStream(true);
+        Process process = null;
+        Thread shutdownHook = null;
+        boolean completed = false;
+        try {
+            publishMavenOutput(description + command);
+            process = processStarter.start(processBuilder);
+            shutdownHook = registerShutdownHook(process);
+            Process runningProcess = process;
+            CompletableFuture<String> output = CompletableFuture.supplyAsync(
+                    () -> readMavenOutput(runningProcess.getInputStream(), environment)
+            );
+            int exitCode = process.waitFor();
+            String processOutput = output.get(5, TimeUnit.SECONDS);
+            completed = true;
+            return new ProcessExecutionResult(command, workingDirectory, exitCode, processOutput);
         } finally {
             removeShutdownHook(shutdownHook);
             if (!completed && process != null && process.isAlive()) {
@@ -202,10 +257,15 @@ class ValidationTestRunner {
     private void deleteStaleValidationReports(Path projectRoot) throws IOException {
         Files.deleteIfExists(validationMarkdownReport(projectRoot));
         Files.deleteIfExists(projectRoot.resolve(".dm-adapter/sql-validation-report.json"));
+        Files.deleteIfExists(validationClasspathFile(projectRoot));
     }
 
     private Path validationMarkdownReport(Path projectRoot) {
         return projectRoot.resolve(".dm-adapter/sql-validation-report.md");
+    }
+
+    private Path validationClasspathFile(Path projectRoot) {
+        return projectRoot.resolve(".dm-adapter/sql-validation-classpath.txt");
     }
 
     private Path existingReportPath(Path reportPath) {
@@ -223,9 +283,83 @@ class ValidationTestRunner {
             command.add("-am");
         }
         command.add("-Dtest=" + DmSqlValidationTestGenerator.TEST_CLASS_NAME);
+        command.add("-DskipTests=false");
+        command.add("-Dmaven.test.skip=false");
+        command.add("-Dmaven.test.skip.exec=false");
         command.add("-Dsurefire.failIfNoSpecifiedTests=false");
         command.add("test");
         return command;
+    }
+
+    List<String> mavenClasspathCommand(ValidationTestGenerationResult generationResult) {
+        Path projectRoot = generationResult.projectRoot();
+        Path moduleRoot = generationResult.appModuleRoot();
+        List<String> command = new ArrayList<>();
+        command.add(mavenExecutable(projectRoot));
+        if (!moduleRoot.equals(projectRoot) && rootPomListsModule(projectRoot, moduleRoot)) {
+            command.add("-pl");
+            command.add(projectRoot.relativize(moduleRoot).toString().replace('\\', '/'));
+            command.add("-am");
+        }
+        command.add("-DskipTests=false");
+        command.add("-Dmaven.test.skip=false");
+        command.add("-Dmaven.test.skip.exec=false");
+        command.add("test-compile");
+        command.add("dependency:build-classpath");
+        command.add("-Dmdep.includeScope=test");
+        command.add("-Dmdep.outputFile=" + validationClasspathFile(projectRoot));
+        return command;
+    }
+
+    List<String> javaValidationCommand(ValidationTestGenerationResult generationResult) throws IOException {
+        List<String> command = new ArrayList<>();
+        command.add(javaExecutable());
+        command.add("-cp");
+        command.add(validationRuntimeClasspath(generationResult));
+        command.add(validationMainClass(generationResult));
+        return command;
+    }
+
+    private String javaExecutable() {
+        Path executable = Path.of(
+                System.getProperty("java.home", ""),
+                "bin",
+                isWindows() ? "java.exe" : "java"
+        );
+        return Files.isRegularFile(executable) ? executable.toString() : "java";
+    }
+
+    private String validationRuntimeClasspath(ValidationTestGenerationResult generationResult) throws IOException {
+        String separator = isWindows() ? ";" : File.pathSeparator;
+        List<String> elements = new ArrayList<>();
+        Path moduleRoot = generationResult.appModuleRoot();
+        elements.add(moduleRoot.resolve("target/test-classes").toString());
+        elements.add(moduleRoot.resolve("target/classes").toString());
+        Path classpathFile = validationClasspathFile(generationResult.projectRoot());
+        if (Files.isRegularFile(classpathFile)) {
+            String classpath = Files.readString(classpathFile, StandardCharsets.UTF_8).trim();
+            if (!classpath.isBlank()) {
+                elements.add(classpath);
+            }
+        }
+        return String.join(separator, elements);
+    }
+
+    private String validationMainClass(ValidationTestGenerationResult generationResult) {
+        Path testRoot = generationResult.appModuleRoot().resolve("src/test/java").toAbsolutePath().normalize();
+        Path testPath = generationResult.testPath().toAbsolutePath().normalize();
+        if (!testPath.startsWith(testRoot)) {
+            return DmSqlValidationTestGenerator.TEST_CLASS_NAME;
+        }
+        String relative = testRoot.relativize(testPath).toString();
+        if (relative.endsWith(".java")) {
+            relative = relative.substring(0, relative.length() - ".java".length());
+        }
+        return relative.replace('\\', '.').replace('/', '.');
+    }
+
+    private boolean mavenTestsWereSkipped(String output) {
+        return output != null && output.toLowerCase(Locale.ROOT).contains("tests are skipped");
     }
 
     private Thread registerShutdownHook(Process process) {
@@ -320,19 +454,45 @@ class ValidationTestRunner {
                 : cause.getClass().getSimpleName() + ": " + message;
     }
 
+    private String combinedOutput(List<ProcessExecutionResult> executions) {
+        StringBuilder output = new StringBuilder();
+        for (ProcessExecutionResult execution : executions) {
+            output.append(execution.output());
+            if (!execution.output().endsWith("\n")) {
+                output.append('\n');
+            }
+        }
+        return output.toString();
+    }
+
     private List<String> runDiagnostics(
-            List<String> command,
-            Path workingDirectory,
+            List<ProcessExecutionResult> executions,
             String output,
             DmValidationEnvironment environment,
             Path projectRoot
     ) {
         List<String> diagnostics = new ArrayList<>();
-        diagnostics.add("Maven command: " + command);
-        diagnostics.add("Working directory: " + workingDirectory);
+        if (executions.isEmpty()) {
+            diagnostics.add("Maven command: <not started>");
+        }
+        for (int i = 0; i < executions.size(); i++) {
+            ProcessExecutionResult execution = executions.get(i);
+            diagnostics.add(commandLabel(i, execution.command()) + ": " + execution.command());
+            diagnostics.add("Working directory: " + execution.workingDirectory());
+        }
         diagnostics.addAll(validationReportSummary(projectRoot));
         diagnostics.addAll(tail(redact(output, environment), 40));
         return diagnostics;
+    }
+
+    private String commandLabel(int index, List<String> command) {
+        if (index == 0) {
+            return "Maven command";
+        }
+        if (!command.isEmpty() && command.get(0).toLowerCase(Locale.ROOT).contains("java")) {
+            return "Java validation command";
+        }
+        return "Maven fallback command";
     }
 
     private List<String> validationReportSummary(Path projectRoot) {

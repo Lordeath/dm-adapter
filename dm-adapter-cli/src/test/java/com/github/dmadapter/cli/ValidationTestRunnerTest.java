@@ -68,7 +68,12 @@ class ValidationTestRunnerTest {
     @Test
     void allowsReactorModulesWithoutGeneratedValidationTest() {
         assertThat(new ValidationTestRunner().mavenCommand(generationResult()))
-                .contains("-Dsurefire.failIfNoSpecifiedTests=false");
+                .contains(
+                        "-DskipTests=false",
+                        "-Dmaven.test.skip=false",
+                        "-Dmaven.test.skip.exec=false",
+                        "-Dsurefire.failIfNoSpecifiedTests=false"
+                );
     }
 
     @Test
@@ -95,10 +100,65 @@ class ValidationTestRunnerTest {
         assertThat(result.outputTail())
                 .anySatisfy(line -> assertThat(line)
                         .contains("Maven command: [mvn")
+                        .contains("-DskipTests=false")
+                        .contains("-Dmaven.test.skip=false")
                         .contains("-Dsurefire.failIfNoSpecifiedTests=false"))
                 .anySatisfy(line -> assertThat(line).contains("Working directory: " + tempDir))
                 .anySatisfy(line -> assertThat(line).contains("maven output"));
         assertThat(shutdownHooks.addedHook).isSameAs(shutdownHooks.removedHook);
+    }
+
+    @Test
+    void runsGeneratedMainWhenSurefireSkipsTests() {
+        List<List<String>> commands = new ArrayList<>();
+        List<Process> processes = new ArrayList<>();
+        processes.add(processWithOutput("[INFO] Tests are skipped.\n", 0));
+        processes.add(processWithOutput("classpath ready\n", 0, () -> {
+            try {
+                Files.createDirectories(tempDir.resolve(".dm-adapter"));
+                Files.writeString(tempDir.resolve(".dm-adapter/sql-validation-classpath.txt"), "dependency.jar");
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        }));
+        processes.add(processWithOutput("validation main output\n", 1));
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> {
+                    commands.add(processBuilder.command());
+                    return processes.remove(0);
+                },
+                new RecordingShutdownHookRegistry()
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(result.exitCode()).isEqualTo(1);
+        assertThat(commands).hasSize(3);
+        assertThat(commands.get(0))
+                .contains("test")
+                .contains("-DskipTests=false")
+                .contains("-Dmaven.test.skip=false");
+        assertThat(commands.get(1))
+                .contains("test-compile")
+                .contains("dependency:build-classpath")
+                .contains("-Dmdep.includeScope=test");
+        assertThat(commands.get(2))
+                .contains("-cp")
+                .contains("DmSqlValidationTest");
+        assertThat(result.outputTail())
+                .anySatisfy(line -> assertThat(line).contains("Maven fallback command: [mvn"))
+                .anySatisfy(line -> assertThat(line).contains("Java validation command: ["))
+                .anySatisfy(line -> assertThat(line).contains("validation main output"));
     }
 
     @Test
