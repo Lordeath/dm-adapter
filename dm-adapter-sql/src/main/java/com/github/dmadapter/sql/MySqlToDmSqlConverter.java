@@ -26,6 +26,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_MAKEDATE_RULE = "MYSQL_MAKEDATE_TO_DATEADD";
     public static final String MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE =
             "MYSQL_INFORMATION_SCHEMA_COLUMNS_TO_ALL_TAB_COLUMNS";
+    public static final String MYSQL_INFORMATION_SCHEMA_TABLES_RULE =
+            "MYSQL_INFORMATION_SCHEMA_TABLES_TO_ALL_TABLES";
     public static final String MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE = "MYSQL_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
@@ -50,6 +52,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CONVERT_DECIMAL_RULE = "MYSQL_CONVERT_DECIMAL_TO_CAST";
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
+    public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
@@ -209,6 +212,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^\\s*select\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
                     + "(?<where>.+?)(?:\\s+order\\s+by\\s+ordinal_position\\s*(?<direction>asc|desc)?\\s*)?;?\\s*$"
     );
+    private static final Pattern INFORMATION_SCHEMA_TABLES_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+count\\s*\\(\\s*(?:\\*|1)\\s*\\)"
+                    + "(?:\\s+(?:as\\s+)?(?<alias>[A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\"))?"
+                    + "\\s+from\\s+information_schema\\s*\\.\\s*tables\\s+where\\s+(?<where>.+?)\\s*;?\\s*$"
+    );
     private static final Pattern METADATA_TABLE_NAME_CONDITION = Pattern.compile(
             "(?is)\\btable_name\\s*=\\s*(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*')"
     );
@@ -256,6 +264,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (selectModifierConversion.changed()) {
             converted = selectModifierConversion.convertedSql();
             rules.add(MYSQL_SELECT_MODIFIER_REMOVAL_RULE);
+        }
+
+        GenericConversion collateClauseConversion = removeMysqlCollateClauses(converted);
+        if (collateClauseConversion.changed()) {
+            converted = collateClauseConversion.convertedSql();
+            rules.add(MYSQL_COLLATE_CLAUSE_REMOVAL_RULE);
         }
 
         GenericConversion dateSubConversion = convertDateSubInterval(converted);
@@ -461,6 +475,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (informationSchemaColumnsConversion.changed()) {
             converted = informationSchemaColumnsConversion.convertedSql();
             rules.add(MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+        }
+
+        GenericConversion informationSchemaTablesConversion = convertInformationSchemaTables(converted);
+        if (informationSchemaTablesConversion.changed()) {
+            converted = informationSchemaTablesConversion.convertedSql();
+            rules.add(MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -711,6 +731,51 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return previousWord != null
                 && isOnlyWhitespace(sql, previousWord.endIndex(), index)
                 && MYSQL_SELECT_MODIFIER_CONTEXT_WORDS.contains(previousWord.text().toUpperCase(Locale.ROOT));
+    }
+
+    private GenericConversion removeMysqlCollateClauses(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                int collateEnd = readMysqlCollateClauseEnd(sql, index);
+                if (collateEnd < 0) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    index = collateEnd;
+                    changed = true;
+                }
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private int readMysqlCollateClauseEnd(String sql, int index) {
+        if (!startsKeyword(sql, index, "COLLATE")) {
+            return -1;
+        }
+        int collationStart = skipWhitespace(sql, index + "COLLATE".length());
+        int cursor = collationStart;
+        while (cursor < sql.length() && isIdentifierPart(sql.charAt(cursor))) {
+            cursor++;
+        }
+        if (cursor == collationStart) {
+            return -1;
+        }
+        return skipWhitespace(sql, cursor);
     }
 
     private GenericConversion convertDateSubInterval(String sql) {
@@ -1542,6 +1607,36 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + tableSchema
                 + ") ORDER BY COLUMN_ID"
                 + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaTables(String sql) {
+        Matcher matcher = INFORMATION_SCHEMA_TABLES_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String whereClause = matcher.group("where");
+        Matcher tableNameMatcher = METADATA_TABLE_NAME_CONDITION.matcher(whereClause);
+        if (!tableNameMatcher.find()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableName = tableNameMatcher.group("value").trim();
+        Matcher tableSchemaMatcher = METADATA_TABLE_SCHEMA_CONDITION.matcher(whereClause);
+        String tableSchema = tableSchemaMatcher.find() ? tableSchemaMatcher.group("value").trim() : "";
+        String residual = tableNameMatcher.replaceAll("");
+        residual = METADATA_TABLE_SCHEMA_CONDITION.matcher(residual).replaceAll("");
+        residual = residual.replaceAll("(?i)\\bAND\\b", "")
+                .replaceAll("[()\\s]", "");
+        if (!residual.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String alias = matcher.group("alias");
+        String converted = "SELECT COUNT(*)"
+                + (alias == null || alias.isBlank() ? "" : " AS " + alias)
+                + " FROM ALL_TABLES WHERE TABLE_NAME = UPPER("
+                + tableName
+                + ")"
+                + (tableSchema.isBlank() ? "" : " AND OWNER = UPPER(" + tableSchema + ")");
         return new GenericConversion(converted, true);
     }
 
