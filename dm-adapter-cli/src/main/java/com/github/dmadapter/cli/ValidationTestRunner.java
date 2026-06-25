@@ -343,30 +343,34 @@ class ValidationTestRunner {
         try {
             String markdown = Files.readString(report, StandardCharsets.UTF_8);
             List<String> summary = new ArrayList<>();
-            summary.add("Validation report summary:");
-            appendCountLine(summary, markdown, "- Passed:");
-            appendCountLine(summary, markdown, "- Failed:");
-            appendCountLine(summary, markdown, "- Skipped:");
-            appendReportSectionSummary(summary, markdown, "Failure Categories");
-            appendReportSectionSummary(summary, markdown, "Failure Patterns");
-            appendReportSectionSummary(summary, markdown, "Schema Object Hotspots");
+            summary.add("验证报告摘要:");
+            appendCountLine(summary, markdown, "- 通过:", "- Passed:");
+            appendCountLine(summary, markdown, "- 失败:", "- Failed:");
+            appendCountLine(summary, markdown, "- 跳过:", "- Skipped:");
+            appendReportSectionSummary(summary, markdown, "失败分类汇总", "Failure Categories");
+            appendReportSectionSummary(summary, markdown, "失败模式汇总", "Failure Patterns");
+            appendReportSectionSummary(summary, markdown, "库表对象缺失热点", "Schema Object Hotspots");
             return summary.size() == 1 ? List.of() : summary;
         } catch (IOException e) {
-            return List.of("Validation report summary unavailable: " + e.getMessage());
+            return List.of("验证报告摘要不可用: " + e.getMessage());
         }
     }
 
-    private void appendCountLine(List<String> summary, String markdown, String prefix) {
+    private void appendCountLine(List<String> summary, String markdown, String primaryPrefix, String legacyPrefix) {
         for (String line : markdown.split("\\R")) {
-            if (line.startsWith(prefix)) {
+            if (line.startsWith(primaryPrefix)) {
                 summary.add(line);
+                return;
+            }
+            if (line.startsWith(legacyPrefix)) {
+                summary.add(primaryPrefix + line.substring(legacyPrefix.length()));
                 return;
             }
         }
     }
 
-    private void appendReportSectionSummary(List<String> summary, String markdown, String heading) {
-        List<String> lines = sectionLines(markdown, "## " + heading);
+    private void appendReportSectionSummary(List<String> summary, String markdown, String heading, String legacyHeading) {
+        List<String> lines = sectionLines(markdown, "## " + heading, "## " + legacyHeading);
         if (lines.isEmpty()) {
             return;
         }
@@ -375,7 +379,7 @@ class ValidationTestRunner {
         boolean omittedCurrentTableRows = false;
         for (String line : lines) {
             if (line.startsWith("### ")) {
-                summary.add(line.substring("### ".length()) + ":");
+                summary.add(reportSubheadingDisplay(line.substring("### ".length())) + ":");
                 rowsInCurrentTable = 0;
                 omittedCurrentTableRows = false;
                 continue;
@@ -394,12 +398,21 @@ class ValidationTestRunner {
         }
     }
 
-    private List<String> sectionLines(String markdown, String heading) {
+    private String reportSubheadingDisplay(String heading) {
+        return switch (heading) {
+            case "Missing Tables/Views" -> "缺失表/视图";
+            case "Missing Columns" -> "缺失字段";
+            default -> heading;
+        };
+    }
+
+    private List<String> sectionLines(String markdown, String... headings) {
         String[] lines = markdown.split("\\R");
         List<String> section = new ArrayList<>();
         boolean inSection = false;
+        Set<String> targetHeadings = Set.of(headings);
         for (String line : lines) {
-            if (line.equals(heading)) {
+            if (targetHeadings.contains(line)) {
                 inSection = true;
                 continue;
             }
@@ -443,7 +456,11 @@ class ValidationTestRunner {
         return "Category".equals(value)
                 || "Pattern".equals(value)
                 || "Object".equals(value)
-                || "Column".equals(value);
+                || "Column".equals(value)
+                || "分类".equals(value)
+                || "模式".equals(value)
+                || "对象".equals(value)
+                || "字段".equals(value);
     }
 
     private Path workingDirectory(ValidationTestGenerationResult generationResult) {

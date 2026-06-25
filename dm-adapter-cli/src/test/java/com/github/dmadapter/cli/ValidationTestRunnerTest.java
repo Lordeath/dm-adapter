@@ -146,37 +146,37 @@ class ValidationTestRunnerTest {
     @Test
     void includesValidationReportSummaryInRunOutput() throws IOException {
         String reportContent = """
-                # Dameng SQL Validation Report
+                # 达梦 SQL 验证报告
 
-                - Passed: `790`
-                - Failed: `451`
-                - Skipped: `234`
+                - 通过: `790`
+                - 失败: `451`
+                - 跳过: `234`
 
-                ## Failure Categories
+                ## 失败分类汇总
 
-                | Category | Count | Hint |
+                | 分类 | 数量 | 处理建议 |
                 | --- | ---: | --- |
-                | TEST_SCHEMA | 336 | Align schema. |
-                | SQL_SYNTAX | 45 | Rewrite SQL. |
+                | 测试库对象问题 (TEST_SCHEMA) | 336 | 对齐测试库。 |
+                | SQL 语法问题 (SQL_SYNTAX) | 45 | 改写 SQL。 |
 
-                ## Failure Patterns
+                ## 失败模式汇总
 
-                | Pattern | Count |
+                | 模式 | 数量 |
                 | --- | ---: |
-                | TEST_SCHEMA_OBJECT | 336 |
-                | MYSQL_JSON_SQL | 5 |
+                | 测试库缺少对象 (TEST_SCHEMA_OBJECT) | 336 |
+                | MySQL JSON SQL (MYSQL_JSON_SQL) | 5 |
 
-                ## Schema Object Hotspots
+                ## 库表对象缺失热点
 
-                ### Missing Tables/Views
+                ### 缺失表/视图
 
-                | Object | Count |
+                | 对象 | 数量 |
                 | --- | ---: |
                 | ns_attendance_machine_management | 26 |
 
-                ### Missing Columns
+                ### 缺失字段
 
-                | Column | Count |
+                | 字段 | 数量 |
                 | --- | ---: |
                 | user_name | 70 |
                 """;
@@ -206,21 +206,90 @@ class ValidationTestRunnerTest {
 
         assertThat(result.outputTail())
                 .contains(
-                        "Validation report summary:",
-                        "- Passed: `790`",
-                        "- Failed: `451`",
-                        "- Skipped: `234`",
-                        "Failure Categories:",
-                        "- TEST_SCHEMA: 336",
-                        "- SQL_SYNTAX: 45",
-                        "Failure Patterns:",
-                        "- TEST_SCHEMA_OBJECT: 336",
-                        "- MYSQL_JSON_SQL: 5",
-                        "Schema Object Hotspots:",
-                        "Missing Tables/Views:",
+                        "验证报告摘要:",
+                        "- 通过: `790`",
+                        "- 失败: `451`",
+                        "- 跳过: `234`",
+                        "失败分类汇总:",
+                        "- 测试库对象问题 (TEST_SCHEMA): 336",
+                        "- SQL 语法问题 (SQL_SYNTAX): 45",
+                        "失败模式汇总:",
+                        "- 测试库缺少对象 (TEST_SCHEMA_OBJECT): 336",
+                        "- MySQL JSON SQL (MYSQL_JSON_SQL): 5",
+                        "库表对象缺失热点:",
+                        "缺失表/视图:",
                         "- ns_attendance_machine_management: 26",
-                        "Missing Columns:",
+                        "缺失字段:",
                         "- user_name: 70"
+                );
+    }
+
+    @Test
+    void includesLegacyEnglishValidationReportSummaryInRunOutput() throws IOException {
+        String reportContent = """
+                # Dameng SQL Validation Report
+
+                - Passed: `790`
+                - Failed: `451`
+                - Skipped: `234`
+
+                ## Failure Categories
+
+                | Category | Count | Hint |
+                | --- | ---: | --- |
+                | TEST_SCHEMA | 336 | Align schema. |
+
+                ## Failure Patterns
+
+                | Pattern | Count |
+                | --- | ---: |
+                | MYSQL_JSON_SQL | 5 |
+
+                ## Schema Object Hotspots
+
+                ### Missing Tables/Views
+
+                | Object | Count |
+                | --- | ---: |
+                | ns_attendance_machine_management | 26 |
+                """;
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> processWithOutput("maven output\n", 1, () -> {
+                    try {
+                        Files.createDirectories(tempDir.resolve(".dm-adapter"));
+                        Files.writeString(tempDir.resolve(".dm-adapter/sql-validation-report.md"), reportContent);
+                    } catch (IOException e) {
+                        throw new AssertionError(e);
+                    }
+                }),
+                new RecordingShutdownHookRegistry()
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(result.outputTail())
+                .contains(
+                        "验证报告摘要:",
+                        "- 通过: `790`",
+                        "- 失败: `451`",
+                        "- 跳过: `234`",
+                        "失败分类汇总:",
+                        "- TEST_SCHEMA: 336",
+                        "失败模式汇总:",
+                        "- MYSQL_JSON_SQL: 5",
+                        "库表对象缺失热点:",
+                        "缺失表/视图:",
+                        "- ns_attendance_machine_management: 26"
                 );
     }
 
@@ -256,6 +325,7 @@ class ValidationTestRunnerTest {
         assertThat(result.reportPath()).isNull();
         assertThat(result.outputTail())
                 .noneSatisfy(line -> assertThat(line).contains("Validation report summary"))
+                .noneSatisfy(line -> assertThat(line).contains("验证报告摘要"))
                 .anySatisfy(line -> assertThat(line).contains("pom failure"));
     }
 

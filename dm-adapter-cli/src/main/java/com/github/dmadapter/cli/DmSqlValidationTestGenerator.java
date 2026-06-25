@@ -2385,22 +2385,22 @@ class DmSqlValidationTestGenerator {
             """
                 private String markdown(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
                     StringBuilder markdown = new StringBuilder();
-                    markdown.append("# Dameng SQL Validation Report\\n\\n");
-                    markdown.append("- Passed: `").append(count(records, "PASSED")).append("`\\n");
-                    markdown.append("- Failed: `").append(count(records, "FAILED")).append("`\\n");
-                    markdown.append("- Skipped: `").append(count(records, "SKIPPED")).append("`\\n\\n");
+                    markdown.append("# 达梦 SQL 验证报告\\n\\n");
+                    markdown.append("- 通过: `").append(count(records, "PASSED")).append("`\\n");
+                    markdown.append("- 失败: `").append(count(records, "FAILED")).append("`\\n");
+                    markdown.append("- 跳过: `").append(count(records, "SKIPPED")).append("`\\n\\n");
                     appendUsageFilterSummary(markdown, records, usageFilterReport);
                     appendFailureCategorySummary(markdown, records);
                     appendFailurePatternSummary(markdown, records);
                     appendSchemaObjectSummary(markdown, records);
                     appendSuggestedNextActions(markdown, records);
-                    markdown.append("## Results\\n\\n");
-                    markdown.append("| Status | Category | Pattern | Mapper Method | Parameter Source | Parameters | Summary | Hint |\\n");
+                    markdown.append("## 验证结果\\n\\n");
+                    markdown.append("| 状态 | 分类 | 模式 | Mapper 方法 | 参数来源 | 参数 | 摘要 | 处理建议 |\\n");
                     markdown.append("| --- | --- | --- | --- | --- | --- | --- | --- |\\n");
                     for (ValidationRecord record : records) {
-                        markdown.append("| ").append(record.status)
-                                .append(" | ").append(escapeMarkdown(category(record)))
-                                .append(" | ").append(escapeMarkdown(failurePattern(record)))
+                        markdown.append("| ").append(escapeMarkdown(statusDisplay(record.status)))
+                                .append(" | ").append(escapeMarkdown(categoryDisplay(category(record))))
+                                .append(" | ").append(escapeMarkdown(failurePatternDisplay(failurePattern(record))))
                                 .append(" | `").append(escapeMarkdown(record.key)).append("`")
                                 .append(" | ").append(escapeMarkdown(record.parameterSource))
                                 .append(" | ").append(escapeMarkdown(abbreviate(record.parameterSummary, 240)))
@@ -2417,15 +2417,15 @@ class DmSqlValidationTestGenerator {
                         List<ValidationRecord> records,
                         UsageFilterReport usageFilterReport
                 ) {
-                    markdown.append("## Usage Filter\\n\\n");
-                    markdown.append("- Enabled: `").append(usageFilterReport.enabled).append("`\\n");
-                    markdown.append("- Available: `").append(usageFilterReport.available).append("`\\n");
-                    markdown.append("- Class directories: `").append(usageFilterReport.classDirectoryCount).append("`\\n");
-                    markdown.append("- Class files scanned: `").append(usageFilterReport.classFileCount).append("`\\n");
-                    markdown.append("- Referenced mapper methods: `").append(usageFilterReport.referencedMethodCount).append("`\\n");
-                    markdown.append("- Skipped as unused: `").append(unusedSkippedCount(records)).append("`\\n");
+                    markdown.append("## 使用情况过滤器\\n\\n");
+                    markdown.append("- 已启用: `").append(usageFilterReport.enabled).append("`\\n");
+                    markdown.append("- 可用: `").append(usageFilterReport.available).append("`\\n");
+                    markdown.append("- class 目录数: `").append(usageFilterReport.classDirectoryCount).append("`\\n");
+                    markdown.append("- 已扫描 class 文件数: `").append(usageFilterReport.classFileCount).append("`\\n");
+                    markdown.append("- 被业务代码引用的 mapper 方法数: `").append(usageFilterReport.referencedMethodCount).append("`\\n");
+                    markdown.append("- 因未使用而跳过: `").append(unusedSkippedCount(records)).append("`\\n");
                     for (String warning : usageFilterReport.warnings) {
-                        markdown.append("- Warning: ").append(escapeMarkdown(warning)).append("\\n");
+                        markdown.append("- 警告: ").append(escapeMarkdown(warning)).append("\\n");
                     }
                     markdown.append("\\n");
                 }
@@ -2435,11 +2435,11 @@ class DmSqlValidationTestGenerator {
                     if (countsByCategory.isEmpty()) {
                         return;
                     }
-                    markdown.append("## Failure Categories\\n\\n");
-                    markdown.append("| Category | Count | Hint |\\n");
+                    markdown.append("## 失败分类汇总\\n\\n");
+                    markdown.append("| 分类 | 数量 | 处理建议 |\\n");
                     markdown.append("| --- | ---: | --- |\\n");
                     for (Map.Entry<String, Long> entry : countsByCategory.entrySet()) {
-                        markdown.append("| ").append(escapeMarkdown(entry.getKey()))
+                        markdown.append("| ").append(escapeMarkdown(categoryDisplay(entry.getKey())))
                                 .append(" | ").append(entry.getValue())
                                 .append(" | ").append(escapeMarkdown(categoryHint(entry.getKey())))
                                 .append(" |\\n");
@@ -2452,11 +2452,11 @@ class DmSqlValidationTestGenerator {
                     if (countsByPattern.isEmpty()) {
                         return;
                     }
-                    markdown.append("## Failure Patterns\\n\\n");
-                    markdown.append("| Pattern | Count |\\n");
+                    markdown.append("## 失败模式汇总\\n\\n");
+                    markdown.append("| 模式 | 数量 |\\n");
                     markdown.append("| --- | ---: |\\n");
                     for (Map.Entry<String, Long> entry : countsByPattern.entrySet()) {
-                        markdown.append("| ").append(escapeMarkdown(entry.getKey()))
+                        markdown.append("| ").append(escapeMarkdown(failurePatternDisplay(entry.getKey())))
                                 .append(" | ").append(entry.getValue())
                                 .append(" |\\n");
                     }
@@ -2469,9 +2469,9 @@ class DmSqlValidationTestGenerator {
                     if (missingTables.isEmpty() && missingColumns.isEmpty()) {
                         return;
                     }
-                    markdown.append("## Schema Object Hotspots\\n\\n");
-                    appendCountSummary(markdown, "Missing Tables/Views", "Object", missingTables, 20);
-                    appendCountSummary(markdown, "Missing Columns", "Column", missingColumns, 30);
+                    markdown.append("## 库表对象缺失热点\\n\\n");
+                    appendCountSummary(markdown, "缺失表/视图", "对象", missingTables, 20);
+                    appendCountSummary(markdown, "缺失字段", "字段", missingColumns, 30);
                 }
 
                 private Map<String, Long> schemaIssueCounts(List<ValidationRecord> records, String marker) {
@@ -2529,12 +2529,12 @@ class DmSqlValidationTestGenerator {
                         return;
                     }
                     markdown.append("### ").append(title).append("\\n\\n");
-                    markdown.append("| ").append(nameHeader).append(" | Count |\\n");
+                    markdown.append("| ").append(nameHeader).append(" | 数量 |\\n");
                     markdown.append("| --- | ---: |\\n");
                     int index = 0;
                     for (Map.Entry<String, Long> entry : counts.entrySet()) {
                         if (index >= limit) {
-                            markdown.append("| ... | ").append(counts.size() - limit).append(" more |\\n");
+                            markdown.append("| ... | 还有 ").append(counts.size() - limit).append(" 项 |\\n");
                             break;
                         }
                         markdown.append("| ").append(escapeMarkdown(entry.getKey()))
@@ -2619,19 +2619,19 @@ class DmSqlValidationTestGenerator {
                     if (failed.isEmpty()) {
                         return;
                     }
-                    markdown.append("\\n## Failure Details\\n\\n");
-                    markdown.append("Long MyBatis messages are shortened here; the JSON report keeps the full message.\\n\\n");
+                    markdown.append("\\n## 失败详情\\n\\n");
+                    markdown.append("这里会截断过长的 MyBatis 错误信息；完整错误请查看 JSON 报告。\\n\\n");
                     for (ValidationRecord record : failed) {
                         markdown.append("<details>\\n");
                         markdown.append("<summary>")
-                                .append(escapeHtml(category(record)))
+                                .append(escapeHtml(categoryDisplay(category(record))))
                                 .append(" / ")
-                                .append(escapeHtml(failurePattern(record)))
+                                .append(escapeHtml(failurePatternDisplay(failurePattern(record))))
                                 .append(" - ")
                                 .append(escapeHtml(record.key))
                                 .append("</summary>\\n\\n");
                         if (record.parameterSummary != null && !record.parameterSummary.isBlank()) {
-                            markdown.append("Parameters: `")
+                            markdown.append("参数: `")
                                     .append(escapeMarkdown(record.parameterSummary))
                                     .append("`\\n\\n");
                         }
@@ -2644,6 +2644,96 @@ class DmSqlValidationTestGenerator {
 
                 private long count(List<ValidationRecord> records, String status) {
                     return records.stream().filter(record -> status.equals(record.status)).count();
+                }
+
+                private String statusDisplay(String status) {
+                    return switch (status) {
+                        case "PASSED" -> "通过 (PASSED)";
+                        case "FAILED" -> "失败 (FAILED)";
+                        case "SKIPPED" -> "跳过 (SKIPPED)";
+                        default -> status;
+                    };
+                }
+
+                private String categoryDisplay(String category) {
+                    return displayCode(category, categoryLabel(category));
+                }
+
+                private String categoryLabel(String category) {
+                    return switch (category) {
+                        case "PASSED" -> "通过";
+                        case "SKIPPED" -> "跳过";
+                        case "CONFIGURATION" -> "配置问题";
+                        case "METHOD_ARGS_OR_BINDING" -> "方法参数或绑定问题";
+                        case "MYSQL_METADATA_SQL" -> "MySQL 元数据 SQL";
+                        case "TEST_SCHEMA" -> "测试库对象问题";
+                        case "TEST_DATA_OR_SCHEMA" -> "测试数据或库结构问题";
+                        case "SQL_SYNTAX" -> "SQL 语法问题";
+                        case "TEST_DATA" -> "测试数据问题";
+                        case "UNKNOWN_FAILURE" -> "未分类失败";
+                        default -> category.endsWith("_OTHER") ? "其他未分类问题" : "";
+                    };
+                }
+
+                private String failurePatternDisplay(String pattern) {
+                    if (pattern == null || pattern.isBlank()) {
+                        return "";
+                    }
+                    return displayCode(pattern, failurePatternLabel(pattern));
+                }
+
+                private String failurePatternLabel(String pattern) {
+                    return switch (pattern) {
+                        case "MYSQL_METADATA_SQL" -> "MySQL 元数据查询";
+                        case "MYSQL_SELECT_MODIFIER" -> "MySQL SELECT 修饰符";
+                        case "MYSQL_INDEX_HINT" -> "MySQL 索引提示";
+                        case "MYSQL_INSERT_VALUE_KEYWORD" -> "MySQL VALUE 关键字";
+                        case "MYSQL_CONVERT_DECIMAL" -> "MySQL CONVERT DECIMAL";
+                        case "MYSQL_USER_VARIABLE" -> "MySQL 用户变量";
+                        case "DYNAMIC_IDENTIFIER_PARAMETER" -> "动态标识符参数";
+                        case "BROKEN_DYNAMIC_SQL_OR_ARGS" -> "动态 SQL 或示例参数异常";
+                        case "TEST_SCHEMA_OBJECT" -> "测试库缺少对象";
+                        case "INSERT_IGNORE" -> "INSERT IGNORE";
+                        case "MYSQL_GROUP_CONCAT" -> "GROUP_CONCAT 函数";
+                        case "MYSQL_CONCAT_WS" -> "CONCAT_WS 函数";
+                        case "MYSQL_DATE_SUB_INTERVAL" -> "DATE_SUB INTERVAL";
+                        case "MYSQL_DATE_ADD_INTERVAL" -> "DATE_ADD INTERVAL";
+                        case "MYSQL_PERIOD_DIFF_YEARMONTH" -> "PERIOD_DIFF 年月差";
+                        case "MYSQL_COUNT_CONDITION_OR_NULL" -> "COUNT 条件 OR NULL";
+                        case "MYSQL_NOT_ISNULL" -> "!ISNULL 表达式";
+                        case "MYSQL_BOOLEAN_OPERATOR" -> "MySQL 布尔运算符";
+                        case "MYSQL_CONVERT_UNSIGNED" -> "CONVERT UNSIGNED";
+                        case "MYSQL_CONVERT_GBK_ORDER" -> "GBK 排序转换";
+                        case "MYSQL_UPDATE_ORDER_LIMIT" -> "UPDATE ORDER BY LIMIT";
+                        case "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON" -> "JSON_TABLE JOIN 缺少 ON";
+                        case "MYSQL_IMPLICIT_CROSS_JOIN" -> "隐式 CROSS JOIN";
+                        case "MYSQL_TEMPORARY_TABLE_AS_SELECT" -> "临时表 AS SELECT";
+                        case "DAMENG_KEYWORD_TABLE_ALIAS" -> "达梦关键字表别名";
+                        case "DAMENG_RESERVED_IDENTIFIER" -> "达梦保留字标识符";
+                        case "MYSQL_JSON_SQL" -> "MySQL JSON SQL";
+                        case "MYSQL_UPDATE_JOIN" -> "UPDATE JOIN";
+                        case "RAW_SQL_PARAMETER" -> "原始 SQL 参数";
+                        case "AMBIGUOUS_COLUMN" -> "歧义列名";
+                        case "EMPTY_SELECT_LIST" -> "空 SELECT 列表";
+                        case "GENERATED_ORDER_PARAMETER" -> "生成的排序参数";
+                        case "UPDATE_SET_TABLE_ORDER" -> "UPDATE SET 语序";
+                        case "ON_DUPLICATE_KEY_UPDATE" -> "ON DUPLICATE KEY UPDATE";
+                        case "INSERT_FOREACH_MISSING_VALUES" -> "INSERT foreach 缺少 VALUES";
+                        case "REGEXP_OPERATOR" -> "REGEXP 操作符";
+                        case "DOUBLE_QUOTED_IDENTIFIER_OR_STRING" -> "双引号标识符或字符串";
+                        case "TRAILING_COMMA" -> "多余逗号";
+                        case "NULL_COLLECTION_PARAMETER" -> "集合参数为空";
+                        case "BINDING_PARAMETER_NAME" -> "绑定参数名问题";
+                        case "TEST_DATA_OR_CONSTRAINT" -> "测试数据或约束问题";
+                        default -> pattern.endsWith("_OTHER") ? "其他未分类模式" : "";
+                    };
+                }
+
+                private String displayCode(String code, String label) {
+                    if (code == null || code.isBlank()) {
+                        return "";
+                    }
+                    return label == null || label.isBlank() ? code : label + " (" + code + ")";
                 }
 
                 private String json(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
@@ -3056,28 +3146,28 @@ class DmSqlValidationTestGenerator {
 
                 private String categoryHint(String category) {
                     if ("CONFIGURATION".equals(category)) {
-                        return "Check sql-validation.yml, mapper XML locations, datasource variables, type aliases, and mapper binding.";
+                        return "检查 sql-validation.yml、mapper XML 路径、数据源环境变量、类型别名、类型处理器和 mapper 绑定。";
                     }
                     if ("MYSQL_METADATA_SQL".equals(category)) {
-                        return "MySQL metadata SQL such as information_schema/database() needs manual Dameng rewrite.";
+                        return "information_schema、database() 等 MySQL 元数据 SQL 需要手工改成达梦写法。";
                     }
                     if ("METHOD_ARGS_OR_BINDING".equals(category)) {
-                        return "Generated sample args did not satisfy mapper dynamic SQL or @Param binding; configure method args or inspect mapper parameter names.";
+                        return "生成的示例参数未满足动态 SQL 或 @Param 绑定；请配置方法参数或检查 mapper 参数名。";
                     }
                     if ("SQL_SYNTAX".equals(category)) {
-                        return "Dameng rejected the SQL syntax; inspect mapper-dm SQL and convert the incompatible fragment manually.";
+                        return "达梦拒绝了 SQL 语法；请检查 mapper-dm SQL，并手工处理未兼容的片段。";
                     }
                     if ("TEST_SCHEMA".equals(category)) {
-                        return "The Dameng test schema is missing a table/view/column, or object names differ from the mapper SQL.";
+                        return "达梦测试库缺少表、视图或字段，或对象命名与 mapper SQL 不一致。";
                     }
                     if ("TEST_DATA_OR_SCHEMA".equals(category)) {
-                        return "Generated test parameters or table DDL do not satisfy constraints; check identity/sequence/default values, column length, seed data, or configure method args.";
+                        return "生成参数或表结构不满足约束；请检查自增、序列、默认值、字段长度、种子数据，或配置方法参数。";
                     }
                     if ("TEST_DATA".equals(category)) {
-                        return "The SQL ran but the current test data does not match mapper expectations; adjust seed data or method args.";
+                        return "SQL 已执行，但当前测试数据不符合 mapper 预期；请调整种子数据或方法参数。";
                     }
                     if ("UNKNOWN_FAILURE".equals(category)) {
-                        return "Review the failure detail and decide whether it is SQL compatibility, test schema, or test data.";
+                        return "查看失败详情，判断属于 SQL 兼容、测试库结构还是测试数据问题。";
                     }
                     return "";
                 }
