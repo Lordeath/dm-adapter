@@ -1462,9 +1462,7 @@ class DmSqlValidationTestGenerator {
                     if (normalized.contains("code")) {
                         return "CODE";
                     }
-                    if (normalized.contains("date")
-                            || normalized.contains("time")
-                            || normalized.endsWith("day")) {
+                    if (isDateLikeParameterName(normalized)) {
                         return "2024-01-01 00:00:00";
                     }
                     return defaultString(valueName);
@@ -1510,7 +1508,10 @@ class DmSqlValidationTestGenerator {
                     if (isIdLikeParameterName(normalized)) {
                         return 1L;
                     }
-                    if (normalized.contains("date") || normalized.contains("time")) {
+                    if (isNumericTextParameterName(normalized)) {
+                        return BigDecimal.ONE;
+                    }
+                    if (isDateLikeParameterName(normalized)) {
                         return "2024-01-01 00:00:00";
                     }
                     return null;
@@ -1560,7 +1561,7 @@ class DmSqlValidationTestGenerator {
                     if (isCompactEnumStringName(normalized) || isDeletionFlagName(normalized) || isNumericParameterName(normalized)) {
                         return 1;
                     }
-                    if (normalized.endsWith("day") || normalized.contains("date") || normalized.contains("time")) {
+                    if (isDateLikeParameterName(normalized)) {
                         return "2024-01-01 00:00:00";
                     }
                     return defaultString(valueName);
@@ -2864,8 +2865,7 @@ class DmSqlValidationTestGenerator {
                     if (isNumericSqlFragmentName(normalized)) {
                         return 1L;
                     }
-                    if (normalized.endsWith("id")
-                            || normalized.endsWith("ids")
+                    if (isIdLikeParameterName(normalized)
                             || normalized.contains("key")) {
                         return 1L;
                     }
@@ -2918,7 +2918,10 @@ class DmSqlValidationTestGenerator {
                     if (isCompactEnumStringName(normalized)) {
                         return "1";
                     }
-                    if (normalized.contains("date") || normalized.contains("time")) {
+                    if (isNumericTextParameterName(normalized)) {
+                        return "1";
+                    }
+                    if (isDateLikeParameterName(normalized)) {
                         return "2024-01-01 00:00:00";
                     }
                     if (normalized.contains("comparison")) {
@@ -3218,11 +3221,49 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean isIdLikeParameterName(String normalizedName) {
+                    if (normalizedName.endsWith("idname")
+                            || normalizedName.endsWith("idsname")
+                            || normalizedName.endsWith("idnames")
+                            || normalizedName.contains("username")) {
+                        return false;
+                    }
                     return normalizedName.endsWith("id")
                             || normalizedName.endsWith("ids")
                             || normalizedName.contains("userid")
                             || normalizedName.contains("enterpriseid")
                             || normalizedName.contains("organizationid");
+                }
+
+                private boolean isDateLikeParameterName(String normalizedName) {
+                    return "date".equals(normalizedName)
+                            || "time".equals(normalizedName)
+                            || normalizedName.endsWith("date")
+                            || normalizedName.endsWith("datetime")
+                            || "starttime".equals(normalizedName)
+                            || "endtime".equals(normalizedName)
+                            || "begintime".equals(normalizedName)
+                            || "finishtime".equals(normalizedName);
+                }
+
+                private boolean isNumericTextParameterName(String normalizedName) {
+                    if (normalizedName.contains("name")
+                            || normalizedName.contains("code")
+                            || normalizedName.endsWith("no")
+                            || normalizedName.contains("orderno")
+                            || normalizedName.contains("billno")
+                            || normalizedName.contains("phone")
+                            || normalizedName.contains("mobile")
+                            || normalizedName.contains("number")
+                            || normalizedName.contains("contactnumber")) {
+                        return false;
+                    }
+                    return normalizedName.endsWith("num")
+                            || normalizedName.contains("price")
+                            || normalizedName.contains("amount")
+                            || normalizedName.contains("money")
+                            || normalizedName.contains("fee")
+                            || normalizedName.contains("rate")
+                            || normalizedName.contains("ratio");
                 }
 
                 private boolean isCompactEnumStringName(String normalizedName) {
@@ -3558,8 +3599,9 @@ class DmSqlValidationTestGenerator {
                             "INSERT_IGNORE")) {
                         markdown.append("- 为 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写补充 .dm-adapter/sql-rewrite.yml 中的 keyColumns，重新执行 migrate 后再验证。\\n");
                     }
-                    if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")) {
-                        markdown.append("- 先对齐达梦测试 schema 中缺失的表、视图、字段或对象命名差异，再将其视为 SQL 改写失败。\\n");
+                    if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")
+                            || countsByPattern.containsKey("TEST_SCHEMA_FUNCTION")) {
+                        markdown.append("- 先对齐达梦测试 schema 中缺失的表、视图、字段、函数或对象命名差异，再将其视为 SQL 改写失败。\\n");
                     }
                     if (countsByPattern.containsKey("BROKEN_DYNAMIC_SQL_OR_ARGS")) {
                         markdown.append("- 检查 mapper 动态 SQL 分支和生成的示例参数；缺少逗号、空条件、非法动态占位符等问题通常属于 mapper 结构或验证参数问题。\\n");
@@ -3715,6 +3757,8 @@ class DmSqlValidationTestGenerator {
                             return "动态 SQL 或示例参数异常";
                         case "TEST_SCHEMA_OBJECT":
                             return "测试库缺少对象";
+                        case "TEST_SCHEMA_FUNCTION":
+                            return "测试库缺少函数/自定义函数";
                         case "TEST_DATA_TYPE_MISMATCH":
                             return "测试参数类型不匹配";
                         case "TEST_DATA_FOREIGN_KEY_CONSTRAINT":
@@ -3974,6 +4018,9 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_USER_VARIABLE";
                     }
+                    if (isAutoParameter(record) && hasMissingDynamicIdentifierIssue(message)) {
+                        return "DYNAMIC_IDENTIFIER_PARAMETER";
+                    }
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
                         return "DYNAMIC_IDENTIFIER_PARAMETER";
                     }
@@ -3983,11 +4030,14 @@ class DmSqlValidationTestGenerator {
                     if (isAutoParameter(record) && hasGeneratedSearchParameterIssue(record, message)) {
                         return "GENERATED_SEARCH_PARAMETER";
                     }
+                    if (hasOriginalXmlSyntaxDefect(message)) {
+                        return "ORIGINAL_XML_SYNTAX_DEFECT";
+                    }
                     if (lower.contains("sql语句为null或空值") || hasBrokenDynamicSqlShape(message)) {
                         return "BROKEN_DYNAMIC_SQL_OR_ARGS";
                     }
-                    if (hasOriginalXmlSyntaxDefect(message)) {
-                        return "ORIGINAL_XML_SYNTAX_DEFECT";
+                    if (hasUnresolvedFunctionObject(message)) {
+                        return "TEST_SCHEMA_FUNCTION";
                     }
                     if (isSchemaObjectFailure(lower)) {
                         return "TEST_SCHEMA_OBJECT";
@@ -4161,6 +4211,16 @@ class DmSqlValidationTestGenerator {
                     return Pattern.compile("\\\\bcollate\\\\s+[A-Za-z0-9_]+", Pattern.CASE_INSENSITIVE).matcher(message).find();
                 }
 
+                private boolean hasMissingDynamicIdentifierIssue(String message) {
+                    String value = message == null ? "" : message;
+                    String lower = value.toLowerCase(Locale.ROOT);
+                    return lower.contains("sql语句为null或空值")
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\binsert\\\\s+into\\\\s*\\\\(").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\s+(?:set|where)\\\\b").matcher(value).find()
+                            || Pattern.compile("(?i)无效的表或视图名\\\\s*\\\\[\\\\s*(?:t|b|ID)\\\\s*][\\\\s\\\\S]*?### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join)\\\\s+(?:t|b|ID)\\\\b").matcher(value).find();
+                }
+
                 private boolean hasGeneratedDynamicIdentifierPlaceholder(String message) {
                     return Pattern.compile("(?im)^### SQL:\\\\s*ID\\\\s*$").matcher(message).find()
                             || Pattern.compile("(?im)^### SQL:\\\\s*ID\\\\s+select\\\\b").matcher(message).find()
@@ -4200,15 +4260,31 @@ class DmSqlValidationTestGenerator {
                             && Pattern.compile("无效的列名\\\\s*\\\\[\\\\s*user_name\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find();
                 }
 
+                private boolean hasUnresolvedFunctionObject(String message) {
+                    String value = message == null ? "" : message;
+                    Matcher matcher = Pattern.compile("无法解析的成员访问表达式\\\\s*\\\\[\\\\s*([A-Za-z_][A-Za-z0-9_]*)\\\\s*]", Pattern.CASE_INSENSITIVE)
+                            .matcher(value);
+                    while (matcher.find()) {
+                        String functionName = matcher.group(1);
+                        if (Pattern.compile("\\\\b" + Pattern.quote(functionName) + "\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(value).find()) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
                 private boolean hasOriginalXmlSyntaxDefect(String message) {
+                    String value = message == null ? "" : message;
                     String identifier = "[A-Za-z_][A-Za-z0-9_$]*(?:\\\\s*\\\\.\\\\s*[A-Za-z_][A-Za-z0-9_$]*)?";
-                    String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
+                    String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
-                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(message).find()
-                            || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(message).find()
-                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(message).find()
-                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(message).find();
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\blike\\\\s+\\\\?\\\\s*'").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\band[A-Za-z_][A-Za-z0-9_$]*\\\\s+(?:in|=|<>|!=|>|<|like)\\\\b").matcher(value).find()
+                            || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(value).find();
                 }
 
                 private boolean hasBrokenDynamicSqlShape(String message) {
@@ -4297,6 +4373,12 @@ class DmSqlValidationTestGenerator {
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
                     }
+                    if (isAutoParameter(record) && hasMissingDynamicIdentifierIssue(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
+                    }
+                    if (hasUnresolvedFunctionObject(message)) {
+                        return "TEST_SCHEMA";
+                    }
                     if (hasMysqlCollateClause(message)
                             || hasOriginalXmlSyntaxDefect(message)) {
                         return "SQL_SYNTAX";
@@ -4362,7 +4444,7 @@ class DmSqlValidationTestGenerator {
                         return "达梦拒绝了 SQL 语法；请检查 mapper-dm SQL，并手工处理未兼容的片段。";
                     }
                     if ("TEST_SCHEMA".equals(category)) {
-                        return "达梦测试库缺少表、视图或字段，或对象命名与 mapper SQL 不一致。";
+                        return "达梦测试库缺少表、视图、字段、函数，或对象命名与 mapper SQL 不一致。";
                     }
                     if ("TEST_DATA_OR_SCHEMA".equals(category)) {
                         return "生成参数或表结构不满足约束；请检查自增、序列、默认值、字段长度、种子数据，或配置方法参数。";
