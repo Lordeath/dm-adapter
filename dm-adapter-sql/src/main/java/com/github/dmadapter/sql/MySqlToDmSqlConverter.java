@@ -570,7 +570,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 } else if (literal.closed()
                         && !literal.value().isBlank()
                         && isImplicitSelectAliasPosition(sql, index, literal.nextIndex())) {
-                    converted.append(" AS ").append(quoteDamengIdentifier(literal.value()));
+                    converted.append(converted.length() > 0 && Character.isWhitespace(converted.charAt(converted.length() - 1))
+                            ? "AS "
+                            : " AS ");
+                    converted.append(quoteDamengIdentifier(literal.value()));
                     index = literal.nextIndex();
                     changed = true;
                 } else {
