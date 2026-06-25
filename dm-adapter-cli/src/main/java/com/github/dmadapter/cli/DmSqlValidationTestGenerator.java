@@ -1453,11 +1453,7 @@ class DmSqlValidationTestGenerator {
                     if (isDeletionFlagName(normalized)) {
                         return 1;
                     }
-                    if (normalized.endsWith("id")
-                            || normalized.endsWith("ids")
-                            || normalized.contains("userid")
-                            || normalized.contains("enterpriseid")
-                            || normalized.contains("organizationid")) {
+                    if (isIdLikeParameterName(normalized)) {
                         return 1L;
                     }
                     if (isNumericParameterName(normalized)) {
@@ -1511,6 +1507,9 @@ class DmSqlValidationTestGenerator {
                     if (isDeletionFlagName(normalized) || isNumericParameterName(normalized)) {
                         return 1;
                     }
+                    if (isIdLikeParameterName(normalized)) {
+                        return 1L;
+                    }
                     if (normalized.contains("date") || normalized.contains("time")) {
                         return "2024-01-01 00:00:00";
                     }
@@ -1555,6 +1554,12 @@ class DmSqlValidationTestGenerator {
                         return defaultValueForJdbcType(valueName, jdbcType);
                     }
                     String normalized = normalizeName(valueName);
+                    if (isIdLikeParameterName(normalized)) {
+                        return 1L;
+                    }
+                    if (isCompactEnumStringName(normalized) || isDeletionFlagName(normalized) || isNumericParameterName(normalized)) {
+                        return 1;
+                    }
                     if (normalized.endsWith("day") || normalized.contains("date") || normalized.contains("time")) {
                         return "2024-01-01 00:00:00";
                     }
@@ -2258,6 +2263,10 @@ class DmSqlValidationTestGenerator {
                     if (columnDefault != null) {
                         return ValueResult.resolved(columnDefault);
                     }
+                    if (shouldUseNullDefault(valueName)
+                            && (statement == null || !statement.nonEmptyCollectionParameter(valueName))) {
+                        return ValueResult.resolved(null);
+                    }
                     if (String.class.equals(targetType)) {
                         if (shouldUseNullDefault(valueName)) {
                             return ValueResult.resolved(null);
@@ -2728,7 +2737,7 @@ class DmSqlValidationTestGenerator {
                     if (normalized.contains("rightmap") && !normalized.contains("userrightmap")) {
                         return "1";
                     }
-                    return "user";
+                    return "extField";
                 }
 
                 private Object defaultCollectionElementForColumnType(String collectionName, String columnType) {
@@ -2897,15 +2906,17 @@ class DmSqlValidationTestGenerator {
                     if ("mainsearch".equals(normalized)) {
                         return "";
                     }
-                    if (normalized.endsWith("id")
-                            || normalized.endsWith("ids")
-                            || normalized.contains("userid")
-                            || normalized.contains("enterpriseid")
-                            || normalized.contains("organizationid")) {
+                    if (isOptionalSearchParameterName(normalized)) {
+                        return "";
+                    }
+                    if (isIdLikeParameterName(normalized)) {
                         return "1";
                     }
                     if (normalized.contains("code")) {
                         return "CODE";
+                    }
+                    if (isCompactEnumStringName(normalized)) {
+                        return "1";
                     }
                     if (normalized.contains("date") || normalized.contains("time")) {
                         return "2024-01-01 00:00:00";
@@ -3170,7 +3181,10 @@ class DmSqlValidationTestGenerator {
                 private boolean shouldUseEmptyCollection(String valueName) {
                     String normalized = normalizeName(valueName);
                     return "filterlist".equals(normalized)
+                            || "filter".equals(normalized)
                             || "filters".equals(normalized)
+                            || "otherconditions".equals(normalized)
+                            || "groupconditions".equals(normalized)
                             || "sorts".equals(normalized)
                             || "orderfields".equals(normalized)
                             || "sortfields".equals(normalized)
@@ -3197,7 +3211,55 @@ class DmSqlValidationTestGenerator {
                     return isOrderFieldName(normalized)
                             || isOrderDirectionName(normalized)
                             || isSqlSegmentParameterName(normalized)
-                            || isRawSqlInjectionName(normalized);
+                            || isRawSqlInjectionName(normalized)
+                            || isOptionalSearchParameterName(normalized)
+                            || isDynamicMapParameterName(normalized)
+                            || isOptionalDynamicTableName(normalized);
+                }
+
+                private boolean isIdLikeParameterName(String normalizedName) {
+                    return normalizedName.endsWith("id")
+                            || normalizedName.endsWith("ids")
+                            || normalizedName.contains("userid")
+                            || normalizedName.contains("enterpriseid")
+                            || normalizedName.contains("organizationid");
+                }
+
+                private boolean isCompactEnumStringName(String normalizedName) {
+                    if (normalizedName.contains("name")) {
+                        return false;
+                    }
+                    return normalizedName.endsWith("status")
+                            || normalizedName.endsWith("state")
+                            || normalizedName.endsWith("flag")
+                            || normalizedName.endsWith("type")
+                            || normalizedName.endsWith("sex")
+                            || normalizedName.endsWith("disable")
+                            || normalizedName.endsWith("disabled")
+                            || normalizedName.startsWith("is");
+                }
+
+                private boolean isOptionalSearchParameterName(String normalizedName) {
+                    return "keywords".equals(normalizedName)
+                            || "keyword".equals(normalizedName)
+                            || "groupcondition".equals(normalizedName)
+                            || "groupconditions".equals(normalizedName)
+                            || "filter".equals(normalizedName)
+                            || "filterlist".equals(normalizedName)
+                            || "filters".equals(normalizedName)
+                            || "otherconditions".equals(normalizedName);
+                }
+
+                private boolean isDynamicMapParameterName(String normalizedName) {
+                    return "dynamicmap".equals(normalizedName)
+                            || normalizedName.endsWith("dynamicmap");
+                }
+
+                private boolean isOptionalDynamicTableName(String normalizedName) {
+                    return "extendtable".equals(normalizedName)
+                            || "extendtablename".equals(normalizedName)
+                            || "extensiontable".equals(normalizedName)
+                            || "extensiontablename".equals(normalizedName);
                 }
 
                 private boolean isDynamicIdentifierName(String normalizedName) {
@@ -3631,6 +3693,8 @@ class DmSqlValidationTestGenerator {
                     switch (pattern) {
                         case "MYSQL_METADATA_SQL":
                             return "MySQL 元数据查询";
+                        case "MYSQL_COLLATE_CLAUSE":
+                            return "MySQL COLLATE 子句";
                         case "MYSQL_SELECT_MODIFIER":
                             return "MySQL SELECT 修饰符";
                         case "MYSQL_INDEX_HINT":
@@ -3877,6 +3941,9 @@ class DmSqlValidationTestGenerator {
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
                     }
+                    if (hasMysqlCollateClause(message)) {
+                        return "MYSQL_COLLATE_CLAUSE";
+                    }
                     if (hasMysqlMakeDate(message)) {
                         return "MYSQL_MAKEDATE";
                     }
@@ -4023,7 +4090,7 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(message).find()) {
-                        return "BROKEN_DYNAMIC_SQL_OR_ARGS";
+                        return "ORIGINAL_XML_SYNTAX_DEFECT";
                     }
                     if (Pattern.compile("(?i)(\\\\band\\\\s*\\\\(\\\\s*\\\\)|,\\\\s*where\\\\b|\\\\bwhere\\\\s+and\\\\b|\\\\bwhere\\\\s+where\\\\b|\\\\bfrom\\\\s+where\\\\b|\\\\bset\\\\s+where\\\\b|\\\\?\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\s*=|^### SQL:\\\\s*ID\\\\s+select\\\\b)").matcher(message).find()) {
                         return "BROKEN_DYNAMIC_SQL_OR_ARGS";
@@ -4090,6 +4157,10 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?im)^### SQL:\\\\s*describe\\\\b").matcher(message).find();
                 }
 
+                private boolean hasMysqlCollateClause(String message) {
+                    return Pattern.compile("\\\\bcollate\\\\s+[A-Za-z0-9_]+", Pattern.CASE_INSENSITIVE).matcher(message).find();
+                }
+
                 private boolean hasGeneratedDynamicIdentifierPlaceholder(String message) {
                     return Pattern.compile("(?im)^### SQL:\\\\s*ID\\\\s*$").matcher(message).find()
                             || Pattern.compile("(?im)^### SQL:\\\\s*ID\\\\s+select\\\\b").matcher(message).find()
@@ -4131,7 +4202,11 @@ class DmSqlValidationTestGenerator {
 
                 private boolean hasOriginalXmlSyntaxDefect(String message) {
                     String identifier = "[A-Za-z_][A-Za-z0-9_$]*(?:\\\\s*\\\\.\\\\s*[A-Za-z_][A-Za-z0-9_$]*)?";
-                    return Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(message).find()
+                    String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
+                    return lower.contains("列表不匹配")
+                            || lower.contains("重复的列名")
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(message).find()
+                            || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(message).find();
                 }
@@ -4222,11 +4297,18 @@ class DmSqlValidationTestGenerator {
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
                     }
+                    if (hasMysqlCollateClause(message)
+                            || hasOriginalXmlSyntaxDefect(message)) {
+                        return "SQL_SYNTAX";
+                    }
                     if (hasMysqlMakeDate(message)
                             || hasMysqlSubdate(message)
                             || hasMysqlUpdateJoinMultiTarget(message)
                             || hasOriginalXmlSyntaxDefect(message)) {
                         return "SQL_SYNTAX";
+                    }
+                    if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
                     }
                     if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的模式名", "无法解析的成员访问表达式")) {
                         return "TEST_SCHEMA";

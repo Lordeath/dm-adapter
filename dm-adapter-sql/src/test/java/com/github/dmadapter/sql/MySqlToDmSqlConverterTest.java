@@ -240,6 +240,29 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesMysqlCollateClausesWithoutChangingStringsOrComments() {
+        SqlConversionResult result = converter.convert("""
+                select * from user
+                where name COLLATE utf8mb4_unicode_ci = #{name}
+                  and title COLLATE utf8mb4_bin like '%test%'
+                  and remark = 'COLLATE utf8mb4_unicode_ci'
+                  -- note COLLATE utf8mb4_unicode_ci
+                  /* block COLLATE utf8mb4_unicode_ci */
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select * from user
+                where name = #{name}
+                  and title like '%test%'
+                  and remark = 'COLLATE utf8mb4_unicode_ci'
+                  -- note COLLATE utf8mb4_unicode_ci
+                  /* block COLLATE utf8mb4_unicode_ci */
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE);
+    }
+
+    @Test
     void convertsMysqlConvertDecimalToCast() {
         SqlConversionResult result = converter.convert(
                 "SELECT CONVERT(NVL(SUM(charging_area),0), DECIMAL(16,6)) as chargingArea from owner_house_result"
@@ -629,6 +652,17 @@ class MySqlToDmSqlConverterTest {
                   -- !find_in_set(1, x)
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_NOT_FIND_IN_SET_RULE);
+    }
+
+    @Test
+    void leavesPositiveFindInSetNativeBecauseDamengSupportsIt() {
+        String sql = "select * from bill where FIND_IN_SET(#{status}, status_list)";
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
     }
 
     @Test
@@ -1351,6 +1385,36 @@ class MySqlToDmSqlConverterTest {
                 .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('newsee-quality') ORDER BY COLUMN_ID ASC");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaTablesQueryToAllTables() {
+        SqlConversionResult result = converter.convert("""
+                SELECT COUNT(*) AS table_exists FROM information_schema.TABLES
+                WHERE TABLE_NAME = #{tableName}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT COUNT(*) AS table_exists FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaTablesQueryWithSchemaToAllTables() {
+        SqlConversionResult result = converter.convert("""
+                SELECT COUNT(1) table_count FROM information_schema.tables
+                WHERE TABLE_SCHEMA = 'newsee-contract' AND TABLE_NAME = ?
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT COUNT(*) AS table_count FROM ALL_TABLES WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('newsee-contract')");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }
 
     @Test
