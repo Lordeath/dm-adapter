@@ -21,6 +21,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_DATE_ADD_INTERVAL_RULE = "MYSQL_DATE_ADD_INTERVAL_TO_DATEADD";
+    public static final String MYSQL_MAKEDATE_RULE = "MYSQL_MAKEDATE_TO_DATEADD";
+    public static final String MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE =
+            "MYSQL_INFORMATION_SCHEMA_COLUMNS_TO_ALL_TAB_COLUMNS";
     public static final String MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE = "MYSQL_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
@@ -107,6 +110,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     );
     private static final List<String> MYSQL_FUNCTIONS_REQUIRING_REVIEW = List.of(
             "DATE_SUB",
+            "MAKEDATE",
             "STR_TO_DATE",
             "UNIX_TIMESTAMP",
             "FROM_UNIXTIME",
@@ -197,6 +201,20 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     + DM_IDENTIFIER
                     + ")?)(\\s+)(.+)$"
     );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
+                    + "(?<where>.+?)(?:\\s+order\\s+by\\s+ordinal_position\\s*(?<direction>asc|desc)?\\s*)?;?\\s*$"
+    );
+    private static final Pattern METADATA_TABLE_NAME_CONDITION = Pattern.compile(
+            "(?is)\\btable_name\\s*=\\s*(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*')"
+    );
+    private static final Pattern METADATA_TABLE_SCHEMA_CONDITION = Pattern.compile(
+            "(?is)\\btable_schema\\s*=\\s*(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*')"
+    );
+    private static final Pattern UPDATE_SET_QUALIFIED_ASSIGNMENT = Pattern.compile(
+            "(?is)^\\s*(?<alias>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\.\\s*"
+                    + "(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*="
+    );
 
     @Override
     public SqlConversionResult convert(String sql) {
@@ -246,6 +264,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (dateAddIntervalConversion.changed()) {
             converted = dateAddIntervalConversion.convertedSql();
             rules.add(MYSQL_DATE_ADD_INTERVAL_RULE);
+        }
+
+        GenericConversion makeDateConversion = convertMakeDateFunctions(converted);
+        if (makeDateConversion.changed()) {
+            converted = makeDateConversion.convertedSql();
+            rules.add(MYSQL_MAKEDATE_RULE);
         }
 
         GenericConversion strToDateYearMonthConversion = convertStrToDateYearMonth(converted);
@@ -409,6 +433,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (booleanOperatorConversion.changed()) {
             converted = booleanOperatorConversion.convertedSql();
             rules.add(MYSQL_BOOLEAN_OPERATOR_RULE);
+        }
+
+        GenericConversion informationSchemaColumnsConversion = convertInformationSchemaColumns(converted);
+        if (informationSchemaColumnsConversion.changed()) {
+            converted = informationSchemaColumnsConversion.convertedSql();
+            rules.add(MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -859,6 +889,58 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return "DATEADD(" + unit + ", " + amount + ", " + dateExpression + ")";
     }
 
+    private GenericConversion convertMakeDateFunctions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "MAKEDATE")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "MAKEDATE");
+                String replacement = functionCall == null ? null : rewriteMakeDate(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteMakeDate(FunctionCall makeDateCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(makeDateCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String yearExpression = arguments.get(0).text().trim();
+        String dayOfYearExpression = arguments.get(1).text().trim();
+        if (yearExpression.isBlank() || dayOfYearExpression.isBlank()) {
+            return null;
+        }
+        return "DATEADD(DAY, "
+                + dayOfYearExpression
+                + " - 1, TO_DATE(CONCAT("
+                + yearExpression
+                + ", '-01-01'), 'YYYY-MM-DD'))";
+    }
+
     private GenericConversion convertStrToDateYearMonth(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
@@ -1292,6 +1374,36 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return index;
     }
 
+    private GenericConversion convertInformationSchemaColumns(String sql) {
+        Matcher matcher = INFORMATION_SCHEMA_COLUMNS_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String whereClause = matcher.group("where");
+        Matcher tableNameMatcher = METADATA_TABLE_NAME_CONDITION.matcher(whereClause);
+        Matcher tableSchemaMatcher = METADATA_TABLE_SCHEMA_CONDITION.matcher(whereClause);
+        if (!tableNameMatcher.find() || !tableSchemaMatcher.find()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableName = tableNameMatcher.group("value").trim();
+        String tableSchema = tableSchemaMatcher.group("value").trim();
+        String residual = tableNameMatcher.replaceAll("");
+        residual = METADATA_TABLE_SCHEMA_CONDITION.matcher(residual).replaceAll("");
+        residual = residual.replaceAll("(?i)\\bAND\\b", "")
+                .replaceAll("[()\\s]", "");
+        if (!residual.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String direction = matcher.group("direction");
+        String converted = "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER("
+                + tableName
+                + ") AND OWNER = UPPER("
+                + tableSchema
+                + ") ORDER BY COLUMN_ID"
+                + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
+        return new GenericConversion(converted, true);
+    }
+
     private GenericConversion addRecursiveCteColumnAliases(String sql) {
         int withIndex = leadingWhitespaceLength(sql);
         if (!startsKeyword(sql, withIndex, "WITH")) {
@@ -1521,6 +1633,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (setClause.isBlank()) {
             return GenericConversion.unchanged(sql);
         }
+        if (updatesJoinedTableAlias(target, setClause)) {
+            return GenericConversion.unchanged(sql);
+        }
 
         JoinSource splitJoin = splitJoinSource(joinSource);
         if (splitJoin.sourceSql().isBlank()) {
@@ -1551,6 +1666,47 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private boolean updatesJoinedTableAlias(String target, String setClause) {
+        String targetAlias = updateTargetAlias(target);
+        if (targetAlias.isBlank()) {
+            return false;
+        }
+        for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
+            Matcher matcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
+            if (matcher.find() && !normalizeIdentifierKey(matcher.group("alias")).equals(targetAlias)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String updateTargetAlias(String target) {
+        String trimmed = target == null ? "" : target.trim();
+        if (trimmed.isBlank()) {
+            return "";
+        }
+        List<String> parts = Pattern.compile("\\s+")
+                .splitAsStream(trimmed)
+                .filter(part -> !part.isBlank())
+                .toList();
+        if (parts.isEmpty()) {
+            return "";
+        }
+        String alias = parts.size() >= 2 ? parts.get(parts.size() - 1) : parts.get(0);
+        if ("AS".equalsIgnoreCase(alias) && parts.size() >= 2) {
+            alias = parts.get(parts.size() - 2);
+        }
+        return normalizeIdentifierKey(alias);
+    }
+
+    private String normalizeIdentifierKey(String identifier) {
+        String trimmed = identifier == null ? "" : identifier.trim();
+        if (trimmed.length() >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+        }
+        return trimmed.toUpperCase(Locale.ROOT);
     }
 
     private GenericConversion removeAsFromTableAliases(String sql) {

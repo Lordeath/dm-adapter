@@ -2038,10 +2038,32 @@ class DmSqlValidationTestGenerator {
                             value.putIfAbsent(dynamicIdentifierName, defaultDynamicIdentifier(dynamicIdentifierName));
                         }
                         for (String collectionName : statement.collectionParameterNames()) {
-                            value.putIfAbsent(collectionName, defaultCollectionParameter(collectionName, statement));
+                            putDefaultParameterValue(value, collectionName, defaultCollectionParameter(collectionName, statement));
                         }
                     }
                     return value;
+                }
+
+                @SuppressWarnings("unchecked")
+                private void putDefaultParameterValue(Map<String, Object> target, String parameterPath, Object parameterValue) {
+                    List<String> parts = pathParts(parameterPath);
+                    if (parts.size() <= 1) {
+                        target.putIfAbsent(parameterPath, parameterValue);
+                        return;
+                    }
+                    Map<String, Object> current = target;
+                    for (int i = 0; i < parts.size() - 1; i++) {
+                        String part = parts.get(i);
+                        Object existing = current.get(part);
+                        if (existing instanceof Map<?, ?> existingMap) {
+                            current = (Map<String, Object>) existingMap;
+                            continue;
+                        }
+                        Map<String, Object> nested = new LinkedHashMap<>();
+                        current.put(part, nested);
+                        current = nested;
+                    }
+                    current.putIfAbsent(parts.get(parts.size() - 1), parameterValue);
                 }
 
                 private Object defaultParameterMapValue(String valueName, Object configuredDefault, MapperStatement statement) {
@@ -2171,6 +2193,9 @@ class DmSqlValidationTestGenerator {
                             || normalized.contains("accountbook")) {
                         return "CODE";
                     }
+                    if (isNumericSqlFragmentName(normalized)) {
+                        return 1L;
+                    }
                     if (normalized.endsWith("id")
                             || normalized.endsWith("ids")
                             || normalized.contains("key")) {
@@ -2239,7 +2264,45 @@ class DmSqlValidationTestGenerator {
                             && !currentConfig.primarySchema().isBlank()) {
                         return quotedIdentifier(currentConfig.primarySchema());
                     }
+                    if (isDynamicIdentifierName(normalized)) {
+                        return "ID";
+                    }
+                    if (isNumericSqlFragmentName(normalized)) {
+                        return "1";
+                    }
+                    if (isStringSqlLiteralFragmentName(normalized)) {
+                        return "'test'";
+                    }
                     return "ID";
+                }
+
+                private boolean isNumericSqlFragmentName(String normalizedName) {
+                    return normalizedName.endsWith("id")
+                            || normalizedName.endsWith("ids")
+                            || normalizedName.endsWith("idlist")
+                            || normalizedName.contains("idlist")
+                            || normalizedName.contains("idslist")
+                            || normalizedName.endsWith("type")
+                            || normalizedName.endsWith("types")
+                            || normalizedName.endsWith("typelist")
+                            || normalizedName.contains("classtype")
+                            || normalizedName.contains("qualityclasstype")
+                            || normalizedName.endsWith("level")
+                            || normalizedName.endsWith("levellist")
+                            || normalizedName.endsWith("status")
+                            || normalizedName.endsWith("statuslist")
+                            || normalizedName.endsWith("flag")
+                            || normalizedName.endsWith("flaglist")
+                            || normalizedName.endsWith("count")
+                            || normalizedName.endsWith("countlist");
+                }
+
+                private boolean isStringSqlLiteralFragmentName(String normalizedName) {
+                    return normalizedName.endsWith("code")
+                            || normalizedName.endsWith("codelist")
+                            || normalizedName.contains("name")
+                            || normalizedName.contains("account")
+                            || normalizedName.contains("no");
                 }
 
                 private boolean isSchemaIdentifierName(String normalized) {
@@ -2559,6 +2622,7 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_UPDATE_JOIN",
                             "MYSQL_DATE_SUB_INTERVAL",
                             "MYSQL_DATE_ADD_INTERVAL",
+                            "MYSQL_MAKEDATE",
                             "MYSQL_CONVERT_UNSIGNED",
                             "MYSQL_CONVERT_DECIMAL",
                             "MYSQL_CONVERT_GBK_ORDER",
@@ -2586,8 +2650,10 @@ class DmSqlValidationTestGenerator {
                     if (containsAnyPattern(countsByPattern,
                             "NULL_COLLECTION_PARAMETER",
                             "BINDING_PARAMETER_NAME",
+                            "MAPPER_PROPERTY_NAME",
                             "METHOD_ARGS_OR_BINDING_OTHER",
                             "DYNAMIC_IDENTIFIER_PARAMETER",
+                            "DYNAMIC_SQL_FRAGMENT_PARAMETER",
                             "RAW_SQL_PARAMETER",
                             "GENERATED_ORDER_PARAMETER")
                             || countsByCategory.containsKey("METHOD_ARGS_OR_BINDING")) {
@@ -2599,12 +2665,15 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_JSON_SQL",
                             "REGEXP_OPERATOR",
                             "MYSQL_METADATA_SQL",
+                            "MYSQL_UPDATE_JOIN_MULTI_TARGET",
                             "MYSQL_USER_VARIABLE",
                             "SQL_SYNTAX_OTHER")) {
                         markdown.append("- 人工复核 GROUP_CONCAT、JSON SQL、REGEXP、MySQL 元数据查询，以及其他未分类的达梦语法失败等复杂 SQL 模式。\\n");
                     }
                     if (containsAnyPattern(countsByPattern,
                             "TEST_DATA_OR_CONSTRAINT",
+                            "TEST_DATA_TYPE_MISMATCH",
+                            "TEST_DATA_FOREIGN_KEY_CONSTRAINT",
                             "TEST_DATA_OTHER")
                             || countsByCategory.containsKey("TEST_DATA_OR_SCHEMA")) {
                         markdown.append("- 调整生成的示例数据、种子数据、默认值或约束，以处理数据相关的验证失败。\\n");
@@ -2691,13 +2760,17 @@ class DmSqlValidationTestGenerator {
                         case "MYSQL_CONVERT_DECIMAL" -> "MySQL CONVERT DECIMAL";
                         case "MYSQL_USER_VARIABLE" -> "MySQL 用户变量";
                         case "DYNAMIC_IDENTIFIER_PARAMETER" -> "动态标识符参数";
+                        case "DYNAMIC_SQL_FRAGMENT_PARAMETER" -> "动态 SQL 片段参数";
                         case "BROKEN_DYNAMIC_SQL_OR_ARGS" -> "动态 SQL 或示例参数异常";
                         case "TEST_SCHEMA_OBJECT" -> "测试库缺少对象";
+                        case "TEST_DATA_TYPE_MISMATCH" -> "测试参数类型不匹配";
+                        case "TEST_DATA_FOREIGN_KEY_CONSTRAINT" -> "外键约束测试数据问题";
                         case "INSERT_IGNORE" -> "INSERT IGNORE";
                         case "MYSQL_GROUP_CONCAT" -> "GROUP_CONCAT 函数";
                         case "MYSQL_CONCAT_WS" -> "CONCAT_WS 函数";
                         case "MYSQL_DATE_SUB_INTERVAL" -> "DATE_SUB INTERVAL";
                         case "MYSQL_DATE_ADD_INTERVAL" -> "DATE_ADD INTERVAL";
+                        case "MYSQL_MAKEDATE" -> "MAKEDATE 函数";
                         case "MYSQL_PERIOD_DIFF_YEARMONTH" -> "PERIOD_DIFF 年月差";
                         case "MYSQL_COUNT_CONDITION_OR_NULL" -> "COUNT 条件 OR NULL";
                         case "MYSQL_NOT_ISNULL" -> "!ISNULL 表达式";
@@ -2712,6 +2785,7 @@ class DmSqlValidationTestGenerator {
                         case "DAMENG_RESERVED_IDENTIFIER" -> "达梦保留字标识符";
                         case "MYSQL_JSON_SQL" -> "MySQL JSON SQL";
                         case "MYSQL_UPDATE_JOIN" -> "UPDATE JOIN";
+                        case "MYSQL_UPDATE_JOIN_MULTI_TARGET" -> "UPDATE JOIN 同时更新多表";
                         case "RAW_SQL_PARAMETER" -> "原始 SQL 参数";
                         case "AMBIGUOUS_COLUMN" -> "歧义列名";
                         case "EMPTY_SELECT_LIST" -> "空 SELECT 列表";
@@ -2724,6 +2798,8 @@ class DmSqlValidationTestGenerator {
                         case "TRAILING_COMMA" -> "多余逗号";
                         case "NULL_COLLECTION_PARAMETER" -> "集合参数为空";
                         case "BINDING_PARAMETER_NAME" -> "绑定参数名问题";
+                        case "MAPPER_PROPERTY_NAME" -> "Mapper 属性名不匹配";
+                        case "INSERT_VALUES_ASSIGNMENT" -> "INSERT VALUES 中出现赋值表达式";
                         case "TEST_DATA_OR_CONSTRAINT" -> "测试数据或约束问题";
                         default -> pattern.endsWith("_OTHER") ? "其他未分类模式" : "";
                     };
@@ -2862,6 +2938,9 @@ class DmSqlValidationTestGenerator {
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
                     }
+                    if (hasMysqlMakeDate(message)) {
+                        return "MYSQL_MAKEDATE";
+                    }
                     if (Pattern.compile("\\\\bsql_(?:big|small)_result\\\\b|\\\\bsql_calc_found_rows\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_SELECT_MODIFIER";
                     }
@@ -2879,6 +2958,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
                         return "DYNAMIC_IDENTIFIER_PARAMETER";
+                    }
+                    if (isAutoParameter(record) && hasDynamicSqlFragmentParameterIssue(message)) {
+                        return "DYNAMIC_SQL_FRAGMENT_PARAMETER";
                     }
                     if (lower.contains("sql语句为null或空值") || hasBrokenDynamicSqlShape(message)) {
                         return "BROKEN_DYNAMIC_SQL_OR_ARGS";
@@ -2901,6 +2983,9 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("\\\\bdate_add\\\\s*\\\\([\\\\s\\\\S]*?\\\\binterval\\\\s+[^,)]*\\\\s+(year|month|week|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\+\\\\s*interval\\\\s+[^\\\\s]+\\\\s+(year|month|week|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_DATE_ADD_INTERVAL";
+                    }
+                    if (hasMysqlMakeDate(message)) {
+                        return "MYSQL_MAKEDATE";
                     }
                     if (Pattern.compile("\\\\bperiod_diff\\\\s*\\\\(|\\\\bextract\\\\s*\\\\(\\\\s*year_month\\\\s+from\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_PERIOD_DIFF_YEARMONTH";
@@ -2941,6 +3026,9 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("\\\\bjson_(?:array|contains|extract|insert|keys|length|object|quote|remove|replace|search|set|table|type|unquote|valid)\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bcast\\\\s*\\\\([\\\\s\\\\S]*?\\\\s+as\\\\s+json\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_JSON_SQL";
+                    }
+                    if (hasMysqlUpdateJoinMultiTarget(message)) {
+                        return "MYSQL_UPDATE_JOIN_MULTI_TARGET";
                     }
                     if (Pattern.compile("\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bjoin\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_UPDATE_JOIN";
@@ -2992,6 +3080,18 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("parameter '") && lower.contains("not found")) {
                         return "BINDING_PARAMETER_NAME";
                     }
+                    if (lower.contains("there is no getter for property")) {
+                        return "MAPPER_PROPERTY_NAME";
+                    }
+                    if (lower.contains("数据类型不匹配")) {
+                        return "TEST_DATA_TYPE_MISMATCH";
+                    }
+                    if (lower.contains("违反引用约束")) {
+                        return "TEST_DATA_FOREIGN_KEY_CONSTRAINT";
+                    }
+                    if (Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(message).find()) {
+                        return "INSERT_VALUES_ASSIGNMENT";
+                    }
                     if (containsAny(message,
                             "非空约束",
                             "违反列[",
@@ -3023,6 +3123,21 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?im)^### SQL:\\\\s*ID\\\\s+select\\\\b").matcher(message).find()
                             || Pattern.compile("\\\\b(?:from|join|update|into|table)\\\\s+ID\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bID\\\\s*=", Pattern.CASE_INSENSITIVE).matcher(message).find();
+                }
+
+                private boolean hasDynamicSqlFragmentParameterIssue(String message) {
+                    return Pattern.compile("\\\\bin\\\\s*\\\\(\\\\s*(?:ID|test)\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("无效的列名\\\\s*\\\\[\\\\s*test\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("\\\\b[A-Za-z_][A-Za-z0-9_$.]*\\\\s+(?:not\\\\s+)?in\\\\s*\\\\(\\\\s*ID\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find();
+                }
+
+                private boolean hasMysqlMakeDate(String message) {
+                    return Pattern.compile("\\\\bmakedate\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("无法解析的成员访问表达式\\\\s*\\\\[\\\\s*MAKEDATE\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find();
+                }
+
+                private boolean hasMysqlUpdateJoinMultiTarget(String message) {
+                    return message != null && message.contains("多表更新时仅支持更新同一个表上的列");
                 }
 
                 private boolean hasBrokenDynamicSqlShape(String message) {
@@ -3108,6 +3223,9 @@ class DmSqlValidationTestGenerator {
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
                     }
+                    if (hasMysqlMakeDate(message) || hasMysqlUpdateJoinMultiTarget(message)) {
+                        return "SQL_SYNTAX";
+                    }
                     if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的模式名", "无法解析的成员访问表达式")) {
                         return "TEST_SCHEMA";
                     }
@@ -3116,7 +3234,9 @@ class DmSqlValidationTestGenerator {
                             "违反列[",
                             "长度超出定义",
                             "类型转换异常",
+                            "数据类型不匹配",
                             "唯一性约束",
+                            "违反引用约束",
                             "非法的时间日期类型数据",
                             "SET IDENTITY_INSERT",
                             "自增列")) {
@@ -4318,28 +4438,28 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private boolean nonEmptyCollectionParameter(String valueName) {
-                        return nonEmptyCollectionParameterNames.contains(normalizeMetadataName(valueName));
+                        return containsNameOrSuffix(nonEmptyCollectionParameterNames, valueName);
                     }
 
                     private Map<String, Object> collectionElementDefault(String valueName) {
-                        Map<String, Object> defaults = collectionElementDefaults.get(normalizeMetadataName(valueName));
+                        Map<String, Object> defaults = valueByNameOrSuffix(collectionElementDefaults, valueName);
                         return defaults == null ? Map.of() : defaults;
                     }
 
                     private Object collectionScalarDefault(String valueName) {
-                        return collectionScalarDefaults.get(normalizeMetadataName(valueName));
+                        return valueByNameOrSuffix(collectionScalarDefaults, valueName);
                     }
 
                     private ColumnReference collectionColumnReference(String valueName) {
-                        return collectionColumnReferences.get(normalizeMetadataName(valueName));
+                        return valueByNameOrSuffix(collectionColumnReferences, valueName);
                     }
 
                     private ColumnReference defaultColumnReference(String valueName) {
-                        return defaultColumnReferences.get(normalizeMetadataName(valueName));
+                        return valueByNameOrSuffix(defaultColumnReferences, valueName);
                     }
 
                     private Object defaultValue(String valueName) {
-                        return defaultValues.get(normalizeMetadataName(valueName));
+                        return valueByNameOrSuffix(defaultValues, valueName);
                     }
 
                     private Map<String, Object> defaultValues() {
@@ -4352,6 +4472,35 @@ class DmSqlValidationTestGenerator {
 
                     private Set<String> collectionParameterNames() {
                         return Set.copyOf(namedCollectionParameterNames);
+                    }
+
+                    private static boolean containsNameOrSuffix(Set<String> values, String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        if (normalized.isBlank()) {
+                            return false;
+                        }
+                        if (values.contains(normalized)) {
+                            return true;
+                        }
+                        return values.stream().anyMatch(value -> value.endsWith(normalized) || normalized.endsWith(value));
+                    }
+
+                    private static <T> T valueByNameOrSuffix(Map<String, T> values, String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        if (normalized.isBlank()) {
+                            return null;
+                        }
+                        T exact = values.get(normalized);
+                        if (exact != null) {
+                            return exact;
+                        }
+                        for (Map.Entry<String, T> entry : values.entrySet()) {
+                            String key = entry.getKey();
+                            if (key.endsWith(normalized) || normalized.endsWith(key)) {
+                                return entry.getValue();
+                            }
+                        }
+                        return null;
                     }
 
                     private static String normalizeMetadataName(String valueName) {
