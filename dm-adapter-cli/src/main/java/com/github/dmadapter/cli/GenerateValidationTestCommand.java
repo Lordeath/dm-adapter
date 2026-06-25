@@ -24,7 +24,7 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
     @Option(names = "--config", description = "Validation config path. Defaults to <project>/.dm-adapter/sql-validation.yml.")
     private Path config;
 
-    @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods.")
+    @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods. Supports comma-separated fallback schemas.")
     private String schema;
 
     private final DmSqlValidationTestGenerator generator = new DmSqlValidationTestGenerator();

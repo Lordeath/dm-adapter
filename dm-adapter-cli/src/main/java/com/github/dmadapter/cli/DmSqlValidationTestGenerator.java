@@ -255,8 +255,10 @@ class DmSqlValidationTestGenerator {
                 """);
         if (schema == null || schema.isBlank()) {
             content.append("""
-                    # Optional Dameng schema. Quoted schema names such as sample-system are supported.
+                    # Optional Dameng schema. Use comma-separated schemas to validate against fallback schemas.
+                    # Quoted schema names such as sample-system are supported.
                     # schema: "sample-system"
+                    # schema: "newsee-charge-10,newsee-bill-10,newsee-owner"
 
                     """);
         } else {
@@ -732,8 +734,7 @@ class DmSqlValidationTestGenerator {
                     log("Loading database column metadata...");
                     try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
                         Connection connection = sqlSession.getConnection();
-                        applySchema(connection, config);
-                        DbColumnMetadata metadata = DbColumnMetadata.load(connection, config.schema);
+                        DbColumnMetadata metadata = DbColumnMetadata.load(connection, config.schemas());
                         log("Database column metadata loaded: " + metadata.columnCount() + " columns.");
                         return metadata;
                     } catch (Throwable e) {
@@ -1626,9 +1627,90 @@ class DmSqlValidationTestGenerator {
                         ParameterResolution parameters,
                         ValidationConfig config
                 ) {
+                    List<String> schemas = validationSchemas(config);
+                    ValidationRecord primaryRecord = invokeMapperMethodWithSchema(
+                            sqlSessionFactory,
+                            mapperMethod,
+                            parameters,
+                            schemas.get(0)
+                    );
+                    if (schemas.size() == 1
+                            || "PASSED".equals(primaryRecord.status)
+                            || !isSchemaObjectFailureRecord(primaryRecord)) {
+                        return primaryRecord;
+                    }
+                    List<SchemaAttempt> attempts = new ArrayList<>();
+                    attempts.add(new SchemaAttempt(schemas.get(0), primaryRecord));
+                    ValidationRecord firstNonSchemaObjectFailure = null;
+                    SchemaAttempt firstNonSchemaObjectAttempt = null;
+                    for (int i = 1; i < schemas.size(); i++) {
+                        String schema = schemas.get(i);
+                        log("SCHEMA FALLBACK " + parameters.recordKey(mapperMethod.key())
+                                + " schema=" + schemaLabel(schema));
+                        ValidationRecord record = invokeMapperMethodWithSchema(sqlSessionFactory, mapperMethod, parameters, schema);
+                        SchemaAttempt attempt = new SchemaAttempt(schema, record);
+                        attempts.add(attempt);
+                        if ("PASSED".equals(record.status)) {
+                            return ValidationRecord.passed(
+                                    parameters.recordKey(mapperMethod.key()),
+                                    parameters.source,
+                                    parametersSummary(parameters),
+                                    "schema=" + schemaLabel(schema) + "; " + record.message
+                            );
+                        }
+                        if (!isSchemaObjectFailureRecord(record) && firstNonSchemaObjectFailure == null) {
+                            firstNonSchemaObjectFailure = record;
+                            firstNonSchemaObjectAttempt = attempt;
+                        }
+                    }
+                    SchemaAttempt representativeAttempt = firstNonSchemaObjectFailure == null
+                            ? attempts.get(0)
+                            : firstNonSchemaObjectAttempt;
+                    ValidationRecord representative = representativeAttempt.record();
+                    return ValidationRecord.failed(
+                            parameters.recordKey(mapperMethod.key()),
+                            parameters.source,
+                            parametersSummary(parameters),
+                            "All configured schemas failed. Representative schema="
+                                    + schemaLabel(representativeAttempt.schema())
+                                    + "\\n" + representative.message
+                                    + "\\nSchema attempts: " + schemaAttemptSummary(attempts)
+                    );
+                }
+
+                private List<String> validationSchemas(ValidationConfig config) {
+                    List<String> schemas = config.schemas();
+                    return schemas.isEmpty() ? List.of("") : schemas;
+                }
+
+                private boolean isSchemaObjectFailureRecord(ValidationRecord record) {
+                    return record != null
+                            && "FAILED".equals(record.status)
+                            && isSchemaObjectFailure(normalizeMessage(record.message).toLowerCase(Locale.ROOT));
+                }
+
+                private String schemaAttemptSummary(List<SchemaAttempt> attempts) {
+                    return attempts.stream()
+                            .map(attempt -> schemaLabel(attempt.schema()) + "="
+                                    + attempt.record().status + "/"
+                                    + category(attempt.record()) + "/"
+                                    + failurePattern(attempt.record()))
+                            .collect(Collectors.joining(" | "));
+                }
+
+                private String schemaLabel(String schema) {
+                    return schema == null || schema.isBlank() ? "<default>" : schema;
+                }
+
+                private ValidationRecord invokeMapperMethodWithSchema(
+                        SqlSessionFactory sqlSessionFactory,
+                        MapperMethod mapperMethod,
+                        ParameterResolution parameters,
+                        String schema
+                ) {
                     try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
                         try {
-                            applySchema(sqlSession.getConnection(), config);
+                            applySchema(sqlSession.getConnection(), schema);
                             Object result = mapperMethod.method == null
                                     ? invokeMappedStatement(sqlSession, mapperMethod, parameters.args.length == 0 ? null : parameters.args[0])
                                     : invokeReflectively(sqlSession, mapperMethod, parameters.args);
@@ -1691,14 +1773,14 @@ class DmSqlValidationTestGenerator {
                     return sqlSession.selectList(mapperMethod.key(), parameter);
                 }
 
-                private void applySchema(Connection connection, ValidationConfig config) {
-                    if (config.schema == null || config.schema.isBlank()) {
+                private void applySchema(Connection connection, String schema) {
+                    if (schema == null || schema.isBlank()) {
                         return;
                     }
                     try (Statement statement = connection.createStatement()) {
-                        statement.execute("set schema " + quotedIdentifier(config.schema));
+                        statement.execute("set schema " + quotedIdentifier(schema));
                     } catch (Exception e) {
-                        throw new IllegalStateException("Failed to set Dameng schema: " + config.schema, e);
+                        throw new IllegalStateException("Failed to set Dameng schema: " + schema, e);
                     }
                 }
 
@@ -2154,9 +2236,8 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isSchemaIdentifierName(normalized)
                             && currentConfig != null
-                            && currentConfig.schema != null
-                            && !currentConfig.schema.isBlank()) {
-                        return quotedIdentifier(currentConfig.schema);
+                            && !currentConfig.primarySchema().isBlank()) {
+                        return quotedIdentifier(currentConfig.primarySchema());
                     }
                     return "ID";
                 }
@@ -3768,6 +3849,25 @@ class DmSqlValidationTestGenerator {
                         return lastDot > 0 && includedMethods.contains(methodKey.substring(0, lastDot) + ".*");
                     }
 
+                    List<String> schemas() {
+                        if (schema == null || schema.isBlank()) {
+                            return List.of();
+                        }
+                        return Pattern.compile(",")
+                                .splitAsStream(schema)
+                                .map(String::trim)
+                                .filter(value -> !value.isBlank())
+                                .collect(Collectors.collectingAndThen(
+                                        Collectors.toCollection(LinkedHashSet::new),
+                                        ArrayList::new
+                                ));
+                    }
+
+                    String primarySchema() {
+                        List<String> schemas = schemas();
+                        return schemas.isEmpty() ? "" : schemas.get(0);
+                    }
+
                     private String scalar(String value) {
                         String trimmed = value.trim();
                         if (trimmed.length() >= 2
@@ -3840,11 +3940,24 @@ class DmSqlValidationTestGenerator {
                         return new DbColumnMetadata();
                     }
 
-                    private static DbColumnMetadata load(Connection connection, String schema) throws Exception {
+                    private static DbColumnMetadata load(Connection connection, List<String> schemas) throws Exception {
                         DbColumnMetadata metadata = new DbColumnMetadata();
-                        metadata.readJdbcColumns(connection, schema);
+                        List<String> targetSchemas = schemas == null ? List.of() : schemas;
+                        if (targetSchemas.isEmpty()) {
+                            metadata.readJdbcColumns(connection, "");
+                        } else {
+                            for (String schema : targetSchemas) {
+                                metadata.readJdbcColumns(connection, schema);
+                            }
+                        }
                         if (metadata.columnCount() == 0) {
-                            metadata.readAllTabColumns(connection, schema);
+                            if (targetSchemas.isEmpty()) {
+                                metadata.readAllTabColumns(connection, "");
+                            } else {
+                                for (String schema : targetSchemas) {
+                                    metadata.readAllTabColumns(connection, schema);
+                                }
+                            }
                         }
                         return metadata;
                     }
@@ -4361,6 +4474,9 @@ class DmSqlValidationTestGenerator {
                     static ValidationRecord skipped(String key, String parameterSource, String parameterSummary, String message) {
                         return new ValidationRecord("SKIPPED", key, parameterSource, parameterSummary, message);
                     }
+                }
+
+                private record SchemaAttempt(String schema, ValidationRecord record) {
                 }
 
                 private static final class MapperInvocationException extends RuntimeException {

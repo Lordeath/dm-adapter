@@ -400,7 +400,16 @@ class DmAdapterCliTest {
                 .contains("statement.defaultValues()")
                 .contains("defaultDynamicIdentifier")
                 .contains("statement.dynamicIdentifierNames()")
-                .contains("quotedIdentifier(currentConfig.schema)")
+                .contains("quotedIdentifier(currentConfig.primarySchema())")
+                .contains("validationSchemas")
+                .contains("invokeMapperMethodWithSchema")
+                .contains("isSchemaObjectFailureRecord")
+                .contains("schemaAttemptSummary")
+                .contains("schemaLabel")
+                .contains("SchemaAttempt")
+                .contains("config.schemas()")
+                .contains("splitAsStream(schema)")
+                .contains("All configured schemas failed")
                 .contains("isRawSqlInjectionName")
                 .contains("recordKey(mapperMethod.key())")
                 .contains("parameterName")
@@ -448,11 +457,32 @@ class DmAdapterCliTest {
                 .contains("optionalSecret(resolvePlaceholders(config.datasource.password), \"datasource.password\")")
                 .contains("references an unresolved placeholder")
                 .contains("set schema")
-                .contains("quotedIdentifier(config.schema)")
+                .contains("quotedIdentifier(schema)")
                 .doesNotContain("@SpringBootTest")
                 .doesNotContain("@ActiveProfiles")
                 .doesNotContain("PlatformTransactionManager")
                 .doesNotContain("RabbitTemplate");
+    }
+
+    @Test
+    void generateValidationTestPreservesCommaSeparatedSchemas() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString(),
+                "--schema",
+                "newsee-charge-10,newsee-bill-10,newsee-owner"
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation.yml")))
+                .contains("schema: \"newsee-charge-10,newsee-bill-10,newsee-owner\"");
+        assertThat(Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java")))
+                .contains("primarySchema()")
+                .contains("SCHEMA FALLBACK");
     }
 
     @Test

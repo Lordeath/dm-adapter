@@ -59,8 +59,10 @@ class DamengMetadataReader {
             Optional<String> configuredSchema
     ) {
         LinkedHashSet<String> candidates = new LinkedHashSet<>();
-        configuredSchema.filter(schema -> !schema.isBlank()).ifPresent(candidates::add);
-        schemaFromJdbcUrl(environment.jdbcUrl()).ifPresent(candidates::add);
+        configuredSchema.filter(schema -> !schema.isBlank())
+                .ifPresent(schema -> addSchemaCandidates(candidates, schema));
+        schemaFromJdbcUrl(environment.jdbcUrl())
+                .ifPresent(schema -> addSchemaCandidates(candidates, schema));
         try {
             String currentSchema = connection.getSchema();
             if (currentSchema != null && !currentSchema.isBlank()) {
@@ -76,6 +78,24 @@ class DamengMetadataReader {
             return List.of();
         }
         return candidates.stream().flatMap(schema -> nameVariants(schema).stream()).distinct().toList();
+    }
+
+    private void addSchemaCandidates(LinkedHashSet<String> candidates, String schemaValue) {
+        candidates.addAll(splitSchemaList(schemaValue));
+    }
+
+    static List<String> splitSchemaList(String schemaValue) {
+        LinkedHashSet<String> schemas = new LinkedHashSet<>();
+        if (schemaValue == null || schemaValue.isBlank()) {
+            return List.of();
+        }
+        for (String schema : schemaValue.split(",")) {
+            String trimmed = schema.trim();
+            if (!trimmed.isBlank()) {
+                schemas.add(trimmed);
+            }
+        }
+        return List.copyOf(schemas);
     }
 
     private Optional<String> schemaFromJdbcUrl(String jdbcUrl) {

@@ -65,7 +65,7 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--config", description = "Validation config path; implies --generate-validation-test. Defaults to <project>/.dm-adapter/sql-validation.yml.")
     private Path config;
 
-    @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods in the generated validation test; implies --generate-validation-test.")
+    @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods in the generated validation test; supports comma-separated fallback schemas; implies --generate-validation-test.")
     private String schema;
 
     private final ProjectScanner projectScanner = new ProjectScanner();
