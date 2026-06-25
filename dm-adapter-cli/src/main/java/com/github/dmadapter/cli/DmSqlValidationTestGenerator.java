@@ -533,6 +533,8 @@ class DmSqlValidationTestGenerator {
             import java.time.LocalDate;
             import java.time.LocalDateTime;
             import java.time.LocalTime;
+            import java.time.ZoneId;
+            import java.time.ZonedDateTime;
             import java.time.format.DateTimeFormatter;
             import java.util.ArrayList;
             import java.util.Arrays;
@@ -2260,6 +2262,9 @@ class DmSqlValidationTestGenerator {
                         if (BigInteger.class.equals(targetType)) {
                             return ValueResult.resolved(new BigInteger(value));
                         }
+                        if (Date.class.isAssignableFrom(targetType)) {
+                            return ValueResult.resolved(configuredDateValue(value, targetType));
+                        }
                         if (LocalDate.class.equals(targetType)) {
                             return ValueResult.resolved(LocalDate.parse(value));
                         }
@@ -2287,6 +2292,48 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
+                private Object configuredDateValue(String value, Class<?> targetType) {
+                    Instant instant = configuredInstant(value);
+                    if (instant == null) {
+                        instant = Instant.parse("2024-01-01T00:00:00Z");
+                    }
+                    if ("java.sql.Date".equals(targetType.getName())) {
+                        return java.sql.Date.valueOf(LocalDateTime.ofInstant(instant, ZoneId.systemDefault()).toLocalDate());
+                    }
+                    if ("java.sql.Time".equals(targetType.getName())) {
+                        return java.sql.Time.valueOf(LocalDateTime.ofInstant(instant, ZoneId.systemDefault()).toLocalTime());
+                    }
+                    if ("java.sql.Timestamp".equals(targetType.getName())) {
+                        return java.sql.Timestamp.from(instant);
+                    }
+                    return Date.from(instant);
+                }
+
+                private Instant configuredInstant(String value) {
+                    String text = value == null ? "" : value.trim();
+                    if (isBlank(text)) {
+                        return null;
+                    }
+                    try {
+                        return Instant.parse(text);
+                    } catch (Exception ignored) {
+                    }
+                    try {
+                        return LocalDateTime.parse(text).atZone(ZoneId.systemDefault()).toInstant();
+                    } catch (Exception ignored) {
+                    }
+                    try {
+                        return LocalDate.parse(text).atStartOfDay(ZoneId.systemDefault()).toInstant();
+                    } catch (Exception ignored) {
+                    }
+                    try {
+                        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("EEE MMM dd HH:mm:ss zzz yyyy", Locale.ENGLISH);
+                        return ZonedDateTime.parse(text, formatter).toInstant();
+                    } catch (Exception ignored) {
+                    }
+                    return null;
+                }
+
                 @SuppressWarnings("unchecked")
                 private ValueResult convertConfiguredValue(Object rawValue, Class<?> targetType, Type genericType) {
                     if (targetType == null || Object.class.equals(targetType)) {
@@ -2312,6 +2359,10 @@ class DmSqlValidationTestGenerator {
                                 ? new LinkedHashSet<>()
                                 : new ArrayList<>();
                         for (Object item : rawCollection) {
+                            if (item instanceof Map<?, ?> && !Map.class.isAssignableFrom(nestedClass)) {
+                                converted.add(new LinkedHashMap<>((Map<String, Object>) item));
+                                continue;
+                            }
                             ValueResult value = convertConfiguredValue(item, nestedClass, nestedType);
                             if (!value.resolved) {
                                 return value;
@@ -2408,6 +2459,10 @@ class DmSqlValidationTestGenerator {
                         int depth,
                         MapperStatement statement
                 ) {
+                    ValueResult contextualDefault = contextualDefaultValue(valueName, targetType, genericType, statement);
+                    if (contextualDefault != null) {
+                        return contextualDefault;
+                    }
                     Object columnDefault = defaultTypedColumnValue(valueName, targetType, statement);
                     if (columnDefault != null) {
                         return ValueResult.resolved(columnDefault);
@@ -2573,6 +2628,131 @@ class DmSqlValidationTestGenerator {
                     return instantiatePojo(targetType, depth, statement);
                 }
 
+                private ValueResult contextualDefaultValue(
+                        String valueName,
+                        Class<?> targetType,
+                        Type genericType,
+                        MapperStatement statement
+                ) {
+                    if (statement == null) {
+                        return null;
+                    }
+                    if (Collection.class.isAssignableFrom(targetType)
+                            || Map.class.isAssignableFrom(targetType)
+                            || targetType.isArray()) {
+                        return null;
+                    }
+                    if (statement.hasDefaultValue(valueName)) {
+                        return adaptContextualDefaultValue(
+                                valueName,
+                                statement.defaultValue(valueName),
+                                targetType,
+                                genericType,
+                                ""
+                        );
+                    }
+                    String columnType = statement.defaultColumnType(valueName, dbColumnMetadata);
+                    if (isBlank(columnType)) {
+                        return null;
+                    }
+                    return adaptContextualDefaultValue(
+                            valueName,
+                            defaultValueForColumnType(valueName, Object.class, columnType),
+                            targetType,
+                            genericType,
+                            columnType
+                    );
+                }
+
+                private ValueResult adaptContextualDefaultValue(
+                        String valueName,
+                        Object rawValue,
+                        Class<?> targetType,
+                        Type genericType,
+                        String typeHint
+                ) {
+                    if (rawValue == null) {
+                        if (targetType.isPrimitive()) {
+                            return null;
+                        }
+                        return ValueResult.resolved(null);
+                    }
+                    if (String.class.equals(targetType)) {
+                        return ValueResult.resolved(String.valueOf(rawValue));
+                    }
+                    if (Object.class.equals(targetType) || targetType.isInstance(rawValue)) {
+                        return ValueResult.resolved(rawValue);
+                    }
+                    if (isDateTimeTypeHint(typeHint) || isDateTimeDefaultValue(rawValue)) {
+                        ValueResult dateValue = dateTimeContextualValue(rawValue, targetType);
+                        if (dateValue != null) {
+                            return dateValue;
+                        }
+                    }
+                    ValueResult converted = convertScalar(String.valueOf(rawValue), targetType, genericType);
+                    return converted.resolved ? converted : null;
+                }
+
+                private boolean isDateTimeTypeHint(String typeHint) {
+                    String normalized = typeHint == null ? "" : typeHint.toUpperCase(Locale.ROOT);
+                    return normalized.contains("DATE")
+                            || normalized.contains("TIME")
+                            || normalized.contains("TIMESTAMP")
+                            || normalized.contains("DATETIME");
+                }
+
+                private boolean isDateTimeDefaultValue(Object value) {
+                    if (!(value instanceof CharSequence)) {
+                        return value instanceof Date
+                                || value instanceof LocalDate
+                                || value instanceof LocalDateTime
+                                || value instanceof LocalTime
+                                || value instanceof Instant;
+                    }
+                    String text = value.toString().trim();
+                    return text.matches("\\\\d{4}-\\\\d{2}-\\\\d{2}.*")
+                            || text.matches("[A-Za-z]{3} [A-Za-z]{3} \\\\d{1,2} \\\\d{2}:\\\\d{2}:\\\\d{2} [A-Za-z_+/:-]+ \\\\d{4}");
+                }
+
+                private ValueResult dateTimeContextualValue(Object rawValue, Class<?> targetType) {
+                    if (String.class.equals(targetType)) {
+                        return ValueResult.resolved(String.valueOf(rawValue));
+                    }
+                    if (Object.class.equals(targetType)) {
+                        return ValueResult.resolved(rawValue);
+                    }
+                    if (LocalDate.class.equals(targetType)) {
+                        return ValueResult.resolved(LocalDate.of(2024, 1, 1));
+                    }
+                    if (LocalDateTime.class.equals(targetType)) {
+                        return ValueResult.resolved(LocalDateTime.of(2024, 1, 1, 0, 0, 0));
+                    }
+                    if (LocalTime.class.equals(targetType)) {
+                        return ValueResult.resolved(LocalTime.of(0, 0, 0));
+                    }
+                    if (Instant.class.equals(targetType)) {
+                        return ValueResult.resolved(Instant.parse("2024-01-01T00:00:00Z"));
+                    }
+                    if (Date.class.isAssignableFrom(targetType)) {
+                        if ("java.sql.Date".equals(targetType.getName())) {
+                            return ValueResult.resolved(java.sql.Date.valueOf("2024-01-01"));
+                        }
+                        if ("java.sql.Time".equals(targetType.getName())) {
+                            return ValueResult.resolved(java.sql.Time.valueOf("00:00:00"));
+                        }
+                        if ("java.sql.Timestamp".equals(targetType.getName())) {
+                            return ValueResult.resolved(java.sql.Timestamp.valueOf("2024-01-01 00:00:00"));
+                        }
+                        return ValueResult.resolved(Date.from(Instant.parse("2024-01-01T00:00:00Z")));
+                    }
+                    if (targetType.isPrimitive()) {
+                        return null;
+                    }
+                    return ValueResult.resolved(null);
+                }
+
+                """,
+            """
                 private boolean isMybatisPlusPageType(Class<?> targetType) {
                     return targetType != null
                             && ("com.baomidou.mybatisplus.core.metadata.IPage".equals(targetType.getName())
@@ -3664,6 +3844,10 @@ class DmSqlValidationTestGenerator {
                         }
                         return values;
                     }
+                    if (value instanceof Map<?, ?>) {
+                        Map<String, Object> values = serializableMap((Map<?, ?>) value);
+                        return values.isEmpty() ? MethodArgumentConfig.MISSING : values;
+                    }
                     if (value instanceof Collection<?>) {
                         List<Object> values = new ArrayList<>();
                         for (Object item : (Collection<?>) value) {
@@ -3778,6 +3962,11 @@ class DmSqlValidationTestGenerator {
                         return "[" + ((Collection<?>) value).stream()
                                 .map(this::yamlValue)
                                 .collect(Collectors.joining(", ")) + "]";
+                    }
+                    if (value instanceof Map<?, ?>) {
+                        return "{" + ((Map<?, ?>) value).entrySet().stream()
+                                .map(entry -> quoteYamlKey(String.valueOf(entry.getKey())) + ": " + yamlValue(entry.getValue()))
+                                .collect(Collectors.joining(", ")) + "}";
                     }
                     return quoteYaml(String.valueOf(value));
                 }
@@ -5818,6 +6007,20 @@ class DmSqlValidationTestGenerator {
                             }
                             return values;
                         }
+                        if (value.startsWith("{") && value.endsWith("}")) {
+                            String body = value.substring(1, value.length() - 1).trim();
+                            Map<String, Object> values = new LinkedHashMap<>();
+                            if (!body.isEmpty()) {
+                                for (String item : splitInlineList(body)) {
+                                    int colon = topLevelColon(item);
+                                    if (colon > 0) {
+                                        String key = scalar(item.substring(0, colon));
+                                        values.put(key, parseYamlValue(item.substring(colon + 1)));
+                                    }
+                                }
+                            }
+                            return values;
+                        }
                         boolean quoted = isQuoted(value);
                         String scalar = scalar(value);
                         if (quoted) {
@@ -5845,6 +6048,7 @@ class DmSqlValidationTestGenerator {
                         List<String> values = new ArrayList<>();
                         boolean singleQuoted = false;
                         boolean doubleQuoted = false;
+                        int nestedDepth = 0;
                         StringBuilder current = new StringBuilder();
                         for (int i = 0; i < body.length(); i++) {
                             char c = body.charAt(i);
@@ -5852,8 +6056,12 @@ class DmSqlValidationTestGenerator {
                                 singleQuoted = !singleQuoted;
                             } else if (c == '\\"' && !singleQuoted) {
                                 doubleQuoted = !doubleQuoted;
+                            } else if (!singleQuoted && !doubleQuoted && (c == '[' || c == '{')) {
+                                nestedDepth++;
+                            } else if (!singleQuoted && !doubleQuoted && (c == ']' || c == '}')) {
+                                nestedDepth--;
                             }
-                            if (c == ',' && !singleQuoted && !doubleQuoted) {
+                            if (c == ',' && !singleQuoted && !doubleQuoted && nestedDepth == 0) {
                                 values.add(current.toString().trim());
                                 current.setLength(0);
                             } else {
@@ -5864,6 +6072,27 @@ class DmSqlValidationTestGenerator {
                             values.add(current.toString().trim());
                         }
                         return values;
+                    }
+
+                    private int topLevelColon(String value) {
+                        boolean singleQuoted = false;
+                        boolean doubleQuoted = false;
+                        int nestedDepth = 0;
+                        for (int i = 0; i < value.length(); i++) {
+                            char c = value.charAt(i);
+                            if (c == '\\'' && !doubleQuoted) {
+                                singleQuoted = !singleQuoted;
+                            } else if (c == '\\"' && !singleQuoted) {
+                                doubleQuoted = !doubleQuoted;
+                            } else if (!singleQuoted && !doubleQuoted && (c == '[' || c == '{')) {
+                                nestedDepth++;
+                            } else if (!singleQuoted && !doubleQuoted && (c == ']' || c == '}')) {
+                                nestedDepth--;
+                            } else if (c == ':' && !singleQuoted && !doubleQuoted && nestedDepth == 0) {
+                                return i;
+                            }
+                        }
+                        return -1;
                     }
 
                     private String stripYamlComment(String line) {
@@ -6161,6 +6390,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.defaultValue(valueName);
                     }
 
+                    private boolean hasDefaultValue(String valueName) {
+                        return dynamicIdentifierMetadata.hasDefaultValue(valueName);
+                    }
+
                     private Map<String, Object> defaultValues() {
                         return dynamicIdentifierMetadata.defaultValues();
                     }
@@ -6208,7 +6441,11 @@ class DmSqlValidationTestGenerator {
                         if (!isSyntheticParameterName(fallbackName)) {
                             return fallbackName;
                         }
-                        return dynamicIdentifierMetadata.valueExpressionName(index, fallbackName);
+                        String valueExpressionName = dynamicIdentifierMetadata.valueExpressionName(index, "");
+                        if (!isBlank(valueExpressionName)) {
+                            return valueExpressionName;
+                        }
+                        return dynamicIdentifierMetadata.collectionExpressionName(index, fallbackName);
                     }
 
                     private boolean isSyntheticParameterName(String valueName) {
@@ -6371,25 +6608,35 @@ class DmSqlValidationTestGenerator {
                             return defaults;
                         }
                         defaults = collectionElementDefaults.get("item");
+                        if (defaults != null) {
+                            return defaults;
+                        }
+                        defaults = singleValue(collectionElementDefaults);
                         return defaults == null ? emptyMap() : defaults;
                     }
 
                     private Object collectionSqlFragmentDefault(String valueName) {
-                        return valueByNameOrSuffix(collectionSqlFragmentDefaults, valueName);
+                        Object value = valueByNameOrSuffix(collectionSqlFragmentDefaults, valueName);
+                        return value != null ? value : singleValue(collectionSqlFragmentDefaults);
                     }
 
                     private Object collectionScalarDefault(String valueName) {
-                        return valueByNameOrSuffix(collectionScalarDefaults, valueName);
+                        Object value = valueByNameOrSuffix(collectionScalarDefaults, valueName);
+                        return value != null ? value : singleValue(collectionScalarDefaults);
                     }
 
                     private ColumnReference collectionColumnReference(String valueName) {
-                        return valueByNameOrSuffix(collectionColumnReferences, valueName);
+                        ColumnReference reference = valueByNameOrSuffix(collectionColumnReferences, valueName);
+                        return reference != null ? reference : singleValue(collectionColumnReferences);
                     }
 
                     private ColumnReference collectionElementColumnReference(String collectionName, String propertyName) {
                         Map<String, ColumnReference> references = valueByNameOrSuffix(collectionElementColumnReferences, collectionName);
                         if (references == null) {
                             references = collectionElementColumnReferences.get("item");
+                        }
+                        if (references == null) {
+                            references = singleValue(collectionElementColumnReferences);
                         }
                         return references == null ? null : valueByNameOrSuffix(references, propertyName);
                     }
@@ -6400,6 +6647,10 @@ class DmSqlValidationTestGenerator {
 
                     private Object defaultValue(String valueName) {
                         return valueByNameOrSuffix(defaultValues, valueName);
+                    }
+
+                    private boolean hasDefaultValue(String valueName) {
+                        return containsNameOrSuffix(defaultValues.keySet(), valueName);
                     }
 
                     private Map<String, Object> defaultValues() {
@@ -6419,6 +6670,13 @@ class DmSqlValidationTestGenerator {
                             return fallbackName;
                         }
                         return new ArrayList<>(valueExpressionNames).get(index);
+                    }
+
+                    private String collectionExpressionName(int index, String fallbackName) {
+                        if (index != 0 || namedCollectionParameterNames.size() != 1) {
+                            return fallbackName;
+                        }
+                        return new ArrayList<>(namedCollectionParameterNames).get(0);
                     }
 
                     private static boolean containsNameOrSuffix(Set<String> values, String valueName) {
@@ -6448,6 +6706,10 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         return null;
+                    }
+
+                    private static <T> T singleValue(Map<String, T> values) {
+                        return values.size() == 1 ? values.values().iterator().next() : null;
                     }
 
                     private static String normalizeMetadataName(String valueName) {
