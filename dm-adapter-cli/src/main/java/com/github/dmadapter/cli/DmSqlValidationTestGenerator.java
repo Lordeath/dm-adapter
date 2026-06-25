@@ -1992,13 +1992,6 @@ class DmSqlValidationTestGenerator {
                             }
                             return ValueResult.resolved(new ArrayList<>(List.of(elementValue)));
                         }
-                        Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);
-                        if (sqlFragmentDefault != null) {
-                            if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(List.of(sqlFragmentDefault)));
-                            }
-                            return ValueResult.resolved(new ArrayList<>(List.of(sqlFragmentDefault)));
-                        }
                         if (shouldUseEmptyCollection(valueName)
                                 && (statement == null || !statement.nonEmptyCollectionParameter(valueName))) {
                             if (Set.class.isAssignableFrom(targetType)) {
@@ -2015,6 +2008,13 @@ class DmSqlValidationTestGenerator {
                                 return ValueResult.resolved(new LinkedHashSet<>(List.of(elementValue)));
                             }
                             return ValueResult.resolved(new ArrayList<>(List.of(elementValue)));
+                        }
+                        Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);
+                        if (sqlFragmentDefault != null) {
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>(List.of(sqlFragmentDefault)));
+                            }
+                            return ValueResult.resolved(new ArrayList<>(List.of(sqlFragmentDefault)));
                         }
                         Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(valueName);
                         if (scalarDefault != null) {
@@ -2136,10 +2136,6 @@ class DmSqlValidationTestGenerator {
                     if (!collectionElementDefault.isEmpty()) {
                         return new ArrayList<>(List.of(new LinkedHashMap<>(collectionElementDefault)));
                     }
-                    Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(collectionName);
-                    if (sqlFragmentDefault != null) {
-                        return new ArrayList<>(List.of(sqlFragmentDefault));
-                    }
                     if (shouldUseEmptyCollection(collectionName)
                             && (statement == null || !statement.nonEmptyCollectionParameter(collectionName))) {
                         return new ArrayList<>();
@@ -2149,6 +2145,10 @@ class DmSqlValidationTestGenerator {
                             : statement.collectionColumnType(collectionName, dbColumnMetadata);
                     if (!columnType.isBlank()) {
                         return new ArrayList<>(List.of(defaultCollectionElementForColumnType(collectionName, columnType)));
+                    }
+                    Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(collectionName);
+                    if (sqlFragmentDefault != null) {
+                        return new ArrayList<>(List.of(sqlFragmentDefault));
                     }
                     Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
                     if (scalarDefault != null) {
@@ -2867,6 +2867,8 @@ class DmSqlValidationTestGenerator {
                         case "MYSQL_SUBDATE" -> "SUBDATE 函数";
                         case "MYSQL_PERIOD_DIFF_YEARMONTH" -> "PERIOD_DIFF 年月差";
                         case "MYSQL_COUNT_CONDITION_OR_NULL" -> "COUNT 条件 OR NULL";
+                        case "MYSQL_COUNT_DISTINCT_IF" -> "COUNT DISTINCT IF";
+                        case "MYSQL_BARE_INTERVAL" -> "裸 INTERVAL 表达式";
                         case "MYSQL_NOT_ISNULL" -> "!ISNULL 表达式";
                         case "MYSQL_BOOLEAN_OPERATOR" -> "MySQL 布尔运算符";
                         case "MYSQL_CONVERT_UNSIGNED" -> "CONVERT UNSIGNED";
@@ -2893,6 +2895,7 @@ class DmSqlValidationTestGenerator {
                         case "NULL_COLLECTION_PARAMETER" -> "集合参数为空";
                         case "BINDING_PARAMETER_NAME" -> "绑定参数名问题";
                         case "MAPPER_PROPERTY_NAME" -> "Mapper 属性名不匹配";
+                        case "KEY_PROPERTY_PARAMETER_OBJECT_MISMATCH" -> "keyProperty 与参数对象不匹配";
                         case "INSERT_VALUES_ASSIGNMENT" -> "INSERT VALUES 中出现赋值表达式";
                         case "ORIGINAL_XML_SYNTAX_DEFECT" -> "原 XML SQL 语法缺陷";
                         case "TEST_DATA_OR_CONSTRAINT" -> "测试数据或约束问题";
@@ -3051,6 +3054,9 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("\\\\bconvert\\\\s*\\\\([\\\\s\\\\S]*?,\\\\s*decimal\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_CONVERT_DECIMAL";
                     }
+                    if (lower.contains("no setter found for the keyproperty")) {
+                        return "KEY_PROPERTY_PARAMETER_OBJECT_MISMATCH";
+                    }
                     if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_USER_VARIABLE";
                     }
@@ -3088,6 +3094,9 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("\\\\+\\\\s*interval\\\\s+[^\\\\s]+\\\\s+(year|month|week|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_DATE_ADD_INTERVAL";
                     }
+                    if (Pattern.compile("[+-]\\\\s*interval\\\\s+[^\\\\s]+\\\\s+(year|month|week|day|hour|minute|second)\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_BARE_INTERVAL";
+                    }
                     if (hasMysqlMakeDate(message)) {
                         return "MYSQL_MAKEDATE";
                     }
@@ -3099,6 +3108,12 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Pattern.compile("\\\\bcount\\\\s*\\\\([\\\\s\\\\S]*?\\\\bor\\\\s+null\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_COUNT_CONDITION_OR_NULL";
+                    }
+                    if (Pattern.compile("\\\\bcount\\\\s*\\\\(\\\\s*distinct[\\\\s\\\\S]*?,\\\\s*if\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "MYSQL_COUNT_DISTINCT_IF";
+                    }
+                    if (Pattern.compile("\\\\[percent]附近出现错误|附近出现错误:[\\\\s\\\\S]*?\\\\bpercent\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                        return "DAMENG_RESERVED_IDENTIFIER";
                     }
                     if (Pattern.compile("!\\\\s*isnull\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_NOT_ISNULL";
@@ -3340,6 +3355,7 @@ class DmSqlValidationTestGenerator {
                             "Parameter '",
                             "not found. Available parameters",
                             "There is no getter for property",
+                            "No setter found for the keyProperty",
                             "invalid comparison:",
                             "Could not set parameters",
                             "primitive return type")) {

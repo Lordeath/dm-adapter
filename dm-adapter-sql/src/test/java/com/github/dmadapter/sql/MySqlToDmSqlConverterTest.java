@@ -204,6 +204,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlImplicitSingleQuotedAliasesToDamengIdentifiers() {
+        SqlConversionResult result = converter.convert(
+                "select count(id)'totalCount', NVL(sum(normalCount),0)'normalCount' from equip"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select count(id) AS \"totalCount\", NVL(sum(normalCount),0) AS \"normalCount\" from equip");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+    }
+
+    @Test
     void removesMysqlSelectModifiers() {
         SqlConversionResult result = converter.convert(
                 "select SQL_BIG_RESULT precinct_id, SUM(charging_area) from owner_house_result group by precinct_id"
@@ -413,6 +425,18 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
                 .isEqualTo("select DATEADD(DAY, #{days}, created_at) from login_log");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlIntervalSubtractionToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select * from task where taskStartTime BETWEEN (SYSDATE - INTERVAL ${day} DAY) and SYSDATE"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select * from task where taskStartTime BETWEEN (DATEADD(DAY, -${day}, SYSDATE)) and SYSDATE");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
     }
 
@@ -1446,6 +1470,33 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.MYSQL_COUNT_CONDITION_OR_NULL_RULE,
                 MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE
         );
+    }
+
+    @Test
+    void convertsMysqlCountDistinctIfToCaseExpression() {
+        SqlConversionResult result = converter.convert("""
+                select count(DISTINCT completeUserId, if(completeUserId > 0, true, null)) userIdCount
+                from ns_equip_inspect_task
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select COUNT(DISTINCT CASE WHEN completeUserId > 0 THEN completeUserId ELSE NULL END) userIdCount
+                from ns_equip_inspect_task
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE);
+    }
+
+    @Test
+    void quotesDamengPercentIdentifier() {
+        SqlConversionResult result = converter.convert(
+                "select id, percent, t.percent from ns_equip_maintain_task_support t where percent is not null"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select id, \"percent\", t.\"percent\" from ns_equip_maintain_task_support t where \"percent\" is not null");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
     }
 
     @Test

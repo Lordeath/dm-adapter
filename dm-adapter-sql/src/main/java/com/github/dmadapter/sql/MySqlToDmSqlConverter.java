@@ -36,6 +36,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_STR_TO_DATE_YEARMONTH_RULE = "MYSQL_STR_TO_DATE_YEARMONTH_TO_TO_DATE";
     public static final String MYSQL_PERIOD_DIFF_YEARMONTH_RULE = "MYSQL_PERIOD_DIFF_YEARMONTH_TO_DATEDIFF";
     public static final String MYSQL_COUNT_CONDITION_OR_NULL_RULE = "MYSQL_COUNT_CONDITION_OR_NULL_TO_CASE";
+    public static final String MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE = "MYSQL_COUNT_DISTINCT_IF_TO_CASE";
     public static final String MYSQL_NOT_ISNULL_RULE = "MYSQL_NOT_ISNULL_TO_CASE";
     public static final String MYSQL_BOOLEAN_OPERATOR_RULE = "MYSQL_BOOLEAN_OPERATOR_TO_WORD_OPERATOR";
     public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
@@ -168,6 +169,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "OR",
             "ORDER",
             "OUTER",
+            "PERCENT",
             "PRIOR",
             "REVERSE",
             "RIGHT",
@@ -437,6 +439,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_COUNT_CONDITION_OR_NULL_RULE);
         }
 
+        GenericConversion countDistinctIfConversion = convertCountDistinctIfToCase(converted);
+        if (countDistinctIfConversion.changed()) {
+            converted = countDistinctIfConversion.convertedSql();
+            rules.add(MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE);
+        }
+
         GenericConversion booleanOperatorConversion = convertBooleanOperatorsInIfConditions(converted);
         if (booleanOperatorConversion.changed()) {
             converted = booleanOperatorConversion.convertedSql();
@@ -555,8 +563,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             char current = sql.charAt(index);
             if (current == '\'') {
                 SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(sql, index);
-                if (literal.closed() && isAsAliasPosition(sql, index) && !literal.value().isBlank()) {
+                if (literal.closed() && !literal.value().isBlank() && isAsAliasPosition(sql, index)) {
                     converted.append(quoteDamengIdentifier(literal.value()));
+                    index = literal.nextIndex();
+                    changed = true;
+                } else if (literal.closed()
+                        && !literal.value().isBlank()
+                        && isImplicitSelectAliasPosition(sql, index, literal.nextIndex())) {
+                    converted.append(" AS ").append(quoteDamengIdentifier(literal.value()));
                     index = literal.nextIndex();
                     changed = true;
                 } else {
@@ -583,6 +597,65 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return previousWord != null
                 && "AS".equalsIgnoreCase(previousWord.text())
                 && isOnlyWhitespace(sql, previousWord.endIndex(), quoteIndex);
+    }
+
+    private boolean isImplicitSelectAliasPosition(String sql, int quoteIndex, int quoteEndIndex) {
+        if (!isInsideSelectList(sql, quoteIndex)) {
+            return false;
+        }
+        char previous = previousNonWhitespace(sql, quoteIndex);
+        if (previous != ')' && previous != '"' && previous != '`' && !isIdentifierPart(previous)) {
+            return false;
+        }
+        WordToken previousWord = previousWord(sql, quoteIndex);
+        if (previousWord != null) {
+            String upper = previousWord.text().toUpperCase(Locale.ROOT);
+            if (Set.of("SELECT", "DISTINCT", "ALL", "WHERE", "AND", "OR", "ON", "IN", "LIKE", "IS", "THEN", "ELSE", "WHEN")
+                    .contains(upper)) {
+                return false;
+            }
+        }
+        int next = skipWhitespace(sql, quoteEndIndex);
+        return next >= sql.length()
+                || sql.charAt(next) == ','
+                || startsKeyword(sql, next, "FROM");
+    }
+
+    private boolean isInsideSelectList(String sql, int targetIndex) {
+        Map<Integer, Boolean> selectListByDepth = new LinkedHashMap<>();
+        int depth = 0;
+        int index = 0;
+        while (index < targetIndex && index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                int newDepth = Math.max(0, depth - 1);
+                selectListByDepth.keySet().removeIf(level -> level > newDepth);
+                depth = newDepth;
+                index++;
+            } else if (startsKeyword(sql, index, "SELECT")) {
+                selectListByDepth.put(depth, true);
+                index += "SELECT".length();
+            } else if (startsKeyword(sql, index, "FROM")) {
+                selectListByDepth.put(depth, false);
+                index += "FROM".length();
+            } else {
+                index++;
+            }
+        }
+        return Boolean.TRUE.equals(selectListByDepth.get(depth));
     }
 
     private GenericConversion removeMysqlSelectModifiers(String sql) {
@@ -806,16 +879,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = skipUntilLineEnd(sql, index);
             } else if (startsBlockComment(sql, index)) {
                 index = skipUntilBlockCommentEnd(sql, index);
-            } else if (current == '+') {
+            } else if (current == '+' || current == '-') {
                 DateIntervalAddition addition = readDateIntervalAddition(sql, index);
                 if (addition == null || addition.leftExpression().startIndex() < lastCopiedIndex) {
                     index++;
                 } else {
+                    String amount = current == '-'
+                            ? negatedIntervalAmount(addition.intervalExpression().amount())
+                            : addition.intervalExpression().amount();
                     converted.append(sql, lastCopiedIndex, addition.leftExpression().startIndex());
                     converted.append("DATEADD(")
                             .append(addition.intervalExpression().unit())
                             .append(", ")
-                            .append(addition.intervalExpression().amount())
+                            .append(amount)
                             .append(", ")
                             .append(addition.leftExpression().text())
                             .append(")");
@@ -2973,6 +3049,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if ("DIMENSION".equals(upper)) {
             return "\"DIMENSION\"";
         }
+        if ("PERCENT".equals(upper)) {
+            return quoteDamengIdentifier(identifier);
+        }
         if ("DESC".equals(upper) && previousNonWhitespace(sql, startIndex) == '.') {
             return "\"DESC\"";
         }
@@ -3229,6 +3308,75 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return "COUNT(CASE WHEN " + condition + " THEN 1 END)";
+    }
+
+    private GenericConversion convertCountDistinctIfToCase(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "COUNT")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "COUNT");
+                String replacement = functionCall == null ? null : rewriteCountDistinctIfToCase(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteCountDistinctIfToCase(FunctionCall countCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(countCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String first = arguments.get(0).text().trim();
+        int firstStart = leadingWhitespaceLength(first);
+        if (!startsKeyword(first, firstStart, "DISTINCT")) {
+            return null;
+        }
+        String distinctExpression = first.substring(firstStart + "DISTINCT".length()).trim();
+        if (distinctExpression.isBlank()) {
+            return null;
+        }
+        String second = arguments.get(1).text().trim();
+        FunctionCall ifCall = readFunctionCall(second, leadingWhitespaceLength(second), "IF");
+        if (ifCall == null || skipWhitespace(second, ifCall.endIndex()) != second.length()) {
+            return null;
+        }
+        List<TopLevelArgument> ifArguments = splitTopLevelArguments(ifCall.body());
+        if (ifArguments.size() != 3) {
+            return null;
+        }
+        String condition = ifArguments.get(0).text().trim();
+        String whenTrue = ifArguments.get(1).text().trim();
+        String whenFalse = ifArguments.get(2).text().trim();
+        if (condition.isBlank()
+                || !("TRUE".equalsIgnoreCase(whenTrue) || "1".equals(whenTrue))
+                || !"NULL".equalsIgnoreCase(whenFalse)) {
+            return null;
+        }
+        return "COUNT(DISTINCT CASE WHEN " + condition + " THEN " + distinctExpression + " ELSE NULL END)";
     }
 
     private GenericConversion convertBooleanOperatorsInIfConditions(String sql) {
