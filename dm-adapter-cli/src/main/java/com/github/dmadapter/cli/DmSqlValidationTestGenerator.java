@@ -560,6 +560,7 @@ class DmSqlValidationTestGenerator {
             @EnabledIfEnvironmentVariable(named = "DM_SQL_VALIDATION", matches = "true")
             public class DmSqlValidationTest {
                 private static final String CONFIG_PATH = ".dm-adapter/sql-validation.yml";
+                private static final String REWRITE_CONFIG_PATH = ".dm-adapter/sql-rewrite.yml";
                 private static final String MARKDOWN_REPORT = ".dm-adapter/sql-validation-report.md";
                 private static final String JSON_REPORT = ".dm-adapter/sql-validation-report.json";
                 private static final Pattern PLACEHOLDER = Pattern.compile("\\\\$\\\\{([^}]+)}");
@@ -633,7 +634,7 @@ class DmSqlValidationTestGenerator {
                     Path configPath = projectRoot.resolve(CONFIG_PATH);
                     log("Started. Project root: " + projectRoot);
                     log("Loading config: " + configPath);
-                    ValidationConfig config = ValidationConfig.load(configPath);
+                    ValidationConfig config = ValidationConfig.load(configPath, projectRoot.resolve(REWRITE_CONFIG_PATH));
                     currentConfig = config;
                     List<ValidationRecord> records = new ArrayList<>();
                     UsageFilterReport usageFilterReport = UsageFilterReport.disabled();
@@ -724,6 +725,7 @@ class DmSqlValidationTestGenerator {
                             .filter(record -> "FAILED".equals(record.status))
                             .collect(Collectors.toList());
                     if (!failed.isEmpty()) {
+                        writeValidationArgsSuggestions(projectRoot, config, failed);
                         fail("Dameng SQL validation failed for " + failed.size()
                                 + " mapper methods. See " + projectRoot.resolve(MARKDOWN_REPORT));
                     }
@@ -960,10 +962,10 @@ class DmSqlValidationTestGenerator {
                     if (methods.size() == 1) {
                         return methods.get(0);
                     }
-                    List<String> configuredArgs = config.methodArgs.get(mapperInterface.getName() + "." + methodName);
-                    if (configuredArgs != null) {
+                    MethodArgumentConfig configuredArgs = config.methodArguments(mapperInterface.getName() + "." + methodName);
+                    if (configuredArgs != null && configuredArgs.argumentCount() >= 0) {
                         List<Method> matchingByCount = methods.stream()
-                                .filter(method -> method.getParameterCount() == configuredArgs.size())
+                                .filter(method -> method.getParameterCount() == configuredArgs.argumentCount())
                                 .collect(Collectors.toList());
                         if (matchingByCount.size() == 1) {
                             return matchingByCount.get(0);
@@ -1857,8 +1859,10 @@ class DmSqlValidationTestGenerator {
                     return text != null && text.trim().toLowerCase(Locale.ROOT).startsWith("set ");
                 }
 
+                """,
+            """
                 private List<ParameterResolution> resolveParameterVariants(MapperMethod mapperMethod, ValidationConfig config) {
-                    List<String> configuredArgs = config.methodArgs.get(mapperMethod.key());
+                    MethodArgumentConfig configuredArgs = config.methodArguments(mapperMethod.key());
                     if (mapperMethod.isUnmapped()) {
                         return listOf(ParameterResolution.unresolved("configuration", "Mapped statement was not registered by MyBatis."));
                     }
@@ -1874,18 +1878,55 @@ class DmSqlValidationTestGenerator {
                     return listOf(statementParameters(mapperMethod, configuredArgs));
                 }
 
-                private ParameterResolution configuredParameters(MapperMethod mapperMethod, List<String> configuredArgs) {
+                private ParameterResolution configuredParameters(MapperMethod mapperMethod, MethodArgumentConfig configuredArgs) {
+                    if (configuredArgs.hasParams()) {
+                        return configuredNamedParameters(mapperMethod, configuredArgs);
+                    }
                     Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
-                    if (configuredArgs.size() != parameterTypes.length) {
+                    if (configuredArgs.args.size() != parameterTypes.length) {
                         return ParameterResolution.unresolved(
                                 "configured",
-                                "Configured argument count " + configuredArgs.size()
+                                "Configured argument count " + configuredArgs.args.size()
                                         + " does not match method parameter count " + parameterTypes.length + "."
                         );
                     }
                     Object[] args = new Object[parameterTypes.length];
                     for (int i = 0; i < parameterTypes.length; i++) {
-                        ValueResult value = convertScalar(configuredArgs.get(i), parameterTypes[i], mapperMethod.method.getGenericParameterTypes()[i]);
+                        ValueResult value = convertConfiguredValue(configuredArgs.args.get(i), parameterTypes[i], mapperMethod.method.getGenericParameterTypes()[i]);
+                        if (!value.resolved) {
+                            return ParameterResolution.unresolved("configured", value.message);
+                        }
+                        args[i] = value.value;
+                    }
+                    return ParameterResolution.resolved("configured", args);
+                }
+
+                private ParameterResolution configuredNamedParameters(MapperMethod mapperMethod, MethodArgumentConfig configuredArgs) {
+                    Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
+                    Type[] genericTypes = mapperMethod.method.getGenericParameterTypes();
+                    Object[] args = new Object[parameterTypes.length];
+                    if (parameterTypes.length == 1) {
+                        String parameterName = parameterName(mapperMethod.method, 0);
+                        if (configuredArgs.params.containsKey(parameterName)) {
+                            ValueResult value = convertConfiguredValue(configuredArgs.params.get(parameterName), parameterTypes[0], genericTypes[0]);
+                            return value.resolved
+                                    ? ParameterResolution.resolved("configured", new Object[] { value.value })
+                                    : ParameterResolution.unresolved("configured", value.message);
+                        }
+                        if (Map.class.isAssignableFrom(parameterTypes[0])) {
+                            return ParameterResolution.resolved("configured", new Object[] { mapParameterValue(parameterTypes[0], configuredArgs.params) });
+                        }
+                        ValueResult pojo = configuredPojoValue(parameterTypes[0], genericTypes[0], configuredArgs.params, mapperMethod.statement);
+                        return pojo.resolved
+                                ? ParameterResolution.resolved("configured", new Object[] { pojo.value })
+                                : ParameterResolution.unresolved("configured", pojo.message);
+                    }
+                    for (int i = 0; i < parameterTypes.length; i++) {
+                        String parameterName = parameterName(mapperMethod.method, i);
+                        Object rawValue = configuredArgs.valueFor(parameterName, i);
+                        ValueResult value = rawValue == MethodArgumentConfig.MISSING
+                                ? defaultValue(parameterName, parameterTypes[i], genericTypes[i], 0, mapperMethod.statement)
+                                : convertConfiguredValue(rawValue, parameterTypes[i], genericTypes[i]);
                         if (!value.resolved) {
                             return ParameterResolution.unresolved("configured", value.message);
                         }
@@ -1898,8 +1939,10 @@ class DmSqlValidationTestGenerator {
                     Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
                     Type[] genericTypes = mapperMethod.method.getGenericParameterTypes();
                     Object[] args = new Object[parameterTypes.length];
+                    List<String> names = new ArrayList<>();
                     for (int i = 0; i < parameterTypes.length; i++) {
                         String parameterName = parameterName(mapperMethod.method, i);
+                        names.add(parameterName);
                         String effectiveParameterName = mapperMethod.statement.parameterExpressionName(i, parameterName);
                         ValueResult value = defaultValue(
                                 effectiveParameterName,
@@ -1913,7 +1956,7 @@ class DmSqlValidationTestGenerator {
                         }
                         args[i] = value.value;
                     }
-                    return ParameterResolution.resolved("auto", args);
+                    return ParameterResolution.resolved("auto", args, names);
                 }
 
                 private List<ParameterResolution> setBranchParameterVariants(
@@ -1938,7 +1981,7 @@ class DmSqlValidationTestGenerator {
                         Object[] args = baseParameters.args.clone();
                         args[parameterIndex] = value.value;
                         String label = variant.parameterName + "=" + variant.literal;
-                        variants.add(ParameterResolution.resolved(baseParameters.source + ":" + label, args, label));
+                        variants.add(ParameterResolution.resolved(baseParameters.source + ":" + label, args, baseParameters.names, label));
                     }
                     return variants.isEmpty() ? listOf(baseParameters) : variants;
                 }
@@ -1973,18 +2016,21 @@ class DmSqlValidationTestGenerator {
 
                 """,
             """
-                private ParameterResolution statementParameters(MapperMethod mapperMethod, List<String> configuredArgs) {
-                    if (configuredArgs != null && configuredArgs.size() > 1) {
+                private ParameterResolution statementParameters(MapperMethod mapperMethod, MethodArgumentConfig configuredArgs) {
+                    if (configuredArgs != null && configuredArgs.hasParams()) {
+                        return ParameterResolution.resolved("configured", new Object[] { new LinkedHashMap<>(configuredArgs.params) });
+                    }
+                    if (configuredArgs != null && configuredArgs.args.size() > 1) {
                         Map<String, Object> namedParameters = new LinkedHashMap<>();
-                        for (int i = 0; i < configuredArgs.size(); i++) {
-                            String value = unquote(configuredArgs.get(i));
+                        for (int i = 0; i < configuredArgs.args.size(); i++) {
+                            Object value = configuredArgs.args.get(i);
                             namedParameters.put("arg" + i, value);
                             namedParameters.put("param" + (i + 1), value);
                         }
                         return ParameterResolution.resolved("configured", new Object[] { namedParameters });
                     }
-                    if (configuredArgs != null && configuredArgs.size() == 1) {
-                        ValueResult value = convertScalar(configuredArgs.get(0), mapperMethod.parameterType, mapperMethod.parameterType);
+                    if (configuredArgs != null && configuredArgs.args.size() == 1) {
+                        ValueResult value = convertConfiguredValue(configuredArgs.args.get(0), mapperMethod.parameterType, mapperMethod.parameterType);
                         return value.resolved
                                 ? ParameterResolution.resolved("configured", new Object[] { value.value })
                                 : ParameterResolution.unresolved("configured", value.message);
@@ -2055,7 +2101,8 @@ class DmSqlValidationTestGenerator {
                             "All configured schemas failed. Representative schema="
                                     + schemaLabel(representativeAttempt.schema())
                                     + "\\n" + representative.message
-                                    + "\\nSchema attempts: " + schemaAttemptSummary(attempts)
+                                    + "\\nSchema attempts: " + schemaAttemptSummary(attempts),
+                            parameters
                     );
                 }
 
@@ -2100,7 +2147,8 @@ class DmSqlValidationTestGenerator {
                                     parameters.recordKey(mapperMethod.key()),
                                     parameters.source,
                                     parametersSummary(parameters),
-                                    resultSummary(result)
+                                    resultSummary(result),
+                                    parameters
                             );
                         } catch (MapperInvocationException e) {
                             sqlSession.rollback(true);
@@ -2108,7 +2156,8 @@ class DmSqlValidationTestGenerator {
                                     parameters.recordKey(mapperMethod.key()),
                                     parameters.source,
                                     parametersSummary(parameters),
-                                    throwableSummary(e.getCause())
+                                    throwableSummary(e.getCause()),
+                                    parameters
                             );
                         } catch (Throwable e) {
                             sqlSession.rollback(true);
@@ -2116,7 +2165,8 @@ class DmSqlValidationTestGenerator {
                                     parameters.recordKey(mapperMethod.key()),
                                     parameters.source,
                                     parametersSummary(parameters),
-                                    throwableSummary(e)
+                                    throwableSummary(e),
+                                    parameters
                             );
                         }
                     } catch (Throwable e) {
@@ -2124,7 +2174,8 @@ class DmSqlValidationTestGenerator {
                                 parameters.recordKey(mapperMethod.key()),
                                 parameters.source,
                                 parametersSummary(parameters),
-                                throwableSummary(e)
+                                throwableSummary(e),
+                                parameters
                         );
                     }
                 }
@@ -2233,6 +2284,103 @@ class DmSqlValidationTestGenerator {
                     } catch (Exception e) {
                         return ValueResult.unresolved("Failed to convert configured value '" + value
                                 + "' to " + targetType.getName() + ": " + e.getMessage());
+                    }
+                }
+
+                @SuppressWarnings("unchecked")
+                private ValueResult convertConfiguredValue(Object rawValue, Class<?> targetType, Type genericType) {
+                    if (targetType == null || Object.class.equals(targetType)) {
+                        return ValueResult.resolved(rawValue);
+                    }
+                    if (rawValue == null) {
+                        if (targetType.isPrimitive()) {
+                            return ValueResult.unresolved("Cannot assign null to primitive type " + targetType.getName() + ".");
+                        }
+                        return ValueResult.resolved(null);
+                    }
+                    if (targetType.isInstance(rawValue)) {
+                        return ValueResult.resolved(rawValue);
+                    }
+                    if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
+                        return ValueResult.resolved(mapParameterValue(targetType, new LinkedHashMap<>((Map<String, Object>) rawValue)));
+                    }
+                    if (Collection.class.isAssignableFrom(targetType) && rawValue instanceof Collection) {
+                        Type nestedType = firstGenericArgument(genericType);
+                        Class<?> nestedClass = rawClass(nestedType);
+                        Collection<?> rawCollection = (Collection<?>) rawValue;
+                        Collection<Object> converted = Set.class.isAssignableFrom(targetType)
+                                ? new LinkedHashSet<>()
+                                : new ArrayList<>();
+                        for (Object item : rawCollection) {
+                            ValueResult value = convertConfiguredValue(item, nestedClass, nestedType);
+                            if (!value.resolved) {
+                                return value;
+                            }
+                            converted.add(value.value);
+                        }
+                        return ValueResult.resolved(converted);
+                    }
+                    if (targetType.isArray() && rawValue instanceof Collection) {
+                        Type componentType = targetType.getComponentType();
+                        Class<?> componentClass = targetType.getComponentType();
+                        Collection<?> rawCollection = (Collection<?>) rawValue;
+                        Object array = Array.newInstance(componentClass, rawCollection.size());
+                        int index = 0;
+                        for (Object item : rawCollection) {
+                            ValueResult value = convertConfiguredValue(item, componentClass, componentType);
+                            if (!value.resolved) {
+                                return value;
+                            }
+                            Array.set(array, index++, value.value);
+                        }
+                        return ValueResult.resolved(array);
+                    }
+                    return convertScalar(configuredScalarText(rawValue), targetType, genericType);
+                }
+
+                private String configuredScalarText(Object rawValue) {
+                    if (rawValue == null) {
+                        return "null";
+                    }
+                    return String.valueOf(rawValue);
+                }
+
+                private ValueResult configuredPojoValue(
+                        Class<?> targetType,
+                        Type genericType,
+                        Map<String, Object> params,
+                        MapperStatement statement
+                ) {
+                    ValueResult base = defaultValue(targetType, genericType, 0, statement);
+                    if (!base.resolved || base.value == null) {
+                        return base;
+                    }
+                    Object instance = base.value;
+                    Class<?> currentType = targetType;
+                    try {
+                        while (currentType != null && !Object.class.equals(currentType)) {
+                            for (Field field : currentType.getDeclaredFields()) {
+                                int modifiers = field.getModifiers();
+                                if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers) || !params.containsKey(field.getName())) {
+                                    continue;
+                                }
+                                ValueResult fieldValue = convertConfiguredValue(
+                                        params.get(field.getName()),
+                                        field.getType(),
+                                        field.getGenericType()
+                                );
+                                if (!fieldValue.resolved) {
+                                    return fieldValue;
+                                }
+                                field.setAccessible(true);
+                                field.set(instance, fieldValue.value);
+                            }
+                            currentType = currentType.getSuperclass();
+                        }
+                        return ValueResult.resolved(instance);
+                    } catch (Exception e) {
+                        return ValueResult.unresolved("Failed to apply configured parameters to "
+                                + targetType.getName() + ": " + e.getMessage());
                     }
                 }
 
@@ -3399,6 +3547,260 @@ class DmSqlValidationTestGenerator {
                     Files.createDirectories(projectRoot.resolve(".dm-adapter"));
                     writeString(projectRoot.resolve(MARKDOWN_REPORT), markdown(records, usageFilterReport), StandardCharsets.UTF_8);
                     writeString(projectRoot.resolve(JSON_REPORT), json(records, usageFilterReport), StandardCharsets.UTF_8);
+                }
+
+                """,
+            """
+                private void writeValidationArgsSuggestions(
+                        Path projectRoot,
+                        ValidationConfig config,
+                        List<ValidationRecord> failedRecords
+                ) throws IOException {
+                    Map<String, MethodArgumentConfig> suggestions = new LinkedHashMap<>();
+                    for (ValidationRecord record : failedRecords) {
+                        if (record.parameters == null
+                                || !record.parameters.resolved
+                                || record.parameterSource == null
+                                || !record.parameterSource.startsWith("auto")) {
+                            continue;
+                        }
+                        String methodKey = baseRecordKey(record.key);
+                        if (config.hasConfiguredArguments(methodKey) || suggestions.containsKey(methodKey)) {
+                            continue;
+                        }
+                        MethodArgumentConfig suggestion = suggestedArgumentConfig(record.parameters);
+                        if (suggestion != null && !suggestion.isEmpty()) {
+                            suggestions.put(methodKey, suggestion);
+                        }
+                    }
+                    if (suggestions.isEmpty()) {
+                        return;
+                    }
+                    Path rewriteConfigPath = projectRoot.resolve(REWRITE_CONFIG_PATH);
+                    List<String> lines = Files.isRegularFile(rewriteConfigPath)
+                            ? Files.readAllLines(rewriteConfigPath, StandardCharsets.UTF_8)
+                            : defaultRewriteConfigLines();
+                    List<String> merged = mergeValidationArgs(lines, suggestions);
+                    Files.createDirectories(rewriteConfigPath.getParent());
+                    writeString(rewriteConfigPath, String.join("\\n", merged) + "\\n", StandardCharsets.UTF_8);
+                    log("Updated validation args in " + rewriteConfigPath + " for "
+                            + suggestions.size() + " failed mapper methods.");
+                }
+
+                private MethodArgumentConfig suggestedArgumentConfig(ParameterResolution parameters) {
+                    if (parameters.args == null || parameters.args.length == 0) {
+                        return null;
+                    }
+                    if (parameters.args.length == 1) {
+                        Object value = parameters.args[0];
+                        if (value instanceof Map<?, ?>) {
+                            Map<String, Object> params = serializableMap((Map<?, ?>) value);
+                            return params.isEmpty() ? null : MethodArgumentConfig.params(params);
+                        }
+                        Object serializable = serializableValue(value);
+                        return serializable == MethodArgumentConfig.MISSING
+                                ? null
+                                : MethodArgumentConfig.args(listOf(serializable));
+                    }
+                    if (parameters.names != null && parameters.names.size() == parameters.args.length) {
+                        Map<String, Object> params = new LinkedHashMap<>();
+                        for (int i = 0; i < parameters.args.length; i++) {
+                            Object serializable = serializableValue(parameters.args[i]);
+                            if (serializable != MethodArgumentConfig.MISSING) {
+                                params.put(parameters.names.get(i), serializable);
+                            }
+                        }
+                        return params.isEmpty() ? null : MethodArgumentConfig.params(params);
+                    }
+                    List<Object> args = new ArrayList<>();
+                    for (Object arg : parameters.args) {
+                        Object serializable = serializableValue(arg);
+                        if (serializable == MethodArgumentConfig.MISSING) {
+                            return null;
+                        }
+                        args.add(serializable);
+                    }
+                    return MethodArgumentConfig.args(args);
+                }
+
+                private Map<String, Object> serializableMap(Map<?, ?> map) {
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    for (Map.Entry<?, ?> entry : map.entrySet()) {
+                        String key = String.valueOf(entry.getKey());
+                        if (isSensitiveName(key)) {
+                            continue;
+                        }
+                        Object value = serializableValue(entry.getValue());
+                        if (value != MethodArgumentConfig.MISSING) {
+                            result.put(key, value);
+                        }
+                    }
+                    return result;
+                }
+
+                private Object serializableValue(Object value) {
+                    if (value == null
+                            || value instanceof CharSequence
+                            || value instanceof Number
+                            || value instanceof Boolean
+                            || value instanceof Enum<?>) {
+                        return value;
+                    }
+                    if (value instanceof Date
+                            || value instanceof java.time.temporal.TemporalAccessor
+                            || value instanceof UUID) {
+                        return String.valueOf(value);
+                    }
+                    Class<?> valueType = value.getClass();
+                    if (valueType.isArray()) {
+                        List<Object> values = new ArrayList<>();
+                        int length = Array.getLength(value);
+                        for (int i = 0; i < length; i++) {
+                            Object item = serializableValue(Array.get(value, i));
+                            if (item == MethodArgumentConfig.MISSING) {
+                                return MethodArgumentConfig.MISSING;
+                            }
+                            values.add(item);
+                        }
+                        return values;
+                    }
+                    if (value instanceof Collection<?>) {
+                        List<Object> values = new ArrayList<>();
+                        for (Object item : (Collection<?>) value) {
+                            Object serializable = serializableValue(item);
+                            if (serializable == MethodArgumentConfig.MISSING) {
+                                return MethodArgumentConfig.MISSING;
+                            }
+                            values.add(serializable);
+                        }
+                        return values;
+                    }
+                    return MethodArgumentConfig.MISSING;
+                }
+
+                private List<String> defaultRewriteConfigLines() {
+                    return new ArrayList<>(Arrays.asList(
+                            "# dm-adapter SQL rewrite config.",
+                            "# keyColumns may be inferred from Dameng primary/unique metadata when DM_SQL_VALIDATION is enabled.",
+                            "upsertKeys:",
+                            "  tables:",
+                            "    {}",
+                            "  methods:",
+                            "    {}"
+                    ));
+                }
+
+                private List<String> mergeValidationArgs(
+                        List<String> originalLines,
+                        Map<String, MethodArgumentConfig> suggestions
+                ) {
+                    List<String> result = new ArrayList<>(originalLines);
+                    int validationStart = topLevelSectionStart(result, "validationArgs:");
+                    if (validationStart < 0) {
+                        if (!result.isEmpty() && !isBlank(result.get(result.size() - 1))) {
+                            result.add("");
+                        }
+                        result.add("validationArgs:");
+                        result.add("  methods:");
+                        appendValidationMethods(result, suggestions);
+                        return result;
+                    }
+                    int validationEnd = topLevelSectionEnd(result, validationStart);
+                    for (int i = validationEnd - 1; i > validationStart; i--) {
+                        if ("{}".equals(result.get(i).trim())) {
+                            result.remove(i);
+                            validationEnd--;
+                        }
+                    }
+                    if (!hasValidationMethods(result, validationStart, validationEnd)) {
+                        result.add(validationEnd++, "  methods:");
+                    }
+                    List<String> methodLines = new ArrayList<>();
+                    appendValidationMethods(methodLines, suggestions);
+                    result.addAll(validationEnd, methodLines);
+                    return result;
+                }
+
+                private int topLevelSectionStart(List<String> lines, String header) {
+                    for (int i = 0; i < lines.size(); i++) {
+                        if (leadingSpaces(lines.get(i)) == 0 && header.equals(lines.get(i).trim())) {
+                            return i;
+                        }
+                    }
+                    return -1;
+                }
+
+                private int topLevelSectionEnd(List<String> lines, int start) {
+                    for (int i = start + 1; i < lines.size(); i++) {
+                        String trimmed = lines.get(i).trim();
+                        if (leadingSpaces(lines.get(i)) == 0 && !trimmed.isEmpty() && !trimmed.startsWith("#")) {
+                            return i;
+                        }
+                    }
+                    return lines.size();
+                }
+
+                private boolean hasValidationMethods(List<String> lines, int start, int end) {
+                    for (int i = start + 1; i < end; i++) {
+                        if (leadingSpaces(lines.get(i)) == 2 && "methods:".equals(lines.get(i).trim())) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                private void appendValidationMethods(List<String> lines, Map<String, MethodArgumentConfig> suggestions) {
+                    for (Map.Entry<String, MethodArgumentConfig> entry : suggestions.entrySet()) {
+                        lines.add("    " + quoteYaml(entry.getKey()) + ":");
+                        MethodArgumentConfig config = entry.getValue();
+                        if (config.hasParams()) {
+                            lines.add("      params:");
+                            for (Map.Entry<String, Object> param : config.params.entrySet()) {
+                                lines.add("        " + quoteYamlKey(param.getKey()) + ": " + yamlValue(param.getValue()));
+                            }
+                        } else {
+                            lines.add("      args:");
+                            for (Object arg : config.args) {
+                                lines.add("        - " + yamlValue(arg));
+                            }
+                        }
+                    }
+                }
+
+                private String yamlValue(Object value) {
+                    if (value == null) {
+                        return "null";
+                    }
+                    if (value instanceof Number || value instanceof Boolean) {
+                        return String.valueOf(value);
+                    }
+                    if (value instanceof Collection<?>) {
+                        return "[" + ((Collection<?>) value).stream()
+                                .map(this::yamlValue)
+                                .collect(Collectors.joining(", ")) + "]";
+                    }
+                    return quoteYaml(String.valueOf(value));
+                }
+
+                private String quoteYamlKey(String value) {
+                    return value.matches("[A-Za-z_][A-Za-z0-9_.$-]*") ? value : quoteYaml(value);
+                }
+
+                private String quoteYaml(String value) {
+                    return "\\"" + (value == null ? "" : value.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"")) + "\\"";
+                }
+
+                private int leadingSpaces(String line) {
+                    int count = 0;
+                    while (count < line.length() && line.charAt(count) == ' ') {
+                        count++;
+                    }
+                    return count;
+                }
+
+                private String baseRecordKey(String recordKey) {
+                    int labelStart = recordKey == null ? -1 : recordKey.indexOf(" [");
+                    return labelStart > 0 ? recordKey.substring(0, labelStart) : recordKey;
                 }
 
                 """,
@@ -5114,6 +5516,55 @@ class DmSqlValidationTestGenerator {
 
                 """,
             """
+                private static final class MethodArgumentConfig {
+                    private static final Object MISSING = new Object();
+                    private final List<Object> args = new ArrayList<>();
+                    private final Map<String, Object> params = new LinkedHashMap<>();
+
+                    static MethodArgumentConfig args(List<?> values) {
+                        MethodArgumentConfig config = new MethodArgumentConfig();
+                        if (values != null) {
+                            config.args.addAll(values);
+                        }
+                        return config;
+                    }
+
+                    static MethodArgumentConfig params(Map<String, Object> values) {
+                        MethodArgumentConfig config = new MethodArgumentConfig();
+                        if (values != null) {
+                            config.params.putAll(values);
+                        }
+                        return config;
+                    }
+
+                    private boolean hasParams() {
+                        return !params.isEmpty();
+                    }
+
+                    private boolean isEmpty() {
+                        return args.isEmpty() && params.isEmpty();
+                    }
+
+                    private int argumentCount() {
+                        return hasParams() ? -1 : args.size();
+                    }
+
+                    private Object valueFor(String parameterName, int index) {
+                        if (params.containsKey(parameterName)) {
+                            return params.get(parameterName);
+                        }
+                        String argName = "arg" + index;
+                        if (params.containsKey(argName)) {
+                            return params.get(argName);
+                        }
+                        String paramName = "param" + (index + 1);
+                        if (params.containsKey(paramName)) {
+                            return params.get(paramName);
+                        }
+                        return MISSING;
+                    }
+                }
+
                 private static final class ValidationConfig {
                     private String schema = "";
                     private boolean usageFilterEnabled = true;
@@ -5123,12 +5574,14 @@ class DmSqlValidationTestGenerator {
                     private final List<String> typeAliasesPackages = new ArrayList<>();
                     private final List<String> typeHandlersPackages = new ArrayList<>();
                     private final Map<String, List<String>> methodArgs = new LinkedHashMap<>();
+                    private final Map<String, MethodArgumentConfig> rewriteMethodArgs = new LinkedHashMap<>();
                     private final Set<String> includedMethods = new LinkedHashSet<>();
                     private final Set<String> excludedMethods = new LinkedHashSet<>();
 
-                    static ValidationConfig load(Path path) throws IOException {
+                    static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
                         if (!Files.isRegularFile(path)) {
+                            config.loadRewriteConfig(rewriteConfigPath);
                             return config;
                         }
                         String section = "";
@@ -5232,7 +5685,73 @@ class DmSqlValidationTestGenerator {
                                 }
                             }
                         }
+                        config.loadRewriteConfig(rewriteConfigPath);
                         return config;
+                    }
+
+                    private void loadRewriteConfig(Path rewriteConfigPath) throws IOException {
+                        if (rewriteConfigPath == null || !Files.isRegularFile(rewriteConfigPath)) {
+                            return;
+                        }
+                        String section = "";
+                        String currentMethod = null;
+                        String valueMode = "";
+                        for (String line : Files.readAllLines(rewriteConfigPath, StandardCharsets.UTF_8)) {
+                            String withoutComment = stripYamlComment(line);
+                            String trimmed = withoutComment.trim();
+                            if (isBlank(trimmed) || "{}".equals(trimmed)) {
+                                continue;
+                            }
+                            int indent = leadingSpaces(withoutComment);
+                            if (indent == 0 && "validationArgs:".equals(trimmed)) {
+                                section = "validationArgs";
+                                currentMethod = null;
+                                valueMode = "";
+                                continue;
+                            }
+                            if (indent == 0) {
+                                section = "";
+                                currentMethod = null;
+                                valueMode = "";
+                                continue;
+                            }
+                            if ("validationArgs".equals(section) && indent == 2 && "methods:".equals(trimmed)) {
+                                section = "validationMethods";
+                                currentMethod = null;
+                                valueMode = "";
+                                continue;
+                            }
+                            if ("validationMethods".equals(section) && indent == 4 && trimmed.endsWith(":")) {
+                                currentMethod = scalar(trimmed.substring(0, trimmed.length() - 1));
+                                rewriteMethodArgs.putIfAbsent(currentMethod, new MethodArgumentConfig());
+                                valueMode = "";
+                                continue;
+                            }
+                            if ("validationMethods".equals(section) && currentMethod != null && indent == 6) {
+                                if ("args:".equals(trimmed)) {
+                                    valueMode = "args";
+                                    continue;
+                                }
+                                if ("params:".equals(trimmed)) {
+                                    valueMode = "params";
+                                    continue;
+                                }
+                            }
+                            if ("validationMethods".equals(section) && currentMethod != null && "args".equals(valueMode)
+                                    && indent >= 8 && trimmed.startsWith("- ")) {
+                                rewriteMethodArgs.computeIfAbsent(currentMethod, ignored -> new MethodArgumentConfig())
+                                        .args.add(parseYamlValue(trimmed.substring(2)));
+                                continue;
+                            }
+                            if ("validationMethods".equals(section) && currentMethod != null && "params".equals(valueMode)
+                                    && indent >= 8 && trimmed.contains(":")) {
+                                int colon = trimmed.indexOf(':');
+                                String key = scalar(trimmed.substring(0, colon));
+                                Object value = parseYamlValue(trimmed.substring(colon + 1));
+                                rewriteMethodArgs.computeIfAbsent(currentMethod, ignored -> new MethodArgumentConfig())
+                                        .params.put(key, value);
+                            }
+                        }
                     }
 
                     boolean excludes(String methodKey) {
@@ -5244,11 +5763,28 @@ class DmSqlValidationTestGenerator {
                     }
 
                     boolean includes(String methodKey) {
-                        if (methodArgs.containsKey(methodKey) || includedMethods.contains(methodKey)) {
+                        MethodArgumentConfig rewriteArgs = rewriteMethodArgs.get(methodKey);
+                        if ((rewriteArgs != null && !rewriteArgs.isEmpty())
+                                || methodArgs.containsKey(methodKey)
+                                || includedMethods.contains(methodKey)) {
                             return true;
                         }
                         int lastDot = methodKey.lastIndexOf('.');
                         return lastDot > 0 && includedMethods.contains(methodKey.substring(0, lastDot) + ".*");
+                    }
+
+                    MethodArgumentConfig methodArguments(String methodKey) {
+                        MethodArgumentConfig rewriteArgs = rewriteMethodArgs.get(methodKey);
+                        if (rewriteArgs != null && !rewriteArgs.isEmpty()) {
+                            return rewriteArgs;
+                        }
+                        List<String> validationArgs = methodArgs.get(methodKey);
+                        return validationArgs == null ? null : MethodArgumentConfig.args(new ArrayList<Object>(validationArgs));
+                    }
+
+                    boolean hasConfiguredArguments(String methodKey) {
+                        MethodArgumentConfig rewriteArgs = rewriteMethodArgs.get(methodKey);
+                        return (rewriteArgs != null && !rewriteArgs.isEmpty()) || methodArgs.containsKey(methodKey);
                     }
 
                     List<String> schemas() {
@@ -5270,14 +5806,103 @@ class DmSqlValidationTestGenerator {
                         return schemas.isEmpty() ? "" : schemas.get(0);
                     }
 
+                    private Object parseYamlValue(String rawValue) {
+                        String value = rawValue == null ? "" : rawValue.trim();
+                        if (value.startsWith("[") && value.endsWith("]")) {
+                            String body = value.substring(1, value.length() - 1).trim();
+                            List<Object> values = new ArrayList<>();
+                            if (!body.isEmpty()) {
+                                for (String item : splitInlineList(body)) {
+                                    values.add(parseYamlValue(item));
+                                }
+                            }
+                            return values;
+                        }
+                        boolean quoted = isQuoted(value);
+                        String scalar = scalar(value);
+                        if (quoted) {
+                            return scalar;
+                        }
+                        if ("null".equalsIgnoreCase(scalar)) {
+                            return null;
+                        }
+                        if ("true".equalsIgnoreCase(scalar) || "false".equalsIgnoreCase(scalar)) {
+                            return Boolean.parseBoolean(scalar);
+                        }
+                        try {
+                            if (scalar.matches("[-+]?\\\\d+")) {
+                                return Long.parseLong(scalar);
+                            }
+                            if (scalar.matches("[-+]?\\\\d+\\\\.\\\\d+")) {
+                                return new BigDecimal(scalar);
+                            }
+                        } catch (Exception ignored) {
+                        }
+                        return scalar;
+                    }
+
+                    private List<String> splitInlineList(String body) {
+                        List<String> values = new ArrayList<>();
+                        boolean singleQuoted = false;
+                        boolean doubleQuoted = false;
+                        StringBuilder current = new StringBuilder();
+                        for (int i = 0; i < body.length(); i++) {
+                            char c = body.charAt(i);
+                            if (c == '\\'' && !doubleQuoted) {
+                                singleQuoted = !singleQuoted;
+                            } else if (c == '\\"' && !singleQuoted) {
+                                doubleQuoted = !doubleQuoted;
+                            }
+                            if (c == ',' && !singleQuoted && !doubleQuoted) {
+                                values.add(current.toString().trim());
+                                current.setLength(0);
+                            } else {
+                                current.append(c);
+                            }
+                        }
+                        if (current.length() > 0) {
+                            values.add(current.toString().trim());
+                        }
+                        return values;
+                    }
+
+                    private String stripYamlComment(String line) {
+                        boolean singleQuoted = false;
+                        boolean doubleQuoted = false;
+                        for (int i = 0; i < line.length(); i++) {
+                            char current = line.charAt(i);
+                            if (current == '\\'' && !doubleQuoted) {
+                                singleQuoted = !singleQuoted;
+                            } else if (current == '\\"' && !singleQuoted) {
+                                doubleQuoted = !doubleQuoted;
+                            } else if (current == '#' && !singleQuoted && !doubleQuoted) {
+                                return line.substring(0, i);
+                            }
+                        }
+                        return line;
+                    }
+
+                    private int leadingSpaces(String line) {
+                        int count = 0;
+                        while (count < line.length() && line.charAt(count) == ' ') {
+                            count++;
+                        }
+                        return count;
+                    }
+
                     private String scalar(String value) {
                         String trimmed = value.trim();
-                        if (trimmed.length() >= 2
-                                && ((trimmed.startsWith("\\"") && trimmed.endsWith("\\""))
-                                || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+                        if (isQuoted(trimmed)) {
                             return trimmed.substring(1, trimmed.length() - 1);
                         }
                         return trimmed;
+                    }
+
+                    private boolean isQuoted(String value) {
+                        String trimmed = value == null ? "" : value.trim();
+                        return trimmed.length() >= 2
+                                && ((trimmed.startsWith("\\"") && trimmed.endsWith("\\\""))
+                                || (trimmed.startsWith("'") && trimmed.endsWith("'")));
                     }
                 }
 
@@ -5951,12 +6576,25 @@ class DmSqlValidationTestGenerator {
                     private final Object[] args;
                     private final String message;
                     private final String label;
+                    private final List<String> names;
 
                     private ParameterResolution(boolean resolved, String source, Object[] args, String message, String label) {
+                        this(resolved, source, args, message, listOf(), label);
+                    }
+
+                    private ParameterResolution(
+                            boolean resolved,
+                            String source,
+                            Object[] args,
+                            String message,
+                            List<String> names,
+                            String label
+                    ) {
                         this.resolved = resolved;
                         this.source = source;
                         this.args = args;
                         this.message = message;
+                        this.names = names == null ? listOf() : copyList(names);
                         this.label = label == null ? "" : label;
                     }
 
@@ -5966,6 +6604,14 @@ class DmSqlValidationTestGenerator {
 
                     static ParameterResolution resolved(String source, Object[] args, String label) {
                         return new ParameterResolution(true, source, args, "", label);
+                    }
+
+                    static ParameterResolution resolved(String source, Object[] args, List<String> names) {
+                        return new ParameterResolution(true, source, args, "", names, "");
+                    }
+
+                    static ParameterResolution resolved(String source, Object[] args, List<String> names, String label) {
+                        return new ParameterResolution(true, source, args, "", names, label);
                     }
 
                     static ParameterResolution unresolved(String source, String message) {
@@ -6003,9 +6649,10 @@ class DmSqlValidationTestGenerator {
                     private final String parameterSource;
                     private final String parameterSummary;
                     private final String message;
+                    private final ParameterResolution parameters;
 
                     private ValidationRecord(String status, String key, String parameterSource, String message) {
-                        this(status, key, parameterSource, "", message);
+                        this(status, key, parameterSource, "", message, null);
                     }
 
                     private ValidationRecord(
@@ -6015,11 +6662,23 @@ class DmSqlValidationTestGenerator {
                             String parameterSummary,
                             String message
                     ) {
+                        this(status, key, parameterSource, parameterSummary, message, null);
+                    }
+
+                    private ValidationRecord(
+                            String status,
+                            String key,
+                            String parameterSource,
+                            String parameterSummary,
+                            String message,
+                            ParameterResolution parameters
+                    ) {
                         this.status = status;
                         this.key = key;
                         this.parameterSource = parameterSource;
                         this.parameterSummary = parameterSummary == null ? "" : parameterSummary;
                         this.message = message;
+                        this.parameters = parameters;
                     }
 
                     static ValidationRecord passed(String key, String parameterSource, String message) {
@@ -6030,12 +6689,20 @@ class DmSqlValidationTestGenerator {
                         return new ValidationRecord("PASSED", key, parameterSource, parameterSummary, message);
                     }
 
+                    static ValidationRecord passed(String key, String parameterSource, String parameterSummary, String message, ParameterResolution parameters) {
+                        return new ValidationRecord("PASSED", key, parameterSource, parameterSummary, message, parameters);
+                    }
+
                     static ValidationRecord failed(String key, String parameterSource, String message) {
                         return new ValidationRecord("FAILED", key, parameterSource, message);
                     }
 
                     static ValidationRecord failed(String key, String parameterSource, String parameterSummary, String message) {
                         return new ValidationRecord("FAILED", key, parameterSource, parameterSummary, message);
+                    }
+
+                    static ValidationRecord failed(String key, String parameterSource, String parameterSummary, String message, ParameterResolution parameters) {
+                        return new ValidationRecord("FAILED", key, parameterSource, parameterSummary, message, parameters);
                     }
 
                     static ValidationRecord skipped(String key, String parameterSource, String message) {

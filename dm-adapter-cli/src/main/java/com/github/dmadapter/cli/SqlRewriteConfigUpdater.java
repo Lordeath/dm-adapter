@@ -165,6 +165,7 @@ class SqlRewriteConfigUpdater {
     private static final class RewriteConfigModel {
         private final LinkedHashMap<String, List<String>> tableKeys = new LinkedHashMap<>();
         private final LinkedHashMap<String, List<String>> methodKeys = new LinkedHashMap<>();
+        private final List<String> validationArgsLines = new ArrayList<>();
 
         static RewriteConfigModel load(Path path) {
             RewriteConfigModel model = new RewriteConfigModel();
@@ -263,10 +264,15 @@ class SqlRewriteConfigUpdater {
                         .append(inlineList(columns))
                         .append("\n"));
             }
+            if (!validationArgsLines.isEmpty()) {
+                yaml.append("\n");
+                validationArgsLines.forEach(line -> yaml.append(line).append("\n"));
+            }
             return yaml.toString();
         }
 
         private void parse(List<String> lines) {
+            validationArgsLines.addAll(topLevelBlock(lines, "validationArgs:"));
             String section = "";
             String currentName = "";
             for (String line : lines) {
@@ -316,6 +322,30 @@ class SqlRewriteConfigUpdater {
                     }
                 }
             }
+        }
+
+        private static List<String> topLevelBlock(List<String> lines, String header) {
+            List<String> block = new ArrayList<>();
+            boolean capturing = false;
+            for (String line : lines) {
+                String trimmed = line.trim();
+                int indent = leadingSpaces(line);
+                if (!capturing) {
+                    if (indent == 0 && header.equals(trimmed)) {
+                        capturing = true;
+                        block.add(line);
+                    }
+                    continue;
+                }
+                if (indent == 0 && !trimmed.isBlank() && !trimmed.startsWith("#")) {
+                    break;
+                }
+                block.add(line);
+            }
+            while (!block.isEmpty() && block.get(block.size() - 1).trim().isBlank()) {
+                block.remove(block.size() - 1);
+            }
+            return block;
         }
 
         private Optional<String> tableKey(String table) {
