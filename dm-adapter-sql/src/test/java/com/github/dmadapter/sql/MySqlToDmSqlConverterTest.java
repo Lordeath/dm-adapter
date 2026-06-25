@@ -1250,6 +1250,97 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void quotesReverseKeywordColumnIdentifiers() {
+        SqlConversionResult result = converter.convert("""
+                select reverse, m.reverse, reverse() as reversed
+                from ns_meter_manage m
+                where reverse = #{reverse}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select "reverse", m."reverse", reverse() as reversed
+                from ns_meter_manage m
+                where "reverse" = #{reverse}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+    }
+
+    @Test
+    void convertsNestedMysqlDateAddIntervals() {
+        SqlConversionResult result = converter.convert("""
+                select DATE_ADD(DATE_ADD(CancelDate, INTERVAL 1 DAY), INTERVAL 1 YEAR)
+                from Charge_ChargeStandard
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select DATEADD(YEAR, 1, DATEADD(DAY, 1, CancelDate))
+                from Charge_ChargeStandard
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
+    void convertsPeriodDiffYearMonthExpressions() {
+        SqlConversionResult result = converter.convert("""
+                select period_diff(extract(YEAR_MONTH from SYSDATE), extract(YEAR_MONTH from min(str_to_date(AccountBook, '%Y%m'))))
+                from Charge_CustomerChargeDetail
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select DATEDIFF(MONTH, min(TO_DATE(AccountBook, 'YYYYMM')), SYSDATE)
+                from Charge_CustomerChargeDetail
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_STR_TO_DATE_YEARMONTH_RULE,
+                MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE
+        );
+    }
+
+    @Test
+    void removesMysqlUseForceAndIgnoreIndexHints() {
+        SqlConversionResult result = converter.convert("""
+                select *
+                from charge_customerchargedetail cd use index (idx_a)
+                join other_table ot force index(idx_b) on cd.id = ot.id
+                join third_table tt ignore index (idx_c) on tt.id = cd.id
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select *
+                from charge_customerchargedetail cd join other_table ot on cd.id = ot.id
+                join third_table tt on tt.id = cd.id
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_INDEX_HINT_REMOVAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlBooleanAggregationAndNotIsNullExpressions() {
+        SqlConversionResult result = converter.convert("""
+                select count(sendState = 'SEND_SUCCESS' or null) smsSuccessCount,
+                       !ISNULL(c.refMeterReadId) charged,
+                       IF((isnull(xm.billType) = 1) || (length(xm.billType) = 0), jt.billType, xm.billType) billType
+                from ns_sms_details
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select COUNT(CASE WHEN sendState = 'SEND_SUCCESS' THEN 1 END) smsSuccessCount,
+                       CASE WHEN ISNULL(c.refMeterReadId) THEN 0 ELSE 1 END charged,
+                       IF((isnull(xm.billType) = 1) OR (length(xm.billType) = 0), jt.billType, xm.billType) billType
+                from ns_sms_details
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_NOT_ISNULL_RULE,
+                MySqlToDmSqlConverter.MYSQL_COUNT_CONDITION_OR_NULL_RULE,
+                MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE
+        );
+    }
+
+    @Test
     void marksAmbiguousLimitForManualReview() {
         SqlConversionResult result = converter.convert("select * from user limit ?, ?");
 
