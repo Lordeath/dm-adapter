@@ -534,7 +534,9 @@ class DmSqlValidationTestGenerator {
             import java.time.LocalTime;
             import java.time.format.DateTimeFormatter;
             import java.util.ArrayList;
+            import java.util.Arrays;
             import java.util.Collection;
+            import java.util.Collections;
             import java.util.Comparator;
             import java.util.Date;
             import java.util.LinkedHashMap;
@@ -549,6 +551,7 @@ class DmSqlValidationTestGenerator {
             import java.util.regex.Matcher;
             import java.util.regex.Pattern;
             import java.util.stream.Collectors;
+            import java.util.stream.Stream;
 
             import static org.junit.jupiter.api.Assertions.fail;
 
@@ -559,7 +562,7 @@ class DmSqlValidationTestGenerator {
                 private static final String MARKDOWN_REPORT = ".dm-adapter/sql-validation-report.md";
                 private static final String JSON_REPORT = ".dm-adapter/sql-validation-report.json";
                 private static final Pattern PLACEHOLDER = Pattern.compile("\\\\$\\\\{([^}]+)}");
-                private static final Set<String> DEFAULT_COLLECTION_PARAMETER_NAMES = Set.of(
+                private static final Set<String> DEFAULT_COLLECTION_PARAMETER_NAMES = new LinkedHashSet<>(Arrays.asList(
                         "primarykeylist",
                         "removeitemids",
                         "ids",
@@ -571,11 +574,41 @@ class DmSqlValidationTestGenerator {
                         "allitem",
                         "chargedetailids",
                         "owneridlist"
-                );
+                ));
                 private static final DateTimeFormatter LOG_TIMESTAMP_FORMATTER =
                         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
                 private ValidationConfig currentConfig = new ValidationConfig();
                 private DbColumnMetadata dbColumnMetadata = DbColumnMetadata.empty();
+
+                @SafeVarargs
+                private static <T> List<T> listOf(T... values) {
+                    return Collections.unmodifiableList(Arrays.asList(values));
+                }
+
+                @SafeVarargs
+                private static <T> Set<T> setOf(T... values) {
+                    return Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(values)));
+                }
+
+                private static <K, V> Map<K, V> emptyMap() {
+                    return Collections.emptyMap();
+                }
+
+                private static <T> List<T> copyList(Collection<? extends T> values) {
+                    return Collections.unmodifiableList(new ArrayList<>(values));
+                }
+
+                private static <K, V> Map<K, V> copyMap(Map<? extends K, ? extends V> values) {
+                    return Collections.unmodifiableMap(new LinkedHashMap<>(values));
+                }
+
+                private static boolean isBlank(String value) {
+                    return value == null || value.trim().isEmpty();
+                }
+
+                private static void writeString(Path path, String content) throws IOException {
+                    Files.write(path, content.getBytes(StandardCharsets.UTF_8));
+                }
 
                 public static void main(String[] args) throws Exception {
                     new DmSqlValidationTest().validateMappedDaoSql();
@@ -749,7 +782,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private String required(String value, String key) {
-                    if (value == null || value.isBlank() || value.contains("${")) {
+                    if (value == null || isBlank(value) || value.contains("${")) {
                         throw new IllegalStateException(key + " is required. Configure it in " + CONFIG_PATH
                                 + " or provide the referenced environment variable.");
                     }
@@ -797,7 +830,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private List<Path> resourceDirectories(Path projectRoot, String directoryName) throws IOException {
-                    try (var paths = Files.walk(projectRoot)) {
+                    try (Stream<Path> paths = Files.walk(projectRoot)) {
                         return paths.filter(Files::isDirectory)
                                 .filter(path -> path.getFileName().toString().equals(directoryName))
                                 .filter(path -> normalize(projectRoot.relativize(path)).contains("src/main/resources/"))
@@ -808,8 +841,8 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private List<Path> resolveMapperXmlLocation(Path projectRoot, String location) throws IOException {
-                    if (location == null || location.isBlank() || location.startsWith("#")) {
-                        return List.of();
+                    if (location == null || isBlank(location) || location.startsWith("#")) {
+                        return listOf();
                     }
                     String normalized = location.trim().replace('\\\\', '/');
                     if (normalized.endsWith("/**/*.xml")) {
@@ -825,17 +858,17 @@ class DmSqlValidationTestGenerator {
                         return xmlFiles(path, true);
                     }
                     if (Files.isRegularFile(path)) {
-                        return List.of(path.toAbsolutePath().normalize());
+                        return listOf(path.toAbsolutePath().normalize());
                     }
-                    return List.of();
+                    return listOf();
                 }
 
                 private List<Path> xmlFiles(Path directory, boolean recursive) throws IOException {
                     if (!Files.isDirectory(directory)) {
-                        return List.of();
+                        return listOf();
                     }
                     int maxDepth = recursive ? Integer.MAX_VALUE : 1;
-                    try (var paths = Files.walk(directory, maxDepth)) {
+                    try (Stream<Path> paths = Files.walk(directory, maxDepth)) {
                         return paths.filter(Files::isRegularFile)
                                 .filter(path -> path.getFileName().toString().endsWith(".xml"))
                                 .sorted()
@@ -844,7 +877,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Path resolveProjectPath(Path projectRoot, String location) {
-                    Path path = Path.of(location);
+                    Path path = java.nio.file.Paths.get(location);
                     if (path.isAbsolute()) {
                         return path.toAbsolutePath().normalize();
                     }
@@ -908,7 +941,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Method mapperMethod(Class<?> mapperInterface, String methodName, ValidationConfig config) {
-                    List<Method> methods = List.of(mapperInterface.getMethods()).stream()
+                    List<Method> methods = Arrays.asList(mapperInterface.getMethods()).stream()
                             .filter(method -> isInvocableMapperMethod(method) && method.getName().equals(methodName))
                             .collect(Collectors.toList());
                     if (methods.size() == 1) {
@@ -949,19 +982,23 @@ class DmSqlValidationTestGenerator {
                         Document document = parseXml(mapperXmlFile);
                         Element root = document.getDocumentElement();
                         if (root == null || !"mapper".equals(root.getTagName())) {
-                            return List.of();
+                            return listOf();
                         }
                         String namespace = root.getAttribute("namespace");
-                        if (namespace == null || namespace.isBlank()) {
-                            return List.of();
+                        if (namespace == null || isBlank(namespace)) {
+                            return listOf();
                         }
                         List<MapperStatement> statements = new ArrayList<>();
                         NodeList children = root.getChildNodes();
                         for (int i = 0; i < children.getLength(); i++) {
                             Node node = children.item(i);
-                            if (node instanceof Element element && isStatementElement(element)) {
+                            if (node instanceof Element) {
+                                Element element = (Element) node;
+                                if (!isStatementElement(element)) {
+                                    continue;
+                                }
                                 String id = element.getAttribute("id");
-                                if (id != null && !id.isBlank()) {
+                                if (id != null && !isBlank(id)) {
                                     statements.add(new MapperStatement(
                                             namespace,
                                             id,
@@ -974,7 +1011,7 @@ class DmSqlValidationTestGenerator {
                         }
                         return statements;
                     } catch (Exception e) {
-                        return List.of();
+                        return listOf();
                     }
                 }
 
@@ -988,22 +1025,22 @@ class DmSqlValidationTestGenerator {
                 private Set<String> generatedKeyProperties(Element statement) {
                     if (!"insert".equals(statement.getTagName())
                             || !"true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys"))) {
-                        return Set.of();
+                        return setOf();
                     }
                     String keyProperty = statement.getAttribute("keyProperty");
-                    if (keyProperty == null || keyProperty.isBlank()) {
-                        return Set.of();
+                    if (keyProperty == null || isBlank(keyProperty)) {
+                        return setOf();
                     }
                     return Pattern.compile("[,\\\\s]+")
                             .splitAsStream(keyProperty.trim())
                             .map(String::trim)
-                            .filter(value -> !value.isBlank())
+                            .filter(value -> !isBlank(value))
                             .collect(Collectors.toCollection(LinkedHashSet::new));
                 }
 
                 private List<SetBranchParameterVariant> setBranchParameterVariants(Element statement) {
                     if (!"update".equals(statement.getTagName())) {
-                        return List.of();
+                        return listOf();
                     }
                     Map<String, BranchCollector> collectors = new LinkedHashMap<>();
                     collectSetBranchParameterVariants(statement, collectors);
@@ -1011,7 +1048,7 @@ class DmSqlValidationTestGenerator {
                             .filter(BranchCollector::valid)
                             .max(Comparator.comparingInt(BranchCollector::size))
                             .map(BranchCollector::variants)
-                            .orElse(List.of());
+                            .orElse(listOf());
                 }
 
                 private DynamicIdentifierMetadata dynamicIdentifierMetadata(Element statement) {
@@ -1028,7 +1065,8 @@ class DmSqlValidationTestGenerator {
                         boolean insideSet,
                         SqlStatementContext sqlContext
                 ) {
-                    if (node instanceof Element element) {
+                    if (node instanceof Element) {
+                        Element element = (Element) node;
                         Map<String, String> currentForeachCollections = foreachCollections;
                         boolean currentInsideSet = insideSet || "set".equals(element.getTagName());
                         if ("foreach".equals(element.getTagName())) {
@@ -1043,7 +1081,7 @@ class DmSqlValidationTestGenerator {
                             if (columnReference != null) {
                                 metadata.addCollectionColumnReference(collection, columnReference);
                             }
-                            if (item != null && !item.isBlank() && collection != null && !collection.isBlank()) {
+                            if (item != null && !isBlank(item) && collection != null && !isBlank(collection)) {
                                 currentForeachCollections = new LinkedHashMap<>(foreachCollections);
                                 currentForeachCollections.put(item, collection);
                             }
@@ -1124,11 +1162,11 @@ class DmSqlValidationTestGenerator {
                     if (collection != null) {
                         if (parts.size() == 1
                                 && jdbcType != null
-                                && !jdbcType.isBlank()) {
+                                && !isBlank(jdbcType)) {
                             metadata.addCollectionScalarDefault(collection, defaultValueForJdbcType(collection, jdbcType));
                         }
                         if (parts.size() > 1) {
-                            Object defaultValue = jdbcType == null || jdbcType.isBlank()
+                            Object defaultValue = jdbcType == null || isBlank(jdbcType)
                                     ? defaultString(parts.get(1))
                                     : defaultValueForJdbcType(parts.get(1), jdbcType);
                             metadata.addCollectionDefault(collection, parts.get(1), defaultValue);
@@ -1140,7 +1178,7 @@ class DmSqlValidationTestGenerator {
                         metadata.addDefaultValue(parts.get(0), defaultValueForDirectParameter(parts.get(0), jdbcType));
                         return;
                     }
-                    if (jdbcType != null && !jdbcType.isBlank()) {
+                    if (jdbcType != null && !isBlank(jdbcType)) {
                         metadata.addDefaultValue(parts.get(parts.size() - 1), defaultValueForJdbcType(parts.get(parts.size() - 1), jdbcType));
                     }
                 }
@@ -1151,7 +1189,7 @@ class DmSqlValidationTestGenerator {
                         DynamicIdentifierMetadata metadata,
                         SqlStatementContext sqlContext
                 ) {
-                    if (text == null || text.isBlank()) {
+                    if (text == null || isBlank(text)) {
                         return;
                     }
                     String identifier = sqlIdentifierPattern();
@@ -1186,7 +1224,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object defaultValueForDirectParameter(String valueName, String jdbcType) {
-                    if (jdbcType != null && !jdbcType.isBlank()) {
+                    if (jdbcType != null && !isBlank(jdbcType)) {
                         return defaultValueForJdbcType(valueName, jdbcType);
                     }
                     String normalized = normalizeName(valueName);
@@ -1259,7 +1297,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean looksLikeSetAssignment(String text) {
-                    if (text == null || text.isBlank()) {
+                    if (text == null || isBlank(text)) {
                         return false;
                     }
                     return Pattern.compile("(?is)(?:^|[,\\\\s])[A-Za-z_][A-Za-z0-9_.$]*\\\\s*=\\\\s*#\\\\{")
@@ -1268,7 +1306,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object defaultValueForSetParameter(String valueName, String jdbcType) {
-                    if (jdbcType != null && !jdbcType.isBlank()) {
+                    if (jdbcType != null && !isBlank(jdbcType)) {
                         return defaultValueForJdbcType(valueName, jdbcType);
                     }
                     String normalized = normalizeName(valueName);
@@ -1285,12 +1323,12 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private List<String> pathParts(String expression) {
-                    if (expression == null || expression.isBlank()) {
-                        return List.of();
+                    if (expression == null || isBlank(expression)) {
+                        return listOf();
                     }
                     return Pattern.compile("\\\\.")
                             .splitAsStream(expression.trim())
-                            .filter(part -> !part.isBlank())
+                            .filter(part -> !isBlank(part))
                             .collect(Collectors.toList());
                 }
 
@@ -1307,14 +1345,15 @@ class DmSqlValidationTestGenerator {
                     }
                     NodeList children = element.getChildNodes();
                     for (int i = 0; i < children.getLength(); i++) {
-                        if (children.item(i) instanceof Element child) {
+                        if (children.item(i) instanceof Element) {
+                            Element child = (Element) children.item(i);
                             collectSetBranchParameterVariants(child, collectors);
                         }
                     }
                 }
 
                 private BranchCondition branchCondition(String test) {
-                    if (test == null || test.isBlank()) {
+                    if (test == null || isBlank(test)) {
                         return null;
                     }
                     Matcher leftLiteral = Pattern.compile(
@@ -1387,11 +1426,11 @@ class DmSqlValidationTestGenerator {
                     while (matcher.find()) {
                         String table = lastIdentifierPart(matcher.group(1));
                         String alias = matcher.group(2);
-                        if (table.isBlank()) {
+                        if (isBlank(table)) {
                             continue;
                         }
                         tableAliases.put(normalizeSqlIdentifier(table), table);
-                        if (alias != null && !alias.isBlank() && !isSqlKeyword(alias)) {
+                        if (alias != null && !isBlank(alias) && !isSqlKeyword(alias)) {
                             tableAliases.put(normalizeSqlIdentifier(alias), table);
                         }
                     }
@@ -1400,7 +1439,7 @@ class DmSqlValidationTestGenerator {
 
                 private ColumnReference inOperatorColumnReference(Element element, SqlStatementContext sqlContext) {
                     String textBefore = compactSql(textBeforeElement(element, 300));
-                    if (textBefore.isBlank()) {
+                    if (isBlank(textBefore)) {
                         return null;
                     }
                     String identifier = sqlIdentifierPattern();
@@ -1413,7 +1452,7 @@ class DmSqlValidationTestGenerator {
                     String expression = matcher.group(1);
                     List<String> parts = Pattern.compile("\\\\.").splitAsStream(expression)
                             .map(String::trim)
-                            .filter(part -> !part.isBlank())
+                            .filter(part -> !isBlank(part))
                             .collect(Collectors.toList());
                     if (parts.isEmpty()) {
                         return null;
@@ -1424,7 +1463,7 @@ class DmSqlValidationTestGenerator {
                 private ColumnReference columnReference(String expression, SqlStatementContext sqlContext) {
                     List<String> parts = Pattern.compile("\\\\.").splitAsStream(expression == null ? "" : expression)
                             .map(String::trim)
-                            .filter(part -> !part.isBlank())
+                            .filter(part -> !isBlank(part))
                             .collect(Collectors.toList());
                     if (parts.isEmpty()) {
                         return null;
@@ -1465,12 +1504,12 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private String lastIdentifierPart(String expression) {
-                    if (expression == null || expression.isBlank()) {
+                    if (expression == null || isBlank(expression)) {
                         return "";
                     }
                     List<String> parts = Pattern.compile("\\\\.").splitAsStream(expression)
                             .map(String::trim)
-                            .filter(part -> !part.isBlank())
+                            .filter(part -> !isBlank(part))
                             .collect(Collectors.toList());
                     return parts.isEmpty() ? "" : cleanSqlIdentifier(parts.get(parts.size() - 1));
                 }
@@ -1494,7 +1533,7 @@ class DmSqlValidationTestGenerator {
 
                 private boolean isSqlKeyword(String identifier) {
                     String normalized = normalizeSqlIdentifier(identifier);
-                    return Set.of(
+                    return setOf(
                             "where", "left", "right", "inner", "outer", "full", "join", "on",
                             "group", "order", "having", "limit", "fetch", "union", "cross"
                     ).contains(normalized);
@@ -1507,18 +1546,18 @@ class DmSqlValidationTestGenerator {
                 private List<ParameterResolution> resolveParameterVariants(MapperMethod mapperMethod, ValidationConfig config) {
                     List<String> configuredArgs = config.methodArgs.get(mapperMethod.key());
                     if (mapperMethod.isUnmapped()) {
-                        return List.of(ParameterResolution.unresolved("configuration", "Mapped statement was not registered by MyBatis."));
+                        return listOf(ParameterResolution.unresolved("configuration", "Mapped statement was not registered by MyBatis."));
                     }
                     if (mapperMethod.method != null) {
                         if (configuredArgs != null) {
-                            return List.of(configuredParameters(mapperMethod, configuredArgs));
+                            return listOf(configuredParameters(mapperMethod, configuredArgs));
                         }
                         ParameterResolution parameters = generatedParameters(mapperMethod);
                         return parameters.resolved
                                 ? setBranchParameterVariants(mapperMethod, parameters)
-                                : List.of(parameters);
+                                : listOf(parameters);
                     }
-                    return List.of(statementParameters(mapperMethod, configuredArgs));
+                    return listOf(statementParameters(mapperMethod, configuredArgs));
                 }
 
                 private ParameterResolution configuredParameters(MapperMethod mapperMethod, List<String> configuredArgs) {
@@ -1568,7 +1607,7 @@ class DmSqlValidationTestGenerator {
                         ParameterResolution baseParameters
                 ) {
                     if (mapperMethod.statement.setBranchParameterVariants.isEmpty()) {
-                        return List.of(baseParameters);
+                        return listOf(baseParameters);
                     }
                     List<ParameterResolution> variants = new ArrayList<>();
                     Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
@@ -1587,7 +1626,7 @@ class DmSqlValidationTestGenerator {
                         String label = variant.parameterName + "=" + variant.literal;
                         variants.add(ParameterResolution.resolved(baseParameters.source + ":" + label, args, label));
                     }
-                    return variants.isEmpty() ? List.of(baseParameters) : variants;
+                    return variants.isEmpty() ? listOf(baseParameters) : variants;
                 }
 
                 private int parameterIndex(Method method, String parameterName) {
@@ -1605,8 +1644,11 @@ class DmSqlValidationTestGenerator {
                         if ("org.apache.ibatis.annotations.Param".equals(annotation.annotationType().getName())) {
                             try {
                                 Object value = annotation.annotationType().getMethod("value").invoke(annotation);
-                                if (value instanceof String name && !name.isBlank()) {
-                                    return name;
+                                if (value instanceof String) {
+                                    String name = (String) value;
+                                    if (!name.trim().isEmpty()) {
+                                        return name;
+                                    }
                                 }
                             } catch (Exception ignored) {
                             }
@@ -1705,7 +1747,7 @@ class DmSqlValidationTestGenerator {
 
                 private List<String> validationSchemas(ValidationConfig config) {
                     List<String> schemas = config.schemas();
-                    return schemas.isEmpty() ? List.of("") : schemas;
+                    return schemas.isEmpty() ? listOf("") : schemas;
                 }
 
                 private boolean isSchemaObjectFailureRecord(ValidationRecord record) {
@@ -1724,7 +1766,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private String schemaLabel(String schema) {
-                    return schema == null || schema.isBlank() ? "<default>" : schema;
+                    return schema == null || isBlank(schema) ? "<default>" : schema;
                 }
 
                 private ValidationRecord invokeMapperMethodWithSchema(
@@ -1799,7 +1841,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private void applySchema(Connection connection, String schema) {
-                    if (schema == null || schema.isBlank()) {
+                    if (schema == null || isBlank(schema)) {
                         return;
                     }
                     try (Statement statement = connection.createStatement()) {
@@ -1983,14 +2025,14 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Collection.class.isAssignableFrom(targetType)) {
                         Map<String, Object> collectionElementDefault = statement == null
-                                ? Map.of()
+                                ? emptyMap()
                                 : statement.collectionElementDefault(valueName);
                         if (!collectionElementDefault.isEmpty()) {
                             Map<String, Object> elementValue = new LinkedHashMap<>(collectionElementDefault);
                             if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(List.of(elementValue)));
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(elementValue)));
                             }
-                            return ValueResult.resolved(new ArrayList<>(List.of(elementValue)));
+                            return ValueResult.resolved(new ArrayList<>(listOf(elementValue)));
                         }
                         if (shouldUseEmptyCollection(valueName)
                                 && (statement == null || !statement.nonEmptyCollectionParameter(valueName))) {
@@ -2002,26 +2044,26 @@ class DmSqlValidationTestGenerator {
                         String columnType = statement == null
                                 ? ""
                                 : statement.collectionColumnType(valueName, dbColumnMetadata);
-                        if (!columnType.isBlank()) {
+                        if (!isBlank(columnType)) {
                             Object elementValue = defaultCollectionElementForColumnType(valueName, columnType);
                             if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(List.of(elementValue)));
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(elementValue)));
                             }
-                            return ValueResult.resolved(new ArrayList<>(List.of(elementValue)));
+                            return ValueResult.resolved(new ArrayList<>(listOf(elementValue)));
                         }
                         Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);
                         if (sqlFragmentDefault != null) {
                             if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(List.of(sqlFragmentDefault)));
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(sqlFragmentDefault)));
                             }
-                            return ValueResult.resolved(new ArrayList<>(List.of(sqlFragmentDefault)));
+                            return ValueResult.resolved(new ArrayList<>(listOf(sqlFragmentDefault)));
                         }
                         Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(valueName);
                         if (scalarDefault != null) {
                             if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(List.of(scalarDefault)));
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(scalarDefault)));
                             }
-                            return ValueResult.resolved(new ArrayList<>(List.of(scalarDefault)));
+                            return ValueResult.resolved(new ArrayList<>(listOf(scalarDefault)));
                         }
                         Type nestedType = firstGenericArgument(genericType);
                         ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1, statement);
@@ -2029,14 +2071,14 @@ class DmSqlValidationTestGenerator {
                             return nestedValue;
                         }
                         if (Set.class.isAssignableFrom(targetType)) {
-                            return ValueResult.resolved(new LinkedHashSet<>(List.of(nestedValue.value)));
+                            return ValueResult.resolved(new LinkedHashSet<>(listOf(nestedValue.value)));
                         }
-                        return ValueResult.resolved(new ArrayList<>(List.of(nestedValue.value)));
+                        return ValueResult.resolved(new ArrayList<>(listOf(nestedValue.value)));
                     }
                     if (Map.class.isAssignableFrom(targetType)) {
                         Map<String, Object> value = defaultParameterMap(statement);
                         Map<String, Object> configuredDefaults = statement == null
-                                ? Map.of()
+                                ? emptyMap()
                                 : statement.collectionElementDefault(valueName);
                         if (!configuredDefaults.isEmpty()) {
                             value.putAll(configuredDefaults);
@@ -2069,7 +2111,8 @@ class DmSqlValidationTestGenerator {
                         Constructor<?> constructor = targetType.getDeclaredConstructor();
                         constructor.setAccessible(true);
                         Object instance = constructor.newInstance();
-                        if (instance instanceof Map map) {
+                        if (instance instanceof Map) {
+                            Map map = (Map) instance;
                             map.putAll(value);
                             return instance;
                         }
@@ -2105,7 +2148,8 @@ class DmSqlValidationTestGenerator {
                     for (int i = 0; i < parts.size() - 1; i++) {
                         String part = parts.get(i);
                         Object existing = current.get(part);
-                        if (existing instanceof Map<?, ?> existingMap) {
+                        if (existing instanceof Map) {
+                            Map<String, Object> existingMap = (Map<String, Object>) existing;
                             current = (Map<String, Object>) existingMap;
                             continue;
                         }
@@ -2118,23 +2162,23 @@ class DmSqlValidationTestGenerator {
 
                 private Object defaultParameterMapValue(String valueName, Object configuredDefault, MapperStatement statement) {
                     String columnType = statement == null ? "" : statement.defaultColumnType(valueName, dbColumnMetadata);
-                    if (!columnType.isBlank() && !isCharacterColumnType(columnType)) {
+                    if (!isBlank(columnType) && !isCharacterColumnType(columnType)) {
                         return defaultValueForColumnType(valueName, Object.class, columnType);
                     }
                     if (configuredDefault != null) {
                         return configuredDefault;
                     }
-                    return columnType.isBlank()
+                    return isBlank(columnType)
                             ? null
                             : defaultValueForColumnType(valueName, Object.class, columnType);
                 }
 
                 private Object defaultCollectionParameter(String collectionName, MapperStatement statement) {
                     Map<String, Object> collectionElementDefault = statement == null
-                            ? Map.of()
+                            ? emptyMap()
                             : statement.collectionElementDefault(collectionName);
                     if (!collectionElementDefault.isEmpty()) {
-                        return new ArrayList<>(List.of(new LinkedHashMap<>(collectionElementDefault)));
+                        return new ArrayList<>(listOf(new LinkedHashMap<>(collectionElementDefault)));
                     }
                     if (shouldUseEmptyCollection(collectionName)
                             && (statement == null || !statement.nonEmptyCollectionParameter(collectionName))) {
@@ -2143,18 +2187,18 @@ class DmSqlValidationTestGenerator {
                     String columnType = statement == null
                             ? ""
                             : statement.collectionColumnType(collectionName, dbColumnMetadata);
-                    if (!columnType.isBlank()) {
-                        return new ArrayList<>(List.of(defaultCollectionElementForColumnType(collectionName, columnType)));
+                    if (!isBlank(columnType)) {
+                        return new ArrayList<>(listOf(defaultCollectionElementForColumnType(collectionName, columnType)));
                     }
                     Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(collectionName);
                     if (sqlFragmentDefault != null) {
-                        return new ArrayList<>(List.of(sqlFragmentDefault));
+                        return new ArrayList<>(listOf(sqlFragmentDefault));
                     }
                     Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
                     if (scalarDefault != null) {
-                        return new ArrayList<>(List.of(scalarDefault));
+                        return new ArrayList<>(listOf(scalarDefault));
                     }
-                    return new ArrayList<>(List.of(defaultCollectionElement(collectionName)));
+                    return new ArrayList<>(listOf(defaultCollectionElement(collectionName)));
                 }
 
                 private Object defaultCollectionElementForColumnType(String collectionName, String columnType) {
@@ -2190,7 +2234,7 @@ class DmSqlValidationTestGenerator {
                         return null;
                     }
                     String columnType = statement == null ? "" : statement.defaultColumnType(valueName, dbColumnMetadata);
-                    if (columnType.isBlank()
+                    if (isBlank(columnType)
                             || (String.class.equals(targetType) && isCharacterColumnType(columnType))) {
                         return null;
                     }
@@ -2318,7 +2362,7 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isSchemaIdentifierName(normalized)
                             && currentConfig != null
-                            && !currentConfig.primarySchema().isBlank()) {
+                            && !isBlank(currentConfig.primarySchema())) {
                         return quotedIdentifier(currentConfig.primarySchema());
                     }
                     if (isDynamicIdentifierName(normalized)) {
@@ -2410,15 +2454,32 @@ class DmSqlValidationTestGenerator {
 
                 private Object defaultValueForJdbcType(String valueName, String jdbcType) {
                     String normalizedJdbcType = jdbcType == null ? "" : jdbcType.toUpperCase(Locale.ROOT);
-                    return switch (normalizedJdbcType) {
-                        case "BIGINT" -> 1L;
-                        case "INTEGER", "INT", "SMALLINT", "TINYINT" -> 1;
-                        case "DOUBLE", "FLOAT", "REAL" -> 1D;
-                        case "DECIMAL", "NUMERIC" -> BigDecimal.ONE;
-                        case "BIT", "BOOLEAN" -> true;
-                        case "DATE", "TIME", "TIMESTAMP", "DATETIME" -> "2024-01-01 00:00:00";
-                        default -> defaultString(valueName);
-                    };
+                    switch (normalizedJdbcType) {
+                        case "BIGINT":
+                            return 1L;
+                        case "INTEGER":
+                        case "INT":
+                        case "SMALLINT":
+                        case "TINYINT":
+                            return 1;
+                        case "DOUBLE":
+                        case "FLOAT":
+                        case "REAL":
+                            return 1D;
+                        case "DECIMAL":
+                        case "NUMERIC":
+                            return BigDecimal.ONE;
+                        case "BIT":
+                        case "BOOLEAN":
+                            return true;
+                        case "DATE":
+                        case "TIME":
+                        case "TIMESTAMP":
+                        case "DATETIME":
+                            return "2024-01-01 00:00:00";
+                        default:
+                            return defaultString(valueName);
+                    }
                 }
 
                 private boolean shouldUseEmptyCollection(String valueName) {
@@ -2496,24 +2557,31 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Type firstGenericArgument(Type type) {
-                    if (type instanceof ParameterizedType parameterizedType && parameterizedType.getActualTypeArguments().length > 0) {
-                        return parameterizedType.getActualTypeArguments()[0];
+                    if (type instanceof ParameterizedType) {
+                        ParameterizedType parameterizedType = (ParameterizedType) type;
+                        if (parameterizedType.getActualTypeArguments().length > 0) {
+                            return parameterizedType.getActualTypeArguments()[0];
+                        }
                     }
                     return String.class;
                 }
 
                 private Class<?> rawClass(Type type) {
-                    if (type instanceof Class<?> clazz) {
-                        return clazz;
+                    if (type instanceof Class<?>) {
+                        return (Class<?>) type;
                     }
-                    if (type instanceof ParameterizedType parameterizedType && parameterizedType.getRawType() instanceof Class<?> clazz) {
-                        return clazz;
+                    if (type instanceof ParameterizedType) {
+                        ParameterizedType parameterizedType = (ParameterizedType) type;
+                        Type rawType = parameterizedType.getRawType();
+                        if (rawType instanceof Class<?>) {
+                            return (Class<?>) rawType;
+                        }
                     }
                     return String.class;
                 }
 
                 private Path findProjectRoot() {
-                    Path current = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
+                    Path current = java.nio.file.Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
                     while (current != null) {
                         if (Files.isRegularFile(current.resolve(CONFIG_PATH))) {
                             return current;
@@ -2529,8 +2597,8 @@ class DmSqlValidationTestGenerator {
                         UsageFilterReport usageFilterReport
                 ) throws IOException {
                     Files.createDirectories(projectRoot.resolve(".dm-adapter"));
-                    Files.writeString(projectRoot.resolve(MARKDOWN_REPORT), markdown(records, usageFilterReport), StandardCharsets.UTF_8);
-                    Files.writeString(projectRoot.resolve(JSON_REPORT), json(records, usageFilterReport), StandardCharsets.UTF_8);
+                    writeString(projectRoot.resolve(MARKDOWN_REPORT), markdown(records, usageFilterReport), StandardCharsets.UTF_8);
+                    writeString(projectRoot.resolve(JSON_REPORT), json(records, usageFilterReport), StandardCharsets.UTF_8);
                 }
 
                 """,
@@ -2648,8 +2716,8 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private List<String> bracketedValuesAfterMarker(String message, String marker) {
-                    if (message == null || marker == null || marker.isBlank()) {
-                        return List.of();
+                    if (message == null || marker == null || isBlank(marker)) {
+                        return listOf();
                     }
                     List<String> values = new ArrayList<>();
                     int searchFrom = 0;
@@ -2791,7 +2859,7 @@ class DmSqlValidationTestGenerator {
                                 .append(" - ")
                                 .append(escapeHtml(record.key))
                                 .append("</summary>\\n\\n");
-                        if (record.parameterSummary != null && !record.parameterSummary.isBlank()) {
+                        if (record.parameterSummary != null && !isBlank(record.parameterSummary)) {
                             markdown.append("参数: `")
                                     .append(escapeMarkdown(record.parameterSummary))
                                     .append("`\\n\\n");
@@ -2808,12 +2876,16 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private String statusDisplay(String status) {
-                    return switch (status) {
-                        case "PASSED" -> "通过 (PASSED)";
-                        case "FAILED" -> "失败 (FAILED)";
-                        case "SKIPPED" -> "跳过 (SKIPPED)";
-                        default -> status;
-                    };
+                    switch (status) {
+                        case "PASSED":
+                            return "通过 (PASSED)";
+                        case "FAILED":
+                            return "失败 (FAILED)";
+                        case "SKIPPED":
+                            return "跳过 (SKIPPED)";
+                        default:
+                            return status;
+                    }
                 }
 
                 private String categoryDisplay(String category) {
@@ -2821,93 +2893,159 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private String categoryLabel(String category) {
-                    return switch (category) {
-                        case "PASSED" -> "通过";
-                        case "SKIPPED" -> "跳过";
-                        case "CONFIGURATION" -> "配置问题";
-                        case "METHOD_ARGS_OR_BINDING" -> "方法参数或绑定问题";
-                        case "MYSQL_METADATA_SQL" -> "MySQL 元数据 SQL";
-                        case "TEST_SCHEMA" -> "测试库对象问题";
-                        case "TEST_DATA_OR_SCHEMA" -> "测试数据或库结构问题";
-                        case "SQL_SYNTAX" -> "SQL 语法问题";
-                        case "TEST_DATA" -> "测试数据问题";
-                        case "UNKNOWN_FAILURE" -> "未分类失败";
-                        default -> category.endsWith("_OTHER") ? "其他未分类问题" : "";
-                    };
+                    switch (category) {
+                        case "PASSED":
+                            return "通过";
+                        case "SKIPPED":
+                            return "跳过";
+                        case "CONFIGURATION":
+                            return "配置问题";
+                        case "METHOD_ARGS_OR_BINDING":
+                            return "方法参数或绑定问题";
+                        case "MYSQL_METADATA_SQL":
+                            return "MySQL 元数据 SQL";
+                        case "TEST_SCHEMA":
+                            return "测试库对象问题";
+                        case "TEST_DATA_OR_SCHEMA":
+                            return "测试数据或库结构问题";
+                        case "SQL_SYNTAX":
+                            return "SQL 语法问题";
+                        case "TEST_DATA":
+                            return "测试数据问题";
+                        case "UNKNOWN_FAILURE":
+                            return "未分类失败";
+                        default:
+                            return category.endsWith("_OTHER") ? "其他未分类问题" : "";
+                    }
                 }
 
                 private String failurePatternDisplay(String pattern) {
-                    if (pattern == null || pattern.isBlank()) {
+                    if (pattern == null || isBlank(pattern)) {
                         return "";
                     }
                     return displayCode(pattern, failurePatternLabel(pattern));
                 }
 
                 private String failurePatternLabel(String pattern) {
-                    return switch (pattern) {
-                        case "MYSQL_METADATA_SQL" -> "MySQL 元数据查询";
-                        case "MYSQL_SELECT_MODIFIER" -> "MySQL SELECT 修饰符";
-                        case "MYSQL_INDEX_HINT" -> "MySQL 索引提示";
-                        case "MYSQL_INSERT_VALUE_KEYWORD" -> "MySQL VALUE 关键字";
-                        case "MYSQL_CONVERT_DECIMAL" -> "MySQL CONVERT DECIMAL";
-                        case "MYSQL_USER_VARIABLE" -> "MySQL 用户变量";
-                        case "DYNAMIC_IDENTIFIER_PARAMETER" -> "动态标识符参数";
-                        case "DYNAMIC_SQL_FRAGMENT_PARAMETER" -> "动态 SQL 片段参数";
-                        case "GENERATED_SEARCH_PARAMETER" -> "生成的搜索参数";
-                        case "BROKEN_DYNAMIC_SQL_OR_ARGS" -> "动态 SQL 或示例参数异常";
-                        case "TEST_SCHEMA_OBJECT" -> "测试库缺少对象";
-                        case "TEST_DATA_TYPE_MISMATCH" -> "测试参数类型不匹配";
-                        case "TEST_DATA_FOREIGN_KEY_CONSTRAINT" -> "外键约束测试数据问题";
-                        case "INSERT_IGNORE" -> "INSERT IGNORE";
-                        case "MYSQL_GROUP_CONCAT" -> "GROUP_CONCAT 函数";
-                        case "MYSQL_CONCAT_WS" -> "CONCAT_WS 函数";
-                        case "MYSQL_DATE_SUB_INTERVAL" -> "DATE_SUB INTERVAL";
-                        case "MYSQL_DATE_ADD_INTERVAL" -> "DATE_ADD INTERVAL";
-                        case "MYSQL_MAKEDATE" -> "MAKEDATE 函数";
-                        case "MYSQL_SUBDATE" -> "SUBDATE 函数";
-                        case "MYSQL_PERIOD_DIFF_YEARMONTH" -> "PERIOD_DIFF 年月差";
-                        case "MYSQL_COUNT_CONDITION_OR_NULL" -> "COUNT 条件 OR NULL";
-                        case "MYSQL_COUNT_DISTINCT_IF" -> "COUNT DISTINCT IF";
-                        case "MYSQL_BARE_INTERVAL" -> "裸 INTERVAL 表达式";
-                        case "MYSQL_NOT_ISNULL" -> "!ISNULL 表达式";
-                        case "MYSQL_BOOLEAN_OPERATOR" -> "MySQL 布尔运算符";
-                        case "MYSQL_CONVERT_UNSIGNED" -> "CONVERT UNSIGNED";
-                        case "MYSQL_CONVERT_GBK_ORDER" -> "GBK 排序转换";
-                        case "MYSQL_UPDATE_ORDER_LIMIT" -> "UPDATE ORDER BY LIMIT";
-                        case "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON" -> "JSON_TABLE JOIN 缺少 ON";
-                        case "MYSQL_IMPLICIT_CROSS_JOIN" -> "隐式 CROSS JOIN";
-                        case "MYSQL_TEMPORARY_TABLE_AS_SELECT" -> "临时表 AS SELECT";
-                        case "DAMENG_KEYWORD_TABLE_ALIAS" -> "达梦关键字表别名";
-                        case "DAMENG_RESERVED_IDENTIFIER" -> "达梦保留字标识符";
-                        case "MYSQL_JSON_SQL" -> "MySQL JSON SQL";
-                        case "MYSQL_UPDATE_JOIN" -> "UPDATE JOIN";
-                        case "MYSQL_UPDATE_JOIN_MULTI_TARGET" -> "UPDATE JOIN 同时更新多表";
-                        case "RAW_SQL_PARAMETER" -> "原始 SQL 参数";
-                        case "AMBIGUOUS_COLUMN" -> "歧义列名";
-                        case "EMPTY_SELECT_LIST" -> "空 SELECT 列表";
-                        case "GENERATED_ORDER_PARAMETER" -> "生成的排序参数";
-                        case "UPDATE_SET_TABLE_ORDER" -> "UPDATE SET 语序";
-                        case "ON_DUPLICATE_KEY_UPDATE" -> "ON DUPLICATE KEY UPDATE";
-                        case "INSERT_FOREACH_MISSING_VALUES" -> "INSERT foreach 缺少 VALUES";
-                        case "REGEXP_OPERATOR" -> "REGEXP 操作符";
-                        case "DOUBLE_QUOTED_IDENTIFIER_OR_STRING" -> "双引号标识符或字符串";
-                        case "TRAILING_COMMA" -> "多余逗号";
-                        case "NULL_COLLECTION_PARAMETER" -> "集合参数为空";
-                        case "BINDING_PARAMETER_NAME" -> "绑定参数名问题";
-                        case "MAPPER_PROPERTY_NAME" -> "Mapper 属性名不匹配";
-                        case "KEY_PROPERTY_PARAMETER_OBJECT_MISMATCH" -> "keyProperty 与参数对象不匹配";
-                        case "INSERT_VALUES_ASSIGNMENT" -> "INSERT VALUES 中出现赋值表达式";
-                        case "ORIGINAL_XML_SYNTAX_DEFECT" -> "原 XML SQL 语法缺陷";
-                        case "TEST_DATA_OR_CONSTRAINT" -> "测试数据或约束问题";
-                        default -> pattern.endsWith("_OTHER") ? "其他未分类模式" : "";
-                    };
+                    switch (pattern) {
+                        case "MYSQL_METADATA_SQL":
+                            return "MySQL 元数据查询";
+                        case "MYSQL_SELECT_MODIFIER":
+                            return "MySQL SELECT 修饰符";
+                        case "MYSQL_INDEX_HINT":
+                            return "MySQL 索引提示";
+                        case "MYSQL_INSERT_VALUE_KEYWORD":
+                            return "MySQL VALUE 关键字";
+                        case "MYSQL_CONVERT_DECIMAL":
+                            return "MySQL CONVERT DECIMAL";
+                        case "MYSQL_USER_VARIABLE":
+                            return "MySQL 用户变量";
+                        case "DYNAMIC_IDENTIFIER_PARAMETER":
+                            return "动态标识符参数";
+                        case "DYNAMIC_SQL_FRAGMENT_PARAMETER":
+                            return "动态 SQL 片段参数";
+                        case "GENERATED_SEARCH_PARAMETER":
+                            return "生成的搜索参数";
+                        case "BROKEN_DYNAMIC_SQL_OR_ARGS":
+                            return "动态 SQL 或示例参数异常";
+                        case "TEST_SCHEMA_OBJECT":
+                            return "测试库缺少对象";
+                        case "TEST_DATA_TYPE_MISMATCH":
+                            return "测试参数类型不匹配";
+                        case "TEST_DATA_FOREIGN_KEY_CONSTRAINT":
+                            return "外键约束测试数据问题";
+                        case "INSERT_IGNORE":
+                            return "INSERT IGNORE";
+                        case "MYSQL_GROUP_CONCAT":
+                            return "GROUP_CONCAT 函数";
+                        case "MYSQL_CONCAT_WS":
+                            return "CONCAT_WS 函数";
+                        case "MYSQL_DATE_SUB_INTERVAL":
+                            return "DATE_SUB INTERVAL";
+                        case "MYSQL_DATE_ADD_INTERVAL":
+                            return "DATE_ADD INTERVAL";
+                        case "MYSQL_MAKEDATE":
+                            return "MAKEDATE 函数";
+                        case "MYSQL_SUBDATE":
+                            return "SUBDATE 函数";
+                        case "MYSQL_PERIOD_DIFF_YEARMONTH":
+                            return "PERIOD_DIFF 年月差";
+                        case "MYSQL_COUNT_CONDITION_OR_NULL":
+                            return "COUNT 条件 OR NULL";
+                        case "MYSQL_COUNT_DISTINCT_IF":
+                            return "COUNT DISTINCT IF";
+                        case "MYSQL_BARE_INTERVAL":
+                            return "裸 INTERVAL 表达式";
+                        case "MYSQL_NOT_ISNULL":
+                            return "!ISNULL 表达式";
+                        case "MYSQL_BOOLEAN_OPERATOR":
+                            return "MySQL 布尔运算符";
+                        case "MYSQL_CONVERT_UNSIGNED":
+                            return "CONVERT UNSIGNED";
+                        case "MYSQL_CONVERT_GBK_ORDER":
+                            return "GBK 排序转换";
+                        case "MYSQL_UPDATE_ORDER_LIMIT":
+                            return "UPDATE ORDER BY LIMIT";
+                        case "MYSQL_JSON_TABLE_JOIN_WITHOUT_ON":
+                            return "JSON_TABLE JOIN 缺少 ON";
+                        case "MYSQL_IMPLICIT_CROSS_JOIN":
+                            return "隐式 CROSS JOIN";
+                        case "MYSQL_TEMPORARY_TABLE_AS_SELECT":
+                            return "临时表 AS SELECT";
+                        case "DAMENG_KEYWORD_TABLE_ALIAS":
+                            return "达梦关键字表别名";
+                        case "DAMENG_RESERVED_IDENTIFIER":
+                            return "达梦保留字标识符";
+                        case "MYSQL_JSON_SQL":
+                            return "MySQL JSON SQL";
+                        case "MYSQL_UPDATE_JOIN":
+                            return "UPDATE JOIN";
+                        case "MYSQL_UPDATE_JOIN_MULTI_TARGET":
+                            return "UPDATE JOIN 同时更新多表";
+                        case "RAW_SQL_PARAMETER":
+                            return "原始 SQL 参数";
+                        case "AMBIGUOUS_COLUMN":
+                            return "歧义列名";
+                        case "EMPTY_SELECT_LIST":
+                            return "空 SELECT 列表";
+                        case "GENERATED_ORDER_PARAMETER":
+                            return "生成的排序参数";
+                        case "UPDATE_SET_TABLE_ORDER":
+                            return "UPDATE SET 语序";
+                        case "ON_DUPLICATE_KEY_UPDATE":
+                            return "ON DUPLICATE KEY UPDATE";
+                        case "INSERT_FOREACH_MISSING_VALUES":
+                            return "INSERT foreach 缺少 VALUES";
+                        case "REGEXP_OPERATOR":
+                            return "REGEXP 操作符";
+                        case "DOUBLE_QUOTED_IDENTIFIER_OR_STRING":
+                            return "双引号标识符或字符串";
+                        case "TRAILING_COMMA":
+                            return "多余逗号";
+                        case "NULL_COLLECTION_PARAMETER":
+                            return "集合参数为空";
+                        case "BINDING_PARAMETER_NAME":
+                            return "绑定参数名问题";
+                        case "MAPPER_PROPERTY_NAME":
+                            return "Mapper 属性名不匹配";
+                        case "KEY_PROPERTY_PARAMETER_OBJECT_MISMATCH":
+                            return "keyProperty 与参数对象不匹配";
+                        case "INSERT_VALUES_ASSIGNMENT":
+                            return "INSERT VALUES 中出现赋值表达式";
+                        case "ORIGINAL_XML_SYNTAX_DEFECT":
+                            return "原 XML SQL 语法缺陷";
+                        case "TEST_DATA_OR_CONSTRAINT":
+                            return "测试数据或约束问题";
+                        default:
+                            return pattern.endsWith("_OTHER") ? "其他未分类模式" : "";
+                    }
                 }
 
                 private String displayCode(String code, String label) {
-                    if (code == null || code.isBlank()) {
+                    if (code == null || isBlank(code)) {
                         return "";
                     }
-                    return label == null || label.isBlank() ? code : label + " (" + code + ")";
+                    return label == null || isBlank(label) ? code : label + " (" + code + ")";
                 }
 
                 private String json(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
@@ -3450,7 +3588,7 @@ class DmSqlValidationTestGenerator {
                     }
                     compact = beforeMarker(compact, "### SQL:");
                     compact = beforeMarker(compact, "### Cause:");
-                    if (compact.isBlank()) {
+                    if (isBlank(compact)) {
                         compact = normalizeMessage(record.message);
                     }
                     return abbreviate(compact, 360);
@@ -3501,7 +3639,8 @@ class DmSqlValidationTestGenerator {
                     if (depth > 2) {
                         return value.getClass().getSimpleName() + "{...}";
                     }
-                    if (value instanceof CharSequence text) {
+                    if (value instanceof CharSequence) {
+                        CharSequence text = (CharSequence) value;
                         return '"' + abbreviate(normalizeParameterText(text.toString()), 120) + '"';
                     }
                     if (value instanceof Number || value instanceof Boolean || value instanceof Enum<?>) {
@@ -3528,7 +3667,8 @@ class DmSqlValidationTestGenerator {
                         }
                         return summary.append("]").toString();
                     }
-                    if (value instanceof Collection<?> collection) {
+                    if (value instanceof Collection<?>) {
+                        Collection<?> collection = (Collection<?>) value;
                         StringBuilder summary = new StringBuilder("[");
                         int index = 0;
                         for (Object item : collection) {
@@ -3544,7 +3684,8 @@ class DmSqlValidationTestGenerator {
                         }
                         return summary.append("]").toString();
                     }
-                    if (value instanceof Map<?, ?> map) {
+                    if (value instanceof Map<?, ?>) {
+                        Map<?, ?> map = (Map<?, ?>) value;
                         StringBuilder summary = new StringBuilder("{");
                         int index = 0;
                         for (Map.Entry<?, ?> entry : map.entrySet()) {
@@ -3619,10 +3760,12 @@ class DmSqlValidationTestGenerator {
                     if (result == null) {
                         return "Returned null.";
                     }
-                    if (result instanceof Collection<?> collection) {
+                    if (result instanceof Collection<?>) {
+                        Collection<?> collection = (Collection<?>) result;
                         return "Returned collection size " + collection.size() + ".";
                     }
-                    if (result instanceof Map<?, ?> map) {
+                    if (result instanceof Map<?, ?>) {
+                        Map<?, ?> map = (Map<?, ?>) result;
                         return "Returned map size " + map.size() + ".";
                     }
                     return "Returned " + result.getClass().getName() + ".";
@@ -3633,7 +3776,7 @@ class DmSqlValidationTestGenerator {
                         return "Unknown failure.";
                     }
                     String message = throwable.getMessage();
-                    return throwable.getClass().getName() + (message == null || message.isBlank() ? "" : ": " + message);
+                    return throwable.getClass().getName() + (message == null || isBlank(message) ? "" : ": " + message);
                 }
 
                 private String escapeMarkdown(String value) {
@@ -3717,7 +3860,7 @@ class DmSqlValidationTestGenerator {
 
                 private void logProgress(int index, int total, ValidationRecord record, long elapsedMillis) {
                     String elapsed = elapsedMillis <= 0 ? "" : " (" + elapsedMillis + " ms)";
-                    String message = record.message == null || record.message.isBlank()
+                    String message = record.message == null || isBlank(record.message)
                             ? ""
                             : ": " + abbreviate(record.message, 240);
                     log(record.status + " [" + index + "/" + total + "] " + record.key + elapsed + message);
@@ -3839,7 +3982,7 @@ class DmSqlValidationTestGenerator {
                             }
                             return directories;
                         }
-                        try (var paths = Files.walk(projectRoot)) {
+                        try (Stream<Path> paths = Files.walk(projectRoot)) {
                             return paths.filter(Files::isDirectory)
                                     .filter(path -> path.getFileName() != null)
                                     .filter(path -> "classes".equals(path.getFileName().toString()))
@@ -3855,7 +3998,7 @@ class DmSqlValidationTestGenerator {
                     private static List<Path> classFiles(List<Path> classDirectories) throws IOException {
                         List<Path> classFiles = new ArrayList<>();
                         for (Path classDirectory : classDirectories) {
-                            try (var paths = Files.walk(classDirectory)) {
+                            try (Stream<Path> paths = Files.walk(classDirectory)) {
                                 classFiles.addAll(paths.filter(Files::isRegularFile)
                                         .filter(path -> path.getFileName().toString().endsWith(".class"))
                                         .sorted()
@@ -3873,7 +4016,7 @@ class DmSqlValidationTestGenerator {
                     ) throws IOException {
                         try (DataInputStream input = new DataInputStream(Files.newInputStream(classFile))) {
                             if (input.readInt() != 0xCAFEBABE) {
-                                return Set.of();
+                                return setOf();
                             }
                             input.readUnsignedShort();
                             input.readUnsignedShort();
@@ -3887,36 +4030,57 @@ class DmSqlValidationTestGenerator {
                             for (int i = 1; i < constantPoolCount; i++) {
                                 int tag = input.readUnsignedByte();
                                 switch (tag) {
-                                    case 1 -> utf8[i] = input.readUTF();
-                                    case 3, 4 -> input.readInt();
-                                    case 5, 6 -> {
+                                    case 1:
+                                        utf8[i] = input.readUTF();
+                                        break;
+                                    case 3:
+                                    case 4:
+                                        input.readInt();
+                                        break;
+                                    case 5:
+                                    case 6:
                                         input.readLong();
                                         i++;
-                                    }
-                                    case 7 -> classNameIndexes[i] = input.readUnsignedShort();
-                                    case 8 -> stringIndexes[i] = input.readUnsignedShort();
-                                    case 9 -> {
+                                        break;
+                                    case 7:
+                                        classNameIndexes[i] = input.readUnsignedShort();
+                                        break;
+                                    case 8:
+                                        stringIndexes[i] = input.readUnsignedShort();
+                                        break;
+                                    case 9:
                                         input.readUnsignedShort();
                                         input.readUnsignedShort();
-                                    }
-                                    case 10, 11 -> memberRefs[i] = new MemberRef(
-                                            input.readUnsignedShort(),
-                                            input.readUnsignedShort()
-                                    );
-                                    case 12 -> nameAndTypes[i] = new NameAndType(
-                                            input.readUnsignedShort(),
-                                            input.readUnsignedShort()
-                                    );
-                                    case 15 -> {
+                                        break;
+                                    case 10:
+                                    case 11:
+                                        memberRefs[i] = new MemberRef(
+                                                input.readUnsignedShort(),
+                                                input.readUnsignedShort()
+                                        );
+                                        break;
+                                    case 12:
+                                        nameAndTypes[i] = new NameAndType(
+                                                input.readUnsignedShort(),
+                                                input.readUnsignedShort()
+                                        );
+                                        break;
+                                    case 15:
                                         input.readUnsignedByte();
                                         input.readUnsignedShort();
-                                    }
-                                    case 16, 19, 20 -> input.readUnsignedShort();
-                                    case 17, 18 -> {
+                                        break;
+                                    case 16:
+                                    case 19:
+                                    case 20:
+                                        input.readUnsignedShort();
+                                        break;
+                                    case 17:
+                                    case 18:
                                         input.readUnsignedShort();
                                         input.readUnsignedShort();
-                                    }
-                                    default -> throw new IOException("Unsupported class constant pool tag: " + tag);
+                                        break;
+                                    default:
+                                        throw new IOException("Unsupported class constant pool tag: " + tag);
                                 }
                             }
 
@@ -3924,7 +4088,7 @@ class DmSqlValidationTestGenerator {
                             int thisClassIndex = input.readUnsignedShort();
                             String thisClass = className(classNameIndexes, utf8, thisClassIndex);
                             if (mapperInternalNames.contains(thisClass)) {
-                                return Set.of();
+                                return setOf();
                             }
 
                             Set<String> referencedStatements = new LinkedHashSet<>();
@@ -3965,7 +4129,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private static Path resolveProjectPath(Path projectRoot, String location) {
-                        Path path = Path.of(location);
+                        Path path = java.nio.file.Paths.get(location);
                         if (path.isAbsolute()) {
                             return path.toAbsolutePath().normalize();
                         }
@@ -3985,11 +4149,11 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private static UsageFilter disabled() {
-                        return new UsageFilter(false, Set.of(), UsageFilterReport.disabled());
+                        return new UsageFilter(false, setOf(), UsageFilterReport.disabled());
                     }
 
                     private static UsageFilter unavailable(UsageFilterReport report) {
-                        return new UsageFilter(false, Set.of(), report);
+                        return new UsageFilter(false, setOf(), report);
                     }
 
                     private static UsageFilter available(Set<String> referencedStatements, UsageFilterReport report) {
@@ -4028,11 +4192,11 @@ class DmSqlValidationTestGenerator {
                         this.classDirectoryCount = classDirectoryCount;
                         this.classFileCount = classFileCount;
                         this.referencedMethodCount = referencedMethodCount;
-                        this.warnings = List.copyOf(warnings == null ? List.of() : warnings);
+                        this.warnings = copyList(warnings == null ? listOf() : warnings);
                     }
 
                     private static UsageFilterReport disabled() {
-                        return new UsageFilterReport(false, false, 0, 0, 0, List.of());
+                        return new UsageFilterReport(false, false, 0, 0, 0, listOf());
                     }
 
                     private String summary() {
@@ -4087,7 +4251,7 @@ class DmSqlValidationTestGenerator {
                         String currentMethod = null;
                         for (String line : Files.readAllLines(path, StandardCharsets.UTF_8)) {
                             String trimmed = line.trim();
-                            if (trimmed.isBlank() || trimmed.startsWith("#")) {
+                            if (isBlank(trimmed) || trimmed.startsWith("#")) {
                                 continue;
                             }
                             if (!line.startsWith(" ") && trimmed.startsWith("schema:")) {
@@ -4204,13 +4368,13 @@ class DmSqlValidationTestGenerator {
                     }
 
                     List<String> schemas() {
-                        if (schema == null || schema.isBlank()) {
-                            return List.of();
+                        if (schema == null || isBlank(schema)) {
+                            return listOf();
                         }
                         return Pattern.compile(",")
                                 .splitAsStream(schema)
                                 .map(String::trim)
-                                .filter(value -> !value.isBlank())
+                                .filter(value -> !isBlank(value))
                                 .collect(Collectors.collectingAndThen(
                                         Collectors.toCollection(LinkedHashSet::new),
                                         ArrayList::new
@@ -4268,18 +4432,33 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
-                private record ColumnReference(String tableName, String columnName) {
+                private static final class ColumnReference {
+                    private final String tableName;
+                    private final String columnName;
+
+                    private ColumnReference(String tableName, String columnName) {
+                        this.tableName = tableName;
+                        this.columnName = columnName;
+                    }
+
+                    private String tableName() {
+                        return tableName;
+                    }
+
+                    private String columnName() {
+                        return columnName;
+                    }
                 }
 
                 private final class SqlStatementContext {
                     private final Map<String, String> tableAliases;
 
                     private SqlStatementContext(Map<String, String> tableAliases) {
-                        this.tableAliases = Map.copyOf(tableAliases == null ? Map.of() : tableAliases);
+                        this.tableAliases = copyMap(tableAliases == null ? emptyMap() : tableAliases);
                     }
 
                     private String tableName(String qualifier) {
-                        if (qualifier == null || qualifier.isBlank()) {
+                        if (qualifier == null || isBlank(qualifier)) {
                             return "";
                         }
                         return tableAliases.getOrDefault(normalizeSqlIdentifier(qualifier), "");
@@ -4296,7 +4475,7 @@ class DmSqlValidationTestGenerator {
 
                     private static DbColumnMetadata load(Connection connection, List<String> schemas) throws Exception {
                         DbColumnMetadata metadata = new DbColumnMetadata();
-                        List<String> targetSchemas = schemas == null ? List.of() : schemas;
+                        List<String> targetSchemas = schemas == null ? listOf() : schemas;
                         if (targetSchemas.isEmpty()) {
                             metadata.readJdbcColumns(connection, "");
                         } else {
@@ -4318,7 +4497,7 @@ class DmSqlValidationTestGenerator {
 
                     private void readJdbcColumns(Connection connection, String schema) throws Exception {
                         DatabaseMetaData databaseMetaData = connection.getMetaData();
-                        String schemaPattern = schema == null || schema.isBlank() ? null : schema;
+                        String schemaPattern = schema == null || isBlank(schema) ? null : schema;
                         try (ResultSet resultSet = databaseMetaData.getColumns(null, schemaPattern, "%", "%")) {
                             while (resultSet.next()) {
                                 addColumn(
@@ -4331,12 +4510,12 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private void readAllTabColumns(Connection connection, String schema) throws Exception {
-                        String sql = schema == null || schema.isBlank()
+                        String sql = schema == null || isBlank(schema)
                                 ? "select table_name, column_name, data_type from all_tab_columns"
                                 : "select table_name, column_name, data_type from all_tab_columns "
                                         + "where owner = ? or upper(owner) = upper(?)";
                         try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                            if (schema != null && !schema.isBlank()) {
+                            if (schema != null && !isBlank(schema)) {
                                 statement.setString(1, schema);
                                 statement.setString(2, schema);
                             }
@@ -4355,7 +4534,7 @@ class DmSqlValidationTestGenerator {
                     private void addColumn(String tableName, String columnName, String dataType) {
                         String normalizedTable = normalizeIdentifier(tableName);
                         String normalizedColumn = normalizeIdentifier(columnName);
-                        if (normalizedTable.isBlank() || normalizedColumn.isBlank() || dataType == null || dataType.isBlank()) {
+                        if (isBlank(normalizedTable) || isBlank(normalizedColumn) || dataType == null || isBlank(dataType)) {
                             return;
                         }
                         String normalizedType = dataType.toUpperCase(Locale.ROOT);
@@ -4364,12 +4543,12 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private String columnType(ColumnReference columnReference) {
-                        if (columnReference == null || columnReference.columnName().isBlank()) {
+                        if (columnReference == null || isBlank(columnReference.columnName())) {
                             return "";
                         }
                         String normalizedColumn = normalizeIdentifier(columnReference.columnName());
                         String normalizedTable = normalizeIdentifier(columnReference.tableName());
-                        if (!normalizedTable.isBlank()) {
+                        if (!isBlank(normalizedTable)) {
                             String type = tableColumnTypes.get(tableKey(normalizedTable, normalizedColumn));
                             if (type != null) {
                                 return type;
@@ -4417,14 +4596,14 @@ class DmSqlValidationTestGenerator {
                     ) {
                         this.namespace = namespace;
                         this.id = id;
-                        this.setBranchParameterVariants = List.copyOf(setBranchParameterVariants == null
-                                ? List.of()
+                        this.setBranchParameterVariants = copyList(setBranchParameterVariants == null
+                                ? listOf()
                                 : setBranchParameterVariants);
                         this.dynamicIdentifierMetadata = dynamicIdentifierMetadata == null
                                 ? new DynamicIdentifierMetadata()
                                 : dynamicIdentifierMetadata;
                         this.generatedKeyProperties = Set.copyOf(generatedKeyProperties == null
-                                ? Set.of()
+                                ? setOf()
                                 : generatedKeyProperties);
                     }
 
@@ -4528,7 +4707,7 @@ class DmSqlValidationTestGenerator {
 
                     private void addDynamicIdentifierName(String valueName) {
                         String normalized = normalizeMetadataName(valueName);
-                        if (!normalized.isBlank()) {
+                        if (!isBlank(normalized)) {
                             dynamicIdentifierNames.add(normalized);
                             namedDynamicIdentifierNames.add(valueName);
                         }
@@ -4540,7 +4719,7 @@ class DmSqlValidationTestGenerator {
 
                     private void addCollectionParameterName(String collectionName, boolean force) {
                         String normalizedCollectionName = normalizeMetadataName(collectionName);
-                        if (normalizedCollectionName.isBlank()
+                        if (isBlank(normalizedCollectionName)
                                 || (!force && !DEFAULT_COLLECTION_PARAMETER_NAMES.contains(normalizedCollectionName))) {
                             return;
                         }
@@ -4550,14 +4729,14 @@ class DmSqlValidationTestGenerator {
 
                     private void addNonEmptyCollectionParameterName(String collectionName) {
                         String normalizedCollectionName = normalizeMetadataName(collectionName);
-                        if (!normalizedCollectionName.isBlank()) {
+                        if (!isBlank(normalizedCollectionName)) {
                             nonEmptyCollectionParameterNames.add(normalizedCollectionName);
                         }
                     }
 
                     private void addCollectionDefault(String collectionName, String propertyName, Object value) {
                         String normalizedCollectionName = normalizeMetadataName(collectionName);
-                        if (normalizedCollectionName.isBlank() || propertyName == null || propertyName.isBlank()) {
+                        if (isBlank(normalizedCollectionName) || propertyName == null || isBlank(propertyName)) {
                             return;
                         }
                         addCollectionParameterName(collectionName, true);
@@ -4568,7 +4747,7 @@ class DmSqlValidationTestGenerator {
 
                     private void addCollectionSqlFragmentDefault(String collectionName, Object value) {
                         String normalizedCollectionName = normalizeMetadataName(collectionName);
-                        if (!normalizedCollectionName.isBlank()) {
+                        if (!isBlank(normalizedCollectionName)) {
                             addCollectionParameterName(collectionName, true);
                             collectionSqlFragmentDefaults.putIfAbsent(normalizedCollectionName, value);
                         }
@@ -4576,7 +4755,7 @@ class DmSqlValidationTestGenerator {
 
                     private void addCollectionScalarDefault(String collectionName, Object value) {
                         String normalizedCollectionName = normalizeMetadataName(collectionName);
-                        if (!normalizedCollectionName.isBlank()) {
+                        if (!isBlank(normalizedCollectionName)) {
                             addCollectionParameterName(collectionName, true);
                             collectionScalarDefaults.putIfAbsent(normalizedCollectionName, value);
                         }
@@ -4584,7 +4763,7 @@ class DmSqlValidationTestGenerator {
 
                     private void addCollectionColumnReference(String collectionName, ColumnReference columnReference) {
                         String normalizedCollectionName = normalizeMetadataName(collectionName);
-                        if (!normalizedCollectionName.isBlank() && columnReference != null && !columnReference.columnName().isBlank()) {
+                        if (!isBlank(normalizedCollectionName) && columnReference != null && !isBlank(columnReference.columnName())) {
                             addCollectionParameterName(collectionName, true);
                             collectionColumnReferences.putIfAbsent(normalizedCollectionName, columnReference);
                         }
@@ -4592,14 +4771,14 @@ class DmSqlValidationTestGenerator {
 
                     private void addDefaultColumnReference(String propertyName, ColumnReference columnReference) {
                         String normalizedPropertyName = normalizeMetadataName(propertyName);
-                        if (!normalizedPropertyName.isBlank() && columnReference != null && !columnReference.columnName().isBlank()) {
+                        if (!isBlank(normalizedPropertyName) && columnReference != null && !isBlank(columnReference.columnName())) {
                             defaultColumnReferences.putIfAbsent(normalizedPropertyName, columnReference);
                         }
                     }
 
                     private void addDefaultValue(String propertyName, Object value) {
                         String normalizedPropertyName = normalizeMetadataName(propertyName);
-                        if (!normalizedPropertyName.isBlank()) {
+                        if (!isBlank(normalizedPropertyName)) {
                             defaultValues.putIfAbsent(normalizedPropertyName, value);
                             namedDefaultValues.putIfAbsent(propertyName, value);
                         }
@@ -4607,7 +4786,7 @@ class DmSqlValidationTestGenerator {
 
                     private void addValueExpressionName(String propertyName) {
                         String normalizedPropertyName = normalizeMetadataName(propertyName);
-                        if (!normalizedPropertyName.isBlank()) {
+                        if (!isBlank(normalizedPropertyName)) {
                             valueExpressionNames.add(propertyName);
                         }
                     }
@@ -4626,7 +4805,7 @@ class DmSqlValidationTestGenerator {
 
                     private Map<String, Object> collectionElementDefault(String valueName) {
                         Map<String, Object> defaults = valueByNameOrSuffix(collectionElementDefaults, valueName);
-                        return defaults == null ? Map.of() : defaults;
+                        return defaults == null ? emptyMap() : defaults;
                     }
 
                     private Object collectionSqlFragmentDefault(String valueName) {
@@ -4650,7 +4829,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private Map<String, Object> defaultValues() {
-                        return Map.copyOf(namedDefaultValues);
+                        return copyMap(namedDefaultValues);
                     }
 
                     private Set<String> dynamicIdentifierNames() {
@@ -4670,7 +4849,7 @@ class DmSqlValidationTestGenerator {
 
                     private static boolean containsNameOrSuffix(Set<String> values, String valueName) {
                         String normalized = normalizeMetadataName(valueName);
-                        if (normalized.isBlank()) {
+                        if (isBlank(normalized)) {
                             return false;
                         }
                         if (values.contains(normalized)) {
@@ -4681,7 +4860,7 @@ class DmSqlValidationTestGenerator {
 
                     private static <T> T valueByNameOrSuffix(Map<String, T> values, String valueName) {
                         String normalized = normalizeMetadataName(valueName);
-                        if (normalized.isBlank()) {
+                        if (isBlank(normalized)) {
                             return null;
                         }
                         T exact = values.get(normalized);
@@ -4835,7 +5014,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private String recordKey(String mapperKey) {
-                        return label.isBlank() ? mapperKey : mapperKey + " [" + label + "]";
+                        return isBlank(label) ? mapperKey : mapperKey + " [" + label + "]";
                     }
                 }
 
@@ -4909,7 +5088,22 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
-                private record SchemaAttempt(String schema, ValidationRecord record) {
+                private static final class SchemaAttempt {
+                    private final String schema;
+                    private final ValidationRecord record;
+
+                    private SchemaAttempt(String schema, ValidationRecord record) {
+                        this.schema = schema;
+                        this.record = record;
+                    }
+
+                    private String schema() {
+                        return schema;
+                    }
+
+                    private ValidationRecord record() {
+                        return record;
+                    }
                 }
 
                 private static final class MapperInvocationException extends RuntimeException {

@@ -290,6 +290,7 @@ class DmAdapterCliTest {
 
         Path config = tempDir.resolve(".dm-adapter/sql-validation.yml");
         Path test = tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java");
+        String generatedTestSource = Files.readString(test);
         assertThat(exitCode).isZero();
         assertThat(Files.readString(config))
                 .contains("schema: \"sample-system\"")
@@ -309,7 +310,7 @@ class DmAdapterCliTest {
                 .contains("com.example.UserMapper.getBatchOpenBillChargeItem")
                 .contains("com.example.UserMapper.selectApprovalStateByPaymentIds")
                 .contains("com.example.UserMapper.deleteByLogical");
-        assertThat(Files.readString(test))
+        assertThat(generatedTestSource)
                 .contains("package com.example;")
                 .contains("public class DmSqlValidationTest")
                 .contains("public static void main(String[] args) throws Exception")
@@ -497,6 +498,27 @@ class DmAdapterCliTest {
                 .doesNotContain("@ActiveProfiles")
                 .doesNotContain("PlatformTransactionManager")
                 .doesNotContain("RabbitTemplate");
+        assertThat(generatedTestSource)
+                .doesNotContain("return switch")
+                .doesNotContain("try (var ")
+                .doesNotContain("Path.of(")
+                .doesNotContain("private record ")
+                .doesNotContain("List.of(")
+                .doesNotContain("Set.of(")
+                .doesNotContain("Map.of(")
+                .doesNotContain("List.copyOf(")
+                .doesNotContain("Map.copyOf(")
+                .doesNotContain("Files.writeString(")
+                .doesNotContain(".isBlank()")
+                .doesNotContain(" instanceof String name")
+                .doesNotContain(" instanceof Map map")
+                .doesNotContain(" instanceof Collection<?> collection")
+                .doesNotContain(" instanceof ParameterizedType parameterizedType")
+                .doesNotContain(" instanceof Class<?> clazz")
+                .doesNotContain(" instanceof Element element")
+                .doesNotContain(" instanceof Element child")
+                .doesNotContainPattern("case\\s+[^:\\n]+->")
+                .doesNotContainPattern("case\\s+[^:\\n]+,\\s+[^:\\n]+:");
     }
 
     @Test
