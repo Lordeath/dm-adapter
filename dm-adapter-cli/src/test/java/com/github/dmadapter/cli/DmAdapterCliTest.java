@@ -311,6 +311,8 @@ class DmAdapterCliTest {
                 .contains("com.example.UserMapper.deleteByLogical");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
+                .contains("public class DmSqlValidationTest")
+                .contains("public static void main(String[] args) throws Exception")
                 .contains("@Tag(\"dm-sql-validation\")")
                 .contains("@EnabledIfEnvironmentVariable")
                 .contains("SqlSessionFactory")
