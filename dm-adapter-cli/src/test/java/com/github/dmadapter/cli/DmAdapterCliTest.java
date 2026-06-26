@@ -683,7 +683,8 @@ class DmAdapterCliTest {
                 .contains("mergeConfiguredParameterMap(value, configuredParams, statement, \"\")")
                 .contains("scalarConfiguredCollectionValue(entryPath, configuredValue, statement)")
                 .contains("String resolvedCollectionName = statement.scalarCollectionName(collectionName)")
-                .contains("Pattern.compile(\"^(?:arg|param)\\\\d+$\").matcher(valueName).matches()")
+                .contains("isSyntheticMetadataName(valueName) && scalarNames.size() == 1")
+                .contains("Character.isDigit(normalized.charAt(i))")
                 .contains("collectionLike ? collectionParameterIndex : -1")
                 .contains("collectionExpressionName(collectionIndex, fallbackName)")
                 .contains("return new ArrayList<>(namedCollectionParameterNames).get(index);");

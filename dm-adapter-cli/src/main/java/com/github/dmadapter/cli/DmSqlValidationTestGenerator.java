@@ -7868,8 +7868,7 @@ class DmSqlValidationTestGenerator {
                                 return scalarName;
                             }
                         }
-                        if (Pattern.compile("^(?:arg|param)\\d+$").matcher(valueName).matches()
-                                && scalarNames.size() == 1) {
+                        if (isSyntheticMetadataName(valueName) && scalarNames.size() == 1) {
                             return scalarNames.iterator().next();
                         }
                         return "";
@@ -8024,6 +8023,27 @@ class DmSqlValidationTestGenerator {
                         return valueName == null
                                 ? ""
                                 : valueName.replace("_", "").replace("-", "").toLowerCase(Locale.ROOT);
+                    }
+
+                    private static boolean isSyntheticMetadataName(String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        int prefixLength;
+                        if (normalized.startsWith("arg")) {
+                            prefixLength = 3;
+                        } else if (normalized.startsWith("param")) {
+                            prefixLength = 5;
+                        } else {
+                            return false;
+                        }
+                        if (normalized.length() == prefixLength) {
+                            return false;
+                        }
+                        for (int i = prefixLength; i < normalized.length(); i++) {
+                            if (!Character.isDigit(normalized.charAt(i))) {
+                                return false;
+                            }
+                        }
+                        return true;
                     }
                 }
 
