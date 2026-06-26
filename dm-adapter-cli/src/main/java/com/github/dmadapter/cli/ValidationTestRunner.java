@@ -290,7 +290,6 @@ class ValidationTestRunner {
         command.add("-Dtest=" + DmSqlValidationTestGenerator.TEST_CLASS_NAME);
         command.add("-DskipTests=false");
         command.add("-Dmaven.test.skip=false");
-        command.add("-Dmaven.test.skip.exec=false");
         command.add("-Dsurefire.failIfNoSpecifiedTests=false");
         command.add("test");
         return command;
@@ -308,7 +307,6 @@ class ValidationTestRunner {
         }
         command.add("-DskipTests=false");
         command.add("-Dmaven.test.skip=false");
-        command.add("-Dmaven.test.skip.exec=false");
         command.add("test-compile");
         command.add("dependency:build-classpath");
         command.add("-Dmdep.includeScope=test");
