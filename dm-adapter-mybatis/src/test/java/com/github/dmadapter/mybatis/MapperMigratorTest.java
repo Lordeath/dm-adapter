@@ -676,6 +676,117 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateJoinWithConditionalSetItemsIsRewrittenAsWholeStatement() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="syncOrgUpdateByTime">
+                        UPDATE ns_system_organization yy
+                        INNER JOIN (
+                            SELECT y.organization_id, y.organization_code, y.organization_type, y.organization_name, y.sync_organization_id
+                            FROM ys_organization y
+                            WHERE y.enterprise_id = #{enterpriseId}
+                        ) c ON yy.sync_organization_id = c.sync_organization_id
+                        SET yy.organization_id = c.organization_id,
+                            yy.organization_code = c.organization_code,
+                        <if test="syncOrgTypeFromYs != 0">
+                            yy.organization_type = c.organization_type,
+                        </if>
+                            yy.organization_name = c.organization_name
+                        WHERE yy.enterprise_id = #{enterpriseId}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("update ns_system_organization yy set yy.organization_id = c.organization_id")
+                .contains("<if test=\"syncOrgTypeFromYs != 0\">")
+                .contains("yy.organization_type = c.organization_type")
+                .contains("from (")
+                .contains("where")
+                .contains("yy.sync_organization_id = c.sync_organization_id")
+                .contains("and yy.enterprise_id = #{enterpriseId}")
+                .doesNotContain("yy.organization_code = c.organization_code, from");
+        assertThat(rewritten.indexOf("yy.organization_name = c.organization_name"))
+                .isLessThan(rewritten.indexOf("from ("));
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+    }
+
+    @Test
+    void dynamicUpdateJoinWithConditionalTrailingAssignmentKeepsAssignmentBeforeFrom() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateNsUser">
+                        UPDATE ns_system_user nu
+                        INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id
+                        SET nu.AD_account = c.AD_account
+                        <if test="isFromV8 != null and (isFromV8 == '1' or isFromV8 == 1)">
+                            ,nu.v8_user_id = c.sso_user_id
+                        </if>
+                        WHERE
+                            nu.enterprise_id = #{enterpriseId}
+                            AND c.update_time &gt; #{lastFinishTime}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("update ns_system_user nu set nu.AD_account = c.AD_account")
+                .contains(",nu.v8_user_id = c.sso_user_id")
+                .contains("from ys_user c")
+                .contains("where")
+                .contains("nu.ys_user_id = c.sso_user_id")
+                .contains("and nu.enterprise_id = #{enterpriseId}")
+                .doesNotContain("where nu.ys_user_id = c.sso_user_id\n                        ,nu.v8_user_id");
+        assertThat(rewritten.indexOf(",nu.v8_user_id = c.sso_user_id"))
+                .isLessThan(rewritten.indexOf("from ys_user c"));
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+    }
+
+    @Test
     void dynamicUpdateJoinWithMultipleJoinsIsNotRewritten() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
