@@ -2644,7 +2644,7 @@ class DmSqlValidationTestGenerator {
                         String valueName
                 ) {
                     if (targetType == null || Object.class.equals(targetType)) {
-                        return ValueResult.resolved(rawValue);
+                        return ValueResult.resolved(configuredValueWithStatementDefaults(rawValue, statement, valueName));
                     }
                     if (rawValue == null) {
                         if (targetType.isPrimitive()) {
@@ -2712,6 +2712,48 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(rawValue);
                     }
                     return convertScalar(configuredScalarText(rawValue), targetType, genericType);
+                }
+
+                @SuppressWarnings("unchecked")
+                private Object configuredValueWithStatementDefaults(
+                        Object rawValue,
+                        MapperStatement statement,
+                        String valueName
+                ) {
+                    if (statement == null || rawValue == null) {
+                        return rawValue;
+                    }
+                    if (rawValue instanceof Collection) {
+                        Map<String, Object> defaultElement = typedCollectionElementDefault(valueName, statement);
+                        if (defaultElement.isEmpty()) {
+                            return rawValue;
+                        }
+                        Collection<Object> converted = rawValue instanceof Set
+                                ? new LinkedHashSet<>()
+                                : new ArrayList<>();
+                        for (Object item : (Collection<?>) rawValue) {
+                            if (item instanceof Map<?, ?>) {
+                                converted.add(mergeConfiguredCollectionElementMap(
+                                        new LinkedHashMap<>(defaultElement),
+                                        new LinkedHashMap<>((Map<String, Object>) item)
+                                ));
+                            } else {
+                                converted.add(item);
+                            }
+                        }
+                        return converted;
+                    }
+                    if (rawValue instanceof Map<?, ?>) {
+                        Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
+                        if (defaultValue.isEmpty()) {
+                            return rawValue;
+                        }
+                        return mergeConfiguredCollectionElementMap(
+                                defaultValue,
+                                new LinkedHashMap<>((Map<String, Object>) rawValue)
+                        );
+                    }
+                    return rawValue;
                 }
 
                 @SuppressWarnings("unchecked")

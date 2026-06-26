@@ -461,6 +461,7 @@ class DmAdapterCliTest {
                 .contains("collectionElementDefault")
                 .contains("dynamicIdentifierParameter")
                 .contains("defaultValueForJdbcType")
+                .contains("configuredValueWithStatementDefaults")
                 .contains("contextualDefaultValue")
                 .contains("adaptContextualDefaultValue")
                 .contains("dateTimeContextualValue")
