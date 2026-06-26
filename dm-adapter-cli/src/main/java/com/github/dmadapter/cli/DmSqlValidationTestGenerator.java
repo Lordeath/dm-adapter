@@ -1317,6 +1317,7 @@ class DmSqlValidationTestGenerator {
                         return;
                     }
                     addUpdateColumnReferences(sql, metadata, sqlContext);
+                    addStructuredInsertColumnReferences(statement, metadata, sqlContext);
                     addInsertColumnReferences(sql, metadata, sqlContext);
                 }
 
@@ -1378,6 +1379,96 @@ class DmSqlValidationTestGenerator {
                             );
                         }
                     }
+                }
+
+                private void addStructuredInsertColumnReferences(
+                        Element statement,
+                        DynamicIdentifierMetadata metadata,
+                        SqlStatementContext sqlContext
+                ) {
+                    if (statement == null || !"insert".equals(statement.getTagName())) {
+                        return;
+                    }
+                    String sql = statement.getTextContent();
+                    if (sql == null || isBlank(sql)) {
+                        return;
+                    }
+                    Matcher insertMatcher = Pattern.compile("(?is)\\\\binsert\\\\s+into\\\\s+(" + sqlIdentifierPattern()
+                            + "(?:\\\\s*\\\\.\\\\s*" + sqlIdentifierPattern() + ")?)").matcher(sql);
+                    if (!insertMatcher.find()) {
+                        return;
+                    }
+                    String table = lastIdentifierPart(insertMatcher.group(1));
+                    List<String> columns = structuredInsertColumns(statement);
+                    InsertForeachValues foreachValues = structuredInsertForeachValues(statement);
+                    if (columns.isEmpty() || foreachValues == null || foreachValues.expressions.isEmpty()) {
+                        return;
+                    }
+                    int count = Math.min(columns.size(), foreachValues.expressions.size());
+                    for (int i = 0; i < count; i++) {
+                        String expression = foreachValues.expressions.get(i);
+                        List<String> parts = pathParts(expression);
+                        if (parts.size() > 1 && foreachValues.item.equals(parts.get(0))) {
+                            metadata.addCollectionDefaultColumnReference(
+                                    foreachValues.collection,
+                                    parts.get(parts.size() - 1),
+                                    new ColumnReference(table, cleanSqlIdentifier(columns.get(i)))
+                            );
+                        }
+                    }
+                }
+
+                private List<String> structuredInsertColumns(Element statement) {
+                    NodeList trims = statement.getElementsByTagName("trim");
+                    for (int i = 0; i < trims.getLength(); i++) {
+                        Node node = trims.item(i);
+                        if (!(node instanceof Element)) {
+                            continue;
+                        }
+                        Element trim = (Element) node;
+                        String text = trim.getTextContent();
+                        if (text == null || isBlank(text) || text.contains("#{") || text.contains("${")) {
+                            continue;
+                        }
+                        List<String> columns = splitTopLevelComma(text).stream()
+                                .map(String::trim)
+                                .filter(value -> !isBlank(value))
+                                .collect(Collectors.toList());
+                        if (!columns.isEmpty()) {
+                            return columns;
+                        }
+                    }
+                    return listOf();
+                }
+
+                private InsertForeachValues structuredInsertForeachValues(Element statement) {
+                    NodeList foreachElements = statement.getElementsByTagName("foreach");
+                    for (int i = 0; i < foreachElements.getLength(); i++) {
+                        Node node = foreachElements.item(i);
+                        if (!(node instanceof Element)) {
+                            continue;
+                        }
+                        Element foreach = (Element) node;
+                        String collection = foreach.getAttribute("collection");
+                        String item = foreach.getAttribute("item");
+                        String text = foreach.getTextContent();
+                        if (isBlank(collection) || isBlank(item) || text == null || isBlank(text)) {
+                            continue;
+                        }
+                        List<String> expressions = new ArrayList<>();
+                        Matcher placeholder = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)(?:[^}]*)}").matcher(text);
+                        while (placeholder.find()) {
+                            String expression = placeholder.group(1);
+                            List<String> parts = pathParts(expression);
+                            if (parts.size() > 1 && item.equals(parts.get(0))) {
+                                expressions.add(expression);
+                            }
+                        }
+                        if (!expressions.isEmpty()) {
+                            return new InsertForeachValues(collection, item, expressions);
+                        }
+                    }
+                    return null;
                 }
 
                 private void addPlaceholderColumnReference(
@@ -7322,6 +7413,18 @@ class DmSqlValidationTestGenerator {
                     private NestedCollection(String parentCollection, String propertyName) {
                         this.parentCollection = parentCollection;
                         this.propertyName = propertyName;
+                    }
+                }
+
+                private static final class InsertForeachValues {
+                    private final String collection;
+                    private final String item;
+                    private final List<String> expressions;
+
+                    private InsertForeachValues(String collection, String item, List<String> expressions) {
+                        this.collection = collection;
+                        this.item = item;
+                        this.expressions = expressions == null ? listOf() : copyList(expressions);
                     }
                 }
 
