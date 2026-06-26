@@ -3179,9 +3179,14 @@ class DmSqlValidationTestGenerator {
                 ) {
                     if (statement == null
                             || item == null
-                            || item.isEmpty()
-                            || (!statement.hasCollectionElementDefault(collectionName)
-                            && !statement.hasCollectionElementColumnReferences(collectionName))) {
+                            || item.isEmpty()) {
+                        return false;
+                    }
+                    if (knownCollectionObjectPropertyCount(item) >= 2) {
+                        return true;
+                    }
+                    if (!statement.hasCollectionElementDefault(collectionName)
+                            && !statement.hasCollectionElementColumnReferences(collectionName)) {
                         return false;
                     }
                     Map<String, Object> defaults = statement.collectionElementDefault(collectionName);
@@ -3195,6 +3200,16 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return false;
+                }
+
+                private int knownCollectionObjectPropertyCount(Map<?, ?> item) {
+                    int count = 0;
+                    for (Object rawKey : item.keySet()) {
+                        if (isKnownCollectionObjectProperty(String.valueOf(rawKey))) {
+                            count++;
+                        }
+                    }
+                    return count;
                 }
 
                 private boolean isKnownCollectionObjectProperty(String propertyName) {
