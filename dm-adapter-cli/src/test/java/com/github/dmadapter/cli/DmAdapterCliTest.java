@@ -680,6 +680,10 @@ class DmAdapterCliTest {
                 .contains("if (references == null && scalarCollectionParameter(collectionName))")
                 .contains("return scalarConfiguredCollectionDefault(collectionName, statement)")
                 .contains("statement.collectionScalarDefault(collectionName)")
+                .contains("mergeConfiguredParameterMap(value, configuredParams, statement, \"\")")
+                .contains("scalarConfiguredCollectionValue(entryPath, configuredValue, statement)")
+                .contains("String resolvedCollectionName = statement.scalarCollectionName(collectionName)")
+                .contains("Pattern.compile(\"^(?:arg|param)\\\\d+$\").matcher(valueName).matches()")
                 .contains("collectionLike ? collectionParameterIndex : -1")
                 .contains("collectionExpressionName(collectionIndex, fallbackName)")
                 .contains("return new ArrayList<>(namedCollectionParameterNames).get(index);");
