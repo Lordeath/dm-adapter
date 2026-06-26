@@ -1921,6 +1921,21 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertMysqlUpdateJoin(String sql) {
+        List<StatementSegment> statements = splitTopLevelStatements(sql);
+        if (statements.size() > 1) {
+            StringBuilder converted = new StringBuilder(sql.length());
+            boolean changed = false;
+            for (StatementSegment statement : statements) {
+                GenericConversion conversion = convertSingleMysqlUpdateJoin(statement.sql());
+                converted.append(conversion.convertedSql()).append(statement.separator());
+                changed = changed || conversion.changed();
+            }
+            return changed ? new GenericConversion(converted.toString(), true) : GenericConversion.unchanged(sql);
+        }
+        return convertSingleMysqlUpdateJoin(sql);
+    }
+
+    private GenericConversion convertSingleMysqlUpdateJoin(String sql) {
         int updateIndex = leadingWhitespaceLength(sql);
         if (!startsKeyword(sql, updateIndex, "UPDATE")) {
             return GenericConversion.unchanged(sql);
@@ -1979,6 +1994,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private List<StatementSegment> splitTopLevelStatements(String sql) {
+        List<StatementSegment> statements = new ArrayList<>();
+        int start = 0;
+        int separatorIndex = findTopLevelChar(sql, ';', start);
+        if (separatorIndex < 0) {
+            return List.of(new StatementSegment(sql, ""));
+        }
+        while (separatorIndex >= 0) {
+            statements.add(new StatementSegment(sql.substring(start, separatorIndex), ";"));
+            start = separatorIndex + 1;
+            separatorIndex = findTopLevelChar(sql, ';', start);
+        }
+        statements.add(new StatementSegment(sql.substring(start), ""));
+        return statements;
     }
 
     private boolean updatesJoinedTableAlias(String target, String setClause) {
@@ -4588,6 +4619,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record JoinSource(String sourceSql, String conditionSql) {
+    }
+
+    private record StatementSegment(String sql, String separator) {
     }
 
     private record IdentifierName(String text, String key) {

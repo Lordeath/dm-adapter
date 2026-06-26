@@ -1022,6 +1022,24 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMultipleMysqlUpdateJoinStatementsInOneMapperStatement() {
+        SqlConversionResult result = converter.convert("""
+                update ns_system_organization_detail od inner join ns_system_organization o on od.organization_id =o.organization_id
+                    set od.organization_type = o.organization_type,od.organization_nature = o.organization_nature,od.organization_path = o.organization_path;
+
+                update ns_system_organization_detail od inner join ns_system_organization o on od.affiliated_organization_id =o.organization_id
+                    set od.affiliated_organization_type = o.organization_type,od.affiliated_organization_nature = o.organization_nature,od.affiliated_organization_path = o.organization_path;
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("update ns_system_organization_detail od set od.organization_type = o.organization_type,od.organization_nature = o.organization_nature,od.organization_path = o.organization_path from ns_system_organization o where od.organization_id =o.organization_id;")
+                .contains("update ns_system_organization_detail od set od.affiliated_organization_type = o.organization_type,od.affiliated_organization_nature = o.organization_nature,od.affiliated_organization_path = o.organization_path from ns_system_organization o where od.affiliated_organization_id =o.organization_id;")
+                .doesNotContain("inner join");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
     void leavesMysqlUpdateJoinThatSetsJoinedTableForManualReview() {
         SqlConversionResult result = converter.convert("""
                 update ns_quality_check_schedule_task a
