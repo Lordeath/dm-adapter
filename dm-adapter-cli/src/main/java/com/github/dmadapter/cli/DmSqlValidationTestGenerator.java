@@ -1918,7 +1918,13 @@ class DmSqlValidationTestGenerator {
                                     : ParameterResolution.unresolved("configured", value.message);
                         }
                         if (Map.class.isAssignableFrom(parameterTypes[0])) {
-                            return ParameterResolution.resolved("configured", new Object[] { mapParameterValue(parameterTypes[0], configuredArgs.params) });
+                            return ParameterResolution.resolved(
+                                    "configured",
+                                    new Object[] { mapParameterValue(
+                                            parameterTypes[0],
+                                            configuredParameterMap(mapperMethod.statement, configuredArgs.params)
+                                    ) }
+                            );
                         }
                         ValueResult pojo = configuredPojoValue(parameterTypes[0], genericTypes[0], configuredArgs.params, mapperMethod.statement);
                         return pojo.resolved
@@ -2022,7 +2028,10 @@ class DmSqlValidationTestGenerator {
             """
                 private ParameterResolution statementParameters(MapperMethod mapperMethod, MethodArgumentConfig configuredArgs) {
                     if (configuredArgs != null && configuredArgs.hasParams()) {
-                        return ParameterResolution.resolved("configured", new Object[] { new LinkedHashMap<>(configuredArgs.params) });
+                        return ParameterResolution.resolved(
+                                "configured",
+                                new Object[] { configuredParameterMap(mapperMethod.statement, configuredArgs.params) }
+                        );
                     }
                     if (configuredArgs != null && configuredArgs.args.size() > 1) {
                         Map<String, Object> namedParameters = new LinkedHashMap<>();
@@ -2938,6 +2947,31 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return value;
+                }
+
+                private Map<String, Object> configuredParameterMap(MapperStatement statement, Map<String, Object> configuredParams) {
+                    Map<String, Object> value = defaultParameterMap(statement);
+                    mergeConfiguredParameterMap(value, configuredParams);
+                    return value;
+                }
+
+                @SuppressWarnings("unchecked")
+                private void mergeConfiguredParameterMap(Map<String, Object> target, Map<String, Object> configuredParams) {
+                    if (configuredParams == null || configuredParams.isEmpty()) {
+                        return;
+                    }
+                    for (Map.Entry<String, Object> entry : configuredParams.entrySet()) {
+                        Object existing = target.get(entry.getKey());
+                        Object configuredValue = entry.getValue();
+                        if (existing instanceof Map && configuredValue instanceof Map) {
+                            mergeConfiguredParameterMap(
+                                    (Map<String, Object>) existing,
+                                    (Map<String, Object>) configuredValue
+                            );
+                            continue;
+                        }
+                        target.put(entry.getKey(), configuredValue);
+                    }
                 }
 
                 @SuppressWarnings("unchecked")
