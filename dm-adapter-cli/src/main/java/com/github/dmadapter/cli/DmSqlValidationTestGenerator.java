@@ -2656,9 +2656,7 @@ class DmSqlValidationTestGenerator {
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
                         Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
-                        if (!defaultValue.isEmpty()) {
-                            configuredValue = mergeConfiguredCollectionElementMap(defaultValue, configuredValue);
-                        }
+                        configuredValue = mergeConfiguredCollectionElementMap(defaultValue, configuredValue);
                         return ValueResult.resolved(mapParameterValue(targetType, configuredValue));
                     }
                     if (Collection.class.isAssignableFrom(targetType) && rawValue instanceof Collection) {
@@ -2677,12 +2675,10 @@ class DmSqlValidationTestGenerator {
                         for (Object item : rawCollection) {
                             if (item instanceof Map<?, ?>) {
                                 Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
-                                if (!defaultElement.isEmpty()) {
-                                    configuredItem = mergeConfiguredCollectionElementMap(
-                                            new LinkedHashMap<>(defaultElement),
-                                            configuredItem
-                                    );
-                                }
+                                configuredItem = mergeConfiguredCollectionElementMap(
+                                        new LinkedHashMap<>(defaultElement),
+                                        configuredItem
+                                );
                                 converted.add(configuredItem);
                                 continue;
                             }
@@ -2726,9 +2722,6 @@ class DmSqlValidationTestGenerator {
                     }
                     if (rawValue instanceof Collection) {
                         Map<String, Object> defaultElement = typedCollectionElementDefault(valueName, statement);
-                        if (defaultElement.isEmpty()) {
-                            return rawValue;
-                        }
                         Collection<Object> converted = rawValue instanceof Set
                                 ? new LinkedHashSet<>()
                                 : new ArrayList<>();
@@ -2746,9 +2739,6 @@ class DmSqlValidationTestGenerator {
                     }
                     if (rawValue instanceof Map<?, ?>) {
                         Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
-                        if (defaultValue.isEmpty()) {
-                            return rawValue;
-                        }
                         return mergeConfiguredCollectionElementMap(
                                 defaultValue,
                                 new LinkedHashMap<>((Map<String, Object>) rawValue)
