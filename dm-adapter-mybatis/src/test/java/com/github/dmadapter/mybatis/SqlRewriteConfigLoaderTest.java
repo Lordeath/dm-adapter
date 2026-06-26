@@ -24,4 +24,19 @@ class SqlRewriteConfigLoaderTest {
         assertThat(config.keyColumnsFor("com.example.UserMapper.other", "user_extend"))
                 .containsExactly("user_id");
     }
+
+    @Test
+    void parsesValidationMissingTableIgnoresAndSkipsComments() {
+        SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
+                "validationIgnores:",
+                "  missingTables:",
+                "    - \"ns_core_resourcecolumn_temp\"",
+                "#    - \"commented_table\"",
+                "    - \"NEWSEE_OWNER.owner_house\""
+        ));
+
+        assertThat(config.ignoredMissingTables())
+                .contains("ns_core_resourcecolumn_temp", "newsee_owner.owner_house")
+                .doesNotContain("commented_table");
+    }
 }

@@ -705,6 +705,7 @@ class DmSqlValidationTestGenerator {
                                             + " params=" + parameters.source);
                                     long startedAt = System.currentTimeMillis();
                                     ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
+                                    record = skipIgnoredMissingTable(record, config);
                                     records.add(record);
                                     logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                                 }
@@ -727,6 +728,7 @@ class DmSqlValidationTestGenerator {
                             .filter(record -> "FAILED".equals(record.status))
                             .collect(Collectors.toList());
                     if (!failed.isEmpty()) {
+                        writeMissingTableIgnoreSuggestions(projectRoot, config, failed);
                         writeValidationArgsSuggestions(projectRoot, config, failed);
                         fail("Dameng SQL validation failed for " + failed.size()
                                 + " mapper methods. See " + projectRoot.resolve(MARKDOWN_REPORT));
@@ -2180,6 +2182,36 @@ class DmSqlValidationTestGenerator {
                                 parameters
                         );
                     }
+                }
+
+                private ValidationRecord skipIgnoredMissingTable(ValidationRecord record, ValidationConfig config) {
+                    if (record == null || !"FAILED".equals(record.status)) {
+                        return record;
+                    }
+                    String ignoredTable = ignoredMissingTable(record.message, config);
+                    if (ignoredTable == null) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "ignored-missing-table",
+                            record.parameterSummary,
+                            "Ignored missing table/view [" + ignoredTable
+                                    + "] by .dm-adapter/sql-rewrite.yml validationIgnores.missingTables.\\n"
+                                    + "Original failure:\\n" + record.message
+                    );
+                }
+
+                private String ignoredMissingTable(String message, ValidationConfig config) {
+                    if (config == null) {
+                        return null;
+                    }
+                    for (String table : bracketedValuesAfterMarker(message, "无效的表或视图名")) {
+                        if (config.ignoresMissingTable(table)) {
+                            return table;
+                        }
+                    }
+                    return null;
                 }
 
                 private Object invokeReflectively(SqlSession sqlSession, MapperMethod mapperMethod, Object[] args) {
@@ -3905,6 +3937,216 @@ class DmSqlValidationTestGenerator {
                     return result;
                 }
 
+                private List<String> mergeMissingTableIgnores(List<String> originalLines, List<String> suggestedTables) {
+                    List<String> result = new ArrayList<>(originalLines);
+                    int ignoreStart = topLevelSectionStart(result, "validationIgnores:");
+                    if (ignoreStart < 0) {
+                        if (!result.isEmpty() && !isBlank(result.get(result.size() - 1))) {
+                            result.add("");
+                        }
+                        result.add("validationIgnores:");
+                        result.add("  missingTables:");
+                        appendMissingTableSuggestions(result, suggestedTables);
+                        return result;
+                    }
+                    int ignoreEnd = topLevelSectionEnd(result, ignoreStart);
+                    int missingTablesStart = missingTablesSectionStart(result, ignoreStart, ignoreEnd);
+                    if (missingTablesStart < 0) {
+                        result.add(ignoreEnd++, "  missingTables:");
+                        appendMissingTableSuggestions(result, ignoreEnd, suggestedTables);
+                        return result;
+                    }
+                    int missingTablesEnd = missingTablesSectionEnd(result, missingTablesStart, ignoreEnd);
+                    appendMissingTableSuggestions(result, missingTablesEnd, suggestedTables);
+                    return result;
+                }
+
+                private void appendMissingTableSuggestions(List<String> lines, List<String> suggestedTables) {
+                    appendMissingTableSuggestions(lines, lines.size(), suggestedTables);
+                }
+
+                private void appendMissingTableSuggestions(List<String> lines, int index, List<String> suggestedTables) {
+                    List<String> suggestionLines = new ArrayList<>();
+                    for (String table : suggestedTables) {
+                        suggestionLines.add("#    - " + quoteYaml(table));
+                    }
+                    lines.addAll(index, suggestionLines);
+                }
+
+                private int missingTablesSectionStart(List<String> lines, int start, int end) {
+                    for (int i = start + 1; i < end; i++) {
+                        String withoutComment = stripYamlComment(lines.get(i));
+                        if (leadingSpaces(withoutComment) == 2
+                                && withoutComment.trim().startsWith("missingTables:")) {
+                            return i;
+                        }
+                    }
+                    return -1;
+                }
+
+                private int missingTablesSectionEnd(List<String> lines, int start, int end) {
+                    for (int i = start + 1; i < end; i++) {
+                        String trimmed = lines.get(i).trim();
+                        if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                            continue;
+                        }
+                        if (leadingSpaces(lines.get(i)) <= 2) {
+                            return i;
+                        }
+                    }
+                    return end;
+                }
+
+                private Set<String> existingMissingTableIgnoreEntries(List<String> lines) {
+                    Set<String> existing = new LinkedHashSet<>();
+                    String section = "";
+                    boolean missingTables = false;
+                    for (String line : lines) {
+                        boolean commented = line.trim().startsWith("#");
+                        String effectiveLine = commented ? line.substring(line.indexOf('#') + 1) : stripYamlComment(line);
+                        String trimmed = effectiveLine.trim();
+                        if (isBlank(trimmed) || "{}".equals(trimmed)) {
+                            continue;
+                        }
+                        int indent = leadingSpaces(effectiveLine);
+                        if (!commented && indent == 0 && "validationIgnores:".equals(trimmed)) {
+                            section = "validationIgnores";
+                            missingTables = false;
+                            continue;
+                        }
+                        if (!commented && indent == 0) {
+                            section = "";
+                            missingTables = false;
+                            continue;
+                        }
+                        if ("validationIgnores".equals(section) && indent == 2 && trimmed.startsWith("missingTables:")) {
+                            missingTables = true;
+                            addMissingTableEntries(existing, yamlStringList(trimmed.substring("missingTables:".length())));
+                            continue;
+                        }
+                        if ("validationIgnores".equals(section) && missingTables && indent >= 4 && trimmed.startsWith("- ")) {
+                            addMissingTableEntries(existing, yamlStringList(trimmed.substring(2)));
+                            continue;
+                        }
+                        if ("validationIgnores".equals(section) && !commented && indent <= 2) {
+                            missingTables = false;
+                        }
+                    }
+                    return existing;
+                }
+
+                private void addMissingTableEntries(Set<String> existing, List<String> tables) {
+                    for (String table : tables) {
+                        String normalized = normalizeMissingTableName(table);
+                        if (!isBlank(normalized)) {
+                            existing.add(normalized);
+                        }
+                    }
+                }
+
+                private boolean containsMissingTable(Set<String> existingTables, String table) {
+                    String normalized = normalizeMissingTableName(table);
+                    String leaf = missingTableLeaf(normalized);
+                    for (String existing : existingTables) {
+                        if (existing.equals(normalized)
+                                || existing.equals(leaf)
+                                || missingTableLeaf(existing).equals(normalized)
+                                || missingTableLeaf(existing).equals(leaf)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                private List<String> yamlStringList(String value) {
+                    String trimmed = value == null ? "" : value.trim();
+                    if (trimmed.isEmpty()) {
+                        return listOf();
+                    }
+                    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                        String body = trimmed.substring(1, trimmed.length() - 1).trim();
+                        if (body.isEmpty()) {
+                            return listOf();
+                        }
+                        List<String> values = new ArrayList<>();
+                        for (String item : splitYamlInlineList(body)) {
+                            String scalar = yamlScalar(item);
+                            if (!isBlank(scalar)) {
+                                values.add(scalar);
+                            }
+                        }
+                        return values;
+                    }
+                    String scalar = yamlScalar(trimmed);
+                    return isBlank(scalar) ? listOf() : listOf(scalar);
+                }
+
+                private List<String> splitYamlInlineList(String body) {
+                    List<String> values = new ArrayList<>();
+                    boolean singleQuoted = false;
+                    boolean doubleQuoted = false;
+                    StringBuilder current = new StringBuilder();
+                    for (int i = 0; i < body.length(); i++) {
+                        char c = body.charAt(i);
+                        if (c == '\\'' && !doubleQuoted) {
+                            singleQuoted = !singleQuoted;
+                        } else if (c == '\\"' && !singleQuoted) {
+                            doubleQuoted = !doubleQuoted;
+                        }
+                        if (c == ',' && !singleQuoted && !doubleQuoted) {
+                            values.add(current.toString().trim());
+                            current.setLength(0);
+                        } else {
+                            current.append(c);
+                        }
+                    }
+                    if (current.length() > 0) {
+                        values.add(current.toString().trim());
+                    }
+                    return values;
+                }
+
+                private String yamlScalar(String value) {
+                    String trimmed = value == null ? "" : value.trim();
+                    if (trimmed.length() >= 2
+                            && ((trimmed.startsWith("\\"") && trimmed.endsWith("\\""))
+                            || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
+                        return trimmed.substring(1, trimmed.length() - 1);
+                    }
+                    return trimmed;
+                }
+
+                private String stripYamlComment(String line) {
+                    boolean singleQuoted = false;
+                    boolean doubleQuoted = false;
+                    for (int i = 0; i < line.length(); i++) {
+                        char current = line.charAt(i);
+                        if (current == '\\'' && !doubleQuoted) {
+                            singleQuoted = !singleQuoted;
+                        } else if (current == '\\"' && !singleQuoted) {
+                            doubleQuoted = !doubleQuoted;
+                        } else if (current == '#' && !singleQuoted && !doubleQuoted) {
+                            return line.substring(0, i);
+                        }
+                    }
+                    return line;
+                }
+
+                private String normalizeMissingTableName(String table) {
+                    if (table == null) {
+                        return "";
+                    }
+                    return table.trim()
+                            .replace("\\"", "")
+                            .replace("`", "")
+                            .toLowerCase(Locale.ROOT);
+                }
+
+                private String missingTableLeaf(String table) {
+                    int dot = table == null ? -1 : table.lastIndexOf('.');
+                    return dot >= 0 && dot + 1 < table.length() ? table.substring(dot + 1) : table;
+                }
+
                 private int topLevelSectionStart(List<String> lines, String header) {
                     for (int i = 0; i < lines.size(); i++) {
                         if (leadingSpaces(lines.get(i)) == 0 && header.equals(lines.get(i).trim())) {
@@ -3994,6 +4236,43 @@ class DmSqlValidationTestGenerator {
 
                 """,
             """
+                private void writeMissingTableIgnoreSuggestions(
+                        Path projectRoot,
+                        ValidationConfig config,
+                        List<ValidationRecord> failedRecords
+                ) throws IOException {
+                    Map<String, String> suggestedTables = new LinkedHashMap<>();
+                    for (ValidationRecord record : failedRecords) {
+                        for (String table : bracketedValuesAfterMarker(record.message, "无效的表或视图名")) {
+                            if (!config.ignoresMissingTable(table)) {
+                                suggestedTables.putIfAbsent(normalizeMissingTableName(table), table);
+                            }
+                        }
+                    }
+                    if (suggestedTables.isEmpty()) {
+                        return;
+                    }
+                    Path rewriteConfigPath = projectRoot.resolve(REWRITE_CONFIG_PATH);
+                    List<String> lines = Files.isRegularFile(rewriteConfigPath)
+                            ? Files.readAllLines(rewriteConfigPath, StandardCharsets.UTF_8)
+                            : defaultRewriteConfigLines();
+                    Set<String> existingTables = existingMissingTableIgnoreEntries(lines);
+                    List<String> missingSuggestions = new ArrayList<>();
+                    for (Map.Entry<String, String> entry : suggestedTables.entrySet()) {
+                        if (!containsMissingTable(existingTables, entry.getKey())) {
+                            missingSuggestions.add(entry.getValue());
+                        }
+                    }
+                    if (missingSuggestions.isEmpty()) {
+                        return;
+                    }
+                    List<String> merged = mergeMissingTableIgnores(lines, missingSuggestions);
+                    Files.createDirectories(rewriteConfigPath.getParent());
+                    writeString(rewriteConfigPath, String.join("\\n", merged) + "\\n", StandardCharsets.UTF_8);
+                    log("Updated missing table ignore suggestions in " + rewriteConfigPath + " for "
+                            + missingSuggestions.size() + " table(s).");
+                }
+
                 private String markdown(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
                     StringBuilder markdown = new StringBuilder();
                     markdown.append("# 达梦 SQL 验证报告\\n\\n");
@@ -5766,6 +6045,7 @@ class DmSqlValidationTestGenerator {
                     private final Map<String, MethodArgumentConfig> rewriteMethodArgs = new LinkedHashMap<>();
                     private final Set<String> includedMethods = new LinkedHashSet<>();
                     private final Set<String> excludedMethods = new LinkedHashSet<>();
+                    private final Set<String> ignoredMissingTables = new LinkedHashSet<>();
 
                     static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
@@ -5898,6 +6178,12 @@ class DmSqlValidationTestGenerator {
                                 valueMode = "";
                                 continue;
                             }
+                            if (indent == 0 && "validationIgnores:".equals(trimmed)) {
+                                section = "validationIgnores";
+                                currentMethod = null;
+                                valueMode = "";
+                                continue;
+                            }
                             if (indent == 0) {
                                 section = "";
                                 currentMethod = null;
@@ -5908,6 +6194,17 @@ class DmSqlValidationTestGenerator {
                                 section = "validationMethods";
                                 currentMethod = null;
                                 valueMode = "";
+                                continue;
+                            }
+                            if ("validationIgnores".equals(section) && indent == 2 && trimmed.startsWith("missingTables:")) {
+                                section = "validationMissingTables";
+                                currentMethod = null;
+                                valueMode = "";
+                                addIgnoredMissingTables(parseYamlValue(trimmed.substring("missingTables:".length())));
+                                continue;
+                            }
+                            if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                                addIgnoredMissingTables(parseYamlValue(trimmed.substring(2)));
                                 continue;
                             }
                             if ("validationMethods".equals(section) && indent == 4 && trimmed.endsWith(":")) {
@@ -5941,6 +6238,55 @@ class DmSqlValidationTestGenerator {
                                         .params.put(key, value);
                             }
                         }
+                    }
+
+                    private void addIgnoredMissingTables(Object value) {
+                        if (value instanceof Collection<?>) {
+                            for (Object item : (Collection<?>) value) {
+                                addIgnoredMissingTable(String.valueOf(item));
+                            }
+                        } else if (value != null) {
+                            addIgnoredMissingTable(String.valueOf(value));
+                        }
+                    }
+
+                    private void addIgnoredMissingTable(String table) {
+                        String normalized = normalizeMissingTableName(table);
+                        if (!isBlank(normalized)) {
+                            ignoredMissingTables.add(normalized);
+                        }
+                    }
+
+                    boolean ignoresMissingTable(String table) {
+                        String normalized = normalizeMissingTableName(table);
+                        if (isBlank(normalized)) {
+                            return false;
+                        }
+                        String leaf = missingTableLeaf(normalized);
+                        for (String ignored : ignoredMissingTables) {
+                            if (ignored.equals(normalized)
+                                    || ignored.equals(leaf)
+                                    || missingTableLeaf(ignored).equals(normalized)
+                                    || missingTableLeaf(ignored).equals(leaf)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+
+                    private String normalizeMissingTableName(String table) {
+                        if (table == null) {
+                            return "";
+                        }
+                        return table.trim()
+                                .replace("\\"", "")
+                                .replace("`", "")
+                                .toLowerCase(Locale.ROOT);
+                    }
+
+                    private String missingTableLeaf(String table) {
+                        int dot = table == null ? -1 : table.lastIndexOf('.');
+                        return dot >= 0 && dot + 1 < table.length() ? table.substring(dot + 1) : table;
                     }
 
                     boolean excludes(String methodKey) {

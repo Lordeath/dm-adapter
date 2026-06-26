@@ -109,6 +109,10 @@ class SqlRewriteConfigUpdaterTest {
                     "com.example.UserMapper.selectById":
                       params:
                         id: "1"
+
+                validationIgnores:
+                  missingTables:
+                    - "ns_core_resourcecolumn_temp"
                 """);
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
                 "com.example.UserMapper.updateExtend",
@@ -132,6 +136,9 @@ class SqlRewriteConfigUpdaterTest {
                 .contains("validationArgs:")
                 .contains("\"com.example.UserMapper.selectById\":")
                 .contains("id: \"1\"")
+                .contains("validationIgnores:")
+                .contains("missingTables:")
+                .contains("- \"ns_core_resourcecolumn_temp\"")
                 .contains("\"com.example.UserMapper.updateExtend\":")
                 .contains("keyColumns: [\"user_id\"]");
     }

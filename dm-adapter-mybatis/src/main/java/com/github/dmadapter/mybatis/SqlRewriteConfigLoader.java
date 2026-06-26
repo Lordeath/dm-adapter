@@ -6,8 +6,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class SqlRewriteConfigLoader {
     public SqlRewriteConfig load(Path path) {
@@ -24,6 +26,7 @@ public class SqlRewriteConfigLoader {
     SqlRewriteConfig parse(List<String> lines) {
         Map<String, List<String>> tableKeys = new LinkedHashMap<>();
         Map<String, List<String>> methodKeys = new LinkedHashMap<>();
+        Set<String> ignoredMissingTables = new LinkedHashSet<>();
         String section = "";
         String currentName = "";
         for (String line : lines) {
@@ -35,6 +38,16 @@ public class SqlRewriteConfigLoader {
             int indent = leadingSpaces(withoutComment);
             if (indent == 0 && "upsertKeys:".equals(trimmed)) {
                 section = "upsertKeys";
+                currentName = "";
+                continue;
+            }
+            if (indent == 0 && "validationIgnores:".equals(trimmed)) {
+                section = "validationIgnores";
+                currentName = "";
+                continue;
+            }
+            if (indent == 0) {
+                section = "";
                 currentName = "";
                 continue;
             }
@@ -67,8 +80,22 @@ public class SqlRewriteConfigLoader {
                     methodKeys.put(currentName, keyColumns);
                 }
             }
+            if ("validationIgnores".equals(section)
+                    && indent == 2
+                    && trimmed.startsWith("missingTables:")) {
+                section = "validationMissingTables";
+                ignoredMissingTables.addAll(parseInlineList(trimmed.substring("missingTables:".length())));
+                currentName = "";
+                continue;
+            }
+            if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                String table = unquote(trimmed.substring(2).trim());
+                if (!table.isBlank()) {
+                    ignoredMissingTables.add(table);
+                }
+            }
         }
-        return new SqlRewriteConfig(tableKeys, methodKeys);
+        return new SqlRewriteConfig(tableKeys, methodKeys, ignoredMissingTables);
     }
 
     private String stripComment(String line) {

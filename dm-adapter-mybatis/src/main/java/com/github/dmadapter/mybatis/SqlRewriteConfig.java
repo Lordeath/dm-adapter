@@ -1,25 +1,33 @@
 package com.github.dmadapter.mybatis;
 
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public record SqlRewriteConfig(
         Map<String, List<String>> tableKeyColumns,
-        Map<String, List<String>> methodKeyColumns
+        Map<String, List<String>> methodKeyColumns,
+        Set<String> ignoredMissingTables
 ) {
+    public SqlRewriteConfig(Map<String, List<String>> tableKeyColumns, Map<String, List<String>> methodKeyColumns) {
+        this(tableKeyColumns, methodKeyColumns, Set.of());
+    }
+
     public SqlRewriteConfig {
         tableKeyColumns = normalizeTableKeys(tableKeyColumns);
         methodKeyColumns = normalizeMethodKeys(methodKeyColumns);
+        ignoredMissingTables = normalizeTables(ignoredMissingTables);
     }
 
     public static SqlRewriteConfig empty() {
-        return new SqlRewriteConfig(Map.of(), Map.of());
+        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of());
     }
 
     public boolean isEmpty() {
-        return tableKeyColumns.isEmpty() && methodKeyColumns.isEmpty();
+        return tableKeyColumns.isEmpty() && methodKeyColumns.isEmpty() && ignoredMissingTables.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {
@@ -72,6 +80,19 @@ public record SqlRewriteConfig(
             }
         });
         return Map.copyOf(normalized);
+    }
+
+    private static Set<String> normalizeTables(Set<String> tables) {
+        if (tables == null || tables.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> normalized = new LinkedHashSet<>();
+        for (String table : tables) {
+            if (table != null && !table.isBlank()) {
+                normalized.add(normalizeTableName(table));
+            }
+        }
+        return Set.copyOf(normalized);
     }
 
     private static List<String> cleanColumns(List<String> columns) {
