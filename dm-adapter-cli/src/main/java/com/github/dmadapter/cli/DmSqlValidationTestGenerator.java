@@ -1092,7 +1092,8 @@ class DmSqlValidationTestGenerator {
                         if ("foreach".equals(element.getTagName())) {
                             String item = element.getAttribute("item");
                             String index = element.getAttribute("index");
-                            String collection = element.getAttribute("collection");
+                            String rawCollection = element.getAttribute("collection");
+                            String collection = canonicalCollectionName(rawCollection);
                             NestedCollection nestedCollection = nestedCollection(collection, foreachCollections);
                             boolean nonEmptyCollection = shouldUseNonEmptyForeachCollection(collection, item, element);
                             if (nestedCollection == null) {
@@ -1100,14 +1101,14 @@ class DmSqlValidationTestGenerator {
                                 if (nonEmptyCollection) {
                                     metadata.addNonEmptyCollectionParameterName(collection);
                                 }
-                                if (isMapForeachCollection(collection, index, item, element)) {
+                                if (isMapForeachCollection(rawCollection, index, item, element)) {
                                     metadata.addMapCollectionParameterName(collection);
                                 }
                             } else {
                                 metadata.addCollectionDefault(
                                         nestedCollection.parentCollection,
                                         nestedCollection.propertyName,
-                                        defaultNestedForeachCollectionValue(collection, index, item, element)
+                                        defaultNestedForeachCollectionValue(rawCollection, index, item, element)
                                 );
                             }
                             ColumnReference columnReference = inOperatorColumnReference(element, sqlContext);
@@ -1266,10 +1267,17 @@ class DmSqlValidationTestGenerator {
                             if (!parts.isEmpty() && foreachCollections.containsKey(parts.get(0))) {
                                 String collection = foreachCollections.get(parts.get(0));
                                 if (!isNestedForeachCollectionPath(collection)) {
-                                    String propertyName = parts.size() == 1 ? parts.get(0) : parts.get(parts.size() - 1);
                                     ColumnReference columnReference = columnReference(matcher.group(1), sqlContext);
                                     if (columnReference != null) {
-                                        metadata.addCollectionDefaultColumnReference(collection, propertyName, columnReference);
+                                        if (parts.size() == 1) {
+                                            metadata.addCollectionColumnReference(collection, columnReference);
+                                        } else {
+                                            metadata.addCollectionDefaultColumnReference(
+                                                    collection,
+                                                    parts.get(parts.size() - 1),
+                                                    columnReference
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1290,10 +1298,17 @@ class DmSqlValidationTestGenerator {
                             if (!parts.isEmpty() && foreachCollections.containsKey(parts.get(0))) {
                                 String collection = foreachCollections.get(parts.get(0));
                                 if (!isNestedForeachCollectionPath(collection)) {
-                                    String propertyName = parts.size() == 1 ? parts.get(0) : parts.get(parts.size() - 1);
                                     ColumnReference columnReference = columnReference(rightColumnMatcher.group(2), sqlContext);
                                     if (columnReference != null) {
-                                        metadata.addCollectionDefaultColumnReference(collection, propertyName, columnReference);
+                                        if (parts.size() == 1) {
+                                            metadata.addCollectionColumnReference(collection, columnReference);
+                                        } else {
+                                            metadata.addCollectionDefaultColumnReference(
+                                                    collection,
+                                                    parts.get(parts.size() - 1),
+                                                    columnReference
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1892,6 +1907,29 @@ class DmSqlValidationTestGenerator {
                     return new NestedCollection(parentCollection, parts.get(1));
                 }
 
+                private String canonicalCollectionName(String collection) {
+                    if (collection == null) {
+                        return "";
+                    }
+                    String trimmed = collection.trim();
+                    String lower = trimmed.toLowerCase(Locale.ROOT);
+                    if (lower.endsWith(".entryset()")) {
+                        return trimmed.substring(0, trimmed.length() - ".entrySet()".length());
+                    }
+                    if (lower.endsWith(".entryset")) {
+                        return trimmed.substring(0, trimmed.length() - ".entrySet".length());
+                    }
+                    return trimmed;
+                }
+
+                private boolean isEntrySetCollection(String collection) {
+                    if (collection == null) {
+                        return false;
+                    }
+                    String lower = collection.trim().toLowerCase(Locale.ROOT);
+                    return lower.endsWith(".entryset()") || lower.endsWith(".entryset");
+                }
+
                 private Object defaultNestedForeachCollectionValue(
                         String collection,
                         String index,
@@ -1905,9 +1943,12 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean isMapForeachCollection(String collection, String index, String item, Element element) {
-                    String normalizedCollection = normalizeName(collection);
+                    String normalizedCollection = normalizeName(canonicalCollectionName(collection));
                     String normalizedItem = normalizeName(item);
                     String normalizedIndex = normalizeName(index);
+                    if (isEntrySetCollection(collection)) {
+                        return true;
+                    }
                     if (isMapForeachCollectionName(normalizedCollection)) {
                         return true;
                     }
@@ -2674,6 +2715,25 @@ class DmSqlValidationTestGenerator {
                         );
                         for (Object item : rawCollection) {
                             if (item instanceof Map<?, ?>) {
+                                Object scalarItem = scalarConfiguredCollectionItem(
+                                        valueName,
+                                        (Map<?, ?>) item,
+                                        statement
+                                );
+                                if (scalarItem != MethodArgumentConfig.MISSING) {
+                                    ValueResult value = convertConfiguredValue(
+                                            scalarItem,
+                                            nestedClass,
+                                            nestedType,
+                                            statement,
+                                            valueName
+                                    );
+                                    if (!value.resolved) {
+                                        return value;
+                                    }
+                                    converted.add(value.value);
+                                    continue;
+                                }
                                 Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
                                 configuredItem = mergeConfiguredCollectionElementMap(
                                         new LinkedHashMap<>(defaultElement),
@@ -2727,6 +2787,15 @@ class DmSqlValidationTestGenerator {
                                 : new ArrayList<>();
                         for (Object item : (Collection<?>) rawValue) {
                             if (item instanceof Map<?, ?>) {
+                                Object scalarItem = scalarConfiguredCollectionItem(
+                                        valueName,
+                                        (Map<?, ?>) item,
+                                        statement
+                                );
+                                if (scalarItem != MethodArgumentConfig.MISSING) {
+                                    converted.add(scalarItem);
+                                    continue;
+                                }
                                 converted.add(mergeConfiguredCollectionElementMap(
                                         new LinkedHashMap<>(defaultElement),
                                         new LinkedHashMap<>((Map<String, Object>) item)
@@ -2769,6 +2838,31 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return emptyMap();
+                }
+
+                private Object scalarConfiguredCollectionItem(
+                        String collectionName,
+                        Map<?, ?> item,
+                        MapperStatement statement
+                ) {
+                    if (statement == null
+                            || item == null
+                            || item.size() != 1
+                            || !statement.scalarCollectionParameter(collectionName)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    Map.Entry<?, ?> entry = item.entrySet().iterator().next();
+                    String key = String.valueOf(entry.getKey());
+                    String normalizedKey = normalizeName(key);
+                    String normalizedCollection = normalizeName(collectionName);
+                    if ("item".equals(normalizedKey)
+                            || "value".equals(normalizedKey)
+                            || "val".equals(normalizedKey)
+                            || normalizedCollection.endsWith(normalizedKey)
+                            || normalizedKey.endsWith(normalizedCollection)) {
+                        return entry.getValue();
+                    }
+                    return MethodArgumentConfig.MISSING;
                 }
 
                 @SuppressWarnings("unchecked")
@@ -3646,6 +3740,11 @@ class DmSqlValidationTestGenerator {
                 private String defaultMapCollectionKey(String collectionName) {
                     String normalized = normalizeName(collectionName);
                     if (normalized.contains("rightmap") && !normalized.contains("userrightmap")) {
+                        return "1";
+                    }
+                    if (normalized.contains("mapupdate")
+                            || normalized.contains("updatemap")
+                            || normalized.contains("idmap")) {
                         return "1";
                     }
                     return "extField";
@@ -7321,6 +7420,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.mapCollectionParameter(valueName);
                     }
 
+                    private boolean scalarCollectionParameter(String valueName) {
+                        return dynamicIdentifierMetadata.scalarCollectionParameter(valueName);
+                    }
+
                     private boolean nonEmptyCollectionParameter(String valueName) {
                         return dynamicIdentifierMetadata.nonEmptyCollectionParameter(valueName);
                     }
@@ -7511,6 +7614,11 @@ class DmSqlValidationTestGenerator {
 
                     private boolean mapCollectionParameter(String valueName) {
                         return containsNameOrSuffix(mapCollectionParameterNames, valueName);
+                    }
+
+                    private boolean scalarCollectionParameter(String valueName) {
+                        return containsNameOrSuffix(collectionScalarDefaults.keySet(), valueName)
+                                || containsNameOrSuffix(collectionColumnReferences.keySet(), valueName);
                     }
 
                     private Map<String, Object> collectionElementDefault(String valueName) {
