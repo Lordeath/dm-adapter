@@ -306,6 +306,73 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void castsStringForeachItemForTrimColumnsAndForeachValues() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseBaseInfoMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.OwnerHouseBaseInfoMapper">
+                    <insert id="insertOwnerHouseBaseInfos" parameterType="java.util.List">
+                        insert into owner_house_base_info
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            enterprise_id,
+                            sys_time,
+                            vacant_stage,
+                            uuid
+                        </trim>
+                        values
+                        <foreach collection="list" separator="," index="index" item="item">
+                            (
+                            #{item.enterpriseId,jdbcType=BIGINT},
+                            SYSDATE,
+                            #{item.vacantStage},
+                            REPLACE(UUID(),'-','')
+                            )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """);
+        compileJavaClass("com/example/OwnerHouseBaseInfo.java", """
+                package com.example;
+
+                public class OwnerHouseBaseInfo {
+                    private Long enterpriseId;
+                    private String vacantStage;
+                }
+                """);
+        compileJavaClass("com/example/OwnerHouseBaseInfoMapper.java", """
+                package com.example;
+
+                import java.util.List;
+
+                public interface OwnerHouseBaseInfoMapper {
+                    int insertOwnerHouseBaseInfos(List<OwnerHouseBaseInfo> ownerHouseBaseInfos);
+                }
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("owner_house_base_info", Map.of(
+                        "enterprise_id", "BIGINT",
+                        "sys_time", "TIMESTAMP",
+                        "vacant_stage", "TINYINT",
+                        "uuid", "VARCHAR"
+                ))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "module/src/main/resources/mapper-dm/OwnerHouseBaseInfoMapper.xml"
+        ));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.warnings()).isEmpty();
+        assertThat(rewritten)
+                .contains("#{item.enterpriseId,jdbcType=BIGINT}")
+                .contains("CAST(#{item.vacantStage,jdbcType=VARCHAR} AS TINYINT)")
+                .contains("SYSDATE")
+                .contains("REPLACE(UUID(),'-','')")
+                .doesNotContain("#{item.vacantStage},");
+    }
+
+    @Test
     void keepsReadableJavaMetadataWhenAnotherSourceFileIsMalformed() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
