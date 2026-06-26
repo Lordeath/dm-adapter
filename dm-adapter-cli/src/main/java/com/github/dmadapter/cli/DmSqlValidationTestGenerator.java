@@ -2431,9 +2431,6 @@ class DmSqlValidationTestGenerator {
                         }
                         return ValueResult.resolved(null);
                     }
-                    if (targetType.isInstance(rawValue)) {
-                        return ValueResult.resolved(rawValue);
-                    }
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
                         Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
@@ -2489,6 +2486,9 @@ class DmSqlValidationTestGenerator {
                             Array.set(array, index++, value.value);
                         }
                         return ValueResult.resolved(array);
+                    }
+                    if (targetType.isInstance(rawValue)) {
+                        return ValueResult.resolved(rawValue);
                     }
                     return convertScalar(configuredScalarText(rawValue), targetType, genericType);
                 }
