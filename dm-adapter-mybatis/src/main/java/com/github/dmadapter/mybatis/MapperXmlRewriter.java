@@ -100,6 +100,18 @@ public class MapperXmlRewriter {
                     + "on\\s+duplicate\\s+key\\s+update\\s*"
                     + "(?<updates>[\\s\\S]*?)(?<trailing>;?\\s*)$"
     );
+    private static final Pattern BATCH_ON_DUPLICATE_KEY_UPDATE_TRIM_COLUMNS_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)insert\\s+into\\s+"
+                    + "(?<table>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?"
+                    + ")\\s*(?<columnsTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)\\s*values\\s*"
+                    + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)\\s*"
+                    + "on\\s+duplicate\\s+key\\s+update\\s*"
+                    + "(?<updates>[\\s\\S]*?)(?<trailing>;?\\s*)$"
+    );
     private static final Pattern BATCH_INSERT_IGNORE_PATTERN = Pattern.compile(
             "(?is)^(?<leading>\\s*)insert\\s+ignore\\s+into\\s+"
                     + "(?<table>"
@@ -111,8 +123,22 @@ public class MapperXmlRewriter {
                     + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
                     + "(?<trailing>;?\\s*)$"
     );
+    private static final Pattern BATCH_INSERT_IGNORE_TRIM_COLUMNS_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)insert\\s+ignore\\s+into\\s+"
+                    + "(?<table>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?"
+                    + ")\\s*(?<columnsTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)\\s*values\\s*"
+                    + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
+                    + "(?<trailing>;?\\s*)$"
+    );
     private static final Pattern FOREACH_TAG_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)</foreach\\s*>\\s*$"
+    );
+    private static final Pattern TRIM_TAG_PATTERN = Pattern.compile(
+            "(?is)^\\s*(?<opening><trim\\b[^>]*>)(?<body>[\\s\\S]*?)</trim\\s*>\\s*$"
     );
     private static final Set<String> AGGREGATE_FUNCTIONS = Set.of(
             "AVG",
@@ -1580,21 +1606,46 @@ public class MapperXmlRewriter {
         IfWrapper wrapper = readWrappingIf(body);
         String candidate = wrapper == null ? body : wrapper.body();
         Matcher matcher = BATCH_ON_DUPLICATE_KEY_UPDATE_PATTERN.matcher(candidate);
-        if (!matcher.matches()) {
-            return body;
+        BatchInsertValues batchInsertValues;
+        if (matcher.matches()) {
+            batchInsertValues = new BatchInsertValues(
+                    matcher.group("leading"),
+                    matcher.group("table"),
+                    matcher.group("columns"),
+                    matcher.group("foreach"),
+                    matcher.group("updates"),
+                    matcher.group("trailing")
+            );
+        } else {
+            Matcher trimMatcher = BATCH_ON_DUPLICATE_KEY_UPDATE_TRIM_COLUMNS_PATTERN.matcher(candidate);
+            if (!trimMatcher.matches()) {
+                return body;
+            }
+            String columns = trimColumnList(trimMatcher.group("columnsTrim"));
+            if (columns == null) {
+                return body;
+            }
+            batchInsertValues = new BatchInsertValues(
+                    trimMatcher.group("leading"),
+                    trimMatcher.group("table"),
+                    columns,
+                    trimMatcher.group("foreach"),
+                    trimMatcher.group("updates"),
+                    trimMatcher.group("trailing")
+            );
         }
-        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, matcher.group("table"));
+        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, batchInsertValues.table());
         if (keyColumns.isEmpty()) {
             return body;
         }
         String converted = convertBatchInsertValuesToMerge(
-                matcher.group("leading"),
-                matcher.group("table"),
-                matcher.group("columns"),
-                matcher.group("foreach"),
-                matcher.group("updates"),
+                batchInsertValues.leading(),
+                batchInsertValues.table(),
+                batchInsertValues.columns(),
+                batchInsertValues.foreach(),
+                batchInsertValues.updates(),
                 keyColumns,
-                matcher.group("trailing")
+                batchInsertValues.trailing()
         );
         if (converted == null || converted.equals(candidate)) {
             return body;
@@ -1606,26 +1657,64 @@ public class MapperXmlRewriter {
         IfWrapper wrapper = readWrappingIf(body);
         String candidate = wrapper == null ? body : wrapper.body();
         Matcher matcher = BATCH_INSERT_IGNORE_PATTERN.matcher(candidate);
-        if (!matcher.matches()) {
-            return body;
+        BatchInsertValues batchInsertValues;
+        if (matcher.matches()) {
+            batchInsertValues = new BatchInsertValues(
+                    matcher.group("leading"),
+                    matcher.group("table"),
+                    matcher.group("columns"),
+                    matcher.group("foreach"),
+                    "",
+                    matcher.group("trailing")
+            );
+        } else {
+            Matcher trimMatcher = BATCH_INSERT_IGNORE_TRIM_COLUMNS_PATTERN.matcher(candidate);
+            if (!trimMatcher.matches()) {
+                return body;
+            }
+            String columns = trimColumnList(trimMatcher.group("columnsTrim"));
+            if (columns == null) {
+                return body;
+            }
+            batchInsertValues = new BatchInsertValues(
+                    trimMatcher.group("leading"),
+                    trimMatcher.group("table"),
+                    columns,
+                    trimMatcher.group("foreach"),
+                    "",
+                    trimMatcher.group("trailing")
+            );
         }
-        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, matcher.group("table"));
+        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, batchInsertValues.table());
         if (keyColumns.isEmpty()) {
             return body;
         }
         String converted = convertBatchInsertValuesToMerge(
-                matcher.group("leading"),
-                matcher.group("table"),
-                matcher.group("columns"),
-                matcher.group("foreach"),
-                "",
+                batchInsertValues.leading(),
+                batchInsertValues.table(),
+                batchInsertValues.columns(),
+                batchInsertValues.foreach(),
+                batchInsertValues.updates(),
                 keyColumns,
-                matcher.group("trailing")
+                batchInsertValues.trailing()
         );
         if (converted == null || converted.equals(candidate)) {
             return body;
         }
         return wrapper == null ? converted : wrapper.wrap(converted);
+    }
+
+    private String trimColumnList(String trimXml) {
+        Matcher matcher = TRIM_TAG_PATTERN.matcher(trimXml);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String openingTag = matcher.group("opening");
+        if (!"(".equals(defaultString(xmlAttribute(openingTag, "prefix")).trim())
+                || !")".equals(defaultString(xmlAttribute(openingTag, "suffix")).trim())) {
+            return null;
+        }
+        return matcher.group("body");
     }
 
     private String neutralizeMyBatisPlaceholdersInSqlLineComments(String body) {
@@ -2782,6 +2871,16 @@ public class MapperXmlRewriter {
         private String toXml() {
             return openingWithSeparator(separator) + body + "</foreach>";
         }
+    }
+
+    private record BatchInsertValues(
+            String leading,
+            String table,
+            String columns,
+            String foreach,
+            String updates,
+            String trailing
+    ) {
     }
 
     private record DynamicHavingConversion(

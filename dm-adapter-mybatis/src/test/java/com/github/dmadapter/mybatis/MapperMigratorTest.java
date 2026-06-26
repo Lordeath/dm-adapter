@@ -254,6 +254,73 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesBatchInsertIgnoreWithTrimColumnListToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.RolePermMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert ignore into ns_core_role_perm
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            ENTERPRISE_ID,
+                            ORGANIZATION_ID,
+                            ENABLED,
+                            PERID,
+                            ROLEID,
+                            TYPE,
+                        </trim>
+                        values
+                        <foreach collection="list" item="item" index="index" separator=",">
+                        (
+                            #{item.enterpriseId, jdbcType=BIGINT},
+                            #{item.organizationId, jdbcType=BIGINT},
+                            #{item.enabled, jdbcType=VARCHAR},
+                            #{item.perid, jdbcType=VARCHAR},
+                            #{item.roleid, jdbcType=VARCHAR},
+                            #{item.type, jdbcType=VARCHAR}
+                        )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/RolePermMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/RolePermMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(
+                                "com.example.RolePermMapper.insertBatch",
+                                List.of("ENTERPRISE_ID", "ORGANIZATION_ID", "PERID", "ROLEID", "TYPE")
+                        )
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/RolePermMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_core_role_perm t")
+                .contains("ON (t.ENTERPRISE_ID = s.ENTERPRISE_ID AND t.ORGANIZATION_ID = s.ORGANIZATION_ID")
+                .contains("t.\"TYPE\" = s.\"TYPE\"")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContain("insert ignore");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
     void migrationRenamesDamengReservedColumnNamesInMapperSql() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",
