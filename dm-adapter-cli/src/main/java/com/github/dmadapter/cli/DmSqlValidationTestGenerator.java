@@ -3153,6 +3153,9 @@ class DmSqlValidationTestGenerator {
                             || !statement.scalarCollectionParameter(collectionName)) {
                         return MethodArgumentConfig.MISSING;
                     }
+                    if (configuredCollectionObjectItem(collectionName, item, statement)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
                     if (item.size() == 1) {
                         Map.Entry<?, ?> entry = item.entrySet().iterator().next();
                         String key = String.valueOf(entry.getKey());
@@ -3167,6 +3170,41 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return scalarConfiguredCollectionDefault(collectionName, statement);
+                }
+
+                private boolean configuredCollectionObjectItem(
+                        String collectionName,
+                        Map<?, ?> item,
+                        MapperStatement statement
+                ) {
+                    if (statement == null
+                            || item == null
+                            || item.isEmpty()
+                            || (!statement.hasCollectionElementDefault(collectionName)
+                            && !statement.hasCollectionElementColumnReferences(collectionName))) {
+                        return false;
+                    }
+                    Map<String, Object> defaults = statement.collectionElementDefault(collectionName);
+                    Map<String, ColumnReference> references = statement.collectionElementColumnReferences(collectionName);
+                    for (Object rawKey : item.keySet()) {
+                        String key = String.valueOf(rawKey);
+                        if (defaults.containsKey(key)
+                                || references.containsKey(key)
+                                || isKnownCollectionObjectProperty(key)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                private boolean isKnownCollectionObjectProperty(String propertyName) {
+                    String normalized = normalizeName(propertyName);
+                    return "key".equals(normalized)
+                            || "value".equals(normalized)
+                            || "fieldname".equals(normalized)
+                            || "fieldvalue".equals(normalized)
+                            || "fieldunderlinename".equals(normalized)
+                            || "comparison".equals(normalized);
                 }
 
                 private Object scalarConfiguredCollectionDefault(String collectionName, MapperStatement statement) {

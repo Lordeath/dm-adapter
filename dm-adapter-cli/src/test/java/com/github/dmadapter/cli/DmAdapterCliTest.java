@@ -697,6 +697,8 @@ class DmAdapterCliTest {
                 .contains("nestedConfiguredCollectionValue(existing, configuredValue)")
                 .contains("isCollectionOfCollections(existing)")
                 .contains("firstCollectionElement(")
+                .contains("configuredCollectionObjectItem(collectionName, item, statement)")
+                .contains("isKnownCollectionObjectProperty(")
                 .contains("isGeneratedDynamicIdentifierPlaceholder(")
                 .contains("isLikelyDynamicIdentifierName(normalized)")
                 .contains("configuredArgs.valueFor(parameterName, effectiveParameterName, i)")
@@ -1140,6 +1142,17 @@ class DmAdapterCliTest {
                                 #{field.fieldValue} AS ${field.fieldName}
                             </foreach>
                             from dual
+                        </foreach>
+                    </update>
+                    <update id="dynamicUpdateWithConstFields">
+                        update ${targetTable} t
+                        set
+                        <foreach collection="fieldNameList" item="fieldName" separator=",">
+                            t.${fieldName} = #{fieldName}
+                        </foreach>
+                        where
+                        <foreach collection="constFieldList" item="constFieldName" separator=" and ">
+                            ${constFieldName.key}<if test="constFieldName.value != null">=#{constFieldName.value}</if>
                         </foreach>
                     </update>
                     <update id="updateOwnerIdByIdAndSplitOwnerId">
