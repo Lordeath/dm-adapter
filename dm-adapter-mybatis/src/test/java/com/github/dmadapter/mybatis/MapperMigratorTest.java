@@ -841,7 +841,7 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("update ns_system_user nu set nu.AD_account = c.AD_account")
+                .contains("update ns_system_user nu set nu.AD_account = c.\"AD_account\"")
                 .contains("nu.sentry_id = case c.sentry_id when '0' then nu.sentry_id else c.sentry_id end")
                 .contains("nu.update_time = SYSDATE")
                 .contains(",nu.v8_user_id = c.sso_user_id")
@@ -1056,7 +1056,7 @@ class MapperMigratorTest {
                 .contains("u.id, u.user_name, u.\"order\"")
                 .contains("from sys_user u")
                 .contains("u.enabled = 'Y'")
-                .contains("and ${fieldName} = #{fieldValue}")
+                .contains("and \"${fieldName}\" = #{fieldValue}")
                 .doesNotContain("`");
         assertThat(result.automaticConversions()).hasSize(2);
         assertThat(result.automaticConversions())
