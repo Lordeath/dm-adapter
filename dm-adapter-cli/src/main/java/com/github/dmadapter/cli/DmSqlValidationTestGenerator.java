@@ -2016,6 +2016,7 @@ class DmSqlValidationTestGenerator {
                             );
                         }
                     }
+                    addDirectNestedForeachBranchDefaults(element, item, elementDefault);
                     if (!elementDefault.isEmpty()) {
                         return new ArrayList<>(listOf(elementDefault));
                     }
@@ -2023,6 +2024,31 @@ class DmSqlValidationTestGenerator {
                         return new ArrayList<>(listOf(scalarDefault));
                     }
                     return defaultNestedForeachCollectionValue(collection, index, item, element);
+                }
+
+                private void addDirectNestedForeachBranchDefaults(
+                        Element element,
+                        String item,
+                        Map<String, Object> elementDefault
+                ) {
+                    if (element == null || isBlank(item)) {
+                        return;
+                    }
+                    if ("if".equals(element.getTagName()) || "when".equals(element.getTagName())) {
+                        BranchCondition condition = branchCondition(element.getAttribute("test"));
+                        if (condition != null) {
+                            List<String> parts = pathParts(condition.parameterName);
+                            if (parts.size() > 1 && parts.get(0).equals(item)) {
+                                elementDefault.putIfAbsent(parts.get(1), condition.defaultValue);
+                            }
+                        }
+                    }
+                    NodeList children = element.getChildNodes();
+                    for (int i = 0; i < children.getLength(); i++) {
+                        if (children.item(i) instanceof Element) {
+                            addDirectNestedForeachBranchDefaults((Element) children.item(i), item, elementDefault);
+                        }
+                    }
                 }
 
                 private boolean isMapForeachCollection(String collection, String index, String item, Element element) {
@@ -4621,6 +4647,9 @@ class DmSqlValidationTestGenerator {
                         return "2024-01-01 00:00:00";
                     }
                     if (normalized.contains("comparison")) {
+                        return "EQUAL";
+                    }
+                    if (normalized.contains("comparision")) {
                         return "EQUAL";
                     }
                     return "test";
