@@ -5,6 +5,7 @@ import com.github.dmadapter.core.FileChange;
 import com.github.dmadapter.core.MapperXmlFile;
 import com.github.dmadapter.core.ProjectScanResult;
 
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -671,16 +672,27 @@ class MapperJdbcTypeAligner {
             }
             Map<String, Map<String, String>> fields = new LinkedHashMap<>();
             try (Stream<Path> paths = Files.walk(projectRoot)) {
-                List<Path> javaFiles = paths
+                List<Path> regularFiles = paths
                         .filter(Files::isRegularFile)
-                        .filter(path -> path.toString().endsWith(".java"))
-                        .filter(JavaFieldTypeMetadata::isMainJavaSource)
                         .toList();
-                for (Path javaFile : javaFiles) {
+                for (Path file : regularFiles) {
+                    if (!file.toString().endsWith(".java") || !isMainJavaSource(file)) {
+                        continue;
+                    }
                     try {
-                        addJavaFile(fields, javaFile);
+                        addJavaFile(fields, file);
                     } catch (IOException ignored) {
                         // Keep usable source metadata when one project file is unreadable or not UTF-8.
+                    }
+                }
+                for (Path file : regularFiles) {
+                    if (!file.toString().endsWith(".class") || !isMainClassFile(file)) {
+                        continue;
+                    }
+                    try {
+                        addClassFile(fields, file);
+                    } catch (IOException ignored) {
+                        // Keep usable compiled metadata when one class file is unreadable.
                     }
                 }
             }
@@ -690,6 +702,11 @@ class MapperJdbcTypeAligner {
         private static boolean isMainJavaSource(Path path) {
             String normalized = path.toString().replace('\\', '/');
             return normalized.contains("/src/main/java/");
+        }
+
+        private static boolean isMainClassFile(Path path) {
+            String normalized = path.toString().replace('\\', '/');
+            return normalized.contains("/target/classes/");
         }
 
         private static void addJavaFile(Map<String, Map<String, String>> fields, Path javaFile) throws IOException {
@@ -714,6 +731,132 @@ class MapperJdbcTypeAligner {
             }
         }
 
+        private static void addClassFile(Map<String, Map<String, String>> fields, Path classFile) throws IOException {
+            ClassFields classFields = readClassFields(classFile);
+            if (classFields.fieldTypes().isEmpty()) {
+                return;
+            }
+            fields.putIfAbsent(classFields.simpleName(), classFields.fieldTypes());
+            fields.putIfAbsent(classFields.typeName(), classFields.fieldTypes());
+        }
+
+        private static ClassFields readClassFields(Path classFile) throws IOException {
+            try (DataInputStream input = new DataInputStream(Files.newInputStream(classFile))) {
+                if (input.readInt() != 0xCAFEBABE) {
+                    throw new IOException("Invalid Java class file");
+                }
+                input.readUnsignedShort();
+                input.readUnsignedShort();
+                Object[] constantPool = readConstantPool(input);
+                input.readUnsignedShort();
+                String typeName = className(constantPool, input.readUnsignedShort()).replace('/', '.');
+                input.readUnsignedShort();
+                int interfacesCount = input.readUnsignedShort();
+                for (int i = 0; i < interfacesCount; i++) {
+                    input.readUnsignedShort();
+                }
+                int fieldsCount = input.readUnsignedShort();
+                Map<String, String> fieldTypes = new LinkedHashMap<>();
+                for (int i = 0; i < fieldsCount; i++) {
+                    input.readUnsignedShort();
+                    String fieldName = utf8(constantPool, input.readUnsignedShort());
+                    String descriptor = utf8(constantPool, input.readUnsignedShort());
+                    String fieldType = descriptorType(descriptor);
+                    if (!fieldName.isBlank() && !fieldName.contains("$") && !fieldType.isBlank()) {
+                        fieldTypes.putIfAbsent(fieldName, fieldType);
+                    }
+                    skipAttributes(input);
+                }
+                return new ClassFields(typeName, simpleTypeName(typeName), fieldTypes);
+            }
+        }
+
+        private static Object[] readConstantPool(DataInputStream input) throws IOException {
+            int count = input.readUnsignedShort();
+            Object[] constantPool = new Object[count];
+            for (int i = 1; i < count; i++) {
+                int tag = input.readUnsignedByte();
+                switch (tag) {
+                    case 1 -> constantPool[i] = input.readUTF();
+                    case 3, 4 -> skipFully(input, 4);
+                    case 5, 6 -> {
+                        skipFully(input, 8);
+                        i++;
+                    }
+                    case 7 -> constantPool[i] = new ClassInfo(input.readUnsignedShort());
+                    case 8, 16, 19, 20 -> input.readUnsignedShort();
+                    case 9, 10, 11, 12, 17, 18 -> skipFully(input, 4);
+                    case 15 -> skipFully(input, 3);
+                    default -> throw new IOException("Unsupported Java class constant pool tag: " + tag);
+                }
+            }
+            return constantPool;
+        }
+
+        private static void skipAttributes(DataInputStream input) throws IOException {
+            int attributesCount = input.readUnsignedShort();
+            for (int i = 0; i < attributesCount; i++) {
+                input.readUnsignedShort();
+                skipFully(input, Integer.toUnsignedLong(input.readInt()));
+            }
+        }
+
+        private static void skipFully(DataInputStream input, long bytes) throws IOException {
+            long remaining = bytes;
+            while (remaining > 0) {
+                long skipped = input.skip(remaining);
+                if (skipped <= 0) {
+                    input.readUnsignedByte();
+                    skipped = 1;
+                }
+                remaining -= skipped;
+            }
+        }
+
+        private static String className(Object[] constantPool, int classIndex) throws IOException {
+            if (classIndex <= 0 || classIndex >= constantPool.length
+                    || !(constantPool[classIndex] instanceof ClassInfo classInfo)) {
+                throw new IOException("Invalid Java class name reference");
+            }
+            return utf8(constantPool, classInfo.nameIndex());
+        }
+
+        private static String utf8(Object[] constantPool, int index) throws IOException {
+            if (index <= 0 || index >= constantPool.length || !(constantPool[index] instanceof String value)) {
+                throw new IOException("Invalid Java class UTF-8 reference");
+            }
+            return value;
+        }
+
+        private static String descriptorType(String descriptor) {
+            String normalized = descriptor == null ? "" : descriptor.trim();
+            while (normalized.startsWith("[")) {
+                normalized = normalized.substring(1);
+            }
+            if (normalized.isBlank()) {
+                return "";
+            }
+            return switch (normalized.charAt(0)) {
+                case 'B' -> "Byte";
+                case 'C' -> "Character";
+                case 'D' -> "Double";
+                case 'F' -> "Float";
+                case 'I' -> "Integer";
+                case 'J' -> "Long";
+                case 'S' -> "Short";
+                case 'Z' -> "Boolean";
+                case 'L' -> objectDescriptorType(normalized);
+                default -> "";
+            };
+        }
+
+        private static String objectDescriptorType(String descriptor) {
+            if (!descriptor.endsWith(";") || descriptor.length() < 3) {
+                return "";
+            }
+            return simpleTypeName(descriptor.substring(1, descriptor.length() - 1).replace('/', '.'));
+        }
+
         private static String normalizeType(String type) {
             String normalized = type == null ? "" : type.trim();
             int genericStart = normalized.indexOf('<');
@@ -728,6 +871,14 @@ class MapperJdbcTypeAligner {
             return normalized;
         }
 
+        private static String simpleTypeName(String typeName) {
+            int packageStart = typeName.lastIndexOf('.');
+            if (packageStart >= 0) {
+                return typeName.substring(packageStart + 1);
+            }
+            return typeName;
+        }
+
         private boolean isStringField(String typeName, String fieldName) {
             Map<String, String> fields = fieldsByType.get(typeName);
             if (fields == null && typeName != null && typeName.contains(".")) {
@@ -737,6 +888,12 @@ class MapperJdbcTypeAligner {
                 return false;
             }
             return "String".equals(fields.get(fieldName));
+        }
+
+        private record ClassInfo(int nameIndex) {
+        }
+
+        private record ClassFields(String typeName, String simpleName, Map<String, String> fieldTypes) {
         }
     }
 }

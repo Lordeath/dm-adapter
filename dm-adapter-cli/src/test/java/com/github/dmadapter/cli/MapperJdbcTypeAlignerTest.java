@@ -10,6 +10,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -163,6 +165,48 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void castsStringPojoNumericPlaceholderFromCompiledClassMetadata() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.OwnerHouseResultMapper">
+                    <insert id="insertSelective" parameterType="com.example.HouseListEntity">
+                        insert into owner_house_result
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="hasRelevance != null">
+                                has_relevance,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="hasRelevance != null">
+                                #{hasRelevance,jdbcType=INTEGER},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """);
+        compileJavaClass("com/example/HouseListEntity.java", """
+                package com.example;
+
+                public class HouseListEntity {
+                    private String hasRelevance;
+                }
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("owner_house_result", Map.of("has_relevance", "INTEGER"))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/OwnerHouseResultMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.warnings()).isEmpty();
+        assertThat(rewritten)
+                .contains("CAST(#{hasRelevance,jdbcType=VARCHAR} AS INTEGER)")
+                .doesNotContain("#{hasRelevance,jdbcType=INTEGER}");
+    }
+
+    @Test
     void keepsReadableJavaMetadataWhenAnotherSourceFileIsMalformed() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -256,5 +300,16 @@ class MapperJdbcTypeAlignerTest {
         Path path = tempDir.resolve(relativePath);
         Files.createDirectories(path.getParent());
         Files.write(path, content);
+    }
+
+    private void compileJavaClass(String sourceRelativePath, String content) throws Exception {
+        Path source = tempDir.resolve("compile-src").resolve(sourceRelativePath);
+        Files.createDirectories(source.getParent());
+        Files.writeString(source, content);
+        Path output = tempDir.resolve("module/target/classes");
+        Files.createDirectories(output);
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        assertThat(compiler).isNotNull();
+        assertThat(compiler.run(null, null, null, "-d", output.toString(), source.toString())).isZero();
     }
 }
