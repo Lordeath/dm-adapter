@@ -637,6 +637,25 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void generatedValidationTestBuildsTopLevelMapParametersFromStatementDefaults() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        String generatedTestSource = Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"));
+        assertThat(exitCode).isZero();
+        assertThat(generatedTestSource)
+                .contains("depth == 0 && statement != null && statement.hasDefaultParameterMap()")
+                .contains("? defaultParameterMap(statement)")
+                .contains("putDefaultParameterValue(value, valueName, collectionValue)");
+    }
+
+    @Test
     void generateValidationTestPreservesCommaSeparatedSchemas() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
