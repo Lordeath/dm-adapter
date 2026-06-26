@@ -746,7 +746,6 @@ class DmAdapterCliTest {
                 .contains("isSyntheticMetadataName(valueName) && values.size() == 1")
                 .contains("private String requiredCollectionValueName(String valueName, MapperStatement statement)")
                 .contains("Set<String> collectionNames = statement.collectionParameterNames()")
-                .contains("private boolean isSyntheticConfiguredParameterName(String valueName)")
                 .contains("valueByMetadataName(collectionScalarDefaults, valueName)");
     }
 
