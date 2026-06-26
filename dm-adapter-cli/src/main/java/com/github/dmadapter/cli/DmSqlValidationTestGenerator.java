@@ -3143,8 +3143,14 @@ class DmSqlValidationTestGenerator {
                         MapperStatement statement,
                         String valueName
                 ) {
-                    if (statement == null || rawValue == null) {
+                    if (statement == null) {
                         return rawValue;
+                    }
+                    if (rawValue == null) {
+                        if (statementRequiredCollectionValue(valueName, statement)) {
+                            return defaultCollectionParameter(valueName, statement);
+                        }
+                        return null;
                     }
                     if (rawValue instanceof Collection) {
                         Map<String, Object> defaultElement = typedCollectionElementDefault(valueName, statement);
@@ -3329,7 +3335,12 @@ class DmSqlValidationTestGenerator {
                             || "fieldname".equals(normalized)
                             || "fieldvalue".equals(normalized)
                             || "fieldunderlinename".equals(normalized)
-                            || "comparison".equals(normalized);
+                            || "comparison".equals(normalized)
+                            || "comparision".equals(normalized)
+                            || "relateformfiltermodelkey".equals(normalized)
+                            || "relateformfiltermodelkeyunderline".equals(normalized)
+                            || "triggermodelkey".equals(normalized)
+                            || "triggervalue".equals(normalized);
                 }
 
                 private Object scalarConfiguredCollectionDefault(String collectionName, MapperStatement statement) {
@@ -3768,6 +3779,13 @@ class DmSqlValidationTestGenerator {
                     if (Collection.class.isAssignableFrom(targetType)) {
                         Type nestedType = firstGenericArgument(genericType);
                         Class<?> nestedClass = rawClass(nestedType);
+                        Object collectionScalarDefault = statement == null ? null : statement.collectionScalarDefault(valueName);
+                        if (collectionScalarDefault instanceof Collection<?>) {
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(collectionScalarDefault)));
+                            }
+                            return ValueResult.resolved(new ArrayList<>(listOf(collectionScalarDefault)));
+                        }
                         if (shouldUsePojoCollectionElement(nestedClass)) {
                             ValueResult nestedValue = defaultValue(valueName, nestedClass, nestedType, depth + 1, statement);
                             if (!nestedValue.resolved) {
@@ -3810,7 +3828,7 @@ class DmSqlValidationTestGenerator {
                             }
                             return ValueResult.resolved(new ArrayList<>(listOf(sqlFragmentDefault)));
                         }
-                        Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(valueName);
+                        Object scalarDefault = collectionScalarDefault;
                         if (scalarDefault != null) {
                             if (Set.class.isAssignableFrom(targetType)) {
                                 return ValueResult.resolved(new LinkedHashSet<>(listOf(scalarDefault)));
@@ -8390,15 +8408,15 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private boolean nonEmptyCollectionParameter(String valueName) {
-                        return containsNameOrSuffix(nonEmptyCollectionParameterNames, valueName);
+                        return containsMetadataName(nonEmptyCollectionParameterNames, valueName);
                     }
 
                     private boolean collectionParameter(String valueName) {
-                        return containsNameOrSuffix(collectionParameterNames, valueName);
+                        return containsMetadataName(collectionParameterNames, valueName);
                     }
 
                     private boolean mapCollectionParameter(String valueName) {
-                        return containsNameOrSuffix(mapCollectionParameterNames, valueName);
+                        return containsMetadataName(mapCollectionParameterNames, valueName);
                     }
 
                     private boolean scalarCollectionParameter(String valueName) {
@@ -8409,26 +8427,11 @@ class DmSqlValidationTestGenerator {
                         Set<String> scalarNames = new LinkedHashSet<>();
                         scalarNames.addAll(collectionScalarDefaults.keySet());
                         scalarNames.addAll(collectionColumnReferences.keySet());
-                        String normalized = normalizeMetadataName(valueName);
-                        if (isBlank(normalized)) {
-                            return "";
-                        }
-                        if (scalarNames.contains(normalized)) {
-                            return normalized;
-                        }
-                        for (String scalarName : scalarNames) {
-                            if (scalarName.endsWith(normalized) || normalized.endsWith(scalarName)) {
-                                return scalarName;
-                            }
-                        }
-                        if (isSyntheticMetadataName(valueName) && scalarNames.size() == 1) {
-                            return scalarNames.iterator().next();
-                        }
-                        return "";
+                        return matchingMetadataName(scalarNames, valueName);
                     }
 
                     private Map<String, Object> collectionElementDefault(String valueName) {
-                        Map<String, Object> defaults = valueByNameOrSuffix(collectionElementDefaults, valueName);
+                        Map<String, Object> defaults = valueByMetadataName(collectionElementDefaults, valueName);
                         if (defaults != null) {
                             return defaults;
                         }
@@ -8443,19 +8446,19 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private Object collectionSqlFragmentDefault(String valueName) {
-                        return valueByNameOrSuffix(collectionSqlFragmentDefaults, valueName);
+                        return valueByMetadataName(collectionSqlFragmentDefaults, valueName);
                     }
 
                     private Object collectionScalarDefault(String valueName) {
-                        return valueByNameOrSuffix(collectionScalarDefaults, valueName);
+                        return valueByMetadataName(collectionScalarDefaults, valueName);
                     }
 
                     private ColumnReference collectionColumnReference(String valueName) {
-                        return valueByNameOrSuffix(collectionColumnReferences, valueName);
+                        return valueByMetadataName(collectionColumnReferences, valueName);
                     }
 
                     private ColumnReference collectionElementColumnReference(String collectionName, String propertyName) {
-                        Map<String, ColumnReference> references = valueByNameOrSuffix(collectionElementColumnReferences, collectionName);
+                        Map<String, ColumnReference> references = valueByMetadataName(collectionElementColumnReferences, collectionName);
                         if (references == null) {
                             references = collectionElementColumnReferences.get("item");
                         }
@@ -8466,8 +8469,8 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private Map<String, ColumnReference> collectionElementColumnReferences(String collectionName) {
-                        Map<String, ColumnReference> references = valueByNameOrSuffix(collectionElementColumnReferences, collectionName);
-                        Map<String, String> names = valueByNameOrSuffix(collectionElementColumnReferenceNames, collectionName);
+                        Map<String, ColumnReference> references = valueByMetadataName(collectionElementColumnReferences, collectionName);
+                        Map<String, String> names = valueByMetadataName(collectionElementColumnReferenceNames, collectionName);
                         if (references == null && scalarCollectionParameter(collectionName)) {
                             return emptyMap();
                         }
@@ -8506,15 +8509,15 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private ColumnReference defaultColumnReference(String valueName) {
-                        return valueByNameOrSuffix(defaultColumnReferences, valueName);
+                        return valueByMetadataName(defaultColumnReferences, valueName);
                     }
 
                     private Object defaultValue(String valueName) {
-                        return valueByNameOrSuffix(defaultValues, valueName);
+                        return valueByMetadataName(defaultValues, valueName);
                     }
 
                     private boolean hasDefaultValue(String valueName) {
-                        return containsNameOrSuffix(defaultValues.keySet(), valueName);
+                        return containsMetadataName(defaultValues.keySet(), valueName);
                     }
 
                     private Map<String, Object> defaultValues() {
@@ -8541,6 +8544,34 @@ class DmSqlValidationTestGenerator {
                             return fallbackName;
                         }
                         return new ArrayList<>(namedCollectionParameterNames).get(index);
+                    }
+
+                    private boolean containsMetadataName(Set<String> values, String valueName) {
+                        return !isBlank(matchingMetadataName(values, valueName));
+                    }
+
+                    private String matchingMetadataName(Set<String> values, String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        if (isBlank(normalized) || values == null || values.isEmpty()) {
+                            return "";
+                        }
+                        if (values.contains(normalized)) {
+                            return normalized;
+                        }
+                        for (String value : values) {
+                            if (value.endsWith(normalized) || normalized.endsWith(value)) {
+                                return value;
+                            }
+                        }
+                        if (isSyntheticMetadataName(valueName) && values.size() == 1) {
+                            return values.iterator().next();
+                        }
+                        return "";
+                    }
+
+                    private <T> T valueByMetadataName(Map<String, T> values, String valueName) {
+                        String key = matchingMetadataName(values.keySet(), valueName);
+                        return isBlank(key) ? null : values.get(key);
                     }
 
                     private static boolean containsNameOrSuffix(Set<String> values, String valueName) {

@@ -714,7 +714,6 @@ class DmAdapterCliTest {
                 .contains("private Object valueFor(String parameterName, String effectiveParameterName, int index)")
                 .contains("Object value = valueForName(effectiveParameterName)")
                 .contains("String resolvedCollectionName = statement.scalarCollectionName(collectionName)")
-                .contains("isSyntheticMetadataName(valueName) && scalarNames.size() == 1")
                 .contains("Character.isDigit(normalized.charAt(i))")
                 .contains("collectionLike ? collectionParameterIndex : -1")
                 .contains("collectionExpressionName(collectionIndex, fallbackName)")
@@ -727,10 +726,20 @@ class DmAdapterCliTest {
                 .contains("return \"2024-01-01 00:00:00\";")
                 .contains("private ValueResult configuredNullDefaultValue(")
                 .contains("statementRequiredCollectionValue(valueName, statement)")
+                .contains("if (rawValue == null) {")
+                .contains("return defaultCollectionParameter(valueName, statement);")
                 .contains("boolean nestedProperty")
                 .contains("field.getName(),")
                 .contains("private Map<String, Object> defaultMapCollectionValue(")
-                .contains("depth > 0 && statement != null && statement.mapCollectionParameter(valueName)");
+                .contains("depth > 0 && statement != null && statement.mapCollectionParameter(valueName)")
+                .contains("Object collectionScalarDefault = statement == null ? null : statement.collectionScalarDefault(valueName)")
+                .contains("collectionScalarDefault instanceof Collection<?>")
+                .contains("\"comparision\".equals(normalized)")
+                .contains("\"relateformfiltermodelkey\".equals(normalized)")
+                .contains("containsMetadataName(nonEmptyCollectionParameterNames, valueName)")
+                .contains("matchingMetadataName(values, valueName)")
+                .contains("isSyntheticMetadataName(valueName) && values.size() == 1")
+                .contains("valueByMetadataName(collectionScalarDefaults, valueName)");
     }
 
     @Test
