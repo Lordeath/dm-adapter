@@ -673,7 +673,9 @@ class DmAdapterCliTest {
                 .contains("defaultValueForDirectParameter(collection, jdbcType)")
                 .contains("statement.scalarCollectionParameter(collectionName)")
                 .contains("!statement.hasCollectionElementDefault(collectionName)")
-                .contains("!statement.hasCollectionElementColumnReferences(collectionName)");
+                .contains("!statement.hasCollectionElementColumnReferences(collectionName)")
+                .contains("return dynamicIdentifierMetadata.hasCollectionElementDefault(valueName)")
+                .contains("return dynamicIdentifierMetadata.hasCollectionElementColumnReferences(valueName)");
     }
 
     @Test
