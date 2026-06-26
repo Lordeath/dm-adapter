@@ -6611,32 +6611,25 @@ class DmSqlValidationTestGenerator {
                         if (defaults != null) {
                             return defaults;
                         }
-                        defaults = singleValue(collectionElementDefaults);
-                        return defaults == null ? emptyMap() : defaults;
+                        return emptyMap();
                     }
 
                     private Object collectionSqlFragmentDefault(String valueName) {
-                        Object value = valueByNameOrSuffix(collectionSqlFragmentDefaults, valueName);
-                        return value != null ? value : singleValue(collectionSqlFragmentDefaults);
+                        return valueByNameOrSuffix(collectionSqlFragmentDefaults, valueName);
                     }
 
                     private Object collectionScalarDefault(String valueName) {
-                        Object value = valueByNameOrSuffix(collectionScalarDefaults, valueName);
-                        return value != null ? value : singleValue(collectionScalarDefaults);
+                        return valueByNameOrSuffix(collectionScalarDefaults, valueName);
                     }
 
                     private ColumnReference collectionColumnReference(String valueName) {
-                        ColumnReference reference = valueByNameOrSuffix(collectionColumnReferences, valueName);
-                        return reference != null ? reference : singleValue(collectionColumnReferences);
+                        return valueByNameOrSuffix(collectionColumnReferences, valueName);
                     }
 
                     private ColumnReference collectionElementColumnReference(String collectionName, String propertyName) {
                         Map<String, ColumnReference> references = valueByNameOrSuffix(collectionElementColumnReferences, collectionName);
                         if (references == null) {
                             references = collectionElementColumnReferences.get("item");
-                        }
-                        if (references == null) {
-                            references = singleValue(collectionElementColumnReferences);
                         }
                         return references == null ? null : valueByNameOrSuffix(references, propertyName);
                     }
@@ -6706,10 +6699,6 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         return null;
-                    }
-
-                    private static <T> T singleValue(Map<String, T> values) {
-                        return values.size() == 1 ? values.values().iterator().next() : null;
                     }
 
                     private static String normalizeMetadataName(String valueName) {
