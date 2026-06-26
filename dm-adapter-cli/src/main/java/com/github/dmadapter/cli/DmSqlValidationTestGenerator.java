@@ -2803,6 +2803,14 @@ class DmSqlValidationTestGenerator {
                         }
                         return ValueResult.resolved(null);
                     }
+                    if (String.class.equals(targetType) && rawValue instanceof String) {
+                        return ValueResult.resolved(normalizeConfiguredDynamicIdentifierValue(
+                                rawValue,
+                                statement,
+                                valueName,
+                                statement == null ? null : statement.defaultValue(valueName)
+                        ));
+                    }
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
                         Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
@@ -2860,7 +2868,9 @@ class DmSqlValidationTestGenerator {
                                 Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
                                 configuredItem = mergeConfiguredCollectionElementMap(
                                         new LinkedHashMap<>(defaultElement),
-                                        configuredItem
+                                        configuredItem,
+                                        statement,
+                                        valueName
                                 );
                                 converted.add(configuredItem);
                                 continue;
@@ -3347,7 +3357,9 @@ class DmSqlValidationTestGenerator {
                                 ValueResult fieldValue = convertConfiguredValue(
                                         params.get(field.getName()),
                                         field.getType(),
-                                        field.getGenericType()
+                                        field.getGenericType(),
+                                        statement,
+                                        field.getName()
                                 );
                                 if (!fieldValue.resolved) {
                                     return fieldValue;
