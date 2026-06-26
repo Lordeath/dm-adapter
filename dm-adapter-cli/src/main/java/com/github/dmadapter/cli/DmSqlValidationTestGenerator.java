@@ -6053,6 +6053,7 @@ class DmSqlValidationTestGenerator {
                     if (containsAnyPattern(countsByPattern,
                             "NULL_COLLECTION_PARAMETER",
                             "BINDING_PARAMETER_NAME",
+                            "FOREACH_ITEM_BINDING",
                             "MAPPER_PROPERTY_NAME",
                             "METHOD_ARGS_OR_BINDING_OTHER",
                             "DYNAMIC_IDENTIFIER_PARAMETER",
@@ -6283,6 +6284,8 @@ class DmSqlValidationTestGenerator {
                             return "集合参数为空";
                         case "BINDING_PARAMETER_NAME":
                             return "绑定参数名问题";
+                        case "FOREACH_ITEM_BINDING":
+                            return "foreach 元素绑定问题";
                         case "MAPPER_PROPERTY_NAME":
                             return "Mapper 属性名不匹配";
                         case "KEY_PROPERTY_PARAMETER_OBJECT_MISMATCH":
@@ -6422,6 +6425,8 @@ class DmSqlValidationTestGenerator {
                             .collect(Collectors.groupingBy(this::failurePattern, LinkedHashMap::new, Collectors.counting()));
                 }
 
+                """,
+            """
                 private String failurePattern(ValidationRecord record) {
                     if (!"FAILED".equals(record.status)) {
                         return "";
@@ -6480,6 +6485,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isAutoParameter(record) && hasGeneratedSearchParameterIssue(record, message)) {
                         return "GENERATED_SEARCH_PARAMETER";
+                    }
+                    if (hasForeachItemBindingIssue(message)) {
+                        return "FOREACH_ITEM_BINDING";
                     }
                     if (lower.contains("on duplicate key update")) {
                         return "ON_DUPLICATE_KEY_UPDATE";
@@ -6611,7 +6619,7 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("标示符长度非法")) {
                         return "DOUBLE_QUOTED_IDENTIFIER_OR_STRING";
                     }
-                    if (Pattern.compile(",\\\\s*\\\\)").matcher(message).find()) {
+                    if (containsTrailingCommaOutsideQuotes(message)) {
                         return "TRAILING_COMMA";
                     }
                     if (lower.contains("evaluated to a null value")) {
@@ -6701,6 +6709,14 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("\\\\b[A-Za-z_][A-Za-z0-9_$.]*\\\\s+(?:not\\\\s+)?in\\\\s*\\\\(\\\\s*ID\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find();
                 }
 
+                private boolean hasForeachItemBindingIssue(String message) {
+                    String value = message == null ? "" : message;
+                    String lower = value.toLowerCase(Locale.ROOT);
+                    return lower.contains("type handler was null")
+                            && lower.contains("linkedhashmap")
+                            && Pattern.compile("__frch_(?:value|item)_\\\\d+", Pattern.CASE_INSENSITIVE).matcher(value).find();
+                }
+
                 private boolean hasMysqlMakeDate(String message) {
                     return Pattern.compile("\\\\bmakedate\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("无法解析的成员访问表达式\\\\s*\\\\[\\\\s*MAKEDATE\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find();
@@ -6740,12 +6756,105 @@ class DmSqlValidationTestGenerator {
                     String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
+                            || hasUnbalancedSqlParentheses(value)
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\blike\\\\s+\\\\?\\\\s*'").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\band[A-Za-z_][A-Za-z0-9_$]*\\\\s+(?:in|=|<>|!=|>|<|like)\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(value).find();
+                }
+
+                private boolean hasUnbalancedSqlParentheses(String message) {
+                    return parenthesisBalance(sqlFromMessage(message)) != 0;
+                }
+
+                private boolean containsTrailingCommaOutsideQuotes(String message) {
+                    String sql = sqlFromMessage(message);
+                    if (isBlank(sql)) {
+                        return false;
+                    }
+                    boolean inSingleQuote = false;
+                    boolean inDoubleQuote = false;
+                    for (int i = 0; i < sql.length(); i++) {
+                        char ch = sql.charAt(i);
+                        if (ch == '\\'' && !inDoubleQuote) {
+                            if (inSingleQuote && i + 1 < sql.length() && sql.charAt(i + 1) == '\\'') {
+                                i++;
+                                continue;
+                            }
+                            inSingleQuote = !inSingleQuote;
+                            continue;
+                        }
+                        if (ch == '"' && !inSingleQuote) {
+                            inDoubleQuote = !inDoubleQuote;
+                            continue;
+                        }
+                        if (inSingleQuote || inDoubleQuote || ch != ',') {
+                            continue;
+                        }
+                        int next = i + 1;
+                        while (next < sql.length() && Character.isWhitespace(sql.charAt(next))) {
+                            next++;
+                        }
+                        if (next < sql.length() && sql.charAt(next) == ')') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                private int parenthesisBalance(String sql) {
+                    if (isBlank(sql)) {
+                        return 0;
+                    }
+                    int depth = 0;
+                    boolean inSingleQuote = false;
+                    boolean inDoubleQuote = false;
+                    for (int i = 0; i < sql.length(); i++) {
+                        char ch = sql.charAt(i);
+                        if (ch == '\\'' && !inDoubleQuote) {
+                            if (inSingleQuote && i + 1 < sql.length() && sql.charAt(i + 1) == '\\'') {
+                                i++;
+                                continue;
+                            }
+                            inSingleQuote = !inSingleQuote;
+                            continue;
+                        }
+                        if (ch == '"' && !inSingleQuote) {
+                            inDoubleQuote = !inDoubleQuote;
+                            continue;
+                        }
+                        if (inSingleQuote || inDoubleQuote) {
+                            continue;
+                        }
+                        if (ch == '(') {
+                            depth++;
+                        } else if (ch == ')') {
+                            depth--;
+                            if (depth < 0) {
+                                return depth;
+                            }
+                        }
+                    }
+                    return depth;
+                }
+
+                private String sqlFromMessage(String message) {
+                    if (message == null) {
+                        return "";
+                    }
+                    String marker = "### SQL:";
+                    int start = message.indexOf(marker);
+                    if (start < 0) {
+                        return "";
+                    }
+                    start += marker.length();
+                    int end = message.indexOf("### Cause:", start);
+                    if (end < 0) {
+                        end = message.length();
+                    }
+                    return message.substring(start, end);
                 }
 
                 private boolean hasBrokenDynamicSqlShape(String message) {
