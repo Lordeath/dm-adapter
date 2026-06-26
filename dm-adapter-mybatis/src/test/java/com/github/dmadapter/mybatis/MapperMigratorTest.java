@@ -1304,6 +1304,41 @@ class MapperMigratorTest {
                 .contains("duplicate WHERE");
     }
 
+    @Test
+    void neutralizesMybatisPlaceholdersInsideSqlLineComments() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
+                select count(*)
+                from ns_system_organization
+                where organization_code = #{organizationCode}
+                -- LOCATE(#{organizationCode}, organization_code) > 0 and ${rawCondition}
+                and organization_id != #{organizationId}
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("organization_code = #{organizationCode}")
+                .contains("and organization_id != #{organizationId}")
+                .contains("-- LOCATE(# {organizationCode}, organization_code) &gt; 0 and $ {rawCondition}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
+    }
+
     private Path writeMapper(String relativePath, String sql) throws Exception {
         Path mapper = tempDir.resolve(relativePath);
         Files.createDirectories(mapper.getParent());

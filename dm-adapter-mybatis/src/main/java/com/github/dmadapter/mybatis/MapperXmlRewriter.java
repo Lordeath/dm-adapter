@@ -30,6 +30,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE =
             "MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM";
+    public static final String MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE =
+            "MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED";
     public static final String MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE =
             "MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE =
@@ -218,20 +220,29 @@ public class MapperXmlRewriter {
             }
 
             String tableName = extractInsertTableName(originalSql);
+            String commentSafeSql = neutralizeMyBatisPlaceholdersInSqlLineComments(originalSql);
+            List<String> staticRules = new ArrayList<>();
+            if (!commentSafeSql.equals(originalSql)) {
+                staticRules.add(MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
+            }
             SqlConversionResult conversionResult =
-                    sqlConverter.convert(originalSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
-            if (conversionResult.changed()) {
+                    sqlConverter.convert(commentSafeSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
+            String convertedSql = conversionResult.changed()
+                    ? conversionResult.convertedSql()
+                    : commentSafeSql;
+            addAppliedRules(staticRules, conversionResult.appliedRules());
+            if (!convertedSql.equals(originalSql)) {
                 replacements.add(StatementReplacement.staticSql(
                         statement.getTagName(),
                         statementId,
-                        conversionResult.convertedSql()
+                        convertedSql
                 ));
                 automaticConversions.add(new SqlChange(
                         reportPath,
                         statementKey,
-                        conversionResult.originalSql(),
-                        conversionResult.convertedSql(),
-                        conversionResult.appliedRules(),
+                        originalSql,
+                        convertedSql,
+                        staticRules,
                         false,
                         ""
                 ));
@@ -240,9 +251,9 @@ public class MapperXmlRewriter {
                 manualReviewItems.add(new SqlChange(
                         reportPath,
                         statementKey,
-                        conversionResult.originalSql(),
-                        conversionResult.convertedSql(),
-                        conversionResult.appliedRules(),
+                        originalSql,
+                        convertedSql,
+                        staticRules,
                         true,
                         conversionResult.reason()
                 ));
@@ -498,6 +509,12 @@ public class MapperXmlRewriter {
     ) {
         List<String> appliedRules = new ArrayList<>();
         String converted = body;
+
+        String commentSafe = neutralizeMyBatisPlaceholdersInSqlLineComments(converted);
+        if (!commentSafe.equals(converted)) {
+            converted = commentSafe;
+            appliedRules.add(MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
+        }
 
         DynamicHavingConversion havingConversion = convertDynamicHavingClauses(converted);
         if (havingConversion.changed()) {
@@ -1595,6 +1612,65 @@ public class MapperXmlRewriter {
             return body;
         }
         return wrapper == null ? converted : wrapper.wrap(converted);
+    }
+
+    private String neutralizeMyBatisPlaceholdersInSqlLineComments(String body) {
+        StringBuilder converted = new StringBuilder(body.length());
+        boolean changed = false;
+        int lineStart = 0;
+        while (lineStart < body.length()) {
+            int lineEnd = body.indexOf('\n', lineStart);
+            boolean hasNewline = lineEnd >= 0;
+            if (!hasNewline) {
+                lineEnd = body.length();
+            }
+            String line = body.substring(lineStart, lineEnd);
+            int commentStart = sqlLineCommentStart(line);
+            if (commentStart >= 0) {
+                String comment = line.substring(commentStart);
+                String neutralized = comment
+                        .replace("#{", "# {")
+                        .replace("${", "$ {");
+                if (!neutralized.equals(comment)) {
+                    line = line.substring(0, commentStart) + neutralized;
+                    changed = true;
+                }
+            }
+            converted.append(line);
+            if (hasNewline) {
+                converted.append('\n');
+            }
+            lineStart = lineEnd + 1;
+        }
+        return changed ? converted.toString() : body;
+    }
+
+    private int sqlLineCommentStart(String line) {
+        boolean inSingleQuote = false;
+        boolean inDoubleQuote = false;
+        for (int i = 0; i < line.length() - 1; i++) {
+            char current = line.charAt(i);
+            if (current == '\'' && !inDoubleQuote) {
+                if (inSingleQuote && i + 1 < line.length() && line.charAt(i + 1) == '\'') {
+                    i++;
+                } else {
+                    inSingleQuote = !inSingleQuote;
+                }
+                continue;
+            }
+            if (current == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+                continue;
+            }
+            if (!inSingleQuote
+                    && !inDoubleQuote
+                    && current == '-'
+                    && line.charAt(i + 1) == '-'
+                    && (i + 2 == line.length() || Character.isWhitespace(line.charAt(i + 2)))) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private String convertBatchInsertValuesToMerge(

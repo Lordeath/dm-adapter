@@ -507,6 +507,8 @@ class DmAdapterCliTest {
                 .contains("quotedIdentifier(currentConfig.primarySchema())")
                 .contains("validationSchemas")
                 .contains("invokeMapperMethodWithSchema")
+                .contains("isPrimitiveNullReturnFailure")
+                .contains("SQL 已执行，但 mapper 基本类型返回值收到 null")
                 .contains("isSchemaObjectFailureRecord")
                 .contains("schemaAttemptSummary")
                 .contains("schemaLabel")
