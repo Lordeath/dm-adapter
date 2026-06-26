@@ -511,6 +511,8 @@ class DmAdapterCliTest {
                 .contains("configuredDateValue")
                 .contains("configuredInstant")
                 .contains("topLevelColon")
+                .contains("sameNamedNestedCollectionValue")
+                .contains("statementRequiredCollectionValue(entryPath, statement)")
                 .contains("\"mainsearch\".equals(normalized)")
                 .contains("statusDisplay")
                 .contains("categoryDisplay")

@@ -2947,6 +2947,15 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
+                        Object sameNamedNestedCollection = sameNamedNestedCollectionValue(
+                                valueName,
+                                configuredValue,
+                                statement,
+                                valueName
+                        );
+                        if (sameNamedNestedCollection instanceof Map<?, ?>) {
+                            configuredValue = new LinkedHashMap<>((Map<String, Object>) sameNamedNestedCollection);
+                        }
                         Map<String, Object> defaultValue = nestedProperty
                                 && statement != null
                                 && statement.mapCollectionParameter(valueName)
@@ -3229,10 +3238,20 @@ class DmSqlValidationTestGenerator {
                         return converted;
                     }
                     if (rawValue instanceof Map<?, ?>) {
+                        Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
+                        Object sameNamedNestedCollection = sameNamedNestedCollectionValue(
+                                valueName,
+                                configuredValue,
+                                statement,
+                                valueName
+                        );
+                        if (sameNamedNestedCollection instanceof Map<?, ?>) {
+                            configuredValue = new LinkedHashMap<>((Map<String, Object>) sameNamedNestedCollection);
+                        }
                         Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
                         return mergeConfiguredCollectionElementMap(
                                 defaultValue,
-                                new LinkedHashMap<>((Map<String, Object>) rawValue),
+                                configuredValue,
                                 statement,
                                 valueName
                         );
@@ -4266,6 +4285,15 @@ class DmSqlValidationTestGenerator {
                                 entryPath,
                                 existing
                         );
+                        Object sameNamedNestedCollection = sameNamedNestedCollectionValue(
+                                entry.getKey(),
+                                configuredValue,
+                                statement,
+                                entryPath
+                        );
+                        if (sameNamedNestedCollection != MethodArgumentConfig.MISSING) {
+                            configuredValue = sameNamedNestedCollection;
+                        }
                         Object nestedCollection = nestedConfiguredCollectionValue(
                                 existing,
                                 configuredValue,
@@ -4292,6 +4320,35 @@ class DmSqlValidationTestGenerator {
                         }
                         target.put(entry.getKey(), configuredValue);
                     }
+                }
+
+                @SuppressWarnings("unchecked")
+                private Object sameNamedNestedCollectionValue(
+                        String entryName,
+                        Object configuredValue,
+                        MapperStatement statement,
+                        String entryPath
+                ) {
+                    if (statement == null
+                            || configuredValue == null
+                            || !(configuredValue instanceof Map<?, ?>)
+                            || !statementRequiredCollectionValue(entryPath, statement)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    String normalizedEntryName = normalizeName(entryName);
+                    if (isBlank(normalizedEntryName)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    for (Map.Entry<?, ?> nestedEntry : ((Map<?, ?>) configuredValue).entrySet()) {
+                        if (!normalizedEntryName.equals(normalizeName(String.valueOf(nestedEntry.getKey())))) {
+                            continue;
+                        }
+                        Object nestedValue = nestedEntry.getValue();
+                        return nestedValue instanceof Map<?, ?> || nestedValue instanceof Collection<?>
+                                ? nestedValue
+                                : MethodArgumentConfig.MISSING;
+                    }
+                    return MethodArgumentConfig.MISSING;
                 }
 
                 @SuppressWarnings("unchecked")
