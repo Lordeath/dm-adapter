@@ -309,7 +309,8 @@ class DmAdapterCliTest {
                 .contains("com.example.UserMapper.dayClosingByIds")
                 .contains("com.example.UserMapper.getBatchOpenBillChargeItem")
                 .contains("com.example.UserMapper.selectApprovalStateByPaymentIds")
-                .contains("com.example.UserMapper.deleteByLogical");
+                .contains("com.example.UserMapper.deleteByLogical")
+                .contains("com.example.UserMapper.listPageWithScopedCollections");
         assertThat(generatedTestSource)
                 .contains("package com.example;")
                 .contains("public class DmSqlValidationTest")
@@ -456,7 +457,6 @@ class DmAdapterCliTest {
                 .contains("addCollectionSqlFragmentDefault")
                 .contains("valueExpressionName")
                 .contains("collectionExpressionName")
-                .contains("singleValue(collectionElementDefaults)")
                 .contains("value instanceof Map<?, ?>")
                 .contains("configuredDateValue")
                 .contains("configuredInstant")
@@ -584,6 +584,11 @@ class DmAdapterCliTest {
                 .doesNotContain(" instanceof Class<?> clazz")
                 .doesNotContain(" instanceof Element element")
                 .doesNotContain(" instanceof Element child")
+                .doesNotContain("singleValue(collectionElementDefaults)")
+                .doesNotContain("singleValue(collectionScalarDefaults)")
+                .doesNotContain("singleValue(collectionSqlFragmentDefaults)")
+                .doesNotContain("singleValue(collectionColumnReferences)")
+                .doesNotContain("singleValue(collectionElementColumnReferences)")
                 .doesNotContainPattern("case\\s+[^:\\n]+->")
                 .doesNotContainPattern("case\\s+[^:\\n]+,\\s+[^:\\n]+:");
     }
@@ -990,6 +995,26 @@ class DmAdapterCliTest {
                             ${item}
                         </foreach>
                     </delete>
+                    <select id="listPageWithScopedCollections" parameterType="com.newsee.common.vo.SearchVo">
+                        select id
+                        from user
+                        <where>
+                            delete_flag = 0
+                            <if test="seeOrganizationIdList != null and seeOrganizationIdList.size() > 0">
+                                and organization_id in
+                                <foreach collection="seeOrganizationIdList" item="item" open="(" close=")" separator=",">
+                                    #{item}
+                                </foreach>
+                            </if>
+                            <if test="filterList != null">
+                                <foreach collection="filterList" item="item">
+                                    <if test="item.comparison != null and item.comparison == 'EQUAL'">
+                                        and ${item.fieldName} = #{item.fieldValue}
+                                    </if>
+                                </foreach>
+                            </if>
+                        </where>
+                    </select>
                 </mapper>
                 """);
     }
