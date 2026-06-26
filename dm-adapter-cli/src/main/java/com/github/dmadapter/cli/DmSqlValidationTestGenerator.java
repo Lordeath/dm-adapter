@@ -4925,36 +4925,12 @@ class DmSqlValidationTestGenerator {
                     if (statementRequiredCollectionValue(valueName, statement)) {
                         return valueName;
                     }
-                    if (!isSyntheticConfiguredParameterName(valueName)) {
-                        return "";
-                    }
                     Set<String> collectionNames = statement.collectionParameterNames();
                     if (collectionNames.size() != 1) {
                         return "";
                     }
                     String collectionName = collectionNames.iterator().next();
                     return statementRequiredCollectionValue(collectionName, statement) ? collectionName : "";
-                }
-
-                private boolean isSyntheticConfiguredParameterName(String valueName) {
-                    String normalized = normalizeName(valueName);
-                    int prefixLength;
-                    if (normalized.startsWith("arg")) {
-                        prefixLength = 3;
-                    } else if (normalized.startsWith("param")) {
-                        prefixLength = 5;
-                    } else {
-                        return false;
-                    }
-                    if (normalized.length() == prefixLength) {
-                        return false;
-                    }
-                    for (int i = prefixLength; i < normalized.length(); i++) {
-                        if (!Character.isDigit(normalized.charAt(i))) {
-                            return false;
-                        }
-                    }
-                    return true;
                 }
 
                 private boolean isIdLikeParameterName(String normalizedName) {
