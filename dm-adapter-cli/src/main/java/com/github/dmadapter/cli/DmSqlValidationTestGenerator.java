@@ -6469,7 +6469,7 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_USER_VARIABLE";
                     }
-                    if (isAutoParameter(record) && hasMissingDynamicIdentifierIssue(message)) {
+                    if (hasMissingDynamicIdentifierIssue(message)) {
                         return "DYNAMIC_IDENTIFIER_PARAMETER";
                     }
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
@@ -6837,7 +6837,7 @@ class DmSqlValidationTestGenerator {
                     if (hasDamengCtasBindParameter(message)) {
                         return "SQL_SYNTAX";
                     }
-                    if (isAutoParameter(record) && hasMissingDynamicIdentifierIssue(message)) {
+                    if (hasMissingDynamicIdentifierIssue(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
                     if (hasUnresolvedFunctionObject(message)) {

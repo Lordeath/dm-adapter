@@ -1604,6 +1604,58 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsPeriodDiffWithDateFormatYearMonthExpressions() {
+        SqlConversionResult result = converter.convert("""
+                select PERIOD_DIFF(DATE_FORMAT(CURDATE(), '%Y%m'), DATE_FORMAT(startDate, '%Y%m'))
+                from ns_contract_info
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select DATEDIFF(MONTH, startDate, CURDATE())
+                from ns_contract_info
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
+    }
+
+    @Test
+    void convertsMysqlDateDiffTwoArgumentForm() {
+        SqlConversionResult result = converter.convert("""
+                select DATEDIFF(DATEADD(MONTH, 1, startDate), CURDATE())
+                from ns_contract_info
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select DATEDIFF(DAY, CURDATE(), DATEADD(MONTH, 1, startDate))
+                from ns_contract_info
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATEDIFF_2ARG_RULE);
+    }
+
+    @Test
+    void convertsNestedPeriodDiffInsideMysqlDateDiff() {
+        SqlConversionResult result = converter.convert("""
+                select DATEDIFF(DATEADD(MONTH,
+                    PERIOD_DIFF(DATE_FORMAT(CURDATE(), '%Y%m'), DATE_FORMAT(startDate, '%Y%m')),
+                    startDate), CURDATE())
+                from ns_contract_info
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select DATEDIFF(DAY, CURDATE(), DATEADD(MONTH,
+                    DATEDIFF(MONTH, startDate, CURDATE()),
+                    startDate))
+                from ns_contract_info
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE,
+                MySqlToDmSqlConverter.MYSQL_DATEDIFF_2ARG_RULE
+        );
+    }
+
+    @Test
     void removesMysqlUseForceAndIgnoreIndexHints() {
         SqlConversionResult result = converter.convert("""
                 select *
