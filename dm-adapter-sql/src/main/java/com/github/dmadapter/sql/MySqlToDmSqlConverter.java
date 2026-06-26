@@ -41,6 +41,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE = "MYSQL_COUNT_DISTINCT_IF_TO_CASE";
     public static final String MYSQL_NOT_ISNULL_RULE = "MYSQL_NOT_ISNULL_TO_CASE";
     public static final String MYSQL_BOOLEAN_OPERATOR_RULE = "MYSQL_BOOLEAN_OPERATOR_TO_WORD_OPERATOR";
+    public static final String MYSQL_BARE_BOOLEAN_PREDICATE_RULE = "MYSQL_BARE_BOOLEAN_PREDICATE_TO_EQUALS_ONE";
     public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
             "MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN";
     public static final String MYSQL_IMPLICIT_CROSS_JOIN_RULE = "MYSQL_IMPLICIT_CROSS_JOIN_TO_DM";
@@ -463,6 +464,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (booleanOperatorConversion.changed()) {
             converted = booleanOperatorConversion.convertedSql();
             rules.add(MYSQL_BOOLEAN_OPERATOR_RULE);
+        }
+
+        GenericConversion bareBooleanPredicateConversion = convertBareBooleanPredicates(converted);
+        if (bareBooleanPredicateConversion.changed()) {
+            converted = bareBooleanPredicateConversion.convertedSql();
+            rules.add(MYSQL_BARE_BOOLEAN_PREDICATE_RULE);
         }
 
         GenericConversion locateNumericNeedleConversion = convertLocateNumericNeedle(converted);
@@ -3594,6 +3601,121 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : expression, changed);
     }
 
+    private GenericConversion convertBareBooleanPredicates(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                BareBooleanPredicate predicate = readBareBooleanPredicate(sql, index);
+                if (predicate == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(sql, index, predicate.identifierEndIndex());
+                    converted.append(" = 1");
+                    index = predicate.identifierEndIndex();
+                    changed = true;
+                }
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private BareBooleanPredicate readBareBooleanPredicate(String sql, int keywordIndex) {
+        String keyword = conditionConnectorKeyword(sql, keywordIndex);
+        if (keyword == null) {
+            return null;
+        }
+        int index = skipWhitespace(sql, keywordIndex + keyword.length());
+        if (index >= sql.length()
+                || startsKeyword(sql, index, "NOT")
+                || startsKeyword(sql, index, "EXISTS")) {
+            return null;
+        }
+
+        IdentifierToken token = readIdentifierToken(sql, index);
+        if (token == null) {
+            return null;
+        }
+        IdentifierToken lastToken = token;
+        int end = skipWhitespace(sql, token.endIndex());
+        while (end < sql.length() && sql.charAt(end) == '.') {
+            end = skipWhitespace(sql, end + 1);
+            token = readIdentifierToken(sql, end);
+            if (token == null) {
+                return null;
+            }
+            lastToken = token;
+            end = skipWhitespace(sql, token.endIndex());
+        }
+        if (!isLikelyBooleanColumn(lastToken.text())
+                || !isBareBooleanPredicateBoundary(sql, end)) {
+            return null;
+        }
+        return new BareBooleanPredicate(lastToken.endIndex());
+    }
+
+    private String conditionConnectorKeyword(String sql, int index) {
+        for (String keyword : List.of("WHERE", "AND", "OR", "ON")) {
+            if (startsKeyword(sql, index, keyword)) {
+                return keyword;
+            }
+        }
+        return null;
+    }
+
+    private boolean isLikelyBooleanColumn(String identifier) {
+        String unquoted = unquoteIdentifier(identifier);
+        String lower = unquoted.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("is_") || lower.startsWith("has_")) {
+            return true;
+        }
+        if (lower.equals("isdelete")
+                || lower.equals("isdeleted")
+                || lower.equals("isvalid")
+                || lower.equals("isenabled")
+                || lower.equals("isactive")) {
+            return true;
+        }
+        if (unquoted.length() > 2
+                && unquoted.startsWith("is")
+                && Character.isUpperCase(unquoted.charAt(2))) {
+            return true;
+        }
+        return lower.endsWith("_flag") || lower.endsWith("flag");
+    }
+
+    private boolean isBareBooleanPredicateBoundary(String sql, int index) {
+        int boundary = skipWhitespace(sql, index);
+        if (boundary >= sql.length()) {
+            return true;
+        }
+        char current = sql.charAt(boundary);
+        if (current == ')' || current == ';') {
+            return true;
+        }
+        return startsKeyword(sql, boundary, "AND")
+                || startsKeyword(sql, boundary, "OR")
+                || startsKeyword(sql, boundary, "GROUP")
+                || startsKeyword(sql, boundary, "ORDER")
+                || startsKeyword(sql, boundary, "HAVING")
+                || startsKeyword(sql, boundary, "LIMIT")
+                || startsKeyword(sql, boundary, "FETCH")
+                || startsKeyword(sql, boundary, "UNION");
+    }
+
     private int firstTopLevelKeyword(String sql, int start, String... keywords) {
         int result = -1;
         for (String keyword : keywords) {
@@ -3661,6 +3783,20 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
 
+        String separator = "','";
+        if (separatorIndex >= 0) {
+            separator = normalizedStringLiteral(body.substring(separatorIndex + "SEPARATOR".length()));
+            if (separator == null) {
+                return null;
+            }
+        } else if (!orderBy.isBlank()) {
+            GroupConcatOrderBy orderByWithoutSeparator = extractTrailingGroupConcatSeparator(orderBy);
+            if (orderByWithoutSeparator != null) {
+                orderBy = orderByWithoutSeparator.orderBy();
+                separator = orderByWithoutSeparator.separator();
+            }
+        }
+
         int expressionEnd = body.length();
         if (orderIndex >= 0) {
             expressionEnd = Math.min(expressionEnd, orderIndex);
@@ -3681,17 +3817,30 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
 
-        String separator = "','";
-        if (separatorIndex >= 0) {
-            separator = normalizedStringLiteral(body.substring(separatorIndex + "SEPARATOR".length()));
-            if (separator == null) {
-                return null;
-            }
-        }
         if (orderBy.isBlank()) {
             orderBy = expression;
         }
         return "LISTAGG(" + (distinct ? "DISTINCT " : "") + expression + ", " + separator + ") WITHIN GROUP (ORDER BY " + orderBy + ")";
+    }
+
+    private GroupConcatOrderBy extractTrailingGroupConcatSeparator(String orderBy) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(orderBy);
+        if (arguments.size() < 2) {
+            return null;
+        }
+        String separator = normalizedStringLiteral(arguments.get(arguments.size() - 1).text());
+        if (separator == null) {
+            return null;
+        }
+        int orderByEnd = skipWhitespaceBackward(orderBy, arguments.get(arguments.size() - 1).startIndex());
+        if (orderByEnd <= 0 || orderBy.charAt(orderByEnd - 1) != ',') {
+            return null;
+        }
+        String trimmedOrderBy = orderBy.substring(0, orderByEnd - 1).trim();
+        if (trimmedOrderBy.isBlank()) {
+            return null;
+        }
+        return new GroupConcatOrderBy(trimmedOrderBy, separator);
     }
 
     private UpdateSetTableOrderConversion convertUpdateSetTableOrder(String sql) {
@@ -4622,6 +4771,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private record TextReplacement(int startIndex, int endIndex, String replacement) {
     }
 
+    private record BareBooleanPredicate(int identifierEndIndex) {
+    }
+
     private record TableAlias(int startIndex, int endIndex, String text) {
     }
 
@@ -4698,6 +4850,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record TopLevelArgument(String text, int startIndex, int endIndex) {
+    }
+
+    private record GroupConcatOrderBy(String orderBy, String separator) {
     }
 
     private record SingleQuotedStringLiteral(String value, int nextIndex, boolean closed) {

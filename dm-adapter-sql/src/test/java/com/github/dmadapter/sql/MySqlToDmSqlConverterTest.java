@@ -578,6 +578,19 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsGroupConcatOrderByTrailingSeparatorLiteralToListaggSeparator() {
+        SqlConversionResult result = converter.convert(
+                "select GROUP_CONCAT(DISTINCT rs.owner_id order by rs.house_owner_relationship_id desc , ',') from owner_house_relationship rs"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select LISTAGG(DISTINCT rs.owner_id, ',') WITHIN GROUP (ORDER BY rs.house_owner_relationship_id desc) from owner_house_relationship rs");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
     void doesNotConvertGroupConcatWithMultipleTopLevelExpressions() {
         SqlConversionResult result = converter.convert("select GROUP_CONCAT(first_name, last_name) from user");
 
@@ -1576,6 +1589,46 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.MYSQL_COUNT_CONDITION_OR_NULL_RULE,
                 MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE
         );
+    }
+
+    @Test
+    void convertsBareBooleanPredicateColumnsToEqualsOne() {
+        SqlConversionResult result = converter.convert("""
+                select count(*)
+                from owner_house_result io
+                where io.rent_status = '已租' and io.is_current_record
+                  and io.deleteFlag
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select count(*)
+                from owner_house_result io
+                where io.rent_status = '已租' and io.is_current_record = 1
+                  and io.deleteFlag = 1
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BARE_BOOLEAN_PREDICATE_RULE);
+    }
+
+    @Test
+    void doesNotConvertBooleanLikeColumnsThatAlreadyHaveOperators() {
+        SqlConversionResult result = converter.convert("""
+                select *
+                from owner_house_result io
+                where io.is_current_record = 1
+                  and io.deleteFlag is null
+                  or exists (select 1 from t where t.id = io.id)
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select *
+                from owner_house_result io
+                where io.is_current_record = 1
+                  and io.deleteFlag is null
+                  or exists (select 1 from t where t.id = io.id)
+                """);
     }
 
     @Test
