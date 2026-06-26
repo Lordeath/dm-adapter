@@ -1236,6 +1236,55 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicTemporaryTableAsSelectConvertsPrefixBeforeForeachSelect() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="createTmp">
+                        create temporary table t_${tmpTableName}
+                        <foreach collection="list" item="item" separator=" union all ">
+                            select
+                            <foreach collection="item" item="field" separator=",">
+                                #{field.fieldValue} AS ${field.fieldName}
+                            </foreach>
+                            from dual
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName} ON COMMIT PRESERVE ROWS AS")
+                .contains("<foreach collection=\"list\" item=\"item\" separator=\" union all \">")
+                .contains("#{field.fieldValue} AS ${field.fieldName}")
+                .doesNotContain("create temporary table t_${tmpTableName}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void rewritesBacktickIdentifiersInSqlFragmentsAndDynamicSqlText() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

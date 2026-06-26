@@ -579,6 +579,12 @@ public class MapperXmlRewriter {
             addAppliedRules(appliedRules, havingConversion.appliedRules());
         }
 
+        TextRewrite temporaryTableAsSelectPrefix = convertDynamicTemporaryTableAsSelectPrefix(converted);
+        if (temporaryTableAsSelectPrefix.changed()) {
+            converted = temporaryTableAsSelectPrefix.text();
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+        }
+
         TextRewrite temporaryTableForeachLiteral = inlineTemporaryTableAsSelectForeachItemParameters(converted);
         if (temporaryTableForeachLiteral.changed()) {
             converted = temporaryTableForeachLiteral.text();
@@ -656,6 +662,54 @@ public class MapperXmlRewriter {
         }
         converted = withoutTrailingCommas;
         return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
+    }
+
+    private TextRewrite convertDynamicTemporaryTableAsSelectPrefix(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? body.length() : end + "-->".length();
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int end = body.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? body.length() : end + "]]>".length();
+            } else if (body.startsWith("--", index)) {
+                int end = body.indexOf('\n', index + 2);
+                index = end < 0 ? body.length() : end;
+            } else if (body.startsWith("/*", index)) {
+                int end = body.indexOf("*/", index + 2);
+                index = end < 0 ? body.length() : end + 2;
+            } else if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(body, index, current);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (isKeywordAt(body, index, "CREATE")) {
+                TemporaryTableSelectStatement statement = readTemporaryTableAsSelectStatement(body, index);
+                if (statement == null) {
+                    index++;
+                } else {
+                    String replacement = "CREATE GLOBAL TEMPORARY TABLE "
+                            + statement.tableName()
+                            + " ON COMMIT PRESERVE ROWS AS";
+                    if (!body.substring(statement.createIndex(), statement.prefixEndIndex()).equals(replacement)) {
+                        replacements.add(new TextReplacement(
+                                statement.createIndex(),
+                                statement.prefixEndIndex(),
+                                replacement
+                        ));
+                    }
+                    index = statement.endIndex();
+                }
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(body, replacements);
     }
 
     private DynamicHavingConversion convertDynamicHavingClauses(String body) {
@@ -741,11 +795,52 @@ public class MapperXmlRewriter {
         if (index < body.length() && body.charAt(index) == '(') {
             return null;
         }
-        int selectIndex = findTopLevelKeywordSkippingXml(body, "SELECT", index);
+        int prefixEndIndex = tableNameEnd;
+        int searchStart = index;
+        int onCommitEnd = readOnCommitRowsClauseEnd(body, index);
+        if (onCommitEnd > index) {
+            prefixEndIndex = onCommitEnd;
+            searchStart = skipWhitespace(body, onCommitEnd);
+        }
+        if (isKeywordAt(body, searchStart, "AS")) {
+            prefixEndIndex = searchStart + "AS".length();
+            searchStart = skipWhitespace(body, prefixEndIndex);
+        }
+        int selectIndex = findTopLevelKeywordSkippingXml(body, "SELECT", searchStart);
         if (selectIndex < 0) {
             return null;
         }
-        return new TemporaryTableSelectStatement(createIndex, selectIndex, findStatementEndSkippingXml(body, selectIndex));
+        String tableName = body.substring(tableNameStart, tableNameEnd).trim();
+        return new TemporaryTableSelectStatement(
+                createIndex,
+                prefixEndIndex,
+                selectIndex,
+                findStatementEndSkippingXml(body, selectIndex),
+                tableName
+        );
+    }
+
+    private int readOnCommitRowsClauseEnd(String body, int start) {
+        int index = skipWhitespace(body, start);
+        if (!isKeywordAt(body, index, "ON")) {
+            return -1;
+        }
+        index = skipWhitespace(body, index + "ON".length());
+        if (!isKeywordAt(body, index, "COMMIT")) {
+            return -1;
+        }
+        index = skipWhitespace(body, index + "COMMIT".length());
+        if (isKeywordAt(body, index, "PRESERVE")) {
+            index = skipWhitespace(body, index + "PRESERVE".length());
+        } else if (isKeywordAt(body, index, "DELETE")) {
+            index = skipWhitespace(body, index + "DELETE".length());
+        } else {
+            return -1;
+        }
+        if (!isKeywordAt(body, index, "ROWS")) {
+            return -1;
+        }
+        return index + "ROWS".length();
     }
 
     private int readCreateTableNameEnd(String body, int start) {
@@ -3637,7 +3732,13 @@ public class MapperXmlRewriter {
     private record TextReplacement(int startIndex, int endIndex, String replacement) {
     }
 
-    private record TemporaryTableSelectStatement(int createIndex, int selectIndex, int endIndex) {
+    private record TemporaryTableSelectStatement(
+            int createIndex,
+            int prefixEndIndex,
+            int selectIndex,
+            int endIndex,
+            String tableName
+    ) {
     }
 
     private record DynamicJoinSource(String sourceSql, String conditionSql) {
