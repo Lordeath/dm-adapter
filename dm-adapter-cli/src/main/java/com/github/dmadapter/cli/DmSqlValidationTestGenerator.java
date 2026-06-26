@@ -2159,11 +2159,20 @@ class DmSqlValidationTestGenerator {
                         );
                     }
                     Object[] args = new Object[parameterTypes.length];
+                    int collectionParameterIndex = 0;
                     for (int i = 0; i < parameterTypes.length; i++) {
                         String parameterName = parameterName(mapperMethod.method, i);
+                        boolean collectionLike = isCollectionLikeParameter(parameterTypes[i]);
                         String effectiveParameterName = mapperMethod.statement == null
                                 ? parameterName
-                                : mapperMethod.statement.parameterExpressionName(i, parameterName);
+                                : mapperMethod.statement.parameterExpressionName(
+                                        i,
+                                        collectionLike ? collectionParameterIndex : -1,
+                                        parameterName
+                                );
+                        if (collectionLike) {
+                            collectionParameterIndex++;
+                        }
                         ValueResult value = convertConfiguredValue(
                                 configuredArgs.args.get(i),
                                 parameterTypes[i],
@@ -2223,9 +2232,14 @@ class DmSqlValidationTestGenerator {
                     }
                     for (int i = 0; i < parameterTypes.length; i++) {
                         String parameterName = parameterName(mapperMethod.method, i);
+                        boolean collectionLike = isCollectionLikeParameter(parameterTypes[i]);
                         String effectiveParameterName = mapperMethod.statement == null
                                 ? parameterName
-                                : mapperMethod.statement.parameterExpressionName(i, parameterName);
+                                : mapperMethod.statement.parameterExpressionName(
+                                        i,
+                                        collectionLike ? collectionParameterIndex(parameterTypes, i) : -1,
+                                        parameterName
+                                );
                         Object rawValue = configuredArgs.valueFor(parameterName, i);
                         ValueResult value = rawValue == MethodArgumentConfig.MISSING
                                 ? defaultValue(effectiveParameterName, parameterTypes[i], genericTypes[i], 0, mapperMethod.statement)
@@ -2249,10 +2263,19 @@ class DmSqlValidationTestGenerator {
                     Type[] genericTypes = mapperMethod.method.getGenericParameterTypes();
                     Object[] args = new Object[parameterTypes.length];
                     List<String> names = new ArrayList<>();
+                    int collectionParameterIndex = 0;
                     for (int i = 0; i < parameterTypes.length; i++) {
                         String parameterName = parameterName(mapperMethod.method, i);
                         names.add(parameterName);
-                        String effectiveParameterName = mapperMethod.statement.parameterExpressionName(i, parameterName);
+                        boolean collectionLike = isCollectionLikeParameter(parameterTypes[i]);
+                        String effectiveParameterName = mapperMethod.statement.parameterExpressionName(
+                                i,
+                                collectionLike ? collectionParameterIndex : -1,
+                                parameterName
+                        );
+                        if (collectionLike) {
+                            collectionParameterIndex++;
+                        }
                         ValueResult value = defaultValue(
                                 effectiveParameterName,
                                 parameterTypes[i],
@@ -2323,6 +2346,21 @@ class DmSqlValidationTestGenerator {
                     return parameter.getName();
                 }
 
+                private boolean isCollectionLikeParameter(Class<?> parameterType) {
+                    return parameterType != null
+                            && (parameterType.isArray() || Collection.class.isAssignableFrom(parameterType));
+                }
+
+                private int collectionParameterIndex(Class<?>[] parameterTypes, int targetIndex) {
+                    int collectionParameterIndex = 0;
+                    for (int i = 0; i < targetIndex; i++) {
+                        if (isCollectionLikeParameter(parameterTypes[i])) {
+                            collectionParameterIndex++;
+                        }
+                    }
+                    return collectionParameterIndex;
+                }
+
                 """,
             """
                 private ParameterResolution statementParameters(MapperMethod mapperMethod, MethodArgumentConfig configuredArgs) {
@@ -2342,9 +2380,10 @@ class DmSqlValidationTestGenerator {
                         return ParameterResolution.resolved("configured", new Object[] { namedParameters });
                     }
                     if (configuredArgs != null && configuredArgs.args.size() == 1) {
+                        boolean collectionLike = isCollectionLikeParameter(mapperMethod.parameterType);
                         String parameterName = mapperMethod.statement == null
                                 ? "arg0"
-                                : mapperMethod.statement.parameterExpressionName(0, "arg0");
+                                : mapperMethod.statement.parameterExpressionName(0, collectionLike ? 0 : -1, "arg0");
                         ValueResult value = convertConfiguredValue(
                                 configuredArgs.args.get(0),
                                 mapperMethod.parameterType,
@@ -7530,7 +7569,7 @@ class DmSqlValidationTestGenerator {
                                 .anyMatch(normalized::equals);
                     }
 
-                    private String parameterExpressionName(int index, String fallbackName) {
+                    private String parameterExpressionName(int index, int collectionIndex, String fallbackName) {
                         if (!isSyntheticParameterName(fallbackName)) {
                             return fallbackName;
                         }
@@ -7538,7 +7577,7 @@ class DmSqlValidationTestGenerator {
                         if (!isBlank(valueExpressionName)) {
                             return valueExpressionName;
                         }
-                        return dynamicIdentifierMetadata.collectionExpressionName(index, fallbackName);
+                        return dynamicIdentifierMetadata.collectionExpressionName(collectionIndex, fallbackName);
                     }
 
                     private boolean isSyntheticParameterName(String valueName) {
@@ -7822,10 +7861,10 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private String collectionExpressionName(int index, String fallbackName) {
-                        if (index != 0 || namedCollectionParameterNames.size() != 1) {
+                        if (index < 0 || index >= namedCollectionParameterNames.size()) {
                             return fallbackName;
                         }
-                        return new ArrayList<>(namedCollectionParameterNames).get(0);
+                        return new ArrayList<>(namedCollectionParameterNames).get(index);
                     }
 
                     private static boolean containsNameOrSuffix(Set<String> values, String valueName) {
