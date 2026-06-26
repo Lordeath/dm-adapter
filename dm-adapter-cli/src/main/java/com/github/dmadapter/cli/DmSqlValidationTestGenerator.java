@@ -1441,7 +1441,28 @@ class DmSqlValidationTestGenerator {
                             return columns;
                         }
                     }
-                    return listOf();
+                    String sql = statement.getTextContent();
+                    if (sql == null || isBlank(sql)) {
+                        return listOf();
+                    }
+                    Matcher insertMatcher = Pattern.compile("(?is)\\\\binsert\\\\s+into\\\\s+"
+                            + sqlIdentifierPattern()
+                            + "(?:\\\\s*\\\\.\\\\s*" + sqlIdentifierPattern() + ")?").matcher(sql);
+                    if (!insertMatcher.find()) {
+                        return listOf();
+                    }
+                    int columnsOpen = sql.indexOf('(', insertMatcher.end());
+                    if (columnsOpen < 0) {
+                        return listOf();
+                    }
+                    int columnsClose = matchingParen(sql, columnsOpen);
+                    if (columnsClose < 0) {
+                        return listOf();
+                    }
+                    return splitTopLevelComma(sql.substring(columnsOpen + 1, columnsClose)).stream()
+                            .map(String::trim)
+                            .filter(value -> !isBlank(value))
+                            .collect(Collectors.toList());
                 }
 
                 private InsertForeachValues structuredInsertForeachValues(Element statement) {
@@ -1727,6 +1748,8 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
+            """,
+            """
                 private BranchCondition branchCondition(String test) {
                     if (test == null || isBlank(test)) {
                         return null;
@@ -3050,6 +3073,8 @@ class DmSqlValidationTestGenerator {
                     );
                 }
 
+            """,
+            """
                 private ValueResult adaptContextualDefaultValue(
                         String valueName,
                         Object rawValue,
@@ -3425,13 +3450,24 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Map<String, Object> typedCollectionElementDefault(String collectionName, MapperStatement statement) {
-                    Map<String, Object> collectionElementDefault = statement == null
-                            ? emptyMap()
-                            : statement.collectionElementDefault(collectionName);
-                    if (collectionElementDefault.isEmpty()) {
+                    if (statement == null) {
                         return emptyMap();
                     }
+                    Map<String, Object> collectionElementDefault = statement.collectionElementDefault(collectionName);
                     Map<String, Object> typed = new LinkedHashMap<>(collectionElementDefault);
+                    Map<String, ColumnReference> columnReferences = statement.collectionElementColumnReferences(collectionName);
+                    for (Map.Entry<String, ColumnReference> entry : columnReferences.entrySet()) {
+                        String columnType = dbColumnMetadata == null ? "" : dbColumnMetadata.columnType(entry.getValue());
+                        if (!isBlank(columnType)) {
+                            typed.putIfAbsent(
+                                    entry.getKey(),
+                                    defaultValueForColumnType(entry.getKey(), Object.class, columnType)
+                            );
+                        }
+                    }
+                    if (typed.isEmpty()) {
+                        return emptyMap();
+                    }
                     for (String propertyName : new ArrayList<>(typed.keySet())) {
                         String columnType = statement.collectionElementColumnType(collectionName, propertyName, dbColumnMetadata);
                         if (!isBlank(columnType)) {
@@ -4526,6 +4562,8 @@ class DmSqlValidationTestGenerator {
                     return dot >= 0 && dot + 1 < table.length() ? table.substring(dot + 1) : table;
                 }
 
+            """,
+            """
                 private int topLevelSectionStart(List<String> lines, String header) {
                     for (int i = 0; i < lines.size(); i++) {
                         if (leadingSpaces(lines.get(i)) == 0 && header.equals(lines.get(i).trim())) {
@@ -6078,6 +6116,8 @@ class DmSqlValidationTestGenerator {
                             return UsageFilter.unavailable(new UsageFilterReport(true, false, classDirectories.size(), 0, 0, warnings));
                         }
 
+            """,
+            """
                         Set<String> referencedStatements = new LinkedHashSet<>();
                         for (Path classFile : classFiles) {
                             try {
@@ -7104,6 +7144,10 @@ class DmSqlValidationTestGenerator {
                                 : columnMetadata.columnType(columnReference);
                     }
 
+                    private Map<String, ColumnReference> collectionElementColumnReferences(String collectionName) {
+                        return dynamicIdentifierMetadata.collectionElementColumnReferences(collectionName);
+                    }
+
                     private String defaultColumnType(String valueName, DbColumnMetadata columnMetadata) {
                         ColumnReference columnReference = dynamicIdentifierMetadata.defaultColumnReference(valueName);
                         return columnReference == null || columnMetadata == null
@@ -7190,6 +7234,7 @@ class DmSqlValidationTestGenerator {
                     private final Map<String, Object> collectionScalarDefaults = new LinkedHashMap<>();
                     private final Map<String, ColumnReference> collectionColumnReferences = new LinkedHashMap<>();
                     private final Map<String, Map<String, ColumnReference>> collectionElementColumnReferences = new LinkedHashMap<>();
+                    private final Map<String, Map<String, String>> collectionElementColumnReferenceNames = new LinkedHashMap<>();
                     private final Map<String, ColumnReference> defaultColumnReferences = new LinkedHashMap<>();
                     private final Map<String, Object> defaultValues = new LinkedHashMap<>();
                     private final Map<String, Object> namedDefaultValues = new LinkedHashMap<>();
@@ -7282,6 +7327,9 @@ class DmSqlValidationTestGenerator {
                             collectionElementColumnReferences
                                     .computeIfAbsent(normalizedCollectionName, ignored -> new LinkedHashMap<>())
                                     .putIfAbsent(normalizedPropertyName, columnReference);
+                            collectionElementColumnReferenceNames
+                                    .computeIfAbsent(normalizedCollectionName, ignored -> new LinkedHashMap<>())
+                                    .putIfAbsent(normalizedPropertyName, propertyName);
                         }
                     }
 
@@ -7357,6 +7405,24 @@ class DmSqlValidationTestGenerator {
                             references = collectionElementColumnReferences.get("item");
                         }
                         return references == null ? null : valueByNameOrSuffix(references, propertyName);
+                    }
+
+                    private Map<String, ColumnReference> collectionElementColumnReferences(String collectionName) {
+                        Map<String, ColumnReference> references = valueByNameOrSuffix(collectionElementColumnReferences, collectionName);
+                        Map<String, String> names = valueByNameOrSuffix(collectionElementColumnReferenceNames, collectionName);
+                        if (references == null) {
+                            references = collectionElementColumnReferences.get("item");
+                            names = collectionElementColumnReferenceNames.get("item");
+                        }
+                        if (references == null || references.isEmpty()) {
+                            return emptyMap();
+                        }
+                        Map<String, ColumnReference> result = new LinkedHashMap<>();
+                        for (Map.Entry<String, ColumnReference> entry : references.entrySet()) {
+                            String propertyName = names == null ? null : names.get(entry.getKey());
+                            result.put(isBlank(propertyName) ? entry.getKey() : propertyName, entry.getValue());
+                        }
+                        return result;
                     }
 
                     private ColumnReference defaultColumnReference(String valueName) {
