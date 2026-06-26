@@ -653,7 +653,10 @@ class DmAdapterCliTest {
         assertThat(generatedTestSource)
                 .contains("depth == 0 && statement != null && statement.hasDefaultParameterMap()")
                 .contains("? defaultParameterMap(statement)")
-                .contains("putDefaultParameterValue(value, valueName, collectionValue)");
+                .contains("putDefaultParameterValue(value, valueName, collectionValue)")
+                .contains("Map<String, Object> defaultValue = nestedProperty")
+                .contains("? defaultMapCollectionValue(valueName, statement)")
+                .contains(": defaultMapParameterValue(valueName, statement)");
     }
 
     @Test
@@ -721,7 +724,13 @@ class DmAdapterCliTest {
                 .contains("Object existingDefault = field.get(instance);")
                 .contains("Object valueToConvert = coerced != configured")
                 .contains("serializablePojo(value, depth)")
-                .contains("return \"2024-01-01 00:00:00\";");
+                .contains("return \"2024-01-01 00:00:00\";")
+                .contains("private ValueResult configuredNullDefaultValue(")
+                .contains("statementRequiredCollectionValue(valueName, statement)")
+                .contains("boolean nestedProperty")
+                .contains("field.getName(),")
+                .contains("private Map<String, Object> defaultMapCollectionValue(")
+                .contains("depth > 0 && statement != null && statement.mapCollectionParameter(valueName)");
     }
 
     @Test

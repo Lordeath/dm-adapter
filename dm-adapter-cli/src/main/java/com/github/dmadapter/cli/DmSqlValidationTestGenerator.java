@@ -2877,12 +2877,34 @@ class DmSqlValidationTestGenerator {
                         MapperStatement statement,
                         String valueName
                 ) {
+                    return convertConfiguredValue(rawValue, targetType, genericType, statement, valueName, false);
+                }
+
+                @SuppressWarnings("unchecked")
+                private ValueResult convertConfiguredValue(
+                        Object rawValue,
+                        Class<?> targetType,
+                        Type genericType,
+                        MapperStatement statement,
+                        String valueName,
+                        boolean nestedProperty
+                ) {
                     if (targetType == null || Object.class.equals(targetType)) {
                         return ValueResult.resolved(configuredValueWithStatementDefaults(rawValue, statement, valueName));
                     }
                     if (rawValue == null) {
                         if (targetType.isPrimitive()) {
                             return ValueResult.unresolved("Cannot assign null to primitive type " + targetType.getName() + ".");
+                        }
+                        ValueResult defaultValue = configuredNullDefaultValue(
+                                targetType,
+                                genericType,
+                                statement,
+                                valueName,
+                                nestedProperty
+                        );
+                        if (defaultValue != null) {
+                            return defaultValue;
                         }
                         return ValueResult.resolved(null);
                     }
@@ -2896,7 +2918,11 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
-                        Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
+                        Map<String, Object> defaultValue = nestedProperty
+                                && statement != null
+                                && statement.mapCollectionParameter(valueName)
+                                ? defaultMapCollectionValue(valueName, statement)
+                                : defaultMapParameterValue(valueName, statement);
                         configuredValue = mergeConfiguredCollectionElementMap(defaultValue, configuredValue, statement, valueName);
                         return ValueResult.resolved(mapParameterValue(targetType, configuredValue));
                     }
@@ -3023,6 +3049,30 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(rawValue);
                     }
                     return convertScalar(configuredScalarText(rawValue), targetType, genericType);
+                }
+
+                private ValueResult configuredNullDefaultValue(
+                        Class<?> targetType,
+                        Type genericType,
+                        MapperStatement statement,
+                        String valueName,
+                        boolean nestedProperty
+                ) {
+                    if (statement == null || !statementRequiredCollectionValue(valueName, statement)) {
+                        return null;
+                    }
+                    if (Map.class.isAssignableFrom(targetType) && statement.mapCollectionParameter(valueName)) {
+                        Map<String, Object> defaultValue = nestedProperty
+                                ? defaultMapCollectionValue(valueName, statement)
+                                : defaultMapParameterValue(valueName, statement);
+                        if (!defaultValue.isEmpty()) {
+                            return ValueResult.resolved(mapParameterValue(targetType, defaultValue));
+                        }
+                    }
+                    if (Collection.class.isAssignableFrom(targetType) || targetType.isArray()) {
+                        return defaultValue(valueName, targetType, genericType, 0, statement);
+                    }
+                    return null;
                 }
 
                 private boolean rawCollectionElementType(Type genericType) {
@@ -3580,7 +3630,8 @@ class DmSqlValidationTestGenerator {
                                         field.getType(),
                                         field.getGenericType(),
                                         statement,
-                                        field.getName()
+                                        field.getName(),
+                                        true
                                 );
                                 if (!fieldValue.resolved) {
                                     return fieldValue;
@@ -3629,7 +3680,7 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(columnDefault);
                     }
                     if (shouldUseNullDefault(valueName)
-                            && (statement == null || !statement.nonEmptyCollectionParameter(valueName))) {
+                            && !statementRequiredCollectionValue(valueName, statement)) {
                         return ValueResult.resolved(null);
                     }
                     if (String.class.equals(targetType)) {
@@ -3776,7 +3827,9 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(new ArrayList<>(listOf(nestedValue.value)));
                     }
                     if (Map.class.isAssignableFrom(targetType)) {
-                        Map<String, Object> value = depth == 0 && statement != null && statement.hasDefaultParameterMap()
+                        Map<String, Object> value = depth > 0 && statement != null && statement.mapCollectionParameter(valueName)
+                                ? defaultMapCollectionValue(valueName, statement)
+                                : depth == 0 && statement != null && statement.hasDefaultParameterMap()
                                 ? defaultParameterMap(statement)
                                 : defaultMapParameterValue(valueName, statement);
                         Map<String, Object> configuredDefaults = statement == null
@@ -4242,6 +4295,14 @@ class DmSqlValidationTestGenerator {
                         return new ArrayList<>(listOf(scalarDefault));
                     }
                     return new ArrayList<>(listOf(defaultCollectionElement(collectionName)));
+                }
+
+                @SuppressWarnings("unchecked")
+                private Map<String, Object> defaultMapCollectionValue(String collectionName, MapperStatement statement) {
+                    Object value = defaultMapCollectionParameter(collectionName, statement);
+                    return value instanceof Map<?, ?>
+                            ? new LinkedHashMap<>((Map<String, Object>) value)
+                            : new LinkedHashMap<>();
                 }
 
                 @SuppressWarnings("unchecked")
@@ -4824,6 +4885,14 @@ class DmSqlValidationTestGenerator {
                             || isOptionalSearchParameterName(normalized)
                             || isDynamicMapParameterName(normalized)
                             || isOptionalDynamicTableName(normalized);
+                }
+
+                private boolean statementRequiredCollectionValue(String valueName, MapperStatement statement) {
+                    return statement != null
+                            && (statement.nonEmptyCollectionParameter(valueName)
+                            || statement.collectionParameter(valueName)
+                            || statement.mapCollectionParameter(valueName)
+                            || statement.scalarCollectionParameter(valueName));
                 }
 
                 private boolean isIdLikeParameterName(String normalizedName) {
