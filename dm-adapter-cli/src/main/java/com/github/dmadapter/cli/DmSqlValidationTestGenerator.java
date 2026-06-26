@@ -3311,7 +3311,9 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(new ArrayList<>(listOf(nestedValue.value)));
                     }
                     if (Map.class.isAssignableFrom(targetType)) {
-                        Map<String, Object> value = defaultMapParameterValue(valueName, statement);
+                        Map<String, Object> value = depth == 0 && statement != null && statement.hasDefaultParameterMap()
+                                ? defaultParameterMap(statement)
+                                : defaultMapParameterValue(valueName, statement);
                         Map<String, Object> configuredDefaults = statement == null
                                 ? emptyMap()
                                 : statement.collectionElementDefault(valueName);
@@ -3721,9 +3723,7 @@ class DmSqlValidationTestGenerator {
                     }
                     if (statement.mapCollectionParameter(valueName) || statement.collectionParameter(valueName)) {
                         Object collectionValue = defaultCollectionParameter(valueName, statement);
-                        if (collectionValue instanceof Map) {
-                            value.putAll((Map<String, Object>) collectionValue);
-                        }
+                        putDefaultParameterValue(value, valueName, collectionValue);
                     }
                     Object scopedValue = valueAtPath(defaultParameterMap(statement), valueName);
                     if (scopedValue instanceof Map) {
