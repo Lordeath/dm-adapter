@@ -89,6 +89,80 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void addsMissingJdbcTypeForBatchInsertFromDamengColumnMetadata() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/NsContractRoomMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NsContractRoomMapper">
+                    <insert id="insertRooms" parameterType="java.util.List">
+                        insert into ns_contract_room (ContractID, houseId, standardId, temporaryBillingArea)
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.contractId}, #{item.houseId}, #{item.standardId}, #{item.temporaryBillingArea})
+                        </foreach>
+                    </insert>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("ns_contract_room", Map.of(
+                        "contractid", "BIGINT",
+                        "houseid", "BIGINT",
+                        "standardid", "BIGINT",
+                        "temporarybillingarea", "DECIMAL"
+                ))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/NsContractRoomMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(rewritten)
+                .contains("#{item.contractId,jdbcType=BIGINT}")
+                .contains("#{item.temporaryBillingArea,jdbcType=DECIMAL}");
+    }
+
+    @Test
+    void castsStringPojoNumericPlaceholderFromDamengColumnMetadata() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.OwnerHouseResultMapper">
+                    <insert id="insertSelective" parameterType="com.example.HouseListEntity">
+                        insert into owner_house_result
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="hasRelevance != null">
+                                has_relevance,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="hasRelevance != null">
+                                #{hasRelevance,jdbcType=INTEGER},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """);
+        writeJava("src/main/java/com/example/HouseListEntity.java", """
+                package com.example;
+
+                public class HouseListEntity {
+                    private String hasRelevance;
+                }
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("owner_house_result", Map.of("has_relevance", "INTEGER"))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/OwnerHouseResultMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(rewritten)
+                .contains("CAST(#{hasRelevance,jdbcType=VARCHAR} AS INTEGER)")
+                .doesNotContain("#{hasRelevance,jdbcType=INTEGER}");
+    }
+
+    @Test
     void collectsReferencedMapperDmTables() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/SystemAreaMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -125,5 +199,11 @@ class MapperJdbcTypeAlignerTest {
                 )),
                 List.of()
         );
+    }
+
+    private void writeJava(String relativePath, String content) throws Exception {
+        Path path = tempDir.resolve(relativePath);
+        Files.createDirectories(path.getParent());
+        Files.writeString(path, content);
     }
 }
