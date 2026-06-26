@@ -1400,6 +1400,8 @@ class DmSqlValidationTestGenerator {
                     }
                     String table = lastIdentifierPart(insertMatcher.group(1));
                     List<String> columns = structuredInsertColumns(statement);
+                    List<String> placeholderExpressions = structuredInsertPlaceholderExpressions(statement);
+                    addStructuredInsertPlaceholderColumnReferences(table, columns, placeholderExpressions, metadata);
                     InsertForeachValues foreachValues = structuredInsertForeachValues(statement);
                     if (columns.isEmpty() || foreachValues == null || foreachValues.expressions.isEmpty()) {
                         return;
@@ -1418,6 +1420,29 @@ class DmSqlValidationTestGenerator {
                                     new ColumnReference(table, cleanSqlIdentifier(columns.get(i)))
                             );
                         }
+                    }
+                }
+
+                private void addStructuredInsertPlaceholderColumnReferences(
+                        String table,
+                        List<String> columns,
+                        List<String> placeholderExpressions,
+                        DynamicIdentifierMetadata metadata
+                ) {
+                    if (columns.isEmpty() || placeholderExpressions.isEmpty()) {
+                        return;
+                    }
+                    int count = Math.min(columns.size(), placeholderExpressions.size());
+                    for (int i = 0; i < count; i++) {
+                        String expression = placeholderExpressions.get(i);
+                        if (expression == null || isBlank(expression)) {
+                            continue;
+                        }
+                        addPlaceholderColumnReference(
+                                expression,
+                                new ColumnReference(table, cleanSqlIdentifier(columns.get(i))),
+                                metadata
+                        );
                     }
                 }
 
@@ -1463,6 +1488,61 @@ class DmSqlValidationTestGenerator {
                             .map(String::trim)
                             .filter(value -> !isBlank(value))
                             .collect(Collectors.toList());
+                }
+
+                private List<String> structuredInsertPlaceholderExpressions(Element statement) {
+                    NodeList trims = statement.getElementsByTagName("trim");
+                    for (int i = 0; i < trims.getLength(); i++) {
+                        Node node = trims.item(i);
+                        if (!(node instanceof Element)) {
+                            continue;
+                        }
+                        Element trim = (Element) node;
+                        if (hasAncestor(trim, "foreach")) {
+                            continue;
+                        }
+                        String text = trim.getTextContent();
+                        String prefix = trim.getAttribute("prefix");
+                        if (text == null
+                                || isBlank(text)
+                                || !text.contains("#{")
+                                || (!prefix.toLowerCase(Locale.ROOT).contains("values")
+                                && !text.toLowerCase(Locale.ROOT).contains("values"))) {
+                            continue;
+                        }
+                        List<String> expressions = placeholderExpressions(splitTopLevelComma(text));
+                        if (!expressions.isEmpty()) {
+                            return expressions;
+                        }
+                    }
+                    return listOf();
+                }
+
+                private List<String> placeholderExpressions(List<String> values) {
+                    List<String> expressions = new ArrayList<>();
+                    boolean foundExpression = false;
+                    for (String value : values) {
+                        String expression = null;
+                        Matcher placeholder = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)(?:[^}]*)}").matcher(value);
+                        if (placeholder.find()) {
+                            expression = placeholder.group(1);
+                            foundExpression = true;
+                        }
+                        expressions.add(expression);
+                    }
+                    return foundExpression ? expressions : listOf();
+                }
+
+                private boolean hasAncestor(Node node, String tagName) {
+                    Node current = node == null ? null : node.getParentNode();
+                    while (current != null) {
+                        if (current instanceof Element
+                                && tagName.equalsIgnoreCase(((Element) current).getTagName())) {
+                            return true;
+                        }
+                        current = current.getParentNode();
+                    }
+                    return false;
                 }
 
                 private InsertForeachValues structuredInsertForeachValues(Element statement) {
@@ -2741,7 +2821,13 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object coerceConfiguredValueToDefaultType(Object configuredValue, Object defaultValue) {
-                    if (!(configuredValue instanceof String) || defaultValue == null) {
+                    if (defaultValue == null) {
+                        return configuredValue;
+                    }
+                    if (defaultValue instanceof String && !(configuredValue instanceof String)) {
+                        return String.valueOf(configuredValue);
+                    }
+                    if (!(configuredValue instanceof String)) {
                         return configuredValue;
                     }
                     String text = stripSqlLiteralQuotes((String) configuredValue);
@@ -7404,6 +7490,9 @@ class DmSqlValidationTestGenerator {
                         if (references == null) {
                             references = collectionElementColumnReferences.get("item");
                         }
+                        if (references == null) {
+                            references = onlyCollectionElementColumnReferences();
+                        }
                         return references == null ? null : valueByNameOrSuffix(references, propertyName);
                     }
 
@@ -7414,6 +7503,13 @@ class DmSqlValidationTestGenerator {
                             references = collectionElementColumnReferences.get("item");
                             names = collectionElementColumnReferenceNames.get("item");
                         }
+                        if (references == null) {
+                            Map.Entry<String, Map<String, ColumnReference>> entry = onlyCollectionElementColumnReferenceEntry();
+                            if (entry != null) {
+                                references = entry.getValue();
+                                names = collectionElementColumnReferenceNames.get(entry.getKey());
+                            }
+                        }
                         if (references == null || references.isEmpty()) {
                             return emptyMap();
                         }
@@ -7423,6 +7519,18 @@ class DmSqlValidationTestGenerator {
                             result.put(isBlank(propertyName) ? entry.getKey() : propertyName, entry.getValue());
                         }
                         return result;
+                    }
+
+                    private Map<String, ColumnReference> onlyCollectionElementColumnReferences() {
+                        Map.Entry<String, Map<String, ColumnReference>> entry = onlyCollectionElementColumnReferenceEntry();
+                        return entry == null ? null : entry.getValue();
+                    }
+
+                    private Map.Entry<String, Map<String, ColumnReference>> onlyCollectionElementColumnReferenceEntry() {
+                        if (collectionElementColumnReferences.size() != 1) {
+                            return null;
+                        }
+                        return collectionElementColumnReferences.entrySet().iterator().next();
                     }
 
                     private ColumnReference defaultColumnReference(String valueName) {
