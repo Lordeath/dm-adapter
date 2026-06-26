@@ -3296,7 +3296,15 @@ class DmSqlValidationTestGenerator {
                                 : new ArrayList<>();
                         for (Object item : (Collection<?>) configuredValue) {
                             if (item instanceof Map<?, ?>) {
-                                converted.add(scalarConfiguredCollectionItem(collectionName, (Map<?, ?>) item, statement));
+                                Object scalarItem = scalarConfiguredCollectionItem(
+                                        collectionName,
+                                        (Map<?, ?>) item,
+                                        statement
+                                );
+                                if (scalarItem == MethodArgumentConfig.MISSING) {
+                                    return MethodArgumentConfig.MISSING;
+                                }
+                                converted.add(scalarItem);
                             } else {
                                 converted.add(item);
                             }
@@ -3304,11 +3312,15 @@ class DmSqlValidationTestGenerator {
                         return converted;
                     }
                     if (configuredValue instanceof Map<?, ?>) {
-                        return new ArrayList<>(listOf(scalarConfiguredCollectionItem(
+                        Object scalarItem = scalarConfiguredCollectionItem(
                                 collectionName,
                                 (Map<?, ?>) configuredValue,
                                 statement
-                        )));
+                        );
+                        if (scalarItem == MethodArgumentConfig.MISSING) {
+                            return MethodArgumentConfig.MISSING;
+                        }
+                        return new ArrayList<>(listOf(scalarItem));
                     }
                     return MethodArgumentConfig.MISSING;
                 }
