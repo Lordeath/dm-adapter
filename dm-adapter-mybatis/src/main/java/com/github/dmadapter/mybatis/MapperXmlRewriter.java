@@ -551,6 +551,12 @@ public class MapperXmlRewriter {
             addAppliedRules(appliedRules, havingConversion.appliedRules());
         }
 
+        TextRewrite temporaryTableForeachLiteral = inlineTemporaryTableAsSelectForeachItemParameters(converted);
+        if (temporaryTableForeachLiteral.changed()) {
+            converted = temporaryTableForeachLiteral.text();
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL_RULE);
+        }
+
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
@@ -629,6 +635,211 @@ public class MapperXmlRewriter {
             guard++;
         }
         return new DynamicHavingConversion(body, converted, appliedRules, changed);
+    }
+
+    private TextRewrite inlineTemporaryTableAsSelectForeachItemParameters(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? body.length() : end + "-->".length();
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int end = body.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? body.length() : end + "]]>".length();
+            } else if (body.startsWith("--", index)) {
+                int end = body.indexOf('\n', index + 2);
+                index = end < 0 ? body.length() : end;
+            } else if (body.startsWith("/*", index)) {
+                int end = body.indexOf("*/", index + 2);
+                index = end < 0 ? body.length() : end + 2;
+            } else if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(body, index, current);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (isKeywordAt(body, index, "CREATE")) {
+                TemporaryTableSelectStatement statement = readTemporaryTableAsSelectStatement(body, index);
+                if (statement == null) {
+                    index++;
+                } else {
+                    addTemporaryTableForeachLiteralReplacements(
+                            body,
+                            statement.selectIndex(),
+                            statement.endIndex(),
+                            replacements
+                    );
+                    index = statement.endIndex();
+                }
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(body, replacements);
+    }
+
+    private TemporaryTableSelectStatement readTemporaryTableAsSelectStatement(String body, int createIndex) {
+        int index = skipWhitespace(body, createIndex + "CREATE".length());
+        if (isKeywordAt(body, index, "GLOBAL")) {
+            index = skipWhitespace(body, index + "GLOBAL".length());
+        }
+        if (!isKeywordAt(body, index, "TEMPORARY")) {
+            return null;
+        }
+        index = skipWhitespace(body, index + "TEMPORARY".length());
+        if (!isKeywordAt(body, index, "TABLE")) {
+            return null;
+        }
+        int tableNameStart = skipWhitespace(body, index + "TABLE".length());
+        int tableNameEnd = readCreateTableNameEnd(body, tableNameStart);
+        if (tableNameEnd <= tableNameStart) {
+            return null;
+        }
+        index = skipWhitespace(body, tableNameEnd);
+        if (index < body.length() && body.charAt(index) == '(') {
+            return null;
+        }
+        int selectIndex = findTopLevelKeywordSkippingXml(body, "SELECT", index);
+        if (selectIndex < 0) {
+            return null;
+        }
+        return new TemporaryTableSelectStatement(createIndex, selectIndex, findStatementEndSkippingXml(body, selectIndex));
+    }
+
+    private int readCreateTableNameEnd(String body, int start) {
+        int index = start;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (Character.isWhitespace(current) || current == '(' || current == ';' || current == '<') {
+                break;
+            }
+            if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(body, index, current);
+            } else {
+                index++;
+            }
+        }
+        return index;
+    }
+
+    private int findStatementEndSkippingXml(String body, int start) {
+        int index = start;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? body.length() : end + "-->".length();
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int end = body.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? body.length() : end + "]]>".length();
+            } else if (body.startsWith("--", index)) {
+                int end = body.indexOf('\n', index + 2);
+                index = end < 0 ? body.length() : end;
+            } else if (body.startsWith("/*", index)) {
+                int end = body.indexOf("*/", index + 2);
+                index = end < 0 ? body.length() : end + 2;
+            } else if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(body, index, current);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (current == ';') {
+                return index + 1;
+            } else {
+                index++;
+            }
+        }
+        return body.length();
+    }
+
+    private void addTemporaryTableForeachLiteralReplacements(
+            String body,
+            int start,
+            int end,
+            List<TextReplacement> replacements
+    ) {
+        int index = start;
+        while (index >= 0 && index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                return;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "foreach".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "foreach", end);
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                String item = xmlAttribute(body.substring(tagStart, tag.endIndex()), "item");
+                if (item != null && !item.isBlank()) {
+                    addScalarForeachItemLiteralReplacements(
+                            body,
+                            tag.endIndex(),
+                            closingStart,
+                            item.trim(),
+                            replacements
+                    );
+                }
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+            } else {
+                index = tag.endIndex();
+            }
+        }
+    }
+
+    private void addScalarForeachItemLiteralReplacements(
+            String body,
+            int start,
+            int end,
+            String item,
+            List<TextReplacement> replacements
+    ) {
+        int index = start;
+        while (index < end) {
+            char current = body.charAt(index);
+            if (body.startsWith("<!--", index)) {
+                int commentEnd = body.indexOf("-->", index + "<!--".length());
+                index = commentEnd < 0 ? end : Math.min(end, commentEnd + "-->".length());
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int cdataEnd = body.indexOf("]]>", index + "<![CDATA[".length());
+                index = cdataEnd < 0 ? end : Math.min(end, cdataEnd + "]]>".length());
+            } else if (current == '\'' || current == '"' || current == '`') {
+                index = Math.min(end, skipQuoted(body, index, current));
+            } else if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                index = tag == null ? index + 1 : Math.min(end, tag.endIndex());
+            } else if (current == '#' && startsMyBatisPlaceholder(body, index)) {
+                int placeholderEnd = skipMyBatisPlaceholder(body, index);
+                if (item.equals(myBatisPlaceholderProperty(body, index, placeholderEnd))) {
+                    replacements.add(new TextReplacement(index, placeholderEnd, "${" + item + "}"));
+                }
+                index = placeholderEnd;
+            } else {
+                index++;
+            }
+        }
+    }
+
+    private String myBatisPlaceholderProperty(String body, int start, int end) {
+        String content = body.substring(start + 2, end - 1).trim();
+        int commaIndex = content.indexOf(',');
+        if (commaIndex >= 0) {
+            content = content.substring(0, commaIndex).trim();
+        }
+        return content;
     }
 
     private ScopeHavingConversion convertFirstDynamicHavingScope(String body) {
@@ -2934,6 +3145,9 @@ public class MapperXmlRewriter {
     }
 
     private record TextReplacement(int startIndex, int endIndex, String replacement) {
+    }
+
+    private record TemporaryTableSelectStatement(int createIndex, int selectIndex, int endIndex) {
     }
 
     private record DynamicJoinSource(String sourceSql, String conditionSql) {
