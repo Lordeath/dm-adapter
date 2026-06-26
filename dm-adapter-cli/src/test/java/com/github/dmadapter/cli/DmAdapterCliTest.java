@@ -356,6 +356,8 @@ class DmAdapterCliTest {
                 .contains("writeMissingTableIgnoreSuggestions")
                 .contains("skipIgnoredMissingTable")
                 .contains("ignored-missing-table")
+                .contains("isEmptyDynamicSqlFailure")
+                .contains("动态 SQL 未生成")
                 .contains("existingMissingTableIgnoreEntries")
                 .contains("#    - ")
                 .contains("MethodArgumentConfig")
