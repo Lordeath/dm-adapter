@@ -2966,7 +2966,12 @@ class DmSqlValidationTestGenerator {
                                         valueName
                                 ));
                             } else {
-                                converted.add(item);
+                                converted.add(normalizeConfiguredDynamicIdentifierValue(
+                                        item,
+                                        statement,
+                                        valueName,
+                                        statement.collectionSqlFragmentDefault(valueName)
+                                ));
                             }
                         }
                         return converted;
@@ -2980,7 +2985,45 @@ class DmSqlValidationTestGenerator {
                                 valueName
                         );
                     }
-                    return rawValue;
+                    return normalizeConfiguredDynamicIdentifierValue(rawValue, statement, valueName, statement.defaultValue(valueName));
+                }
+
+                private Object normalizeConfiguredDynamicIdentifierValue(
+                        Object configuredValue,
+                        MapperStatement statement,
+                        String valueName,
+                        Object existingDefault
+                ) {
+                    if (!(configuredValue instanceof String) || statement == null) {
+                        return configuredValue;
+                    }
+                    String normalized = normalizeName(valueName);
+                    if (!statement.dynamicIdentifierParameter(valueName)
+                            && !isLikelyDynamicIdentifierName(normalized)
+                            && !isSchemaIdentifierName(normalized)) {
+                        return configuredValue;
+                    }
+                    String text = ((String) configuredValue).trim();
+                    String stripped = stripSqlLiteralQuotes(text);
+                    if (isGeneratedDynamicIdentifierPlaceholder(stripped)) {
+                        if (existingDefault instanceof String) {
+                            String defaultText = ((String) existingDefault).trim();
+                            String strippedDefault = stripSqlLiteralQuotes(defaultText);
+                            if (!isGeneratedDynamicIdentifierPlaceholder(strippedDefault)) {
+                                return defaultText;
+                            }
+                        }
+                        return defaultDynamicIdentifier(valueName);
+                    }
+                    return text.equals(stripped) ? configuredValue : stripped;
+                }
+
+                private boolean isGeneratedDynamicIdentifierPlaceholder(String value) {
+                    String text = value == null ? "" : value.trim();
+                    return "test".equalsIgnoreCase(text)
+                            || "CODE".equalsIgnoreCase(text)
+                            || "1=1".equals(text)
+                            || "1".equals(text);
                 }
 
                 @SuppressWarnings("unchecked")
@@ -3070,8 +3113,13 @@ class DmSqlValidationTestGenerator {
                     }
                     for (Map.Entry<String, Object> entry : configuredValue.entrySet()) {
                         Object existing = merged.get(entry.getKey());
-                        Object configured = entry.getValue();
                         String entryPath = childPath(pathPrefix, entry.getKey());
+                        Object configured = normalizeConfiguredDynamicIdentifierValue(
+                                entry.getValue(),
+                                statement,
+                                entryPath,
+                                existing
+                        );
                         Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configured, statement);
                         if (scalarCollection != MethodArgumentConfig.MISSING) {
                             merged.put(entry.getKey(), scalarCollection);
@@ -3816,8 +3864,13 @@ class DmSqlValidationTestGenerator {
                     }
                     for (Map.Entry<String, Object> entry : configuredParams.entrySet()) {
                         Object existing = target.get(entry.getKey());
-                        Object configuredValue = entry.getValue();
                         String entryPath = childPath(pathPrefix, entry.getKey());
+                        Object configuredValue = normalizeConfiguredDynamicIdentifierValue(
+                                entry.getValue(),
+                                statement,
+                                entryPath,
+                                existing
+                        );
                         Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configuredValue, statement);
                         if (scalarCollection != MethodArgumentConfig.MISSING) {
                             target.put(entry.getKey(), scalarCollection);
@@ -4162,7 +4215,7 @@ class DmSqlValidationTestGenerator {
                     if (statement != null && statement.dynamicIdentifierParameter(valueName)) {
                         return defaultDynamicIdentifier(valueName);
                     }
-                    if (isDynamicIdentifierName(normalized)) {
+                    if (isLikelyDynamicIdentifierName(normalized)) {
                         return defaultDynamicIdentifier(valueName);
                     }
                     Object columnDefault = defaultTypedColumnValue(valueName, String.class, statement);
@@ -4215,15 +4268,6 @@ class DmSqlValidationTestGenerator {
                             && !isBlank(currentConfig.primarySchema())) {
                         return quotedIdentifier(currentConfig.primarySchema());
                     }
-                    if (isDynamicIdentifierName(normalized)) {
-                        return "ID";
-                    }
-                    if (isNumericSqlFragmentName(normalized)) {
-                        return "1";
-                    }
-                    if (isStringSqlLiteralFragmentName(normalized)) {
-                        return "'test'";
-                    }
                     return "ID";
                 }
 
@@ -4250,6 +4294,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isRawSqlInjectionName(normalized)) {
                         return "";
+                    }
+                    if (isLikelyDynamicIdentifierName(normalized)) {
+                        return defaultDynamicIdentifier(expression);
                     }
                     if (followsLogicalOperator(text, startIndex) && !followsInOperator(text, startIndex)) {
                         return "1=1";
@@ -4585,6 +4632,19 @@ class DmSqlValidationTestGenerator {
                     return normalizedName.contains("fieldunderlinename")
                             || normalizedName.endsWith("fieldname")
                             || normalizedName.endsWith("columnname");
+                }
+
+                private boolean isLikelyDynamicIdentifierName(String normalizedName) {
+                    return isDynamicIdentifierName(normalizedName)
+                            || normalizedName.contains("fieldname")
+                            || normalizedName.contains("columnname")
+                            || normalizedName.endsWith("field")
+                            || normalizedName.endsWith("field2")
+                            || normalizedName.endsWith("column")
+                            || normalizedName.endsWith("tablename")
+                            || normalizedName.endsWith("table")
+                            || normalizedName.endsWith("pkname")
+                            || normalizedName.endsWith("keyname");
                 }
 
                 private String normalizeName(String valueName) {
