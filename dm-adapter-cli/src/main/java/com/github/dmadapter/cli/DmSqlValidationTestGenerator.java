@@ -6480,14 +6480,14 @@ class DmSqlValidationTestGenerator {
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
                         return "DYNAMIC_IDENTIFIER_PARAMETER";
                     }
-                    if (isAutoParameter(record) && hasDynamicSqlFragmentParameterIssue(message)) {
+                    if (hasForeachItemBindingIssue(message)) {
+                        return "FOREACH_ITEM_BINDING";
+                    }
+                    if (hasDynamicSqlFragmentParameterIssue(message)) {
                         return "DYNAMIC_SQL_FRAGMENT_PARAMETER";
                     }
                     if (isAutoParameter(record) && hasGeneratedSearchParameterIssue(record, message)) {
                         return "GENERATED_SEARCH_PARAMETER";
-                    }
-                    if (hasForeachItemBindingIssue(message)) {
-                        return "FOREACH_ITEM_BINDING";
                     }
                     if (lower.contains("on duplicate key update")) {
                         return "ON_DUPLICATE_KEY_UPDATE";
@@ -6700,6 +6700,7 @@ class DmSqlValidationTestGenerator {
                     return Pattern.compile("\\\\bin\\\\s*\\\\(\\\\s*(?:ID|test)\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bin\\\\s*\\\\([^)]*\\\\{[^)]*}[^)]*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bin\\\\s*\\\\(\\\\s*\\\\[[^)]*]\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("\\\\bcast\\\\s*\\\\(\\\\s*[\\\\[{]", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("Type handler was null[\\\\s\\\\S]*LinkedHashMap", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bin\\\\s*\\\\(\\\\s*\\\\[ID]\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("无效的列名\\\\s*\\\\[\\\\s*test\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find()
@@ -6714,7 +6715,7 @@ class DmSqlValidationTestGenerator {
                     String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("type handler was null")
                             && lower.contains("linkedhashmap")
-                            && Pattern.compile("__frch_(?:value|item)_\\\\d+", Pattern.CASE_INSENSITIVE).matcher(value).find();
+                            && Pattern.compile("__frch_[A-Za-z][A-Za-z0-9_]*_\\\\d+", Pattern.CASE_INSENSITIVE).matcher(value).find();
                 }
 
                 private boolean hasMysqlMakeDate(String message) {
