@@ -26,6 +26,7 @@ import java.util.regex.Pattern;
 public class MapperXmlRewriter {
     public static final String MYBATIS_BATCH_INSERT_ADD_VALUES_RULE = "MYBATIS_BATCH_INSERT_ADD_VALUES";
     public static final String MYBATIS_FOREACH_TRAILING_COMMA_RULE = "MYBATIS_FOREACH_TRAILING_COMMA";
+    public static final String MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE = "MYBATIS_DYNAMIC_SET_MISSING_COMMA";
     public static final String MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE =
             "MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE";
     public static final String MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
@@ -76,6 +77,10 @@ public class MapperXmlRewriter {
             "([#$]\\{\\s*)([A-Za-z_][A-Za-z0-9_$]*)(\\s*(?:,[^}]*)?)\\}"
     );
     private static final Pattern IF_BODY_TRAILING_COMMA_PATTERN = Pattern.compile("(?is),\\s*</if\\s*>");
+    private static final Pattern SET_ASSIGNMENT_START_PATTERN = Pattern.compile(
+            "(?is)^\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
+                    + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))?\\s*="
+    );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\")";
     private static final Pattern WRAPPING_IF_PATTERN = Pattern.compile(
@@ -624,6 +629,11 @@ public class MapperXmlRewriter {
             if (!dynamicUpdateJoin.equals(converted)) {
                 appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
                 converted = dynamicUpdateJoin;
+            }
+            TextRewrite dynamicSetCommas = addMissingDynamicSetCommas(converted);
+            if (dynamicSetCommas.changed()) {
+                appliedRules.add(MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE);
+                converted = dynamicSetCommas.text();
             }
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
@@ -3128,6 +3138,158 @@ public class MapperXmlRewriter {
     private String simpleNullTestProperty(String expression) {
         Matcher matcher = SIMPLE_NULL_TEST_PATTERN.matcher(expression == null ? "" : expression);
         return matcher.matches() ? matcher.group(1) : "";
+    }
+
+    private TextRewrite addMissingDynamicSetCommas(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "set".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "set", body.length());
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                addMissingSetCommasInRange(body, tag.endIndex(), closingStart, replacements);
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+            } else {
+                index = tag.endIndex();
+            }
+        }
+        return applyTextReplacements(body, replacements);
+    }
+
+    private void addMissingSetCommasInRange(
+            String body,
+            int start,
+            int end,
+            List<TextReplacement> replacements
+    ) {
+        int index = start;
+        while (index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "if".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "if", end);
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                int ifEnd = closingEnd < 0 ? closingStart : closingEnd + 1;
+                int insertionIndex = missingSetCommaInsertionIndex(body, tag.endIndex(), closingStart, ifEnd, end);
+                if (insertionIndex >= 0) {
+                    replacements.add(new TextReplacement(insertionIndex, insertionIndex, ","));
+                }
+                index = tag.endIndex();
+            } else {
+                index = tag.endIndex();
+            }
+        }
+    }
+
+    private int missingSetCommaInsertionIndex(String body, int ifBodyStart, int ifBodyEnd, int afterIfEnd, int scopeEnd) {
+        String ifBody = body.substring(ifBodyStart, ifBodyEnd);
+        if (!isSetAssignmentFragment(ifBody) || !hasFollowingSetAssignment(body, afterIfEnd, scopeEnd)) {
+            return -1;
+        }
+        int insertionIndex = trimTrailingWhitespaceIndex(body, ifBodyStart, ifBodyEnd);
+        if (insertionIndex <= ifBodyStart || body.charAt(insertionIndex - 1) == ',') {
+            return -1;
+        }
+        return insertionIndex;
+    }
+
+    private boolean hasFollowingSetAssignment(String body, int start, int end) {
+        int index = start;
+        while (index < end) {
+            index = skipWhitespaceAndXmlComments(body, index, end);
+            if (index >= end) {
+                return false;
+            }
+            char current = body.charAt(index);
+            if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                if (tag == null) {
+                    return false;
+                }
+                if (tag.closing()) {
+                    return false;
+                }
+                if (!tag.selfClosing() && "if".equalsIgnoreCase(tag.name())) {
+                    int closingStart = findClosingTag(body, tag.endIndex(), "if", end);
+                    return closingStart >= 0 && isSetAssignmentFragment(body.substring(tag.endIndex(), closingStart));
+                }
+                return false;
+            }
+            int nextTag = body.indexOf('<', index);
+            int textEnd = nextTag < 0 ? end : Math.min(nextTag, end);
+            String text = body.substring(index, textEnd);
+            if (text.isBlank()) {
+                index = textEnd;
+                continue;
+            }
+            return isSetAssignmentFragment(text);
+        }
+        return false;
+    }
+
+    private boolean isSetAssignmentFragment(String fragment) {
+        if (fragment == null || fragment.isBlank()) {
+            return false;
+        }
+        String stripped = fragment.stripLeading();
+        if (stripped.startsWith("<![CDATA[")) {
+            int cdataEnd = stripped.indexOf("]]>");
+            if (cdataEnd > "<![CDATA[".length()) {
+                stripped = stripped.substring("<![CDATA[".length(), cdataEnd).stripLeading();
+            }
+        }
+        return SET_ASSIGNMENT_START_PATTERN.matcher(stripped).find();
+    }
+
+    private int trimTrailingWhitespaceIndex(String value, int start, int end) {
+        int index = end;
+        while (index > start && Character.isWhitespace(value.charAt(index - 1))) {
+            index--;
+        }
+        return index;
+    }
+
+    private int skipWhitespaceAndXmlComments(String value, int start, int end) {
+        int index = start;
+        while (index < end) {
+            while (index < end && Character.isWhitespace(value.charAt(index))) {
+                index++;
+            }
+            if (index < end && value.startsWith("<!--", index)) {
+                int commentEnd = value.indexOf("-->", index + "<!--".length());
+                if (commentEnd < 0 || commentEnd + "-->".length() > end) {
+                    return end;
+                }
+                index = commentEnd + "-->".length();
+            } else {
+                return index;
+            }
+        }
+        return index;
     }
 
     private TextRewrite qualifyBarePropertyReferences(

@@ -955,6 +955,61 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateSetAddsMissingCommasBetweenConditionalAssignments() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.HouseMapper">
+                    <update id="batchUpdateExpirationOrEffDate" parameterType="java.util.List">
+                        update owner_house_house_extend_info
+                        <set>
+                            <foreach collection="list" item="record" separator=",">
+                                <if test="record.effectiveDate != null">
+                                    effective_date = #{record.effectiveDate, jdbcType=DATE}
+                                </if>
+                                <if test="record.expirationDate != null">
+                                    expiration_date = #{record.expirationDate, jdbcType=DATE}
+                                </if>
+                            </foreach>
+                        </set>
+                        where house_id in
+                        <foreach collection="list" item="record" open="(" close=")" separator=",">
+                            #{record.houseId}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/HouseMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/HouseMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/HouseMapper.xml"));
+        assertThat(rewritten)
+                .contains("effective_date = #{record.effectiveDate, jdbcType=DATE},")
+                .contains("expiration_date = #{record.expirationDate, jdbcType=DATE}")
+                .doesNotContain("expiration_date = #{record.expirationDate, jdbcType=DATE},");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicBatchInsertAddsValuesAndRemovesForeachTrailingComma() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
