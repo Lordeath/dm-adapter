@@ -1407,6 +1407,9 @@ class DmSqlValidationTestGenerator {
                     int count = Math.min(columns.size(), foreachValues.expressions.size());
                     for (int i = 0; i < count; i++) {
                         String expression = foreachValues.expressions.get(i);
+                        if (expression == null || isBlank(expression)) {
+                            continue;
+                        }
                         List<String> parts = pathParts(expression);
                         if (parts.size() > 1 && foreachValues.item.equals(parts.get(0))) {
                             metadata.addCollectionDefaultColumnReference(
@@ -1455,20 +1458,44 @@ class DmSqlValidationTestGenerator {
                         if (isBlank(collection) || isBlank(item) || text == null || isBlank(text)) {
                             continue;
                         }
-                        List<String> expressions = new ArrayList<>();
-                        Matcher placeholder = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)(?:[^}]*)}").matcher(text);
-                        while (placeholder.find()) {
-                            String expression = placeholder.group(1);
-                            List<String> parts = pathParts(expression);
-                            if (parts.size() > 1 && item.equals(parts.get(0))) {
-                                expressions.add(expression);
-                            }
+                        List<String> values = structuredInsertValueExpressions(text);
+                        if (values.isEmpty()) {
+                            continue;
                         }
-                        if (!expressions.isEmpty()) {
+                        List<String> expressions = new ArrayList<>();
+                        boolean foundExpression = false;
+                        for (String value : values) {
+                            String matchedExpression = null;
+                            Matcher placeholder = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)(?:[^}]*)}").matcher(value);
+                            if (placeholder.find()) {
+                                String expression = placeholder.group(1);
+                                List<String> parts = pathParts(expression);
+                                if (parts.size() > 1 && item.equals(parts.get(0))) {
+                                    matchedExpression = expression;
+                                    foundExpression = true;
+                                }
+                            }
+                            expressions.add(matchedExpression);
+                        }
+                        if (foundExpression) {
                             return new InsertForeachValues(collection, item, expressions);
                         }
                     }
                     return null;
+                }
+
+                private List<String> structuredInsertValueExpressions(String text) {
+                    if (text == null || isBlank(text)) {
+                        return listOf();
+                    }
+                    String valueText = text.trim();
+                    if (valueText.startsWith("(")) {
+                        int close = matchingParen(valueText, 0);
+                        if (close == valueText.length() - 1) {
+                            valueText = valueText.substring(1, close);
+                        }
+                    }
+                    return splitTopLevelComma(valueText);
                 }
 
                 private void addPlaceholderColumnReference(
