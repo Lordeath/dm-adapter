@@ -428,6 +428,7 @@ class DmAdapterCliTest {
                 .contains("addStructuredInsertColumnReferences")
                 .contains("structuredInsertColumns")
                 .contains("structuredInsertForeachValues")
+                .contains("structuredInsertValueExpressions")
                 .contains("InsertForeachValues")
                 .contains("addUpdateColumnReferences")
                 .contains("metadata.addDefaultColumnReference")
