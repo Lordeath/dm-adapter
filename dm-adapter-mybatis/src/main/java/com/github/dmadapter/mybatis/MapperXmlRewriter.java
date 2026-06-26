@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -551,6 +552,11 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
+            String dynamicUpdateJoinWithSet = convertDynamicUpdateJoinWithSetClause(converted);
+            if (!dynamicUpdateJoinWithSet.equals(converted)) {
+                appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+                converted = dynamicUpdateJoinWithSet;
+            }
             String dynamicUpdateJoin = convertDynamicUpdateJoin(converted);
             if (!dynamicUpdateJoin.equals(converted)) {
                 appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
@@ -2008,6 +2014,162 @@ public class MapperXmlRewriter {
         return converted.toString();
     }
 
+    private String convertDynamicUpdateJoinWithSetClause(String body) {
+        int statementEnd = body.length();
+        while (statementEnd > 0 && Character.isWhitespace(body.charAt(statementEnd - 1))) {
+            statementEnd--;
+        }
+        String trailing = body.substring(statementEnd);
+        if (statementEnd > 0 && body.charAt(statementEnd - 1) == ';') {
+            statementEnd--;
+            trailing = body.substring(statementEnd);
+        }
+        String statement = body.substring(0, statementEnd);
+        int updateIndex = leadingWhitespaceLength(statement);
+        if (!isKeywordAt(statement, updateIndex, "UPDATE")) {
+            return body;
+        }
+        int joinIndex = findTopLevelKeywordSkippingXml(statement, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return body;
+        }
+        int setIndex = findTopLevelKeywordSkippingXml(statement, "SET", joinIndex + "JOIN".length());
+        if (setIndex < 0) {
+            return body;
+        }
+        int whereIndex = findTopLevelKeywordSkippingXml(statement, "WHERE", setIndex + "SET".length());
+        if (whereIndex < 0) {
+            return body;
+        }
+
+        int joinTypeStart = dynamicJoinTypeStart(statement, joinIndex);
+        String leading = statement.substring(0, updateIndex);
+        String target = statement.substring(updateIndex + "UPDATE".length(), joinTypeStart).strip();
+        String joinSourceWithCondition = statement.substring(joinIndex + "JOIN".length(), setIndex).strip();
+        String setClause = statement.substring(setIndex + "SET".length(), whereIndex).strip();
+        String whereClause = statement.substring(whereIndex + "WHERE".length()).strip();
+        DynamicJoinSource splitJoin = splitDynamicJoinSource(joinSourceWithCondition);
+        if (target.isBlank()
+                || splitJoin == null
+                || splitJoin.sourceSql().isBlank()
+                || splitJoin.conditionSql().isBlank()
+                || setClause.isBlank()
+                || whereClause.isBlank()
+                || containsJoinKeyword(target)
+                || containsTopLevelJoinKeyword(splitJoin.sourceSql())
+                || containsTopLevelJoinKeyword(splitJoin.conditionSql())
+                || findTopLevelKeywordSkippingXml(setClause, "SET", 0) >= 0) {
+            return body;
+        }
+
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        StringBuilder converted = new StringBuilder(body.length() + 64);
+        converted.append(leading)
+                .append("update ")
+                .append(target)
+                .append(" set ")
+                .append(setClause)
+                .append("\n")
+                .append(baseIndent)
+                .append("from ")
+                .append(splitJoin.sourceSql())
+                .append("\n")
+                .append(baseIndent)
+                .append("where\n")
+                .append(childIndent)
+                .append(splitJoin.conditionSql())
+                .append("\n")
+                .append(childIndent)
+                .append("and ")
+                .append(whereClause)
+                .append(trailing);
+        return converted.toString();
+    }
+
+    private int leadingWhitespaceLength(String value) {
+        int index = 0;
+        while (index < value.length() && Character.isWhitespace(value.charAt(index))) {
+            index++;
+        }
+        return index;
+    }
+
+    private int dynamicJoinTypeStart(String value, int joinIndex) {
+        int cursor = joinIndex - 1;
+        while (cursor >= 0 && Character.isWhitespace(value.charAt(cursor))) {
+            cursor--;
+        }
+        int end = cursor + 1;
+        while (cursor >= 0 && isIdentifierPart(value.charAt(cursor))) {
+            cursor--;
+        }
+        int start = cursor + 1;
+        if (start >= end) {
+            return joinIndex;
+        }
+        String word = value.substring(start, end).toUpperCase(Locale.ROOT);
+        if (!Set.of("INNER", "LEFT", "RIGHT", "FULL", "CROSS").contains(word)) {
+            return joinIndex;
+        }
+        int outerCursor = start - 1;
+        while (outerCursor >= 0 && Character.isWhitespace(value.charAt(outerCursor))) {
+            outerCursor--;
+        }
+        int outerEnd = outerCursor + 1;
+        while (outerCursor >= 0 && isIdentifierPart(value.charAt(outerCursor))) {
+            outerCursor--;
+        }
+        int outerStart = outerCursor + 1;
+        if (outerStart < outerEnd && "OUTER".equalsIgnoreCase(value.substring(outerStart, outerEnd))) {
+            return outerStart;
+        }
+        return start;
+    }
+
+    private DynamicJoinSource splitDynamicJoinSource(String joinSource) {
+        int onIndex = findTopLevelKeywordSkippingXml(joinSource, "ON", 0);
+        if (onIndex < 0) {
+            return null;
+        }
+        String source = joinSource.substring(0, onIndex).strip();
+        String condition = joinSource.substring(onIndex + "ON".length()).strip();
+        return new DynamicJoinSource(source, condition);
+    }
+
+    private boolean containsTopLevelJoinKeyword(String value) {
+        return findTopLevelKeywordSkippingXml(value, "JOIN", 0) >= 0;
+    }
+
+    private int findTopLevelKeywordSkippingXml(String value, String keyword, int start) {
+        int depth = 0;
+        int index = Math.max(0, start);
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(value, index, current);
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (current == '<') {
+                int tagEnd = findXmlTagEnd(value, index);
+                index = tagEnd < 0 ? value.length() : tagEnd + 1;
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == 0 && isKeywordAt(value, index, keyword)) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
     private boolean containsJoinKeyword(String value) {
         return Pattern.compile("\\bjoin\\b", Pattern.CASE_INSENSITIVE).matcher(value).find();
     }
@@ -2336,6 +2498,9 @@ public class MapperXmlRewriter {
                     false
             );
         }
+        if (isUpdateJoinWithoutWhere(text)) {
+            return new TextSegmentConversion(text, List.of(), List.of(), false);
+        }
         SqlConversionResult conversionResult =
                 sqlConverter.convert(text, rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(text)));
         List<String> manualReviewReasons = conversionResult.manualReviewRequired()
@@ -2391,8 +2556,16 @@ public class MapperXmlRewriter {
     }
 
     private boolean isUpdateJoinWithoutWhere(String text) {
-        Matcher matcher = Pattern.compile("(?is)^\\s*update\\b[\\s\\S]*\\bjoin\\b[\\s\\S]*\\bset\\b").matcher(text);
-        return matcher.find() && !Pattern.compile("(?is)\\bwhere\\b").matcher(text).find();
+        int updateIndex = leadingWhitespaceLength(text);
+        if (!isKeywordAt(text, updateIndex, "UPDATE")) {
+            return false;
+        }
+        int joinIndex = findTopLevelKeywordSkippingXml(text, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return false;
+        }
+        int setIndex = findTopLevelKeywordSkippingXml(text, "SET", joinIndex + "JOIN".length());
+        return setIndex >= 0 && findTopLevelKeywordSkippingXml(text, "WHERE", setIndex + "SET".length()) < 0;
     }
 
     private void addAppliedRules(List<String> appliedRules, List<String> rulesToAdd) {
@@ -2522,6 +2695,9 @@ public class MapperXmlRewriter {
     }
 
     private record TextReplacement(int startIndex, int endIndex, String replacement) {
+    }
+
+    private record DynamicJoinSource(String sourceSql, String conditionSql) {
     }
 
     private record AggregateAlias(String expression, String alias) {
