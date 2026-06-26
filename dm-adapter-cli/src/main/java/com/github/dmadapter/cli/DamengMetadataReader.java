@@ -53,6 +53,42 @@ class DamengMetadataReader {
         }
     }
 
+    Map<String, Map<String, String>> readColumnTypes(
+            DmValidationEnvironment environment,
+            Optional<String> configuredSchema,
+            Collection<String> tableNames
+    ) {
+        if (tableNames == null || tableNames.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            Class.forName("dm.jdbc.driver.DmDriver");
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("Dameng JDBC driver was not found on the CLI classpath.", e);
+        }
+
+        try (Connection connection = DriverManager.getConnection(
+                environment.jdbcUrl(),
+                environment.username(),
+                environment.password()
+        )) {
+            List<String> schemaCandidates = schemaCandidates(connection, environment, configuredSchema);
+            DatabaseMetaData databaseMetaData = connection.getMetaData();
+            Map<String, Map<String, String>> metadata = new LinkedHashMap<>();
+            for (String tableName : tableNames) {
+                QualifiedTable qualifiedTable = QualifiedTable.parse(tableName);
+                List<String> tableSchemas = qualifiedTable.schema().isBlank()
+                        ? schemaCandidates
+                        : List.of(qualifiedTable.schema());
+                Map<String, String> columns = readColumnTypes(databaseMetaData, tableSchemas, qualifiedTable.table());
+                metadata.put(normalizeTableName(tableName), columns);
+            }
+            return metadata;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read Dameng column metadata: " + e.getMessage(), e);
+        }
+    }
+
     private List<String> schemaCandidates(
             Connection connection,
             DmValidationEnvironment environment,
@@ -149,6 +185,38 @@ class DamengMetadataReader {
         primaryKey.ifPresent(constraints::add);
         constraints.addAll(uniqueKeys(databaseMetaData, schema, tableName, primaryKey));
         return new TableKeyMetadata(tableName, constraints);
+    }
+
+    private Map<String, String> readColumnTypes(
+            DatabaseMetaData databaseMetaData,
+            List<String> schemaCandidates,
+            String tableName
+    ) throws SQLException {
+        for (String schema : schemaCandidates.isEmpty() ? List.of("") : schemaCandidates) {
+            for (String tableVariant : nameVariants(tableName)) {
+                Map<String, String> columns = readColumnTypes(databaseMetaData, blankToNull(schema), tableVariant);
+                if (!columns.isEmpty()) {
+                    return columns;
+                }
+            }
+        }
+        return Map.of();
+    }
+
+    private Map<String, String> readColumnTypes(DatabaseMetaData databaseMetaData, String schema, String tableName)
+            throws SQLException {
+        Map<String, String> columns = new LinkedHashMap<>();
+        try (ResultSet resultSet = databaseMetaData.getColumns(null, schema, tableName, "%")) {
+            while (resultSet.next()) {
+                String columnName = resultSet.getString("COLUMN_NAME");
+                String typeName = resultSet.getString("TYPE_NAME");
+                if (columnName == null || columnName.isBlank() || typeName == null || typeName.isBlank()) {
+                    continue;
+                }
+                columns.putIfAbsent(normalizeIdentifier(columnName), typeName.toUpperCase(Locale.ROOT));
+            }
+        }
+        return columns;
     }
 
     private Optional<TableConstraint> primaryKey(DatabaseMetaData databaseMetaData, String schema, String tableName)
