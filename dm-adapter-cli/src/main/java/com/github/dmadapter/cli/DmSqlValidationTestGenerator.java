@@ -1469,7 +1469,7 @@ class DmSqlValidationTestGenerator {
                         return "CODE";
                     }
                     if (isDateLikeParameterName(normalized)) {
-                        return "2024-01-01 00:00:00";
+                        return java.sql.Timestamp.valueOf("2024-01-01 00:00:00");
                     }
                     return defaultString(valueName);
                 }
@@ -1896,7 +1896,17 @@ class DmSqlValidationTestGenerator {
                     }
                     Object[] args = new Object[parameterTypes.length];
                     for (int i = 0; i < parameterTypes.length; i++) {
-                        ValueResult value = convertConfiguredValue(configuredArgs.args.get(i), parameterTypes[i], mapperMethod.method.getGenericParameterTypes()[i]);
+                        String parameterName = parameterName(mapperMethod.method, i);
+                        String effectiveParameterName = mapperMethod.statement == null
+                                ? parameterName
+                                : mapperMethod.statement.parameterExpressionName(i, parameterName);
+                        ValueResult value = convertConfiguredValue(
+                                configuredArgs.args.get(i),
+                                parameterTypes[i],
+                                mapperMethod.method.getGenericParameterTypes()[i],
+                                mapperMethod.statement,
+                                effectiveParameterName
+                        );
                         if (!value.resolved) {
                             return ParameterResolution.unresolved("configured", value.message);
                         }
@@ -1912,7 +1922,13 @@ class DmSqlValidationTestGenerator {
                     if (parameterTypes.length == 1) {
                         String parameterName = parameterName(mapperMethod.method, 0);
                         if (configuredArgs.params.containsKey(parameterName)) {
-                            ValueResult value = convertConfiguredValue(configuredArgs.params.get(parameterName), parameterTypes[0], genericTypes[0]);
+                            ValueResult value = convertConfiguredValue(
+                                    configuredArgs.params.get(parameterName),
+                                    parameterTypes[0],
+                                    genericTypes[0],
+                                    mapperMethod.statement,
+                                    parameterName
+                            );
                             return value.resolved
                                     ? ParameterResolution.resolved("configured", new Object[] { value.value })
                                     : ParameterResolution.unresolved("configured", value.message);
@@ -1933,10 +1949,19 @@ class DmSqlValidationTestGenerator {
                     }
                     for (int i = 0; i < parameterTypes.length; i++) {
                         String parameterName = parameterName(mapperMethod.method, i);
+                        String effectiveParameterName = mapperMethod.statement == null
+                                ? parameterName
+                                : mapperMethod.statement.parameterExpressionName(i, parameterName);
                         Object rawValue = configuredArgs.valueFor(parameterName, i);
                         ValueResult value = rawValue == MethodArgumentConfig.MISSING
-                                ? defaultValue(parameterName, parameterTypes[i], genericTypes[i], 0, mapperMethod.statement)
-                                : convertConfiguredValue(rawValue, parameterTypes[i], genericTypes[i]);
+                                ? defaultValue(effectiveParameterName, parameterTypes[i], genericTypes[i], 0, mapperMethod.statement)
+                                : convertConfiguredValue(
+                                        rawValue,
+                                        parameterTypes[i],
+                                        genericTypes[i],
+                                        mapperMethod.statement,
+                                        effectiveParameterName
+                                );
                         if (!value.resolved) {
                             return ParameterResolution.unresolved("configured", value.message);
                         }
@@ -2043,7 +2068,16 @@ class DmSqlValidationTestGenerator {
                         return ParameterResolution.resolved("configured", new Object[] { namedParameters });
                     }
                     if (configuredArgs != null && configuredArgs.args.size() == 1) {
-                        ValueResult value = convertConfiguredValue(configuredArgs.args.get(0), mapperMethod.parameterType, mapperMethod.parameterType);
+                        String parameterName = mapperMethod.statement == null
+                                ? "arg0"
+                                : mapperMethod.statement.parameterExpressionName(0, "arg0");
+                        ValueResult value = convertConfiguredValue(
+                                configuredArgs.args.get(0),
+                                mapperMethod.parameterType,
+                                mapperMethod.parameterType,
+                                mapperMethod.statement,
+                                parameterName
+                        );
                         return value.resolved
                                 ? ParameterResolution.resolved("configured", new Object[] { value.value })
                                 : ParameterResolution.unresolved("configured", value.message);
@@ -2377,6 +2411,17 @@ class DmSqlValidationTestGenerator {
 
                 @SuppressWarnings("unchecked")
                 private ValueResult convertConfiguredValue(Object rawValue, Class<?> targetType, Type genericType) {
+                    return convertConfiguredValue(rawValue, targetType, genericType, null, "");
+                }
+
+                @SuppressWarnings("unchecked")
+                private ValueResult convertConfiguredValue(
+                        Object rawValue,
+                        Class<?> targetType,
+                        Type genericType,
+                        MapperStatement statement,
+                        String valueName
+                ) {
                     if (targetType == null || Object.class.equals(targetType)) {
                         return ValueResult.resolved(rawValue);
                     }
@@ -2390,7 +2435,12 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(rawValue);
                     }
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
-                        return ValueResult.resolved(mapParameterValue(targetType, new LinkedHashMap<>((Map<String, Object>) rawValue)));
+                        Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
+                        Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
+                        if (!defaultValue.isEmpty()) {
+                            configuredValue = mergeConfiguredCollectionElementMap(defaultValue, configuredValue);
+                        }
+                        return ValueResult.resolved(mapParameterValue(targetType, configuredValue));
                     }
                     if (Collection.class.isAssignableFrom(targetType) && rawValue instanceof Collection) {
                         Type nestedType = firstGenericArgument(genericType);
@@ -2399,12 +2449,25 @@ class DmSqlValidationTestGenerator {
                         Collection<Object> converted = Set.class.isAssignableFrom(targetType)
                                 ? new LinkedHashSet<>()
                                 : new ArrayList<>();
+                        Map<String, Object> defaultElement = configuredCollectionElementDefault(
+                                valueName,
+                                targetType,
+                                genericType,
+                                statement
+                        );
                         for (Object item : rawCollection) {
-                            if (item instanceof Map<?, ?> && !Map.class.isAssignableFrom(nestedClass)) {
-                                converted.add(new LinkedHashMap<>((Map<String, Object>) item));
+                            if (item instanceof Map<?, ?>) {
+                                Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
+                                if (!defaultElement.isEmpty()) {
+                                    configuredItem = mergeConfiguredCollectionElementMap(
+                                            new LinkedHashMap<>(defaultElement),
+                                            configuredItem
+                                    );
+                                }
+                                converted.add(configuredItem);
                                 continue;
                             }
-                            ValueResult value = convertConfiguredValue(item, nestedClass, nestedType);
+                            ValueResult value = convertConfiguredValue(item, nestedClass, nestedType, statement, valueName);
                             if (!value.resolved) {
                                 return value;
                             }
@@ -2419,7 +2482,7 @@ class DmSqlValidationTestGenerator {
                         Object array = Array.newInstance(componentClass, rawCollection.size());
                         int index = 0;
                         for (Object item : rawCollection) {
-                            ValueResult value = convertConfiguredValue(item, componentClass, componentType);
+                            ValueResult value = convertConfiguredValue(item, componentClass, componentType, statement, valueName);
                             if (!value.resolved) {
                                 return value;
                             }
@@ -2428,6 +2491,170 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(array);
                     }
                     return convertScalar(configuredScalarText(rawValue), targetType, genericType);
+                }
+
+                @SuppressWarnings("unchecked")
+                private Map<String, Object> configuredCollectionElementDefault(
+                        String collectionName,
+                        Class<?> targetType,
+                        Type genericType,
+                        MapperStatement statement
+                ) {
+                    Map<String, Object> value = typedCollectionElementDefault(collectionName, statement);
+                    if (!value.isEmpty()) {
+                        return new LinkedHashMap<>(value);
+                    }
+                    ValueResult defaultCollection = defaultValue(collectionName, targetType, genericType, 0, statement);
+                    if (!defaultCollection.resolved || !(defaultCollection.value instanceof Collection)) {
+                        return emptyMap();
+                    }
+                    Collection<?> values = (Collection<?>) defaultCollection.value;
+                    for (Object item : values) {
+                        if (item instanceof Map<?, ?>) {
+                            return new LinkedHashMap<>((Map<String, Object>) item);
+                        }
+                    }
+                    return emptyMap();
+                }
+
+                @SuppressWarnings("unchecked")
+                private Map<String, Object> mergeConfiguredCollectionElementMap(
+                        Map<String, Object> defaultValue,
+                        Map<String, Object> configuredValue
+                ) {
+                    Map<String, Object> merged = new LinkedHashMap<>(defaultValue);
+                    if (configuredValue == null || configuredValue.isEmpty()) {
+                        return merged;
+                    }
+                    for (Map.Entry<String, Object> entry : configuredValue.entrySet()) {
+                        Object existing = merged.get(entry.getKey());
+                        Object configured = entry.getValue();
+                        if (existing instanceof Map && configured instanceof Map) {
+                            merged.put(
+                                    entry.getKey(),
+                                    mergeConfiguredCollectionElementMap(
+                                            new LinkedHashMap<>((Map<String, Object>) existing),
+                                            new LinkedHashMap<>((Map<String, Object>) configured)
+                                    )
+                            );
+                            continue;
+                        }
+                        Object coerced = coerceConfiguredValueToDefaultType(configured, existing);
+                        if (coerced != configured || shouldKeepConfiguredValue(entry.getKey(), configured, existing)) {
+                            merged.put(entry.getKey(), coerced);
+                        }
+                    }
+                    return merged;
+                }
+
+                private boolean shouldKeepConfiguredValue(String valueName, Object configuredValue, Object defaultValue) {
+                    if (defaultValue == null) {
+                        return true;
+                    }
+                    if (!isGeneratedPlaceholderValue(valueName, configuredValue)) {
+                        return true;
+                    }
+                    if (!(defaultValue instanceof String)) {
+                        return false;
+                    }
+                    String normalized = normalizeName(valueName);
+                    String defaultText = ((String) defaultValue).trim();
+                    return isGeneratedPlaceholderText(defaultText)
+                            && !isNumericTextParameterName(normalized)
+                            && !isCompactEnumStringName(normalized)
+                            && !isDateLikeParameterName(normalized);
+                }
+
+                private boolean isGeneratedPlaceholderValue(String valueName, Object value) {
+                    if (!(value instanceof String)) {
+                        return false;
+                    }
+                    String text = ((String) value).trim();
+                    if (isGeneratedPlaceholderText(text)) {
+                        return true;
+                    }
+                    String normalized = normalizeName(valueName);
+                    return isDateLikeParameterName(normalized) && configuredInstant(text) != null;
+                }
+
+                private boolean isGeneratedPlaceholderText(String value) {
+                    String text = stripSqlLiteralQuotes(value == null ? "" : value.trim());
+                    return "test".equalsIgnoreCase(text)
+                            || "CODE".equalsIgnoreCase(text)
+                            || "2024-01-01".equals(text)
+                            || "2024-01-01 00:00:00".equals(text)
+                            || "2024-01-01 00:00:00.0".equals(text);
+                }
+
+                private String stripSqlLiteralQuotes(String value) {
+                    if (value == null) {
+                        return "";
+                    }
+                    String text = value.trim();
+                    if (text.length() >= 2
+                            && ((text.startsWith("'") && text.endsWith("'"))
+                            || (text.startsWith("\\\"") && text.endsWith("\\\"")))) {
+                        return text.substring(1, text.length() - 1);
+                    }
+                    return text;
+                }
+
+                private Object coerceConfiguredValueToDefaultType(Object configuredValue, Object defaultValue) {
+                    if (!(configuredValue instanceof String) || defaultValue == null) {
+                        return configuredValue;
+                    }
+                    String text = stripSqlLiteralQuotes((String) configuredValue);
+                    try {
+                        if (defaultValue instanceof BigDecimal) {
+                            return new BigDecimal(text);
+                        }
+                        if (defaultValue instanceof BigInteger) {
+                            return new BigInteger(text);
+                        }
+                        if (defaultValue instanceof Integer) {
+                            return Integer.valueOf(text);
+                        }
+                        if (defaultValue instanceof Long) {
+                            return Long.valueOf(text);
+                        }
+                        if (defaultValue instanceof Short) {
+                            return Short.valueOf(text);
+                        }
+                        if (defaultValue instanceof Byte) {
+                            return Byte.valueOf(text);
+                        }
+                        if (defaultValue instanceof Double) {
+                            return Double.valueOf(text);
+                        }
+                        if (defaultValue instanceof Float) {
+                            return Float.valueOf(text);
+                        }
+                        if (defaultValue instanceof Boolean) {
+                            return Boolean.valueOf(text);
+                        }
+                        if (defaultValue instanceof java.sql.Timestamp) {
+                            Instant instant = configuredInstant(text);
+                            return instant == null ? configuredValue : java.sql.Timestamp.from(instant);
+                        }
+                        if (defaultValue instanceof java.sql.Date) {
+                            Instant instant = configuredInstant(text);
+                            return instant == null
+                                    ? configuredValue
+                                    : java.sql.Date.valueOf(LocalDateTime.ofInstant(instant, ZoneId.systemDefault()).toLocalDate());
+                        }
+                        if (defaultValue instanceof java.sql.Time) {
+                            Instant instant = configuredInstant(text);
+                            return instant == null
+                                    ? configuredValue
+                                    : java.sql.Time.valueOf(LocalDateTime.ofInstant(instant, ZoneId.systemDefault()).toLocalTime());
+                        }
+                        if (defaultValue instanceof Date) {
+                            Instant instant = configuredInstant(text);
+                            return instant == null ? configuredValue : Date.from(instant);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                    return configuredValue;
                 }
 
                 private String configuredScalarText(Object rawValue) {
@@ -3158,7 +3385,7 @@ class DmSqlValidationTestGenerator {
                     if (normalizedType.contains("DATE")
                             || normalizedType.contains("TIME")
                             || normalizedType.contains("TIMESTAMP")) {
-                        return "2024-01-01 00:00:00";
+                        return java.sql.Timestamp.valueOf("2024-01-01 00:00:00");
                     }
                     return defaultCollectionElement(collectionName);
                 }
@@ -3233,7 +3460,7 @@ class DmSqlValidationTestGenerator {
                     if (normalizedType.contains("DATE")
                             || normalizedType.contains("TIME")
                             || normalizedType.contains("TIMESTAMP")) {
-                        return "2024-01-01 00:00:00";
+                        return java.sql.Timestamp.valueOf("2024-01-01 00:00:00");
                     }
                     return defaultNameBasedString(valueName);
                 }
@@ -3569,7 +3796,7 @@ class DmSqlValidationTestGenerator {
                         case "TIME":
                         case "TIMESTAMP":
                         case "DATETIME":
-                            return "2024-01-01 00:00:00";
+                            return java.sql.Timestamp.valueOf("2024-01-01 00:00:00");
                         default:
                             return defaultString(valueName);
                     }
