@@ -1714,6 +1714,7 @@ class DmSqlValidationTestGenerator {
                             || "ischarge".equals(normalizedName)
                             || "isrelactive".equals(normalizedName)
                             || "hassynctowx".equals(normalizedName)
+                            || "syncpwd".equals(normalizedName)
                             || "supportmobile".equals(normalizedName)
                             || "notifytype".equals(normalizedName)
                             || "encrypt".equals(normalizedName)
@@ -2802,12 +2803,28 @@ class DmSqlValidationTestGenerator {
                             );
                             continue;
                         }
+                        if (existing == null) {
+                            existing = inferredConfiguredPlaceholderDefault(entry.getKey(), configured);
+                            if (existing != null) {
+                                merged.put(entry.getKey(), existing);
+                            }
+                        }
                         Object coerced = coerceConfiguredValueToDefaultType(configured, existing);
                         if (coerced != configured || shouldKeepConfiguredValue(entry.getKey(), configured, existing)) {
                             merged.put(entry.getKey(), coerced);
                         }
                     }
                     return merged;
+                }
+
+                private Object inferredConfiguredPlaceholderDefault(String valueName, Object configuredValue) {
+                    if (isGeneratedPlaceholderValue(valueName, configuredValue)) {
+                        return defaultNameBasedTypedValue(valueName);
+                    }
+                    if (configuredValue instanceof Number && normalizeName(valueName).contains("code")) {
+                        return String.valueOf(configuredValue);
+                    }
+                    return null;
                 }
 
                 private boolean shouldKeepConfiguredValue(String valueName, Object configuredValue, Object defaultValue) {
@@ -4142,6 +4159,8 @@ class DmSqlValidationTestGenerator {
                             || "time".equals(normalizedName)
                             || normalizedName.endsWith("date")
                             || normalizedName.endsWith("datetime")
+                            || normalizedName.endsWith("timestamp")
+                            || (normalizedName.endsWith("time") && !normalizedName.endsWith("parttime"))
                             || "starttime".equals(normalizedName)
                             || "endtime".equals(normalizedName)
                             || "begintime".equals(normalizedName)
@@ -4178,6 +4197,7 @@ class DmSqlValidationTestGenerator {
                             || normalizedName.endsWith("flag")
                             || normalizedName.endsWith("type")
                             || normalizedName.endsWith("sex")
+                            || "syncpwd".equals(normalizedName)
                             || normalizedName.endsWith("disable")
                             || normalizedName.endsWith("disabled")
                             || normalizedName.startsWith("is");
