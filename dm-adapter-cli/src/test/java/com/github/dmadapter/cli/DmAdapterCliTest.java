@@ -577,6 +577,7 @@ class DmAdapterCliTest {
                 .contains("DAMENG_KEYWORD_TABLE_ALIAS")
                 .contains("hasGeneratedDynamicIdentifierPlaceholder")
                 .contains("hasMissingDynamicIdentifierIssue")
+                .contains("if (hasMissingDynamicIdentifierIssue(message))")
                 .contains("hasBrokenDynamicSqlShape")
                 .contains("isSchemaObjectFailure")
                 .contains("Type handler was null")

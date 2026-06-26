@@ -39,6 +39,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_NOT_FIND_IN_SET_RULE = "MYSQL_NOT_FIND_IN_SET_TO_EQUALS_ZERO";
     public static final String MYSQL_STR_TO_DATE_YEARMONTH_RULE = "MYSQL_STR_TO_DATE_YEARMONTH_TO_TO_DATE";
     public static final String MYSQL_PERIOD_DIFF_YEARMONTH_RULE = "MYSQL_PERIOD_DIFF_YEARMONTH_TO_DATEDIFF";
+    public static final String MYSQL_DATEDIFF_2ARG_RULE = "MYSQL_DATEDIFF_2ARG_TO_DM_DATEDIFF";
     public static final String MYSQL_COUNT_CONDITION_OR_NULL_RULE = "MYSQL_COUNT_CONDITION_OR_NULL_TO_CASE";
     public static final String MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE = "MYSQL_COUNT_DISTINCT_IF_TO_CASE";
     public static final String MYSQL_NOT_ISNULL_RULE = "MYSQL_NOT_ISNULL_TO_CASE";
@@ -314,6 +315,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (periodDiffYearMonthConversion.changed()) {
             converted = periodDiffYearMonthConversion.convertedSql();
             rules.add(MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
+        }
+
+        GenericConversion dateDiff2ArgConversion = convertDateDiff2Arg(converted);
+        if (dateDiff2ArgConversion.changed()) {
+            converted = dateDiff2ArgConversion.convertedSql();
+            rules.add(MYSQL_DATEDIFF_2ARG_RULE);
         }
 
         GenericConversion unsignedCastConversion = convertUnsignedCasts(converted);
@@ -1282,12 +1289,71 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String trimmed = expression.trim();
         int start = leadingWhitespaceLength(trimmed);
         FunctionCall extractCall = readFunctionCall(trimmed, start, "EXTRACT");
-        if (extractCall == null || skipWhitespace(trimmed, extractCall.endIndex()) != trimmed.length()) {
+        if (extractCall != null && skipWhitespace(trimmed, extractCall.endIndex()) == trimmed.length()) {
+            Matcher matcher = Pattern.compile("(?is)^\\s*YEAR_MONTH\\s+FROM\\s+(.+?)\\s*$")
+                    .matcher(extractCall.body());
+            if (matcher.matches()) {
+                return matcher.group(1).trim();
+            }
+        }
+        FunctionCall dateFormatCall = readFunctionCall(trimmed, start, "DATE_FORMAT");
+        if (dateFormatCall == null || skipWhitespace(trimmed, dateFormatCall.endIndex()) != trimmed.length()) {
             return null;
         }
-        Matcher matcher = Pattern.compile("(?is)^\\s*YEAR_MONTH\\s+FROM\\s+(.+?)\\s*$")
-                .matcher(extractCall.body());
-        return matcher.matches() ? matcher.group(1).trim() : null;
+        List<TopLevelArgument> arguments = splitTopLevelArguments(dateFormatCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String format = normalizedStringLiteral(arguments.get(1).text());
+        return "'%Y%m'".equalsIgnoreCase(format) ? arguments.get(0).text().trim() : null;
+    }
+
+    private GenericConversion convertDateDiff2Arg(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "DATEDIFF")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "DATEDIFF");
+                String replacement = functionCall == null ? null : rewriteDateDiff2Arg(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteDateDiff2Arg(FunctionCall dateDiffCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(dateDiffCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String left = arguments.get(0).text().trim();
+        String right = arguments.get(1).text().trim();
+        if (left.isBlank() || right.isBlank()) {
+            return null;
+        }
+        return "DATEDIFF(DAY, " + right + ", " + left + ")";
     }
 
     private boolean isNowExpression(String expression) {
