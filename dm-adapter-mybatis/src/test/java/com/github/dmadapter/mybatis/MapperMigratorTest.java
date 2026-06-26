@@ -1013,6 +1013,71 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicBatchInsertQualifiesBareListItemReferences() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ContractRoomMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert into ns_contract_room
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="contractId != null">
+                                ContractID,
+                            </if>
+                            <if test="houseId != null">
+                                houseId
+                            </if>
+                        </trim>
+                        values
+                        <foreach collection="list" item="item" index="index" separator=",">
+                            (
+                            <if test="contractId != null">
+                                #{contractId, jdbcType=VARCHAR},
+                            </if>
+                            <if test="houseId != null">
+                                #{houseId, jdbcType=BIGINT}
+                            </if>
+                            )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ContractRoomMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ContractRoomMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ContractRoomMapper.xml"));
+        assertThat(rewritten)
+                .contains("<if test=\"list != null and list.size() &gt; 0 and list[0].contractId != null\">")
+                .contains("<if test=\"list != null and list.size() &gt; 0 and list[0].houseId != null\">")
+                .contains("<if test=\"item.contractId != null\">")
+                .contains("#{item.contractId, jdbcType=VARCHAR}")
+                .contains("<if test=\"item.houseId != null\">")
+                .contains("#{item.houseId, jdbcType=BIGINT}")
+                .doesNotContain("<if test=\"contractId != null\">")
+                .doesNotContain("#{contractId, jdbcType=VARCHAR}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicTemporaryTableAsSelectInlinesScalarForeachItems() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
