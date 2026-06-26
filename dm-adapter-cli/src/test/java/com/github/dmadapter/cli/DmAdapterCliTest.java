@@ -678,6 +678,8 @@ class DmAdapterCliTest {
                 .contains("return dynamicIdentifierMetadata.hasCollectionElementColumnReferences(valueName)")
                 .contains("if (scalarCollectionParameter(valueName))")
                 .contains("if (references == null && scalarCollectionParameter(collectionName))")
+                .contains("return scalarConfiguredCollectionDefault(collectionName, statement)")
+                .contains("statement.collectionScalarDefault(collectionName)")
                 .contains("collectionLike ? collectionParameterIndex : -1")
                 .contains("collectionExpressionName(collectionIndex, fallbackName)")
                 .contains("return new ArrayList<>(namedCollectionParameterNames).get(index);");

@@ -2956,22 +2956,35 @@ class DmSqlValidationTestGenerator {
                 ) {
                     if (statement == null
                             || item == null
-                            || item.size() != 1
                             || !statement.scalarCollectionParameter(collectionName)) {
                         return MethodArgumentConfig.MISSING;
                     }
-                    Map.Entry<?, ?> entry = item.entrySet().iterator().next();
-                    String key = String.valueOf(entry.getKey());
-                    String normalizedKey = normalizeName(key);
-                    String normalizedCollection = normalizeName(collectionName);
-                    if ("item".equals(normalizedKey)
-                            || "value".equals(normalizedKey)
-                            || "val".equals(normalizedKey)
-                            || normalizedCollection.endsWith(normalizedKey)
-                            || normalizedKey.endsWith(normalizedCollection)) {
-                        return entry.getValue();
+                    if (item.size() == 1) {
+                        Map.Entry<?, ?> entry = item.entrySet().iterator().next();
+                        String key = String.valueOf(entry.getKey());
+                        String normalizedKey = normalizeName(key);
+                        String normalizedCollection = normalizeName(collectionName);
+                        if ("item".equals(normalizedKey)
+                                || "value".equals(normalizedKey)
+                                || "val".equals(normalizedKey)
+                                || normalizedCollection.endsWith(normalizedKey)
+                                || normalizedKey.endsWith(normalizedCollection)) {
+                            return entry.getValue();
+                        }
                     }
-                    return MethodArgumentConfig.MISSING;
+                    return scalarConfiguredCollectionDefault(collectionName, statement);
+                }
+
+                private Object scalarConfiguredCollectionDefault(String collectionName, MapperStatement statement) {
+                    Object scalarDefault = statement.collectionScalarDefault(collectionName);
+                    if (scalarDefault != null) {
+                        return scalarDefault;
+                    }
+                    String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
+                    if (!isBlank(columnType)) {
+                        return defaultCollectionElementForColumnType(collectionName, columnType);
+                    }
+                    return defaultCollectionElement(collectionName);
                 }
 
                 @SuppressWarnings("unchecked")
