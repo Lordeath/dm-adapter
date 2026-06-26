@@ -1104,6 +1104,11 @@ class DmSqlValidationTestGenerator {
                                 if (isMapForeachCollection(rawCollection, index, item, element)) {
                                     metadata.addMapCollectionParameterName(collection);
                                 }
+                            } else if (nestedCollection.directElement) {
+                                metadata.addCollectionScalarDefault(
+                                        nestedCollection.parentCollection,
+                                        defaultDirectNestedForeachCollectionValue(rawCollection, index, item, element, sqlContext)
+                                );
                             } else {
                                 metadata.addCollectionDefault(
                                         nestedCollection.parentCollection,
@@ -1117,7 +1122,14 @@ class DmSqlValidationTestGenerator {
                             }
                             if (item != null && !isBlank(item) && collection != null && !isBlank(collection)) {
                                 currentForeachCollections = new LinkedHashMap<>(foreachCollections);
-                                currentForeachCollections.put(item, collection);
+                                if (nestedCollection != null && nestedCollection.directElement) {
+                                    currentForeachCollections.put(
+                                            item,
+                                            directNestedForeachCollectionPath(nestedCollection.parentCollection)
+                                    );
+                                } else {
+                                    currentForeachCollections.put(item, collection);
+                                }
                             }
                         }
                         if ("if".equals(element.getTagName()) || "when".equals(element.getTagName())) {
@@ -1225,6 +1237,9 @@ class DmSqlValidationTestGenerator {
                     }
                     String collection = foreachCollections.get(parts.get(0));
                     if (collection != null) {
+                        if (isNestedForeachCollectionPath(collection)) {
+                            return;
+                        }
                         if (parts.size() == 1) {
                             metadata.addCollectionScalarDefault(
                                     collection,
@@ -1898,14 +1913,17 @@ class DmSqlValidationTestGenerator {
 
                 private NestedCollection nestedCollection(String collection, Map<String, String> foreachCollections) {
                     List<String> parts = pathParts(collection);
-                    if (parts.size() < 2 || foreachCollections == null) {
+                    if (parts.isEmpty() || foreachCollections == null) {
                         return null;
                     }
                     String parentCollection = foreachCollections.get(parts.get(0));
                     if (parentCollection == null || isBlank(parentCollection)) {
                         return null;
                     }
-                    return new NestedCollection(parentCollection, parts.get(1));
+                    if (parts.size() == 1) {
+                        return new NestedCollection(parentCollection, "", true);
+                    }
+                    return new NestedCollection(parentCollection, parts.get(1), false);
                 }
 
                 private String canonicalCollectionName(String collection) {
@@ -1943,6 +1961,67 @@ class DmSqlValidationTestGenerator {
                     return new ArrayList<>(listOf(defaultCollectionElement(collection)));
                 }
 
+                private Object defaultDirectNestedForeachCollectionValue(
+                        String collection,
+                        String index,
+                        String item,
+                        Element element,
+                        SqlStatementContext sqlContext
+                ) {
+                    String text = element == null || element.getTextContent() == null ? "" : element.getTextContent();
+                    Map<String, Object> elementDefault = new LinkedHashMap<>();
+                    Object scalarDefault = MethodArgumentConfig.MISSING;
+                    Matcher dynamicMatcher = Pattern.compile("\\\\$\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*}").matcher(text);
+                    while (dynamicMatcher.find()) {
+                        List<String> parts = pathParts(dynamicMatcher.group(1));
+                        if (parts.size() == 1 && parts.get(0).equals(item)) {
+                            scalarDefault = defaultDynamicSqlFragmentValue(
+                                    collection,
+                                    "",
+                                    text,
+                                    dynamicMatcher.start(),
+                                    dynamicMatcher.end(),
+                                    sqlContext
+                            );
+                        } else if (parts.size() > 1 && parts.get(0).equals(item)) {
+                            elementDefault.putIfAbsent(
+                                    parts.get(1),
+                                    defaultDynamicSqlFragmentValue(
+                                            collection,
+                                            parts.get(1),
+                                            text,
+                                            dynamicMatcher.start(),
+                                            dynamicMatcher.end(),
+                                            sqlContext
+                                    )
+                            );
+                        }
+                    }
+                    Matcher valueMatcher = Pattern.compile("#\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)}").matcher(text);
+                    while (valueMatcher.find()) {
+                        List<String> parts = pathParts(valueMatcher.group(1));
+                        if (parts.size() == 1 && parts.get(0).equals(item)) {
+                            scalarDefault = defaultValueForDirectParameter(collection, jdbcType(valueMatcher.group(2)));
+                        } else if (parts.size() > 1 && parts.get(0).equals(item)) {
+                            String propertyName = parts.get(1);
+                            String jdbcType = jdbcType(valueMatcher.group(2));
+                            elementDefault.putIfAbsent(
+                                    propertyName,
+                                    jdbcType == null || isBlank(jdbcType)
+                                            ? defaultString(propertyName)
+                                            : defaultValueForJdbcType(propertyName, jdbcType)
+                            );
+                        }
+                    }
+                    if (!elementDefault.isEmpty()) {
+                        return new ArrayList<>(listOf(elementDefault));
+                    }
+                    if (scalarDefault != MethodArgumentConfig.MISSING) {
+                        return new ArrayList<>(listOf(scalarDefault));
+                    }
+                    return defaultNestedForeachCollectionValue(collection, index, item, element);
+                }
+
                 private boolean isMapForeachCollection(String collection, String index, String item, Element element) {
                     String normalizedCollection = normalizeName(canonicalCollectionName(collection));
                     String normalizedItem = normalizeName(item);
@@ -1973,6 +2052,10 @@ class DmSqlValidationTestGenerator {
                 private boolean isNestedForeachCollectionPath(String collectionName) {
                     List<String> parts = pathParts(collectionName);
                     return parts.size() > 1 && isForeachItemName(parts.get(0));
+                }
+
+                private String directNestedForeachCollectionPath(String parentCollection) {
+                    return "item." + (parentCollection == null ? "" : parentCollection);
                 }
 
                 private boolean isForeachItemName(String valueName) {
@@ -3888,6 +3971,11 @@ class DmSqlValidationTestGenerator {
                             target.put(entry.getKey(), scalarCollection);
                             continue;
                         }
+                        Object nestedCollection = nestedConfiguredCollectionValue(existing, configuredValue);
+                        if (nestedCollection != MethodArgumentConfig.MISSING) {
+                            target.put(entry.getKey(), nestedCollection);
+                            continue;
+                        }
                         if (existing instanceof Map && configuredValue instanceof Map) {
                             mergeConfiguredParameterMap(
                                     (Map<String, Object>) existing,
@@ -3899,6 +3987,42 @@ class DmSqlValidationTestGenerator {
                         }
                         target.put(entry.getKey(), configuredValue);
                     }
+                }
+
+                private Object nestedConfiguredCollectionValue(Object existing, Object configuredValue) {
+                    if (!isCollectionOfCollections(existing)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    if (configuredValue instanceof Collection<?>) {
+                        Collection<?> configuredCollection = (Collection<?>) configuredValue;
+                        Object first = firstCollectionElement(configuredCollection);
+                        if (first == null || first instanceof Collection<?>) {
+                            return configuredValue;
+                        }
+                        return new ArrayList<>(listOf(configuredValue));
+                    }
+                    if (configuredValue instanceof Map<?, ?>) {
+                        return new ArrayList<>(listOf(new ArrayList<>(listOf(configuredValue))));
+                    }
+                    return MethodArgumentConfig.MISSING;
+                }
+
+                private boolean isCollectionOfCollections(Object value) {
+                    if (!(value instanceof Collection<?>)) {
+                        return false;
+                    }
+                    Object first = firstCollectionElement((Collection<?>) value);
+                    return first instanceof Collection<?>;
+                }
+
+                private Object firstCollectionElement(Collection<?> values) {
+                    if (values == null) {
+                        return null;
+                    }
+                    for (Object value : values) {
+                        return value;
+                    }
+                    return null;
                 }
 
                 @SuppressWarnings("unchecked")
@@ -8190,10 +8314,16 @@ class DmSqlValidationTestGenerator {
                 private static final class NestedCollection {
                     private final String parentCollection;
                     private final String propertyName;
+                    private final boolean directElement;
 
                     private NestedCollection(String parentCollection, String propertyName) {
+                        this(parentCollection, propertyName, false);
+                    }
+
+                    private NestedCollection(String parentCollection, String propertyName, boolean directElement) {
                         this.parentCollection = parentCollection;
                         this.propertyName = propertyName;
+                        this.directElement = directElement;
                     }
                 }
 
