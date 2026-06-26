@@ -591,6 +591,36 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsSubstringIndexGroupConcatFirstItemToRegexpSubstrListagg() {
+        SqlConversionResult result = converter.convert(
+                "select SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT rs.owner_id order by rs.house_owner_relationship_id desc , ','),',',1) from owner_house_relationship rs"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select REGEXP_SUBSTR(LISTAGG(DISTINCT rs.owner_id, ',') WITHIN GROUP (ORDER BY rs.house_owner_relationship_id desc), '[^,]+', 1, 1) from owner_house_relationship rs");
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE,
+                MySqlToDmSqlConverter.MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE
+        );
+    }
+
+    @Test
+    void convertsSubstringIndexNegativeOneToLastToken() {
+        SqlConversionResult result = converter.convert(
+                "select SUBSTRING_INDEX(ys_ets_code,'-',-1) as ysEtsCode from owner_house_base_info"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select REGEXP_SUBSTR(ys_ets_code, '[^\\-]+$', 1, 1) as ysEtsCode from owner_house_base_info");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE);
+    }
+
+    @Test
     void doesNotConvertGroupConcatWithMultipleTopLevelExpressions() {
         SqlConversionResult result = converter.convert("select GROUP_CONCAT(first_name, last_name) from user");
 

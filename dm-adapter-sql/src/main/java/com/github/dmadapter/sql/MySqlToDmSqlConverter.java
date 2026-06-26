@@ -33,6 +33,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
+    public static final String MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE =
+            "MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR";
     public static final String MYSQL_HAVING_AGGREGATE_ALIAS_RULE = "MYSQL_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYSQL_NOT_FIND_IN_SET_RULE = "MYSQL_NOT_FIND_IN_SET_TO_EQUALS_ZERO";
     public static final String MYSQL_STR_TO_DATE_YEARMONTH_RULE = "MYSQL_STR_TO_DATE_YEARMONTH_TO_TO_DATE";
@@ -428,6 +430,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (groupConcatConversion.changed()) {
             converted = groupConcatConversion.convertedSql();
             rules.add(MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+        }
+
+        GenericConversion substringIndexConversion = convertSubstringIndex(converted);
+        if (substringIndexConversion.changed()) {
+            converted = substringIndexConversion.convertedSql();
+            rules.add(MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE);
         }
 
         GenericConversion havingAggregateAliasConversion = convertHavingAggregateAliases(converted);
@@ -3841,6 +3849,89 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return new GroupConcatOrderBy(trimmedOrderBy, separator);
+    }
+
+    private GenericConversion convertSubstringIndex(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "SUBSTRING_INDEX")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "SUBSTRING_INDEX");
+                String replacement = functionCall == null ? null : rewriteSubstringIndex(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteSubstringIndex(FunctionCall substringIndexCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(substringIndexCall.body());
+        if (arguments.size() != 3) {
+            return null;
+        }
+        String source = arguments.get(0).text().trim();
+        String delimiter = stringLiteralValue(arguments.get(1).text());
+        String count = arguments.get(2).text().trim();
+        if (source.isBlank() || delimiter == null || delimiter.length() != 1) {
+            return null;
+        }
+        String regex;
+        if ("1".equals(count)) {
+            regex = "[^" + escapeRegexCharacterClassChar(delimiter.charAt(0)) + "]+";
+        } else if ("-1".equals(count)) {
+            regex = "[^" + escapeRegexCharacterClassChar(delimiter.charAt(0)) + "]+$";
+        } else {
+            return null;
+        }
+        StringBuilder regexLiteral = new StringBuilder();
+        appendSingleQuotedStringLiteral(regexLiteral, regex);
+        return "REGEXP_SUBSTR(" + source + ", " + regexLiteral + ", 1, 1)";
+    }
+
+    private String stringLiteralValue(String expression) {
+        String trimmed = expression.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (trimmed.charAt(0) == '\'') {
+            SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(trimmed, 0);
+            return literal.closed() && literal.nextIndex() == trimmed.length() ? literal.value() : null;
+        }
+        if (trimmed.charAt(0) == '"') {
+            DoubleQuotedStringLiteral literal = readDoubleQuotedStringLiteral(trimmed, 0);
+            return literal.closed() && literal.nextIndex() == trimmed.length() ? literal.value() : null;
+        }
+        return null;
+    }
+
+    private String escapeRegexCharacterClassChar(char value) {
+        return switch (value) {
+            case '\\' -> "\\\\";
+            case '^', '-', ']' -> "\\" + value;
+            default -> Character.toString(value);
+        };
     }
 
     private UpdateSetTableOrderConversion convertUpdateSetTableOrder(String sql) {
