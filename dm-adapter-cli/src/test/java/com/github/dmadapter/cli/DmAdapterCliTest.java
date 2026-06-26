@@ -726,8 +726,10 @@ class DmAdapterCliTest {
                 .contains("return \"2024-01-01 00:00:00\";")
                 .contains("private ValueResult configuredNullDefaultValue(")
                 .contains("statementRequiredCollectionValue(valueName, statement)")
+                .contains("String collectionValueName = requiredCollectionValueName(valueName, statement)")
+                .contains("return defaultValue(collectionValueName, targetType, genericType, 0, statement);")
                 .contains("if (rawValue == null) {")
-                .contains("return defaultCollectionParameter(valueName, statement);")
+                .contains("return defaultCollectionParameter(collectionValueName, statement);")
                 .contains("boolean nestedProperty")
                 .contains("field.getName(),")
                 .contains("private Map<String, Object> defaultMapCollectionValue(")
@@ -739,6 +741,9 @@ class DmAdapterCliTest {
                 .contains("containsMetadataName(nonEmptyCollectionParameterNames, valueName)")
                 .contains("matchingMetadataName(values, valueName)")
                 .contains("isSyntheticMetadataName(valueName) && values.size() == 1")
+                .contains("private String requiredCollectionValueName(String valueName, MapperStatement statement)")
+                .contains("Set<String> collectionNames = statement.collectionParameterNames()")
+                .contains("private boolean isSyntheticConfiguredParameterName(String valueName)")
                 .contains("valueByMetadataName(collectionScalarDefaults, valueName)");
     }
 

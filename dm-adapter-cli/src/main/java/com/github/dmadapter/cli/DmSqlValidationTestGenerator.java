@@ -3058,19 +3058,20 @@ class DmSqlValidationTestGenerator {
                         String valueName,
                         boolean nestedProperty
                 ) {
-                    if (statement == null || !statementRequiredCollectionValue(valueName, statement)) {
+                    String collectionValueName = requiredCollectionValueName(valueName, statement);
+                    if (isBlank(collectionValueName)) {
                         return null;
                     }
-                    if (Map.class.isAssignableFrom(targetType) && statement.mapCollectionParameter(valueName)) {
+                    if (Map.class.isAssignableFrom(targetType) && statement.mapCollectionParameter(collectionValueName)) {
                         Map<String, Object> defaultValue = nestedProperty
-                                ? defaultMapCollectionValue(valueName, statement)
-                                : defaultMapParameterValue(valueName, statement);
+                                ? defaultMapCollectionValue(collectionValueName, statement)
+                                : defaultMapParameterValue(collectionValueName, statement);
                         if (!defaultValue.isEmpty()) {
                             return ValueResult.resolved(mapParameterValue(targetType, defaultValue));
                         }
                     }
                     if (Collection.class.isAssignableFrom(targetType) || targetType.isArray()) {
-                        return defaultValue(valueName, targetType, genericType, 0, statement);
+                        return defaultValue(collectionValueName, targetType, genericType, 0, statement);
                     }
                     return null;
                 }
@@ -3147,8 +3148,9 @@ class DmSqlValidationTestGenerator {
                         return rawValue;
                     }
                     if (rawValue == null) {
-                        if (statementRequiredCollectionValue(valueName, statement)) {
-                            return defaultCollectionParameter(valueName, statement);
+                        String collectionValueName = requiredCollectionValueName(valueName, statement);
+                        if (!isBlank(collectionValueName)) {
+                            return defaultCollectionParameter(collectionValueName, statement);
                         }
                         return null;
                     }
@@ -4911,6 +4913,45 @@ class DmSqlValidationTestGenerator {
                             || statement.collectionParameter(valueName)
                             || statement.mapCollectionParameter(valueName)
                             || statement.scalarCollectionParameter(valueName));
+                }
+
+                private String requiredCollectionValueName(String valueName, MapperStatement statement) {
+                    if (statement == null) {
+                        return "";
+                    }
+                    if (statementRequiredCollectionValue(valueName, statement)) {
+                        return valueName;
+                    }
+                    if (!isSyntheticConfiguredParameterName(valueName)) {
+                        return "";
+                    }
+                    Set<String> collectionNames = statement.collectionParameterNames();
+                    if (collectionNames.size() != 1) {
+                        return "";
+                    }
+                    String collectionName = collectionNames.iterator().next();
+                    return statementRequiredCollectionValue(collectionName, statement) ? collectionName : "";
+                }
+
+                private boolean isSyntheticConfiguredParameterName(String valueName) {
+                    String normalized = normalizeName(valueName);
+                    int prefixLength;
+                    if (normalized.startsWith("arg")) {
+                        prefixLength = 3;
+                    } else if (normalized.startsWith("param")) {
+                        prefixLength = 5;
+                    } else {
+                        return false;
+                    }
+                    if (normalized.length() == prefixLength) {
+                        return false;
+                    }
+                    for (int i = prefixLength; i < normalized.length(); i++) {
+                        if (!Character.isDigit(normalized.charAt(i))) {
+                            return false;
+                        }
+                    }
+                    return true;
                 }
 
                 private boolean isIdLikeParameterName(String normalizedName) {
