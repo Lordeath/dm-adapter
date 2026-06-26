@@ -5097,7 +5097,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean isCompactEnumStringName(String normalizedName) {
-                    if (normalizedName.contains("name")) {
+                    if (normalizedName.contains("name") || isDateLikeParameterName(normalizedName)) {
                         return false;
                     }
                     return normalizedName.endsWith("status")
@@ -5105,7 +5105,20 @@ class DmSqlValidationTestGenerator {
                             || normalizedName.endsWith("flag")
                             || normalizedName.endsWith("type")
                             || normalizedName.endsWith("sex")
+                            || normalizedName.endsWith("unit")
+                            || normalizedName.endsWith("period")
+                            || normalizedName.endsWith("frequency")
+                            || normalizedName.endsWith("source")
+                            || normalizedName.endsWith("entity")
+                            || normalizedName.startsWith("has")
+                            || normalizedName.startsWith("sync")
                             || "syncpwd".equals(normalizedName)
+                            || normalizedName.contains("wechat")
+                            || normalizedName.contains("alipay")
+                            || normalizedName.contains("warrantydeposit")
+                            || normalizedName.contains("relatedcontract")
+                            || normalizedName.contains("collectionorsettlement")
+                            || normalizedName.contains("rewardorpunish")
                             || normalizedName.endsWith("disable")
                             || normalizedName.endsWith("disabled")
                             || normalizedName.startsWith("is");
