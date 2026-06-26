@@ -490,6 +490,7 @@ public class MapperXmlRewriter {
         if (structuralConversion.changed()) {
             rewrittenBody = structuralConversion.convertedBody();
             addAppliedRules(appliedRules, structuralConversion.appliedRules());
+            addManualReviewReasons(manualReviewReasons, structuralConversion.manualReviewReasons());
             changed = true;
         }
         return new DynamicBodyConversion(
@@ -509,6 +510,7 @@ public class MapperXmlRewriter {
             SqlRewriteConfig rewriteConfig
     ) {
         List<String> appliedRules = new ArrayList<>();
+        List<String> manualReviewReasons = new ArrayList<>();
         String converted = body;
 
         String commentSafe = neutralizeMyBatisPlaceholdersInSqlLineComments(converted);
@@ -524,7 +526,7 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
-            return new DynamicBodyConversion(body, converted, appliedRules, List.of(), !appliedRules.isEmpty());
+            return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
 
         String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
@@ -552,17 +554,23 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
-            String dynamicUpdateJoinWithSet = convertDynamicUpdateJoinWithSetClause(converted);
-            if (!dynamicUpdateJoinWithSet.equals(converted)) {
-                appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
-                converted = dynamicUpdateJoinWithSet;
+            DynamicBodyConversion dynamicUpdateJoinWithSet = convertDynamicUpdateJoinWithSetClause(
+                    converted,
+                    statementKey,
+                    sqlConverter,
+                    rewriteConfig
+            );
+            if (dynamicUpdateJoinWithSet.changed()) {
+                addAppliedRules(appliedRules, dynamicUpdateJoinWithSet.appliedRules());
+                addManualReviewReasons(manualReviewReasons, dynamicUpdateJoinWithSet.manualReviewReasons());
+                converted = dynamicUpdateJoinWithSet.convertedBody();
             }
             String dynamicUpdateJoin = convertDynamicUpdateJoin(converted);
             if (!dynamicUpdateJoin.equals(converted)) {
                 appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
                 converted = dynamicUpdateJoin;
             }
-            return new DynamicBodyConversion(body, converted, appliedRules, List.of(), !appliedRules.isEmpty());
+            return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
 
         String withMissingValues = addMissingBatchInsertValues(converted);
@@ -576,7 +584,7 @@ public class MapperXmlRewriter {
             appliedRules.add(MYBATIS_FOREACH_TRAILING_COMMA_RULE);
         }
         converted = withoutTrailingCommas;
-        return new DynamicBodyConversion(body, converted, appliedRules, List.of(), !appliedRules.isEmpty());
+        return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
     }
 
     private DynamicHavingConversion convertDynamicHavingClauses(String body) {
@@ -2014,7 +2022,12 @@ public class MapperXmlRewriter {
         return converted.toString();
     }
 
-    private String convertDynamicUpdateJoinWithSetClause(String body) {
+    private DynamicBodyConversion convertDynamicUpdateJoinWithSetClause(
+            String body,
+            String statementKey,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig
+    ) {
         int statementEnd = body.length();
         while (statementEnd > 0 && Character.isWhitespace(body.charAt(statementEnd - 1))) {
             statementEnd--;
@@ -2027,19 +2040,19 @@ public class MapperXmlRewriter {
         String statement = body.substring(0, statementEnd);
         int updateIndex = leadingWhitespaceLength(statement);
         if (!isKeywordAt(statement, updateIndex, "UPDATE")) {
-            return body;
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
         int joinIndex = findTopLevelKeywordSkippingXml(statement, "JOIN", updateIndex + "UPDATE".length());
         if (joinIndex < 0) {
-            return body;
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
         int setIndex = findTopLevelKeywordSkippingXml(statement, "SET", joinIndex + "JOIN".length());
         if (setIndex < 0) {
-            return body;
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
         int whereIndex = findTopLevelKeywordSkippingXml(statement, "WHERE", setIndex + "SET".length());
         if (whereIndex < 0) {
-            return body;
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
 
         int joinTypeStart = dynamicJoinTypeStart(statement, joinIndex);
@@ -2059,32 +2072,159 @@ public class MapperXmlRewriter {
                 || containsTopLevelJoinKeyword(splitJoin.sourceSql())
                 || containsTopLevelJoinKeyword(splitJoin.conditionSql())
                 || findTopLevelKeywordSkippingXml(setClause, "SET", 0) >= 0) {
-            return body;
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
+
+        TextSegmentConversion targetConversion = convertSqlTextWithXmlTags(
+                target,
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion sourceConversion = convertSqlTextWithXmlTags(
+                splitJoin.sourceSql(),
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion conditionConversion = convertSqlTextWithXmlTags(
+                splitJoin.conditionSql(),
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion setConversion = convertSqlTextWithXmlTags(
+                setClause,
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion whereConversion = convertSqlTextWithXmlTags(
+                whereClause,
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        List<String> appliedRules = new ArrayList<>();
+        List<String> manualReviewReasons = new ArrayList<>();
+        appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, targetConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, sourceConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, conditionConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, setConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, whereConversion);
 
         String baseIndent = indentationOfLastLine(leading);
         String childIndent = baseIndent + "    ";
         StringBuilder converted = new StringBuilder(body.length() + 64);
         converted.append(leading)
                 .append("update ")
-                .append(target)
+                .append(targetConversion.convertedText().strip())
                 .append(" set ")
-                .append(setClause)
+                .append(setConversion.convertedText().strip())
                 .append("\n")
                 .append(baseIndent)
                 .append("from ")
-                .append(splitJoin.sourceSql())
+                .append(sourceConversion.convertedText().strip())
                 .append("\n")
                 .append(baseIndent)
                 .append("where\n")
                 .append(childIndent)
-                .append(splitJoin.conditionSql())
+                .append(conditionConversion.convertedText().strip())
                 .append("\n")
                 .append(childIndent)
                 .append("and ")
-                .append(whereClause)
+                .append(whereConversion.convertedText().strip())
                 .append(trailing);
-        return converted.toString();
+        return new DynamicBodyConversion(
+                body,
+                converted.toString(),
+                appliedRules,
+                manualReviewReasons,
+                true
+        );
+    }
+
+    private TextSegmentConversion convertSqlTextWithXmlTags(
+            String value,
+            String statementKey,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        StringBuilder converted = new StringBuilder(value.length());
+        List<String> appliedRules = new ArrayList<>();
+        List<String> manualReviewReasons = new ArrayList<>();
+        boolean changed = false;
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<![CDATA[", index)) {
+                int cdataEnd = value.indexOf("]]>", index + "<![CDATA[".length());
+                if (cdataEnd < 0) {
+                    converted.append(value, index, value.length());
+                    break;
+                }
+                String content = value.substring(index + "<![CDATA[".length(), cdataEnd);
+                TextSegmentConversion conversion = convertTextSegment(
+                        content,
+                        statementKey,
+                        sqlConverter,
+                        rewriteConfig,
+                        false
+                );
+                converted.append(toCdata(conversion.convertedText()));
+                addAppliedRules(appliedRules, conversion.appliedRules());
+                addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
+                changed = changed || conversion.changed();
+                index = cdataEnd + "]]>".length();
+            } else if (value.startsWith("<!--", index)) {
+                int commentEnd = value.indexOf("-->", index + "<!--".length());
+                if (commentEnd < 0) {
+                    converted.append(value, index, value.length());
+                    break;
+                }
+                converted.append(value, index, commentEnd + "-->".length());
+                index = commentEnd + "-->".length();
+            } else if (value.charAt(index) == '<') {
+                int tagEnd = findXmlTagEnd(value, index);
+                if (tagEnd < 0) {
+                    converted.append(value, index, value.length());
+                    break;
+                }
+                converted.append(value, index, tagEnd + 1);
+                index = tagEnd + 1;
+            } else {
+                int nextTag = value.indexOf('<', index);
+                int textEnd = nextTag < 0 ? value.length() : nextTag;
+                String text = value.substring(index, textEnd);
+                TextSegmentConversion conversion = convertTextSegment(
+                        text,
+                        statementKey,
+                        sqlConverter,
+                        rewriteConfig,
+                        false
+                );
+                converted.append(conversion.convertedText());
+                addAppliedRules(appliedRules, conversion.appliedRules());
+                addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
+                changed = changed || conversion.changed();
+                index = textEnd;
+            }
+        }
+        return new TextSegmentConversion(
+                changed ? converted.toString() : value,
+                appliedRules,
+                manualReviewReasons,
+                changed
+        );
+    }
+
+    private void addSqlFragmentConversion(
+            List<String> appliedRules,
+            List<String> manualReviewReasons,
+            TextSegmentConversion conversion
+    ) {
+        addAppliedRules(appliedRules, conversion.appliedRules());
+        addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
     }
 
     private int leadingWhitespaceLength(String value) {

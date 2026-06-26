@@ -743,7 +743,9 @@ class MapperMigratorTest {
                     <update id="updateNsUser">
                         UPDATE ns_system_user nu
                         INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id
-                        SET nu.AD_account = c.AD_account
+                        SET nu.AD_account = c.`AD_account`,
+                            nu.sentry_id = case c.`sentry_id` when "0" then nu.sentry_id else c.`sentry_id` end,
+                            nu.update_time = now()
                         <if test="isFromV8 != null and (isFromV8 == '1' or isFromV8 == 1)">
                             ,nu.v8_user_id = c.sso_user_id
                         </if>
@@ -773,17 +775,21 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
                 .contains("update ns_system_user nu set nu.AD_account = c.AD_account")
+                .contains("nu.sentry_id = case c.sentry_id when '0' then nu.sentry_id else c.sentry_id end")
+                .contains("nu.update_time = SYSDATE")
                 .contains(",nu.v8_user_id = c.sso_user_id")
                 .contains("from ys_user c")
                 .contains("where")
                 .contains("nu.ys_user_id = c.sso_user_id")
                 .contains("and nu.enterprise_id = #{enterpriseId}")
-                .doesNotContain("where nu.ys_user_id = c.sso_user_id\n                        ,nu.v8_user_id");
+                .doesNotContain("where nu.ys_user_id = c.sso_user_id\n                        ,nu.v8_user_id")
+                .doesNotContain("`")
+                .doesNotContain("\"0\"");
         assertThat(rewritten.indexOf(",nu.v8_user_id = c.sso_user_id"))
                 .isLessThan(rewritten.indexOf("from ys_user c"));
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+                .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
     }
 
     @Test
