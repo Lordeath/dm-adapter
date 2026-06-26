@@ -610,6 +610,8 @@ class DmAdapterCliTest {
                 .doesNotContain("@ActiveProfiles")
                 .doesNotContain("PlatformTransactionManager")
                 .doesNotContain("RabbitTemplate");
+        assertThat(generatedTestSource.indexOf("if (lower.contains(\"on duplicate key update\"))"))
+                .isLessThan(generatedTestSource.indexOf("if (hasOriginalXmlSyntaxDefect(message))"));
         assertThat(generatedTestSource)
                 .doesNotContain("return switch")
                 .doesNotContain("try (var ")
