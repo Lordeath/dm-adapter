@@ -207,6 +207,53 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void castsStringForeachItemNumericPlaceholderFromCompiledMapperMethodSignature() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/NSMeiDiEBSMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NSMeiDiEBSMapper">
+                    <insert id="batchInsertX_OUT_ACC_DATA_ITEM" parameterType="java.util.List">
+                        insert into x_out_acc_data_item (ACC_SEGMENT_CODE, R_NO)
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.ACC_SEGMENT_CODE,jdbcType=VARCHAR}, #{item.R_NO,jdbcType=BIGINT})
+                        </foreach>
+                    </insert>
+                </mapper>
+                """);
+        compileJavaClass("com/example/X_OUT_ACC_DATA_ITEM.java", """
+                package com.example;
+
+                public class X_OUT_ACC_DATA_ITEM {
+                    private String ACC_SEGMENT_CODE;
+                    private String R_NO;
+                }
+                """);
+        compileJavaClass("com/example/NSMeiDiEBSMapper.java", """
+                package com.example;
+
+                import java.util.List;
+
+                public interface NSMeiDiEBSMapper {
+                    int batchInsertX_OUT_ACC_DATA_ITEM(List<X_OUT_ACC_DATA_ITEM> items);
+                }
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("x_out_acc_data_item", Map.of("acc_segment_code", "VARCHAR", "r_no", "BIGINT"))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/NSMeiDiEBSMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.warnings()).isEmpty();
+        assertThat(rewritten)
+                .contains("#{item.ACC_SEGMENT_CODE,jdbcType=VARCHAR}")
+                .contains("CAST(#{item.R_NO,jdbcType=VARCHAR} AS BIGINT)")
+                .doesNotContain("#{item.R_NO,jdbcType=BIGINT}");
+    }
+
+    @Test
     void keepsReadableJavaMetadataWhenAnotherSourceFileIsMalformed() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -310,6 +357,15 @@ class MapperJdbcTypeAlignerTest {
         Files.createDirectories(output);
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         assertThat(compiler).isNotNull();
-        assertThat(compiler.run(null, null, null, "-d", output.toString(), source.toString())).isZero();
+        assertThat(compiler.run(
+                null,
+                null,
+                null,
+                "-classpath",
+                output.toString(),
+                "-d",
+                output.toString(),
+                source.toString()
+        )).isZero();
     }
 }

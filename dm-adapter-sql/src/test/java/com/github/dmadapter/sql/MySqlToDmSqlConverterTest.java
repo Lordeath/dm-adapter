@@ -1642,6 +1642,33 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsBooleanLiteralComparisonsOnLikelyBooleanColumns() {
+        SqlConversionResult result = converter.convert("""
+                delete from owner_house_result
+                where house_id = #{houseId} and is_current_record = true
+                  and deleteFlag != false
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                delete from owner_house_result
+                where house_id = #{houseId} and is_current_record = 1
+                  and deleteFlag != 0
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_BOOLEAN_LITERAL_COMPARISON_RULE
+        );
+    }
+
+    @Test
+    void doesNotConvertBooleanLiteralComparisonsForNonBooleanColumnNames() {
+        SqlConversionResult result = converter.convert("select * from t where status = true and note = 'true'");
+
+        assertThat(result.changed()).isFalse();
+    }
+
+    @Test
     void doesNotConvertBooleanLikeColumnsThatAlreadyHaveOperators() {
         SqlConversionResult result = converter.convert("""
                 select *

@@ -44,6 +44,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_NOT_ISNULL_RULE = "MYSQL_NOT_ISNULL_TO_CASE";
     public static final String MYSQL_BOOLEAN_OPERATOR_RULE = "MYSQL_BOOLEAN_OPERATOR_TO_WORD_OPERATOR";
     public static final String MYSQL_BARE_BOOLEAN_PREDICATE_RULE = "MYSQL_BARE_BOOLEAN_PREDICATE_TO_EQUALS_ONE";
+    public static final String MYSQL_BOOLEAN_LITERAL_COMPARISON_RULE =
+            "MYSQL_BOOLEAN_LITERAL_COMPARISON_TO_NUMERIC";
     public static final String MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE =
             "MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN";
     public static final String MYSQL_IMPLICIT_CROSS_JOIN_RULE = "MYSQL_IMPLICIT_CROSS_JOIN_TO_DM";
@@ -474,6 +476,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (booleanOperatorConversion.changed()) {
             converted = booleanOperatorConversion.convertedSql();
             rules.add(MYSQL_BOOLEAN_OPERATOR_RULE);
+        }
+
+        GenericConversion booleanLiteralComparisonConversion = convertBooleanLiteralComparisons(converted);
+        if (booleanLiteralComparisonConversion.changed()) {
+            converted = booleanLiteralComparisonConversion.convertedSql();
+            rules.add(MYSQL_BOOLEAN_LITERAL_COMPARISON_RULE);
         }
 
         GenericConversion bareBooleanPredicateConversion = convertBareBooleanPredicates(converted);
@@ -3611,6 +3619,100 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : expression, changed);
     }
 
+    private GenericConversion convertBooleanLiteralComparisons(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                BooleanLiteralComparison comparison = readBooleanLiteralComparison(sql, index);
+                if (comparison == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(comparison.replacement());
+                    index = comparison.endIndex();
+                    changed = true;
+                }
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private BooleanLiteralComparison readBooleanLiteralComparison(String sql, int index) {
+        if (index > 0 && isIdentifierPart(sql.charAt(index - 1))) {
+            return null;
+        }
+        QualifiedIdentifier identifier = readQualifiedIdentifier(sql, index);
+        if (identifier == null || !isLikelyBooleanColumn(identifier.lastToken())) {
+            return null;
+        }
+        int operatorStart = skipWhitespace(sql, identifier.endIndex());
+        String operator = readComparisonOperator(sql, operatorStart);
+        if (operator.isBlank()) {
+            return null;
+        }
+        int literalStart = skipWhitespace(sql, operatorStart + operator.length());
+        String literalValue;
+        int literalEnd;
+        if (startsKeyword(sql, literalStart, "TRUE")) {
+            literalValue = "1";
+            literalEnd = literalStart + "TRUE".length();
+        } else if (startsKeyword(sql, literalStart, "FALSE")) {
+            literalValue = "0";
+            literalEnd = literalStart + "FALSE".length();
+        } else {
+            return null;
+        }
+        return new BooleanLiteralComparison(
+                literalEnd,
+                sql.substring(index, literalStart) + literalValue
+        );
+    }
+
+    private String readComparisonOperator(String sql, int index) {
+        if (index >= sql.length()) {
+            return "";
+        }
+        if (sql.startsWith("<>", index) || sql.startsWith("!=", index)) {
+            return sql.substring(index, index + 2);
+        }
+        if (sql.charAt(index) == '=') {
+            return "=";
+        }
+        return "";
+    }
+
+    private QualifiedIdentifier readQualifiedIdentifier(String sql, int index) {
+        IdentifierToken token = readIdentifierToken(sql, index);
+        if (token == null) {
+            return null;
+        }
+        IdentifierToken lastToken = token;
+        int end = skipWhitespace(sql, token.endIndex());
+        while (end < sql.length() && sql.charAt(end) == '.') {
+            end = skipWhitespace(sql, end + 1);
+            token = readIdentifierToken(sql, end);
+            if (token == null) {
+                return null;
+            }
+            lastToken = token;
+            end = skipWhitespace(sql, token.endIndex());
+        }
+        return new QualifiedIdentifier(unquoteIdentifier(lastToken.text()), end);
+    }
+
     private GenericConversion convertBareBooleanPredicates(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
@@ -4862,6 +4964,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record TextReplacement(int startIndex, int endIndex, String replacement) {
+    }
+
+    private record BooleanLiteralComparison(int endIndex, String replacement) {
+    }
+
+    private record QualifiedIdentifier(String lastToken, int endIndex) {
     }
 
     private record BareBooleanPredicate(int identifierEndIndex) {
