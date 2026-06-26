@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -25,6 +26,8 @@ import java.util.regex.Pattern;
 public class MapperXmlRewriter {
     public static final String MYBATIS_BATCH_INSERT_ADD_VALUES_RULE = "MYBATIS_BATCH_INSERT_ADD_VALUES";
     public static final String MYBATIS_FOREACH_TRAILING_COMMA_RULE = "MYBATIS_FOREACH_TRAILING_COMMA";
+    public static final String MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE =
+            "MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE";
     public static final String MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE =
@@ -52,7 +55,26 @@ public class MapperXmlRewriter {
     private static final Pattern INSERT_TRIM_THEN_FOREACH_PATTERN = Pattern.compile(
             "(?is)(\\binsert\\s+into\\b[\\s\\S]*?</trim>)(\\s*)(<foreach\\b)"
     );
+    private static final Pattern INSERT_TRIM_VALUES_FOREACH_PATTERN = Pattern.compile(
+            "(?is)(?<prefix>\\binsert\\s+into\\b[\\s\\S]*?<trim\\b[^>]*>[\\s\\S]*?</trim>\\s*values\\s*)"
+                    + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
+    );
     private static final Pattern FOREACH_BLOCK_PATTERN = Pattern.compile("(?is)<foreach\\b[^>]*>[\\s\\S]*?</foreach>");
+    private static final Pattern FOREACH_WITH_BODY_PATTERN = Pattern.compile(
+            "(?is)^(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)(?<closing></foreach\\s*>)$"
+    );
+    private static final Pattern IF_OPENING_TAG_PATTERN = Pattern.compile(
+            "(?is)<if\\b[^>]*\\btest\\s*=\\s*([\"'])(.*?)\\1[^>]*>"
+    );
+    private static final Pattern IF_TEST_ATTRIBUTE_PATTERN = Pattern.compile(
+            "(?is)(<if\\b[^>]*\\btest\\s*=\\s*)([\"'])(.*?)(\\2)([^>]*>)"
+    );
+    private static final Pattern SIMPLE_NULL_TEST_PATTERN = Pattern.compile(
+            "(?is)^\\s*([A-Za-z_][A-Za-z0-9_$]*)\\s*!=\\s*null\\s*$"
+    );
+    private static final Pattern MYBATIS_SIMPLE_PARAMETER_PATTERN = Pattern.compile(
+            "([#$]\\{\\s*)([A-Za-z_][A-Za-z0-9_$]*)(\\s*(?:,[^}]*)?)\\}"
+    );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\")";
     private static final Pattern WRAPPING_IF_PATTERN = Pattern.compile(
@@ -609,6 +631,12 @@ public class MapperXmlRewriter {
         if (!withMissingValues.equals(converted)) {
             appliedRules.add(MYBATIS_BATCH_INSERT_ADD_VALUES_RULE);
             converted = withMissingValues;
+        }
+
+        TextRewrite qualifiedBatchInsertListItems = qualifyBatchInsertListItemReferences(converted);
+        if (qualifiedBatchInsertListItems.changed()) {
+            appliedRules.add(MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE);
+            converted = qualifiedBatchInsertListItems.text();
         }
 
         String withoutTrailingCommas = removeForeachTrailingCommas(converted);
@@ -1731,6 +1759,14 @@ public class MapperXmlRewriter {
             previous--;
         }
         return previous < 0 ? '\0' : value.charAt(previous);
+    }
+
+    private char nextNonWhitespace(String value, int index) {
+        int next = index;
+        while (next < value.length() && Character.isWhitespace(value.charAt(next))) {
+            next++;
+        }
+        return next >= value.length() ? '\0' : value.charAt(next);
     }
 
     private int skipWhitespace(String value, int index) {
@@ -2906,6 +2942,226 @@ public class MapperXmlRewriter {
         return changed ? converted.toString() : body;
     }
 
+    private TextRewrite qualifyBatchInsertListItemReferences(String body) {
+        Matcher matcher = INSERT_TRIM_VALUES_FOREACH_PATTERN.matcher(body);
+        StringBuffer converted = new StringBuffer(body.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            String prefix = matcher.group("prefix");
+            String foreachBlock = matcher.group("foreach");
+            PreservedForeach preservedForeach = readPreservedForeach(foreachBlock);
+            if (preservedForeach == null || !isIndexableBatchCollectionName(preservedForeach.collection())) {
+                continue;
+            }
+
+            Set<String> columnProperties = simpleColumnIfProperties(prefix);
+            if (columnProperties.isEmpty()) {
+                continue;
+            }
+
+            TextRewrite foreachRewrite = qualifyForeachItemReferences(
+                    preservedForeach.body(),
+                    preservedForeach.item(),
+                    preservedForeach.index(),
+                    columnProperties
+            );
+            if (!foreachRewrite.changed()) {
+                continue;
+            }
+
+            TextRewrite prefixRewrite = qualifyBatchInsertColumnTests(
+                    prefix,
+                    preservedForeach.collection(),
+                    columnProperties
+            );
+            String replacement = prefixRewrite.text()
+                    + preservedForeach.openingTag()
+                    + foreachRewrite.text()
+                    + preservedForeach.closingTag();
+            matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return new TextRewrite(changed ? converted.toString() : body, changed);
+    }
+
+    private PreservedForeach readPreservedForeach(String block) {
+        Matcher matcher = FOREACH_WITH_BODY_PATTERN.matcher(block);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String openingTag = matcher.group("opening");
+        String collection = xmlAttribute(openingTag, "collection");
+        String item = xmlAttribute(openingTag, "item");
+        if (collection == null || item == null || item.isBlank()) {
+            return null;
+        }
+        return new PreservedForeach(
+                openingTag,
+                matcher.group("body"),
+                matcher.group("closing"),
+                collection,
+                item,
+                defaultString(xmlAttribute(openingTag, "index"))
+        );
+    }
+
+    private boolean isIndexableBatchCollectionName(String collection) {
+        if (collection == null || !collection.matches("[A-Za-z_][A-Za-z0-9_$]*")) {
+            return false;
+        }
+        String lower = collection.toLowerCase(Locale.ROOT);
+        return "list".equals(lower) || "array".equals(lower) || lower.endsWith("list");
+    }
+
+    private Set<String> simpleColumnIfProperties(String prefix) {
+        Set<String> properties = new LinkedHashSet<>();
+        Matcher matcher = IF_OPENING_TAG_PATTERN.matcher(prefix);
+        while (matcher.find()) {
+            String property = simpleNullTestProperty(matcher.group(2));
+            if (!property.isBlank()) {
+                properties.add(property);
+            }
+        }
+        return properties;
+    }
+
+    private TextRewrite qualifyForeachItemReferences(
+            String body,
+            String item,
+            String index,
+            Set<String> propertyNames
+    ) {
+        TextRewrite parameterRewrite = qualifyMyBatisSimpleParameters(body, item, index, propertyNames);
+        TextRewrite testRewrite = qualifyIfTestAttributes(parameterRewrite.text(), propertyNames, item + ".");
+        boolean changed = parameterRewrite.changed() || testRewrite.changed();
+        return new TextRewrite(changed ? testRewrite.text() : body, changed);
+    }
+
+    private TextRewrite qualifyMyBatisSimpleParameters(
+            String value,
+            String item,
+            String index,
+            Set<String> propertyNames
+    ) {
+        Matcher matcher = MYBATIS_SIMPLE_PARAMETER_PATTERN.matcher(value);
+        StringBuffer converted = new StringBuffer(value.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            String name = matcher.group(2);
+            if (!propertyNames.contains(name) || name.equals(item) || name.equals(index)) {
+                continue;
+            }
+            matcher.appendReplacement(
+                    converted,
+                    Matcher.quoteReplacement(matcher.group(1) + item + "." + name + matcher.group(3) + "}")
+            );
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return new TextRewrite(changed ? converted.toString() : value, changed);
+    }
+
+    private TextRewrite qualifyIfTestAttributes(String value, Set<String> propertyNames, String qualifier) {
+        Matcher matcher = IF_TEST_ATTRIBUTE_PATTERN.matcher(value);
+        StringBuffer converted = new StringBuffer(value.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            TextRewrite testRewrite = qualifyBarePropertyReferences(matcher.group(3), propertyNames, qualifier);
+            if (!testRewrite.changed()) {
+                continue;
+            }
+            matcher.appendReplacement(
+                    converted,
+                    Matcher.quoteReplacement(
+                            matcher.group(1)
+                                    + matcher.group(2)
+                                    + testRewrite.text()
+                                    + matcher.group(4)
+                                    + matcher.group(5)
+                    )
+            );
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return new TextRewrite(changed ? converted.toString() : value, changed);
+    }
+
+    private TextRewrite qualifyBatchInsertColumnTests(
+            String prefix,
+            String collection,
+            Set<String> propertyNames
+    ) {
+        Matcher matcher = IF_TEST_ATTRIBUTE_PATTERN.matcher(prefix);
+        StringBuffer converted = new StringBuffer(prefix.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            String property = simpleNullTestProperty(matcher.group(3));
+            if (property.isBlank() || !propertyNames.contains(property)) {
+                continue;
+            }
+            String replacementTest = collection
+                    + " != null and "
+                    + collection
+                    + ".size() &gt; 0 and "
+                    + collection
+                    + "[0]."
+                    + property
+                    + " != null";
+            matcher.appendReplacement(
+                    converted,
+                    Matcher.quoteReplacement(
+                            matcher.group(1)
+                                    + matcher.group(2)
+                                    + replacementTest
+                                    + matcher.group(4)
+                                    + matcher.group(5)
+                    )
+            );
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return new TextRewrite(changed ? converted.toString() : prefix, changed);
+    }
+
+    private String simpleNullTestProperty(String expression) {
+        Matcher matcher = SIMPLE_NULL_TEST_PATTERN.matcher(expression == null ? "" : expression);
+        return matcher.matches() ? matcher.group(1) : "";
+    }
+
+    private TextRewrite qualifyBarePropertyReferences(
+            String expression,
+            Set<String> propertyNames,
+            String qualifier
+    ) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < expression.length()) {
+            char current = expression.charAt(index);
+            if (current == '\'' || current == '"') {
+                index = skipQuoted(expression, index, current);
+            } else if (isIdentifierStart(current)) {
+                IdentifierToken token = readIdentifierToken(expression, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                char previous = previousNonWhitespace(expression, index);
+                char next = nextNonWhitespace(expression, token.endIndex());
+                if (propertyNames.contains(token.text())
+                        && previous != '.'
+                        && next != '.'
+                        && next != '(') {
+                    replacements.add(new TextReplacement(index, token.endIndex(), qualifier + token.text()));
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(expression, replacements);
+    }
+
     private String removeForeachTrailingCommas(String body) {
         Matcher matcher = FOREACH_BLOCK_PATTERN.matcher(body);
         StringBuilder converted = new StringBuilder(body.length());
@@ -3082,6 +3338,16 @@ public class MapperXmlRewriter {
         private String toXml() {
             return openingWithSeparator(separator) + body + "</foreach>";
         }
+    }
+
+    private record PreservedForeach(
+            String openingTag,
+            String body,
+            String closingTag,
+            String collection,
+            String item,
+            String index
+    ) {
     }
 
     private record BatchInsertValues(
