@@ -113,7 +113,7 @@ class SqlRewriteConfigUpdater {
             methodKeys.putIfAbsent(entry.getKey(), entry.getValue());
         }
         methodKeys.putAll(model.nonEmptyMethodKeys());
-        return new SqlRewriteConfig(tableKeys, methodKeys);
+        return new SqlRewriteConfig(tableKeys, methodKeys, loadedRewriteConfig.ignoredMissingTables());
     }
 
     private Optional<FileChange> writeIfChanged(AdapterContext context, Path rewriteConfigPath, RewriteConfigModel model) {
@@ -165,6 +165,7 @@ class SqlRewriteConfigUpdater {
     private static final class RewriteConfigModel {
         private final LinkedHashMap<String, List<String>> tableKeys = new LinkedHashMap<>();
         private final LinkedHashMap<String, List<String>> methodKeys = new LinkedHashMap<>();
+        private final List<String> validationIgnoreLines = new ArrayList<>();
         private final List<String> validationArgsLines = new ArrayList<>();
 
         static RewriteConfigModel load(Path path) {
@@ -268,11 +269,16 @@ class SqlRewriteConfigUpdater {
                 yaml.append("\n");
                 validationArgsLines.forEach(line -> yaml.append(line).append("\n"));
             }
+            if (!validationIgnoreLines.isEmpty()) {
+                yaml.append("\n");
+                validationIgnoreLines.forEach(line -> yaml.append(line).append("\n"));
+            }
             return yaml.toString();
         }
 
         private void parse(List<String> lines) {
             validationArgsLines.addAll(topLevelBlock(lines, "validationArgs:"));
+            validationIgnoreLines.addAll(topLevelBlock(lines, "validationIgnores:"));
             String section = "";
             String currentName = "";
             for (String line : lines) {
