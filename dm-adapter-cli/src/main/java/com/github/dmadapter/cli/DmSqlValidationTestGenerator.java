@@ -6027,6 +6027,9 @@ class DmSqlValidationTestGenerator {
                             "INSERT_IGNORE")) {
                         markdown.append("- 为 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写补充 .dm-adapter/sql-rewrite.yml 中的 keyColumns，重新执行 migrate 后再验证。\\n");
                     }
+                    if (countsByPattern.containsKey("DM_CTAS_BIND_PARAMETER")) {
+                        markdown.append("- 达梦不支持在 CREATE TABLE AS SELECT 中使用 JDBC 绑定参数；将该 mapper 拆为显式建临时表和参数化 INSERT 两个步骤。\\n");
+                    }
                     if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")
                             || countsByPattern.containsKey("TEST_SCHEMA_FUNCTION")) {
                         markdown.append("- 先对齐达梦测试 schema 中缺失的表、视图、字段、函数或对象命名差异，再将其视为 SQL 改写失败。\\n");
@@ -6231,6 +6234,8 @@ class DmSqlValidationTestGenerator {
                             return "隐式 CROSS JOIN";
                         case "MYSQL_TEMPORARY_TABLE_AS_SELECT":
                             return "临时表 AS SELECT";
+                        case "DM_CTAS_BIND_PARAMETER":
+                            return "CTAS 绑定参数";
                         case "DAMENG_KEYWORD_TABLE_ALIAS":
                             return "达梦关键字表别名";
                         case "DAMENG_RESERVED_IDENTIFIER":
@@ -6415,6 +6420,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasMysqlCollateClause(message)) {
                         return "MYSQL_COLLATE_CLAUSE";
+                    }
+                    if (hasDamengCtasBindParameter(message)) {
+                        return "DM_CTAS_BIND_PARAMETER";
                     }
                     if (hasMysqlMakeDate(message)) {
                         return "MYSQL_MAKEDATE";
@@ -6635,6 +6643,16 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?im)^### SQL:\\\\s*describe\\\\b").matcher(message).find();
                 }
 
+                private boolean hasDamengCtasBindParameter(String message) {
+                    if (!containsAny(message, "Invalid expression", "无效的表达式")) {
+                        return false;
+                    }
+                    return Pattern.compile(
+                            "\\\\bcreate\\\\s+(?:global\\\\s+)?temporary\\\\s+table\\\\b[\\\\s\\\\S]*?\\\\bas\\\\s+select\\\\b[\\\\s\\\\S]*?\\\\?\\\\s+as\\\\s+(?:\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(message).find();
+                }
+
                 private boolean hasMysqlCollateClause(String message) {
                     return Pattern.compile("\\\\bcollate\\\\s+[A-Za-z0-9_]+", Pattern.CASE_INSENSITIVE).matcher(message).find();
                 }
@@ -6800,6 +6818,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
+                    }
+                    if (hasDamengCtasBindParameter(message)) {
+                        return "SQL_SYNTAX";
                     }
                     if (isAutoParameter(record) && hasMissingDynamicIdentifierIssue(message)) {
                         return "METHOD_ARGS_OR_BINDING";
