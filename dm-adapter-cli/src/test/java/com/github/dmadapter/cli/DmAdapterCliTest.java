@@ -587,6 +587,7 @@ class DmAdapterCliTest {
                 .contains("and[A-Za-z_][A-Za-z0-9_$]*")
                 .contains("BROKEN_DYNAMIC_SQL_OR_ARGS")
                 .contains("TEST_DATA_TYPE_MISMATCH")
+                .contains("NumberFormatException")
                 .contains("TEST_DATA_FOREIGN_KEY_CONSTRAINT")
                 .contains("RETURN_TYPE_MISMATCH")
                 .contains("MAPPER_PROPERTY_NAME")

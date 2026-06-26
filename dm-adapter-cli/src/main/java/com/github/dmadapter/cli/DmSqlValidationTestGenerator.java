@@ -6448,7 +6448,9 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("classcastexception") && lower.contains("cannot be cast")) {
                         return "RETURN_TYPE_MISMATCH";
                     }
-                    if (lower.contains("类型转换异常") || lower.contains("数据类型不匹配")) {
+                    if (lower.contains("类型转换异常")
+                            || lower.contains("数据类型不匹配")
+                            || (lower.contains("numberformatexception") && lower.contains("for input string"))) {
                         return "TEST_DATA_TYPE_MISMATCH";
                     }
                     if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
@@ -6850,6 +6852,7 @@ class DmSqlValidationTestGenerator {
                             "长度超出定义",
                             "类型转换异常",
                             "数据类型不匹配",
+                            "NumberFormatException",
                             "唯一性约束",
                             "违反引用约束",
                             "非法的时间日期类型数据",
