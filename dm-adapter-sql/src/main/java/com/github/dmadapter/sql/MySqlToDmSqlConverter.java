@@ -52,6 +52,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE = "MYSQL_TEMPORARY_TABLE_AS_SELECT_TO_DM";
     public static final String MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL_RULE =
             "MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL";
+    public static final String MYSQL_DELETE_ALIAS_STAR_RULE = "MYSQL_DELETE_ALIAS_STAR_TO_DM";
     public static final String DAMENG_KEYWORD_TABLE_ALIAS_RULE = "DAMENG_KEYWORD_TABLE_ALIAS_QUOTE";
     public static final String MYSQL_SINGLE_QUOTED_ALIAS_RULE = "MYSQL_SINGLE_QUOTED_ALIAS_TO_DM_IDENTIFIER";
     public static final String MYSQL_INSERT_VALUE_TO_VALUES_RULE = "MYSQL_INSERT_VALUE_TO_VALUES";
@@ -343,6 +344,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (temporaryTableConversion.changed()) {
             converted = temporaryTableConversion.convertedSql();
             rules.add(MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+        }
+
+        GenericConversion deleteAliasStarConversion = convertMysqlDeleteAliasStar(converted);
+        if (deleteAliasStarConversion.changed()) {
+            converted = deleteAliasStarConversion.convertedSql();
+            rules.add(MYSQL_DELETE_ALIAS_STAR_RULE);
         }
 
         GenericConversion withRecursiveConversion = addRecursiveCteColumnAliases(converted);
@@ -1603,6 +1610,54 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return index;
+    }
+
+    private GenericConversion convertMysqlDeleteAliasStar(String sql) {
+        int deleteIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, deleteIndex, "DELETE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int aliasStart = skipWhitespace(sql, deleteIndex + "DELETE".length());
+        IdentifierToken deleteAlias = readIdentifierToken(sql, aliasStart);
+        if (deleteAlias == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        int dotIndex = skipWhitespace(sql, deleteAlias.endIndex());
+        if (dotIndex >= sql.length() || sql.charAt(dotIndex) != '.') {
+            return GenericConversion.unchanged(sql);
+        }
+        int starIndex = skipWhitespace(sql, dotIndex + 1);
+        if (starIndex >= sql.length() || sql.charAt(starIndex) != '*') {
+            return GenericConversion.unchanged(sql);
+        }
+        int fromIndex = skipWhitespace(sql, starIndex + 1);
+        if (!startsKeyword(sql, fromIndex, "FROM")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableStart = skipWhitespace(sql, fromIndex + "FROM".length());
+        IdentifierToken table = readDynamicTableNameToken(sql, tableStart);
+        if (table == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableAliasStart = skipWhitespace(sql, table.endIndex());
+        IdentifierToken tableAlias = readIdentifierToken(sql, tableAliasStart);
+        if (tableAlias == null
+                || !normalizeIdentifierKey(tableAlias.text()).equals(normalizeIdentifierKey(deleteAlias.text()))) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(sql.substring(0, deleteIndex) + "delete from " + sql.substring(tableStart), true);
+    }
+
+    private IdentifierToken readDynamicTableNameToken(String sql, int start) {
+        IdentifierToken identifier = readQualifiedIdentifierToken(sql, start);
+        if (identifier != null) {
+            return identifier;
+        }
+        if (start + 2 > sql.length() || !sql.startsWith("${", start)) {
+            return null;
+        }
+        int end = skipMyBatisPlaceholder(sql, start);
+        return end > start + 3 ? new IdentifierToken(sql.substring(start, end), end) : null;
     }
 
     private GenericConversion convertInformationSchemaColumns(String sql) {
