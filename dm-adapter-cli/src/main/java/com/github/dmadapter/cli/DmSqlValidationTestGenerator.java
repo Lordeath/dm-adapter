@@ -2971,7 +2971,16 @@ class DmSqlValidationTestGenerator {
                         for (Object item : rawCollection) {
                             if (item instanceof Map<?, ?>) {
                                 if (Collection.class.isAssignableFrom(nestedClass)) {
-                                    converted.add(new ArrayList<>(listOf(item)));
+                                    Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
+                                    if (!defaultElement.isEmpty()) {
+                                        configuredItem = mergeConfiguredCollectionElementMap(
+                                                new LinkedHashMap<>(defaultElement),
+                                                configuredItem,
+                                                statement,
+                                                valueName
+                                        );
+                                    }
+                                    converted.add(new ArrayList<>(listOf(configuredItem)));
                                     continue;
                                 }
                                 if (shouldUsePojoCollectionElement(nestedClass)) {
@@ -3266,6 +3275,8 @@ class DmSqlValidationTestGenerator {
                             || "1".equals(text);
                 }
 
+                """,
+            """
                 @SuppressWarnings("unchecked")
                 private Map<String, Object> configuredCollectionElementDefault(
                         String collectionName,
@@ -3282,9 +3293,24 @@ class DmSqlValidationTestGenerator {
                         return emptyMap();
                     }
                     Collection<?> values = (Collection<?>) defaultCollection.value;
-                    for (Object item : values) {
-                        if (item instanceof Map<?, ?>) {
-                            return new LinkedHashMap<>((Map<String, Object>) item);
+                    Map<String, Object> nestedDefault = firstMapElementDefault(values);
+                    if (!nestedDefault.isEmpty()) {
+                        return nestedDefault;
+                    }
+                    return emptyMap();
+                }
+
+                @SuppressWarnings("unchecked")
+                private Map<String, Object> firstMapElementDefault(Object value) {
+                    if (value instanceof Map<?, ?>) {
+                        return new LinkedHashMap<>((Map<String, Object>) value);
+                    }
+                    if (value instanceof Collection<?>) {
+                        for (Object item : (Collection<?>) value) {
+                            Map<String, Object> nested = firstMapElementDefault(item);
+                            if (!nested.isEmpty()) {
+                                return nested;
+                            }
                         }
                     }
                     return emptyMap();
@@ -4216,14 +4242,19 @@ class DmSqlValidationTestGenerator {
                                 entryPath,
                                 existing
                         );
+                        Object nestedCollection = nestedConfiguredCollectionValue(
+                                existing,
+                                configuredValue,
+                                statement,
+                                entryPath
+                        );
+                        if (nestedCollection != MethodArgumentConfig.MISSING) {
+                            target.put(entry.getKey(), nestedCollection);
+                            continue;
+                        }
                         Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configuredValue, statement);
                         if (scalarCollection != MethodArgumentConfig.MISSING) {
                             target.put(entry.getKey(), scalarCollection);
-                            continue;
-                        }
-                        Object nestedCollection = nestedConfiguredCollectionValue(existing, configuredValue);
-                        if (nestedCollection != MethodArgumentConfig.MISSING) {
-                            target.put(entry.getKey(), nestedCollection);
                             continue;
                         }
                         if (existing instanceof Map && configuredValue instanceof Map) {
@@ -4239,20 +4270,51 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
-                private Object nestedConfiguredCollectionValue(Object existing, Object configuredValue) {
+                @SuppressWarnings("unchecked")
+                private Object nestedConfiguredCollectionValue(
+                        Object existing,
+                        Object configuredValue,
+                        MapperStatement statement,
+                        String pathPrefix
+                ) {
                     if (!isCollectionOfCollections(existing)) {
                         return MethodArgumentConfig.MISSING;
                     }
+                    Map<String, Object> defaultElement = firstMapElementDefault(existing);
                     if (configuredValue instanceof Collection<?>) {
                         Collection<?> configuredCollection = (Collection<?>) configuredValue;
                         Object first = firstCollectionElement(configuredCollection);
                         if (first == null || first instanceof Collection<?>) {
                             return configuredValue;
                         }
-                        return new ArrayList<>(listOf(configuredValue));
+                        Collection<Object> nestedItems = configuredCollection instanceof Set<?>
+                                ? new LinkedHashSet<>()
+                                : new ArrayList<>();
+                        for (Object item : configuredCollection) {
+                            if (item instanceof Map<?, ?> && !defaultElement.isEmpty()) {
+                                nestedItems.add(mergeConfiguredCollectionElementMap(
+                                        new LinkedHashMap<>(defaultElement),
+                                        new LinkedHashMap<>((Map<String, Object>) item),
+                                        statement,
+                                        pathPrefix
+                                ));
+                            } else {
+                                nestedItems.add(item);
+                            }
+                        }
+                        return new ArrayList<>(listOf(nestedItems));
                     }
                     if (configuredValue instanceof Map<?, ?>) {
-                        return new ArrayList<>(listOf(new ArrayList<>(listOf(configuredValue))));
+                        Object nestedItem = configuredValue;
+                        if (!defaultElement.isEmpty()) {
+                            nestedItem = mergeConfiguredCollectionElementMap(
+                                    new LinkedHashMap<>(defaultElement),
+                                    new LinkedHashMap<>((Map<String, Object>) configuredValue),
+                                    statement,
+                                    pathPrefix
+                            );
+                        }
+                        return new ArrayList<>(listOf(new ArrayList<>(listOf(nestedItem))));
                     }
                     return MethodArgumentConfig.MISSING;
                 }
