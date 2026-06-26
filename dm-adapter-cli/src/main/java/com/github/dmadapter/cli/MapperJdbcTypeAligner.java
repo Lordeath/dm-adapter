@@ -46,8 +46,14 @@ class MapperJdbcTypeAligner {
             "#\\{\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)}"
     );
     private static final Pattern JDBC_TYPE_PATTERN = Pattern.compile("(?i)(jdbcType\\s*=\\s*)([A-Za-z0-9_]+)");
+    private static final Pattern MAPPER_NAMESPACE_PATTERN = Pattern.compile(
+            "(?is)<mapper\\b[^>]*\\bnamespace\\s*=\\s*([\"'])(.*?)\\1"
+    );
     private static final Pattern TRIM_PATTERN = Pattern.compile("(?is)<trim\\b([^>]*)>([\\s\\S]*?)</trim>");
     private static final Pattern IF_PATTERN = Pattern.compile("(?is)<if\\b[^>]*>([\\s\\S]*?)</if>");
+    private static final Pattern FOREACH_ITEM_PATTERN = Pattern.compile(
+            "(?is)<foreach\\b[^>]*\\bitem\\s*=\\s*([\"'])(.*?)\\1"
+    );
 
     Set<String> referencedTables(ProjectScanResult scanResult, AdapterContext context) {
         Set<String> tables = new LinkedHashSet<>();
@@ -161,10 +167,11 @@ class MapperJdbcTypeAligner {
             JavaFieldTypeMetadata javaFieldTypes
     ) {
         Matcher matcher = STATEMENT_PATTERN.matcher(text);
+        String mapperType = mapperNamespace(text);
         StringBuffer output = new StringBuffer();
         int replacements = 0;
         while (matcher.find()) {
-            Alignment statement = alignStatement(matcher.group(), columnTypes, javaFieldTypes);
+            Alignment statement = alignStatement(matcher.group(), mapperType, columnTypes, javaFieldTypes);
             replacements += statement.replacements();
             matcher.appendReplacement(output, Matcher.quoteReplacement(statement.text()));
         }
@@ -174,13 +181,15 @@ class MapperJdbcTypeAligner {
 
     private Alignment alignStatement(
             String statement,
+            String mapperType,
             Map<String, Map<String, String>> columnTypes,
             JavaFieldTypeMetadata javaFieldTypes
     ) {
+        String statementId = statementAttribute(statement, "id");
         String parameterType = statementAttribute(statement, "parameterType");
-        Alignment current = alignUpdatePlaceholders(statement, columnTypes, parameterType, javaFieldTypes);
-        Alignment simpleInsert = alignSimpleInsertPlaceholders(current.text(), columnTypes, parameterType, javaFieldTypes);
-        Alignment structuredInsert = alignStructuredInsertPlaceholders(simpleInsert.text(), columnTypes, parameterType, javaFieldTypes);
+        Alignment current = alignUpdatePlaceholders(statement, columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
+        Alignment simpleInsert = alignSimpleInsertPlaceholders(current.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
+        Alignment structuredInsert = alignStructuredInsertPlaceholders(simpleInsert.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         return new Alignment(
                 structuredInsert.text(),
                 current.replacements() + simpleInsert.replacements() + structuredInsert.replacements()
@@ -191,6 +200,8 @@ class MapperJdbcTypeAligner {
             String statement,
             Map<String, Map<String, String>> columnTypes,
             String parameterType,
+            String mapperType,
+            String statementId,
             JavaFieldTypeMetadata javaFieldTypes
     ) {
         String table = firstTable(statement, UPDATE_TABLE_PATTERN);
@@ -205,6 +216,8 @@ class MapperJdbcTypeAligner {
                 3,
                 4,
                 parameterType,
+                mapperType,
+                statementId,
                 javaFieldTypes,
                 columnTypes
         );
@@ -216,6 +229,8 @@ class MapperJdbcTypeAligner {
                 1,
                 2,
                 parameterType,
+                mapperType,
+                statementId,
                 javaFieldTypes,
                 columnTypes
         );
@@ -230,6 +245,8 @@ class MapperJdbcTypeAligner {
             int placeholderGroup,
             int expressionGroup,
             String parameterType,
+            String mapperType,
+            String statementId,
             JavaFieldTypeMetadata javaFieldTypes,
             Map<String, Map<String, String>> columnTypes
     ) {
@@ -243,7 +260,14 @@ class MapperJdbcTypeAligner {
             String alignedPlaceholder = alignPlaceholderJdbcType(
                     placeholder,
                     columnType,
-                    isStringParameterExpression(matcher.group(expressionGroup), parameterType, javaFieldTypes)
+                    isStringParameterExpression(
+                            matcher.group(expressionGroup),
+                            parameterType,
+                            mapperType,
+                            statementId,
+                            text,
+                            javaFieldTypes
+                    )
             );
             if (!placeholder.equals(alignedPlaceholder)) {
                 replacements++;
@@ -259,6 +283,8 @@ class MapperJdbcTypeAligner {
             String statement,
             Map<String, Map<String, String>> columnTypes,
             String parameterType,
+            String mapperType,
+            String statementId,
             JavaFieldTypeMetadata javaFieldTypes
     ) {
         Matcher insertMatcher = INSERT_TABLE_PATTERN.matcher(statement);
@@ -303,13 +329,22 @@ class MapperJdbcTypeAligner {
                 }
             }
         }
-        return alignPlaceholdersByExpression(statement, expressionColumnTypes, parameterType, javaFieldTypes);
+        return alignPlaceholdersByExpression(
+                statement,
+                expressionColumnTypes,
+                parameterType,
+                mapperType,
+                statementId,
+                javaFieldTypes
+        );
     }
 
     private Alignment alignStructuredInsertPlaceholders(
             String statement,
             Map<String, Map<String, String>> columnTypes,
             String parameterType,
+            String mapperType,
+            String statementId,
             JavaFieldTypeMetadata javaFieldTypes
     ) {
         Matcher insertMatcher = INSERT_TABLE_PATTERN.matcher(statement);
@@ -347,13 +382,22 @@ class MapperJdbcTypeAligner {
                 expressionColumnTypes.put(expression, columnType);
             }
         }
-        return alignPlaceholdersByExpression(statement, expressionColumnTypes, parameterType, javaFieldTypes);
+        return alignPlaceholdersByExpression(
+                statement,
+                expressionColumnTypes,
+                parameterType,
+                mapperType,
+                statementId,
+                javaFieldTypes
+        );
     }
 
     private Alignment alignPlaceholdersByExpression(
             String text,
             Map<String, String> expressionColumnTypes,
             String parameterType,
+            String mapperType,
+            String statementId,
             JavaFieldTypeMetadata javaFieldTypes
     ) {
         if (expressionColumnTypes.isEmpty()) {
@@ -369,7 +413,7 @@ class MapperJdbcTypeAligner {
             String alignedPlaceholder = alignPlaceholderJdbcType(
                     placeholder,
                     columnType,
-                    isStringParameterExpression(expression, parameterType, javaFieldTypes)
+                    isStringParameterExpression(expression, parameterType, mapperType, statementId, text, javaFieldTypes)
             );
             if (!placeholder.equals(alignedPlaceholder)) {
                 replacements++;
@@ -412,19 +456,28 @@ class MapperJdbcTypeAligner {
     private boolean isStringParameterExpression(
             String expression,
             String parameterType,
+            String mapperType,
+            String statementId,
+            String statement,
             JavaFieldTypeMetadata javaFieldTypes
     ) {
-        if (javaFieldTypes == null || parameterType == null || parameterType.isBlank()) {
+        if (javaFieldTypes == null) {
             return false;
         }
         List<String> parts = Pattern.compile("\\.")
                 .splitAsStream(expression == null ? "" : expression.trim())
                 .filter(part -> !part.isBlank())
                 .toList();
-        if (parts.size() != 1) {
-            return false;
+        if (parts.size() == 1 && parameterType != null && !parameterType.isBlank()) {
+            return javaFieldTypes.isStringField(parameterType, parts.get(0));
         }
-        return javaFieldTypes.isStringField(parameterType, parts.get(0));
+        if (parts.size() == 2
+                && !mapperType.isBlank()
+                && !statementId.isBlank()
+                && foreachItemNames(statement).contains(parts.get(0))) {
+            return javaFieldTypes.isStringCollectionItemField(mapperType, statementId, parts.get(1));
+        }
+        return false;
     }
 
     private boolean isNumericColumnType(String columnType) {
@@ -522,6 +575,26 @@ class MapperJdbcTypeAligner {
         return matcher.find() ? matcher.group(2).trim() : "";
     }
 
+    private String mapperNamespace(String text) {
+        Matcher matcher = MAPPER_NAMESPACE_PATTERN.matcher(text == null ? "" : text);
+        return matcher.find() ? matcher.group(2).trim() : "";
+    }
+
+    private Set<String> foreachItemNames(String statement) {
+        Set<String> names = new LinkedHashSet<>();
+        Matcher matcher = FOREACH_ITEM_PATTERN.matcher(statement == null ? "" : statement);
+        while (matcher.find()) {
+            String item = matcher.group(2).trim();
+            if (!item.isBlank()) {
+                names.add(item);
+            }
+        }
+        if (names.isEmpty() && statement != null && statement.toLowerCase(Locale.ROOT).contains("<foreach")) {
+            names.add("item");
+        }
+        return names;
+    }
+
     private List<TrimBlock> trimBlocks(String text) {
         List<TrimBlock> trims = new ArrayList<>();
         Matcher matcher = TRIM_PATTERN.matcher(text);
@@ -571,6 +644,11 @@ class MapperJdbcTypeAligner {
                 inSingleQuote = !inSingleQuote;
             } else if (ch == '"' && !inSingleQuote) {
                 inDoubleQuote = !inDoubleQuote;
+            } else if (!inSingleQuote && !inDoubleQuote && startsMyBatisPlaceholder(text, i)) {
+                int close = text.indexOf('}', i + 2);
+                if (close > i) {
+                    i = close;
+                }
             } else if (!inSingleQuote && !inDoubleQuote) {
                 if (ch == '(') {
                     depth++;
@@ -587,6 +665,12 @@ class MapperJdbcTypeAligner {
             parts.add(last);
         }
         return parts;
+    }
+
+    private boolean startsMyBatisPlaceholder(String text, int index) {
+        return index + 1 < text.length()
+                && text.charAt(index) == '#'
+                && text.charAt(index + 1) == '{';
     }
 
     private int matchingParen(String text, int openIndex) {
@@ -655,15 +739,23 @@ class MapperJdbcTypeAligner {
                         + "([A-Za-z_][A-Za-z0-9_.$]*(?:\\s*<[^;=(){}]+>)?(?:\\s*\\[\\])?)\\s+"
                         + "([A-Za-z_][A-Za-z0-9_]*)\\s*(?:=|;)"
         );
+        private static final Pattern COLLECTION_ELEMENT_SIGNATURE_PATTERN = Pattern.compile(
+                "Ljava/util/(?:List|Collection|Set)<L([^;]+);>;"
+        );
 
         private final Map<String, Map<String, String>> fieldsByType;
+        private final Map<String, Map<String, MethodCollectionMetadata>> collectionMethodsByType;
 
-        private JavaFieldTypeMetadata(Map<String, Map<String, String>> fieldsByType) {
+        private JavaFieldTypeMetadata(
+                Map<String, Map<String, String>> fieldsByType,
+                Map<String, Map<String, MethodCollectionMetadata>> collectionMethodsByType
+        ) {
             this.fieldsByType = fieldsByType;
+            this.collectionMethodsByType = collectionMethodsByType;
         }
 
         private static JavaFieldTypeMetadata empty() {
-            return new JavaFieldTypeMetadata(Map.of());
+            return new JavaFieldTypeMetadata(Map.of(), Map.of());
         }
 
         private static JavaFieldTypeMetadata load(Path projectRoot) throws IOException {
@@ -671,6 +763,7 @@ class MapperJdbcTypeAligner {
                 return empty();
             }
             Map<String, Map<String, String>> fields = new LinkedHashMap<>();
+            Map<String, Map<String, MethodCollectionMetadata>> collectionMethods = new LinkedHashMap<>();
             try (Stream<Path> paths = Files.walk(projectRoot)) {
                 List<Path> regularFiles = paths
                         .filter(Files::isRegularFile)
@@ -690,13 +783,13 @@ class MapperJdbcTypeAligner {
                         continue;
                     }
                     try {
-                        addClassFile(fields, file);
+                        addClassFile(fields, collectionMethods, file);
                     } catch (IOException ignored) {
                         // Keep usable compiled metadata when one class file is unreadable.
                     }
                 }
             }
-            return new JavaFieldTypeMetadata(fields);
+            return new JavaFieldTypeMetadata(fields, collectionMethods);
         }
 
         private static boolean isMainJavaSource(Path path) {
@@ -731,16 +824,23 @@ class MapperJdbcTypeAligner {
             }
         }
 
-        private static void addClassFile(Map<String, Map<String, String>> fields, Path classFile) throws IOException {
-            ClassFields classFields = readClassFields(classFile);
-            if (classFields.fieldTypes().isEmpty()) {
-                return;
+        private static void addClassFile(
+                Map<String, Map<String, String>> fields,
+                Map<String, Map<String, MethodCollectionMetadata>> collectionMethods,
+                Path classFile
+        ) throws IOException {
+            ClassMetadata metadata = readClassFile(classFile);
+            if (!metadata.fieldTypes().isEmpty()) {
+                fields.putIfAbsent(metadata.simpleName(), metadata.fieldTypes());
+                fields.putIfAbsent(metadata.typeName(), metadata.fieldTypes());
             }
-            fields.putIfAbsent(classFields.simpleName(), classFields.fieldTypes());
-            fields.putIfAbsent(classFields.typeName(), classFields.fieldTypes());
+            if (!metadata.collectionMethods().isEmpty()) {
+                collectionMethods.putIfAbsent(metadata.simpleName(), metadata.collectionMethods());
+                collectionMethods.putIfAbsent(metadata.typeName(), metadata.collectionMethods());
+            }
         }
 
-        private static ClassFields readClassFields(Path classFile) throws IOException {
+        private static ClassMetadata readClassFile(Path classFile) throws IOException {
             try (DataInputStream input = new DataInputStream(Files.newInputStream(classFile))) {
                 if (input.readInt() != 0xCAFEBABE) {
                     throw new IOException("Invalid Java class file");
@@ -767,8 +867,88 @@ class MapperJdbcTypeAligner {
                     }
                     skipAttributes(input);
                 }
-                return new ClassFields(typeName, simpleTypeName(typeName), fieldTypes);
+                Map<String, MethodCollectionMetadata> collectionMethods = readCollectionMethods(input, constantPool);
+                return new ClassMetadata(typeName, simpleTypeName(typeName), fieldTypes, collectionMethods);
             }
+        }
+
+        private static Map<String, MethodCollectionMetadata> readCollectionMethods(
+                DataInputStream input,
+                Object[] constantPool
+        ) throws IOException {
+            int methodsCount = input.readUnsignedShort();
+            Map<String, MethodCollectionMetadata> methods = new LinkedHashMap<>();
+            for (int i = 0; i < methodsCount; i++) {
+                input.readUnsignedShort();
+                String methodName = utf8(constantPool, input.readUnsignedShort());
+                input.readUnsignedShort();
+                MethodAttributes attributes = readMethodAttributes(input, constantPool);
+                List<String> elementTypes = collectionElementTypes(attributes.signature());
+                if (!elementTypes.isEmpty()) {
+                    methods.putIfAbsent(
+                            methodName,
+                            new MethodCollectionMetadata(elementTypes, attributes.parameterNames())
+                    );
+                }
+            }
+            return methods;
+        }
+
+        private static MethodAttributes readMethodAttributes(
+                DataInputStream input,
+                Object[] constantPool
+        ) throws IOException {
+            int attributesCount = input.readUnsignedShort();
+            String signature = "";
+            List<String> parameterNames = List.of();
+            for (int i = 0; i < attributesCount; i++) {
+                String attributeName = utf8(constantPool, input.readUnsignedShort());
+                long length = Integer.toUnsignedLong(input.readInt());
+                if ("Signature".equals(attributeName) && length >= 2) {
+                    signature = utf8(constantPool, input.readUnsignedShort());
+                    skipFully(input, length - 2);
+                } else if ("MethodParameters".equals(attributeName) && length >= 1) {
+                    MethodParameters methodParameters = readMethodParameters(input, constantPool, length);
+                    parameterNames = methodParameters.parameterNames();
+                } else {
+                    skipFully(input, length);
+                }
+            }
+            return new MethodAttributes(signature, parameterNames);
+        }
+
+        private static MethodParameters readMethodParameters(
+                DataInputStream input,
+                Object[] constantPool,
+                long length
+        ) throws IOException {
+            int parametersCount = input.readUnsignedByte();
+            long consumed = 1;
+            List<String> parameterNames = new ArrayList<>();
+            for (int i = 0; i < parametersCount; i++) {
+                int nameIndex = input.readUnsignedShort();
+                input.readUnsignedShort();
+                consumed += 4;
+                if (nameIndex > 0) {
+                    parameterNames.add(utf8(constantPool, nameIndex));
+                } else {
+                    parameterNames.add("");
+                }
+            }
+            skipFully(input, Math.max(0, length - consumed));
+            return new MethodParameters(parameterNames);
+        }
+
+        private static List<String> collectionElementTypes(String signature) {
+            if (signature == null || signature.isBlank()) {
+                return List.of();
+            }
+            Matcher matcher = COLLECTION_ELEMENT_SIGNATURE_PATTERN.matcher(signature);
+            List<String> elementTypes = new ArrayList<>();
+            while (matcher.find()) {
+                elementTypes.add(matcher.group(1).replace('/', '.'));
+            }
+            return elementTypes;
         }
 
         private static Object[] readConstantPool(DataInputStream input) throws IOException {
@@ -890,10 +1070,39 @@ class MapperJdbcTypeAligner {
             return "String".equals(fields.get(fieldName));
         }
 
+        private boolean isStringCollectionItemField(String mapperType, String methodName, String fieldName) {
+            Map<String, MethodCollectionMetadata> methods = collectionMethodsByType.get(mapperType);
+            if (methods == null && mapperType != null && mapperType.contains(".")) {
+                methods = collectionMethodsByType.get(mapperType.substring(mapperType.lastIndexOf('.') + 1));
+            }
+            if (methods == null) {
+                return false;
+            }
+            MethodCollectionMetadata method = methods.get(methodName);
+            if (method == null || method.elementTypes().size() != 1) {
+                return false;
+            }
+            return isStringField(method.elementTypes().get(0), fieldName);
+        }
+
         private record ClassInfo(int nameIndex) {
         }
 
-        private record ClassFields(String typeName, String simpleName, Map<String, String> fieldTypes) {
+        private record ClassMetadata(
+                String typeName,
+                String simpleName,
+                Map<String, String> fieldTypes,
+                Map<String, MethodCollectionMetadata> collectionMethods
+        ) {
+        }
+
+        private record MethodAttributes(String signature, List<String> parameterNames) {
+        }
+
+        private record MethodParameters(List<String> parameterNames) {
+        }
+
+        private record MethodCollectionMetadata(List<String> elementTypes, List<String> parameterNames) {
         }
     }
 }
