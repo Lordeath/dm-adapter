@@ -558,7 +558,13 @@ class MapperJdbcTypeAligner {
         if (tableColumns == null) {
             return "";
         }
-        return tableColumns.getOrDefault(normalizeIdentifier(column), "");
+        String cleanedColumn = cleanSqlIdentifier(column);
+        String normalizedColumn = cleanedColumn.toLowerCase(Locale.ROOT);
+        String columnType = tableColumns.getOrDefault(normalizedColumn, "");
+        if (!columnType.isBlank()) {
+            return columnType;
+        }
+        return tableColumns.getOrDefault(toSnakeCaseIdentifier(cleanedColumn).toLowerCase(Locale.ROOT), "");
     }
 
     private String firstTable(String text, Pattern pattern) {
@@ -723,6 +729,26 @@ class MapperJdbcTypeAligner {
 
     private String normalizeIdentifier(String identifier) {
         return cleanSqlIdentifier(identifier).toLowerCase(Locale.ROOT);
+    }
+
+    private String toSnakeCaseIdentifier(String identifier) {
+        String value = identifier == null ? "" : identifier.trim();
+        if (value.isBlank() || value.indexOf('_') >= 0) {
+            return value;
+        }
+        StringBuilder snake = new StringBuilder(value.length() + 8);
+        for (int i = 0; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (Character.isUpperCase(current)) {
+                if (i > 0) {
+                    snake.append('_');
+                }
+                snake.append(Character.toLowerCase(current));
+            } else {
+                snake.append(current);
+            }
+        }
+        return snake.toString();
     }
 
     private record Alignment(String text, int replacements) {

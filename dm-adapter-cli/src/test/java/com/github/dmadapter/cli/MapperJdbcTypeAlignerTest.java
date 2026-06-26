@@ -254,6 +254,58 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void castsStringForeachItemWhenInsertColumnUsesCamelCaseName() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/BrandResourceLibraryMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.BrandResourceLibraryMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert into ns_brand_resource_library (enterpriseId, precinctIdModified)
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.enterpriseId,jdbcType=BIGINT}, #{item.precinctIdModified})
+                        </foreach>
+                    </insert>
+                </mapper>
+                """);
+        compileJavaClass("com/example/BrandResourceLibrary.java", """
+                package com.example;
+
+                public class BrandResourceLibrary {
+                    private Long enterpriseId;
+                    private String precinctIdModified;
+                }
+                """);
+        compileJavaClass("com/example/BrandResourceLibraryMapper.java", """
+                package com.example;
+
+                import java.util.List;
+
+                public interface BrandResourceLibraryMapper {
+                    int insertBatch(List<BrandResourceLibrary> brandResourceLibraryList);
+                }
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of(
+                        "ns_brand_resource_library",
+                        Map.of("enterprise_id", "BIGINT", "precinct_id_modified", "TINYINT")
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "module/src/main/resources/mapper-dm/BrandResourceLibraryMapper.xml"
+        ));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.warnings()).isEmpty();
+        assertThat(rewritten)
+                .contains("#{item.enterpriseId,jdbcType=BIGINT}")
+                .contains("CAST(#{item.precinctIdModified,jdbcType=VARCHAR} AS TINYINT)")
+                .doesNotContain("#{item.precinctIdModified}");
+    }
+
+    @Test
     void keepsReadableJavaMetadataWhenAnotherSourceFileIsMalformed() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
