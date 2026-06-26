@@ -2806,7 +2806,7 @@ class DmSqlValidationTestGenerator {
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
                         Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
-                        configuredValue = mergeConfiguredCollectionElementMap(defaultValue, configuredValue);
+                        configuredValue = mergeConfiguredCollectionElementMap(defaultValue, configuredValue, statement, valueName);
                         return ValueResult.resolved(mapParameterValue(targetType, configuredValue));
                     }
                     if (Collection.class.isAssignableFrom(targetType) && rawValue instanceof Collection) {
@@ -2907,7 +2907,9 @@ class DmSqlValidationTestGenerator {
                                 }
                                 converted.add(mergeConfiguredCollectionElementMap(
                                         new LinkedHashMap<>(defaultElement),
-                                        new LinkedHashMap<>((Map<String, Object>) item)
+                                        new LinkedHashMap<>((Map<String, Object>) item),
+                                        statement,
+                                        valueName
                                 ));
                             } else {
                                 converted.add(item);
@@ -2919,7 +2921,9 @@ class DmSqlValidationTestGenerator {
                         Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
                         return mergeConfiguredCollectionElementMap(
                                 defaultValue,
-                                new LinkedHashMap<>((Map<String, Object>) rawValue)
+                                new LinkedHashMap<>((Map<String, Object>) rawValue),
+                                statement,
+                                valueName
                         );
                     }
                     return rawValue;
@@ -2976,6 +2980,10 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object scalarConfiguredCollectionDefault(String collectionName, MapperStatement statement) {
+                    String resolvedCollectionName = statement.scalarCollectionName(collectionName);
+                    if (!isBlank(resolvedCollectionName)) {
+                        collectionName = resolvedCollectionName;
+                    }
                     Object scalarDefault = statement.collectionScalarDefault(collectionName);
                     if (scalarDefault != null) {
                         return scalarDefault;
@@ -2992,6 +3000,16 @@ class DmSqlValidationTestGenerator {
                         Map<String, Object> defaultValue,
                         Map<String, Object> configuredValue
                 ) {
+                    return mergeConfiguredCollectionElementMap(defaultValue, configuredValue, null, "");
+                }
+
+                @SuppressWarnings("unchecked")
+                private Map<String, Object> mergeConfiguredCollectionElementMap(
+                        Map<String, Object> defaultValue,
+                        Map<String, Object> configuredValue,
+                        MapperStatement statement,
+                        String pathPrefix
+                ) {
                     Map<String, Object> merged = new LinkedHashMap<>(defaultValue);
                     if (configuredValue == null || configuredValue.isEmpty()) {
                         return merged;
@@ -2999,12 +3017,20 @@ class DmSqlValidationTestGenerator {
                     for (Map.Entry<String, Object> entry : configuredValue.entrySet()) {
                         Object existing = merged.get(entry.getKey());
                         Object configured = entry.getValue();
+                        String entryPath = childPath(pathPrefix, entry.getKey());
+                        Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configured, statement);
+                        if (scalarCollection != MethodArgumentConfig.MISSING) {
+                            merged.put(entry.getKey(), scalarCollection);
+                            continue;
+                        }
                         if (existing instanceof Map && configured instanceof Map) {
                             merged.put(
                                     entry.getKey(),
                                     mergeConfiguredCollectionElementMap(
                                             new LinkedHashMap<>((Map<String, Object>) existing),
-                                            new LinkedHashMap<>((Map<String, Object>) configured)
+                                            new LinkedHashMap<>((Map<String, Object>) configured),
+                                            statement,
+                                            entryPath
                                     )
                             );
                             continue;
@@ -3021,6 +3047,47 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return merged;
+                }
+
+                private Object scalarConfiguredCollectionValue(
+                        String collectionName,
+                        Object configuredValue,
+                        MapperStatement statement
+                ) {
+                    if (statement == null || !statement.scalarCollectionParameter(collectionName)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    if (configuredValue instanceof Collection) {
+                        Collection<Object> converted = configuredValue instanceof Set
+                                ? new LinkedHashSet<>()
+                                : new ArrayList<>();
+                        for (Object item : (Collection<?>) configuredValue) {
+                            if (item instanceof Map<?, ?>) {
+                                converted.add(scalarConfiguredCollectionItem(collectionName, (Map<?, ?>) item, statement));
+                            } else {
+                                converted.add(item);
+                            }
+                        }
+                        return converted;
+                    }
+                    if (configuredValue instanceof Map<?, ?>) {
+                        return new ArrayList<>(listOf(scalarConfiguredCollectionItem(
+                                collectionName,
+                                (Map<?, ?>) configuredValue,
+                                statement
+                        )));
+                    }
+                    return MethodArgumentConfig.MISSING;
+                }
+
+                private String childPath(String pathPrefix, String childName) {
+                    if (isBlank(pathPrefix)) {
+                        return childName;
+                    }
+                    if (isBlank(childName)) {
+                        return pathPrefix;
+                    }
+                    return pathPrefix + "." + childName;
                 }
 
                 private Object inferredConfiguredPlaceholderDefault(String valueName, Object configuredValue) {
@@ -3674,22 +3741,40 @@ class DmSqlValidationTestGenerator {
 
                 private Map<String, Object> configuredParameterMap(MapperStatement statement, Map<String, Object> configuredParams) {
                     Map<String, Object> value = defaultParameterMap(statement);
-                    mergeConfiguredParameterMap(value, configuredParams);
+                    mergeConfiguredParameterMap(value, configuredParams, statement, "");
                     return value;
                 }
 
                 @SuppressWarnings("unchecked")
                 private void mergeConfiguredParameterMap(Map<String, Object> target, Map<String, Object> configuredParams) {
+                    mergeConfiguredParameterMap(target, configuredParams, null, "");
+                }
+
+                @SuppressWarnings("unchecked")
+                private void mergeConfiguredParameterMap(
+                        Map<String, Object> target,
+                        Map<String, Object> configuredParams,
+                        MapperStatement statement,
+                        String pathPrefix
+                ) {
                     if (configuredParams == null || configuredParams.isEmpty()) {
                         return;
                     }
                     for (Map.Entry<String, Object> entry : configuredParams.entrySet()) {
                         Object existing = target.get(entry.getKey());
                         Object configuredValue = entry.getValue();
+                        String entryPath = childPath(pathPrefix, entry.getKey());
+                        Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configuredValue, statement);
+                        if (scalarCollection != MethodArgumentConfig.MISSING) {
+                            target.put(entry.getKey(), scalarCollection);
+                            continue;
+                        }
                         if (existing instanceof Map && configuredValue instanceof Map) {
                             mergeConfiguredParameterMap(
                                     (Map<String, Object>) existing,
-                                    (Map<String, Object>) configuredValue
+                                    (Map<String, Object>) configuredValue,
+                                    statement,
+                                    entryPath
                             );
                             continue;
                         }
@@ -7551,6 +7636,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.scalarCollectionParameter(valueName);
                     }
 
+                    private String scalarCollectionName(String valueName) {
+                        return dynamicIdentifierMetadata.scalarCollectionName(valueName);
+                    }
+
                     private boolean hasCollectionElementDefault(String valueName) {
                         return dynamicIdentifierMetadata.hasCollectionElementDefault(valueName);
                     }
@@ -7760,8 +7849,30 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private boolean scalarCollectionParameter(String valueName) {
-                        return containsNameOrSuffix(collectionScalarDefaults.keySet(), valueName)
-                                || containsNameOrSuffix(collectionColumnReferences.keySet(), valueName);
+                        return !isBlank(scalarCollectionName(valueName));
+                    }
+
+                    private String scalarCollectionName(String valueName) {
+                        Set<String> scalarNames = new LinkedHashSet<>();
+                        scalarNames.addAll(collectionScalarDefaults.keySet());
+                        scalarNames.addAll(collectionColumnReferences.keySet());
+                        String normalized = normalizeMetadataName(valueName);
+                        if (isBlank(normalized)) {
+                            return "";
+                        }
+                        if (scalarNames.contains(normalized)) {
+                            return normalized;
+                        }
+                        for (String scalarName : scalarNames) {
+                            if (scalarName.endsWith(normalized) || normalized.endsWith(scalarName)) {
+                                return scalarName;
+                            }
+                        }
+                        if (Pattern.compile("^(?:arg|param)\\d+$").matcher(valueName).matches()
+                                && scalarNames.size() == 1) {
+                            return scalarNames.iterator().next();
+                        }
+                        return "";
                     }
 
                     private Map<String, Object> collectionElementDefault(String valueName) {
