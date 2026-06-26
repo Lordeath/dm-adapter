@@ -699,6 +699,8 @@ class DmAdapterCliTest {
                 .contains("firstCollectionElement(")
                 .contains("configuredCollectionObjectItem(collectionName, item, statement)")
                 .contains("isKnownCollectionObjectProperty(")
+                .contains("if (scalarItem == MethodArgumentConfig.MISSING) {")
+                .contains("return MethodArgumentConfig.MISSING;")
                 .contains("isGeneratedDynamicIdentifierPlaceholder(")
                 .contains("isLikelyDynamicIdentifierName(normalized)")
                 .contains("configuredArgs.valueFor(parameterName, effectiveParameterName, i)")
