@@ -2947,6 +2947,7 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
+                        boolean sameNamedNestedCollectionApplied = false;
                         Object sameNamedNestedCollection = sameNamedNestedCollectionValue(
                                 valueName,
                                 configuredValue,
@@ -2955,8 +2956,9 @@ class DmSqlValidationTestGenerator {
                         );
                         if (sameNamedNestedCollection instanceof Map<?, ?>) {
                             configuredValue = new LinkedHashMap<>((Map<String, Object>) sameNamedNestedCollection);
+                            sameNamedNestedCollectionApplied = true;
                         }
-                        Map<String, Object> defaultValue = nestedProperty
+                        Map<String, Object> defaultValue = (sameNamedNestedCollectionApplied || nestedProperty)
                                 && statement != null
                                 && statement.mapCollectionParameter(valueName)
                                 ? defaultMapCollectionValue(valueName, statement)
@@ -3239,6 +3241,7 @@ class DmSqlValidationTestGenerator {
                     }
                     if (rawValue instanceof Map<?, ?>) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
+                        boolean sameNamedNestedCollectionApplied = false;
                         Object sameNamedNestedCollection = sameNamedNestedCollectionValue(
                                 valueName,
                                 configuredValue,
@@ -3247,8 +3250,13 @@ class DmSqlValidationTestGenerator {
                         );
                         if (sameNamedNestedCollection instanceof Map<?, ?>) {
                             configuredValue = new LinkedHashMap<>((Map<String, Object>) sameNamedNestedCollection);
+                            sameNamedNestedCollectionApplied = true;
                         }
-                        Map<String, Object> defaultValue = defaultMapParameterValue(valueName, statement);
+                        Map<String, Object> defaultValue = sameNamedNestedCollectionApplied
+                                && statement != null
+                                && statement.mapCollectionParameter(valueName)
+                                ? defaultMapCollectionValue(valueName, statement)
+                                : defaultMapParameterValue(valueName, statement);
                         return mergeConfiguredCollectionElementMap(
                                 defaultValue,
                                 configuredValue,
