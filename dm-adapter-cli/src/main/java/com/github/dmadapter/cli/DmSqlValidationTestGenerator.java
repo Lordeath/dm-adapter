@@ -2824,6 +2824,20 @@ class DmSqlValidationTestGenerator {
                         );
                         for (Object item : rawCollection) {
                             if (item instanceof Map<?, ?>) {
+                                if (scalarCollectionElementType(nestedClass)) {
+                                    ValueResult value = configuredScalarCollectionElement(
+                                            valueName,
+                                            (Map<?, ?>) item,
+                                            nestedClass,
+                                            nestedType,
+                                            statement
+                                    );
+                                    if (!value.resolved) {
+                                        return value;
+                                    }
+                                    converted.add(value.value);
+                                    continue;
+                                }
                                 Object scalarItem = scalarConfiguredCollectionItem(
                                         valueName,
                                         (Map<?, ?>) item,
@@ -2878,6 +2892,46 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(rawValue);
                     }
                     return convertScalar(configuredScalarText(rawValue), targetType, genericType);
+                }
+
+                private ValueResult configuredScalarCollectionElement(
+                        String collectionName,
+                        Map<?, ?> item,
+                        Class<?> targetType,
+                        Type genericType,
+                        MapperStatement statement
+                ) {
+                    Object scalarItem = scalarConfiguredCollectionItem(collectionName, item, statement);
+                    if (scalarItem != MethodArgumentConfig.MISSING) {
+                        ValueResult value = convertConfiguredValue(scalarItem, targetType, genericType, statement, collectionName);
+                        if (value.resolved) {
+                            return value;
+                        }
+                    }
+                    for (Object candidate : item.values()) {
+                        ValueResult value = convertConfiguredValue(candidate, targetType, genericType, statement, collectionName);
+                        if (value.resolved) {
+                            return value;
+                        }
+                    }
+                    return defaultValue(collectionName, targetType, genericType, 0, statement);
+                }
+
+                private boolean scalarCollectionElementType(Class<?> targetType) {
+                    if (targetType == null) {
+                        return false;
+                    }
+                    return targetType.isPrimitive()
+                            || CharSequence.class.isAssignableFrom(targetType)
+                            || Number.class.isAssignableFrom(targetType)
+                            || Boolean.class.equals(targetType)
+                            || Character.class.equals(targetType)
+                            || Date.class.isAssignableFrom(targetType)
+                            || LocalDate.class.equals(targetType)
+                            || LocalDateTime.class.equals(targetType)
+                            || LocalTime.class.equals(targetType)
+                            || Instant.class.equals(targetType)
+                            || targetType.isEnum();
                 }
 
                 @SuppressWarnings("unchecked")
