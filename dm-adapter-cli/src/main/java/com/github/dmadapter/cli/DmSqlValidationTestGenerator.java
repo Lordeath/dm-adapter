@@ -2197,6 +2197,16 @@ class DmSqlValidationTestGenerator {
                                     : ParameterResolution.unresolved("configured", value.message);
                         }
                         if (Map.class.isAssignableFrom(parameterTypes[0])) {
+                            if (mapperMethod.statement != null
+                                    && mapperMethod.statement.mapCollectionParameter(parameterName)) {
+                                return ParameterResolution.resolved(
+                                        "configured",
+                                        new Object[] { mapParameterValue(
+                                                parameterTypes[0],
+                                                defaultMapParameterValue(parameterName, mapperMethod.statement)
+                                        ) }
+                                );
+                            }
                             return ParameterResolution.resolved(
                                     "configured",
                                     new Object[] { mapParameterValue(

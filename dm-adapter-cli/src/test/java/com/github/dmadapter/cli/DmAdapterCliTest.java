@@ -495,6 +495,7 @@ class DmAdapterCliTest {
                 .contains("scalarConfiguredCollectionItem")
                 .contains("scalarCollectionParameter")
                 .contains("normalized.contains(\"mapupdate\")")
+                .contains("mapperMethod.statement.mapCollectionParameter(parameterName)")
                 .contains("value instanceof Map<?, ?>")
                 .contains("configuredDateValue")
                 .contains("configuredInstant")
