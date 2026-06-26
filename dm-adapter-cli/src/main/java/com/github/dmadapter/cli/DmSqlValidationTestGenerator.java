@@ -6468,6 +6468,9 @@ class DmSqlValidationTestGenerator {
                     if (isAutoParameter(record) && hasGeneratedSearchParameterIssue(record, message)) {
                         return "GENERATED_SEARCH_PARAMETER";
                     }
+                    if (lower.contains("on duplicate key update")) {
+                        return "ON_DUPLICATE_KEY_UPDATE";
+                    }
                     if (hasOriginalXmlSyntaxDefect(message)) {
                         return "ORIGINAL_XML_SYNTAX_DEFECT";
                     }
@@ -6585,9 +6588,6 @@ class DmSqlValidationTestGenerator {
                     }
                     if (Pattern.compile("update\\\\s+set\\\\s+[a-z_][a-z0-9_]*", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "UPDATE_SET_TABLE_ORDER";
-                    }
-                    if (lower.contains("on duplicate key update")) {
-                        return "ON_DUPLICATE_KEY_UPDATE";
                     }
                     if (Pattern.compile("insert\\\\s+into\\\\b[\\\\s\\\\S]*?\\\\)\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "INSERT_FOREACH_MISSING_VALUES";
