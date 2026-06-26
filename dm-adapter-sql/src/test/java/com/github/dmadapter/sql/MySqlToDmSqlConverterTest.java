@@ -390,6 +390,29 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlDeleteAliasStarToDamengDeleteAlias() {
+        SqlConversionResult result = converter.convert("""
+                delete t.* from ${targetTableName} t
+                where t.id = #{id}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                delete from ${targetTableName} t
+                where t.id = #{id}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DELETE_ALIAS_STAR_RULE);
+    }
+
+    @Test
+    void keepsDeleteAliasStarWhenAliasDoesNotMatchTargetAlias() {
+        SqlConversionResult result = converter.convert("delete t.* from sample_user u where u.id = #{id}");
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
     void quotesDamengKeywordTableAliasAndReferences() {
         SqlConversionResult result = converter.convert("""
                 SELECT base.precinct_id, SUM(cluster.manage_area) AS inpipeArea
