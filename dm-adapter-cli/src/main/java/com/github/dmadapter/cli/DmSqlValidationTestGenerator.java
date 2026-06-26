@@ -2915,6 +2915,22 @@ class DmSqlValidationTestGenerator {
                         );
                         for (Object item : rawCollection) {
                             if (item instanceof Map<?, ?>) {
+                                if (Collection.class.isAssignableFrom(nestedClass)) {
+                                    converted.add(new ArrayList<>(listOf(item)));
+                                    continue;
+                                }
+                                if (rawCollectionElementType(genericType)
+                                        && configuredCollectionObjectItem(valueName, (Map<?, ?>) item, statement)) {
+                                    Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
+                                    configuredItem = mergeConfiguredCollectionElementMap(
+                                            new LinkedHashMap<>(defaultElement),
+                                            configuredItem,
+                                            statement,
+                                            valueName
+                                    );
+                                    converted.add(configuredItem);
+                                    continue;
+                                }
                                 if (scalarCollectionElementType(nestedClass)) {
                                     ValueResult value = configuredScalarCollectionElement(
                                             valueName,
@@ -2985,6 +3001,10 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(rawValue);
                     }
                     return convertScalar(configuredScalarText(rawValue), targetType, genericType);
+                }
+
+                private boolean rawCollectionElementType(Type genericType) {
+                    return !(genericType instanceof ParameterizedType);
                 }
 
                 private ValueResult configuredScalarCollectionElement(

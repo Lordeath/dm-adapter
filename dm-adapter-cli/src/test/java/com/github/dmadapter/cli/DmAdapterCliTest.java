@@ -697,6 +697,8 @@ class DmAdapterCliTest {
                 .contains("nestedConfiguredCollectionValue(existing, configuredValue)")
                 .contains("isCollectionOfCollections(existing)")
                 .contains("firstCollectionElement(")
+                .contains("Collection.class.isAssignableFrom(nestedClass)")
+                .contains("rawCollectionElementType(genericType)")
                 .contains("configuredCollectionObjectItem(collectionName, item, statement)")
                 .contains("knownCollectionObjectPropertyCount(item) >= 2")
                 .contains("private int knownCollectionObjectPropertyCount(Map<?, ?> item)")
