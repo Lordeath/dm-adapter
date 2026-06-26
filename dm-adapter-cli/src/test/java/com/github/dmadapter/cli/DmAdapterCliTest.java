@@ -675,7 +675,9 @@ class DmAdapterCliTest {
                 .contains("!statement.hasCollectionElementDefault(collectionName)")
                 .contains("!statement.hasCollectionElementColumnReferences(collectionName)")
                 .contains("return dynamicIdentifierMetadata.hasCollectionElementDefault(valueName)")
-                .contains("return dynamicIdentifierMetadata.hasCollectionElementColumnReferences(valueName)");
+                .contains("return dynamicIdentifierMetadata.hasCollectionElementColumnReferences(valueName)")
+                .contains("if (scalarCollectionParameter(valueName))")
+                .contains("if (references == null && scalarCollectionParameter(collectionName))");
     }
 
     @Test

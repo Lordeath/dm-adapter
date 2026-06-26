@@ -7717,6 +7717,9 @@ class DmSqlValidationTestGenerator {
                         if (defaults != null) {
                             return defaults;
                         }
+                        if (scalarCollectionParameter(valueName)) {
+                            return emptyMap();
+                        }
                         defaults = collectionElementDefaults.get("item");
                         if (defaults != null) {
                             return defaults;
@@ -7750,6 +7753,9 @@ class DmSqlValidationTestGenerator {
                     private Map<String, ColumnReference> collectionElementColumnReferences(String collectionName) {
                         Map<String, ColumnReference> references = valueByNameOrSuffix(collectionElementColumnReferences, collectionName);
                         Map<String, String> names = valueByNameOrSuffix(collectionElementColumnReferenceNames, collectionName);
+                        if (references == null && scalarCollectionParameter(collectionName)) {
+                            return emptyMap();
+                        }
                         if (references == null) {
                             references = collectionElementColumnReferences.get("item");
                             names = collectionElementColumnReferenceNames.get("item");
