@@ -2473,6 +2473,16 @@ class DmSqlValidationTestGenerator {
                         } catch (MapperInvocationException e) {
                             sqlSession.rollback(true);
                             String summary = throwableSummary(e.getCause());
+                            if (isEmptyDynamicSqlFailure(summary)) {
+                                return ValidationRecord.skipped(
+                                        parameters.recordKey(mapperMethod.key()),
+                                        parameters.source,
+                                        parametersSummary(parameters),
+                                        "动态 SQL 未生成，通常是当前测试参数没有触发 mapper 的动态 SQL 分支；"
+                                                + "请在 .dm-adapter/sql-rewrite.yml 的 validationArgs 中配置能触发该分支的参数。"
+                                                + "\\n" + summary
+                                );
+                            }
                             if (isPrimitiveNullReturnFailure(summary)) {
                                 return ValidationRecord.skipped(
                                         parameters.recordKey(mapperMethod.key()),
@@ -2492,6 +2502,16 @@ class DmSqlValidationTestGenerator {
                         } catch (Throwable e) {
                             sqlSession.rollback(true);
                             String summary = throwableSummary(e);
+                            if (isEmptyDynamicSqlFailure(summary)) {
+                                return ValidationRecord.skipped(
+                                        parameters.recordKey(mapperMethod.key()),
+                                        parameters.source,
+                                        parametersSummary(parameters),
+                                        "动态 SQL 未生成，通常是当前测试参数没有触发 mapper 的动态 SQL 分支；"
+                                                + "请在 .dm-adapter/sql-rewrite.yml 的 validationArgs 中配置能触发该分支的参数。"
+                                                + "\\n" + summary
+                                );
+                            }
                             if (isPrimitiveNullReturnFailure(summary)) {
                                 return ValidationRecord.skipped(
                                         parameters.recordKey(mapperMethod.key()),
@@ -2528,6 +2548,10 @@ class DmSqlValidationTestGenerator {
                                 parameters
                         );
                     }
+                }
+
+                private boolean isEmptyDynamicSqlFailure(String message) {
+                    return message != null && message.toLowerCase(Locale.ROOT).contains("sql语句为null或空值");
                 }
 
                 private boolean isPrimitiveNullReturnFailure(String message) {
