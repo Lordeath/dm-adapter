@@ -3194,6 +3194,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (rawValue instanceof Collection) {
                         Map<String, Object> defaultElement = typedCollectionElementDefault(valueName, statement);
+                        if (defaultElement.isEmpty() && statement != null) {
+                            defaultElement = firstMapElementDefault(statement.collectionScalarDefault(valueName));
+                        }
                         Collection<Object> converted = rawValue instanceof Set
                                 ? new LinkedHashSet<>()
                                 : new ArrayList<>();
@@ -3287,6 +3290,14 @@ class DmSqlValidationTestGenerator {
                     Map<String, Object> value = typedCollectionElementDefault(collectionName, statement);
                     if (!value.isEmpty()) {
                         return new LinkedHashMap<>(value);
+                    }
+                    if (statement != null) {
+                        Map<String, Object> scalarDefault = firstMapElementDefault(
+                                statement.collectionScalarDefault(collectionName)
+                        );
+                        if (!scalarDefault.isEmpty()) {
+                            return scalarDefault;
+                        }
                     }
                     ValueResult defaultCollection = defaultValue(collectionName, targetType, genericType, 0, statement);
                     if (!defaultCollection.resolved || !(defaultCollection.value instanceof Collection)) {
@@ -3688,6 +3699,15 @@ class DmSqlValidationTestGenerator {
                                         field.getName(),
                                         existingDefault
                                 );
+                                Object nestedCollection = nestedConfiguredCollectionValue(
+                                        existingDefault,
+                                        configured,
+                                        statement,
+                                        field.getName()
+                                );
+                                if (nestedCollection != MethodArgumentConfig.MISSING) {
+                                    configured = nestedCollection;
+                                }
                                 Object coerced = coerceConfiguredValueToDefaultType(configured, existingDefault);
                                 Object valueToConvert = coerced != configured
                                         || shouldKeepConfiguredValue(field.getName(), configured, existingDefault)
