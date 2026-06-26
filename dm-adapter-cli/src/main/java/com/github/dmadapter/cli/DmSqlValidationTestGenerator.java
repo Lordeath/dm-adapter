@@ -2240,7 +2240,7 @@ class DmSqlValidationTestGenerator {
                                         collectionLike ? collectionParameterIndex(parameterTypes, i) : -1,
                                         parameterName
                                 );
-                        Object rawValue = configuredArgs.valueFor(parameterName, i);
+                        Object rawValue = configuredArgs.valueFor(parameterName, effectiveParameterName, i);
                         ValueResult value = rawValue == MethodArgumentConfig.MISSING
                                 ? defaultValue(effectiveParameterName, parameterTypes[i], genericTypes[i], 0, mapperMethod.statement)
                                 : convertConfiguredValue(
@@ -6886,18 +6886,32 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private Object valueFor(String parameterName, int index) {
-                        if (params.containsKey(parameterName)) {
-                            return params.get(parameterName);
+                        return valueFor(parameterName, "", index);
+                    }
+
+                    private Object valueFor(String parameterName, String effectiveParameterName, int index) {
+                        Object value = valueForName(effectiveParameterName);
+                        if (value != MISSING) {
+                            return value;
+                        }
+                        value = valueForName(parameterName);
+                        if (value != MISSING) {
+                            return value;
                         }
                         String argName = "arg" + index;
-                        if (params.containsKey(argName)) {
-                            return params.get(argName);
+                        value = valueForName(argName);
+                        if (value != MISSING) {
+                            return value;
                         }
                         String paramName = "param" + (index + 1);
-                        if (params.containsKey(paramName)) {
-                            return params.get(paramName);
+                        return valueForName(paramName);
+                    }
+
+                    private Object valueForName(String name) {
+                        if (isBlank(name) || !params.containsKey(name)) {
+                            return MISSING;
                         }
-                        return MISSING;
+                        return params.get(name);
                     }
                 }
 
