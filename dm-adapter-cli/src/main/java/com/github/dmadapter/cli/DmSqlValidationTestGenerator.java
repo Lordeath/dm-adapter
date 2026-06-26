@@ -7499,6 +7499,14 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.scalarCollectionParameter(valueName);
                     }
 
+                    private boolean hasCollectionElementDefault(String valueName) {
+                        return dynamicIdentifierMetadata.hasCollectionElementDefault(valueName);
+                    }
+
+                    private boolean hasCollectionElementColumnReferences(String valueName) {
+                        return dynamicIdentifierMetadata.hasCollectionElementColumnReferences(valueName);
+                    }
+
                     private boolean nonEmptyCollectionParameter(String valueName) {
                         return dynamicIdentifierMetadata.nonEmptyCollectionParameter(valueName);
                     }
