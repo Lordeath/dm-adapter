@@ -163,6 +163,51 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void keepsReadableJavaMetadataWhenAnotherSourceFileIsMalformed() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.OwnerHouseResultMapper">
+                    <insert id="insertSelective" parameterType="com.example.HouseListEntity">
+                        insert into owner_house_result
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="hasRelevance != null">
+                                has_relevance,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="hasRelevance != null">
+                                #{hasRelevance,jdbcType=INTEGER},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """);
+        writeJava("src/main/java/com/example/HouseListEntity.java", """
+                package com.example;
+
+                public class HouseListEntity {
+                    private String hasRelevance;
+                }
+                """);
+        writeBytes("src/main/java/com/example/MalformedSource.java", new byte[]{
+                (byte) 0xF0, 0x28, (byte) 0x8C, (byte) 0xBC
+        });
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("owner_house_result", Map.of("has_relevance", "INTEGER"))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/OwnerHouseResultMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.warnings()).isEmpty();
+        assertThat(rewritten)
+                .contains("CAST(#{hasRelevance,jdbcType=VARCHAR} AS INTEGER)")
+                .doesNotContain("#{hasRelevance,jdbcType=INTEGER}");
+    }
+
+    @Test
     void collectsReferencedMapperDmTables() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/SystemAreaMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -205,5 +250,11 @@ class MapperJdbcTypeAlignerTest {
         Path path = tempDir.resolve(relativePath);
         Files.createDirectories(path.getParent());
         Files.writeString(path, content);
+    }
+
+    private void writeBytes(String relativePath, byte[] content) throws Exception {
+        Path path = tempDir.resolve(relativePath);
+        Files.createDirectories(path.getParent());
+        Files.write(path, content);
     }
 }

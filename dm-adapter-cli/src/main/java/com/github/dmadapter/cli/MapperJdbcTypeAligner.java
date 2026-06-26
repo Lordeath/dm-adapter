@@ -677,7 +677,11 @@ class MapperJdbcTypeAligner {
                         .filter(JavaFieldTypeMetadata::isMainJavaSource)
                         .toList();
                 for (Path javaFile : javaFiles) {
-                    addJavaFile(fields, javaFile);
+                    try {
+                        addJavaFile(fields, javaFile);
+                    } catch (IOException ignored) {
+                        // Keep usable source metadata when one project file is unreadable or not UTF-8.
+                    }
                 }
             }
             return new JavaFieldTypeMetadata(fields);
