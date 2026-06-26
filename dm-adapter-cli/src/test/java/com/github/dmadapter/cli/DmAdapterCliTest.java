@@ -656,6 +656,27 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void generatedValidationTestKeepsScalarForeachCollectionsFromReusingObjectElementDefaults() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        String generatedTestSource = Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"));
+        assertThat(exitCode).isZero();
+        assertThat(generatedTestSource)
+                .contains("metadata.addCollectionScalarDefault(")
+                .contains("defaultValueForDirectParameter(collection, jdbcType)")
+                .contains("statement.scalarCollectionParameter(collectionName)")
+                .contains("!statement.hasCollectionElementDefault(collectionName)")
+                .contains("!statement.hasCollectionElementColumnReferences(collectionName)");
+    }
+
+    @Test
     void generateValidationTestPreservesCommaSeparatedSchemas() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
@@ -1077,6 +1098,24 @@ class DmAdapterCliTest {
                             </if>
                         </where>
                     </select>
+                    <update id="updateOwnerIdByIdAndSplitOwnerId">
+                        update owner_customer
+                        <trim prefix="set" suffixOverrides=",">
+                            owner_id = case owner_id
+                            <foreach collection="list" item="item">
+                                when #{item.splitOldOwnerId} then #{item.ownerId}
+                            </foreach>
+                            end,
+                        </trim>
+                        where owner_id in
+                        <foreach collection="list" item="item" open="(" close=")" separator=",">
+                            #{item.splitOldOwnerId}
+                        </foreach>
+                        and id in
+                        <foreach collection="processTaskDetailIdList" item="item" open="(" close=")" separator=",">
+                            #{item}
+                        </foreach>
+                    </update>
                 </mapper>
                 """);
     }
