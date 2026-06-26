@@ -216,6 +216,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlImplicitSingleQuotedColumnAliasesInSelectFragments() {
+        SqlConversionResult result = converter.convert(
+                "wfInst.id_ 'id',wfInst.subject_ 'subject', due.date_type_ 'dueDateType'"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("wfInst.id_ AS \"id\",wfInst.subject_ AS \"subject\", due.date_type_ AS \"dueDateType\"");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+    }
+
+    @Test
     void convertsMysqlImplicitSingleQuotedAliasAfterSubqueryExpression() {
         SqlConversionResult result = converter.convert(
                 "select (select count(tmp.id_) from role_auth tmp where tmp.menu_alias_ = menu.alias_) 'checked' from menu"
@@ -225,6 +237,26 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql())
                 .isEqualTo("select (select count(tmp.id_) from role_auth tmp where tmp.menu_alias_ = menu.alias_) AS \"checked\" from menu");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+    }
+
+    @Test
+    void convertsMysqlImplicitSingleQuotedAliasAfterSubqueryFragment() {
+        SqlConversionResult result = converter.convert(
+                "(SELECT count(tmpB.id_) FROM portal_sys_role_auth tmpB WHERE tmpB.menu_alias_ = sysMenu.ALIAS_) 'checked'"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("(SELECT count(tmpB.id_) FROM portal_sys_role_auth tmpB WHERE tmpB.menu_alias_ = sysMenu.ALIAS_) AS \"checked\"");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+    }
+
+    @Test
+    void keepsSingleQuotedStringLiteralsInConditionFragments() {
+        assertThat(converter.convert("AND opinion.status_ != 'signLineRetracted'").convertedSql())
+                .isEqualTo("AND opinion.status_ != 'signLineRetracted'");
+        assertThat(converter.convert("WHERE status_ 'ACTIVE'").convertedSql())
+                .isEqualTo("WHERE status_ 'ACTIVE'");
     }
 
     @Test

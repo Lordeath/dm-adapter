@@ -662,9 +662,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private boolean isImplicitSelectAliasPosition(String sql, int quoteIndex, int quoteEndIndex) {
-        if (!isInsideSelectList(sql, quoteIndex)) {
-            return false;
-        }
         char previous = previousNonWhitespace(sql, quoteIndex);
         if (previous != ')' && previous != '"' && previous != '`' && !isIdentifierPart(previous)) {
             return false;
@@ -678,9 +675,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         int next = skipWhitespace(sql, quoteEndIndex);
-        return next >= sql.length()
+        boolean hasAliasTerminator = next >= sql.length()
                 || sql.charAt(next) == ','
                 || startsKeyword(sql, next, "FROM");
+        return hasAliasTerminator
+                && (isInsideSelectList(sql, quoteIndex) || isLikelySelectListFragmentAliasPosition(sql, quoteIndex));
     }
 
     private boolean isInsideSelectList(String sql, int targetIndex) {
@@ -718,6 +717,79 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return Boolean.TRUE.equals(selectListByDepth.get(depth));
+    }
+
+    private boolean isLikelySelectListFragmentAliasPosition(String sql, int quoteIndex) {
+        int boundary = previousTopLevelSelectItemBoundary(sql, quoteIndex);
+        String itemPrefix = sql.substring(boundary, quoteIndex).trim();
+        return !itemPrefix.isBlank()
+                && !startsWithTopLevelSqlClauseKeyword(itemPrefix)
+                && !containsTopLevelClauseKeyword(itemPrefix);
+    }
+
+    private int previousTopLevelSelectItemBoundary(String sql, int targetIndex) {
+        int depth = 0;
+        int boundary = 0;
+        int index = 0;
+        while (index < targetIndex && index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (depth == 0 && current == ',') {
+                boundary = index + 1;
+                index++;
+            } else if (depth == 0 && startsKeyword(sql, index, "SELECT")) {
+                boundary = index + "SELECT".length();
+                index += "SELECT".length();
+            } else {
+                index++;
+            }
+        }
+        return boundary;
+    }
+
+    private boolean startsWithTopLevelSqlClauseKeyword(String sql) {
+        int index = skipWhitespace(sql, 0);
+        return startsKeyword(sql, index, "AND")
+                || startsKeyword(sql, index, "OR")
+                || startsKeyword(sql, index, "ON")
+                || startsKeyword(sql, index, "WHERE")
+                || startsKeyword(sql, index, "FROM")
+                || startsKeyword(sql, index, "GROUP")
+                || startsKeyword(sql, index, "ORDER")
+                || startsKeyword(sql, index, "HAVING")
+                || startsKeyword(sql, index, "LIMIT")
+                || startsKeyword(sql, index, "JOIN")
+                || startsKeyword(sql, index, "SET")
+                || startsKeyword(sql, index, "VALUES");
+    }
+
+    private boolean containsTopLevelClauseKeyword(String sql) {
+        return findTopLevelKeyword(sql, "FROM", 0) >= 0
+                || findTopLevelKeyword(sql, "WHERE", 0) >= 0
+                || findTopLevelKeyword(sql, "JOIN", 0) >= 0
+                || findTopLevelKeyword(sql, "ON", 0) >= 0
+                || findTopLevelKeyword(sql, "GROUP", 0) >= 0
+                || findTopLevelKeyword(sql, "ORDER", 0) >= 0
+                || findTopLevelKeyword(sql, "HAVING", 0) >= 0
+                || findTopLevelKeyword(sql, "LIMIT", 0) >= 0
+                || findTopLevelKeyword(sql, "UNION", 0) >= 0
+                || findTopLevelKeyword(sql, "SET", 0) >= 0
+                || findTopLevelKeyword(sql, "VALUES", 0) >= 0;
     }
 
     private GenericConversion removeMysqlSelectModifiers(String sql) {
