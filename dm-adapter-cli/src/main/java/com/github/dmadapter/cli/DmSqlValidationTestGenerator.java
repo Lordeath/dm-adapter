@@ -3416,6 +3416,10 @@ class DmSqlValidationTestGenerator {
                     if (!isBlank(resolvedCollectionName)) {
                         collectionName = resolvedCollectionName;
                     }
+                    Object sqlFragmentDefault = statement.collectionSqlFragmentDefault(collectionName);
+                    if (sqlFragmentDefault != null) {
+                        return sqlFragmentDefault;
+                    }
                     Object scalarDefault = statement.collectionScalarDefault(collectionName);
                     if (scalarDefault != null) {
                         return scalarDefault;
@@ -8556,6 +8560,7 @@ class DmSqlValidationTestGenerator {
 
                     private String scalarCollectionName(String valueName) {
                         Set<String> scalarNames = new LinkedHashSet<>();
+                        scalarNames.addAll(collectionSqlFragmentDefaults.keySet());
                         scalarNames.addAll(collectionScalarDefaults.keySet());
                         scalarNames.addAll(collectionColumnReferences.keySet());
                         return matchingMetadataName(scalarNames, valueName);
