@@ -2919,6 +2919,20 @@ class DmSqlValidationTestGenerator {
                                     converted.add(new ArrayList<>(listOf(item)));
                                     continue;
                                 }
+                                if (shouldUsePojoCollectionElement(nestedClass)) {
+                                    ValueResult value = convertConfiguredValue(
+                                            item,
+                                            nestedClass,
+                                            nestedType,
+                                            statement,
+                                            valueName
+                                    );
+                                    if (!value.resolved) {
+                                        return value;
+                                    }
+                                    converted.add(value.value);
+                                    continue;
+                                }
                                 if (rawCollectionElementType(genericType)
                                         && configuredCollectionObjectItem(valueName, (Map<?, ?>) item, statement)) {
                                     Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
@@ -2982,6 +2996,14 @@ class DmSqlValidationTestGenerator {
                         }
                         return ValueResult.resolved(converted);
                     }
+                    if (rawValue instanceof Map<?, ?> && shouldUsePojoCollectionElement(targetType)) {
+                        return configuredPojoValue(
+                                targetType,
+                                genericType,
+                                new LinkedHashMap<>((Map<String, Object>) rawValue),
+                                statement
+                        );
+                    }
                     if (targetType.isArray() && rawValue instanceof Collection) {
                         Type componentType = targetType.getComponentType();
                         Class<?> componentClass = targetType.getComponentType();
@@ -3005,6 +3027,24 @@ class DmSqlValidationTestGenerator {
 
                 private boolean rawCollectionElementType(Type genericType) {
                     return !(genericType instanceof ParameterizedType);
+                }
+
+                private boolean shouldUsePojoCollectionElement(Class<?> targetType) {
+                    if (targetType == null
+                            || Object.class.equals(targetType)
+                            || targetType.isPrimitive()
+                            || targetType.isArray()
+                            || targetType.isInterface()
+                            || Modifier.isAbstract(targetType.getModifiers())
+                            || Map.class.isAssignableFrom(targetType)
+                            || Collection.class.isAssignableFrom(targetType)
+                            || scalarCollectionElementType(targetType)) {
+                        return false;
+                    }
+                    String name = targetType.getName();
+                    return !name.startsWith("java.")
+                            && !name.startsWith("javax.")
+                            && !name.startsWith("jakarta.");
                 }
 
                 private ValueResult configuredScalarCollectionElement(
@@ -3522,8 +3562,21 @@ class DmSqlValidationTestGenerator {
                                 if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers) || !params.containsKey(field.getName())) {
                                     continue;
                                 }
-                                ValueResult fieldValue = convertConfiguredValue(
+                                field.setAccessible(true);
+                                Object existingDefault = field.get(instance);
+                                Object configured = normalizeConfiguredDynamicIdentifierValue(
                                         params.get(field.getName()),
+                                        statement,
+                                        field.getName(),
+                                        existingDefault
+                                );
+                                Object coerced = coerceConfiguredValueToDefaultType(configured, existingDefault);
+                                Object valueToConvert = coerced != configured
+                                        || shouldKeepConfiguredValue(field.getName(), configured, existingDefault)
+                                        ? coerced
+                                        : existingDefault;
+                                ValueResult fieldValue = convertConfiguredValue(
+                                        valueToConvert,
                                         field.getType(),
                                         field.getGenericType(),
                                         statement,
@@ -3532,7 +3585,6 @@ class DmSqlValidationTestGenerator {
                                 if (!fieldValue.resolved) {
                                     return fieldValue;
                                 }
-                                field.setAccessible(true);
                                 field.set(instance, fieldValue.value);
                             }
                             currentType = currentType.getSuperclass();
@@ -3663,6 +3715,18 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(array);
                     }
                     if (Collection.class.isAssignableFrom(targetType)) {
+                        Type nestedType = firstGenericArgument(genericType);
+                        Class<?> nestedClass = rawClass(nestedType);
+                        if (shouldUsePojoCollectionElement(nestedClass)) {
+                            ValueResult nestedValue = defaultValue(valueName, nestedClass, nestedType, depth + 1, statement);
+                            if (!nestedValue.resolved) {
+                                return nestedValue;
+                            }
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(nestedValue.value)));
+                            }
+                            return ValueResult.resolved(new ArrayList<>(listOf(nestedValue.value)));
+                        }
                         Map<String, Object> collectionElementDefault = typedCollectionElementDefault(valueName, statement);
                         if (!collectionElementDefault.isEmpty()) {
                             Map<String, Object> elementValue = new LinkedHashMap<>(collectionElementDefault);
@@ -3702,7 +3766,6 @@ class DmSqlValidationTestGenerator {
                             }
                             return ValueResult.resolved(new ArrayList<>(listOf(scalarDefault)));
                         }
-                        Type nestedType = firstGenericArgument(genericType);
                         ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1, statement);
                         if (!nestedValue.resolved) {
                             return nestedValue;
@@ -5050,6 +5113,10 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object serializableValue(Object value) {
+                    return serializableValue(value, 0);
+                }
+
+                private Object serializableValue(Object value, int depth) {
                     if (value == null
                             || value instanceof CharSequence
                             || value instanceof Number
@@ -5057,8 +5124,28 @@ class DmSqlValidationTestGenerator {
                             || value instanceof Enum<?>) {
                         return value;
                     }
-                    if (value instanceof Date
-                            || value instanceof java.time.temporal.TemporalAccessor
+                    if (value instanceof java.sql.Date) {
+                        return "2024-01-01";
+                    }
+                    if (value instanceof java.sql.Time) {
+                        return "00:00:00";
+                    }
+                    if (value instanceof Date) {
+                        return "2024-01-01 00:00:00";
+                    }
+                    if (value instanceof LocalDate) {
+                        return "2024-01-01";
+                    }
+                    if (value instanceof LocalDateTime) {
+                        return "2024-01-01T00:00:00";
+                    }
+                    if (value instanceof LocalTime) {
+                        return "00:00:00";
+                    }
+                    if (value instanceof Instant) {
+                        return "2024-01-01T00:00:00Z";
+                    }
+                    if (value instanceof java.time.temporal.TemporalAccessor
                             || value instanceof UUID) {
                         return String.valueOf(value);
                     }
@@ -5067,7 +5154,7 @@ class DmSqlValidationTestGenerator {
                         List<Object> values = new ArrayList<>();
                         int length = Array.getLength(value);
                         for (int i = 0; i < length; i++) {
-                            Object item = serializableValue(Array.get(value, i));
+                            Object item = serializableValue(Array.get(value, i), depth + 1);
                             if (item == MethodArgumentConfig.MISSING) {
                                 return MethodArgumentConfig.MISSING;
                             }
@@ -5082,7 +5169,7 @@ class DmSqlValidationTestGenerator {
                     if (value instanceof Collection<?>) {
                         List<Object> values = new ArrayList<>();
                         for (Object item : (Collection<?>) value) {
-                            Object serializable = serializableValue(item);
+                            Object serializable = serializableValue(item, depth + 1);
                             if (serializable == MethodArgumentConfig.MISSING) {
                                 return MethodArgumentConfig.MISSING;
                             }
@@ -5090,7 +5177,55 @@ class DmSqlValidationTestGenerator {
                         }
                         return values;
                     }
+                    Map<String, Object> pojo = serializablePojo(value, depth);
+                    if (!pojo.isEmpty()) {
+                        return pojo;
+                    }
                     return MethodArgumentConfig.MISSING;
+                }
+
+                private Map<String, Object> serializablePojo(Object value, int depth) {
+                    if (value == null || depth > 2 || !shouldSerializePojoType(value.getClass())) {
+                        return emptyMap();
+                    }
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    Class<?> currentType = value.getClass();
+                    try {
+                        while (currentType != null && !Object.class.equals(currentType)) {
+                            for (Field field : currentType.getDeclaredFields()) {
+                                int modifiers = field.getModifiers();
+                                if (Modifier.isStatic(modifiers)
+                                        || Modifier.isFinal(modifiers)
+                                        || isSensitiveName(field.getName())) {
+                                    continue;
+                                }
+                                field.setAccessible(true);
+                                Object serializable = serializableValue(field.get(value), depth + 1);
+                                if (serializable != MethodArgumentConfig.MISSING) {
+                                    result.put(field.getName(), serializable);
+                                }
+                            }
+                            currentType = currentType.getSuperclass();
+                        }
+                    } catch (Exception ignored) {
+                        return emptyMap();
+                    }
+                    return result;
+                }
+
+                private boolean shouldSerializePojoType(Class<?> valueType) {
+                    if (valueType == null
+                            || valueType.isPrimitive()
+                            || valueType.isArray()
+                            || valueType.isEnum()
+                            || valueType.isInterface()
+                            || Modifier.isAbstract(valueType.getModifiers())) {
+                        return false;
+                    }
+                    String name = valueType.getName();
+                    return !name.startsWith("java.")
+                            && !name.startsWith("javax.")
+                            && !name.startsWith("jakarta.");
                 }
 
                 private List<String> defaultRewriteConfigLines() {

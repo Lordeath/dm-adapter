@@ -715,7 +715,13 @@ class DmAdapterCliTest {
                 .contains("Character.isDigit(normalized.charAt(i))")
                 .contains("collectionLike ? collectionParameterIndex : -1")
                 .contains("collectionExpressionName(collectionIndex, fallbackName)")
-                .contains("return new ArrayList<>(namedCollectionParameterNames).get(index);");
+                .contains("return new ArrayList<>(namedCollectionParameterNames).get(index);")
+                .contains("shouldUsePojoCollectionElement(nestedClass)")
+                .contains("rawValue instanceof Map<?, ?> && shouldUsePojoCollectionElement(targetType)")
+                .contains("Object existingDefault = field.get(instance);")
+                .contains("Object valueToConvert = coerced != configured")
+                .contains("serializablePojo(value, depth)")
+                .contains("return \"2024-01-01 00:00:00\";");
     }
 
     @Test
