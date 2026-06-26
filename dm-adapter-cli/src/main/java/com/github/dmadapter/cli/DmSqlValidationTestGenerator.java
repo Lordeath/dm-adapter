@@ -567,6 +567,9 @@ class DmSqlValidationTestGenerator {
                 private static final String JSON_REPORT = ".dm-adapter/sql-validation-report.json";
                 private static final Pattern PLACEHOLDER = Pattern.compile("\\\\$\\\\{([^}]+)}");
                 private static final Set<String> DEFAULT_COLLECTION_PARAMETER_NAMES = new LinkedHashSet<>(Arrays.asList(
+                        "list",
+                        "collection",
+                        "array",
                         "primarykeylist",
                         "removeitemids",
                         "ids",
