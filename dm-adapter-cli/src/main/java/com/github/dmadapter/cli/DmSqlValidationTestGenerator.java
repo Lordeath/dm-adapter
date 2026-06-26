@@ -1225,10 +1225,11 @@ class DmSqlValidationTestGenerator {
                     }
                     String collection = foreachCollections.get(parts.get(0));
                     if (collection != null) {
-                        if (parts.size() == 1
-                                && jdbcType != null
-                                && !isBlank(jdbcType)) {
-                            metadata.addCollectionScalarDefault(collection, defaultValueForJdbcType(collection, jdbcType));
+                        if (parts.size() == 1) {
+                            metadata.addCollectionScalarDefault(
+                                    collection,
+                                    defaultValueForDirectParameter(collection, jdbcType)
+                            );
                         }
                         if (parts.size() > 1) {
                             Object defaultValue = jdbcType == null || isBlank(jdbcType)
@@ -3749,6 +3750,11 @@ class DmSqlValidationTestGenerator {
 
                 private Map<String, Object> typedCollectionElementDefault(String collectionName, MapperStatement statement) {
                     if (statement == null) {
+                        return emptyMap();
+                    }
+                    if (statement.scalarCollectionParameter(collectionName)
+                            && !statement.hasCollectionElementDefault(collectionName)
+                            && !statement.hasCollectionElementColumnReferences(collectionName)) {
                         return emptyMap();
                     }
                     Map<String, Object> collectionElementDefault = statement.collectionElementDefault(collectionName);
@@ -7667,6 +7673,14 @@ class DmSqlValidationTestGenerator {
 
                     private boolean hasCollectionDefault(String collectionName) {
                         return collectionElementDefaults.containsKey(normalizeMetadataName(collectionName));
+                    }
+
+                    private boolean hasCollectionElementDefault(String collectionName) {
+                        return valueByNameOrSuffix(collectionElementDefaults, collectionName) != null;
+                    }
+
+                    private boolean hasCollectionElementColumnReferences(String collectionName) {
+                        return valueByNameOrSuffix(collectionElementColumnReferences, collectionName) != null;
                     }
 
                     private boolean dynamicIdentifierParameter(String valueName) {
