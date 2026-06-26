@@ -71,9 +71,9 @@ class ValidationTestRunnerTest {
                 .contains(
                         "-DskipTests=false",
                         "-Dmaven.test.skip=false",
-                        "-Dmaven.test.skip.exec=false",
                         "-Dsurefire.failIfNoSpecifiedTests=false"
-                );
+                )
+                .doesNotContain("-Dmaven.test.skip.exec=false");
     }
 
     @Test
@@ -147,11 +147,13 @@ class ValidationTestRunnerTest {
         assertThat(commands.get(0))
                 .contains("test")
                 .contains("-DskipTests=false")
-                .contains("-Dmaven.test.skip=false");
+                .contains("-Dmaven.test.skip=false")
+                .doesNotContain("-Dmaven.test.skip.exec=false");
         assertThat(commands.get(1))
                 .contains("test-compile")
                 .contains("dependency:build-classpath")
-                .contains("-Dmdep.includeScope=test");
+                .contains("-Dmdep.includeScope=test")
+                .doesNotContain("-Dmaven.test.skip.exec=false");
         assertThat(commands.get(2)).hasSize(2);
         assertThat(commands.get(2).get(1))
                 .startsWith("@")
