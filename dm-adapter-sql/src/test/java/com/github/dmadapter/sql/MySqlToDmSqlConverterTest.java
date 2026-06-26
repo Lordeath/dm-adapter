@@ -676,7 +676,7 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                select SUM(amount) AS totalAmount, item_id
+                select SUM(amount) AS "totalAmount", item_id
                 from bill
                 group by item_id
                 having (SUM(amount)) > 0 and remark <> 'totalAmount'
@@ -748,10 +748,22 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select u.id, u.user_name, ${item.fieldName} from sys_user u where u.enabled = 'Y'");
+                .isEqualTo("select u.id, u.user_name, \"${item.fieldName}\" from sys_user u where u.enabled = 'Y'");
         assertThat(result.appliedRules())
                 .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
                         MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
+    }
+
+    @Test
+    void quotesBacktickIdentifiersThatNeedCasePreservation() {
+        SqlConversionResult result = converter.convert(
+                "select `foreignerKeyId`, t.`extField`, `${key}` from `ns_other_information_extend` t"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select \"foreignerKeyId\", t.\"extField\", \"${key}\" from ns_other_information_extend t");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
     }
 
     @Test

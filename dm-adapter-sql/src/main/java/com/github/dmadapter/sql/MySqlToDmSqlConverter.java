@@ -4069,7 +4069,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(sql, index, sql.length());
                     index = sql.length();
                 } else {
-                    converted.append(toDamengIdentifier(identifier.value()));
+                    converted.append(toDamengBacktickIdentifier(identifier.value()));
                     index = identifier.nextIndex();
                     changed = true;
                 }
@@ -4111,8 +4111,24 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return quoteDamengIdentifier(identifier);
     }
 
+    private String toDamengBacktickIdentifier(String identifier) {
+        if (containsMyBatisPlaceholder(identifier) || needsQuotedCasePreservation(identifier)) {
+            return quoteDamengIdentifier(identifier);
+        }
+        return toDamengIdentifier(identifier);
+    }
+
     private boolean containsMyBatisPlaceholder(String value) {
         return value.contains("${") || value.contains("#{");
+    }
+
+    private boolean needsQuotedCasePreservation(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (Character.isUpperCase(value.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean isSimpleIdentifier(String value) {
