@@ -54,6 +54,8 @@ class MapperJdbcTypeAligner {
     private static final Pattern FOREACH_ITEM_PATTERN = Pattern.compile(
             "(?is)<foreach\\b[^>]*\\bitem\\s*=\\s*([\"'])(.*?)\\1"
     );
+    private static final Pattern FOREACH_BLOCK_PATTERN = Pattern.compile("(?is)<foreach\\b[^>]*>([\\s\\S]*?)</foreach>");
+    private static final Pattern VALUES_PATTERN = Pattern.compile("(?is)\\bvalues\\b");
 
     Set<String> referencedTables(ProjectScanResult scanResult, AdapterContext context) {
         Set<String> tables = new LinkedHashSet<>();
@@ -367,6 +369,9 @@ class MapperJdbcTypeAligner {
                 expressions = placeholderEntries(trim.body());
             }
         }
+        if (!columns.isEmpty() && expressions.isEmpty()) {
+            expressions = foreachValuePlaceholderEntries(statement);
+        }
         if (columns.isEmpty() || expressions.isEmpty()) {
             return new Alignment(statement, 0);
         }
@@ -624,6 +629,37 @@ class MapperJdbcTypeAligner {
             expressions.add(matcher.find() ? matcher.group(1) : "");
         }
         return expressions;
+    }
+
+    private List<String> foreachValuePlaceholderEntries(String statement) {
+        Matcher valuesMatcher = VALUES_PATTERN.matcher(statement == null ? "" : statement);
+        if (!valuesMatcher.find()) {
+            return List.of();
+        }
+        Matcher foreachMatcher = FOREACH_BLOCK_PATTERN.matcher(statement);
+        while (foreachMatcher.find()) {
+            if (foreachMatcher.start() < valuesMatcher.end()) {
+                continue;
+            }
+            String body = unwrapSingleTuple(foreachMatcher.group(1));
+            List<String> expressions = placeholderEntries(body);
+            if (!expressions.isEmpty()) {
+                return expressions;
+            }
+        }
+        return List.of();
+    }
+
+    private String unwrapSingleTuple(String text) {
+        String trimmed = text == null ? "" : text.trim();
+        if (!trimmed.startsWith("(")) {
+            return trimmed;
+        }
+        int close = matchingParen(trimmed, 0);
+        if (close >= 0 && trimmed.substring(close + 1).trim().isBlank()) {
+            return trimmed.substring(1, close);
+        }
+        return trimmed;
     }
 
     private List<String> entryBodies(String text) {
