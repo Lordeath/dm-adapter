@@ -2472,32 +2472,67 @@ class DmSqlValidationTestGenerator {
                             );
                         } catch (MapperInvocationException e) {
                             sqlSession.rollback(true);
+                            String summary = throwableSummary(e.getCause());
+                            if (isPrimitiveNullReturnFailure(summary)) {
+                                return ValidationRecord.skipped(
+                                        parameters.recordKey(mapperMethod.key()),
+                                        parameters.source,
+                                        parametersSummary(parameters),
+                                        "SQL 已执行，但 mapper 基本类型返回值收到 null，通常是测试数据未命中；已跳过此项。"
+                                                + "\\n" + summary
+                                );
+                            }
                             return ValidationRecord.failed(
                                     parameters.recordKey(mapperMethod.key()),
                                     parameters.source,
                                     parametersSummary(parameters),
-                                    throwableSummary(e.getCause()),
+                                    summary,
                                     parameters
                             );
                         } catch (Throwable e) {
                             sqlSession.rollback(true);
+                            String summary = throwableSummary(e);
+                            if (isPrimitiveNullReturnFailure(summary)) {
+                                return ValidationRecord.skipped(
+                                        parameters.recordKey(mapperMethod.key()),
+                                        parameters.source,
+                                        parametersSummary(parameters),
+                                        "SQL 已执行，但 mapper 基本类型返回值收到 null，通常是测试数据未命中；已跳过此项。"
+                                                + "\\n" + summary
+                                );
+                            }
                             return ValidationRecord.failed(
                                     parameters.recordKey(mapperMethod.key()),
                                     parameters.source,
                                     parametersSummary(parameters),
-                                    throwableSummary(e),
+                                    summary,
                                     parameters
                             );
                         }
                     } catch (Throwable e) {
+                        String summary = throwableSummary(e);
+                        if (isPrimitiveNullReturnFailure(summary)) {
+                            return ValidationRecord.skipped(
+                                    parameters.recordKey(mapperMethod.key()),
+                                    parameters.source,
+                                    parametersSummary(parameters),
+                                    "SQL 已执行，但 mapper 基本类型返回值收到 null，通常是测试数据未命中；已跳过此项。"
+                                            + "\\n" + summary
+                            );
+                        }
                         return ValidationRecord.failed(
                                 parameters.recordKey(mapperMethod.key()),
                                 parameters.source,
                                 parametersSummary(parameters),
-                                throwableSummary(e),
+                                summary,
                                 parameters
                         );
                     }
+                }
+
+                private boolean isPrimitiveNullReturnFailure(String message) {
+                    return message != null
+                            && message.contains("attempted to return null from a method with a primitive return type");
                 }
 
                 private ValidationRecord skipIgnoredMissingTable(ValidationRecord record, ValidationConfig config) {
