@@ -75,6 +75,7 @@ public class MapperXmlRewriter {
     private static final Pattern MYBATIS_SIMPLE_PARAMETER_PATTERN = Pattern.compile(
             "([#$]\\{\\s*)([A-Za-z_][A-Za-z0-9_$]*)(\\s*(?:,[^}]*)?)\\}"
     );
+    private static final Pattern IF_BODY_TRAILING_COMMA_PATTERN = Pattern.compile("(?is),\\s*</if\\s*>");
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\")";
     private static final Pattern WRAPPING_IF_PATTERN = Pattern.compile(
@@ -3170,13 +3171,71 @@ public class MapperXmlRewriter {
         while (matcher.find()) {
             converted.append(body, index, matcher.start());
             String foreachBlock = matcher.group();
+            boolean blockChanged = false;
+            PreservedForeach preservedForeach = readPreservedForeach(foreachBlock);
+            if (preservedForeach != null) {
+                TextRewrite trimWrappedBody = wrapDynamicForeachTupleWithTrim(preservedForeach.body());
+                if (trimWrappedBody.changed()) {
+                    foreachBlock = preservedForeach.openingTag()
+                            + trimWrappedBody.text()
+                            + preservedForeach.closingTag();
+                    blockChanged = true;
+                }
+            }
             String rewrittenBlock = TRAILING_COMMA_BEFORE_PAREN_PATTERN.matcher(foreachBlock).replaceAll("$1");
             converted.append(rewrittenBlock);
-            changed = changed || !rewrittenBlock.equals(foreachBlock);
+            changed = changed || blockChanged || !rewrittenBlock.equals(foreachBlock);
             index = matcher.end();
         }
         converted.append(body, index, body.length());
         return changed ? converted.toString() : body;
+    }
+
+    private TextRewrite wrapDynamicForeachTupleWithTrim(String body) {
+        ParenthesizedBody parenthesizedBody = outerParenthesizedBody(body);
+        if (parenthesizedBody == null
+                || !parenthesizedBody.content().contains("<if")
+                || !IF_BODY_TRAILING_COMMA_PATTERN.matcher(parenthesizedBody.content()).find()
+                || parenthesizedBody.content().stripLeading().startsWith("<trim")) {
+            return new TextRewrite(body, false);
+        }
+        return new TextRewrite(
+                parenthesizedBody.leading()
+                        + "<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">"
+                        + parenthesizedBody.content()
+                        + "</trim>"
+                        + parenthesizedBody.trailing(),
+                true
+        );
+    }
+
+    private ParenthesizedBody outerParenthesizedBody(String value) {
+        if (value == null) {
+            return null;
+        }
+        int openIndex = 0;
+        while (openIndex < value.length() && Character.isWhitespace(value.charAt(openIndex))) {
+            openIndex++;
+        }
+        if (openIndex >= value.length() || value.charAt(openIndex) != '(') {
+            return null;
+        }
+        int closeIndex = findMatchingParen(value, openIndex);
+        if (closeIndex < 0) {
+            return null;
+        }
+        int trailingIndex = closeIndex + 1;
+        while (trailingIndex < value.length() && Character.isWhitespace(value.charAt(trailingIndex))) {
+            trailingIndex++;
+        }
+        if (trailingIndex != value.length()) {
+            return null;
+        }
+        return new ParenthesizedBody(
+                value.substring(0, openIndex),
+                value.substring(openIndex + 1, closeIndex),
+                value.substring(closeIndex + 1)
+        );
     }
 
     private TextSegmentConversion convertTextSegment(
@@ -3348,6 +3407,9 @@ public class MapperXmlRewriter {
             String item,
             String index
     ) {
+    }
+
+    private record ParenthesizedBody(String leading, String content, String trailing) {
     }
 
     private record BatchInsertValues(

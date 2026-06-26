@@ -1036,7 +1036,7 @@ class MapperMigratorTest {
                                 #{contractId, jdbcType=VARCHAR},
                             </if>
                             <if test="houseId != null">
-                                #{houseId, jdbcType=BIGINT}
+                                #{houseId, jdbcType=BIGINT},
                             </if>
                             )
                         </foreach>
@@ -1064,6 +1064,8 @@ class MapperMigratorTest {
         assertThat(rewritten)
                 .contains("<if test=\"list != null and list.size() &gt; 0 and list[0].contractId != null\">")
                 .contains("<if test=\"list != null and list.size() &gt; 0 and list[0].houseId != null\">")
+                .contains("<foreach collection=\"list\" item=\"item\" index=\"index\" separator=\",\">\n"
+                        + "            <trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">")
                 .contains("<if test=\"item.contractId != null\">")
                 .contains("#{item.contractId, jdbcType=VARCHAR}")
                 .contains("<if test=\"item.houseId != null\">")
@@ -1072,7 +1074,10 @@ class MapperMigratorTest {
                 .doesNotContain("#{contractId, jdbcType=VARCHAR}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE);
+                .containsExactly(
+                        MapperXmlRewriter.MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE,
+                        MapperXmlRewriter.MYBATIS_FOREACH_TRAILING_COMMA_RULE
+                );
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
