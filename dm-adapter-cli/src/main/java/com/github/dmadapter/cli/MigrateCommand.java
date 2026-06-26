@@ -75,6 +75,7 @@ public class MigrateCommand implements Callable<Integer> {
     private final SqlRewriteConfigLoader sqlRewriteConfigLoader = new SqlRewriteConfigLoader();
     private final SqlRewriteConfigUpdater sqlRewriteConfigUpdater = new SqlRewriteConfigUpdater();
     private final DamengMetadataReader damengMetadataReader = new DamengMetadataReader();
+    private final MapperJdbcTypeAligner mapperJdbcTypeAligner = new MapperJdbcTypeAligner();
     private final ReportWriter reportWriter = new ReportWriter();
     private final DmSqlValidationTestGenerator validationTestGenerator = new DmSqlValidationTestGenerator();
     private final ValidationTestRunner validationTestRunner = new ValidationTestRunner();
@@ -147,6 +148,9 @@ public class MigrateCommand implements Callable<Integer> {
             );
             fileChanges.addAll(mapperMigrationResult.fileChanges());
             warnings.addAll(mapperMigrationResult.warnings());
+            MapperJdbcTypeAlignmentResult jdbcTypeAlignmentResult = alignMapperJdbcTypes(context, scanResult);
+            fileChanges.addAll(jdbcTypeAlignmentResult.fileChanges());
+            warnings.addAll(jdbcTypeAlignmentResult.warnings());
             if (hasAesBase64Conversion(mapperMigrationResult)) {
                 warnings.addAll(aesBase64ConversionWarnings());
             }
@@ -359,6 +363,46 @@ public class MigrateCommand implements Callable<Integer> {
                     Map.of(),
                     false,
                     List.of("Dameng metadata inference was skipped: " + redact(e.getMessage(), environment))
+            );
+        }
+    }
+
+    private MapperJdbcTypeAlignmentResult alignMapperJdbcTypes(AdapterContext context, ProjectScanResult scanResult) {
+        if (context.dryRun()) {
+            return MapperJdbcTypeAlignmentResult.empty();
+        }
+        DmValidationEnvironment environment = DmValidationEnvironment.fromSystem();
+        if (!environment.validationEnabled()) {
+            return MapperJdbcTypeAlignmentResult.empty();
+        }
+        if (!environment.ready()) {
+            return new MapperJdbcTypeAlignmentResult(
+                    List.of(),
+                    List.of("DM_SQL_VALIDATION is true but mapper jdbcType alignment was skipped because required variables are missing: "
+                            + environment.missingVariables())
+            );
+        }
+        Set<String> tableNames = mapperJdbcTypeAligner.referencedTables(scanResult, context);
+        if (tableNames.isEmpty()) {
+            return MapperJdbcTypeAlignmentResult.empty();
+        }
+        try {
+            Map<String, Map<String, String>> columnTypes = damengMetadataReader.readColumnTypes(
+                    environment,
+                    configuredSchema(context),
+                    tableNames
+            );
+            MapperJdbcTypeAlignmentResult result = mapperJdbcTypeAligner.align(scanResult, context, columnTypes);
+            if (result.fileChanges().isEmpty()) {
+                return result;
+            }
+            List<String> warnings = new ArrayList<>(result.warnings());
+            warnings.add("Aligned MyBatis jdbcType declarations in mapper-dm with Dameng column metadata.");
+            return new MapperJdbcTypeAlignmentResult(result.fileChanges(), warnings);
+        } catch (Exception e) {
+            return new MapperJdbcTypeAlignmentResult(
+                    List.of(),
+                    List.of("Dameng mapper jdbcType alignment was skipped: " + redact(e.getMessage(), environment))
             );
         }
     }
