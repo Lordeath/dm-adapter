@@ -698,6 +698,8 @@ class DmAdapterCliTest {
                 .contains("isCollectionOfCollections(existing)")
                 .contains("firstCollectionElement(")
                 .contains("configuredCollectionObjectItem(collectionName, item, statement)")
+                .contains("knownCollectionObjectPropertyCount(item) >= 2")
+                .contains("private int knownCollectionObjectPropertyCount(Map<?, ?> item)")
                 .contains("isKnownCollectionObjectProperty(")
                 .contains("if (scalarItem == MethodArgumentConfig.MISSING) {")
                 .contains("return MethodArgumentConfig.MISSING;")
