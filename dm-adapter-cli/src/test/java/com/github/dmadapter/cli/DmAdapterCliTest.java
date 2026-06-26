@@ -310,7 +310,8 @@ class DmAdapterCliTest {
                 .contains("com.example.UserMapper.getBatchOpenBillChargeItem")
                 .contains("com.example.UserMapper.selectApprovalStateByPaymentIds")
                 .contains("com.example.UserMapper.deleteByLogical")
-                .contains("com.example.UserMapper.listPageWithScopedCollections");
+                .contains("com.example.UserMapper.listPageWithScopedCollections")
+                .contains("com.example.UserMapper.dynamicUpdateBatchCreateTemp");
         assertThat(generatedTestSource)
                 .contains("package com.example;")
                 .contains("public class DmSqlValidationTest")
@@ -690,6 +691,12 @@ class DmAdapterCliTest {
                 .contains("statement == null ? null : statement.defaultValue(valueName)")
                 .contains("field.getGenericType(),\n                            statement,\n                            field.getName()")
                 .contains("configuredItem,\n                            statement,\n                            valueName")
+                .contains("nestedCollection.directElement")
+                .contains("defaultDirectNestedForeachCollectionValue(")
+                .contains("directNestedForeachCollectionPath(")
+                .contains("nestedConfiguredCollectionValue(existing, configuredValue)")
+                .contains("isCollectionOfCollections(existing)")
+                .contains("firstCollectionElement(")
                 .contains("isGeneratedDynamicIdentifierPlaceholder(")
                 .contains("isLikelyDynamicIdentifierName(normalized)")
                 .contains("configuredArgs.valueFor(parameterName, effectiveParameterName, i)")
@@ -1125,6 +1132,16 @@ class DmAdapterCliTest {
                             </if>
                         </where>
                     </select>
+                    <update id="dynamicUpdateBatchCreateTemp">
+                        create temporary table t_${tmpTableName} as
+                        <foreach collection="list" item="item" separator=" union all ">
+                            select
+                            <foreach collection="item" item="field" separator=",">
+                                #{field.fieldValue} AS ${field.fieldName}
+                            </foreach>
+                            from dual
+                        </foreach>
+                    </update>
                     <update id="updateOwnerIdByIdAndSplitOwnerId">
                         update owner_customer
                         <trim prefix="set" suffixOverrides=",">
