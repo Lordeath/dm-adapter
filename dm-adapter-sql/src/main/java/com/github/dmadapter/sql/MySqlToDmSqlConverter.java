@@ -29,6 +29,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_INFORMATION_SCHEMA_COLUMNS_TO_ALL_TAB_COLUMNS";
     public static final String MYSQL_INFORMATION_SCHEMA_TABLES_RULE =
             "MYSQL_INFORMATION_SCHEMA_TABLES_TO_ALL_TABLES";
+    public static final String MYSQL_DESCRIBE_TABLE_RULE = "MYSQL_DESCRIBE_TABLE_TO_USER_TAB_COLUMNS";
     public static final String MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE = "MYSQL_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
@@ -276,6 +277,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     + "from\\s+information_schema\\s*\\.\\s*(?:tables|\"tables\")\\s+where\\s+"
                     + "table_schema\\s*=\\s*\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\)\\s+and\\s+"
                     + "table_name\\s+like\\s+(?<tableLike>.+?)\\s*;?\\s*$"
+    );
+    private static final Pattern MYSQL_DESCRIBE_TABLE_PATTERN = Pattern.compile(
+            "(?is)^\\s*(?:desc|describe)\\s+(?<table>[^;\\s]+)\\s*;?\\s*$"
     );
     private static final Pattern METADATA_TABLE_NAME_CONDITION = Pattern.compile(
             "(?is)\\btable_name\\s*=\\s*(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*')"
@@ -667,6 +671,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (concatConversion.changed()) {
             converted = concatConversion.convertedSql();
             rules.add(MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
+        }
+
+        GenericConversion describeTableConversion = convertDescribeTable(converted);
+        if (describeTableConversion.changed()) {
+            converted = describeTableConversion.convertedSql();
+            rules.add(MYSQL_DESCRIBE_TABLE_RULE);
         }
 
         GenericConversion informationSchemaColumnsConversion = convertInformationSchemaColumns(converted);
@@ -2820,6 +2830,39 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + ") ORDER BY COLUMN_ID"
                 + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
         return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertDescribeTable(String sql) {
+        Matcher matcher = MYSQL_DESCRIBE_TABLE_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableNameExpression = describeTableNameExpression(matcher.group("table").trim());
+        if (tableNameExpression.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT COLUMN_NAME AS \"Field\", DATA_TYPE AS \"Type\", NULLABLE AS \"Null\", "
+                + "NULL AS \"Key\", DATA_DEFAULT AS \"Default\", NULL AS \"Extra\" "
+                + "FROM USER_TAB_COLUMNS WHERE TABLE_NAME = UPPER("
+                + tableNameExpression
+                + ") ORDER BY COLUMN_ID";
+        return new GenericConversion(converted, true);
+    }
+
+    private String describeTableNameExpression(String tableName) {
+        if (tableName.isBlank()) {
+            return "";
+        }
+        if (tableName.equals("?")
+                || tableName.startsWith("#{")
+                || tableName.startsWith("'")
+                || tableName.startsWith("\"")) {
+            return tableName;
+        }
+        if (tableName.startsWith("${")) {
+            return "'" + tableName + "'";
+        }
+        return "'" + tableName.replace("'", "''") + "'";
     }
 
     private GenericConversion convertInformationSchemaColumnsTableList(String sql) {

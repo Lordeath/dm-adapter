@@ -314,6 +314,62 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationWrapsConfiguredIdentityInsertTableWhenMysqlOmitsIntoKeyword() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ThirdAddHouseInfoMapper">
+                    <insert id="insertThirdHouseEntity" parameterType="list">
+                        insert zj_add_house_info
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            id,
+                            enterprise_id,
+                            roomName
+                        </trim>
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.id}, #{item.enterpriseId}, #{item.roomName})
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ThirdAddHouseInfoMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ThirdAddHouseInfoMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of("zj_add_house_info")
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ThirdAddHouseInfoMapper.xml"));
+        assertThat(rewritten)
+                .contains("SET IDENTITY_INSERT zj_add_house_info ON;")
+                .contains("insert zj_add_house_info")
+                .contains("SET IDENTITY_INSERT zj_add_house_info OFF;");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.DAMENG_IDENTITY_INSERT_RULE);
+    }
+
+    @Test
     void migrationRewritesBatchInsertIgnoreWithTrimColumnListToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -1191,6 +1247,54 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicMultiTargetUpdateJoinRemovesDuplicateBlockSemicolon() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="syncCustomer">
+                        update owner_customer_result r
+                        inner join tmp_owner_precinct_result_20200322 t on t.owner_id = r.owner_id
+                        inner join owner_customer_base_info b on b.owner_id = t.owner_id
+                        set
+                        r.precinct_id = t.precinct_id,
+                        b.precinct_id = t.precinct_id
+                        ;
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("BEGIN")
+                .contains("END;")
+                .doesNotContain("END;;");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
+                        MapperXmlRewriter.DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE
+                );
+    }
+
+    @Test
     void dynamicUpdateJoinWithConditionalTrailingAssignmentKeepsAssignmentBeforeFrom() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -2036,12 +2140,19 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
                 .contains("CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName} ON COMMIT PRESERVE ROWS AS")
+                .contains("<foreach collection=\"list[0]\" item=\"field\" separator=\",\">")
+                .contains("CAST(NULL AS VARCHAR(4000)) AS ${field.fieldName}")
+                .contains("from dual where 1 = 0;")
+                .contains("insert into t_${tmpTableName}")
                 .contains("<foreach collection=\"list\" item=\"item\" separator=\" union all \">")
                 .contains("#{field.fieldValue} AS ${field.fieldName}")
                 .doesNotContain("create temporary table t_${tmpTableName}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
+                );
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
