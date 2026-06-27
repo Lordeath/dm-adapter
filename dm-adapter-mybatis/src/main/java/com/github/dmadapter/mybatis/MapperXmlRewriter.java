@@ -88,6 +88,9 @@ public class MapperXmlRewriter {
     private static final Pattern BARE_WHERE_LINE_PATTERN = Pattern.compile("(?is)^\\s*where\\s*$");
     private static final Pattern WHERE_CONNECTOR_LINE_PATTERN = Pattern.compile("(?is)^\\s*(?:and|or)\\b");
     private static final Pattern WHERE_TRAILING_CONNECTOR_PATTERN = Pattern.compile("(?is).*\\b(?:and|or)\\s*$");
+    private static final Pattern WHERE_TRAILING_OPEN_CONNECTOR_PATTERN = Pattern.compile(
+            "(?is).*\\b(?:and|or)\\s*\\(\\s*$"
+    );
     private static final Pattern WHERE_CLAUSE_BOUNDARY_LINE_PATTERN = Pattern.compile(
             "(?is)^\\s*(?:group\\s+by|order\\s+by|having\\b|limit\\b|offset\\b|fetch\\b|union\\b|for\\b)"
     );
@@ -3644,7 +3647,7 @@ public class MapperXmlRewriter {
             }
             String line = body.substring(lineStart, contentEnd);
             String stripped = line.strip();
-            if (stripped.isEmpty() || stripped.startsWith("--") || stripped.startsWith("/*")) {
+            if (isIgnorableSqlLine(stripped)) {
                 lineStart = nextLineStart(body, lineEnd);
                 continue;
             }
@@ -3665,18 +3668,34 @@ public class MapperXmlRewriter {
                 continue;
             }
             if (WHERE_CONNECTOR_LINE_PATTERN.matcher(line).find()) {
-                previousPredicateNeedsConnector = isStaticWherePredicateLine(line);
+                previousPredicateNeedsConnector = staticWherePredicateNeedsConnector(line);
                 lineStart = nextLineStart(body, lineEnd);
                 continue;
             }
-            if (previousPredicateNeedsConnector && isStaticWherePredicateLine(line)) {
+            boolean currentPredicate = isStaticWherePredicateLine(line);
+            if (previousPredicateNeedsConnector
+                    && currentPredicate
+                    && isFollowedByForeachTag(body, nextLineStart(body, lineEnd))) {
                 int insertionIndex = firstNonWhitespaceIndex(body, lineStart, contentEnd);
                 replacements.add(new TextReplacement(insertionIndex, insertionIndex, "and "));
             }
-            previousPredicateNeedsConnector = isStaticWherePredicateLine(line);
+            previousPredicateNeedsConnector = staticWherePredicateNeedsConnector(line);
             lineStart = nextLineStart(body, lineEnd);
         }
         return applyTextReplacements(body, replacements);
+    }
+
+    private boolean isIgnorableSqlLine(String stripped) {
+        return stripped.isEmpty()
+                || stripped.startsWith("--")
+                || stripped.startsWith("/*")
+                || stripped.startsWith("<!--");
+    }
+
+    private boolean staticWherePredicateNeedsConnector(String line) {
+        String stripped = line.stripLeading();
+        return isStaticWherePredicateLine(line)
+                && !WHERE_TRAILING_OPEN_CONNECTOR_PATTERN.matcher(stripped).matches();
     }
 
     private boolean isStaticWherePredicateLine(String line) {
@@ -3691,6 +3710,27 @@ public class MapperXmlRewriter {
             return false;
         }
         return WHERE_PREDICATE_START_PATTERN.matcher(stripped).find();
+    }
+
+    private boolean isFollowedByForeachTag(String body, int start) {
+        int lineStart = start;
+        while (lineStart < body.length()) {
+            int lineEnd = body.indexOf('\n', lineStart);
+            if (lineEnd < 0) {
+                lineEnd = body.length();
+            }
+            int contentEnd = lineEnd;
+            if (contentEnd > lineStart && body.charAt(contentEnd - 1) == '\r') {
+                contentEnd--;
+            }
+            String stripped = body.substring(lineStart, contentEnd).strip();
+            if (isIgnorableSqlLine(stripped)) {
+                lineStart = nextLineStart(body, lineEnd);
+                continue;
+            }
+            return stripped.regionMatches(true, 0, "<foreach", 0, "<foreach".length());
+        }
+        return false;
     }
 
     private int nextLineStart(String value, int lineEnd) {

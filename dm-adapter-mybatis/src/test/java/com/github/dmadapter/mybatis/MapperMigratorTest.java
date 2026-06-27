@@ -1118,6 +1118,57 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicWhereKeepsForeachPredicateAfterOpenConnectorGroup() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="getDetailForCarryOver" resultType="map">
+                        select *
+                        from Charge_CustomerChargeDetail
+                        where
+                        IsDelete = 0 and (
+                        Id in
+                        <foreach collection="ids" item="item" separator="," close=")" open="(">
+                            #{item}
+                        </foreach>
+                        OR (
+                        RefChargeDetailId IN
+                        <foreach collection="ids" item="item" separator="," close=")" open="(">
+                            #{item}
+                        </foreach>
+                        AND Arrears &lt; 0
+                        )
+                        )
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml"));
+        assertThat(rewritten)
+                .containsPattern("(?s)IsDelete = 0 and \\(\\s+Id in")
+                .doesNotContain("and Id in");
+        assertThat(result.automaticConversions()).isEmpty();
+    }
+
+    @Test
     void dynamicUpdateSetAddsMissingCommasBetweenConditionalAssignments() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
