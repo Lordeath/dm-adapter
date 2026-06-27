@@ -19,6 +19,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_DATE_SUB_NOW_DAY_RULE = MYSQL_DATE_SUB_INTERVAL_RULE;
     public static final String MYSQL_REGEXP_OPERATOR_RULE = "MYSQL_REGEXP_OPERATOR_TO_REGEXP_LIKE";
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
+    public static final String MYSQL_CAST_SIGNED_RULE = "MYSQL_CAST_SIGNED_TO_BIGINT";
     public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_DATE_ADD_INTERVAL_RULE = "MYSQL_DATE_ADD_INTERVAL_TO_DATEADD";
     public static final String MYSQL_SUBDATE_RULE = "MYSQL_SUBDATE_TO_DATEADD";
@@ -63,11 +64,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_INSERT_VALUE_TO_VALUES_RULE = "MYSQL_INSERT_VALUE_TO_VALUES";
     public static final String MYSQL_INDEX_HINT_REMOVAL_RULE = "MYSQL_INDEX_HINT_REMOVED";
     public static final String MYSQL_CONVERT_DECIMAL_RULE = "MYSQL_CONVERT_DECIMAL_TO_CAST";
+    public static final String MYSQL_CONVERT_CHAR_RULE = "MYSQL_CONVERT_CHAR_TO_CAST";
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
     public static final String MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE = "MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY";
+    public static final String MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE = "MYSQL_CREATE_TABLE_OPTIONS_REMOVED";
+    public static final String MYSQL_USING_BTREE_REMOVAL_RULE = "MYSQL_USING_BTREE_REMOVED";
+    public static final String MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE = "MYSQL_CREATE_TABLE_KEY_REMOVED";
+    public static final String MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE = "MYSQL_NUMERIC_TYPE_ATTRIBUTE_TO_DM";
+    public static final String MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE = "MYSQL_ON_UPDATE_TIMESTAMP_REMOVED";
+    public static final String MYSQL_SESSION_VARIABLE_NOOP_RULE = "MYSQL_SESSION_VARIABLE_TO_NOOP";
     public static final String DUPLICATE_WHERE_KEYWORD_RULE = "DUPLICATE_WHERE_KEYWORD_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
@@ -92,8 +100,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern CAST_UNSIGNED_BODY_PATTERN = Pattern.compile(
             "(?is)^\\s*(.+?)\\s+AS\\s+UNSIGNED(?:\\s+INTEGER)?\\s*$"
     );
+    private static final Pattern CAST_SIGNED_BODY_PATTERN = Pattern.compile(
+            "(?is)^\\s*(.+?)\\s+AS\\s+SIGNED(?:\\s+INTEGER)?\\s*$"
+    );
     private static final Pattern DECIMAL_TARGET_TYPE_PATTERN = Pattern.compile(
             "(?is)^\\s*DECIMAL\\s*\\(\\s*\\d+\\s*,\\s*\\d+\\s*\\)\\s*$"
+    );
+    private static final Pattern CHAR_TARGET_TYPE_PATTERN = Pattern.compile(
+            "(?is)^\\s*CHAR(?:\\s*\\(\\s*\\d+\\s*\\))?\\s*$"
     );
     private static final Pattern MYSQL_INTERVAL_PATTERN = Pattern.compile(
             "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)\\s*$"
@@ -166,6 +180,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "DATE",
             "DELETE",
             "DESC",
+            "DISTINCT",
             "DROP",
             "FROM",
             "FULL",
@@ -282,6 +297,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_SELECT_MODIFIER_REMOVAL_RULE);
         }
 
+        GenericConversion createTableOptionConversion = removeMysqlCreateTableOptions(converted);
+        if (createTableOptionConversion.changed()) {
+            converted = createTableOptionConversion.convertedSql();
+            rules.add(MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE);
+        }
+
         GenericConversion collateClauseConversion = removeMysqlCollateClauses(converted);
         if (collateClauseConversion.changed()) {
             converted = collateClauseConversion.convertedSql();
@@ -298,6 +319,36 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (autoIncrementConversion.changed()) {
             converted = autoIncrementConversion.convertedSql();
             rules.add(MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE);
+        }
+
+        GenericConversion numericTypeAttributeConversion = convertMysqlNumericTypeAttributes(converted);
+        if (numericTypeAttributeConversion.changed()) {
+            converted = numericTypeAttributeConversion.convertedSql();
+            rules.add(MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE);
+        }
+
+        GenericConversion usingBtreeConversion = removeMysqlUsingBtreeClauses(converted);
+        if (usingBtreeConversion.changed()) {
+            converted = usingBtreeConversion.convertedSql();
+            rules.add(MYSQL_USING_BTREE_REMOVAL_RULE);
+        }
+
+        GenericConversion createTableKeyConversion = removeMysqlCreateTableKeyDefinitions(converted);
+        if (createTableKeyConversion.changed()) {
+            converted = createTableKeyConversion.convertedSql();
+            rules.add(MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE);
+        }
+
+        GenericConversion onUpdateTimestampConversion = removeMysqlOnUpdateCurrentTimestamp(converted);
+        if (onUpdateTimestampConversion.changed()) {
+            converted = onUpdateTimestampConversion.convertedSql();
+            rules.add(MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE);
+        }
+
+        GenericConversion sessionVariableConversion = convertMysqlSessionVariableSetToNoop(converted);
+        if (sessionVariableConversion.changed()) {
+            converted = sessionVariableConversion.convertedSql();
+            rules.add(MYSQL_SESSION_VARIABLE_NOOP_RULE);
         }
 
         GenericConversion duplicateWhereConversion = removeDuplicateWhereKeyword(converted);
@@ -354,6 +405,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_CAST_UNSIGNED_RULE);
         }
 
+        GenericConversion signedCastConversion = convertSignedCasts(converted);
+        if (signedCastConversion.changed()) {
+            converted = signedCastConversion.convertedSql();
+            rules.add(MYSQL_CAST_SIGNED_RULE);
+        }
+
         GenericConversion unsignedConvertConversion = convertUnsignedConvertFunctions(converted);
         if (unsignedConvertConversion.changed()) {
             converted = unsignedConvertConversion.convertedSql();
@@ -364,6 +421,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (decimalConvertConversion.changed()) {
             converted = decimalConvertConversion.convertedSql();
             rules.add(MYSQL_CONVERT_DECIMAL_RULE);
+        }
+
+        GenericConversion charConvertConversion = convertCharConvertFunctions(converted);
+        if (charConvertConversion.changed()) {
+            converted = charConvertConversion.convertedSql();
+            rules.add(MYSQL_CONVERT_CHAR_RULE);
         }
 
         GenericConversion gbkOrderConversion = convertMysqlGbkOrderBy(converted);
@@ -932,6 +995,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return -1;
         }
         int collationStart = skipWhitespace(sql, index + "COLLATE".length());
+        if (collationStart < sql.length() && sql.charAt(collationStart) == '=') {
+            collationStart = skipWhitespace(sql, collationStart + 1);
+        }
         int cursor = collationStart;
         while (cursor < sql.length() && isIdentifierPart(sql.charAt(cursor))) {
             cursor++;
@@ -1042,6 +1108,313 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return skipWhitespace(sql, cursor);
+    }
+
+    private GenericConversion removeMysqlCreateTableOptions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                int optionEnd = readMysqlCreateTableOptionEnd(sql, index);
+                if (optionEnd < 0) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    index = optionEnd;
+                    changed = true;
+                    appendSpaceBeforeNextTokenIfNeeded(converted, sql, index);
+                }
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private int readMysqlCreateTableOptionEnd(String sql, int index) {
+        if (startsKeyword(sql, index, "ENGINE")
+                || startsKeyword(sql, index, "ROW_FORMAT")
+                || startsKeyword(sql, index, "AUTO_INCREMENT")) {
+            int cursor = skipWhitespace(sql, index + readIdentifierToken(sql, index).text().length());
+            if (cursor < sql.length() && sql.charAt(cursor) == '=') {
+                return skipMysqlTableOptionValue(sql, cursor + 1);
+            }
+            return -1;
+        }
+        if (startsKeyword(sql, index, "DEFAULT")) {
+            int cursor = skipWhitespace(sql, index + "DEFAULT".length());
+            if (startsKeyword(sql, cursor, "CHARSET")) {
+                return readMysqlCharacterSetClauseEnd(sql, cursor);
+            }
+            if (startsKeyword(sql, cursor, "CHARACTER")) {
+                return readMysqlCharacterSetClauseEnd(sql, cursor);
+            }
+            if (startsKeyword(sql, cursor, "COLLATE")) {
+                return readMysqlCollateClauseEnd(sql, cursor);
+            }
+            return -1;
+        }
+        if (startsKeyword(sql, index, "COMMENT") && previousNonWhitespace(sql, index) == ')') {
+            int cursor = skipWhitespace(sql, index + "COMMENT".length());
+            if (cursor < sql.length() && sql.charAt(cursor) == '=') {
+                cursor = skipWhitespace(sql, cursor + 1);
+            }
+            if (cursor < sql.length() && sql.charAt(cursor) == '\'') {
+                return skipWhitespace(sql, skipSingleQuotedString(sql, cursor));
+            }
+        }
+        return -1;
+    }
+
+    private GenericConversion convertMysqlNumericTypeAttributes(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (isIdentifierStart(current)) {
+                IdentifierToken token = readIdentifierToken(sql, index);
+                NumericTypeRewrite rewrite = token == null ? null : readMysqlNumericTypeRewrite(sql, token);
+                if (rewrite == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(rewrite.replacement());
+                    index = rewrite.endIndex();
+                    changed = true;
+                    appendSpaceBeforeNextTokenIfNeeded(converted, sql, index);
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private NumericTypeRewrite readMysqlNumericTypeRewrite(String sql, IdentifierToken token) {
+        String upper = token.text().toUpperCase(Locale.ROOT);
+        if (Set.of("BIGINT", "INT", "INTEGER", "SMALLINT", "TINYINT", "MEDIUMINT").contains(upper)) {
+            int cursor = skipWhitespace(sql, token.endIndex());
+            boolean changed = false;
+            if (cursor < sql.length() && sql.charAt(cursor) == '(') {
+                int close = readSimpleNumericTypeModifierEnd(sql, cursor, false);
+                if (close > 0) {
+                    cursor = skipWhitespace(sql, close);
+                    changed = true;
+                }
+            }
+            if (startsKeyword(sql, cursor, "UNSIGNED")) {
+                cursor = skipWhitespace(sql, cursor + "UNSIGNED".length());
+                changed = true;
+            }
+            return changed ? new NumericTypeRewrite(cursor, token.text()) : null;
+        }
+        if ("DOUBLE".equals(upper)) {
+            int cursor = skipWhitespace(sql, token.endIndex());
+            if (cursor < sql.length() && sql.charAt(cursor) == '(') {
+                int close = readSimpleNumericTypeModifierEnd(sql, cursor, true);
+                if (close > 0) {
+                    String scale = sql.substring(cursor + 1, close - 1).trim();
+                    return new NumericTypeRewrite(skipWhitespace(sql, close), "DECIMAL(" + scale + ")");
+                }
+            }
+        }
+        return null;
+    }
+
+    private int readSimpleNumericTypeModifierEnd(String sql, int openParenIndex, boolean allowComma) {
+        int index = openParenIndex + 1;
+        boolean hasDigit = false;
+        boolean hasComma = false;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (Character.isDigit(current)) {
+                hasDigit = true;
+                index++;
+            } else if (allowComma && current == ',' && !hasComma) {
+                hasComma = true;
+                index++;
+            } else if (Character.isWhitespace(current)) {
+                index++;
+            } else if (current == ')') {
+                return hasDigit ? index + 1 : -1;
+            } else {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    private GenericConversion removeMysqlUsingBtreeClauses(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsKeyword(sql, index, "USING")) {
+                int btreeIndex = skipWhitespace(sql, index + "USING".length());
+                if (startsKeyword(sql, btreeIndex, "BTREE")) {
+                    index = skipWhitespace(sql, btreeIndex + "BTREE".length());
+                    changed = true;
+                } else {
+                    converted.append(current);
+                    index++;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion removeMysqlCreateTableKeyDefinitions(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String body = sql.substring(openParenIndex + 1, closeParenIndex);
+        List<TopLevelArgument> definitions = splitTopLevelArguments(body);
+        List<String> kept = new ArrayList<>();
+        boolean changed = false;
+        for (TopLevelArgument definition : definitions) {
+            if (isMysqlCreateTableSecondaryKeyDefinition(definition.text())) {
+                changed = true;
+            } else {
+                kept.add(definition.text());
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        String replacement = String.join(",", kept);
+        return new GenericConversion(
+                sql.substring(0, openParenIndex + 1) + replacement + sql.substring(closeParenIndex),
+                true
+        );
+    }
+
+    private boolean isMysqlCreateTableSecondaryKeyDefinition(String definition) {
+        int index = leadingWhitespaceLength(definition);
+        if (startsKeyword(definition, index, "KEY") || startsKeyword(definition, index, "INDEX")) {
+            return true;
+        }
+        if (startsKeyword(definition, index, "UNIQUE")) {
+            int cursor = skipWhitespace(definition, index + "UNIQUE".length());
+            return startsKeyword(definition, cursor, "KEY") || startsKeyword(definition, cursor, "INDEX");
+        }
+        return false;
+    }
+
+    private GenericConversion removeMysqlOnUpdateCurrentTimestamp(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsKeyword(sql, index, "ON")) {
+                int updateIndex = skipWhitespace(sql, index + "ON".length());
+                int timestampIndex = skipWhitespace(sql, updateIndex + "UPDATE".length());
+                if (startsKeyword(sql, updateIndex, "UPDATE")
+                        && startsKeyword(sql, timestampIndex, "CURRENT_TIMESTAMP")) {
+                    int cursor = skipWhitespace(sql, timestampIndex + "CURRENT_TIMESTAMP".length());
+                    if (cursor < sql.length() && sql.charAt(cursor) == '(') {
+                        int close = findMatchingParen(sql, cursor);
+                        if (close > 0) {
+                            cursor = skipWhitespace(sql, close + 1);
+                        }
+                    }
+                    index = cursor;
+                    changed = true;
+                    appendSpaceBeforeNextTokenIfNeeded(converted, sql, index);
+                } else {
+                    converted.append(current);
+                    index++;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertMysqlSessionVariableSetToNoop(String sql) {
+        String trimmed = sql.strip();
+        if (!trimmed.matches("(?is)^set\\s+session\\s+(tmp_table_size|max_heap_table_size)\\s*=\\s*[^;]+;?\\s*$")) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion("SELECT 1", true);
+    }
+
+    private void appendSpaceBeforeNextTokenIfNeeded(StringBuilder converted, String sql, int nextIndex) {
+        if (converted.isEmpty() || nextIndex >= sql.length()) {
+            return;
+        }
+        char previous = converted.charAt(converted.length() - 1);
+        char next = sql.charAt(nextIndex);
+        if (!Character.isWhitespace(previous)
+                && !Character.isWhitespace(next)
+                && previous != '('
+                && next != ')'
+                && next != ','
+                && next != ';') {
+            converted.append(' ');
+        }
     }
 
     private GenericConversion removeDuplicateWhereKeyword(String sql) {
@@ -1722,6 +2095,53 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return "CAST(" + expression + " AS BIGINT)";
     }
 
+    private GenericConversion convertSignedCasts(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "CAST")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CAST");
+                String replacement = functionCall == null ? null : rewriteSignedCast(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteSignedCast(FunctionCall castCall) {
+        Matcher matcher = CAST_SIGNED_BODY_PATTERN.matcher(castCall.body());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String expression = matcher.group(1).trim();
+        if (expression.isBlank()) {
+            return null;
+        }
+        return "CAST(" + expression + " AS BIGINT)";
+    }
+
     private GenericConversion convertUnsignedConvertFunctions(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
@@ -1816,6 +2236,54 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return "CAST(" + expression + " AS " + targetType + ")";
+    }
+
+    private GenericConversion convertCharConvertFunctions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "CONVERT")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CONVERT");
+                String replacement = functionCall == null ? null : rewriteCharConvert(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteCharConvert(FunctionCall convertCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(convertCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String expression = arguments.get(0).text().trim();
+        String targetType = arguments.get(1).text().trim();
+        if (expression.isBlank() || !CHAR_TARGET_TYPE_PATTERN.matcher(targetType).matches()) {
+            return null;
+        }
+        return "CAST(" + expression + " AS VARCHAR(4000))";
     }
 
     private GenericConversion convertMysqlGbkOrderBy(String sql) {
@@ -2608,8 +3076,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     index++;
                 } else {
                     String unquotedAlias = unquoteIdentifier(alias.text());
-                    if (!alias.text().startsWith("\"") && isDamengKeywordRequiringQuotes(unquotedAlias)) {
+                    if (isDamengKeywordRequiringQuotes(unquotedAlias)) {
                         aliases.add(unquotedAlias.toUpperCase(Locale.ROOT));
+                    }
+                    if (!alias.text().startsWith("\"") && isDamengKeywordRequiringQuotes(unquotedAlias)) {
                         replacements.add(new TextReplacement(
                                 alias.startIndex(),
                                 alias.endIndex(),
@@ -3625,6 +4095,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         if ("DESC".equals(upper) && previousNonWhitespace(sql, startIndex) == '.') {
             return "\"DESC\"";
+        }
+        if ("DISTINCT".equals(upper) && previousNonWhitespace(sql, startIndex) == ',') {
+            return quoteDamengIdentifier(identifier);
         }
         if ("REVERSE".equals(upper) && nextNonWhitespace(sql, startIndex + identifier.length()) != '(') {
             return quoteDamengIdentifier(identifier);
@@ -5589,6 +6062,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record TextReplacement(int startIndex, int endIndex, String replacement) {
+    }
+
+    private record NumericTypeRewrite(int endIndex, String replacement) {
     }
 
     private record BooleanLiteralComparison(int endIndex, String replacement) {
