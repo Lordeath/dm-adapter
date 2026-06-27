@@ -236,6 +236,21 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDynamicSingleQuotedAliasesWithoutEscapingOgnlStringLiterals() {
+        SqlConversionResult result = converter.convert("""
+                select sum(chargeSum) as '${"saturatedChargeSum" + item}'
+                from charge_customerchargedetail
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select sum(chargeSum) as "${"saturatedChargeSum" + item}"
+                from charge_customerchargedetail
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+    }
+
+    @Test
     void convertsMysqlImplicitSingleQuotedAliasesToDamengIdentifiers() {
         SqlConversionResult result = converter.convert(
                 "select count(id)'totalCount', NVL(sum(normalCount),0)'normalCount' from equip"
@@ -1895,13 +1910,14 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).isEqualTo("""
                 select COUNT(CASE WHEN sendState = 'SEND_SUCCESS' THEN 1 END) smsSuccessCount,
                        CASE WHEN ISNULL(c.refMeterReadId) THEN 0 ELSE 1 END charged,
-                       IF((isnull(xm.billType) = 1) OR (length(xm.billType) = 0), jt.billType, xm.billType) billType
+                       CASE WHEN (isnull(xm.billType) = 1) OR (length(xm.billType) = 0) THEN jt.billType ELSE xm.billType END billType
                 from ns_sms_details
                 """);
         assertThat(result.appliedRules()).containsExactly(
                 MySqlToDmSqlConverter.MYSQL_NOT_ISNULL_RULE,
                 MySqlToDmSqlConverter.MYSQL_COUNT_CONDITION_OR_NULL_RULE,
-                MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE
+                MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE,
+                MySqlToDmSqlConverter.MYSQL_IF_TO_CASE_RULE
         );
     }
 
@@ -1985,6 +2001,21 @@ class MySqlToDmSqlConverterTest {
                 from ns_equip_inspect_task
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE);
+    }
+
+    @Test
+    void convertsMysqlIfFunctionToCaseExpression() {
+        SqlConversionResult result = converter.convert("""
+                select sum(amount) / if(count(DISTINCT log.id) = 0, 1, count(DISTINCT log.id)) as avgAmount
+                from payment_log log
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select sum(amount) / CASE WHEN count(DISTINCT log.id) = 0 THEN 1 ELSE count(DISTINCT log.id) END as avgAmount
+                from payment_log log
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_IF_TO_CASE_RULE);
     }
 
     @Test
