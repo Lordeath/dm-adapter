@@ -3277,12 +3277,16 @@ class DmSqlValidationTestGenerator {
                         return configuredValue;
                     }
                     String normalized = normalizeName(valueName);
+                    boolean schemaIdentifier = isSchemaIdentifierName(normalized);
                     if (!statement.dynamicIdentifierParameter(valueName)
                             && !isLikelyDynamicIdentifierName(normalized)
-                            && !isSchemaIdentifierName(normalized)) {
+                            && !schemaIdentifier) {
                         return configuredValue;
                     }
                     String text = ((String) configuredValue).trim();
+                    if (schemaIdentifier && isDoubleQuotedSqlIdentifier(text)) {
+                        return text;
+                    }
                     String stripped = stripSqlLiteralQuotes(text);
                     if (isGeneratedDynamicIdentifierPlaceholder(stripped)) {
                         if (existingDefault instanceof String) {
@@ -3294,7 +3298,22 @@ class DmSqlValidationTestGenerator {
                         }
                         return defaultDynamicIdentifier(valueName);
                     }
+                    if (schemaIdentifier && text.equals(stripped) && !isSimpleQualifiedIdentifier(stripped)) {
+                        return quotedIdentifier(stripped);
+                    }
                     return text.equals(stripped) ? configuredValue : stripped;
+                }
+
+                private boolean isDoubleQuotedSqlIdentifier(String value) {
+                    return value != null
+                            && value.length() >= 2
+                            && value.charAt(0) == 34
+                            && value.charAt(value.length() - 1) == 34;
+                }
+
+                private boolean isSimpleQualifiedIdentifier(String value) {
+                    return value != null
+                            && value.matches("[A-Za-z_][A-Za-z0-9_$]*(?:\\\\.[A-Za-z_][A-Za-z0-9_$]*)*");
                 }
 
                 private boolean isGeneratedDynamicIdentifierPlaceholder(String value) {
