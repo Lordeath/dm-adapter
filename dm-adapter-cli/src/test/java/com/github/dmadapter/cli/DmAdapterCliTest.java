@@ -545,7 +545,7 @@ class DmAdapterCliTest {
                 .contains("isDoubleQuotedSqlIdentifier")
                 .contains("isSimpleQualifiedIdentifier")
                 .contains("return quotedIdentifier(stripped)")
-                .contains("Object rawConfigured = params.get(field.getName())")
+                .contains("Object rawConfigured = normalizedParams.get(field.getName())")
                 .contains("Cannot assign null to primitive field")
                 .contains("DYNAMIC_IDENTIFIER_PARAMETER")
                 .contains("DYNAMIC_SQL_FRAGMENT_PARAMETER")
@@ -759,7 +759,12 @@ class DmAdapterCliTest {
                 .contains("normalized.startsWith(\"sum\")")
                 .contains("value.put(beforeCurrentFlagKey, null);")
                 .contains("isRegexpSqlFragmentName(normalizeName(valueName))")
+                .contains("&& \"ID\".equalsIgnoreCase(stripSqlLiteralQuotes(text))")
                 .contains("return quoteSqlLiteral(\"1\");");
+        assertThat(generatedTestSource)
+                .contains("Map<String, Object> normalizedParams = normalizeValidationParameterMap(new LinkedHashMap<>(params));")
+                .contains("!normalizedParams.containsKey(field.getName())")
+                .contains("Object rawConfigured = normalizedParams.get(field.getName())");
     }
 
     @Test
