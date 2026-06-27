@@ -314,6 +314,69 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationWrapsConfiguredIdentityInsertTableWithTrimValuesPrefix() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.BankAccountMapper">
+                    <insert id="insertSelective" parameterType="com.example.BankAccount">
+                        insert into owner_customer_bank_account
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="ownerBankAccountId != null">
+                                owner_bank_account_id,
+                            </if>
+                            <if test="ownerId != null">
+                                owner_id,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="ownerBankAccountId != null">
+                                #{ownerBankAccountId,jdbcType=BIGINT},
+                            </if>
+                            <if test="ownerId != null">
+                                #{ownerId,jdbcType=BIGINT},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/BankAccountMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BankAccountMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of("owner_customer_bank_account")
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BankAccountMapper.xml"));
+        assertThat(rewritten)
+                .contains("SET IDENTITY_INSERT owner_customer_bank_account ON;")
+                .contains("<trim prefix=\"values (\" suffix=\")\" suffixOverrides=\",\">")
+                .contains("SET IDENTITY_INSERT owner_customer_bank_account OFF;");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.DAMENG_IDENTITY_INSERT_RULE);
+    }
+
+    @Test
     void migrationWrapsConfiguredIdentityInsertTableWhenMysqlOmitsIntoKeyword() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -2139,10 +2202,10 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName} ON COMMIT PRESERVE ROWS AS")
+                .contains("CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName}")
                 .contains("<foreach collection=\"list[0]\" item=\"field\" separator=\",\">")
-                .contains("CAST(NULL AS VARCHAR(4000)) AS ${field.fieldName}")
-                .contains("from dual where 1 = 0;")
+                .contains("${field.fieldName} VARCHAR(4000)")
+                .contains(") ON COMMIT PRESERVE ROWS;")
                 .contains("insert into t_${tmpTableName}")
                 .contains("<foreach collection=\"list\" item=\"item\" separator=\" union all \">")
                 .contains("#{field.fieldValue} AS ${field.fieldName}")
