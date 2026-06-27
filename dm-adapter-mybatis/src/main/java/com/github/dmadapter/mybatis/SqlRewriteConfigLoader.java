@@ -29,6 +29,7 @@ public class SqlRewriteConfigLoader {
         Set<String> ignoredMissingTables = new LinkedHashSet<>();
         Set<String> ignoredMissingColumns = new LinkedHashSet<>();
         Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
+        Set<String> identityInsertTables = new LinkedHashSet<>();
         String section = "";
         String currentName = "";
         for (String line : lines) {
@@ -48,9 +49,22 @@ public class SqlRewriteConfigLoader {
                 currentName = "";
                 continue;
             }
+            if (indent == 0 && trimmed.startsWith("identityInsertTables:")) {
+                section = "identityInsertTables";
+                currentName = "";
+                identityInsertTables.addAll(parseInlineList(trimmed.substring("identityInsertTables:".length())));
+                continue;
+            }
             if (indent == 0) {
                 section = "";
                 currentName = "";
+                continue;
+            }
+            if ("identityInsertTables".equals(section) && indent >= 2 && trimmed.startsWith("- ")) {
+                String table = unquote(trimmed.substring(2).trim());
+                if (!table.isBlank()) {
+                    identityInsertTables.add(table);
+                }
                 continue;
             }
             if (indent == 2
@@ -125,7 +139,14 @@ public class SqlRewriteConfigLoader {
                 }
             }
         }
-        return new SqlRewriteConfig(tableKeys, methodKeys, ignoredMissingTables, ignoredMissingColumns, ignoredMissingSchemas);
+        return new SqlRewriteConfig(
+                tableKeys,
+                methodKeys,
+                ignoredMissingTables,
+                ignoredMissingColumns,
+                ignoredMissingSchemas,
+                identityInsertTables
+        );
     }
 
     private boolean isValidationIgnoresSection(String section) {

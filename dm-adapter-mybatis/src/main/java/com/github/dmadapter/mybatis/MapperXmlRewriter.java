@@ -51,6 +51,7 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE";
     public static final String MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE =
             "MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE";
+    public static final String DAMENG_IDENTITY_INSERT_RULE = "DAMENG_IDENTITY_INSERT";
     private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
             "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
 
@@ -310,6 +311,12 @@ public class MapperXmlRewriter {
                                 sqlConverter,
                                 rewriteConfig
                         );
+                dynamicBodyConversion = wrapDynamicIdentityInsertIfConfigured(
+                        statement.getTagName(),
+                        originalSql,
+                        dynamicBodyConversion,
+                        rewriteConfig
+                );
                 manualReviewItems.add(new SqlChange(
                         reportPath,
                         statementKey,
@@ -338,7 +345,7 @@ public class MapperXmlRewriter {
                 continue;
             }
 
-            String tableName = extractInsertTableName(originalSql);
+            String tableName = extractInsertTableNameLenient(originalSql);
             String commentSafeSql = neutralizeMyBatisPlaceholdersInSqlLineComments(originalSql);
             List<String> staticRules = new ArrayList<>();
             if (!commentSafeSql.equals(originalSql)) {
@@ -350,6 +357,11 @@ public class MapperXmlRewriter {
                     ? conversionResult.convertedSql()
                     : commentSafeSql;
             addAppliedRules(staticRules, conversionResult.appliedRules());
+            String identityInsertTable = identityInsertTableName(statement.getTagName(), originalSql, rewriteConfig);
+            if (!identityInsertTable.isBlank() && !containsIdentityInsert(convertedSql)) {
+                convertedSql = wrapIdentityInsertSql(convertedSql, identityInsertTable);
+                staticRules.add(DAMENG_IDENTITY_INSERT_RULE);
+            }
             if (!convertedSql.equals(originalSql)) {
                 replacements.add(StatementReplacement.staticSql(
                         statement.getTagName(),
@@ -419,6 +431,97 @@ public class MapperXmlRewriter {
                         + ")?)\\s*\\("
         ).matcher(sql);
         return matcher.find() ? matcher.group(1).trim() : "";
+    }
+
+    private String extractInsertTableNameLenient(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return "";
+        }
+        Matcher matcher = Pattern.compile(
+                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+("
+                        + DM_IDENTIFIER
+                        + "(?:\\s*\\.\\s*"
+                        + DM_IDENTIFIER
+                        + ")?)\\b"
+        ).matcher(sql);
+        return matcher.find() ? matcher.group(1).trim() : "";
+    }
+
+    private String identityInsertTableName(String tagName, String sql, SqlRewriteConfig rewriteConfig) {
+        if (!"insert".equals(tagName) || rewriteConfig == null || sql == null || sql.isBlank()) {
+            return "";
+        }
+        String tableName = extractInsertTableNameLenient(sql);
+        if (tableName.isBlank()
+                || !rewriteConfig.requiresIdentityInsert(tableName)
+                || !insertColumnListContains(sql, tableName, "ID")) {
+            return "";
+        }
+        return tableName;
+    }
+
+    private boolean insertColumnListContains(String sql, String tableName, String columnName) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+"
+                        + Pattern.quote(tableName)
+        ).matcher(sql);
+        if (!matcher.find()) {
+            return false;
+        }
+        int valuesIndex = findTopLevelKeywordSkippingXml(sql, "VALUES", matcher.end());
+        if (valuesIndex < 0) {
+            return false;
+        }
+        String columns = sql.substring(matcher.end(), valuesIndex);
+        return Pattern.compile("(?i)(^|[^A-Za-z0-9_$])"
+                + Pattern.quote(columnName)
+                + "([^A-Za-z0-9_$]|$)").matcher(columns).find();
+    }
+
+    private DynamicBodyConversion wrapDynamicIdentityInsertIfConfigured(
+            String tagName,
+            String originalSql,
+            DynamicBodyConversion conversion,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        String tableName = identityInsertTableName(tagName, originalSql, rewriteConfig);
+        if (tableName.isBlank() || containsIdentityInsert(conversion.convertedBody())) {
+            return conversion;
+        }
+        List<String> appliedRules = new ArrayList<>(conversion.appliedRules());
+        appliedRules.add(DAMENG_IDENTITY_INSERT_RULE);
+        return new DynamicBodyConversion(
+                conversion.originalBody(),
+                wrapIdentityInsertSql(conversion.convertedBody(), tableName),
+                appliedRules,
+                conversion.manualReviewReasons(),
+                true
+        );
+    }
+
+    private boolean containsIdentityInsert(String sql) {
+        return sql != null && Pattern.compile("(?is)\\bSET\\s+IDENTITY_INSERT\\b").matcher(sql).find();
+    }
+
+    private String wrapIdentityInsertSql(String sql, String tableName) {
+        int leadingLength = leadingWhitespaceLength(sql);
+        int trailingStart = sql.length();
+        while (trailingStart > leadingLength && Character.isWhitespace(sql.charAt(trailingStart - 1))) {
+            trailingStart--;
+        }
+        String leading = sql.substring(0, leadingLength);
+        String core = sql.substring(leadingLength, trailingStart);
+        String trailing = sql.substring(trailingStart);
+        String indent = indentationOfLastLine(leading);
+        String semicolon = core.stripTrailing().endsWith(";") ? "\n" : ";\n";
+        return leading
+                + "BEGIN\n"
+                + indent + "SET IDENTITY_INSERT " + tableName + " ON;\n"
+                + indent + core
+                + semicolon
+                + indent + "SET IDENTITY_INSERT " + tableName + " OFF;\n"
+                + indent + "END;"
+                + trailing;
     }
 
     private String readXml(Path path) {

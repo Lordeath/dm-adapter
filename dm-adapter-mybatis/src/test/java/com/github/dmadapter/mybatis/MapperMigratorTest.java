@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -251,6 +252,65 @@ class MapperMigratorTest {
                 .contains(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
+    void migrationWrapsConfiguredIdentityInsertTableWithDynamicColumnList() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.AreaClassMapper">
+                    <insert id="insertIdBatch" parameterType="java.util.List">
+                        insert into ns_equip_area_class
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            ID,
+                            areaClassName
+                        </trim>
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.id}, #{item.areaClassName})
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/AreaClassMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/AreaClassMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of("ns_equip_area_class")
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AreaClassMapper.xml"));
+        assertThat(rewritten)
+                .contains("BEGIN")
+                .contains("SET IDENTITY_INSERT ns_equip_area_class ON;")
+                .contains("insert into ns_equip_area_class")
+                .contains("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">")
+                .contains("<foreach collection=\"list\" item=\"item\" separator=\",\">")
+                .contains("SET IDENTITY_INSERT ns_equip_area_class OFF;")
+                .contains("END;");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.DAMENG_IDENTITY_INSERT_RULE);
     }
 
     @Test

@@ -28,6 +28,9 @@ class SqlRewriteConfigLoaderTest {
     @Test
     void parsesValidationMissingTableIgnoresAndSkipsComments() {
         SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
+                "identityInsertTables:",
+                "  - \"ns_equip_area_class\"",
+                "identityInsertTables: [\"NEWSEE_OWNER.owner_house\"]",
                 "validationIgnores:",
                 "  missingTables:",
                 "    - \"ns_core_resourcecolumn_temp\"",
@@ -53,5 +56,8 @@ class SqlRewriteConfigLoaderTest {
         assertThat(config.ignoredMissingSchemas())
                 .contains("newsee-quartz", "newsee-scheduler")
                 .doesNotContain("commented_schema");
+        assertThat(config.requiresIdentityInsert("ns_equip_area_class")).isTrue();
+        assertThat(config.requiresIdentityInsert("owner_house")).isTrue();
+        assertThat(config.requiresIdentityInsert("other_table")).isFalse();
     }
 }
