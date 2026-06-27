@@ -2710,6 +2710,10 @@ class DmSqlValidationTestGenerator {
                         } catch (MapperInvocationException e) {
                             sqlSession.rollback(true);
                             String summary = throwableSummary(e.getCause());
+                            ValidationRecord skippedRegexp = skippedRegexpPlaceholderRecord(mapperMethod, parameters, summary);
+                            if (skippedRegexp != null) {
+                                return skippedRegexp;
+                            }
                             if (isEmptyDynamicSqlFailure(summary)) {
                                 return ValidationRecord.skipped(
                                         parameters.recordKey(mapperMethod.key()),
@@ -2739,6 +2743,10 @@ class DmSqlValidationTestGenerator {
                         } catch (Throwable e) {
                             sqlSession.rollback(true);
                             String summary = throwableSummary(e);
+                            ValidationRecord skippedRegexp = skippedRegexpPlaceholderRecord(mapperMethod, parameters, summary);
+                            if (skippedRegexp != null) {
+                                return skippedRegexp;
+                            }
                             if (isEmptyDynamicSqlFailure(summary)) {
                                 return ValidationRecord.skipped(
                                         parameters.recordKey(mapperMethod.key()),
@@ -2768,6 +2776,10 @@ class DmSqlValidationTestGenerator {
                         }
                     } catch (Throwable e) {
                         String summary = throwableSummary(e);
+                        ValidationRecord skippedRegexp = skippedRegexpPlaceholderRecord(mapperMethod, parameters, summary);
+                        if (skippedRegexp != null) {
+                            return skippedRegexp;
+                        }
                         if (isPrimitiveNullReturnFailure(summary)) {
                             return ValidationRecord.skipped(
                                     parameters.recordKey(mapperMethod.key()),
@@ -2794,6 +2806,82 @@ class DmSqlValidationTestGenerator {
                 private boolean isPrimitiveNullReturnFailure(String message) {
                     return message != null
                             && message.contains("attempted to return null from a method with a primitive return type");
+                }
+
+                private ValidationRecord skippedRegexpPlaceholderRecord(
+                        MapperMethod mapperMethod,
+                        ParameterResolution parameters,
+                        String summary
+                ) {
+                    if (!isRegexpMemoryLimitFailure(summary)
+                            || !hasGeneratedRegexpPlaceholderParameter(mapperMethod, parameters)) {
+                        return null;
+                    }
+                    return ValidationRecord.skipped(
+                            parameters.recordKey(mapperMethod.key()),
+                            "regexp-placeholder",
+                            parametersSummary(parameters),
+                            "达梦在占位 regexp 参数上触发正则表达式内存限制；"
+                                    + "请在 .dm-adapter/sql-rewrite.yml 的 validationArgs 中配置真实业务正则，"
+                                    + "或人工确认是否需要把该 SQL 改成 LIKE/INSTR 等达梦写法。"
+                                    + "\\n" + summary
+                    );
+                }
+
+                private boolean isRegexpMemoryLimitFailure(String message) {
+                    if (message == null) {
+                        return false;
+                    }
+                    String lower = normalizeMessage(message).toLowerCase(Locale.ROOT);
+                    return lower.contains("正则表达式内存限制")
+                            || lower.contains("out of memory for regex");
+                }
+
+                private boolean hasGeneratedRegexpPlaceholderParameter(MapperMethod mapperMethod, ParameterResolution parameters) {
+                    if (mapperMethod == null || parameters == null || parameters.args == null) {
+                        return false;
+                    }
+                    if (mapperMethod.method != null) {
+                        Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
+                        int collectionParameterIndex = 0;
+                        for (int i = 0; i < parameterTypes.length && i < parameters.args.length; i++) {
+                            String parameterName = parameterName(mapperMethod.method, i);
+                            boolean collectionLike = isCollectionLikeParameter(parameterTypes[i]);
+                            String effectiveParameterName = mapperMethod.statement == null
+                                    ? parameterName
+                                    : mapperMethod.statement.parameterExpressionName(
+                                            i,
+                                            collectionLike ? collectionParameterIndex : -1,
+                                            parameterName
+                                    );
+                            if (collectionLike) {
+                                collectionParameterIndex++;
+                            }
+                            if (isRegexpSqlFragmentName(normalizeName(effectiveParameterName))
+                                    && isGeneratedRegexpPlaceholderValue(parameters.args[i])) {
+                                return true;
+                            }
+                        }
+                    }
+                    if (parameters.args.length == 1 && parameters.args[0] instanceof Map<?, ?>) {
+                        Map<?, ?> values = (Map<?, ?>) parameters.args[0];
+                        for (Map.Entry<?, ?> entry : values.entrySet()) {
+                            if (entry.getKey() != null
+                                    && isRegexpSqlFragmentName(normalizeName(String.valueOf(entry.getKey())))
+                                    && isGeneratedRegexpPlaceholderValue(entry.getValue())) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+
+                private boolean isGeneratedRegexpPlaceholderValue(Object value) {
+                    if (!(value instanceof String)) {
+                        return false;
+                    }
+                    String stripped = stripSqlLiteralQuotes(((String) value).trim());
+                    return "ID".equalsIgnoreCase(stripped) || "1".equals(stripped);
                 }
 
                 private ValidationRecord skipIgnoredMissingTable(ValidationRecord record, ValidationConfig config) {
@@ -6998,6 +7086,9 @@ class DmSqlValidationTestGenerator {
                     if (hasDynamicSqlFragmentParameterIssue(message)) {
                         return "DYNAMIC_SQL_FRAGMENT_PARAMETER";
                     }
+                    if (hasRegexpOperatorIssue(message)) {
+                        return "REGEXP_OPERATOR";
+                    }
                     if (isAutoParameter(record) && hasGeneratedSearchParameterIssue(record, message)) {
                         return "GENERATED_SEARCH_PARAMETER";
                     }
@@ -7485,6 +7576,9 @@ class DmSqlValidationTestGenerator {
                             || hasOriginalXmlSyntaxDefect(message)) {
                         return "SQL_SYNTAX";
                     }
+                    if (hasRegexpOperatorIssue(message)) {
+                        return "SQL_SYNTAX";
+                    }
                     if (hasMysqlMakeDate(message)
                             || hasMysqlSubdate(message)
                             || hasMysqlUpdateJoinMultiTarget(message)
@@ -7577,6 +7671,15 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return false;
+                }
+
+                private boolean hasRegexpOperatorIssue(String message) {
+                    String normalized = normalizeMessage(message);
+                    String lower = normalized.toLowerCase(Locale.ROOT);
+                    return lower.contains("regexp_like")
+                            || lower.contains("正则表达式")
+                            || lower.contains("regex")
+                            || Pattern.compile("\\\\bregexp\\\\b", Pattern.CASE_INSENSITIVE).matcher(normalized).find();
                 }
 
                 private String parametersSummary(ParameterResolution parameters) {
