@@ -4367,13 +4367,22 @@ class DmSqlValidationTestGenerator {
                         Map<String, Object> params,
                         MapperStatement statement
                 ) {
-                    ValueResult base = defaultValue(targetType, genericType, 0, statement);
+                    Map<String, Object> normalizedParams = normalizeValidationParameterMap(new LinkedHashMap<>(params));
+                    Class<?> effectiveType = configuredPojoType(targetType, normalizedParams);
+                    if (effectiveType == null) {
+                        return ValueResult.unresolved("Configured __class is not assignable to "
+                                + targetType.getName() + ".");
+                    }
+                    if (!targetType.equals(effectiveType)) {
+                        genericType = effectiveType;
+                    }
+                    removeConfiguredPojoTypeKeys(normalizedParams);
+                    ValueResult base = defaultValue(effectiveType, genericType, 0, statement);
                     if (!base.resolved || base.value == null) {
                         return base;
                     }
-                    Map<String, Object> normalizedParams = normalizeValidationParameterMap(new LinkedHashMap<>(params));
                     Object instance = base.value;
-                    Class<?> currentType = targetType;
+                    Class<?> currentType = effectiveType;
                     try {
                         while (currentType != null && !Object.class.equals(currentType)) {
                             for (Field field : currentType.getDeclaredFields()) {
@@ -4434,8 +4443,45 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(instance);
                     } catch (Exception e) {
                         return ValueResult.unresolved("Failed to apply configured parameters to "
-                                + targetType.getName() + ": " + e.getMessage());
+                                + effectiveType.getName() + ": " + e.getMessage());
                     }
+                }
+
+                private Class<?> configuredPojoType(Class<?> targetType, Map<String, Object> params) {
+                    Object configuredType = configuredPojoTypeValue(params);
+                    if (configuredType == null) {
+                        return targetType;
+                    }
+                    String className = String.valueOf(configuredType).trim();
+                    if (isBlank(className)) {
+                        return targetType;
+                    }
+                    try {
+                        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+                        Class<?> type = Class.forName(
+                                className,
+                                false,
+                                classLoader == null ? targetType.getClassLoader() : classLoader
+                        );
+                        return targetType.isAssignableFrom(type) ? type : null;
+                    } catch (ClassNotFoundException e) {
+                        return null;
+                    }
+                }
+
+                private Object configuredPojoTypeValue(Map<String, Object> params) {
+                    for (String key : listOf("__class", "__type", "@class")) {
+                        if (params.containsKey(key)) {
+                            return params.get(key);
+                        }
+                    }
+                    return null;
+                }
+
+                private void removeConfiguredPojoTypeKeys(Map<String, Object> params) {
+                    params.remove("__class");
+                    params.remove("__type");
+                    params.remove("@class");
                 }
 
                 private boolean shouldPreserveConfiguredNullDefault(

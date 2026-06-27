@@ -285,7 +285,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     );
     private static final Pattern UPDATE_SET_QUALIFIED_ASSIGNMENT = Pattern.compile(
             "(?is)^\\s*(?<alias>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\.\\s*"
-                    + "(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*="
+                    + "(?<column>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*="
     );
 
     @Override
@@ -3230,6 +3230,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return GenericConversion.unchanged(sql);
         }
         if (updatesJoinedTableAlias(target, setClause)) {
+            GenericConversion multiTargetConversion = convertMultiTargetMysqlUpdateJoin(
+                    sql,
+                    updateIndex,
+                    target,
+                    joinSource,
+                    setClause,
+                    whereClause,
+                    statementEnd
+            );
+            if (multiTargetConversion.changed()) {
+                return multiTargetConversion;
+            }
             return GenericConversion.unchanged(sql);
         }
 
@@ -3262,6 +3274,180 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertMultiTargetMysqlUpdateJoin(
+            String sql,
+            int updateIndex,
+            String target,
+            String joinSource,
+            String setClause,
+            String whereClause,
+            int statementEnd
+    ) {
+        UpdateJoinChain chain = updateJoinChain(target, joinSource);
+        if (chain == null || chain.tables().size() < 2) {
+            return GenericConversion.unchanged(sql);
+        }
+        Map<String, List<UpdateSetAssignment>> assignmentsByAlias = new LinkedHashMap<>();
+        for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
+            Matcher matcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
+            if (!matcher.find()) {
+                return GenericConversion.unchanged(sql);
+            }
+            String aliasKey = normalizeIdentifierKey(matcher.group("alias"));
+            if (tableByAlias(chain.tables(), aliasKey) == null) {
+                return GenericConversion.unchanged(sql);
+            }
+            assignmentsByAlias
+                    .computeIfAbsent(aliasKey, ignored -> new ArrayList<>())
+                    .add(new UpdateSetAssignment(
+                            aliasKey,
+                            normalizeIdentifierKey(matcher.group("column")),
+                            assignment.text().trim()
+                    ));
+        }
+        if (assignmentsByAlias.size() < 2) {
+            return GenericConversion.unchanged(sql);
+        }
+        List<Map.Entry<String, List<UpdateSetAssignment>>> orderedAssignments =
+                new ArrayList<>(assignmentsByAlias.entrySet());
+        String predicates = String.join(" and ", updateJoinPredicates(chain.conditions(), whereClause));
+        orderedAssignments.sort((left, right) -> Boolean.compare(
+                updatesPredicateColumn(left.getKey(), left.getValue(), predicates),
+                updatesPredicateColumn(right.getKey(), right.getValue(), predicates)
+        ));
+
+        StringBuilder converted = new StringBuilder(sql.length() + 32);
+        converted.append(sql, 0, updateIndex).append("BEGIN\n");
+        for (Map.Entry<String, List<UpdateSetAssignment>> entry : orderedAssignments) {
+            UpdateJoinTable updateTable = tableByAlias(chain.tables(), entry.getKey());
+            if (updateTable == null) {
+                return GenericConversion.unchanged(sql);
+            }
+            List<String> sources = chain.tables().stream()
+                    .filter(table -> !table.aliasKey().equals(entry.getKey()))
+                    .map(UpdateJoinTable::tableSql)
+                    .toList();
+            if (sources.isEmpty()) {
+                return GenericConversion.unchanged(sql);
+            }
+            converted.append("update ")
+                    .append(updateTable.tableSql())
+                    .append(" set ")
+                    .append(String.join(", ", entry.getValue().stream().map(UpdateSetAssignment::text).toList()))
+                    .append(" from ")
+                    .append(String.join(", ", sources));
+            List<String> whereParts = updateJoinPredicates(chain.conditions(), whereClause);
+            if (!whereParts.isEmpty()) {
+                converted.append(" where ").append(String.join(" and ", whereParts));
+            }
+            converted.append(";\n");
+        }
+        converted.append("END;");
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private UpdateJoinChain updateJoinChain(String target, String joinSource) {
+        List<UpdateJoinTable> tables = new ArrayList<>();
+        List<String> conditions = new ArrayList<>();
+        UpdateJoinTable targetTable = updateJoinTable(target);
+        if (targetTable == null) {
+            return null;
+        }
+        tables.add(targetTable);
+
+        String remaining = joinSource == null ? "" : joinSource.strip();
+        while (!remaining.isBlank()) {
+            int onIndex = findTopLevelKeyword(remaining, "ON", 0);
+            if (onIndex < 0) {
+                return null;
+            }
+            UpdateJoinTable sourceTable = updateJoinTable(remaining.substring(0, onIndex).strip());
+            if (sourceTable == null) {
+                return null;
+            }
+            tables.add(sourceTable);
+
+            int conditionStart = onIndex + "ON".length();
+            int nextJoinIndex = findTopLevelKeyword(remaining, "JOIN", conditionStart);
+            int conditionEnd = nextJoinIndex < 0 ? remaining.length() : joinTypeStart(remaining, nextJoinIndex);
+            String condition = remaining.substring(conditionStart, conditionEnd).strip();
+            if (condition.isBlank()) {
+                return null;
+            }
+            conditions.add(condition);
+            if (nextJoinIndex < 0) {
+                break;
+            }
+            remaining = remaining.substring(nextJoinIndex + "JOIN".length()).strip();
+        }
+        return new UpdateJoinChain(tables, conditions);
+    }
+
+    private UpdateJoinTable updateJoinTable(String tableSql) {
+        String trimmed = tableSql == null ? "" : tableSql.strip();
+        if (trimmed.isBlank() || trimmed.startsWith("(")) {
+            return null;
+        }
+        List<String> parts = Pattern.compile("\\s+")
+                .splitAsStream(trimmed)
+                .filter(part -> !part.isBlank())
+                .toList();
+        if (parts.isEmpty()) {
+            return null;
+        }
+        String alias = parts.size() >= 2 ? parts.get(parts.size() - 1) : tableLeaf(parts.get(0));
+        if ("AS".equalsIgnoreCase(alias) && parts.size() >= 2) {
+            alias = parts.get(parts.size() - 2);
+        }
+        if (isSqlClauseKeyword(alias)) {
+            return null;
+        }
+        return new UpdateJoinTable(trimmed, normalizeIdentifierKey(alias));
+    }
+
+    private String tableLeaf(String tableName) {
+        String unquoted = unquoteIdentifier(tableName == null ? "" : tableName.trim());
+        int dot = unquoted.lastIndexOf('.');
+        return dot >= 0 && dot + 1 < unquoted.length() ? unquoted.substring(dot + 1) : unquoted;
+    }
+
+    private UpdateJoinTable tableByAlias(List<UpdateJoinTable> tables, String aliasKey) {
+        for (UpdateJoinTable table : tables) {
+            if (table.aliasKey().equals(aliasKey)) {
+                return table;
+            }
+        }
+        return null;
+    }
+
+    private List<String> updateJoinPredicates(List<String> joinConditions, String whereClause) {
+        List<String> predicates = new ArrayList<>();
+        for (String condition : joinConditions) {
+            if (condition != null && !condition.isBlank()) {
+                predicates.add(condition);
+            }
+        }
+        if (whereClause != null && !whereClause.isBlank()) {
+            predicates.add(whereClause);
+        }
+        return predicates;
+    }
+
+    private boolean updatesPredicateColumn(
+            String aliasKey,
+            List<UpdateSetAssignment> assignments,
+            String predicates
+    ) {
+        String normalizedPredicates = normalizeIdentifierKey(predicates).replaceAll("\\s+", "");
+        for (UpdateSetAssignment assignment : assignments) {
+            String reference = aliasKey + "." + assignment.columnKey();
+            if (normalizedPredicates.contains(reference)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private List<StatementSegment> splitTopLevelStatements(String sql) {
@@ -6457,6 +6643,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record JoinSource(String sourceSql, String conditionSql) {
+    }
+
+    private record UpdateJoinTable(String tableSql, String aliasKey) {
+    }
+
+    private record UpdateJoinChain(List<UpdateJoinTable> tables, List<String> conditions) {
+    }
+
+    private record UpdateSetAssignment(String aliasKey, String columnKey, String text) {
     }
 
     private record StatementSegment(String sql, String separator) {

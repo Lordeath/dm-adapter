@@ -349,6 +349,8 @@ class DmAdapterCliTest {
                 .contains("parametersSummary")
                 .contains("valueSummary")
                 .contains("isSensitiveName")
+                .contains("configuredPojoType")
+                .contains("__class")
                 .contains("REWRITE_CONFIG_PATH")
                 .contains("validationArgs")
                 .contains("validationIgnores")
