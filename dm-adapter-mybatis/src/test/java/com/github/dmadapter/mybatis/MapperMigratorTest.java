@@ -1288,6 +1288,69 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateSetRemovesDuplicateAssignments() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeItemMapper">
+                    <update id="updateById">
+                        update Charge_ChargeItem
+                        <set>
+                            <if test="powerType != null">
+                                powerType = #{powerType,jdbcType=INTEGER},
+                            </if>
+                            <if test="powerType != null">
+                                powerType = #{powerType, jdbcType=INTEGER },
+                            </if>
+                            <if test="billName != null">
+                                billName = #{billName,jdbcType=VARCHAR},
+                            </if>
+                            <if test="billName == null">
+                                billName = null,
+                            </if>
+                            <if test="chargeItemClass!=''">
+                                ChargeItemClass = CAST(#{chargeItemClass, jdbcType=VARCHAR } AS TINYINT),
+                            </if>
+                            ChargeItemClass = CAST(#{chargeItemClass,jdbcType=VARCHAR} AS TINYINT),
+                        </set>
+                        where id = #{id}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeItemMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeItemMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ChargeItemMapper.xml"));
+        assertThat(countMatches(rewritten, "powerType =")).isEqualTo(1);
+        assertThat(countMatches(rewritten, "billName = #{billName")).isEqualTo(1);
+        assertThat(countMatches(rewritten, "billName = null")).isEqualTo(1);
+        assertThat(countMatches(rewritten, "ChargeItemClass =")).isEqualTo(1);
+        assertThat(rewritten)
+                .doesNotContain("<if test=\"chargeItemClass!=''\">")
+                .contains("ChargeItemClass = CAST(#{chargeItemClass,jdbcType=VARCHAR} AS TINYINT)");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicInsertTrimAddsMissingCommasBetweenConditionalValues() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -2129,6 +2192,20 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
+    }
+
+    private int countMatches(String value, String needle) {
+        int count = 0;
+        int index = 0;
+        while (index < value.length()) {
+            int match = value.indexOf(needle, index);
+            if (match < 0) {
+                return count;
+            }
+            count++;
+            index = match + needle.length();
+        }
+        return count;
     }
 
     private Path writeMapper(String relativePath, String sql) throws Exception {

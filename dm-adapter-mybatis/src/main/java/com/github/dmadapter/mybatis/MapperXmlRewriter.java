@@ -27,6 +27,8 @@ public class MapperXmlRewriter {
     public static final String MYBATIS_BATCH_INSERT_ADD_VALUES_RULE = "MYBATIS_BATCH_INSERT_ADD_VALUES";
     public static final String MYBATIS_FOREACH_TRAILING_COMMA_RULE = "MYBATIS_FOREACH_TRAILING_COMMA";
     public static final String MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE = "MYBATIS_DYNAMIC_SET_MISSING_COMMA";
+    public static final String MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE =
+            "MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT";
     public static final String MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE =
             "MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA";
     public static final String MYBATIS_STATIC_WHERE_MISSING_AND_RULE =
@@ -199,6 +201,13 @@ public class MapperXmlRewriter {
     );
     private static final Pattern IF_BLOCK_PATTERN = Pattern.compile(
             "(?is)(?<opening><if\\b[^>]*>)(?<body>[\\s\\S]*?)</if\\s*>"
+    );
+    private static final Pattern SET_ASSIGNMENT_COLUMN_PATTERN = Pattern.compile(
+            "(?is)^\\s*((?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
+                    + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))?)\\s*="
+    );
+    private static final Pattern DYNAMIC_XML_TAG_PATTERN = Pattern.compile(
+            "(?is)<\\s*/?\\s*(if|foreach|choose|when|otherwise|trim|where|set)\\b"
     );
     private static final Set<String> AGGREGATE_FUNCTIONS = Set.of(
             "AVG",
@@ -678,6 +687,11 @@ public class MapperXmlRewriter {
             if (dynamicSetCommas.changed()) {
                 appliedRules.add(MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE);
                 converted = dynamicSetCommas.text();
+            }
+            TextRewrite duplicateSetAssignments = removeDuplicateDynamicSetAssignments(converted);
+            if (duplicateSetAssignments.changed()) {
+                appliedRules.add(MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE);
+                converted = duplicateSetAssignments.text();
             }
             DynamicBodyConversion dynamicUpdateOrderLimitOne = convertDynamicUpdateOrderLimitOneWithSetClause(converted);
             if (dynamicUpdateOrderLimitOne.changed()) {
@@ -3819,6 +3833,235 @@ public class MapperXmlRewriter {
         return applyTextReplacements(body, replacements);
     }
 
+    private TextRewrite removeDuplicateDynamicSetAssignments(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "set".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "set", body.length());
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                removeDuplicateSetAssignmentsInRange(body, tag.endIndex(), closingStart, replacements);
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+            } else {
+                index = tag.endIndex();
+            }
+        }
+        replacements.sort((left, right) -> Integer.compare(left.startIndex(), right.startIndex()));
+        return applyTextReplacements(body, replacements);
+    }
+
+    private void removeDuplicateSetAssignmentsInRange(
+            String body,
+            int start,
+            int end,
+            List<TextReplacement> replacements
+    ) {
+        Map<String, List<SetAssignment>> seenAssignments = new LinkedHashMap<>();
+        int index = start;
+        while (index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                removeDuplicateSetAssignmentsFromText(body, index, end, seenAssignments, replacements);
+                return;
+            }
+            if (tagStart > index) {
+                removeDuplicateSetAssignmentsFromText(body, index, tagStart, seenAssignments, replacements);
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "if".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "if", end);
+                if (closingStart >= 0) {
+                    int closingEnd = body.indexOf('>', closingStart + 1);
+                    if (closingEnd >= 0 && closingEnd + 1 <= end) {
+                        String ifBody = body.substring(tag.endIndex(), closingStart);
+                        String condition = readIfTestAttribute(body.substring(tagStart, tag.endIndex()));
+                        SetAssignment assignment = readSetAssignment(ifBody, condition, tagStart, closingEnd + 1);
+                        deduplicateSetAssignment(assignment, seenAssignments, replacements);
+                        index = closingEnd + 1;
+                        continue;
+                    }
+                }
+            }
+            index = tag.endIndex();
+        }
+    }
+
+    private void removeDuplicateSetAssignmentsFromText(
+            String body,
+            int start,
+            int end,
+            Map<String, List<SetAssignment>> seenAssignments,
+            List<TextReplacement> replacements
+    ) {
+        int lineStart = start;
+        while (lineStart < end) {
+            int lineEnd = body.indexOf('\n', lineStart);
+            if (lineEnd < 0 || lineEnd >= end) {
+                lineEnd = end;
+            }
+            int contentEnd = lineEnd;
+            if (contentEnd > lineStart && body.charAt(contentEnd - 1) == '\r') {
+                contentEnd--;
+            }
+            int replacementEnd = lineEnd < end && lineEnd < body.length() && body.charAt(lineEnd) == '\n'
+                    ? lineEnd + 1
+                    : lineEnd;
+            String line = body.substring(lineStart, contentEnd);
+            SetAssignment assignment = readSetAssignment(line, "", lineStart, replacementEnd);
+            deduplicateSetAssignment(assignment, seenAssignments, replacements);
+            lineStart = lineEnd < end ? lineEnd + 1 : end;
+        }
+    }
+
+    private String readIfTestAttribute(String openingTag) {
+        Matcher matcher = IF_OPENING_TAG_PATTERN.matcher(openingTag);
+        return matcher.find() ? normalizeExpressionForComparison(matcher.group(2)) : "";
+    }
+
+    private SetAssignment readSetAssignment(String fragment, String condition, int startIndex, int endIndex) {
+        if (fragment == null || fragment.isBlank()) {
+            return null;
+        }
+        if (DYNAMIC_XML_TAG_PATTERN.matcher(fragment).find() || hasMultipleSetAssignmentLines(fragment)) {
+            return null;
+        }
+        Matcher matcher = SET_ASSIGNMENT_COLUMN_PATTERN.matcher(fragment);
+        if (!matcher.find()) {
+            return null;
+        }
+        String rhs = stripTrailingComma(fragment.substring(matcher.end()));
+        if (rhs.isBlank()) {
+            return null;
+        }
+        return new SetAssignment(
+                normalizeSetAssignmentColumn(matcher.group(1)),
+                normalizeExpressionForComparison(rhs),
+                condition == null ? "" : condition,
+                startIndex,
+                endIndex
+        );
+    }
+
+    private boolean hasMultipleSetAssignmentLines(String fragment) {
+        int assignmentLines = 0;
+        int lineStart = 0;
+        while (lineStart < fragment.length()) {
+            int lineEnd = fragment.indexOf('\n', lineStart);
+            if (lineEnd < 0) {
+                lineEnd = fragment.length();
+            }
+            String line = fragment.substring(lineStart, lineEnd);
+            if (SET_ASSIGNMENT_COLUMN_PATTERN.matcher(line).find()) {
+                assignmentLines++;
+                if (assignmentLines > 1) {
+                    return true;
+                }
+            }
+            lineStart = lineEnd < fragment.length() ? lineEnd + 1 : fragment.length();
+        }
+        return false;
+    }
+
+    private String normalizeSetAssignmentColumn(String column) {
+        if (column == null) {
+            return "";
+        }
+        return column.replace("`", "")
+                .replace("\"", "")
+                .replaceAll("\\s+", "")
+                .toLowerCase(Locale.ROOT);
+    }
+
+    private String normalizeExpressionForComparison(String expression) {
+        if (expression == null || expression.isBlank()) {
+            return "";
+        }
+        StringBuilder normalized = new StringBuilder(expression.length());
+        boolean inSingleQuotedString = false;
+        boolean inDoubleQuotedString = false;
+        for (int i = 0; i < expression.length(); i++) {
+            char current = expression.charAt(i);
+            if (current == '\'' && !inDoubleQuotedString) {
+                inSingleQuotedString = !inSingleQuotedString;
+                normalized.append(current);
+            } else if (current == '"' && !inSingleQuotedString) {
+                inDoubleQuotedString = !inDoubleQuotedString;
+                normalized.append(current);
+            } else if (Character.isWhitespace(current) && !inSingleQuotedString && !inDoubleQuotedString) {
+                continue;
+            } else {
+                normalized.append(current);
+            }
+        }
+        return normalized.toString();
+    }
+
+    private void deduplicateSetAssignment(
+            SetAssignment assignment,
+            Map<String, List<SetAssignment>> seenAssignments,
+            List<TextReplacement> replacements
+    ) {
+        if (assignment == null) {
+            return;
+        }
+        List<SetAssignment> seenForColumn = seenAssignments.get(assignment.column());
+        if (seenForColumn == null) {
+            rememberSetAssignment(assignment, seenAssignments);
+            return;
+        }
+        List<SetAssignment> duplicates = seenForColumn.stream()
+                .filter(previous -> sameSetAssignmentValue(previous, assignment)
+                        && setAssignmentConditionsCanOverlap(previous.condition(), assignment.condition()))
+                .toList();
+        if (duplicates.isEmpty()) {
+            rememberSetAssignment(assignment, seenAssignments);
+            return;
+        }
+        if (assignment.condition().isBlank()
+                && duplicates.stream().noneMatch(previous -> previous.condition().isBlank())) {
+            duplicates.forEach(previous -> replacements.add(new TextReplacement(
+                    previous.startIndex(),
+                    previous.endIndex(),
+                    ""
+            )));
+            seenForColumn.removeAll(duplicates);
+            rememberSetAssignment(assignment, seenAssignments);
+            return;
+        }
+        replacements.add(new TextReplacement(assignment.startIndex(), assignment.endIndex(), ""));
+    }
+
+    private boolean setAssignmentConditionsCanOverlap(String left, String right) {
+        return left.isBlank() || right.isBlank() || left.equals(right);
+    }
+
+    private boolean sameSetAssignmentValue(SetAssignment left, SetAssignment right) {
+        return left.valueExpression().equals(right.valueExpression());
+    }
+
+    private void rememberSetAssignment(SetAssignment assignment, Map<String, List<SetAssignment>> seenAssignments) {
+        if (assignment != null) {
+            seenAssignments.computeIfAbsent(assignment.column(), ignored -> new ArrayList<>()).add(assignment);
+        }
+    }
+
     private TextRewrite addMissingDynamicInsertTrimCommas(String body) {
         List<TextReplacement> replacements = new ArrayList<>();
         int index = 0;
@@ -4377,6 +4620,15 @@ public class MapperXmlRewriter {
     }
 
     private record ConditionalTrimItem(String opening, String test, String content) {
+    }
+
+    private record SetAssignment(
+            String column,
+            String valueExpression,
+            String condition,
+            int startIndex,
+            int endIndex
+    ) {
     }
 
     private record DynamicHavingConversion(
