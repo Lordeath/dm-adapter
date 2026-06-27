@@ -2939,7 +2939,6 @@ class DmSqlValidationTestGenerator {
                 private ValidationRecord skipMissingDynamicSqlFragment(ValidationRecord record) {
                     if (record == null
                             || !"FAILED".equals(record.status)
-                            || !isAutoParameter(record)
                             || !hasDynamicSqlFragmentParameterIssue(record.message)) {
                         return record;
                     }
@@ -2947,7 +2946,7 @@ class DmSqlValidationTestGenerator {
                             record.key,
                             "dynamic-sql-fragment-parameter",
                             record.parameterSummary,
-                            "Dynamic SQL fragment parameter is missing or generated placeholder; "
+                            "Dynamic SQL fragment parameter is missing or still uses a generated placeholder; "
                                     + "configure a real SQL fragment in .dm-adapter/sql-rewrite.yml validationArgs, "
                                     + "for example whereSql/orderBy/sqlFragment/inSql."
                                     + "\\nOriginal failure:\\n" + record.message
