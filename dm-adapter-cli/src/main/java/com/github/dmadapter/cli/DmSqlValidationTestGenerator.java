@@ -3165,9 +3165,11 @@ class DmSqlValidationTestGenerator {
                     if (config == null) {
                         return null;
                     }
-                    for (String table : bracketedValuesAfterMarker(message, "无效的表或视图名")) {
-                        if (config.ignoresMissingTable(table)) {
-                            return table;
+                    for (String marker : listOf("无效的表或视图名", "无效的表名")) {
+                        for (String table : bracketedValuesAfterMarker(message, marker)) {
+                            if (config.ignoresMissingTable(table)) {
+                                return table;
+                            }
                         }
                     }
                     return null;
@@ -6980,9 +6982,11 @@ class DmSqlValidationTestGenerator {
                     Map<String, String> suggestedTables = new LinkedHashMap<>();
                     Map<String, String> suggestedColumns = new LinkedHashMap<>();
                     for (ValidationRecord record : failedRecords) {
-                        for (String table : bracketedValuesAfterMarker(record.message, "无效的表或视图名")) {
-                            if (!config.ignoresMissingTable(table)) {
-                                suggestedTables.putIfAbsent(normalizeMissingTableName(table), table);
+                        for (String marker : listOf("无效的表或视图名", "无效的表名")) {
+                            for (String table : bracketedValuesAfterMarker(record.message, marker)) {
+                                if (!config.ignoresMissingTable(table)) {
+                                    suggestedTables.putIfAbsent(normalizeMissingTableName(table), table);
+                                }
                             }
                         }
                         for (String marker : listOf("无效的列名", "无效的变量名", "无法解析的成员访问表达式")) {
@@ -7112,7 +7116,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private void appendSchemaObjectSummary(StringBuilder markdown, List<ValidationRecord> records) {
-                    Map<String, Long> missingTables = schemaIssueCounts(records, "无效的表或视图名");
+                    Map<String, Long> missingTables = schemaIssueCounts(records, "无效的表或视图名", "无效的表名");
                     Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式");
                     Map<String, Long> missingSchemas = schemaIssueCounts(records, "无效的模式名");
                     if (missingTables.isEmpty() && missingColumns.isEmpty() && missingSchemas.isEmpty()) {
@@ -7585,7 +7589,7 @@ class DmSqlValidationTestGenerator {
 
                 private void appendSchemaObjectHotspotsJson(StringBuilder json, List<ValidationRecord> records) {
                     json.append("  \\"schemaObjectHotspots\\": {");
-                    appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(records, "无效的表或视图名"));
+                    appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(records, "无效的表或视图名", "无效的表名"));
                     json.append(", ");
                     appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式"));
                     json.append(", ");
@@ -7851,6 +7855,7 @@ class DmSqlValidationTestGenerator {
 
                 private boolean isSchemaObjectFailure(String lowerMessage) {
                     return lowerMessage.contains("无效的表或视图名")
+                            || lowerMessage.contains("无效的表名")
                             || lowerMessage.contains("无效的列名")
                             || lowerMessage.contains("无效的变量名")
                             || lowerMessage.contains("无效的模式名")
@@ -7882,7 +7887,7 @@ class DmSqlValidationTestGenerator {
                     return lower.contains("sql语句为null或空值")
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\binsert\\\\s+into\\\\s*\\\\(").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\s+(?:set|where)\\\\b").matcher(value).find()
-                            || Pattern.compile("(?i)无效的表或视图名\\\\s*\\\\[\\\\s*(?:t|b|ID)\\\\s*][\\\\s\\\\S]*?### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join|update|into|table)\\\\s+(?:t|b|ID)\\\\b").matcher(value).find();
+                            || Pattern.compile("(?i)无效的表(?:或视图)?名\\\\s*\\\\[\\\\s*(?:t|b|ID)\\\\s*][\\\\s\\\\S]*?### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join|update|into|table)\\\\s+(?:t|b|ID)\\\\b").matcher(value).find();
                 }
 
                 private boolean hasGeneratedDynamicIdentifierPlaceholder(String message) {
@@ -8186,7 +8191,7 @@ class DmSqlValidationTestGenerator {
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
-                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的变量名", "无效的模式名", "无法解析的成员访问表达式")) {
+                    if (containsAny(message, "无效的表或视图名", "无效的表名", "无效的列名", "无效的变量名", "无效的模式名", "无法解析的成员访问表达式")) {
                         return "TEST_SCHEMA";
                     }
                     if (hasTestDataOrConstraintIssue(message)

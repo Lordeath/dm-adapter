@@ -434,7 +434,7 @@ class MapperJdbcTypeAligner {
         if (targetJdbcType.isBlank()) {
             return placeholder;
         }
-        if (stringParameter && isNumericColumnType(columnType)) {
+        if (stringParameter && (isNumericColumnType(columnType) || isTemporalColumnType(columnType))) {
             return "CAST(" + replaceOrAddJdbcType(placeholder, "VARCHAR") + " AS " + targetJdbcType + ")";
         }
         return replaceOrAddJdbcType(placeholder, targetJdbcType);
@@ -507,6 +507,14 @@ class MapperJdbcTypeAligner {
                 || type.contains("DOUBLE")
                 || type.contains("FLOAT")
                 || type.contains("REAL");
+    }
+
+    private boolean isTemporalColumnType(String columnType) {
+        String type = columnType == null ? "" : columnType.toUpperCase(Locale.ROOT);
+        return type.contains("TIMESTAMP")
+                || type.contains("DATETIME")
+                || type.contains("DATE")
+                || type.contains("TIME");
     }
 
     private String jdbcTypeForColumnType(String columnType) {
