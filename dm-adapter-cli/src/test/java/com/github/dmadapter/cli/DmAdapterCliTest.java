@@ -716,7 +716,13 @@ class DmAdapterCliTest {
         assertThat(exitCode).isZero();
         assertThat(generatedTestSource)
                 .contains("metadata.addDefaultValue(expression, defaultValue);")
-                .contains("metadata.addDefaultValue(valueMatcher.group(1), defaultValue);");
+                .contains("metadata.addDefaultValue(valueMatcher.group(1), defaultValue);")
+                .contains("metadata.addSetDefaultValue(propertyName);")
+                .contains("metadata.addSetDefaultValue(valueMatcher.group(1));")
+                .contains("private boolean shouldPreserveConfiguredNullDefault(")
+                .contains("!statement.setDefaultValue(valueName) && !statement.hasSetDefaultUnder(valueName)")
+                .contains("configuredValue == null && shouldPreserveConfiguredNullDefault(entryPath, existing, statement)")
+                .contains("return dynamicIdentifierMetadata.hasSetDefaultUnder(valueName)");
     }
 
     @Test
