@@ -1358,6 +1358,66 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicMultiTargetUpdateJoinKeepsTrailingPredicatesInsideDamengBlock() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateShareCheckTaskById">
+                        update ns_quality_check_schedule_task a
+                        join ns_quality_check_schedule_task_user u on a.ID=u.checkScheduleTaskID
+                        join ns_quality_day_task_transfer b on b.reportUserID=u.checkUserID
+                        set u.checkUserID=b.transferUserID,
+                            u.checkUserName=b.transferUserName,
+                            a.transferType=1,
+                            a.transferFromUserID=b.reportUserID,
+                            a.transferFromUserName=b.reportUserName
+                        where b.ID = #{id} and a.checkStatus=1
+                        <if test="importantFlag != null">
+                            and a.importantFlag = #{importantFlag}
+                        </if>
+                        and a.searchStartDate between b.startDate and b.endDate
+                        and a.searchEndDate between b.startDate and b.endDate
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("BEGIN")
+                .contains("update ns_quality_check_schedule_task_user u")
+                .contains("update ns_quality_check_schedule_task a")
+                .contains("END;")
+                .doesNotContain("END;\n                        <if")
+                .doesNotContain("END;\n                        and a.searchStartDate");
+        assertThat(rewritten.split("a.importantFlag", -1)).hasSize(3);
+        assertThat(rewritten.split("a.searchStartDate between b.startDate and b.endDate", -1)).hasSize(3);
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
+                        MapperXmlRewriter.DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED_RULE
+                );
+    }
+
+    @Test
     void dynamicUpdateJoinWithConditionalTrailingAssignmentKeepsAssignmentBeforeFrom() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
