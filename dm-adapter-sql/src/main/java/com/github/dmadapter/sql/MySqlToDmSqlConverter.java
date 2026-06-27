@@ -3352,14 +3352,34 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 return null;
             }
             end = close + 1;
-        } else {
-            end = start;
-            while (end < sql.length() && !isRegexpRightBoundary(sql, end)) {
-                end++;
+        } else if (isIdentifierStart(current)) {
+            int cursor = start + 1;
+            while (cursor < sql.length() && isIdentifierPart(sql.charAt(cursor))) {
+                cursor++;
             }
+            int openParen = skipWhitespace(sql, cursor);
+            if (openParen < sql.length() && sql.charAt(openParen) == '(') {
+                int close = findMatchingParen(sql, openParen);
+                if (close < 0) {
+                    return null;
+                }
+                end = close + 1;
+            } else {
+                end = readRegexpRightUntilBoundary(sql, start);
+            }
+        } else {
+            end = readRegexpRightUntilBoundary(sql, start);
         }
         String text = sql.substring(start, end);
         return text.isBlank() ? null : new Operand(start, end, text);
+    }
+
+    private int readRegexpRightUntilBoundary(String sql, int start) {
+        int end = start;
+        while (end < sql.length() && !isRegexpRightBoundary(sql, end)) {
+            end++;
+        }
+        return end;
     }
 
     private boolean isRegexpRightBoundary(String sql, int index) {
