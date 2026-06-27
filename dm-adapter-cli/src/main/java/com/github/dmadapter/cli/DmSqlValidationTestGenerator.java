@@ -5991,7 +5991,7 @@ class DmSqlValidationTestGenerator {
 
                 private void appendSchemaObjectSummary(StringBuilder markdown, List<ValidationRecord> records) {
                     Map<String, Long> missingTables = schemaIssueCounts(records, "无效的表或视图名");
-                    Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名");
+                    Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名", "无效的变量名");
                     if (missingTables.isEmpty() && missingColumns.isEmpty()) {
                         return;
                     }
@@ -6000,14 +6000,16 @@ class DmSqlValidationTestGenerator {
                     appendCountSummary(markdown, "缺失字段", "字段", missingColumns, 30);
                 }
 
-                private Map<String, Long> schemaIssueCounts(List<ValidationRecord> records, String marker) {
+                private Map<String, Long> schemaIssueCounts(List<ValidationRecord> records, String... markers) {
                     Map<String, Long> counts = new LinkedHashMap<>();
                     for (ValidationRecord record : records) {
                         if (!"FAILED".equals(record.status)) {
                             continue;
                         }
-                        for (String value : bracketedValuesAfterMarker(record.message, marker)) {
-                            counts.merge(value, 1L, Long::sum);
+                        for (String marker : markers) {
+                            for (String value : bracketedValuesAfterMarker(record.message, marker)) {
+                                counts.merge(value, 1L, Long::sum);
+                            }
                         }
                     }
                     return counts.entrySet().stream()
@@ -6459,7 +6461,7 @@ class DmSqlValidationTestGenerator {
                     json.append("  \\"schemaObjectHotspots\\": {");
                     appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(records, "无效的表或视图名"));
                     json.append(", ");
-                    appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名"));
+                    appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名", "无效的变量名"));
                     json.append("}");
                 }
 
@@ -6666,6 +6668,7 @@ class DmSqlValidationTestGenerator {
                     }
                     if (lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(message).find()) {
                         return "ORIGINAL_XML_SYNTAX_DEFECT";
                     }
@@ -6722,13 +6725,14 @@ class DmSqlValidationTestGenerator {
                 private boolean isSchemaObjectFailure(String lowerMessage) {
                     return lowerMessage.contains("无效的表或视图名")
                             || lowerMessage.contains("无效的列名")
+                            || lowerMessage.contains("无效的变量名")
                             || lowerMessage.contains("无效的模式名")
                             || lowerMessage.contains("无法解析的成员访问表达式");
                 }
 
                 private boolean isMysqlMetadataSql(String message) {
                     return Pattern.compile("\\\\binformation_schema\\\\b|\\\\bdatabase\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
-                            || Pattern.compile("(?im)^### SQL:\\\\s*describe\\\\b").matcher(message).find();
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bdescribe\\\\b").matcher(message).find();
                 }
 
                 private boolean hasDamengCtasBindParameter(String message) {
@@ -6824,6 +6828,7 @@ class DmSqlValidationTestGenerator {
                             || lower.contains("重复的列名")
                             || hasUnbalancedSqlParentheses(value)
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\blike\\\\s+\\\\?\\\\s*'").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\band[A-Za-z_][A-Za-z0-9_$]*\\\\s+(?:in|=|<>|!=|>|<|like)\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(value).find()
@@ -7031,7 +7036,7 @@ class DmSqlValidationTestGenerator {
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
-                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的模式名", "无法解析的成员访问表达式")) {
+                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的变量名", "无效的模式名", "无法解析的成员访问表达式")) {
                         return "TEST_SCHEMA";
                     }
                     if (containsAny(message,
