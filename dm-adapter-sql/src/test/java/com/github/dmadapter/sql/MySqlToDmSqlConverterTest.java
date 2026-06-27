@@ -1953,6 +1953,31 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlInformationSchemaColumnsTableListPrefixSplitByDynamicForeach() {
+        SqlConversionResult result = converter.convert("""
+                SELECT table_name
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE table_name LIKE concat(#{tablePrefix},'%')
+                AND table_schema = (select DATABASE())
+                AND column_name not in
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT TABLE_NAME
+                FROM ALL_TAB_COLUMNS
+                WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                AND TABLE_NAME LIKE UPPER((#{tablePrefix}) || ('%'))
+                AND COLUMN_NAME NOT IN""");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE,
+                        MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE
+                );
+    }
+
+    @Test
     void convertsMysqlInformationSchemaTablesQueryToAllTables() {
         SqlConversionResult result = converter.convert("""
                 SELECT COUNT(*) AS table_exists FROM information_schema.TABLES

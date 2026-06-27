@@ -254,6 +254,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     + "table_schema\\s*=\\s*\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\)\\s+and\\s+"
                     + "column_name\\s+not\\s+in\\s+(?<notIn>.+?)\\s+group\\s+by\\s+table_name\\s*;?\\s*$"
     );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_TABLE_LIST_PREFIX_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+table_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
+                    + "table_name\\s+like\\s+(?<tableLike>.+?)\\s+and\\s+"
+                    + "table_schema\\s*=\\s*\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\)\\s+and\\s+"
+                    + "column_name\\s+not\\s+in\\s*;?\\s*$"
+    );
     private static final Pattern INFORMATION_SCHEMA_TABLES_PATTERN = Pattern.compile(
             "(?is)^\\s*select\\s+count\\s*\\(\\s*(?:\\*|1)\\s*\\)"
                     + "(?:\\s+(?:as\\s+)?(?<alias>[A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\"))?"
@@ -2799,21 +2805,34 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private GenericConversion convertInformationSchemaColumnsTableList(String sql) {
         Matcher matcher = INFORMATION_SCHEMA_COLUMNS_TABLE_LIST_PATTERN.matcher(sql);
-        if (!matcher.matches()) {
+        if (matcher.matches()) {
+            String tableLike = matcher.group("tableLike").trim();
+            String notIn = matcher.group("notIn").trim();
+            if (tableLike.isBlank() || notIn.isBlank()) {
+                return GenericConversion.unchanged(sql);
+            }
+            String converted = "SELECT TABLE_NAME\n"
+                    + "FROM ALL_TAB_COLUMNS\n"
+                    + "WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                    + "AND TABLE_NAME LIKE UPPER(" + tableLike + ")\n"
+                    + "AND COLUMN_NAME NOT IN\n"
+                    + notIn
+                    + "\nGROUP BY TABLE_NAME";
+            return new GenericConversion(converted, true);
+        }
+        Matcher prefixMatcher = INFORMATION_SCHEMA_COLUMNS_TABLE_LIST_PREFIX_PATTERN.matcher(sql);
+        if (!prefixMatcher.matches()) {
             return GenericConversion.unchanged(sql);
         }
-        String tableLike = matcher.group("tableLike").trim();
-        String notIn = matcher.group("notIn").trim();
-        if (tableLike.isBlank() || notIn.isBlank()) {
+        String tableLike = prefixMatcher.group("tableLike").trim();
+        if (tableLike.isBlank()) {
             return GenericConversion.unchanged(sql);
         }
         String converted = "SELECT TABLE_NAME\n"
                 + "FROM ALL_TAB_COLUMNS\n"
                 + "WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
                 + "AND TABLE_NAME LIKE UPPER(" + tableLike + ")\n"
-                + "AND COLUMN_NAME NOT IN\n"
-                + notIn
-                + "\nGROUP BY TABLE_NAME";
+                + "AND COLUMN_NAME NOT IN";
         return new GenericConversion(converted, true);
     }
 

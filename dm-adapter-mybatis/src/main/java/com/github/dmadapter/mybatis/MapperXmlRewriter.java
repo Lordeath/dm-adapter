@@ -49,6 +49,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE =
             "MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE";
+    public static final String MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE =
+            "MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE";
     private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
             "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
 
@@ -651,6 +653,11 @@ public class MapperXmlRewriter {
             converted = dynamicWhereAnd.text();
             appliedRules.add(MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE);
         }
+        TextRewrite keywordAliasReferences = quoteDynamicQuotedAliasReferences(converted);
+        if (keywordAliasReferences.changed()) {
+            converted = keywordAliasReferences.text();
+            appliedRules.add(MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE);
+        }
 
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
@@ -739,6 +746,219 @@ public class MapperXmlRewriter {
         }
         converted = withoutTrailingCommas;
         return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
+    }
+
+    private TextRewrite quoteDynamicQuotedAliasReferences(String body) {
+        Map<String, String> aliases = collectQuotedRelationAliases(body);
+        if (aliases.isEmpty()) {
+            return new TextRewrite(body, false);
+        }
+        List<TextReplacement> replacements = new ArrayList<>();
+        collectQuotedAliasReferenceReplacements(body, aliases, replacements);
+        return applyTextReplacements(body, replacements);
+    }
+
+    private Map<String, String> collectQuotedRelationAliases(String body) {
+        Map<String, String> aliases = new LinkedHashMap<>();
+        int index = 0;
+        while (index < body.length()) {
+            if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? body.length() : end + "-->".length();
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int end = body.indexOf("]]>", index + "<![CDATA[".length());
+                if (end < 0) {
+                    index = body.length();
+                } else {
+                    collectQuotedRelationAliasesInSqlText(
+                            body.substring(index + "<![CDATA[".length(), end),
+                            aliases
+                    );
+                    index = end + "]]>".length();
+                }
+            } else if (body.charAt(index) == '<') {
+                int tagEnd = findXmlTagEnd(body, index);
+                index = tagEnd < 0 ? body.length() : tagEnd + 1;
+            } else {
+                int nextTag = body.indexOf('<', index);
+                int textEnd = nextTag < 0 ? body.length() : nextTag;
+                collectQuotedRelationAliasesInSqlText(body.substring(index, textEnd), aliases);
+                index = textEnd;
+            }
+        }
+        return aliases;
+    }
+
+    private void collectQuotedRelationAliasesInSqlText(String text, Map<String, String> aliases) {
+        int index = 0;
+        while (index < text.length()) {
+            char current = text.charAt(index);
+            if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(text, index, current);
+            } else if (startsMyBatisPlaceholder(text, index)) {
+                index = skipMyBatisPlaceholder(text, index);
+            } else if (text.startsWith("--", index)) {
+                int end = text.indexOf('\n', index + 2);
+                index = end < 0 ? text.length() : end;
+            } else if (text.startsWith("/*", index)) {
+                int end = text.indexOf("*/", index + 2);
+                index = end < 0 ? text.length() : end + 2;
+            } else if (isKeywordAt(text, index, "FROM") || isKeywordAt(text, index, "JOIN")) {
+                String keyword = isKeywordAt(text, index, "FROM") ? "FROM" : "JOIN";
+                int relationEnd = readRelationEnd(text, skipWhitespace(text, index + keyword.length()));
+                if (relationEnd < 0) {
+                    index += keyword.length();
+                    continue;
+                }
+                int aliasStart = skipWhitespace(text, relationEnd);
+                if (isKeywordAt(text, aliasStart, "AS")) {
+                    aliasStart = skipWhitespace(text, aliasStart + "AS".length());
+                }
+                IdentifierToken alias = readIdentifierToken(text, aliasStart);
+                if (alias != null && alias.text().startsWith("\"") && !isSqlClauseKeyword(alias.text())) {
+                    String unquoted = unquoteIdentifier(alias.text());
+                    aliases.putIfAbsent(unquoted.toUpperCase(Locale.ROOT), unquoted);
+                    index = alias.endIndex();
+                } else {
+                    index = relationEnd;
+                }
+            } else {
+                index++;
+            }
+        }
+    }
+
+    private void collectQuotedAliasReferenceReplacements(
+            String body,
+            Map<String, String> aliases,
+            List<TextReplacement> replacements
+    ) {
+        int index = 0;
+        while (index < body.length()) {
+            if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? body.length() : end + "-->".length();
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int contentStart = index + "<![CDATA[".length();
+                int end = body.indexOf("]]>", contentStart);
+                if (end < 0) {
+                    index = body.length();
+                } else {
+                    collectQuotedAliasReferenceReplacementsInSqlText(
+                            body.substring(contentStart, end),
+                            contentStart,
+                            aliases,
+                            replacements
+                    );
+                    index = end + "]]>".length();
+                }
+            } else if (body.charAt(index) == '<') {
+                int tagEnd = findXmlTagEnd(body, index);
+                index = tagEnd < 0 ? body.length() : tagEnd + 1;
+            } else {
+                int nextTag = body.indexOf('<', index);
+                int textEnd = nextTag < 0 ? body.length() : nextTag;
+                collectQuotedAliasReferenceReplacementsInSqlText(
+                        body.substring(index, textEnd),
+                        index,
+                        aliases,
+                        replacements
+                );
+                index = textEnd;
+            }
+        }
+    }
+
+    private void collectQuotedAliasReferenceReplacementsInSqlText(
+            String text,
+            int baseOffset,
+            Map<String, String> aliases,
+            List<TextReplacement> replacements
+    ) {
+        int index = 0;
+        while (index < text.length()) {
+            char current = text.charAt(index);
+            if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(text, index, current);
+            } else if (startsMyBatisPlaceholder(text, index)) {
+                index = skipMyBatisPlaceholder(text, index);
+            } else if (text.startsWith("--", index)) {
+                int end = text.indexOf('\n', index + 2);
+                index = end < 0 ? text.length() : end;
+            } else if (text.startsWith("/*", index)) {
+                int end = text.indexOf("*/", index + 2);
+                index = end < 0 ? text.length() : end + 2;
+            } else {
+                IdentifierToken identifier = readIdentifierToken(text, index);
+                if (identifier == null || identifier.text().startsWith("\"") || identifier.text().startsWith("`")) {
+                    index++;
+                    continue;
+                }
+                String alias = aliases.get(identifier.text().toUpperCase(Locale.ROOT));
+                int afterIdentifier = skipWhitespace(text, identifier.endIndex());
+                if (alias != null && afterIdentifier < text.length() && text.charAt(afterIdentifier) == '.') {
+                    replacements.add(new TextReplacement(
+                            baseOffset + index,
+                            baseOffset + identifier.endIndex(),
+                            quoteDynamicAliasIdentifier(alias)
+                    ));
+                }
+                index = identifier.endIndex();
+            }
+        }
+    }
+
+    private int readRelationEnd(String text, int start) {
+        if (start >= text.length()) {
+            return -1;
+        }
+        if (text.charAt(start) == '(') {
+            return skipParenthesizedSql(text, start);
+        }
+        if (startsMyBatisPlaceholder(text, start)) {
+            return skipMyBatisPlaceholder(text, start);
+        }
+        IdentifierToken identifier = readIdentifierToken(text, start);
+        if (identifier == null) {
+            return -1;
+        }
+        int end = identifier.endIndex();
+        int index = skipWhitespace(text, end);
+        while (index < text.length() && text.charAt(index) == '.') {
+            int partStart = skipWhitespace(text, index + 1);
+            IdentifierToken part = readIdentifierToken(text, partStart);
+            if (part == null) {
+                break;
+            }
+            end = part.endIndex();
+            index = skipWhitespace(text, end);
+        }
+        return end;
+    }
+
+    private int skipParenthesizedSql(String text, int start) {
+        int depth = 1;
+        int index = start + 1;
+        while (index < text.length()) {
+            char current = text.charAt(index);
+            if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(text, index, current);
+            } else if (startsMyBatisPlaceholder(text, index)) {
+                index = skipMyBatisPlaceholder(text, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth--;
+                index++;
+                if (depth == 0) {
+                    return index;
+                }
+            } else {
+                index++;
+            }
+        }
+        return -1;
     }
 
     private TextRewrite convertDynamicTemporaryTableAsSelectPrefix(String body) {
@@ -3444,6 +3664,10 @@ public class MapperXmlRewriter {
             return unquoted;
         }
         return "\"" + unquoted.replace("\"", "\"\"") + "\"";
+    }
+
+    private String quoteDynamicAliasIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 
     private String unquoteIdentifier(String identifier) {
