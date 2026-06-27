@@ -403,6 +403,7 @@ class DmAdapterCliTest {
                 .contains("\"removeitemids\"")
                 .contains("\"orders\"")
                 .contains("\"ordernos\"")
+                .contains("\"monthlist\"")
                 .contains("metadata.addCollectionParameterName(collection, nonEmptyCollection)")
                 .contains("metadata.addNonEmptyCollectionParameterName(collection)")
                 .contains("shouldUseNonEmptyForeachCollection")
@@ -894,7 +895,9 @@ class DmAdapterCliTest {
                 .contains("isSyntheticMetadataName(valueName) && values.size() == 1")
                 .contains("private String requiredCollectionValueName(String valueName, MapperStatement statement)")
                 .contains("Set<String> collectionNames = statement.collectionParameterNames()")
-                .contains("valueByMetadataName(collectionScalarDefaults, valueName)");
+                .contains("valueByMetadataName(collectionScalarDefaults, valueName)")
+                .contains("normalized.contains(\"month\")")
+                .contains("return \"202401\";");
     }
 
     @Test
