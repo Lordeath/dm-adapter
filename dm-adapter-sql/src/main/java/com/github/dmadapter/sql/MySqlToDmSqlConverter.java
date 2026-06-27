@@ -45,6 +45,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_DATEDIFF_2ARG_RULE = "MYSQL_DATEDIFF_2ARG_TO_DM_DATEDIFF";
     public static final String MYSQL_COUNT_CONDITION_OR_NULL_RULE = "MYSQL_COUNT_CONDITION_OR_NULL_TO_CASE";
     public static final String MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE = "MYSQL_COUNT_DISTINCT_IF_TO_CASE";
+    public static final String MYSQL_IF_TO_CASE_RULE = "MYSQL_IF_TO_CASE";
     public static final String MYSQL_NOT_ISNULL_RULE = "MYSQL_NOT_ISNULL_TO_CASE";
     public static final String MYSQL_BOOLEAN_OPERATOR_RULE = "MYSQL_BOOLEAN_OPERATOR_TO_WORD_OPERATOR";
     public static final String MYSQL_BARE_BOOLEAN_PREDICATE_RULE = "MYSQL_BARE_BOOLEAN_PREDICATE_TO_EQUALS_ONE";
@@ -502,6 +503,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_BOOLEAN_OPERATOR_RULE);
         }
 
+        GenericConversion ifConversion = convertMysqlIfToCase(converted);
+        if (ifConversion.changed()) {
+            converted = ifConversion.convertedSql();
+            rules.add(MYSQL_IF_TO_CASE_RULE);
+        }
+
         GenericConversion booleanLiteralComparisonConversion = convertBooleanLiteralComparisons(converted);
         if (booleanLiteralComparisonConversion.changed()) {
             converted = booleanLiteralComparisonConversion.convertedSql();
@@ -645,7 +652,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             if (current == '\'') {
                 SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(sql, index);
                 if (literal.closed() && !literal.value().isBlank() && isAsAliasPosition(sql, index)) {
-                    converted.append(quoteDamengIdentifier(literal.value()));
+                    converted.append(quoteSingleQuotedAliasValue(literal.value()));
                     index = literal.nextIndex();
                     changed = true;
                 } else if (literal.closed()
@@ -654,7 +661,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(converted.length() > 0 && Character.isWhitespace(converted.charAt(converted.length() - 1))
                             ? "AS "
                             : " AS ");
-                    converted.append(quoteDamengIdentifier(literal.value()));
+                    converted.append(quoteSingleQuotedAliasValue(literal.value()));
                     index = literal.nextIndex();
                     changed = true;
                 } else {
@@ -674,6 +681,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String quoteSingleQuotedAliasValue(String value) {
+        if (containsMyBatisPlaceholder(value)) {
+            return "\"" + value + "\"";
+        }
+        return quoteDamengIdentifier(value);
     }
 
     private boolean isAsAliasPosition(String sql, int quoteIndex) {
@@ -3865,6 +3879,55 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + ", " + arguments.get(1).text().trim()
                 + ", " + arguments.get(2).text().trim()
                 + ")";
+    }
+
+    private GenericConversion convertMysqlIfToCase(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "IF")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "IF");
+                String replacement = functionCall == null ? null : rewriteMysqlIfToCase(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteMysqlIfToCase(FunctionCall ifCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(ifCall.body());
+        if (arguments.size() != 3) {
+            return null;
+        }
+        String condition = convertMysqlIfToCase(arguments.get(0).text()).convertedSql().trim();
+        String whenTrue = convertMysqlIfToCase(arguments.get(1).text()).convertedSql().trim();
+        String whenFalse = convertMysqlIfToCase(arguments.get(2).text()).convertedSql().trim();
+        if (condition.isBlank() || whenTrue.isBlank() || whenFalse.isBlank()) {
+            return null;
+        }
+        return "CASE WHEN " + condition + " THEN " + whenTrue + " ELSE " + whenFalse + " END";
     }
 
     private GenericConversion convertBooleanOperators(String expression) {
