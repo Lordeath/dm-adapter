@@ -12,10 +12,11 @@ public record SqlRewriteConfig(
         Map<String, List<String>> methodKeyColumns,
         Set<String> ignoredMissingTables,
         Set<String> ignoredMissingColumns,
-        Set<String> ignoredMissingSchemas
+        Set<String> ignoredMissingSchemas,
+        Set<String> identityInsertTables
 ) {
     public SqlRewriteConfig(Map<String, List<String>> tableKeyColumns, Map<String, List<String>> methodKeyColumns) {
-        this(tableKeyColumns, methodKeyColumns, Set.of(), Set.of(), Set.of());
+        this(tableKeyColumns, methodKeyColumns, Set.of(), Set.of(), Set.of(), Set.of());
     }
 
     public SqlRewriteConfig(
@@ -23,7 +24,7 @@ public record SqlRewriteConfig(
             Map<String, List<String>> methodKeyColumns,
             Set<String> ignoredMissingTables
     ) {
-        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, Set.of(), Set.of());
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, Set.of(), Set.of(), Set.of());
     }
 
     public SqlRewriteConfig(
@@ -32,7 +33,17 @@ public record SqlRewriteConfig(
             Set<String> ignoredMissingTables,
             Set<String> ignoredMissingColumns
     ) {
-        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, ignoredMissingColumns, Set.of());
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, ignoredMissingColumns, Set.of(), Set.of());
+    }
+
+    public SqlRewriteConfig(
+            Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Set<String> ignoredMissingTables,
+            Set<String> ignoredMissingColumns,
+            Set<String> ignoredMissingSchemas
+    ) {
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, ignoredMissingColumns, ignoredMissingSchemas, Set.of());
     }
 
     public SqlRewriteConfig {
@@ -41,10 +52,11 @@ public record SqlRewriteConfig(
         ignoredMissingTables = normalizeTables(ignoredMissingTables);
         ignoredMissingColumns = normalizeColumns(ignoredMissingColumns);
         ignoredMissingSchemas = normalizeSchemas(ignoredMissingSchemas);
+        identityInsertTables = normalizeTables(identityInsertTables);
     }
 
     public static SqlRewriteConfig empty() {
-        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of(), Set.of());
+        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), Set.of());
     }
 
     public boolean isEmpty() {
@@ -52,7 +64,8 @@ public record SqlRewriteConfig(
                 && methodKeyColumns.isEmpty()
                 && ignoredMissingTables.isEmpty()
                 && ignoredMissingColumns.isEmpty()
-                && ignoredMissingSchemas.isEmpty();
+                && ignoredMissingSchemas.isEmpty()
+                && identityInsertTables.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {
@@ -70,6 +83,23 @@ public record SqlRewriteConfig(
 
     public List<String> methodKeyColumns(String methodKey) {
         return methodKeyColumns.getOrDefault(methodKey, List.of());
+    }
+
+    public boolean requiresIdentityInsert(String tableName) {
+        if (tableName == null || tableName.isBlank()) {
+            return false;
+        }
+        String normalized = normalizeTableName(tableName);
+        String leaf = tableLeaf(normalized);
+        for (String table : identityInsertTables) {
+            if (table.equals(normalized)
+                    || table.equals(leaf)
+                    || tableLeaf(table).equals(normalized)
+                    || tableLeaf(table).equals(leaf)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static String normalizeTableName(String tableName) {
@@ -158,6 +188,11 @@ public record SqlRewriteConfig(
                 .replace("\"", "")
                 .replace("`", "")
                 .toLowerCase(Locale.ROOT);
+    }
+
+    private static String tableLeaf(String tableName) {
+        int dot = tableName == null ? -1 : tableName.lastIndexOf('.');
+        return dot >= 0 && dot + 1 < tableName.length() ? tableName.substring(dot + 1) : tableName;
     }
 
     private static List<String> cleanColumns(List<String> columns) {

@@ -728,6 +728,7 @@ class DmSqlValidationTestGenerator {
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         record = skipIgnoredMissingSchema(record, config);
+                                        record = skipIgnoredNotNullColumn(record, config);
                                         records.add(record);
                                         logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                                     }
@@ -3230,6 +3231,48 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return null;
+                }
+
+                private ValidationRecord skipIgnoredNotNullColumn(ValidationRecord record, ValidationConfig config) {
+                    if (record == null || !"FAILED".equals(record.status)) {
+                        return record;
+                    }
+                    String ignoredColumn = ignoredNotNullColumn(record.message, config);
+                    if (ignoredColumn == null) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "ignored-not-null-column",
+                            record.parameterSummary,
+                            "Ignored not-null column [" + ignoredColumn
+                                    + "] by .dm-adapter/sql-rewrite.yml validationIgnores.notNullColumns.\\n"
+                                    + "Original failure:\\n" + record.message
+                    );
+                }
+
+                private String ignoredNotNullColumn(String message, ValidationConfig config) {
+                    if (config == null || !containsAny(message, "非空约束", "违反列[")) {
+                        return null;
+                    }
+                    String table = insertTableFromMessage(message);
+                    for (String column : bracketedValuesAfterMarker(message, "违反列")) {
+                        if (config.ignoresNotNullColumn(table, column)) {
+                            return isBlank(table) ? column : table + "." + column;
+                        }
+                    }
+                    return null;
+                }
+
+                private String insertTableFromMessage(String message) {
+                    String sql = sqlFromMessage(message);
+                    if (isBlank(sql)) {
+                        return "";
+                    }
+                    Matcher matcher = Pattern.compile(
+                            "(?is)\\\\binsert\\\\s+into\\\\s+([A-Za-z_][A-Za-z0-9_$]*(?:\\\\s*\\\\.\\\\s*[A-Za-z_][A-Za-z0-9_$]*)?)"
+                    ).matcher(sql);
+                    return matcher.find() ? matcher.group(1).replaceAll("\\\\s+", "").trim() : "";
                 }
 
                 private Object invokeReflectively(SqlSession sqlSession, MapperMethod mapperMethod, Object[] args) {
@@ -9003,6 +9046,7 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> ignoredMissingTables = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingColumns = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
+                    private final Set<String> ignoredNotNullColumns = new LinkedHashSet<>();
 
                     static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
@@ -9174,6 +9218,13 @@ class DmSqlValidationTestGenerator {
                                 addIgnoredMissingSchemas(parseYamlValue(trimmed.substring("missingSchemas:".length())));
                                 continue;
                             }
+                            if (isValidationIgnoreSection(section) && indent == 2 && trimmed.startsWith("notNullColumns:")) {
+                                section = "validationNotNullColumns";
+                                currentMethod = null;
+                                valueMode = "";
+                                addIgnoredNotNullColumns(parseYamlValue(trimmed.substring("notNullColumns:".length())));
+                                continue;
+                            }
                             if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredMissingTables(parseYamlValue(trimmed.substring(2)));
                                 continue;
@@ -9184,6 +9235,10 @@ class DmSqlValidationTestGenerator {
                             }
                             if ("validationMissingSchemas".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredMissingSchemas(parseYamlValue(trimmed.substring(2)));
+                                continue;
+                            }
+                            if ("validationNotNullColumns".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                                addIgnoredNotNullColumns(parseYamlValue(trimmed.substring(2)));
                                 continue;
                             }
                             if ("validationMethods".equals(section) && indent == 4 && trimmed.endsWith(":")) {
@@ -9223,7 +9278,8 @@ class DmSqlValidationTestGenerator {
                         return "validationIgnores".equals(section)
                                 || "validationMissingTables".equals(section)
                                 || "validationMissingColumns".equals(section)
-                                || "validationMissingSchemas".equals(section);
+                                || "validationMissingSchemas".equals(section)
+                                || "validationNotNullColumns".equals(section);
                     }
 
                     private void addIgnoredMissingTables(Object value) {
@@ -9314,6 +9370,45 @@ class DmSqlValidationTestGenerator {
                     boolean ignoresMissingSchema(String schema) {
                         String normalized = normalizeMissingSchemaName(schema);
                         return !isBlank(normalized) && ignoredMissingSchemas.contains(normalized);
+                    }
+
+                    private void addIgnoredNotNullColumns(Object value) {
+                        if (value instanceof Collection<?>) {
+                            for (Object item : (Collection<?>) value) {
+                                addIgnoredNotNullColumn(String.valueOf(item));
+                            }
+                        } else if (value != null) {
+                            addIgnoredNotNullColumn(String.valueOf(value));
+                        }
+                    }
+
+                    private void addIgnoredNotNullColumn(String column) {
+                        String normalized = normalizeMissingColumnName(column);
+                        if (!isBlank(normalized)) {
+                            ignoredNotNullColumns.add(normalized);
+                        }
+                    }
+
+                    boolean ignoresNotNullColumn(String table, String column) {
+                        String normalizedColumn = normalizeMissingColumnName(column);
+                        if (isBlank(normalizedColumn)) {
+                            return false;
+                        }
+                        String normalizedTable = normalizeMissingTableName(table);
+                        String qualified = isBlank(normalizedTable) ? "" : normalizedTable + "." + normalizedColumn;
+                        String leafQualified = isBlank(normalizedTable) ? "" : missingTableLeaf(normalizedTable) + "." + normalizedColumn;
+                        for (String ignored : ignoredNotNullColumns) {
+                            if (ignored.indexOf('.') < 0) {
+                                if (ignored.equals(normalizedColumn)) {
+                                    return true;
+                                }
+                                continue;
+                            }
+                            if (ignored.equals(qualified) || ignored.equals(leafQualified)) {
+                                return true;
+                            }
+                        }
+                        return false;
                     }
 
                     private String normalizeMissingTableName(String table) {
