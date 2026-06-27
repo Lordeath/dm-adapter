@@ -20,6 +20,15 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlSysdateFunction() {
+        SqlConversionResult result = converter.convert("insert into audit_log(create_time) values (SYSDATE())");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("insert into audit_log(create_time) values (SYSDATE)");
+        assertThat(result.appliedRules()).containsExactly("SYSDATE_FUNCTION_TO_SYSDATE");
+    }
+
+    @Test
     void convertsDoubleQuotedStringLiterals() {
         SqlConversionResult result = converter.convert(
                 "select * from user where status = \"ACTIVE\" and remark = \"Bob's \\\"note\\\"\""

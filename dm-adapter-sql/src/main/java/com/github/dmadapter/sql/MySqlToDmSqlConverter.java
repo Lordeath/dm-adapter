@@ -98,6 +98,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOW_PATTERN = Pattern.compile("\\bNOW\\s*\\(\\s*\\)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SYSDATE_FUNCTION_PATTERN = Pattern.compile(
+            "\\bSYSDATE\\s*\\(\\s*\\)",
+            Pattern.CASE_INSENSITIVE
+    );
     private static final Pattern GROUP_CONCAT_PATTERN = Pattern.compile("\\bGROUP_CONCAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern INSERT_IGNORE_PATTERN = Pattern.compile(
             "\\bINSERT\\s+IGNORE\\s+INTO\\b",
@@ -568,6 +572,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (nowMatcher.find()) {
             converted = nowMatcher.replaceAll("SYSDATE");
             rules.add("NOW_TO_SYSDATE");
+        }
+
+        Matcher sysdateFunctionMatcher = SYSDATE_FUNCTION_PATTERN.matcher(converted);
+        if (sysdateFunctionMatcher.find()) {
+            converted = sysdateFunctionMatcher.replaceAll("SYSDATE");
+            rules.add("SYSDATE_FUNCTION_TO_SYSDATE");
         }
 
         AesBase64Conversion aesBase64Conversion = convertBase64Aes(converted);
