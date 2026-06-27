@@ -384,6 +384,89 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesConditionalTrimOnDuplicateKeyUpdateToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.RecentlyUsedMapper">
+                    <insert id="insertOrUpdate">
+                        insert into ns_recently_used
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="enterpriseId != null">
+                                `enterpriseId`,
+                            </if>
+                            <if test="organizationId != null">
+                                `organizationId`,
+                            </if>
+                            <if test="agentType != null">
+                                `agentType`,
+                            </if>
+                            <if test="useTime != null">
+                                `useTime`,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="enterpriseId != null">
+                                #{enterpriseId},
+                            </if>
+                            <if test="organizationId != null">
+                                #{organizationId},
+                            </if>
+                            <if test="agentType != null">
+                                #{agentType},
+                            </if>
+                            <if test="useTime != null">
+                                #{useTime},
+                            </if>
+                        </trim>
+                        ON DUPLICATE KEY UPDATE
+                        <trim suffixOverrides=",">
+                            <if test="useTime != null">
+                                `useTime` = VALUES(`useTime`),
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/RecentlyUsedMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/RecentlyUsedMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(
+                                "com.example.RecentlyUsedMapper.insertOrUpdate",
+                                List.of("enterpriseId", "organizationId", "agentType")
+                        )
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/RecentlyUsedMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_recently_used t")
+                .contains("ON (t.enterpriseId = s.enterpriseId AND t.organizationId = s.organizationId AND t.agentType = s.agentType)")
+                .contains("WHEN MATCHED THEN UPDATE SET")
+                .contains("t.useTime = s.useTime")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContain("ON DUPLICATE KEY UPDATE");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
     void migrationRenamesDamengReservedColumnNamesInMapperSql() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",

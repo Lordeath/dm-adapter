@@ -201,6 +201,18 @@ public class MapperXmlRewriter {
                     + "(?<valuesTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)"
                     + "(?<trailing>;?\\s*)$"
     );
+    private static final Pattern ON_DUPLICATE_TRIM_COLUMNS_VALUES_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)insert\\s+into\\s+"
+                    + "(?<table>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?"
+                    + ")\\s*(?<columnsTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)\\s*"
+                    + "(?<valuesTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)\\s*"
+                    + "on\\s+duplicate\\s+key\\s+update\\s*"
+                    + "(?<updates>[\\s\\S]*?)(?<trailing>;?\\s*)$"
+    );
     private static final Pattern FOREACH_TAG_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)</foreach\\s*>\\s*$"
     );
@@ -2269,7 +2281,32 @@ public class MapperXmlRewriter {
         } else {
             Matcher trimMatcher = BATCH_ON_DUPLICATE_KEY_UPDATE_TRIM_COLUMNS_PATTERN.matcher(candidate);
             if (!trimMatcher.matches()) {
-                return body;
+                Matcher trimValuesMatcher = ON_DUPLICATE_TRIM_COLUMNS_VALUES_PATTERN.matcher(candidate);
+                if (!trimValuesMatcher.matches()) {
+                    return body;
+                }
+                String columns = trimColumnList(trimValuesMatcher.group("columnsTrim"));
+                String values = trimValuesList(trimValuesMatcher.group("valuesTrim"));
+                if (columns == null || values == null) {
+                    return body;
+                }
+                List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, trimValuesMatcher.group("table"));
+                if (keyColumns.isEmpty()) {
+                    return body;
+                }
+                String converted = convertConditionalTrimOnDuplicateKeyUpdateToMerge(
+                        trimValuesMatcher.group("leading"),
+                        trimValuesMatcher.group("table"),
+                        columns,
+                        values,
+                        trimValuesMatcher.group("updates"),
+                        keyColumns,
+                        trimValuesMatcher.group("trailing")
+                );
+                if (converted == null || converted.equals(candidate)) {
+                    return body;
+                }
+                return wrapper == null ? converted : wrapper.wrap(converted);
             }
             String columns = trimColumnList(trimMatcher.group("columnsTrim"));
             if (columns == null) {
@@ -2403,6 +2440,19 @@ public class MapperXmlRewriter {
             return null;
         }
         if (!")".equals(defaultString(xmlAttribute(openingTag, "suffix")).trim())) {
+            return null;
+        }
+        return matcher.group("body");
+    }
+
+    private String trimUpdateList(String trimXml) {
+        Matcher matcher = TRIM_TAG_PATTERN.matcher(trimXml == null ? "" : trimXml.trim());
+        if (!matcher.matches()) {
+            return trimXml;
+        }
+        String openingTag = matcher.group("opening");
+        String suffixOverrides = defaultString(xmlAttribute(openingTag, "suffixOverrides")).trim();
+        if (!",".equals(suffixOverrides)) {
             return null;
         }
         return matcher.group("body");
@@ -2704,6 +2754,188 @@ public class MapperXmlRewriter {
                     .append(dmIdentifier(keyColumn));
         }
         converted.append(")\n")
+                .append(baseIndent)
+                .append("WHEN NOT MATCHED THEN INSERT\n")
+                .append(baseIndent)
+                .append("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">\n");
+        for (int i = 0; i < columns.size(); i++) {
+            String columnName = columnNames.get(i);
+            converted.append(childIndent)
+                    .append(columns.get(i).opening())
+                    .append("\n")
+                    .append(nestedIndent)
+                    .append(dmIdentifier(columnName))
+                    .append(",\n")
+                    .append(childIndent)
+                    .append("</if>\n");
+        }
+        converted.append(baseIndent)
+                .append("</trim>\n")
+                .append(baseIndent)
+                .append("VALUES\n")
+                .append(baseIndent)
+                .append("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">\n");
+        for (int i = 0; i < columns.size(); i++) {
+            String columnName = columnNames.get(i);
+            converted.append(childIndent)
+                    .append(columns.get(i).opening())
+                    .append("\n")
+                    .append(nestedIndent)
+                    .append("s.")
+                    .append(dmIdentifier(columnName))
+                    .append(",\n")
+                    .append(childIndent)
+                    .append("</if>\n");
+        }
+        converted.append(baseIndent)
+                .append("</trim>")
+                .append(trailing);
+        return converted.toString();
+    }
+
+    private String convertConditionalTrimOnDuplicateKeyUpdateToMerge(
+            String leading,
+            String table,
+            String columnList,
+            String valueList,
+            String updateClause,
+            List<String> keyColumns,
+            String trailing
+    ) {
+        String updateBody = trimUpdateList(updateClause);
+        if (updateBody == null) {
+            return null;
+        }
+        List<ConditionalTrimItem> columns = conditionalTrimItems(columnList);
+        List<ConditionalTrimItem> values = conditionalTrimItems(valueList);
+        List<ConditionalTrimItem> updates = conditionalTrimItems(updateBody);
+        if (columns.isEmpty() || columns.size() != values.size() || updates.isEmpty()) {
+            return null;
+        }
+        List<String> normalizedKeys = normalizeIdentifiers(keyColumns);
+        List<String> columnNames = new ArrayList<>();
+        Map<String, String> columnTestsByName = new LinkedHashMap<>();
+        for (int i = 0; i < columns.size(); i++) {
+            ConditionalTrimItem column = columns.get(i);
+            ConditionalTrimItem value = values.get(i);
+            if (!column.test().equals(value.test())) {
+                return null;
+            }
+            String columnName = stripTrailingComma(column.content()).trim();
+            String valueExpression = stripTrailingComma(value.content()).trim();
+            if (columnName.isBlank() || valueExpression.isBlank()) {
+                return null;
+            }
+            columnNames.add(columnName);
+            columnTestsByName.put(normalizeIdentifier(columnName), column.test());
+        }
+        List<Integer> keyIndexes = new ArrayList<>();
+        for (String keyColumn : normalizedKeys) {
+            int index = indexOfIdentifier(columnNames, keyColumn);
+            if (index < 0) {
+                return null;
+            }
+            keyIndexes.add(index);
+        }
+
+        List<ConditionalUpdateAssignment> updateAssignments = new ArrayList<>();
+        for (ConditionalTrimItem update : updates) {
+            List<BatchUpdateAssignment> parsed = updateAssignments(stripTrailingComma(update.content()).trim());
+            if (parsed == null || parsed.size() != 1) {
+                return null;
+            }
+            BatchUpdateAssignment assignment = parsed.get(0);
+            String normalizedTarget = normalizeIdentifier(assignment.target());
+            if (normalizedKeys.contains(normalizedTarget)) {
+                continue;
+            }
+            if (assignment.valuesReference()) {
+                String normalizedSource = normalizeIdentifier(assignment.sourceExpression());
+                if (!columnTestsByName.containsKey(normalizedSource)
+                        || !columnTestsByName.get(normalizedSource).equals(update.test())) {
+                    return null;
+                }
+            }
+            updateAssignments.add(new ConditionalUpdateAssignment(update.opening(), assignment));
+        }
+        if (updateAssignments.isEmpty()) {
+            return null;
+        }
+
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        String nestedIndent = childIndent + "    ";
+        StringBuilder converted = new StringBuilder();
+        converted.append(leading)
+                .append("MERGE INTO ")
+                .append(table)
+                .append(" t\n")
+                .append(baseIndent)
+                .append("USING (\n")
+                .append(childIndent)
+                .append("SELECT\n")
+                .append(nestedIndent)
+                .append("<trim suffixOverrides=\",\">\n");
+        for (int i = 0; i < columns.size(); i++) {
+            String columnName = columnNames.get(i);
+            String valueExpression = stripTrailingComma(values.get(i).content()).trim();
+            converted.append(nestedIndent)
+                    .append("    ")
+                    .append(columns.get(i).opening())
+                    .append("\n")
+                    .append(nestedIndent)
+                    .append("        ")
+                    .append(valueExpression)
+                    .append(" AS ")
+                    .append(dmIdentifier(columnName))
+                    .append(",\n")
+                    .append(nestedIndent)
+                    .append("    </if>\n");
+        }
+        converted.append(nestedIndent)
+                .append("</trim>\n")
+                .append(childIndent)
+                .append("FROM dual\n")
+                .append(baseIndent)
+                .append(") s\n")
+                .append(baseIndent)
+                .append("ON (");
+        for (int i = 0; i < keyIndexes.size(); i++) {
+            if (i > 0) {
+                converted.append(" AND ");
+            }
+            String keyColumn = columnNames.get(keyIndexes.get(i));
+            converted.append("t.")
+                    .append(dmIdentifier(keyColumn))
+                    .append(" = s.")
+                    .append(dmIdentifier(keyColumn));
+        }
+        converted.append(")\n")
+                .append(baseIndent)
+                .append("WHEN MATCHED THEN UPDATE SET\n")
+                .append(baseIndent)
+                .append("<trim suffixOverrides=\",\">\n");
+        for (ConditionalUpdateAssignment update : updateAssignments) {
+            BatchUpdateAssignment assignment = update.assignment();
+            converted.append(childIndent)
+                    .append(update.opening())
+                    .append("\n")
+                    .append(nestedIndent)
+                    .append("t.")
+                    .append(dmIdentifier(assignment.target()))
+                    .append(" = ");
+            if (assignment.valuesReference()) {
+                converted.append("s.")
+                        .append(dmIdentifier(assignment.sourceExpression()));
+            } else {
+                converted.append(assignment.sourceExpression());
+            }
+            converted.append(",\n")
+                    .append(childIndent)
+                    .append("</if>\n");
+        }
+        converted.append(baseIndent)
+                .append("</trim>\n")
                 .append(baseIndent)
                 .append("WHEN NOT MATCHED THEN INSERT\n")
                 .append(baseIndent)
@@ -5055,6 +5287,9 @@ public class MapperXmlRewriter {
     }
 
     private record ConditionalTrimItem(String opening, String test, String content) {
+    }
+
+    private record ConditionalUpdateAssignment(String opening, BatchUpdateAssignment assignment) {
     }
 
     private record SetAssignment(
