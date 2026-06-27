@@ -1184,28 +1184,34 @@ public class MapperXmlRewriter {
         boolean changed = false;
         while (matcher.find()) {
             String tableName = matcher.group("table");
-            String outerOpen = matcher.group("outerOpen");
             String inner = matcher.group("inner");
-            String replacement = "CREATE GLOBAL TEMPORARY TABLE "
+            String dynamicInsertSelectList = inner
+                    .replaceAll("(?is)#\\{\\s*field\\.fieldValue\\s*(?:,[^}]*)?}", "?");
+            String bindValueList = inner
+                    .replaceAll("(?is)#\\{\\s*field\\.fieldValue\\s*(?:,[^}]*)?}\\s+AS\\s+\\$\\{\\s*field\\.fieldName\\s*}", "#{field.fieldValue}");
+            String replacement = "BEGIN\n"
+                    + "      EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE "
                     + tableName
                     + "\n"
                     + "      (\n"
                     + "      <foreach collection=\"list[0]\" item=\"field\" separator=\",\">\n"
                     + "        ${field.fieldName} VARCHAR(4000)\n"
                     + "      </foreach>\n"
-                    + "      ) ON COMMIT PRESERVE ROWS;\n"
-                    + "      insert into "
+                    + "      ) ON COMMIT PRESERVE ROWS';\n"
+                    + "      <foreach collection=\"list\" item=\"item\" separator=\";\">\n"
+                    + "        EXECUTE IMMEDIATE 'insert into "
                     + tableName
                     + "\n"
-                    + "      "
-                    + outerOpen
+                    + "        select\n"
+                    + "        "
+                    + dynamicInsertSelectList
                     + "\n"
-                    + "      select\n"
-                    + "      "
-                    + inner
+                    + "        from dual' USING\n"
+                    + "        "
+                    + bindValueList
                     + "\n"
-                    + "      from dual\n"
-                    + "      </foreach>";
+                    + "      </foreach>;\n"
+                    + "END;";
             matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
             changed = true;
         }

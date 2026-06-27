@@ -366,6 +366,7 @@ class DmAdapterCliTest {
                 .contains("skipIgnoredNotNullColumn")
                 .contains("skipValidationTestDataIssue")
                 .contains("validation-test-data")
+                .contains("唯一性约束")
                 .contains("TooManyResultsException")
                 .contains("ignored-missing-table")
                 .contains("ignored-missing-column")
