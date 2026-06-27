@@ -3856,7 +3856,8 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(columnDefault);
                     }
                     if (shouldUseNullDefault(valueName)
-                            && !statementRequiredCollectionValue(valueName, statement)) {
+                            && !statementRequiredCollectionValue(valueName, statement)
+                            && !statementRequiredDefaultValue(valueName, statement)) {
                         return ValueResult.resolved(null);
                     }
                     if (String.class.equals(targetType)) {
@@ -5156,6 +5157,11 @@ class DmSqlValidationTestGenerator {
                             || statement.collectionParameter(valueName)
                             || statement.mapCollectionParameter(valueName)
                             || statement.scalarCollectionParameter(valueName));
+                }
+
+                private boolean statementRequiredDefaultValue(String valueName, MapperStatement statement) {
+                    return statement != null
+                            && (statement.setDefaultValue(valueName) || statement.hasSetDefaultUnder(valueName));
                 }
 
                 private String requiredCollectionValueName(String valueName, MapperStatement statement) {
