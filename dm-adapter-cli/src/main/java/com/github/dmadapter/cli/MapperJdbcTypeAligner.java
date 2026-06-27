@@ -447,6 +447,16 @@ class MapperJdbcTypeAligner {
             if (close < 0) {
                 return placeholder;
             }
+            int insertAt = close;
+            while (insertAt > 0 && Character.isWhitespace(placeholder.charAt(insertAt - 1))) {
+                insertAt--;
+            }
+            if (insertAt > 0 && placeholder.charAt(insertAt - 1) == ',') {
+                return placeholder.substring(0, insertAt)
+                        + "jdbcType=" + targetJdbcType
+                        + placeholder.substring(insertAt, close)
+                        + placeholder.substring(close);
+            }
             return placeholder.substring(0, close) + ",jdbcType=" + targetJdbcType + placeholder.substring(close);
         }
         String current = matcher.group(2);
