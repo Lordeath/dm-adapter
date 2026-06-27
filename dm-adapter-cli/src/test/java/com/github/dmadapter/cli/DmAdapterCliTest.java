@@ -549,6 +549,8 @@ class DmAdapterCliTest {
                 .contains("Cannot assign null to primitive field")
                 .contains("DYNAMIC_IDENTIFIER_PARAMETER")
                 .contains("DYNAMIC_SQL_FRAGMENT_PARAMETER")
+                .contains("skipMissingDynamicSqlFragment(record)")
+                .contains("Dynamic SQL fragment parameter is missing or generated placeholder")
                 .contains("if (hasDynamicSqlFragmentParameterIssue(message))")
                 .doesNotContain("if (isAutoParameter(record) && hasDynamicSqlFragmentParameterIssue(message))")
                 .contains("RAW_SQL_PARAMETER")

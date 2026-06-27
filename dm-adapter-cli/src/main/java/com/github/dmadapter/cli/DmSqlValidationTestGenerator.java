@@ -714,6 +714,7 @@ class DmSqlValidationTestGenerator {
                                         long startedAt = System.currentTimeMillis();
                                         ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
                                         record = skipMissingDynamicIdentifier(record);
+                                        record = skipMissingDynamicSqlFragment(record);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         records.add(record);
@@ -2931,6 +2932,24 @@ class DmSqlValidationTestGenerator {
                             "Dynamic SQL identifier parameter is missing or blank; "
                                     + "configure a real identifier in .dm-adapter/sql-rewrite.yml validationArgs, "
                                     + "for example extendTable/targetTable/fieldName."
+                                    + "\\nOriginal failure:\\n" + record.message
+                    );
+                }
+
+                private ValidationRecord skipMissingDynamicSqlFragment(ValidationRecord record) {
+                    if (record == null
+                            || !"FAILED".equals(record.status)
+                            || !isAutoParameter(record)
+                            || !hasDynamicSqlFragmentParameterIssue(record.message)) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "dynamic-sql-fragment-parameter",
+                            record.parameterSummary,
+                            "Dynamic SQL fragment parameter is missing or generated placeholder; "
+                                    + "configure a real SQL fragment in .dm-adapter/sql-rewrite.yml validationArgs, "
+                                    + "for example whereSql/orderBy/sqlFragment/inSql."
                                     + "\\nOriginal failure:\\n" + record.message
                     );
                 }
