@@ -91,6 +91,78 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void ignoresCommentedDynamicInsertIfBlocksWhenAligningJdbcTypes() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/CommentedInsertMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.CommentedInsertMapper">
+                    <insert id="insert" parameterType="com.example.CommentedInsert">
+                        insert into ns_commented_insert
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                id,
+                            </if>
+                <!--            <if test="ignoredId != null">-->
+                <!--                ignored_id,-->
+                <!--            </if>-->
+                            <if test="name != null">
+                                name,
+                            </if>
+                            <if test="createdAt != null">
+                                created_at,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                #{id, jdbcType=BIGINT},
+                            </if>
+                <!--            <if test="ignoredId != null">-->
+                <!--                # {ignoredId, jdbcType=BIGINT},-->
+                <!--            </if>-->
+                            <if test="name != null">
+                                #{name, jdbcType=VARCHAR},
+                            </if>
+                            <if test="createdAt != null">
+                                #{createdAt, jdbcType=TIMESTAMP},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """);
+        writeJava("src/main/java/com/example/CommentedInsert.java", """
+                package com.example;
+
+                import java.util.Date;
+
+                public class CommentedInsert {
+                    private Long id;
+                    private Long ignoredId;
+                    private String name;
+                    private Date createdAt;
+                }
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("ns_commented_insert", Map.of(
+                        "id", "BIGINT",
+                        "ignored_id", "BIGINT",
+                        "name", "VARCHAR",
+                        "created_at", "TIMESTAMP"
+                ))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "module/src/main/resources/mapper-dm/CommentedInsertMapper.xml"
+        ));
+        assertThat(result.fileChanges()).isEmpty();
+        assertThat(rewritten)
+                .contains("#{name, jdbcType=VARCHAR},")
+                .contains("#{createdAt, jdbcType=TIMESTAMP},")
+                .doesNotContain("CAST(#{name, jdbcType=VARCHAR} AS TIMESTAMP)");
+    }
+
+    @Test
     void addsMissingJdbcTypeForBatchInsertFromDamengColumnMetadata() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/NsContractRoomMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>

@@ -42,6 +42,7 @@
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 不是达梦列属性，通常改成 `BEFORE UPDATE` 触发器给时间列赋 `SYSDATE`，或由业务代码显式维护更新时间。
 - MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。
 - MySQL 正则、日期、加密、编码、空值处理函数与达梦函数不完全一致，遇到 `REGEXP`、`DATE_FORMAT`、`STR_TO_DATE`、`IFNULL`、`IF`、`FIND_IN_SET`、`AES_ENCRYPT`、`AES_DECRYPT`、`MD5`、`TO_BASE64`、`YEARWEEK`、`PERIOD_DIFF` 等函数时必须逐项确认达梦等价写法。
+- MySQL 原始 mapper 中应保留 MySQL 函数形态，例如 `SYSDATE()`；达梦侧可在生成的 `mapper-dm` 中转换为 `SYSDATE`。验证清零时不能把达梦函数反写到原始 MySQL XML，否则原项目在 MySQL 上会直接失效。
 - `FIND_IN_SET` 不要简单替换为 `LIKE '%x%'`。需要确认分隔符、空值语义、返回位置还是布尔过滤；无法确定时标记人工确认或改写为规范的关联表/拆分函数。
 - MySQL `IF(expr,a,b)` 可以在布尔表达式清晰时改为 `CASE WHEN expr THEN a ELSE b END`，但 `IF(count(...),...)`、`COUNT(DISTINCT IF(...))` 这类聚合内条件需要先确认 NULL 过滤语义。
 - MySQL 除法在分母为 0 时的容错和达梦参数相关。业务 SQL 如直接 `a / b`，应优先改为 `a / NULLIF(b, 0)` 或 `CASE WHEN b = 0 THEN ...`，不要依赖实例容错。
