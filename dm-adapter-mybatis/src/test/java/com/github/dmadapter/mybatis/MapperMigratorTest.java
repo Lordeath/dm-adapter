@@ -534,6 +534,70 @@ class MapperMigratorTest {
     }
 
     @Test
+    void batchOnDuplicateKeyUpdateUsesConstantAssignmentForMissingKeyColumn() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.NsMeterUseDayMapper">
+                    <insert id="upsertBatch">
+                        insert into ns_meter_use_day
+                        (bm, `dataTime`, pointId, `usage`)
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.bm}, #{item.dataTime}, #{item.pointId}, #{item.usage})
+                        </foreach>
+                        on duplicate key update
+                            bm = values(bm),
+                            `usage` = values(`usage`),
+                            isDelete = 0
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/NsMeterUseDayMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/NsMeterUseDayMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(
+                                "com.example.NsMeterUseDayMapper.upsertBatch",
+                                List.of("pointId", "dataTime", "isDelete")
+                        )
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/NsMeterUseDayMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_meter_use_day t")
+                .contains("#{item.bm} AS bm")
+                .contains("#{item.dataTime} AS dataTime")
+                .contains("0 AS isDelete")
+                .contains("ON (t.pointId = s.pointId AND t.dataTime = s.dataTime AND t.isDelete = s.isDelete)")
+                .contains("WHEN MATCHED THEN UPDATE SET t.bm = s.bm, t.usage = s.usage")
+                .contains("WHEN NOT MATCHED THEN INSERT (bm, dataTime, pointId, usage) VALUES (s.bm, s.dataTime, s.pointId, s.usage)")
+                .doesNotContain("ON DUPLICATE KEY UPDATE")
+                .doesNotContain("INSERT (bm, dataTime, pointId, usage, isDelete)");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE
+                );
+    }
+
+    @Test
     void dynamicXmlKeepsSafeTextConversionsWhenRemainingSqlNeedsManualReview() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

@@ -2243,24 +2243,50 @@ public class MapperXmlRewriter {
         }
 
         List<String> normalizedKeys = normalizeIdentifiers(keyColumns);
-        List<Integer> keyIndexes = new ArrayList<>();
-        for (String keyColumn : normalizedKeys) {
-            int index = indexOfIdentifier(columns, keyColumn);
-            if (index < 0) {
-                return null;
-            }
-            keyIndexes.add(index);
+        List<MergeSourceColumn> sourceColumns = new ArrayList<>();
+        Map<String, MergeSourceColumn> sourceColumnsByName = new LinkedHashMap<>();
+        for (int i = 0; i < columns.size(); i++) {
+            MergeSourceColumn sourceColumn = new MergeSourceColumn(columns.get(i), values.get(i));
+            sourceColumns.add(sourceColumn);
+            sourceColumnsByName.put(normalizeIdentifier(sourceColumn.name()), sourceColumn);
         }
 
-        List<String> updateColumns = updateClause.isBlank()
+        List<BatchUpdateAssignment> updateAssignments = updateClause.isBlank()
                 ? List.of()
-                : updateColumns(updateClause);
-        if (updateColumns == null) {
+                : updateAssignments(updateClause);
+        if (updateAssignments == null) {
             return null;
         }
-        updateColumns = updateColumns.stream()
-                .filter(column -> !normalizedKeys.contains(normalizeIdentifier(column)))
+
+        Map<String, BatchUpdateAssignment> assignmentsByTarget = new LinkedHashMap<>();
+        for (BatchUpdateAssignment assignment : updateAssignments) {
+            assignmentsByTarget.put(normalizeIdentifier(assignment.target()), assignment);
+        }
+        List<MergeSourceColumn> keySourceColumns = new ArrayList<>();
+        for (int i = 0; i < normalizedKeys.size(); i++) {
+            String keyColumn = normalizedKeys.get(i);
+            MergeSourceColumn sourceColumn = sourceColumnsByName.get(keyColumn);
+            if (sourceColumn == null) {
+                BatchUpdateAssignment assignment = assignmentsByTarget.get(keyColumn);
+                if (assignment == null || assignment.valuesReference()) {
+                    return null;
+                }
+                sourceColumn = new MergeSourceColumn(keyColumns.get(i), assignment.sourceExpression());
+                sourceColumns.add(sourceColumn);
+                sourceColumnsByName.put(keyColumn, sourceColumn);
+            }
+            keySourceColumns.add(sourceColumn);
+        }
+
+        updateAssignments = updateAssignments.stream()
+                .filter(assignment -> !normalizedKeys.contains(normalizeIdentifier(assignment.target())))
                 .toList();
+        for (BatchUpdateAssignment assignment : updateAssignments) {
+            if (assignment.valuesReference()
+                    && !sourceColumnsByName.containsKey(normalizeIdentifier(assignment.sourceExpression()))) {
+                return null;
+            }
+        }
 
         String baseIndent = indentationOfLastLine(leading);
         String childIndent = baseIndent + "    ";
@@ -2277,41 +2303,48 @@ public class MapperXmlRewriter {
                 .append("USING (\n")
                 .append(nestedIndent)
                 .append("SELECT ");
-        for (int i = 0; i < columns.size(); i++) {
+        for (int i = 0; i < sourceColumns.size(); i++) {
             if (i > 0) {
                 converted.append(", ");
             }
-            converted.append(values.get(i))
+            MergeSourceColumn sourceColumn = sourceColumns.get(i);
+            converted.append(sourceColumn.expression())
                     .append(" AS ")
-                    .append(dmIdentifier(columns.get(i)));
+                    .append(dmIdentifier(sourceColumn.name()));
         }
         converted.append(" FROM dual\n")
                 .append(childIndent)
                 .append(") s\n")
                 .append(childIndent)
                 .append("ON (");
-        for (int i = 0; i < keyIndexes.size(); i++) {
+        for (int i = 0; i < keySourceColumns.size(); i++) {
             if (i > 0) {
                 converted.append(" AND ");
             }
-            String keyColumn = columns.get(keyIndexes.get(i));
+            String keyColumn = keySourceColumns.get(i).name();
             converted.append("t.")
                     .append(dmIdentifier(keyColumn))
                     .append(" = s.")
                     .append(dmIdentifier(keyColumn));
         }
         converted.append(")\n");
-        if (!updateColumns.isEmpty()) {
+        if (!updateAssignments.isEmpty()) {
             converted.append(childIndent)
                     .append("WHEN MATCHED THEN UPDATE SET ");
-            for (int i = 0; i < updateColumns.size(); i++) {
+            for (int i = 0; i < updateAssignments.size(); i++) {
                 if (i > 0) {
                     converted.append(", ");
                 }
+                BatchUpdateAssignment assignment = updateAssignments.get(i);
                 converted.append("t.")
-                        .append(dmIdentifier(updateColumns.get(i)))
-                        .append(" = s.")
-                        .append(dmIdentifier(updateColumns.get(i)));
+                        .append(dmIdentifier(assignment.target()))
+                        .append(" = ");
+                if (assignment.valuesReference()) {
+                    converted.append("s.")
+                            .append(dmIdentifier(assignment.sourceExpression()));
+                } else {
+                    converted.append(assignment.sourceExpression());
+                }
             }
             converted.append("\n");
         }
@@ -3318,23 +3351,35 @@ public class MapperXmlRewriter {
         return index < value.length() ? index + 1 : value.length();
     }
 
-    private List<String> updateColumns(String updateClause) {
-        List<String> columns = new ArrayList<>();
+    private List<BatchUpdateAssignment> updateAssignments(String updateClause) {
+        List<BatchUpdateAssignment> assignments = new ArrayList<>();
         for (String assignment : splitTopLevelComma(updateClause)) {
-            Matcher matcher = Pattern.compile(
+            Matcher valuesMatcher = Pattern.compile(
                     "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*values\\s*\\(\\s*(?<source>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\)\\s*$"
             ).matcher(assignment);
-            if (!matcher.matches()) {
+            if (valuesMatcher.matches()) {
+                String target = valuesMatcher.group("target");
+                String source = valuesMatcher.group("source");
+                if (!normalizeIdentifier(target).equals(normalizeIdentifier(source))) {
+                    return null;
+                }
+                assignments.add(new BatchUpdateAssignment(target, source, true));
+                continue;
+            }
+
+            Matcher constantMatcher = Pattern.compile(
+                    "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*(?<constant>NULL|[-+]?\\d+(?:\\.\\d+)?|N?'(?:''|[^'])*')\\s*$"
+            ).matcher(assignment);
+            if (!constantMatcher.matches()) {
                 return null;
             }
-            String target = matcher.group("target");
-            String source = matcher.group("source");
-            if (!normalizeIdentifier(target).equals(normalizeIdentifier(source))) {
-                return null;
-            }
-            columns.add(target);
+            assignments.add(new BatchUpdateAssignment(
+                    constantMatcher.group("target"),
+                    constantMatcher.group("constant").trim(),
+                    false
+            ));
         }
-        return columns;
+        return assignments;
     }
 
     private List<String> normalizeIdentifiers(List<String> identifiers) {
@@ -4323,6 +4368,12 @@ public class MapperXmlRewriter {
             String updates,
             String trailing
     ) {
+    }
+
+    private record MergeSourceColumn(String name, String expression) {
+    }
+
+    private record BatchUpdateAssignment(String target, String sourceExpression, boolean valuesReference) {
     }
 
     private record ConditionalTrimItem(String opening, String test, String content) {
