@@ -27,6 +27,8 @@ public class MapperXmlRewriter {
     public static final String MYBATIS_BATCH_INSERT_ADD_VALUES_RULE = "MYBATIS_BATCH_INSERT_ADD_VALUES";
     public static final String MYBATIS_FOREACH_TRAILING_COMMA_RULE = "MYBATIS_FOREACH_TRAILING_COMMA";
     public static final String MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE = "MYBATIS_DYNAMIC_SET_MISSING_COMMA";
+    public static final String MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE =
+            "MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA";
     public static final String MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE =
             "MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE";
     public static final String MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
@@ -673,6 +675,12 @@ public class MapperXmlRewriter {
         if (qualifiedBatchInsertListItems.changed()) {
             appliedRules.add(MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE);
             converted = qualifiedBatchInsertListItems.text();
+        }
+
+        TextRewrite dynamicInsertTrimCommas = addMissingDynamicInsertTrimCommas(converted);
+        if (dynamicInsertTrimCommas.changed()) {
+            appliedRules.add(MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE);
+            converted = dynamicInsertTrimCommas.text();
         }
 
         String withoutTrailingCommas = removeForeachTrailingCommas(converted);
@@ -3627,6 +3635,142 @@ public class MapperXmlRewriter {
             }
         }
         return applyTextReplacements(body, replacements);
+    }
+
+    private TextRewrite addMissingDynamicInsertTrimCommas(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing()
+                    && !tag.selfClosing()
+                    && "trim".equalsIgnoreCase(tag.name())
+                    && isCommaSeparatedInsertTrim(body.substring(tagStart, tag.endIndex()))) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "trim", body.length());
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                addMissingTrimCommasInRange(body, tag.endIndex(), closingStart, replacements);
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+            } else {
+                index = tag.endIndex();
+            }
+        }
+        return applyTextReplacements(body, replacements);
+    }
+
+    private boolean isCommaSeparatedInsertTrim(String openingTag) {
+        String suffixOverrides = defaultString(xmlAttribute(openingTag, "suffixOverrides"));
+        if (!suffixOverrides.contains(",")) {
+            return false;
+        }
+        String prefix = defaultString(xmlAttribute(openingTag, "prefix")).trim().replaceAll("\\s+", " ");
+        return "(".equals(prefix) || "values (".equalsIgnoreCase(prefix);
+    }
+
+    private void addMissingTrimCommasInRange(
+            String body,
+            int start,
+            int end,
+            List<TextReplacement> replacements
+    ) {
+        int index = start;
+        while (index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "if".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "if", end);
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                int ifEnd = closingEnd < 0 ? closingStart : closingEnd + 1;
+                int insertionIndex = missingTrimCommaInsertionIndex(body, tag.endIndex(), closingStart, ifEnd, end);
+                if (insertionIndex >= 0) {
+                    replacements.add(new TextReplacement(insertionIndex, insertionIndex, ","));
+                }
+                index = tag.endIndex();
+            } else {
+                index = tag.endIndex();
+            }
+        }
+    }
+
+    private int missingTrimCommaInsertionIndex(String body, int ifBodyStart, int ifBodyEnd, int afterIfEnd, int scopeEnd) {
+        String ifBody = body.substring(ifBodyStart, ifBodyEnd);
+        if (!isCommaSeparatedTrimItemFragment(ifBody)
+                || !hasFollowingCommaSeparatedTrimItem(body, afterIfEnd, scopeEnd)) {
+            return -1;
+        }
+        int insertionIndex = trimTrailingWhitespaceIndex(body, ifBodyStart, ifBodyEnd);
+        if (insertionIndex <= ifBodyStart || body.charAt(insertionIndex - 1) == ',') {
+            return -1;
+        }
+        return insertionIndex;
+    }
+
+    private boolean hasFollowingCommaSeparatedTrimItem(String body, int start, int end) {
+        int index = start;
+        while (index < end) {
+            index = skipWhitespaceAndXmlComments(body, index, end);
+            if (index >= end) {
+                return false;
+            }
+            char current = body.charAt(index);
+            if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                if (tag == null || tag.closing()) {
+                    return false;
+                }
+                if (!tag.selfClosing() && "if".equalsIgnoreCase(tag.name())) {
+                    int closingStart = findClosingTag(body, tag.endIndex(), "if", end);
+                    return closingStart >= 0
+                            && isCommaSeparatedTrimItemFragment(body.substring(tag.endIndex(), closingStart));
+                }
+                return false;
+            }
+            int nextTag = body.indexOf('<', index);
+            int textEnd = nextTag < 0 ? end : Math.min(nextTag, end);
+            String text = body.substring(index, textEnd);
+            if (text.isBlank()) {
+                index = textEnd;
+                continue;
+            }
+            return isCommaSeparatedTrimItemFragment(text);
+        }
+        return false;
+    }
+
+    private boolean isCommaSeparatedTrimItemFragment(String fragment) {
+        if (fragment == null || fragment.isBlank()) {
+            return false;
+        }
+        String stripped = fragment.stripLeading();
+        if (stripped.startsWith("<![CDATA[")) {
+            int cdataEnd = stripped.indexOf("]]>");
+            if (cdataEnd > "<![CDATA[".length()) {
+                stripped = stripped.substring("<![CDATA[".length(), cdataEnd).stripLeading();
+            }
+        }
+        return !stripped.isBlank() && stripped.charAt(0) != '<';
     }
 
     private void addMissingSetCommasInRange(
