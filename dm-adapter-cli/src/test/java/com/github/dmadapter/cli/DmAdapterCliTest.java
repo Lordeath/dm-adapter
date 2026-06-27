@@ -481,6 +481,8 @@ class DmAdapterCliTest {
                 .contains("defaultValueForJdbcType")
                 .contains("configuredValueWithStatementDefaults")
                 .contains("inferredConfiguredPlaceholderDefault")
+                .contains("isGeneratedNullPlaceholderValue")
+                .contains("existing == null && isGeneratedNullPlaceholderValue(configuredValue)")
                 .contains("contextualDefaultValue")
                 .contains("adaptContextualDefaultValue")
                 .contains("dateTimeContextualValue")
