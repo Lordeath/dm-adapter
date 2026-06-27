@@ -952,6 +952,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsGroupConcatWithImplicitAliasAndTrimSeparator() {
+        SqlConversionResult result = converter.convert(
+                "SELECT GROUP_CONCAT(TRIM(TRAILING ','FROM inspectType))inspectType FROM ns_equip_inspect_template_item"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT LISTAGG(TRIM(TRAILING ','FROM inspectType), ',') WITHIN GROUP (ORDER BY TRIM(TRAILING ','FROM inspectType)) inspectType FROM ns_equip_inspect_template_item");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
     void convertsDistinctGroupConcatMultipleExpressionsToListaggConcatenation() {
         SqlConversionResult result = converter.convert(
                 "select group_concat(DISTINCT precinctId ,',',chargeItemId ) as dataGroup from charge group by precinctId, chargeItemId"
@@ -2324,6 +2336,21 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).isEqualTo("""
                 select sum(amount) / CASE WHEN count(DISTINCT log.id) = 0 THEN 1 ELSE count(DISTINCT log.id) END as avgAmount
                 from payment_log log
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_IF_TO_CASE_RULE);
+    }
+
+    @Test
+    void convertsMysqlIfFunctionWithImplicitAliasToCaseExpression() {
+        SqlConversionResult result = converter.convert("""
+                select if(e.isMustCheck = 1,'是','否')isMustCheckValue,d.equipName
+                from ns_equip_equip e
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select CASE WHEN e.isMustCheck = 1 THEN '是' ELSE '否' END isMustCheckValue,d.equipName
+                from ns_equip_equip e
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_IF_TO_CASE_RULE);
     }
