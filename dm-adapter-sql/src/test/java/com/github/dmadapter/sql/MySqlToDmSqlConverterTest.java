@@ -368,6 +368,88 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesMysqlCreateTableIndexesAndTableOptionsForDameng() {
+        SqlConversionResult result = converter.convert("""
+                create table if not exists tmp_report_sync_init(
+                  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+                  `type` int(2) unsigned DEFAULT NULL COMMENT '类型',
+                  `doneFlag` tinyint(1) DEFAULT NULL COMMENT '是否完成',
+                  tmp_sys_time timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                  PRIMARY KEY (`id`) USING BTREE,
+                  KEY idx_search (`type`,`doneFlag`) USING BTREE
+                ) ENGINE=InnoDB DEFAULT COLLATE=utf8mb4_0900_ai_ci;
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("id bigint NOT NULL IDENTITY(1,1)")
+                .contains("\"type\" int DEFAULT NULL")
+                .contains("\"doneFlag\" tinyint DEFAULT NULL")
+                .contains("PRIMARY KEY (id)")
+                .doesNotContain("bigint(20)")
+                .doesNotContain("int(2)")
+                .doesNotContain("tinyint(1)")
+                .doesNotContainIgnoringCase("unsigned")
+                .doesNotContainIgnoringCase("USING BTREE")
+                .doesNotContain("KEY idx_search")
+                .doesNotContainIgnoringCase("ENGINE")
+                .doesNotContainIgnoringCase("COLLATE")
+                .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP");
+        assertThat(result.appliedRules()).contains(
+                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
+                MySqlToDmSqlConverter.MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE,
+                MySqlToDmSqlConverter.MYSQL_USING_BTREE_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE
+        );
+    }
+
+    @Test
+    void convertsMysqlSignedCastAndCharConvertForDameng() {
+        SqlConversionResult result = converter.convert("""
+                select cast(REGEXP_SUBSTR(ids, '[^,]+', 1, 1) as SIGNED) as id,
+                       CONVERT(payment.id, char) as paymentId
+                from ns_payment_chargepayment payment
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select CAST(REGEXP_SUBSTR(ids, '[^,]+', 1, 1) AS BIGINT) as id,
+                       CAST(payment.id AS VARCHAR(4000)) as paymentId
+                from ns_payment_chargepayment payment
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_CAST_SIGNED_RULE,
+                MySqlToDmSqlConverter.MYSQL_CONVERT_CHAR_RULE
+        );
+    }
+
+    @Test
+    void quotesKeywordAliasesConvertedFromBackticksAndBareDistinctColumns() {
+        SqlConversionResult result = converter.convert("""
+                select cluster.house_id as clusterId,
+                       distinct
+                from owner_house_cluster_info `cluster`
+                join owner_house_base_info stat on stat.house_id = cluster.house_id
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select "cluster".house_id as clusterId,
+                       "distinct"
+                from owner_house_cluster_info "cluster"
+                join owner_house_base_info stat on stat.house_id = "cluster".house_id
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
+                MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE
+        );
+    }
+
+    @Test
     void removesDuplicateWhereKeywordOutsideIgnoredText() {
         SqlConversionResult result = converter.convert("""
                 update charge_allowance_detail
