@@ -183,6 +183,38 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsSelectContinuationFragmentLimitAfterMyBatisInclude() {
+        SqlConversionResult result = converter.convert("""
+                from ns_wms_material
+                where materialCode LIKE #{materialClassCode}'%'
+                order by id desc limit 1
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                from ns_wms_material
+                where materialCode LIKE (#{materialClassCode}) || ('%')
+                order by id desc FETCH FIRST 1 ROWS ONLY
+                """.stripTrailing());
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE,
+                        "LIMIT_TO_DM_FETCH"
+                );
+    }
+
+    @Test
+    void doesNotConvertWhereOnlyLimitFragment() {
+        SqlConversionResult result = converter.convert(
+                "where customerId = #{customerId} order by createTime desc limit 1"
+        );
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("LIMIT");
+    }
+
+    @Test
     void leavesDateFormatNativeAndStillAppliesOtherSafeRules() {
         SqlConversionResult result = converter.convert("select DATE_FORMAT(created_at, '%Y-%m-%d') from user");
 

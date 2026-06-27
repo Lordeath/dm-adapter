@@ -643,6 +643,60 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicSelectWithIncludeRewritesTrailingLimitFragment() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.MaterialMapper">
+                    <sql id="Material_Column_List">
+                        `id`,`materialCode`
+                    </sql>
+                    <select id="selectMax" resultType="map">
+                        select
+                        <include refid="Material_Column_List" />
+                        from
+                        ns_wms_material
+                        where `enterpriseId` = #{enterpriseId,jdbcType=BIGINT}
+                        and `materialCode` LIKE #{materialClassCode}"%"
+                        order by
+                        `id`
+                        desc limit 1
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/MaterialMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/MaterialMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/MaterialMapper.xml"));
+        assertThat(rewritten)
+                .contains("\"enterpriseId\" = #{enterpriseId,jdbcType=BIGINT}")
+                .contains("and \"materialCode\" LIKE (#{materialClassCode}) || ('%')")
+                .contains("desc FETCH FIRST 1 ROWS ONLY")
+                .doesNotContain("limit 1");
+        assertThat(result.automaticConversions())
+                .anySatisfy(conversion -> assertThat(conversion.appliedRules())
+                        .contains(
+                                MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE,
+                                "LIMIT_TO_DM_FETCH"
+                        ));
+    }
+
+    @Test
     void dynamicMapOnDuplicateKeyUpdateIsRewrittenToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
