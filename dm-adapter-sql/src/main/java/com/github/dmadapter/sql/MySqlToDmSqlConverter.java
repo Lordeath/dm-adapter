@@ -66,6 +66,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
+    public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
+    public static final String MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE = "MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY";
     public static final String DUPLICATE_WHERE_KEYWORD_RULE = "DUPLICATE_WHERE_KEYWORD_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
@@ -284,6 +286,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (collateClauseConversion.changed()) {
             converted = collateClauseConversion.convertedSql();
             rules.add(MYSQL_COLLATE_CLAUSE_REMOVAL_RULE);
+        }
+
+        GenericConversion characterSetClauseConversion = removeMysqlCharacterSetClauses(converted);
+        if (characterSetClauseConversion.changed()) {
+            converted = characterSetClauseConversion.convertedSql();
+            rules.add(MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE);
+        }
+
+        GenericConversion autoIncrementConversion = convertMysqlAutoIncrement(converted);
+        if (autoIncrementConversion.changed()) {
+            converted = autoIncrementConversion.convertedSql();
+            rules.add(MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE);
         }
 
         GenericConversion duplicateWhereConversion = removeDuplicateWhereKeyword(converted);
@@ -709,6 +723,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     .contains(upper)) {
                 return false;
             }
+            if (Set.of("COMMENT", "DEFAULT").contains(upper)) {
+                return false;
+            }
         }
         int next = skipWhitespace(sql, quoteEndIndex);
         boolean hasAliasTerminator = next >= sql.length()
@@ -921,6 +938,108 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         if (cursor == collationStart) {
             return -1;
+        }
+        return skipWhitespace(sql, cursor);
+    }
+
+    private GenericConversion removeMysqlCharacterSetClauses(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                int characterSetEnd = readMysqlCharacterSetClauseEnd(sql, index);
+                if (characterSetEnd < 0) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    index = characterSetEnd;
+                    changed = true;
+                }
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private int readMysqlCharacterSetClauseEnd(String sql, int index) {
+        int cursor;
+        if (startsKeyword(sql, index, "CHARACTER")) {
+            int setIndex = skipWhitespace(sql, index + "CHARACTER".length());
+            if (!startsKeyword(sql, setIndex, "SET")) {
+                return -1;
+            }
+            cursor = skipWhitespace(sql, setIndex + "SET".length());
+        } else if (startsKeyword(sql, index, "CHARSET")) {
+            cursor = skipWhitespace(sql, index + "CHARSET".length());
+            if (cursor < sql.length() && sql.charAt(cursor) == '=') {
+                cursor = skipWhitespace(sql, cursor + 1);
+            }
+        } else {
+            return -1;
+        }
+        int charsetStart = cursor;
+        while (cursor < sql.length() && isIdentifierPart(sql.charAt(cursor))) {
+            cursor++;
+        }
+        if (cursor == charsetStart) {
+            return -1;
+        }
+        return skipWhitespace(sql, cursor);
+    }
+
+    private GenericConversion convertMysqlAutoIncrement(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsKeyword(sql, index, "AUTO_INCREMENT")) {
+                int afterKeyword = skipWhitespace(sql, index + "AUTO_INCREMENT".length());
+                if (afterKeyword < sql.length() && sql.charAt(afterKeyword) == '=') {
+                    index = skipMysqlTableOptionValue(sql, afterKeyword + 1);
+                } else {
+                    converted.append("IDENTITY(1,1)");
+                    index += "AUTO_INCREMENT".length();
+                }
+                changed = true;
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private int skipMysqlTableOptionValue(String sql, int start) {
+        int cursor = skipWhitespace(sql, start);
+        while (cursor < sql.length()) {
+            char current = sql.charAt(cursor);
+            if (Character.isLetterOrDigit(current) || current == '_' || current == '.' || current == '-') {
+                cursor++;
+            } else {
+                break;
+            }
         }
         return skipWhitespace(sql, cursor);
     }
