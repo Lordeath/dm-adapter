@@ -330,6 +330,7 @@ class DmAdapterCliTest {
                 .contains("缺失表/视图")
                 .contains("缺失字段")
                 .contains("schemaIssueCounts")
+                .contains("无效的表名")
                 .contains("schemaObjectHotspots")
                 .contains("missingTablesOrViews")
                 .contains("建议后续处理")

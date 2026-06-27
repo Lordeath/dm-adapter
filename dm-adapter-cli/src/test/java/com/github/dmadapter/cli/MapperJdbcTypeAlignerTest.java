@@ -235,6 +235,53 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void castsStringForeachItemTemporalPlaceholderFromCompiledMapperMethodSignature() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/NspaymentChargeDepositDetailMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NspaymentChargeDepositDetailMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert into ns_payment_chargedepositdetail (ClosingDay)
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.closingDay, jdbcType=VARCHAR})
+                        </foreach>
+                    </insert>
+                </mapper>
+                """);
+        compileJavaClass("com/example/NspaymentChargeDepositDetail.java", """
+                package com.example;
+
+                public class NspaymentChargeDepositDetail {
+                    private String closingDay;
+                }
+                """);
+        compileJavaClass("com/example/NspaymentChargeDepositDetailMapper.java", """
+                package com.example;
+
+                import java.util.List;
+
+                public interface NspaymentChargeDepositDetailMapper {
+                    int insertBatch(List<NspaymentChargeDepositDetail> details);
+                }
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("ns_payment_chargedepositdetail", Map.of("closingday", "TIMESTAMP"))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "module/src/main/resources/mapper-dm/NspaymentChargeDepositDetailMapper.xml"
+        ));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.warnings()).isEmpty();
+        assertThat(rewritten)
+                .contains("CAST(#{item.closingDay, jdbcType=VARCHAR} AS TIMESTAMP)")
+                .doesNotContain("#{item.closingDay, jdbcType=TIMESTAMP}");
+    }
+
+    @Test
     void castsStringForeachItemNumericPlaceholderFromCompiledMapperMethodSignature() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/NSMeiDiEBSMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
