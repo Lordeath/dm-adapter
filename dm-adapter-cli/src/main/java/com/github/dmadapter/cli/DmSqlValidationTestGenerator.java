@@ -3710,6 +3710,7 @@ class DmSqlValidationTestGenerator {
                     return "test".equalsIgnoreCase(text)
                             || "CODE".equalsIgnoreCase(text)
                             || "ID".equalsIgnoreCase(text)
+                            || "null".equalsIgnoreCase(text)
                             || "1=1".equals(text)
                             || "1".equals(text);
                 }
@@ -4133,6 +4134,7 @@ class DmSqlValidationTestGenerator {
                     return "test".equalsIgnoreCase(text)
                             || "CODE".equalsIgnoreCase(text)
                             || "ID".equalsIgnoreCase(text)
+                            || "null".equalsIgnoreCase(text)
                             || "2024-01-01".equals(text)
                             || "2024-01-01 00:00:00".equals(text)
                             || "2024-01-01 00:00:00.0".equals(text);
@@ -5038,6 +5040,9 @@ class DmSqlValidationTestGenerator {
 
                 private Object defaultParameterMapValue(String valueName, Object configuredDefault, MapperStatement statement) {
                     String columnType = statement == null ? "" : statement.defaultColumnType(valueName, dbColumnMetadata);
+                    if (!isBlank(columnType) && isDateTimeColumnType(columnType)) {
+                        return defaultStringDateTimeForColumnType(columnType);
+                    }
                     if (!isBlank(columnType) && !isCharacterColumnType(columnType)) {
                         return defaultValueForColumnType(valueName, Object.class, columnType);
                     }
@@ -5296,6 +5301,23 @@ class DmSqlValidationTestGenerator {
                         return java.sql.Timestamp.valueOf("2024-01-01 00:00:00");
                     }
                     return defaultNameBasedString(valueName);
+                }
+
+                private boolean isDateTimeColumnType(String columnType) {
+                    String normalizedType = columnType == null ? "" : columnType.toUpperCase(Locale.ROOT);
+                    return normalizedType.contains("DATE")
+                            || normalizedType.contains("TIME")
+                            || normalizedType.contains("TIMESTAMP");
+                }
+
+                private String defaultStringDateTimeForColumnType(String columnType) {
+                    String normalizedType = columnType == null ? "" : columnType.toUpperCase(Locale.ROOT);
+                    if (normalizedType.contains("TIME")
+                            && !normalizedType.contains("DATE")
+                            && !normalizedType.contains("TIMESTAMP")) {
+                        return "00:00:00";
+                    }
+                    return "2024-01-01 00:00:00";
                 }
 
                 private boolean isCharacterColumnType(String columnType) {
