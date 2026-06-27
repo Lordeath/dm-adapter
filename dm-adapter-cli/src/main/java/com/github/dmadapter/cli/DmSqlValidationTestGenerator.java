@@ -6756,7 +6756,7 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\binsert\\\\s+into\\\\s*\\\\(").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\s+(?:set|where)\\\\b").matcher(value).find()
-                            || Pattern.compile("(?i)无效的表或视图名\\\\s*\\\\[\\\\s*(?:t|b|ID)\\\\s*][\\\\s\\\\S]*?### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join)\\\\s+(?:t|b|ID)\\\\b").matcher(value).find();
+                            || Pattern.compile("(?i)无效的表或视图名\\\\s*\\\\[\\\\s*(?:t|b|ID)\\\\s*][\\\\s\\\\S]*?### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join|update|into|table)\\\\s+(?:t|b|ID)\\\\b").matcher(value).find();
                 }
 
                 private boolean hasGeneratedDynamicIdentifierPlaceholder(String message) {
