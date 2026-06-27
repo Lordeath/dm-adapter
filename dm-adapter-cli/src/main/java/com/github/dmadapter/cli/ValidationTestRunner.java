@@ -287,7 +287,7 @@ class ValidationTestRunner {
             command.add(projectRoot.relativize(moduleRoot).toString().replace('\\', '/'));
             command.add("-am");
         }
-        command.add("-Dtest=" + DmSqlValidationTestGenerator.TEST_CLASS_NAME);
+        command.add("-Dtest=" + validationMainClass(generationResult));
         command.add("-DskipTests=false");
         command.add("-Dmaven.test.skip=false");
         command.add("-Dsurefire.failIfNoSpecifiedTests=false");
