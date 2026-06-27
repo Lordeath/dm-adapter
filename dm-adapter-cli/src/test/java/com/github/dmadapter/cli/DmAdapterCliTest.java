@@ -702,6 +702,24 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void generatedValidationTestKeepsNestedSetAssignmentDefaults() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        String generatedTestSource = Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"));
+        assertThat(exitCode).isZero();
+        assertThat(generatedTestSource)
+                .contains("metadata.addDefaultValue(expression, defaultValue);")
+                .contains("metadata.addDefaultValue(valueMatcher.group(1), defaultValue);");
+    }
+
+    @Test
     void generatedValidationTestKeepsScalarForeachCollectionsFromReusingObjectElementDefaults() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
