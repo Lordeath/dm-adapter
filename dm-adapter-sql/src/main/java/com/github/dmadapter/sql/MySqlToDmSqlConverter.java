@@ -4243,6 +4243,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             if (text.isBlank() || text.contains("${")) {
                 return null;
             }
+            GenericConversion nestedConcatConversion = convertConcat(text);
+            if (nestedConcatConversion.changed()) {
+                text = nestedConcatConversion.convertedSql().trim();
+            }
             if (!expression.isEmpty()) {
                 expression.append(" || ");
             }
