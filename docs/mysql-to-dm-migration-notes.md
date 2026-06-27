@@ -38,6 +38,7 @@
 - MySQL `GROUP_CONCAT(DISTINCT a, ',', b)` 这类多参数聚合要先把参数拼接为一个表达式，再转为达梦 `LISTAGG(DISTINCT ..., ',') WITHIN GROUP (...)`，不能保留 MySQL 的多参数函数形态。
 - MySQL `CONVERT(expr, DECIMAL(n))`、`CONVERT(expr, DECIMAL(n,m))` 应转为 `CAST(expr AS DECIMAL(...))`，不能按达梦 `CONVERT` 函数原样保留。
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE`、`ON UPDATE CURRENT_TIMESTAMP` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
+- MySQL `ALTER TABLE t AUTO_INCREMENT = n` 是重置自增起点的写法，不能通过删除 `AUTO_INCREMENT = n` 保留为半截 `ALTER TABLE`。dm-adapter 会转成达梦可执行的占位语句避免验证失败；如业务确实依赖重置序列语义，应按达梦身份列/序列方案人工确认。
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 不是达梦列属性，通常改成 `BEFORE UPDATE` 触发器给时间列赋 `SYSDATE`，或由业务代码显式维护更新时间。
 - MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。
 - MySQL 正则、日期、加密、编码、空值处理函数与达梦函数不完全一致，遇到 `REGEXP`、`DATE_FORMAT`、`STR_TO_DATE`、`IFNULL`、`IF`、`FIND_IN_SET`、`AES_ENCRYPT`、`AES_DECRYPT`、`MD5`、`TO_BASE64`、`YEARWEEK`、`PERIOD_DIFF` 等函数时必须逐项确认达梦等价写法。

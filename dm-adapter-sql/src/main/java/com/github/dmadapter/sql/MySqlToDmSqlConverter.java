@@ -70,6 +70,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
     public static final String MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE = "MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY";
+    public static final String MYSQL_ALTER_AUTO_INCREMENT_RESET_RULE = "MYSQL_ALTER_AUTO_INCREMENT_RESET_TO_DM";
     public static final String MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE = "MYSQL_CREATE_TABLE_OPTIONS_REMOVED";
     public static final String MYSQL_USING_BTREE_REMOVAL_RULE = "MYSQL_USING_BTREE_REMOVED";
     public static final String MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE = "MYSQL_CREATE_TABLE_KEY_REMOVED";
@@ -115,6 +116,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     );
     private static final Pattern MYSQL_INTERVAL_PATTERN = Pattern.compile(
             "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)\\s*$"
+    );
+    private static final Pattern MYSQL_ALTER_TABLE_AUTO_INCREMENT_RESET = Pattern.compile(
+            "(?is)^\\s*ALTER\\s+TABLE\\s+(.+?)\\s+AUTO_INCREMENT\\s*=\\s*[-+]?\\d+\\s*;?\\s*$"
     );
     private static final Pattern SIMPLE_INTERVAL_AMOUNT_PATTERN = Pattern.compile(
             "(?is)^[+-]?(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})$"
@@ -320,6 +324,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (selectModifierConversion.changed()) {
             converted = selectModifierConversion.convertedSql();
             rules.add(MYSQL_SELECT_MODIFIER_REMOVAL_RULE);
+        }
+
+        GenericConversion alterAutoIncrementResetConversion = convertMysqlAlterTableAutoIncrementReset(converted);
+        if (alterAutoIncrementResetConversion.changed()) {
+            converted = alterAutoIncrementResetConversion.convertedSql();
+            rules.add(MYSQL_ALTER_AUTO_INCREMENT_RESET_RULE);
         }
 
         GenericConversion createTableOptionConversion = removeMysqlCreateTableOptions(converted);
@@ -1138,6 +1148,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertMysqlAlterTableAutoIncrementReset(String sql) {
+        Matcher matcher = MYSQL_ALTER_TABLE_AUTO_INCREMENT_RESET.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableName = matcher.group(1).strip();
+        return new GenericConversion("SET IDENTITY_INSERT " + tableName + " OFF", true);
     }
 
     private int skipMysqlTableOptionValue(String sql, int start) {

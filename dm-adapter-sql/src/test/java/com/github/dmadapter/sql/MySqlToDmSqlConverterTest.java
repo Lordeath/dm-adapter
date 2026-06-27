@@ -467,6 +467,15 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlAlterTableAutoIncrementResetForDameng() {
+        SqlConversionResult result = converter.convert("ALTER TABLE ns_contract_info AUTO_INCREMENT = 1");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("SET IDENTITY_INSERT ns_contract_info OFF");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_ALTER_AUTO_INCREMENT_RESET_RULE);
+    }
+
+    @Test
     void convertsMysqlSignedCastAndCharConvertForDameng() {
         SqlConversionResult result = converter.convert("""
                 select cast(REGEXP_SUBSTR(ids, '[^,]+', 1, 1) as SIGNED) as id,
