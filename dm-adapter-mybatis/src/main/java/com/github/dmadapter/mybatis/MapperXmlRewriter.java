@@ -55,6 +55,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT";
     public static final String DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE =
             "DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED";
+    public static final String DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED_RULE =
+            "DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED";
     public static final String DAMENG_IDENTITY_INSERT_RULE = "DAMENG_IDENTITY_INSERT";
     private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
             "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
@@ -873,6 +875,11 @@ public class MapperXmlRewriter {
                 addAppliedRules(appliedRules, dynamicUpdateOrderLimitOne.appliedRules());
                 converted = dynamicUpdateOrderLimitOne.convertedBody();
             }
+            TextRewrite trailingBlockPredicates = attachTrailingDynamicPredicatesToDamengBlock(converted);
+            if (trailingBlockPredicates.changed()) {
+                appliedRules.add(DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED_RULE);
+                converted = trailingBlockPredicates.text();
+            }
             TextRewrite duplicateBlockSemicolon = removeDuplicateDamengBlockSemicolons(converted);
             if (duplicateBlockSemicolon.changed()) {
                 appliedRules.add(DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE);
@@ -915,6 +922,115 @@ public class MapperXmlRewriter {
     private TextRewrite removeDuplicateDamengBlockSemicolons(String body) {
         String converted = Pattern.compile("(?is)\\bEND;\\s*;").matcher(body).replaceAll("END;");
         return new TextRewrite(converted, !converted.equals(body));
+    }
+
+    private TextRewrite attachTrailingDynamicPredicatesToDamengBlock(String body) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^(?<leading>\\s*BEGIN\\b)(?<block>[\\s\\S]*?)(?<end>\\bEND;)\\s*(?<tail>\\S[\\s\\S]*)$"
+        ).matcher(body);
+        if (!matcher.matches()) {
+            return new TextRewrite(body, false);
+        }
+        String tail = matcher.group("tail");
+        if (!isDamengBlockTrailingPredicateTail(tail)) {
+            return new TextRewrite(body, false);
+        }
+        List<String> statements = splitDamengBlockStatements(matcher.group("block"));
+        if (statements.size() < 2 || statements.stream().anyMatch(statement -> !isDamengBlockUpdateStatement(statement))) {
+            return new TextRewrite(body, false);
+        }
+
+        String tailWithoutTrailingWhitespace = tail.stripTrailing();
+        StringBuilder converted = new StringBuilder(body.length() + tail.length() * statements.size());
+        converted.append(matcher.group("leading"));
+        for (String statement : statements) {
+            String withoutSemicolon = stripTrailingStatementSemicolon(statement).stripTrailing();
+            converted.append(withoutSemicolon);
+            if (!startsWithLineBreak(tailWithoutTrailingWhitespace)) {
+                converted.append("\n");
+            }
+            converted.append(tailWithoutTrailingWhitespace).append(";\n");
+        }
+        converted.append(matcher.group("end"));
+        return new TextRewrite(converted.toString(), true);
+    }
+
+    private boolean isDamengBlockTrailingPredicateTail(String tail) {
+        String stripped = tail == null ? "" : tail.stripLeading();
+        if (stripped.isBlank()) {
+            return false;
+        }
+        String lower = stripped.toLowerCase(Locale.ROOT);
+        if (!(lower.startsWith("<if")
+                || lower.startsWith("<choose")
+                || lower.startsWith("<foreach")
+                || lower.startsWith("<trim")
+                || lower.startsWith("and ")
+                || lower.startsWith("or "))) {
+            return false;
+        }
+        return findTopLevelKeywordSkippingXml(stripped, "UPDATE", 0) < 0
+                && findTopLevelKeywordSkippingXml(stripped, "INSERT", 0) < 0
+                && findTopLevelKeywordSkippingXml(stripped, "DELETE", 0) < 0
+                && findTopLevelKeywordSkippingXml(stripped, "SELECT", 0) < 0;
+    }
+
+    private List<String> splitDamengBlockStatements(String block) {
+        List<String> statements = new ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        int index = 0;
+        while (index < block.length()) {
+            char current = block.charAt(index);
+            if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(block, index, current);
+            } else if (startsMyBatisPlaceholder(block, index)) {
+                index = skipMyBatisPlaceholder(block, index);
+            } else if (current == '<') {
+                int tagEnd = findXmlTagEnd(block, index);
+                index = tagEnd < 0 ? block.length() : tagEnd + 1;
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (current == ';' && depth == 0) {
+                statements.add(block.substring(start, index + 1));
+                index++;
+                start = index;
+            } else {
+                index++;
+            }
+        }
+        if (!block.substring(start).isBlank()) {
+            return List.of();
+        }
+        return statements;
+    }
+
+    private boolean isDamengBlockUpdateStatement(String statement) {
+        String stripped = statement == null ? "" : statement.stripLeading();
+        return isKeywordAt(stripped, 0, "UPDATE")
+                && stripped.stripTrailing().endsWith(";")
+                && findTopLevelKeywordSkippingXml(stripped, "WHERE", 0) >= 0;
+    }
+
+    private String stripTrailingStatementSemicolon(String statement) {
+        int index = statement.length() - 1;
+        while (index >= 0 && Character.isWhitespace(statement.charAt(index))) {
+            index--;
+        }
+        if (index >= 0 && statement.charAt(index) == ';') {
+            return statement.substring(0, index) + statement.substring(index + 1);
+        }
+        return statement;
+    }
+
+    private boolean startsWithLineBreak(String value) {
+        return value.startsWith("\n") || value.startsWith("\r");
     }
 
     private TextRewrite quoteDynamicQuotedAliasReferences(String body) {
