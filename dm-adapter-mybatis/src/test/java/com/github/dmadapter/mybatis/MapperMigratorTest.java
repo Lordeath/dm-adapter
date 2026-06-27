@@ -2202,13 +2202,17 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName}")
+                .contains("BEGIN")
+                .contains("EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName}")
                 .contains("<foreach collection=\"list[0]\" item=\"field\" separator=\",\">")
                 .contains("${field.fieldName} VARCHAR(4000)")
-                .contains(") ON COMMIT PRESERVE ROWS;")
-                .contains("insert into t_${tmpTableName}")
-                .contains("<foreach collection=\"list\" item=\"item\" separator=\" union all \">")
-                .contains("#{field.fieldValue} AS ${field.fieldName}")
+                .contains(") ON COMMIT PRESERVE ROWS';")
+                .contains("<foreach collection=\"list\" item=\"item\" separator=\";\">")
+                .contains("EXECUTE IMMEDIATE 'insert into t_${tmpTableName}")
+                .contains("? AS ${field.fieldName}")
+                .contains("from dual' USING")
+                .contains("#{field.fieldValue}")
+                .contains("END;")
                 .doesNotContain("create temporary table t_${tmpTableName}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())

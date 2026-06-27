@@ -3113,7 +3113,8 @@ class DmSqlValidationTestGenerator {
                             "validation-test-data",
                             record.parameterSummary,
                             "SQL reached the database execution phase, but validation sample data does not satisfy "
-                                    + "foreign-key or selectOne cardinality expectations; skipped as a validation-data issue."
+                                    + "foreign-key, unique constraint, or selectOne cardinality expectations; "
+                                    + "skipped as a validation-data issue."
                                     + "\\nOriginal failure:\\n" + record.message
                     );
                 }
@@ -3121,6 +3122,7 @@ class DmSqlValidationTestGenerator {
                 private boolean hasValidationTestDataIssue(String message) {
                     return containsAny(message,
                             "违反引用约束",
+                            "唯一性约束",
                             "TooManyResultsException");
                 }
 
