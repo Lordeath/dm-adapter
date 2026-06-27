@@ -206,6 +206,9 @@ public class MapperXmlRewriter {
             "(?is)^\\s*((?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
                     + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))?)\\s*="
     );
+    private static final Pattern SIMPLE_MYBATIS_PARAMETER_PATTERN = Pattern.compile(
+            "(?is)^#\\{\\s*([A-Za-z_][A-Za-z0-9_$.]*)\\s*(?:,[^}]*)?}$"
+    );
     private static final Pattern DYNAMIC_XML_TAG_PATTERN = Pattern.compile(
             "(?is)<\\s*/?\\s*(if|foreach|choose|when|otherwise|trim|where|set)\\b"
     );
@@ -4053,7 +4056,22 @@ public class MapperXmlRewriter {
     }
 
     private boolean sameSetAssignmentValue(SetAssignment left, SetAssignment right) {
-        return left.valueExpression().equals(right.valueExpression());
+        if (left.valueExpression().equals(right.valueExpression())) {
+            return true;
+        }
+        return !left.condition().isBlank()
+                && right.condition().isBlank()
+                && sameSimpleMyBatisParameter(left.valueExpression(), right.valueExpression());
+    }
+
+    private boolean sameSimpleMyBatisParameter(String left, String right) {
+        String leftParameter = simpleMyBatisParameterName(left);
+        return !leftParameter.isBlank() && leftParameter.equals(simpleMyBatisParameterName(right));
+    }
+
+    private String simpleMyBatisParameterName(String expression) {
+        Matcher matcher = SIMPLE_MYBATIS_PARAMETER_PATTERN.matcher(expression);
+        return matcher.matches() ? matcher.group(1) : "";
     }
 
     private void rememberSetAssignment(SetAssignment assignment, Map<String, List<SetAssignment>> seenAssignments) {
