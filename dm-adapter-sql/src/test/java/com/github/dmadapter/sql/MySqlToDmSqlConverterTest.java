@@ -354,8 +354,8 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table if not exists tmp_budget_payment_receipt (
-                  id bigint NOT NULL IDENTITY(1,1) COMMENT '自增id',
-                  "chargeItem" varchar(200) DEFAULT NULL COMMENT '收费科目',
+                  id bigint NOT NULL IDENTITY(1,1),
+                  "chargeItem" varchar(200) DEFAULT NULL,
                   PRIMARY KEY (id)
                 )
                 """);
@@ -363,7 +363,8 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                 MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE,
-                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
         );
     }
 
@@ -394,16 +395,50 @@ class MySqlToDmSqlConverterTest {
                 .doesNotContain("KEY idx_search")
                 .doesNotContainIgnoringCase("ENGINE")
                 .doesNotContainIgnoringCase("COLLATE")
-                .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP");
+                .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP")
+                .doesNotContainIgnoringCase("COMMENT");
         assertThat(result.appliedRules()).contains(
                 MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
                 MySqlToDmSqlConverter.MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE,
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_USING_BTREE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE
         );
+    }
+
+    @Test
+    void capsMysqlDecimalPrecisionAndRemovesCommentsInCreateTable() {
+        SqlConversionResult result = converter.convert("""
+                create table tmp_should_amortize_detail (
+                  `chargeSum` DECIMAL(40,2) DEFAULT '0.00' COMMENT '合同金额',
+                  `ratio` numeric(50,40) DEFAULT NULL COMMENT '比例'
+                )
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                create table tmp_should_amortize_detail (
+                  "chargeSum" DECIMAL(38,2) DEFAULT '0.00',
+                  ratio numeric(38,38) DEFAULT NULL
+                )
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                MySqlToDmSqlConverter.MYSQL_DECIMAL_PRECISION_CAP_RULE,
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
+        );
+    }
+
+    @Test
+    void convertsMysqlTruncateToDamengTruncateTable() {
+        SqlConversionResult result = converter.convert("TRUNCATE tmp_static_report_precinct_steward_report;");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("TRUNCATE TABLE tmp_static_report_precinct_steward_report;");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_TRUNCATE_TABLE_RULE);
     }
 
     @Test
@@ -447,6 +482,23 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
                 MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE
         );
+    }
+
+    @Test
+    void quotesDamengKeywordListTableAlias() {
+        SqlConversionResult result = converter.convert("""
+                SELECT max(list.id) as remindId
+                FROM charge_reminder_list list
+                left join charge_reminder_list_charge_relationship ship on ship.remind_list_id = list.id
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT max("list".id) as remindId
+                FROM charge_reminder_list "list"
+                left join charge_reminder_list_charge_relationship ship on ship.remind_list_id = "list".id
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE);
     }
 
     @Test
