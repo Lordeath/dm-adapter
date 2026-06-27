@@ -34,10 +34,14 @@ class SqlRewriteConfigLoaderTest {
                 "#    - \"commented_table\"",
                 "    - \"EXAMPLE_OWNER.owner_house\"",
                 "  missingColumns: [\"organization_id\", \"D.fullPath\"]",
+                "  missingSchemas: [\"EXAMPLE-QUARTZ\"]",
                 "  missingTables: [\"b\"]",
                 "  missingColumns:",
                 "#    - \"commented_column\"",
-                "    - \"accountType\""
+                "    - \"accountType\"",
+                "  missingSchemas:",
+                "#    - \"commented_schema\"",
+                "    - \"EXAMPLE-SCHEDULER\""
         ));
 
         assertThat(config.ignoredMissingTables())
@@ -46,5 +50,8 @@ class SqlRewriteConfigLoaderTest {
         assertThat(config.ignoredMissingColumns())
                 .contains("organization_id", "d.fullpath", "accounttype")
                 .doesNotContain("commented_column");
+        assertThat(config.ignoredMissingSchemas())
+                .contains("example-quartz", "example-scheduler")
+                .doesNotContain("commented_schema");
     }
 }
