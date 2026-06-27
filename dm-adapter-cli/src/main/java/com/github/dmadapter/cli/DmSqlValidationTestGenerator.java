@@ -1091,7 +1091,9 @@ class DmSqlValidationTestGenerator {
                     if (node instanceof Element) {
                         Element element = (Element) node;
                         Map<String, String> currentForeachCollections = foreachCollections;
-                        boolean currentInsideSet = insideSet || "set".equals(element.getTagName());
+                        boolean currentInsideSet = insideSet
+                                || "set".equals(element.getTagName())
+                                || isSetTrimElement(element);
                         if ("foreach".equals(element.getTagName())) {
                             String item = element.getAttribute("item");
                             String index = element.getAttribute("index");
@@ -1178,6 +1180,33 @@ class DmSqlValidationTestGenerator {
                         addValueExpression(valueMatcher.group(1), jdbcType(valueMatcher.group(2)), foreachCollections, metadata);
                     }
                     addValueColumnReferences(text, foreachCollections, metadata, sqlContext);
+                }
+
+                private boolean isSetTrimElement(Element element) {
+                    if (element == null || !"trim".equals(element.getTagName())) {
+                        return false;
+                    }
+                    String prefix = element.getAttribute("prefix");
+                    if (prefix != null && "set".equalsIgnoreCase(prefix.trim())) {
+                        return true;
+                    }
+                    String suffixOverrides = element.getAttribute("suffixOverrides");
+                    if (suffixOverrides == null || !suffixOverrides.contains(",")) {
+                        return false;
+                    }
+                    Node sibling = element.getPreviousSibling();
+                    while (sibling != null) {
+                        if (sibling.getNodeType() == Node.TEXT_NODE || sibling.getNodeType() == Node.CDATA_SECTION_NODE) {
+                            String text = sibling.getTextContent();
+                            if (!isBlank(text)) {
+                                return Pattern.compile("(?is)(?:^|\\\\s)set\\\\s*$").matcher(text).find();
+                            }
+                        } else if (sibling instanceof Element) {
+                            return false;
+                        }
+                        sibling = sibling.getPreviousSibling();
+                    }
+                    return false;
                 }
 
                 private void addDynamicIdentifierExpression(
