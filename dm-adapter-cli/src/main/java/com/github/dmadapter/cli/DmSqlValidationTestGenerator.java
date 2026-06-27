@@ -713,6 +713,7 @@ class DmSqlValidationTestGenerator {
                                                 + " params=" + parameters.source);
                                         long startedAt = System.currentTimeMillis();
                                         ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
+                                        record = skipMissingDynamicIdentifier(record);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         records.add(record);
@@ -745,6 +746,8 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
+                """,
+            """
                 private SqlSessionFactory buildSqlSessionFactory(
                         ValidationConfig config,
                         List<Path> mapperXmlFiles,
@@ -2915,6 +2918,21 @@ class DmSqlValidationTestGenerator {
                     }
                     String stripped = stripSqlLiteralQuotes(((String) value).trim());
                     return "ID".equalsIgnoreCase(stripped) || "1".equals(stripped);
+                }
+
+                private ValidationRecord skipMissingDynamicIdentifier(ValidationRecord record) {
+                    if (record == null || !"FAILED".equals(record.status) || !hasMissingDynamicIdentifierIssue(record.message)) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "dynamic-identifier-parameter",
+                            record.parameterSummary,
+                            "Dynamic SQL identifier parameter is missing or blank; "
+                                    + "configure a real identifier in .dm-adapter/sql-rewrite.yml validationArgs, "
+                                    + "for example extendTable/targetTable/fieldName."
+                                    + "\\nOriginal failure:\\n" + record.message
+                    );
                 }
 
                 private ValidationRecord skipIgnoredMissingTable(ValidationRecord record, ValidationConfig config) {
