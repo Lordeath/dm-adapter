@@ -1111,6 +1111,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 return null;
             }
             start = readExpressionNameStartBeforeParen(sql, openParenIndex);
+        } else if (previous == '\'') {
+            start = findSingleQuotedStringStartEndingAt(sql, end);
+            if (start < 0) {
+                return null;
+            }
         } else if (previous == '}') {
             start = readMyBatisPlaceholderStartBackward(sql, end);
             if (start < 0) {
@@ -1127,6 +1132,29 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return new DateExpression(start, end, expression);
+    }
+
+    private int findSingleQuotedStringStartEndingAt(String sql, int end) {
+        int closeIndex = end - 1;
+        if (closeIndex <= 0 || sql.charAt(closeIndex) != '\'') {
+            return -1;
+        }
+        int index = 0;
+        while (index < closeIndex) {
+            if (sql.charAt(index) == '\'') {
+                int nextIndex = skipSingleQuotedString(sql, index);
+                if (nextIndex == end) {
+                    return index;
+                }
+                if (nextIndex > closeIndex) {
+                    return -1;
+                }
+                index = nextIndex;
+            } else {
+                index++;
+            }
+        }
+        return -1;
     }
 
     private IntervalExpression readIntervalExpressionAfterPlus(String sql, int plusIndex) {

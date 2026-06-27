@@ -519,6 +519,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlIntervalAdditionAfterSingleQuotedMyBatisValueToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select * from payment_order where pay_time &lt; '${lastDayOfMonth}' + interval 1 day"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select * from payment_order where pay_time &lt; DATEADD(DAY, 1, '${lastDayOfMonth}')");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
     void convertsMysqlIntervalSubtractionToDateadd() {
         SqlConversionResult result = converter.convert(
                 "select * from task where taskStartTime BETWEEN (SYSDATE - INTERVAL ${day} DAY) and SYSDATE"
