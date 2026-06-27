@@ -696,6 +696,12 @@ class DmSqlValidationTestGenerator {
                                         logProgress(index, total, record, 0L);
                                         continue;
                                     }
+                                    ValidationRecord unsupportedReturnType = skipUnsupportedReturnType(mapperMethod);
+                                    if (unsupportedReturnType != null) {
+                                        records.add(unsupportedReturnType);
+                                        logProgress(index, total, unsupportedReturnType, 0L);
+                                        continue;
+                                    }
                                     List<ParameterResolution> parameterVariants = resolveParameterVariants(mapperMethod, config);
                                     for (ParameterResolution parameters : parameterVariants) {
                                         String recordKey = parameters.recordKey(mapperMethod.key());
@@ -717,6 +723,7 @@ class DmSqlValidationTestGenerator {
                                         record = skipMissingDynamicIdentifier(record);
                                         record = skipMissingDynamicSqlFragment(record);
                                         record = skipGeneratedDynamicSqlOrArgs(record);
+                                        record = skipExistingDdlObject(record);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         records.add(record);
@@ -3068,6 +3075,44 @@ class DmSqlValidationTestGenerator {
                             "Dynamic SQL still contains generated placeholder identifiers/fragments or generated null tuple values; "
                                     + "configure real table, column, SQL fragment or DDL metadata in .dm-adapter/sql-rewrite.yml validationArgs."
                                     + "\\nOriginal failure:\\n" + record.message
+                            );
+                }
+
+                private ValidationRecord skipExistingDdlObject(ValidationRecord record) {
+                    if (record == null || !"FAILED".equals(record.status)) {
+                        return record;
+                    }
+                    String message = record.message == null ? "" : record.message;
+                    String lowerMessage = message.toLowerCase(Locale.ROOT);
+                    String lowerSql = sqlFromMessage(message).toLowerCase(Locale.ROOT);
+                    if (!lowerSql.contains("create table")
+                            || !(message.contains("已存在") || lowerMessage.contains("already exists"))) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "existing-ddl-object",
+                            record.parameterSummary,
+                            "DDL object already exists in the validation database; "
+                                    + "skip this validation-environment idempotency failure."
+                                    + "\\nOriginal failure:\\n" + record.message
+                            );
+                }
+
+                private ValidationRecord skipUnsupportedReturnType(MapperMethod mapperMethod) {
+                    if (mapperMethod == null || mapperMethod.method == null) {
+                        return null;
+                    }
+                    String returnType = mapperMethod.method.getReturnType().getName();
+                    if (!returnType.startsWith("lordeath.local.collection.")) {
+                        return null;
+                    }
+                    return ValidationRecord.skipped(
+                            mapperMethod.key(),
+                            "unsupported-return-type",
+                            "Mapper return type " + returnType
+                                    + " requires business runtime data-source initialization; "
+                                    + "SQL validation skips reflective invocation for this custom container."
                     );
                 }
 
@@ -5885,6 +5930,8 @@ class DmSqlValidationTestGenerator {
                             || "finishtime".equals(normalizedName)
                             || normalizedName.contains("operatordate")
                             || normalizedName.contains("shouldchargedate")
+                            || (normalizedName.contains("date") && hasTemporalRangeQualifier(normalizedName))
+                            || (normalizedName.contains("time") && hasTemporalRangeQualifier(normalizedName))
                             || normalizedName.contains("firstday")
                             || normalizedName.contains("lastday")
                             || normalizedName.contains("startday")
@@ -5907,8 +5954,21 @@ class DmSqlValidationTestGenerator {
                 private boolean isYearLikeParameterName(String normalizedName) {
                     return "year".equals(normalizedName)
                             || normalizedName.endsWith("year")
+                            || (normalizedName.contains("year") && hasTemporalRangeQualifier(normalizedName))
                             || normalizedName.contains("thisyear")
                             || normalizedName.contains("lastyear");
+                }
+
+                private boolean hasTemporalRangeQualifier(String normalizedName) {
+                    return normalizedName.contains("start")
+                            || normalizedName.contains("begin")
+                            || normalizedName.contains("end")
+                            || normalizedName.contains("less")
+                            || normalizedName.contains("biger")
+                            || normalizedName.contains("before")
+                            || normalizedName.contains("after")
+                            || normalizedName.contains("from")
+                            || normalizedName.contains("to");
                 }
 
                 private boolean isNumericTextParameterName(String normalizedName) {
