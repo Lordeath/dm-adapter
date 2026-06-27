@@ -3562,7 +3562,7 @@ class DmSqlValidationTestGenerator {
                 ) {
                     Map<String, Object> merged = new LinkedHashMap<>(defaultValue);
                     if (configuredValue == null || configuredValue.isEmpty()) {
-                        return merged;
+                        return normalizeValidationParameterMap(merged);
                     }
                     for (Map.Entry<String, Object> entry : configuredValue.entrySet()) {
                         Object existing = merged.get(entry.getKey());
@@ -3601,7 +3601,94 @@ class DmSqlValidationTestGenerator {
                             merged.put(entry.getKey(), coerced);
                         }
                     }
-                    return merged;
+                    return normalizeValidationParameterMap(merged);
+                }
+
+                @SuppressWarnings("unchecked")
+                private Map<String, Object> normalizeValidationParameterMap(Map<String, Object> value) {
+                    if (value == null || value.isEmpty()) {
+                        return value;
+                    }
+                    for (Object nestedValue : value.values()) {
+                        if (nestedValue instanceof Map<?, ?>) {
+                            normalizeValidationParameterMap((Map<String, Object>) nestedValue);
+                        } else if (nestedValue instanceof Collection<?>) {
+                            for (Object item : (Collection<?>) nestedValue) {
+                                if (item instanceof Map<?, ?>) {
+                                    normalizeValidationParameterMap((Map<String, Object>) item);
+                                }
+                            }
+                        }
+                    }
+                    normalizeSqlIsComparisonValue(value);
+                    normalizeMutuallyExclusiveFlagValues(value);
+                    return value;
+                }
+
+                private void normalizeSqlIsComparisonValue(Map<String, Object> value) {
+                    String comparisonKey = keyByNormalizedName(value, "comparison");
+                    if (isBlank(comparisonKey)
+                            || !"IS".equalsIgnoreCase(String.valueOf(value.get(comparisonKey)).trim())) {
+                        return;
+                    }
+                    String fieldValueTypeKey = keyByNormalizedName(value, "fieldvaluetype");
+                    if (!isBlank(fieldValueTypeKey) && !isTruthyFlagValue(value.get(fieldValueTypeKey))) {
+                        return;
+                    }
+                    String fieldValueKey = keyByNormalizedName(value, "fieldvalue");
+                    if (isBlank(fieldValueKey)) {
+                        return;
+                    }
+                    Object fieldValue = value.get(fieldValueKey);
+                    if (fieldValue == null || isGeneratedPlaceholderValue(fieldValueKey, fieldValue)) {
+                        value.put(fieldValueKey, "NULL");
+                    }
+                }
+
+                private void normalizeMutuallyExclusiveFlagValues(Map<String, Object> value) {
+                    List<String> enabledSumFlags = new ArrayList<>();
+                    for (String key : value.keySet()) {
+                        String normalized = normalizeName(key);
+                        if (normalized.startsWith("sum")
+                                && normalized.endsWith("flag")
+                                && isTruthyFlagValue(value.get(key))) {
+                            enabledSumFlags.add(key);
+                        }
+                    }
+                    for (int i = 1; i < enabledSumFlags.size(); i++) {
+                        value.put(enabledSumFlags.get(i), null);
+                    }
+                    String currentFlagKey = keyByNormalizedName(value, "currentflag");
+                    String beforeCurrentFlagKey = keyByNormalizedName(value, "beforecurrentflag");
+                    if (!isBlank(currentFlagKey)
+                            && !isBlank(beforeCurrentFlagKey)
+                            && isTruthyFlagValue(value.get(currentFlagKey))
+                            && isTruthyFlagValue(value.get(beforeCurrentFlagKey))) {
+                        value.put(beforeCurrentFlagKey, null);
+                    }
+                }
+
+                private String keyByNormalizedName(Map<String, Object> value, String normalizedName) {
+                    for (String key : value.keySet()) {
+                        if (normalizedName.equals(normalizeName(key))) {
+                            return key;
+                        }
+                    }
+                    return "";
+                }
+
+                private boolean isTruthyFlagValue(Object value) {
+                    if (value instanceof Boolean) {
+                        return Boolean.TRUE.equals(value);
+                    }
+                    if (value instanceof Number) {
+                        return ((Number) value).longValue() != 0L;
+                    }
+                    if (value == null) {
+                        return false;
+                    }
+                    String text = stripSqlLiteralQuotes(String.valueOf(value)).trim();
+                    return "1".equals(text) || "true".equalsIgnoreCase(text);
                 }
 
                 private Object scalarConfiguredCollectionValue(
@@ -3658,6 +3745,11 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object inferredConfiguredPlaceholderDefault(String valueName, Object configuredValue) {
+                    if (configuredValue instanceof String
+                            && isRegexpSqlFragmentName(normalizeName(valueName))
+                            && "ID".equalsIgnoreCase(stripSqlLiteralQuotes((String) configuredValue))) {
+                        return quoteSqlLiteral("1");
+                    }
                     if (isGeneratedPlaceholderValue(valueName, configuredValue)) {
                         return defaultNameBasedTypedValue(valueName);
                     }
@@ -3671,13 +3763,18 @@ class DmSqlValidationTestGenerator {
                     if (defaultValue == null) {
                         return true;
                     }
+                    String normalized = normalizeName(valueName);
+                    if (isRegexpSqlFragmentName(normalized)
+                            && configuredValue instanceof String
+                            && "ID".equalsIgnoreCase(stripSqlLiteralQuotes((String) configuredValue))) {
+                        return false;
+                    }
                     if (!isGeneratedPlaceholderValue(valueName, configuredValue)) {
                         return true;
                     }
                     if (!(defaultValue instanceof String)) {
                         return false;
                     }
-                    String normalized = normalizeName(valueName);
                     String defaultText = ((String) defaultValue).trim();
                     return isGeneratedPlaceholderText(defaultText)
                             && !isNumericTextParameterName(normalized)
@@ -4380,13 +4477,13 @@ class DmSqlValidationTestGenerator {
                             putDefaultParameterValue(value, collectionName, defaultCollectionParameter(collectionName, statement));
                         }
                     }
-                    return value;
+                    return normalizeValidationParameterMap(value);
                 }
 
                 private Map<String, Object> configuredParameterMap(MapperStatement statement, Map<String, Object> configuredParams) {
                     Map<String, Object> value = defaultParameterMap(statement);
                     mergeConfiguredParameterMap(value, configuredParams, statement, "");
-                    return value;
+                    return normalizeValidationParameterMap(value);
                 }
 
                 @SuppressWarnings("unchecked")
@@ -5006,6 +5103,9 @@ class DmSqlValidationTestGenerator {
                     if (isSqlSegmentParameterName(normalizedProperty) || isSqlSegmentParameterName(normalizedCollection)) {
                         return "";
                     }
+                    if (isRegexpSqlFragmentName(normalizedProperty) || isRegexpSqlFragmentName(normalizedCollection)) {
+                        return quoteSqlLiteral("1");
+                    }
                     if (normalizedProperty.endsWith("field")
                             || normalizedProperty.endsWith("fieldname")
                             || normalizedProperty.endsWith("column")
@@ -5120,6 +5220,10 @@ class DmSqlValidationTestGenerator {
                             || normalizedName.contains("name")
                             || normalizedName.contains("account")
                             || normalizedName.contains("no");
+                }
+
+                private boolean isRegexpSqlFragmentName(String normalizedName) {
+                    return normalizedName.contains("regexp") || normalizedName.contains("regex");
                 }
 
                 private boolean isSqlSegmentParameterName(String normalizedName) {

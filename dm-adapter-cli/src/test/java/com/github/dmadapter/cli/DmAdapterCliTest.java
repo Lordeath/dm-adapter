@@ -738,6 +738,31 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void generatedValidationTestNormalizesConfiguredValidationPlaceholders() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        String generatedTestSource = Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"));
+        assertThat(exitCode).isZero();
+        assertThat(generatedTestSource)
+                .contains("return normalizeValidationParameterMap(value);")
+                .contains("normalizeSqlIsComparisonValue(value);")
+                .contains("normalizeMutuallyExclusiveFlagValues(value);")
+                .contains("\"IS\".equalsIgnoreCase(String.valueOf(value.get(comparisonKey)).trim())")
+                .contains("value.put(fieldValueKey, \"NULL\");")
+                .contains("normalized.startsWith(\"sum\")")
+                .contains("value.put(beforeCurrentFlagKey, null);")
+                .contains("isRegexpSqlFragmentName(normalizeName(valueName))")
+                .contains("return quoteSqlLiteral(\"1\");");
+    }
+
+    @Test
     void generatedValidationTestKeepsScalarForeachCollectionsFromReusingObjectElementDefaults() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
