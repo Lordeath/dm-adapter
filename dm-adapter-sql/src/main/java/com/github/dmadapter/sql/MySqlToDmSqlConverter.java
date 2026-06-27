@@ -63,6 +63,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
+    public static final String DUPLICATE_WHERE_KEYWORD_RULE = "DUPLICATE_WHERE_KEYWORD_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
@@ -280,6 +281,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (collateClauseConversion.changed()) {
             converted = collateClauseConversion.convertedSql();
             rules.add(MYSQL_COLLATE_CLAUSE_REMOVAL_RULE);
+        }
+
+        GenericConversion duplicateWhereConversion = removeDuplicateWhereKeyword(converted);
+        if (duplicateWhereConversion.changed()) {
+            converted = duplicateWhereConversion.convertedSql();
+            rules.add(DUPLICATE_WHERE_KEYWORD_RULE);
         }
 
         GenericConversion dateSubConversion = convertDateSubInterval(converted);
@@ -894,6 +901,47 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return -1;
         }
         return skipWhitespace(sql, cursor);
+    }
+
+    private GenericConversion removeDuplicateWhereKeyword(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "WHERE")) {
+                int afterFirstWhere = index + "WHERE".length();
+                int secondWhereIndex = skipWhitespace(sql, afterFirstWhere);
+                if (startsKeyword(sql, secondWhereIndex, "WHERE")) {
+                    converted.append(sql, lastCopiedIndex, afterFirstWhere);
+                    converted.append(' ');
+                    int afterSecondWhere = skipWhitespace(sql, secondWhereIndex + "WHERE".length());
+                    lastCopiedIndex = afterSecondWhere;
+                    index = afterSecondWhere;
+                    changed = true;
+                } else {
+                    index++;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
     }
 
     private GenericConversion convertDateSubInterval(String sql) {
