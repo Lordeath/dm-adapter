@@ -5791,6 +5791,7 @@ class DmSqlValidationTestGenerator {
                 private boolean isSchemaIdentifierName(String normalized) {
                     return "schema".equals(normalized)
                             || "schemaname".equals(normalized)
+                            || normalized.endsWith("schema")
                             || "database".equals(normalized)
                             || "databasename".equals(normalized);
                 }
