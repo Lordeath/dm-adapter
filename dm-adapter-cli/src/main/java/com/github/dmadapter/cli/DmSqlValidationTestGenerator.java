@@ -3341,17 +3341,24 @@ class DmSqlValidationTestGenerator {
                         String valueName,
                         Object existingDefault
                 ) {
-                    if (!(configuredValue instanceof String) || statement == null) {
+                    if (!(configuredValue instanceof String)) {
                         return configuredValue;
                     }
                     String normalized = normalizeName(valueName);
+                    String text = ((String) configuredValue).trim();
+                    if (isRegexpSqlFragmentName(normalized)
+                            && "ID".equalsIgnoreCase(stripSqlLiteralQuotes(text))) {
+                        return quoteSqlLiteral("1");
+                    }
+                    if (statement == null) {
+                        return configuredValue;
+                    }
                     boolean schemaIdentifier = isSchemaIdentifierName(normalized);
                     if (!statement.dynamicIdentifierParameter(valueName)
                             && !isLikelyDynamicIdentifierName(normalized)
                             && !schemaIdentifier) {
                         return configuredValue;
                     }
-                    String text = ((String) configuredValue).trim();
                     if (schemaIdentifier && isDoubleQuotedSqlIdentifier(text)) {
                         return text;
                     }
@@ -3897,17 +3904,18 @@ class DmSqlValidationTestGenerator {
                     if (!base.resolved || base.value == null) {
                         return base;
                     }
+                    Map<String, Object> normalizedParams = normalizeValidationParameterMap(new LinkedHashMap<>(params));
                     Object instance = base.value;
                     Class<?> currentType = targetType;
                     try {
                         while (currentType != null && !Object.class.equals(currentType)) {
                             for (Field field : currentType.getDeclaredFields()) {
                                 int modifiers = field.getModifiers();
-                                if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers) || !params.containsKey(field.getName())) {
+                                if (Modifier.isStatic(modifiers) || Modifier.isFinal(modifiers) || !normalizedParams.containsKey(field.getName())) {
                                     continue;
                                 }
                                 field.setAccessible(true);
-                                Object rawConfigured = params.get(field.getName());
+                                Object rawConfigured = normalizedParams.get(field.getName());
                                 if (rawConfigured == null) {
                                     if (field.getType().isPrimitive()) {
                                         return ValueResult.unresolved("Cannot assign null to primitive field "
