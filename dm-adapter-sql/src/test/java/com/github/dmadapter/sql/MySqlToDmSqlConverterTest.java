@@ -775,6 +775,48 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsLikePlaceholderAdjacentStringLiteralToDamengConcat() {
+        SqlConversionResult result = converter.convert(
+                "select * from ns_wms_material where `materialCode` LIKE #{materialClassCode}\"%\""
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select * from ns_wms_material where \"materialCode\" LIKE (#{materialClassCode}) || ('%')");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                        MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE
+                );
+    }
+
+    @Test
+    void convertsLikeStringLiteralAdjacentPlaceholderToDamengConcat() {
+        SqlConversionResult result = converter.convert(
+                "select * from customer where name LIKE '%' #{customerName}"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select * from customer where name LIKE ('%') || (#{customerName})");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE);
+    }
+
+    @Test
+    void doesNotConvertLikeDynamicPlaceholderAdjacentLiteral() {
+        SqlConversionResult result = converter.convert(
+                "select * from customer where name LIKE ${customerName}'%'"
+        );
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
     void doesNotConvertMysqlConcatWithDynamicIdentifier() {
         SqlConversionResult result = converter.convert(
                 "select concat(${remarkField}, '\\n') from customer"
