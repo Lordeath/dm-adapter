@@ -51,6 +51,10 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE";
     public static final String MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE =
             "MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE";
+    public static final String MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE =
+            "MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT";
+    public static final String DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE =
+            "DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED";
     public static final String DAMENG_IDENTITY_INSERT_RULE = "DAMENG_IDENTITY_INSERT";
     private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
             "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
@@ -214,6 +218,19 @@ public class MapperXmlRewriter {
                     + "on\\s+duplicate\\s+key\\s+update\\s*"
                     + "(?<updates>[\\s\\S]*?)(?<trailing>;?\\s*)$"
     );
+    private static final Pattern DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_PATTERN = Pattern.compile(
+            "(?is)(?<prefix>CREATE\\s+GLOBAL\\s+TEMPORARY\\s+TABLE\\s+"
+                    + "(?<table>[^\\s;]+)"
+                    + "\\s+ON\\s+COMMIT\\s+PRESERVE\\s+ROWS\\s+AS\\s*)"
+                    + "(?<outerOpen><foreach\\b(?=[^>]*\\bcollection\\s*=\\s*\"list\")"
+                    + "(?=[^>]*\\bitem\\s*=\\s*\"item\")[^>]*>)\\s*"
+                    + "select\\s*"
+                    + "(?<inner><foreach\\b(?=[^>]*\\bcollection\\s*=\\s*\"item\")"
+                    + "(?=[^>]*\\bitem\\s*=\\s*\"field\")[^>]*>\\s*"
+                    + "#\\{\\s*field\\.fieldValue\\s*(?:,[^}]*)?}\\s+AS\\s+"
+                    + "\\$\\{\\s*field\\.fieldName\\s*}\\s*</foreach>)\\s*"
+                    + "from\\s+dual\\s*</foreach>"
+    );
     private static final Pattern FOREACH_TAG_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)</foreach\\s*>\\s*$"
     );
@@ -362,6 +379,11 @@ public class MapperXmlRewriter {
                 convertedSql = wrapIdentityInsertSql(convertedSql, identityInsertTable);
                 staticRules.add(DAMENG_IDENTITY_INSERT_RULE);
             }
+            TextRewrite duplicateBlockSemicolon = removeDuplicateDamengBlockSemicolons(convertedSql);
+            if (duplicateBlockSemicolon.changed()) {
+                convertedSql = duplicateBlockSemicolon.text();
+                staticRules.add(DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE);
+            }
             if (!convertedSql.equals(originalSql)) {
                 replacements.add(StatementReplacement.staticSql(
                         statement.getTagName(),
@@ -424,7 +446,7 @@ public class MapperXmlRewriter {
             return "";
         }
         Matcher matcher = Pattern.compile(
-                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+("
+                "(?is)\\binsert\\s+(?:ignore\\s+)?(?:into\\s+)?("
                         + DM_IDENTIFIER
                         + "(?:\\s*\\.\\s*"
                         + DM_IDENTIFIER
@@ -437,14 +459,22 @@ public class MapperXmlRewriter {
         if (sql == null || sql.isBlank()) {
             return "";
         }
-        Matcher matcher = Pattern.compile(
-                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+("
-                        + DM_IDENTIFIER
-                        + "(?:\\s*\\.\\s*"
-                        + DM_IDENTIFIER
-                        + ")?)\\b"
-        ).matcher(sql);
-        return matcher.find() ? matcher.group(1).trim() : "";
+        Matcher matcher = Pattern.compile("(?is)\\binsert\\b").matcher(sql);
+        if (!matcher.find()) {
+            return "";
+        }
+        int index = skipWhitespace(sql, matcher.end());
+        if (isKeywordAt(sql, index, "IGNORE")) {
+            index = skipWhitespace(sql, index + "IGNORE".length());
+        }
+        if (isKeywordAt(sql, index, "INTO")) {
+            index = skipWhitespace(sql, index + "INTO".length());
+        }
+        int tableEnd = readRelationEnd(sql, index);
+        if (tableEnd <= index) {
+            return "";
+        }
+        return sql.substring(index, tableEnd).trim();
     }
 
     private String identityInsertTableName(String tagName, String sql, SqlRewriteConfig rewriteConfig) {
@@ -462,7 +492,7 @@ public class MapperXmlRewriter {
 
     private boolean insertColumnListContains(String sql, String tableName, String columnName) {
         Matcher matcher = Pattern.compile(
-                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+"
+                "(?is)\\binsert\\s+(?:ignore\\s+)?(?:into\\s+)?"
                         + Pattern.quote(tableName)
         ).matcher(sql);
         if (!matcher.find()) {
@@ -752,6 +782,12 @@ public class MapperXmlRewriter {
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
         }
 
+        TextRewrite temporaryTableBindSelect = splitTemporaryTableBindSelect(converted);
+        if (temporaryTableBindSelect.changed()) {
+            converted = temporaryTableBindSelect.text();
+            appliedRules.add(MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE);
+        }
+
         TextRewrite temporaryTableForeachLiteral = inlineTemporaryTableAsSelectForeachItemParameters(converted);
         if (temporaryTableForeachLiteral.changed()) {
             converted = temporaryTableForeachLiteral.text();
@@ -834,6 +870,11 @@ public class MapperXmlRewriter {
                 addAppliedRules(appliedRules, dynamicUpdateOrderLimitOne.appliedRules());
                 converted = dynamicUpdateOrderLimitOne.convertedBody();
             }
+            TextRewrite duplicateBlockSemicolon = removeDuplicateDamengBlockSemicolons(converted);
+            if (duplicateBlockSemicolon.changed()) {
+                appliedRules.add(DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE);
+                converted = duplicateBlockSemicolon.text();
+            }
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
 
@@ -860,7 +901,17 @@ public class MapperXmlRewriter {
             appliedRules.add(MYBATIS_FOREACH_TRAILING_COMMA_RULE);
         }
         converted = withoutTrailingCommas;
+        TextRewrite duplicateBlockSemicolon = removeDuplicateDamengBlockSemicolons(converted);
+        if (duplicateBlockSemicolon.changed()) {
+            appliedRules.add(DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE);
+            converted = duplicateBlockSemicolon.text();
+        }
         return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
+    }
+
+    private TextRewrite removeDuplicateDamengBlockSemicolons(String body) {
+        String converted = Pattern.compile("(?is)\\bEND;\\s*;").matcher(body).replaceAll("END;");
+        return new TextRewrite(converted, !converted.equals(body));
     }
 
     private TextRewrite quoteDynamicQuotedAliasReferences(String body) {
@@ -1122,6 +1173,40 @@ public class MapperXmlRewriter {
             }
         }
         return applyTextReplacements(body, replacements);
+    }
+
+    private TextRewrite splitTemporaryTableBindSelect(String body) {
+        Matcher matcher = DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_PATTERN.matcher(body);
+        StringBuffer converted = new StringBuffer();
+        boolean changed = false;
+        while (matcher.find()) {
+            String prefix = matcher.group("prefix");
+            String tableName = matcher.group("table");
+            String outerOpen = matcher.group("outerOpen");
+            String inner = matcher.group("inner");
+            String replacement = prefix
+                    + "select\n"
+                    + "      <foreach collection=\"list[0]\" item=\"field\" separator=\",\">\n"
+                    + "        CAST(NULL AS VARCHAR(4000)) AS ${field.fieldName}\n"
+                    + "      </foreach>\n"
+                    + "      from dual where 1 = 0;\n"
+                    + "      insert into "
+                    + tableName
+                    + "\n"
+                    + "      "
+                    + outerOpen
+                    + "\n"
+                    + "      select\n"
+                    + "      "
+                    + inner
+                    + "\n"
+                    + "      from dual\n"
+                    + "      </foreach>";
+            matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return new TextRewrite(changed ? converted.toString() : body, changed);
     }
 
     private DynamicHavingConversion convertDynamicHavingClauses(String body) {

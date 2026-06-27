@@ -1929,6 +1929,31 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDescribeTableToDamengUserTabColumns() {
+        SqlConversionResult result = converter.convert("describe owner_customer_result");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT COLUMN_NAME AS \"Field\", DATA_TYPE AS \"Type\", NULLABLE AS \"Null\", "
+                        + "NULL AS \"Key\", DATA_DEFAULT AS \"Default\", NULL AS \"Extra\" "
+                        + "FROM USER_TAB_COLUMNS WHERE TABLE_NAME = UPPER('owner_customer_result') ORDER BY COLUMN_ID");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_DESCRIBE_TABLE_RULE);
+    }
+
+    @Test
+    void convertsDescribeDynamicTableToDamengUserTabColumns() {
+        SqlConversionResult result = converter.convert("describe ${targetTable}");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("WHERE TABLE_NAME = UPPER('${targetTable}')");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_DESCRIBE_TABLE_RULE);
+    }
+
+    @Test
     void convertsMysqlInformationSchemaColumnsQueryToAllTabColumns() {
         SqlConversionResult result = converter.convert("""
                 SELECT column_name FROM information_schema.COLUMNS
