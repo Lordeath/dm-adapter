@@ -563,6 +563,8 @@ class DmAdapterCliTest {
                 .contains("if (hasDynamicSqlFragmentParameterIssue(message))")
                 .contains("hasGeneratedDynamicSqlOrArgumentIssue")
                 .contains("(?im)^### SQL:\\\\s*(?:ID|test)\\\\s*$")
+                .contains("(?i)### SQL:\\\\s*(?:ID|test)(?:\\\\s*###|\\\\s*$)")
+                .contains("(?:from|join|into|update|table)\\\\s+'(?:ID|test|\\\\d{4}-\\\\d{2}-\\\\d{2})'")
                 .contains("Tuple3{f0=null")
                 .contains("Tuple4{f0=null")
                 .doesNotContain("if (isAutoParameter(record) && hasDynamicSqlFragmentParameterIssue(message))")
