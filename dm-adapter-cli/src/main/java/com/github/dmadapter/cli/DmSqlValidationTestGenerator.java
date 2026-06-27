@@ -3914,6 +3914,9 @@ class DmSqlValidationTestGenerator {
                             continue;
                         }
                         if (existing == null) {
+                            if (isGeneratedNullPlaceholderValue(configured)) {
+                                continue;
+                            }
                             existing = inferredConfiguredPlaceholderDefault(entry.getKey(), configured);
                             if (existing != null) {
                                 merged.put(entry.getKey(), existing);
@@ -4138,6 +4141,13 @@ class DmSqlValidationTestGenerator {
                             || "2024-01-01".equals(text)
                             || "2024-01-01 00:00:00".equals(text)
                             || "2024-01-01 00:00:00.0".equals(text);
+                }
+
+                private boolean isGeneratedNullPlaceholderValue(Object value) {
+                    if (!(value instanceof String)) {
+                        return false;
+                    }
+                    return "null".equalsIgnoreCase(stripSqlLiteralQuotes(((String) value).trim()));
                 }
 
                 private String stripSqlLiteralQuotes(String value) {
@@ -4881,6 +4891,9 @@ class DmSqlValidationTestGenerator {
                         Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configuredValue, statement);
                         if (scalarCollection != MethodArgumentConfig.MISSING) {
                             target.put(entry.getKey(), scalarCollection);
+                            continue;
+                        }
+                        if (existing == null && isGeneratedNullPlaceholderValue(configuredValue)) {
                             continue;
                         }
                         if (existing instanceof Map && configuredValue instanceof Map) {
