@@ -839,7 +839,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     .contains(upper)) {
                 return false;
             }
-            if (Set.of("COMMENT", "DEFAULT").contains(upper)) {
+            if (Set.of("COMMENT", "DEFAULT", "LEADING", "TRAILING", "BOTH").contains(upper)) {
                 return false;
             }
         }
@@ -1779,7 +1779,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(current);
                     index++;
                 } else {
-                    converted.append(replacement);
+                    appendFunctionReplacement(converted, replacement, sql, functionCall);
                     index = functionCall.endIndex();
                     changed = true;
                 }
@@ -1833,7 +1833,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(current);
                     index++;
                 } else {
-                    converted.append(replacement);
+                    appendFunctionReplacement(converted, replacement, sql, functionCall);
                     index = functionCall.endIndex();
                     changed = true;
                 }
@@ -1896,7 +1896,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(current);
                     index++;
                 } else {
-                    converted.append(replacement);
+                    appendFunctionReplacement(converted, replacement, sql, functionCall);
                     index = functionCall.endIndex();
                     changed = true;
                 }
@@ -2124,7 +2124,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(current);
                     index++;
                 } else {
-                    converted.append(replacement);
+                    appendFunctionReplacement(converted, replacement, sql, functionCall);
                     index = functionCall.endIndex();
                     changed = true;
                 }
@@ -4854,7 +4854,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(current);
                     index++;
                 } else {
-                    converted.append(replacement);
+                    appendFunctionReplacement(converted, replacement, sql, functionCall);
                     index = functionCall.endIndex();
                     changed = true;
                 }
@@ -5159,7 +5159,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(current);
                     index++;
                 } else {
-                    converted.append(replacement);
+                    appendFunctionReplacement(converted, replacement, sql, functionCall);
                     index = functionCall.endIndex();
                     changed = true;
                 }
@@ -5686,6 +5686,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 closeParenIndex + 1,
                 sql.substring(openParenIndex + 1, closeParenIndex)
         );
+    }
+
+    private void appendFunctionReplacement(StringBuilder converted, String replacement, String sql, FunctionCall functionCall) {
+        converted.append(replacement);
+        if (functionCall.endIndex() < sql.length() && startsImplicitAlias(sql.charAt(functionCall.endIndex()))) {
+            converted.append(' ');
+        }
+    }
+
+    private boolean startsImplicitAlias(char value) {
+        return value == '"'
+                || value == '`'
+                || isIdentifierStart(value);
     }
 
     private boolean startsFunction(String sql, int index, String functionName) {
