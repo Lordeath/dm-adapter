@@ -6535,6 +6535,7 @@ class DmSqlValidationTestGenerator {
                     }
                     if (lower.contains("类型转换异常")
                             || lower.contains("数据类型不匹配")
+                            || lower.contains("invalid comparison:")
                             || (lower.contains("numberformatexception") && lower.contains("for input string"))) {
                         return "TEST_DATA_TYPE_MISMATCH";
                     }
@@ -6833,6 +6834,7 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\band[A-Za-z_][A-Za-z0-9_$]*\\\\s+(?:in|=|<>|!=|>|<|like)\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*(?:=|<>|!=|>=|<=|>|<|like)\\\\s*(?:\\\\?|\\\\d+|'[^']*'|\\\\([^)]*\\\\))\\\\s+" + identifier + "\\\\s+(?:in\\\\s*\\\\(|=|<>|!=|>=|<=|>|<|like\\\\b|is\\\\b)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(value).find();
                 }
 
