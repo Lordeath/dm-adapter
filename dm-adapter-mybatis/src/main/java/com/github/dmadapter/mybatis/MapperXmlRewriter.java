@@ -330,7 +330,7 @@ public class MapperXmlRewriter {
                         );
                 dynamicBodyConversion = wrapDynamicIdentityInsertIfConfigured(
                         statement.getTagName(),
-                        originalSql,
+                        statementBody.rawBody(),
                         dynamicBodyConversion,
                         rewriteConfig
                 );
@@ -484,13 +484,13 @@ public class MapperXmlRewriter {
         String tableName = extractInsertTableNameLenient(sql);
         if (tableName.isBlank()
                 || !rewriteConfig.requiresIdentityInsert(tableName)
-                || !insertColumnListContains(sql, tableName, "ID")) {
+                || !hasExplicitInsertColumnList(sql, tableName)) {
             return "";
         }
         return tableName;
     }
 
-    private boolean insertColumnListContains(String sql, String tableName, String columnName) {
+    private boolean hasExplicitInsertColumnList(String sql, String tableName) {
         Matcher matcher = Pattern.compile(
                 "(?is)\\binsert\\s+(?:ignore\\s+)?(?:into\\s+)?"
                         + Pattern.quote(tableName)
@@ -498,14 +498,17 @@ public class MapperXmlRewriter {
         if (!matcher.find()) {
             return false;
         }
-        int valuesIndex = findTopLevelKeywordSkippingXml(sql, "VALUES", matcher.end());
-        if (valuesIndex < 0) {
+        int index = skipWhitespaceAndXmlComments(sql, matcher.end(), sql.length());
+        if (index >= sql.length() || isKeywordAt(sql, index, "VALUES")) {
             return false;
         }
-        String columns = sql.substring(matcher.end(), valuesIndex);
-        return Pattern.compile("(?i)(^|[^A-Za-z0-9_$])"
-                + Pattern.quote(columnName)
-                + "([^A-Za-z0-9_$]|$)").matcher(columns).find();
+        if (sql.charAt(index) == '(') {
+            return true;
+        }
+        return Pattern.compile("(?is)<trim\\b(?=[^>]*\\bprefix\\s*=\\s*([\"'])\\s*\\()[^>]*>")
+                .matcher(sql)
+                .region(index, sql.length())
+                .lookingAt();
     }
 
     private DynamicBodyConversion wrapDynamicIdentityInsertIfConfigured(
@@ -1180,16 +1183,17 @@ public class MapperXmlRewriter {
         StringBuffer converted = new StringBuffer();
         boolean changed = false;
         while (matcher.find()) {
-            String prefix = matcher.group("prefix");
             String tableName = matcher.group("table");
             String outerOpen = matcher.group("outerOpen");
             String inner = matcher.group("inner");
-            String replacement = prefix
-                    + "select\n"
+            String replacement = "CREATE GLOBAL TEMPORARY TABLE "
+                    + tableName
+                    + "\n"
+                    + "      (\n"
                     + "      <foreach collection=\"list[0]\" item=\"field\" separator=\",\">\n"
-                    + "        CAST(NULL AS VARCHAR(4000)) AS ${field.fieldName}\n"
+                    + "        ${field.fieldName} VARCHAR(4000)\n"
                     + "      </foreach>\n"
-                    + "      from dual where 1 = 0;\n"
+                    + "      ) ON COMMIT PRESERVE ROWS;\n"
                     + "      insert into "
                     + tableName
                     + "\n"
