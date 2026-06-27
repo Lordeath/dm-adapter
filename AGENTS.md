@@ -57,4 +57,6 @@ git push origin main
 
 ## AI 专项约束
 
+处理 MySQL 到达梦迁移、SQL 重写或验证失败分类前，必须先阅读并遵守 `docs/mysql-to-dm-migration-notes.md`，区分工具可自动转换、业务 SQL 需修正、测试库缺对象、必须人工配置入参这几类问题。
+
 不得覆盖原始 mapper XML。默认迁移输出目录必须保持为 `src/main/resources/mapper-dm`。不确定的 SQL 必须保留原内容并写入人工确认报告，不能强行转换。
