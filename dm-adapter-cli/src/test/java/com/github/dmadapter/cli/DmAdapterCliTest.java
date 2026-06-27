@@ -898,6 +898,55 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void generatedValidationTestScansDynamicMetadataFromSqlIncludes() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        String generatedTestSource = Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"));
+        assertThat(exitCode).isZero();
+        assertThat(generatedTestSource)
+                .contains("Map<String, Element> sqlFragments = sqlFragments(root, namespace);")
+                .contains("private Map<String, Element> sqlFragments(Element mapperRoot, String namespace)")
+                .contains("dynamicIdentifierMetadata(element, sqlFragments, namespace)")
+                .contains("if (\"include\".equals(element.getTagName()))")
+                .contains("sqlFragment(sqlFragments, namespace, element.getAttribute(\"refid\"))")
+                .contains("currentIncludeStack.add(includeKey)")
+                .contains("private Element sqlFragment(Map<String, Element> sqlFragments, String namespace, String refid)")
+                .contains("private String sqlFragmentKey(String namespace, String refid)");
+    }
+
+    @Test
+    void generatedValidationTestAvoidsDoubleQuotedDynamicSqlFragmentDefaults() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        String generatedTestSource = Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"));
+        assertThat(exitCode).isZero();
+        assertThat(generatedTestSource)
+                .contains("quoteAwareDynamicSqlFragmentDefault")
+                .contains("dynamicPlaceholderInsideSqlLiteral(text, startIndex, endIndex)")
+                .contains("return stripSqlLiteralQuotes(value);")
+                .contains("previousNonWhitespaceIndex(text, startIndex - 1)")
+                .contains("nextNonWhitespaceIndex(text, endIndex)")
+                .contains("defaultText.equals(strippedDefault)")
+                .contains("!configuredText.equals(strippedConfigured)")
+                .contains("&& isGeneratedPlaceholderText(defaultText)")
+                .contains("return strippedConfigured;");
+    }
+
+    @Test
     void generateValidationTestPreservesCommaSeparatedSchemas() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");

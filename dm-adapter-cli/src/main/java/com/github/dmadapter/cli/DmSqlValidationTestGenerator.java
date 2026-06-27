@@ -1048,6 +1048,7 @@ class DmSqlValidationTestGenerator {
                         if (namespace == null || isBlank(namespace)) {
                             return listOf();
                         }
+                        Map<String, Element> sqlFragments = sqlFragments(root, namespace);
                         List<MapperStatement> statements = new ArrayList<>();
                         NodeList children = root.getChildNodes();
                         for (int i = 0; i < children.getLength(); i++) {
@@ -1063,7 +1064,7 @@ class DmSqlValidationTestGenerator {
                                             namespace,
                                             id,
                                             setBranchParameterVariants(element),
-                                            dynamicIdentifierMetadata(element),
+                                            dynamicIdentifierMetadata(element, sqlFragments, namespace),
                                             generatedKeyProperties(element)
                                     ));
                                 }
@@ -1073,6 +1074,30 @@ class DmSqlValidationTestGenerator {
                     } catch (Exception e) {
                         return listOf();
                     }
+                }
+
+                private Map<String, Element> sqlFragments(Element mapperRoot, String namespace) {
+                    Map<String, Element> fragments = new LinkedHashMap<>();
+                    NodeList children = mapperRoot.getChildNodes();
+                    for (int i = 0; i < children.getLength(); i++) {
+                        Node node = children.item(i);
+                        if (!(node instanceof Element)) {
+                            continue;
+                        }
+                        Element element = (Element) node;
+                        if (!"sql".equals(element.getTagName())) {
+                            continue;
+                        }
+                        String id = element.getAttribute("id");
+                        if (id == null || isBlank(id)) {
+                            continue;
+                        }
+                        fragments.put(id, element);
+                        if (!isBlank(namespace)) {
+                            fragments.put(namespace + "." + id, element);
+                        }
+                    }
+                    return fragments;
                 }
 
                 private boolean isStatementElement(Element element) {
@@ -1111,7 +1136,11 @@ class DmSqlValidationTestGenerator {
                             .orElse(listOf());
                 }
 
-                private DynamicIdentifierMetadata dynamicIdentifierMetadata(Element statement) {
+                private DynamicIdentifierMetadata dynamicIdentifierMetadata(
+                        Element statement,
+                        Map<String, Element> sqlFragments,
+                        String namespace
+                ) {
                     DynamicIdentifierMetadata metadata = new DynamicIdentifierMetadata();
                     SqlStatementContext sqlContext = sqlStatementContext(statement);
                     collectDynamicIdentifierMetadata(
@@ -1120,7 +1149,10 @@ class DmSqlValidationTestGenerator {
                             metadata,
                             false,
                             Collections.emptySet(),
-                            sqlContext
+                            sqlContext,
+                            sqlFragments,
+                            namespace,
+                            new LinkedHashSet<>()
                     );
                     addDmlColumnReferences(statement, metadata, sqlContext);
                     return metadata;
@@ -1132,7 +1164,10 @@ class DmSqlValidationTestGenerator {
                         DynamicIdentifierMetadata metadata,
                         boolean insideSet,
                         Set<String> optionalDynamicExpressions,
-                        SqlStatementContext sqlContext
+                        SqlStatementContext sqlContext,
+                        Map<String, Element> sqlFragments,
+                        String namespace,
+                        Set<String> includeStack
                 ) {
                     if (node instanceof Element) {
                         Element element = (Element) node;
@@ -1198,6 +1233,29 @@ class DmSqlValidationTestGenerator {
                                 addSetAssignmentDefaults(element, currentForeachCollections, metadata);
                             }
                         }
+                        if ("include".equals(element.getTagName())) {
+                            Element fragment = sqlFragment(sqlFragments, namespace, element.getAttribute("refid"));
+                            String includeKey = sqlFragmentKey(namespace, element.getAttribute("refid"));
+                            if (fragment != null && !includeStack.contains(includeKey)) {
+                                Set<String> currentIncludeStack = new LinkedHashSet<>(includeStack);
+                                currentIncludeStack.add(includeKey);
+                                NodeList fragmentChildren = fragment.getChildNodes();
+                                for (int i = 0; i < fragmentChildren.getLength(); i++) {
+                                    collectDynamicIdentifierMetadata(
+                                            fragmentChildren.item(i),
+                                            currentForeachCollections,
+                                            metadata,
+                                            currentInsideSet,
+                                            currentOptionalDynamicExpressions,
+                                            sqlContext,
+                                            sqlFragments,
+                                            namespace,
+                                            currentIncludeStack
+                                    );
+                                }
+                            }
+                            return;
+                        }
                         NodeList children = element.getChildNodes();
                         for (int i = 0; i < children.getLength(); i++) {
                             collectDynamicIdentifierMetadata(
@@ -1206,7 +1264,10 @@ class DmSqlValidationTestGenerator {
                                     metadata,
                                     currentInsideSet,
                                     currentOptionalDynamicExpressions,
-                                    sqlContext
+                                    sqlContext,
+                                    sqlFragments,
+                                    namespace,
+                                    includeStack
                             );
                         }
                         return;
@@ -1234,6 +1295,37 @@ class DmSqlValidationTestGenerator {
                         addValueExpression(valueMatcher.group(1), jdbcType(valueMatcher.group(2)), foreachCollections, metadata);
                     }
                     addValueColumnReferences(text, foreachCollections, metadata, sqlContext);
+                }
+
+                private Element sqlFragment(Map<String, Element> sqlFragments, String namespace, String refid) {
+                    if (sqlFragments == null || isBlank(refid)) {
+                        return null;
+                    }
+                    Element fragment = sqlFragments.get(refid);
+                    if (fragment != null) {
+                        return fragment;
+                    }
+                    if (refid.indexOf('.') < 0 && !isBlank(namespace)) {
+                        fragment = sqlFragments.get(namespace + "." + refid);
+                        if (fragment != null) {
+                            return fragment;
+                        }
+                    }
+                    int dotIndex = refid.lastIndexOf('.');
+                    if (dotIndex >= 0 && dotIndex + 1 < refid.length()) {
+                        return sqlFragments.get(refid.substring(dotIndex + 1));
+                    }
+                    return null;
+                }
+
+                private String sqlFragmentKey(String namespace, String refid) {
+                    if (isBlank(refid)) {
+                        return "";
+                    }
+                    if (refid.indexOf('.') >= 0 || isBlank(namespace)) {
+                        return refid;
+                    }
+                    return namespace + "." + refid;
                 }
 
                 private boolean isSetTrimElement(Element element) {
@@ -4046,6 +4138,17 @@ class DmSqlValidationTestGenerator {
                     if (!(configuredValue instanceof String)) {
                         return configuredValue;
                     }
+                    if (defaultValue instanceof String) {
+                        String defaultText = ((String) defaultValue).trim();
+                        String strippedDefault = stripSqlLiteralQuotes(defaultText);
+                        String configuredText = ((String) configuredValue).trim();
+                        String strippedConfigured = stripSqlLiteralQuotes(configuredText);
+                        if (defaultText.equals(strippedDefault)
+                                && !configuredText.equals(strippedConfigured)
+                                && isGeneratedPlaceholderText(defaultText)) {
+                            return strippedConfigured;
+                        }
+                    }
                     String text = stripSqlLiteralQuotes((String) configuredValue);
                     try {
                         if (defaultValue instanceof BigDecimal) {
@@ -5312,9 +5415,14 @@ class DmSqlValidationTestGenerator {
                     ColumnReference columnReference = dynamicPlaceholderColumnReference(text, startIndex, sqlContext);
                     String columnType = dbColumnMetadata == null ? "" : dbColumnMetadata.columnType(columnReference);
                     if (!isBlank(columnType)) {
-                        return defaultSqlFragmentForColumnType(
-                                isBlank(propertyName) ? collectionName : propertyName,
-                                columnType
+                        return quoteAwareDynamicSqlFragmentDefault(
+                                defaultSqlFragmentForColumnType(
+                                        isBlank(propertyName) ? collectionName : propertyName,
+                                        columnType
+                                ),
+                                text,
+                                startIndex,
+                                endIndex
                         );
                     }
                     if (isOrderFieldName(normalizedProperty) || isOrderFieldName(normalizedCollection)
@@ -5325,7 +5433,7 @@ class DmSqlValidationTestGenerator {
                         return "";
                     }
                     if (isRegexpSqlFragmentName(normalizedProperty) || isRegexpSqlFragmentName(normalizedCollection)) {
-                        return quoteSqlLiteral("1");
+                        return quoteAwareDynamicSqlFragmentDefault(quoteSqlLiteral("1"), text, startIndex, endIndex);
                     }
                     if (normalizedProperty.endsWith("field")
                             || normalizedProperty.endsWith("fieldname")
@@ -5334,21 +5442,21 @@ class DmSqlValidationTestGenerator {
                             || normalizedProperty.endsWith("modelkey")
                             || normalizedProperty.endsWith("underline")
                             || normalizedProperty.endsWith("underlinename")) {
-                        return "ID";
+                        return quoteAwareDynamicSqlFragmentDefault("ID", text, startIndex, endIndex);
                     }
                     if ("fieldvalue".equals(normalizedProperty)
                             || "value".equals(normalizedProperty)
                             || normalizedProperty.endsWith("values")
                             || isNumericSqlFragmentName(normalizedProperty)
                             || isNumericSqlFragmentName(normalizedCollection)) {
-                        return "1";
+                        return quoteAwareDynamicSqlFragmentDefault("1", text, startIndex, endIndex);
                     }
                     if ("map".equals(normalizedCollection)
                             || normalizedCollection.contains("user")
                             || normalizedCollection.contains("owner")
                             || normalizedCollection.contains("rightmap")
                             || normalizedCollection.contains("groupmap")) {
-                        return "1";
+                        return quoteAwareDynamicSqlFragmentDefault("1", text, startIndex, endIndex);
                     }
                     if (normalizedProperty.endsWith("key")
                             || normalizedProperty.endsWith("keys")
@@ -5356,13 +5464,55 @@ class DmSqlValidationTestGenerator {
                             || normalizedCollection.endsWith("keys")
                             || normalizedProperty.contains("code")
                             || normalizedCollection.contains("code")) {
-                        return "'CODE'";
+                        return quoteAwareDynamicSqlFragmentDefault("'CODE'", text, startIndex, endIndex);
                     }
                     if (isStringSqlLiteralFragmentName(normalizedProperty)
                             || isStringSqlLiteralFragmentName(normalizedCollection)) {
-                        return "'test'";
+                        return quoteAwareDynamicSqlFragmentDefault("'test'", text, startIndex, endIndex);
                     }
-                    return "ID";
+                    return quoteAwareDynamicSqlFragmentDefault("ID", text, startIndex, endIndex);
+                }
+
+                private String quoteAwareDynamicSqlFragmentDefault(
+                        String value,
+                        String text,
+                        int startIndex,
+                        int endIndex
+                ) {
+                    if (dynamicPlaceholderInsideSqlLiteral(text, startIndex, endIndex)) {
+                        return stripSqlLiteralQuotes(value);
+                    }
+                    return value;
+                }
+
+                private boolean dynamicPlaceholderInsideSqlLiteral(String text, int startIndex, int endIndex) {
+                    if (text == null || startIndex < 0 || endIndex < 0 || startIndex > text.length()) {
+                        return false;
+                    }
+                    int before = previousNonWhitespaceIndex(text, startIndex - 1);
+                    int after = nextNonWhitespaceIndex(text, endIndex);
+                    return before >= 0
+                            && after >= 0
+                            && text.charAt(before) == '\\''
+                            && text.charAt(after) == '\\'';
+                }
+
+                private int previousNonWhitespaceIndex(String text, int startIndex) {
+                    for (int i = Math.min(startIndex, text.length() - 1); i >= 0; i--) {
+                        if (!Character.isWhitespace(text.charAt(i))) {
+                            return i;
+                        }
+                    }
+                    return -1;
+                }
+
+                private int nextNonWhitespaceIndex(String text, int startIndex) {
+                    for (int i = Math.max(startIndex, 0); i < text.length(); i++) {
+                        if (!Character.isWhitespace(text.charAt(i))) {
+                            return i;
+                        }
+                    }
+                    return -1;
                 }
 
                 private ColumnReference dynamicPlaceholderColumnReference(String text, int startIndex, SqlStatementContext sqlContext) {
