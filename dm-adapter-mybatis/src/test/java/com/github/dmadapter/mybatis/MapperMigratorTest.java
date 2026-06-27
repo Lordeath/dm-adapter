@@ -764,6 +764,72 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicMapOnDuplicateKeyUpdateWithBacktickDynamicColumnsIsRewrittenToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateExtend">
+                        <if test="dynamicMap != null and !dynamicMap.isEmpty()">
+                            INSERT INTO ns_organization_and_employees_extend (foreignerKeyId
+                            <foreach collection="dynamicMap.keys" item="key" open="," separator=",">
+                                `${key}`
+                            </foreach>
+                            )
+                            VALUES (#{userId, jdbcType=BIGINT}
+                            <foreach collection="dynamicMap.values" item="value" open="," separator=",">
+                                #{value}
+                            </foreach>
+                            )
+                            ON DUPLICATE KEY UPDATE
+                            <foreach collection="dynamicMap" index="key" item="value" separator=",">
+                                `${key}` = VALUES(`${key}`)
+                            </foreach>
+                        </if>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.UserMapper.updateExtend", List.of("foreignerKeyId"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_organization_and_employees_extend t")
+                .contains("SELECT #{userId, jdbcType=BIGINT} AS foreignerKeyId")
+                .contains(", #{value} AS ${key}")
+                .contains("ON (t.foreignerKeyId = s.foreignerKeyId)")
+                .contains("t.${key} = s.${key}")
+                .doesNotContain("ON DUPLICATE KEY UPDATE")
+                .doesNotContain("VALUES(`${key}`)")
+                .doesNotContain("\"${key}\" = VALUES(\"${key}\")");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE
+                );
+    }
+
+    @Test
     void dynamicMapOnDuplicateKeyUpdateWithDifferentMapNamesIsNotRewrittenToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

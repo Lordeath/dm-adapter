@@ -2801,7 +2801,7 @@ public class MapperXmlRewriter {
                 || !updateForeach.separator().equals(",")
                 || !valueForeach.collection().equals(mapName + ".values")
                 || !updateForeach.collection().equals(mapName)
-                || !keyForeach.body().strip().equals("${" + keyForeach.item() + "}")
+                || !isDynamicColumnBody(keyForeach.body(), keyForeach.item())
                 || !valueForeach.body().strip().equals("#{" + valueForeach.item() + "}")
                 || !isDynamicValuesUpdateBody(updateForeach.body(), keyForeach.item())) {
             return body;
@@ -3450,11 +3450,20 @@ public class MapperXmlRewriter {
 
     private boolean isDynamicValuesUpdateBody(String body, String keyName) {
         Pattern pattern = Pattern.compile(
-                "(?is)^\\s*\\$\\{"
+                "(?is)^\\s*[`\"]?\\$\\{"
                         + Pattern.quote(keyName)
-                        + "}\\s*=\\s*VALUES\\s*\\(\\s*\\$\\{"
+                        + "}[`\"]?\\s*=\\s*VALUES\\s*\\(\\s*[`\"]?\\$\\{"
                         + Pattern.quote(keyName)
-                        + "}\\s*\\)\\s*$"
+                        + "}[`\"]?\\s*\\)\\s*$"
+        );
+        return pattern.matcher(body).matches();
+    }
+
+    private boolean isDynamicColumnBody(String body, String keyName) {
+        Pattern pattern = Pattern.compile(
+                "(?is)^\\s*[`\"]?\\$\\{"
+                        + Pattern.quote(keyName)
+                        + "}[`\"]?\\s*$"
         );
         return pattern.matcher(body).matches();
     }
