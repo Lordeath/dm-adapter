@@ -654,64 +654,70 @@ class DmSqlValidationTestGenerator {
                             log("FAILED discovery: No mapper XML files matched mapperXmlLocations.");
                         } else {
                             SqlSessionFactory sqlSessionFactory = buildSqlSessionFactory(config, mapperXmlFiles, projectRoot);
-                            dbColumnMetadata = loadColumnMetadata(sqlSessionFactory, config);
-                            List<MapperMethod> mapperMethods = mapperMethods(sqlSessionFactory.getConfiguration(), mapperXmlFiles, config);
-                            log("Discovered mapper statements: " + mapperMethods.size());
-                            if (mapperMethods.isEmpty()) {
-                                records.add(ValidationRecord.failed("(discovery)", "configuration",
-                                        "No mapped statements were found in mapper XML files."));
-                                log("FAILED discovery: No mapped statements were found in mapper XML files.");
-                            }
-                            UsageFilter usageFilter = MapperUsageIndex.build(projectRoot, config, mapperMethods);
-                            usageFilterReport = usageFilter.report();
-                            log("Usage filter: " + usageFilterReport.summary());
-                            int index = 0;
-                            int total = mapperMethods.size();
-                            for (MapperMethod mapperMethod : mapperMethods) {
-                                index++;
-                                if (config.excludes(mapperMethod.key())) {
-                                    ValidationRecord record = ValidationRecord.skipped(
-                                            mapperMethod.key(),
-                                            "excluded",
-                                            "Excluded by sql-validation.yml."
-                                    );
-                                    records.add(record);
-                                    logProgress(index, total, record, 0L);
-                                    continue;
+                            ValidationRecord connectionFailure = databaseConnectionFailure(sqlSessionFactory);
+                            if (connectionFailure != null) {
+                                records.add(connectionFailure);
+                                log("FAILED database connection: " + connectionFailure.message);
+                            } else {
+                                dbColumnMetadata = loadColumnMetadata(sqlSessionFactory, config);
+                                List<MapperMethod> mapperMethods = mapperMethods(sqlSessionFactory.getConfiguration(), mapperXmlFiles, config);
+                                log("Discovered mapper statements: " + mapperMethods.size());
+                                if (mapperMethods.isEmpty()) {
+                                    records.add(ValidationRecord.failed("(discovery)", "configuration",
+                                            "No mapped statements were found in mapper XML files."));
+                                    log("FAILED discovery: No mapped statements were found in mapper XML files.");
                                 }
-                                if (usageFilter.unused(mapperMethod, config)) {
-                                    ValidationRecord record = ValidationRecord.skipped(
-                                            mapperMethod.key(),
-                                            "unused",
-                                            "No project class references mapper method " + mapperMethod.key()
-                                                    + "; skipped by usage filter."
-                                    );
-                                    records.add(record);
-                                    logProgress(index, total, record, 0L);
-                                    continue;
-                                }
-                                List<ParameterResolution> parameterVariants = resolveParameterVariants(mapperMethod, config);
-                                for (ParameterResolution parameters : parameterVariants) {
-                                    String recordKey = parameters.recordKey(mapperMethod.key());
-                                    if (!parameters.resolved) {
+                                UsageFilter usageFilter = MapperUsageIndex.build(projectRoot, config, mapperMethods);
+                                usageFilterReport = usageFilter.report();
+                                log("Usage filter: " + usageFilterReport.summary());
+                                int index = 0;
+                                int total = mapperMethods.size();
+                                for (MapperMethod mapperMethod : mapperMethods) {
+                                    index++;
+                                    if (config.excludes(mapperMethod.key())) {
                                         ValidationRecord record = ValidationRecord.skipped(
-                                                recordKey,
-                                                parameters.source,
-                                                parametersSummary(parameters),
-                                                parameters.message
+                                                mapperMethod.key(),
+                                                "excluded",
+                                                "Excluded by sql-validation.yml."
                                         );
                                         records.add(record);
                                         logProgress(index, total, record, 0L);
                                         continue;
                                     }
-                                    log("RUN [" + index + "/" + total + "] " + recordKey
-                                            + " params=" + parameters.source);
-                                    long startedAt = System.currentTimeMillis();
-                                    ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
-                                    record = skipIgnoredMissingTable(record, config);
-                                    record = skipIgnoredMissingColumn(record, config);
-                                    records.add(record);
-                                    logProgress(index, total, record, System.currentTimeMillis() - startedAt);
+                                    if (usageFilter.unused(mapperMethod, config)) {
+                                        ValidationRecord record = ValidationRecord.skipped(
+                                                mapperMethod.key(),
+                                                "unused",
+                                                "No project class references mapper method " + mapperMethod.key()
+                                                        + "; skipped by usage filter."
+                                        );
+                                        records.add(record);
+                                        logProgress(index, total, record, 0L);
+                                        continue;
+                                    }
+                                    List<ParameterResolution> parameterVariants = resolveParameterVariants(mapperMethod, config);
+                                    for (ParameterResolution parameters : parameterVariants) {
+                                        String recordKey = parameters.recordKey(mapperMethod.key());
+                                        if (!parameters.resolved) {
+                                            ValidationRecord record = ValidationRecord.skipped(
+                                                    recordKey,
+                                                    parameters.source,
+                                                    parametersSummary(parameters),
+                                                    parameters.message
+                                            );
+                                            records.add(record);
+                                            logProgress(index, total, record, 0L);
+                                            continue;
+                                        }
+                                        log("RUN [" + index + "/" + total + "] " + recordKey
+                                                + " params=" + parameters.source);
+                                        long startedAt = System.currentTimeMillis();
+                                        ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
+                                        record = skipIgnoredMissingTable(record, config);
+                                        record = skipIgnoredMissingColumn(record, config);
+                                        records.add(record);
+                                        logProgress(index, total, record, System.currentTimeMillis() - startedAt);
+                                    }
                                 }
                             }
                         }
@@ -779,6 +785,33 @@ class DmSqlValidationTestGenerator {
                     }
                     log("MyBatis SqlSessionFactory ready.");
                     return new SqlSessionFactoryBuilder().build(configuration);
+                }
+
+                private ValidationRecord databaseConnectionFailure(SqlSessionFactory sqlSessionFactory) {
+                    log("Checking database connection...");
+                    try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
+                        Connection connection = sqlSession.getConnection();
+                        try (Statement statement = connection.createStatement();
+                             ResultSet resultSet = statement.executeQuery("SELECT 1")) {
+                            if (resultSet.next()) {
+                                log("Database connection ready.");
+                                return null;
+                            }
+                        }
+                        return ValidationRecord.failed(
+                                "(database-connection)",
+                                "configuration",
+                                "Dameng validation connection check did not return a result."
+                        );
+                    } catch (Throwable e) {
+                        return ValidationRecord.failed(
+                                "(database-connection)",
+                                "configuration",
+                                "Failed to open Dameng validation connection. "
+                                        + "Check DM_JDBC_URL, DM_DB_USERNAME, DM_DB_PASSWORD and database availability.\\n"
+                                        + throwableSummary(e)
+                        );
+                    }
                 }
 
                 private UnpooledDataSource dataSource(ValidationConfig config) {
@@ -6774,6 +6807,8 @@ class DmSqlValidationTestGenerator {
 
                 private String failurePatternLabel(String pattern) {
                     switch (pattern) {
+                        case "DATABASE_CONNECTION":
+                            return "数据库连接失败";
                         case "MYSQL_METADATA_SQL":
                             return "MySQL 元数据查询";
                         case "MYSQL_COLLATE_CLAUSE":
@@ -7029,6 +7064,9 @@ class DmSqlValidationTestGenerator {
                     }
                     String message = normalizeMessage(record.message);
                     String lower = message.toLowerCase(Locale.ROOT);
+                    if (isDatabaseConnectionFailure(message)) {
+                        return "DATABASE_CONNECTION";
+                    }
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
                     }
@@ -7532,6 +7570,8 @@ class DmSqlValidationTestGenerator {
                             "No mapped statements were found",
                             "Could not find",
                             "Failed to parse mapper XML",
+                            "Failed to open Dameng validation connection",
+                            "Error getting a new connection",
                             "Mapped statement was not registered",
                             "Parsing error was found in mapping",
                             "datasource.")) {
@@ -7671,6 +7711,15 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return false;
+                }
+
+                private boolean isDatabaseConnectionFailure(String message) {
+                    String normalized = normalizeMessage(message);
+                    String lower = normalized.toLowerCase(Locale.ROOT);
+                    return normalized.contains("Failed to open Dameng validation connection")
+                            || lower.contains("error getting a new connection")
+                            || lower.contains("connection refused")
+                            || lower.contains("communication error");
                 }
 
                 private boolean hasRegexpOperatorIssue(String message) {
