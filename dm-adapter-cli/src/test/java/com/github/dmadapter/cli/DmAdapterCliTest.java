@@ -550,6 +550,7 @@ class DmAdapterCliTest {
                 .contains("trimmed.charAt(0) == 34")
                 .contains("isDoubleQuotedSqlIdentifier")
                 .contains("isSimpleQualifiedIdentifier")
+                .contains("normalized.endsWith(\"schema\")")
                 .contains("return quotedIdentifier(stripped)")
                 .contains("Object rawConfigured = normalizedParams.get(field.getName())")
                 .contains("Cannot assign null to primitive field")
