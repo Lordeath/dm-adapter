@@ -1310,9 +1310,9 @@ class MapperMigratorTest {
                                 billName = null,
                             </if>
                             <if test="chargeItemClass!=''">
-                                ChargeItemClass = CAST(#{chargeItemClass, jdbcType=VARCHAR } AS TINYINT),
+                                ChargeItemClass = #{chargeItemClass, jdbcType=TINYINT },
                             </if>
-                            ChargeItemClass = CAST(#{chargeItemClass,jdbcType=VARCHAR} AS TINYINT),
+                            ChargeItemClass = #{chargeItemClass},
                         </set>
                         where id = #{id}
                     </update>
@@ -1342,7 +1342,7 @@ class MapperMigratorTest {
         assertThat(countMatches(rewritten, "ChargeItemClass =")).isEqualTo(1);
         assertThat(rewritten)
                 .doesNotContain("<if test=\"chargeItemClass!=''\">")
-                .contains("ChargeItemClass = CAST(#{chargeItemClass,jdbcType=VARCHAR} AS TINYINT)");
+                .contains("ChargeItemClass = #{chargeItemClass}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE);
