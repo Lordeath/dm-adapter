@@ -5327,7 +5327,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
 
         Matcher commaMatcher = LIMIT_COMMA_PATTERN.matcher(sql);
-        if (commaMatcher.matches() && startsWithSelect(commaMatcher.group("base"))) {
+        if (commaMatcher.matches() && startsWithSelectOrSelectContinuationFragment(commaMatcher.group("base"))) {
             String base = stripTrailingWhitespace(commaMatcher.group("base"));
             String offset = commaMatcher.group("offset");
             String size = commaMatcher.group("size");
@@ -5338,7 +5338,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
 
         Matcher offsetMatcher = LIMIT_OFFSET_PATTERN.matcher(sql);
-        if (offsetMatcher.matches() && startsWithSelect(offsetMatcher.group("base"))) {
+        if (offsetMatcher.matches() && startsWithSelectOrSelectContinuationFragment(offsetMatcher.group("base"))) {
             String base = stripTrailingWhitespace(offsetMatcher.group("base"));
             String offset = offsetMatcher.group("offset");
             String size = offsetMatcher.group("size");
@@ -5349,7 +5349,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
 
         Matcher sizeMatcher = LIMIT_SIZE_PATTERN.matcher(sql);
-        if (sizeMatcher.matches() && startsWithSelect(sizeMatcher.group("base"))) {
+        if (sizeMatcher.matches() && startsWithSelectOrSelectContinuationFragment(sizeMatcher.group("base"))) {
             String base = stripTrailingWhitespace(sizeMatcher.group("base"));
             String size = sizeMatcher.group("size");
             return LimitConversion.converted(base + " FETCH FIRST " + size + " ROWS ONLY", "LIMIT_TO_DM_FETCH");
@@ -5364,6 +5364,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private boolean startsWithSelect(String sql) {
         return sql.stripLeading().toLowerCase(Locale.ROOT).startsWith("select");
+    }
+
+    private boolean startsWithSelectOrSelectContinuationFragment(String sql) {
+        if (startsWithSelect(sql)) {
+            return true;
+        }
+        String lower = sql.stripLeading().toLowerCase(Locale.ROOT);
+        return lower.startsWith("from")
+                && (lower.length() == "from".length() || Character.isWhitespace(lower.charAt("from".length())));
     }
 
     private String stripTrailingWhitespace(String value) {
