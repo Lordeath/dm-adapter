@@ -1449,6 +1449,28 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlRegexpOperatorWithConcatRightOperand() {
+        SqlConversionResult result = converter.convert("""
+                select id
+                from ns_contract_template
+                where departmentIds REGEXP CONCAT( '(^|,)(',#{seeOrganizationIds,jdbcType=VARCHAR}, ')(,|$)')
+                order by id desc
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select id
+                from ns_contract_template
+                where REGEXP_LIKE(departmentIds, ('(^|,)(') || (#{seeOrganizationIds,jdbcType=VARCHAR}) || (')(,|$)'))
+                order by id desc
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_REGEXP_OPERATOR_RULE,
+                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
+        );
+    }
+
+    @Test
     void convertsUnsignedCastAndAddsRecursiveCteColumnAliases() {
         SqlConversionResult result = converter.convert("""
                 WITH RECURSIVE OrganizationHierarchy AS (
