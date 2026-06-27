@@ -7347,6 +7347,38 @@ class DmSqlValidationTestGenerator {
                     return value;
                 }
 
+                private static String unescapeYamlDoubleQuoted(String value) {
+                    StringBuilder result = new StringBuilder(value.length());
+                    boolean escaped = false;
+                    for (int i = 0; i < value.length(); i++) {
+                        char current = value.charAt(i);
+                        if (escaped) {
+                            if (current == 34 || current == 92) {
+                                result.append(current);
+                            } else if (current == 'n') {
+                                result.append((char) 10);
+                            } else if (current == 'r') {
+                                result.append((char) 13);
+                            } else if (current == 't') {
+                                result.append((char) 9);
+                            } else {
+                                result.append(current);
+                            }
+                            escaped = false;
+                            continue;
+                        }
+                        if (current == 92) {
+                            escaped = true;
+                            continue;
+                        }
+                        result.append(current);
+                    }
+                    if (escaped) {
+                        result.append((char) 92);
+                    }
+                    return result.toString();
+                }
+
                 private Document parseXml(Path path) throws Exception {
                     DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
                     factory.setNamespaceAware(false);
@@ -8260,8 +8292,13 @@ class DmSqlValidationTestGenerator {
 
                     private String scalar(String value) {
                         String trimmed = value.trim();
-                        if (isQuoted(trimmed)) {
-                            return trimmed.substring(1, trimmed.length() - 1);
+                        if (trimmed.length() >= 2 && trimmed.charAt(0) == 34
+                                && trimmed.charAt(trimmed.length() - 1) == 34) {
+                            return unescapeYamlDoubleQuoted(trimmed.substring(1, trimmed.length() - 1));
+                        }
+                        if (trimmed.length() >= 2 && trimmed.charAt(0) == 39
+                                && trimmed.charAt(trimmed.length() - 1) == 39) {
+                            return trimmed.substring(1, trimmed.length() - 1).replace("''", "'");
                         }
                         return trimmed;
                     }
@@ -8269,11 +8306,13 @@ class DmSqlValidationTestGenerator {
                     private boolean isQuoted(String value) {
                         String trimmed = value == null ? "" : value.trim();
                         return trimmed.length() >= 2
-                                && ((trimmed.startsWith("\\"") && trimmed.endsWith("\\\""))
-                                || (trimmed.startsWith("'") && trimmed.endsWith("'")));
+                                && ((trimmed.charAt(0) == 34 && trimmed.charAt(trimmed.length() - 1) == 34)
+                                || (trimmed.charAt(0) == 39 && trimmed.charAt(trimmed.length() - 1) == 39));
                     }
                 }
 
+                """,
+            """
                 private static final class DatasourceConfig {
                     private String driverClassName = "dm.jdbc.driver.DmDriver";
                     private String url = "${DM_JDBC_URL}";
@@ -8300,10 +8339,13 @@ class DmSqlValidationTestGenerator {
 
                     private String scalar(String value) {
                         String trimmed = value.trim();
-                        if (trimmed.length() >= 2
-                                && ((trimmed.startsWith("\\"") && trimmed.endsWith("\\""))
-                                || (trimmed.startsWith("'") && trimmed.endsWith("'")))) {
-                            return trimmed.substring(1, trimmed.length() - 1);
+                        if (trimmed.length() >= 2 && trimmed.charAt(0) == 34
+                                && trimmed.charAt(trimmed.length() - 1) == 34) {
+                            return unescapeYamlDoubleQuoted(trimmed.substring(1, trimmed.length() - 1));
+                        }
+                        if (trimmed.length() >= 2 && trimmed.charAt(0) == 39
+                                && trimmed.charAt(trimmed.length() - 1) == 39) {
+                            return trimmed.substring(1, trimmed.length() - 1).replace("''", "'");
                         }
                         return trimmed;
                     }
