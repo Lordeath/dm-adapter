@@ -342,6 +342,32 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlCreateTableColumnOptionsForDameng() {
+        SqlConversionResult result = converter.convert("""
+                create table if not exists tmp_budget_payment_receipt (
+                  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '自增id',
+                  `chargeItem` varchar(200) CHARACTER SET utf8 COLLATE utf8_general_ci DEFAULT NULL COMMENT '收费科目',
+                  PRIMARY KEY (`id`)
+                )
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                create table if not exists tmp_budget_payment_receipt (
+                  id bigint NOT NULL IDENTITY(1,1) COMMENT '自增id',
+                  "chargeItem" varchar(200) DEFAULT NULL COMMENT '收费科目',
+                  PRIMARY KEY (id)
+                )
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE
+        );
+    }
+
+    @Test
     void removesDuplicateWhereKeywordOutsideIgnoredText() {
         SqlConversionResult result = converter.convert("""
                 update charge_allowance_detail
