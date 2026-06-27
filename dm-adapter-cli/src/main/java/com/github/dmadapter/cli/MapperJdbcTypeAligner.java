@@ -681,7 +681,8 @@ class MapperJdbcTypeAligner {
     }
 
     private List<String> entryBodies(String text) {
-        Matcher ifMatcher = IF_PATTERN.matcher(text);
+        String uncommented = stripXmlComments(text);
+        Matcher ifMatcher = IF_PATTERN.matcher(uncommented);
         List<String> entries = new ArrayList<>();
         while (ifMatcher.find()) {
             entries.add(ifMatcher.group(1));
@@ -689,7 +690,14 @@ class MapperJdbcTypeAligner {
         if (!entries.isEmpty()) {
             return entries;
         }
-        return splitTopLevelComma(text);
+        return splitTopLevelComma(uncommented);
+    }
+
+    private String stripXmlComments(String text) {
+        if (text == null || text.isBlank() || !text.contains("<!--")) {
+            return text == null ? "" : text;
+        }
+        return Pattern.compile("(?is)<!--.*?-->").matcher(text).replaceAll("");
     }
 
     private List<String> splitTopLevelComma(String text) {
