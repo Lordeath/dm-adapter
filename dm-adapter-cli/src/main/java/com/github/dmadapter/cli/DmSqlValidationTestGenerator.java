@@ -716,6 +716,7 @@ class DmSqlValidationTestGenerator {
                                         ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
                                         record = skipMissingDynamicIdentifier(record);
                                         record = skipMissingDynamicSqlFragment(record);
+                                        record = skipGeneratedDynamicSqlOrArgs(record);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         records.add(record);
@@ -3050,6 +3051,22 @@ class DmSqlValidationTestGenerator {
                             "Dynamic SQL fragment parameter is missing or still uses a generated placeholder; "
                                     + "configure a real SQL fragment in .dm-adapter/sql-rewrite.yml validationArgs, "
                                     + "for example whereSql/orderBy/sqlFragment/inSql."
+                                    + "\\nOriginal failure:\\n" + record.message
+                    );
+                }
+
+                private ValidationRecord skipGeneratedDynamicSqlOrArgs(ValidationRecord record) {
+                    if (record == null
+                            || !"FAILED".equals(record.status)
+                            || !hasGeneratedDynamicSqlOrArgumentIssue(record)) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "generated-dynamic-sql-or-args",
+                            record.parameterSummary,
+                            "Dynamic SQL still contains generated placeholder identifiers/fragments or generated null tuple values; "
+                                    + "configure real table, column, SQL fragment or DDL metadata in .dm-adapter/sql-rewrite.yml validationArgs."
                                     + "\\nOriginal failure:\\n" + record.message
                     );
                 }
@@ -7677,6 +7694,27 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\(\\\\s*(?:is\\\\s+(?:not\\\\s+)?null|(?:or|and)\\\\s*(?:=|<>|!=|>=|<=|>|<|like\\\\b|in\\\\s*\\\\())").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:and|or)\\\\s+ID(?:\\\\s|$)").matcher(message).find()
                             || Pattern.compile("\\\\b[A-Za-z_][A-Za-z0-9_$.]*\\\\s+(?:not\\\\s+)?in\\\\s*\\\\(\\\\s*ID\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find();
+                }
+
+                private boolean hasGeneratedDynamicSqlOrArgumentIssue(ValidationRecord record) {
+                    if (record == null) {
+                        return false;
+                    }
+                    String message = normalizeMessage(record.message);
+                    String parameterSummary = record.parameterSummary == null ? "" : record.parameterSummary;
+                    return hasGeneratedDynamicIdentifierPlaceholder(message)
+                            || Pattern.compile("(?im)^### SQL:\\\\s*(?:ID|test)\\\\s*$").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bdelete\\\\s+from\\\\s+\\\"?ID\\\"?\\\\b").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bcreate\\\\s+table(?:\\\\s+if\\\\s+not\\\\s+exists)?\\\\s+\\\"?ID\\\"?\\\\s*\\\\(").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join|into|update|table)\\\\s+\\\"?ID\\\"?\\\\b").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\s+ID\\\\s*(?:=|and|$)").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:and|or)\\\\s+1\\\\s*=\\\\s*1\\\\s*(?:=|in\\\\s*\\\\()").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bADD\\\\s+COLUMN\\\\s+`?null`?\\\\s+null\\\\b").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\"\\\"").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:select|where|group\\\\s+by)\\\\s+ID\\\\s*(?:$|\\\\r?\\\\n)").matcher(message).find()
+                            || parameterSummary.contains("Tuple3{f0=null")
+                            || parameterSummary.contains("Tuple4{f0=null")
+                            || message.contains("Can't add values ` , null");
                 }
 
                 private boolean hasForeachItemBindingIssue(String message) {
