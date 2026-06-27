@@ -28,6 +28,7 @@ public class SqlRewriteConfigLoader {
         Map<String, List<String>> methodKeys = new LinkedHashMap<>();
         Set<String> ignoredMissingTables = new LinkedHashSet<>();
         Set<String> ignoredMissingColumns = new LinkedHashSet<>();
+        Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
         String section = "";
         String currentName = "";
         for (String line : lines) {
@@ -97,6 +98,14 @@ public class SqlRewriteConfigLoader {
                 currentName = "";
                 continue;
             }
+            if (isValidationIgnoresSection(section)
+                    && indent == 2
+                    && trimmed.startsWith("missingSchemas:")) {
+                section = "validationMissingSchemas";
+                ignoredMissingSchemas.addAll(parseInlineList(trimmed.substring("missingSchemas:".length())));
+                currentName = "";
+                continue;
+            }
             if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                 String table = unquote(trimmed.substring(2).trim());
                 if (!table.isBlank()) {
@@ -109,14 +118,21 @@ public class SqlRewriteConfigLoader {
                     ignoredMissingColumns.add(column);
                 }
             }
+            if ("validationMissingSchemas".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                String schema = unquote(trimmed.substring(2).trim());
+                if (!schema.isBlank()) {
+                    ignoredMissingSchemas.add(schema);
+                }
+            }
         }
-        return new SqlRewriteConfig(tableKeys, methodKeys, ignoredMissingTables, ignoredMissingColumns);
+        return new SqlRewriteConfig(tableKeys, methodKeys, ignoredMissingTables, ignoredMissingColumns, ignoredMissingSchemas);
     }
 
     private boolean isValidationIgnoresSection(String section) {
         return "validationIgnores".equals(section)
                 || "validationMissingTables".equals(section)
-                || "validationMissingColumns".equals(section);
+                || "validationMissingColumns".equals(section)
+                || "validationMissingSchemas".equals(section);
     }
 
     private String stripComment(String line) {

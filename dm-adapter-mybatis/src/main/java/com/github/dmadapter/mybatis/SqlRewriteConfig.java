@@ -11,10 +11,11 @@ public record SqlRewriteConfig(
         Map<String, List<String>> tableKeyColumns,
         Map<String, List<String>> methodKeyColumns,
         Set<String> ignoredMissingTables,
-        Set<String> ignoredMissingColumns
+        Set<String> ignoredMissingColumns,
+        Set<String> ignoredMissingSchemas
 ) {
     public SqlRewriteConfig(Map<String, List<String>> tableKeyColumns, Map<String, List<String>> methodKeyColumns) {
-        this(tableKeyColumns, methodKeyColumns, Set.of(), Set.of());
+        this(tableKeyColumns, methodKeyColumns, Set.of(), Set.of(), Set.of());
     }
 
     public SqlRewriteConfig(
@@ -22,7 +23,16 @@ public record SqlRewriteConfig(
             Map<String, List<String>> methodKeyColumns,
             Set<String> ignoredMissingTables
     ) {
-        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, Set.of());
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, Set.of(), Set.of());
+    }
+
+    public SqlRewriteConfig(
+            Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Set<String> ignoredMissingTables,
+            Set<String> ignoredMissingColumns
+    ) {
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, ignoredMissingColumns, Set.of());
     }
 
     public SqlRewriteConfig {
@@ -30,17 +40,19 @@ public record SqlRewriteConfig(
         methodKeyColumns = normalizeMethodKeys(methodKeyColumns);
         ignoredMissingTables = normalizeTables(ignoredMissingTables);
         ignoredMissingColumns = normalizeColumns(ignoredMissingColumns);
+        ignoredMissingSchemas = normalizeSchemas(ignoredMissingSchemas);
     }
 
     public static SqlRewriteConfig empty() {
-        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of());
+        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of(), Set.of());
     }
 
     public boolean isEmpty() {
         return tableKeyColumns.isEmpty()
                 && methodKeyColumns.isEmpty()
                 && ignoredMissingTables.isEmpty()
-                && ignoredMissingColumns.isEmpty();
+                && ignoredMissingColumns.isEmpty()
+                && ignoredMissingSchemas.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {
@@ -121,8 +133,28 @@ public record SqlRewriteConfig(
         return Set.copyOf(normalized);
     }
 
+    private static Set<String> normalizeSchemas(Set<String> schemas) {
+        if (schemas == null || schemas.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> normalized = new LinkedHashSet<>();
+        for (String schema : schemas) {
+            if (schema != null && !schema.isBlank()) {
+                normalized.add(normalizeSchemaName(schema));
+            }
+        }
+        return Set.copyOf(normalized);
+    }
+
     private static String normalizeColumnName(String column) {
         return column.trim()
+                .replace("\"", "")
+                .replace("`", "")
+                .toLowerCase(Locale.ROOT);
+    }
+
+    private static String normalizeSchemaName(String schema) {
+        return schema.trim()
                 .replace("\"", "")
                 .replace("`", "")
                 .toLowerCase(Locale.ROOT);

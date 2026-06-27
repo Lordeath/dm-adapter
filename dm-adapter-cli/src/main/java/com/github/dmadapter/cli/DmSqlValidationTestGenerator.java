@@ -727,6 +727,7 @@ class DmSqlValidationTestGenerator {
                                         record = skipValidationTestDataIssue(record);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
+                                        record = skipIgnoredMissingSchema(record, config);
                                         records.add(record);
                                         logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                                     }
@@ -3196,6 +3197,36 @@ class DmSqlValidationTestGenerator {
                             if (config.ignoresMissingColumn(column)) {
                                 return column;
                             }
+                        }
+                    }
+                    return null;
+                }
+
+                private ValidationRecord skipIgnoredMissingSchema(ValidationRecord record, ValidationConfig config) {
+                    if (record == null || !"FAILED".equals(record.status)) {
+                        return record;
+                    }
+                    String ignoredSchema = ignoredMissingSchema(record.message, config);
+                    if (ignoredSchema == null) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "ignored-missing-schema",
+                            record.parameterSummary,
+                            "Ignored missing schema [" + ignoredSchema
+                                    + "] by .dm-adapter/sql-rewrite.yml validationIgnores.missingSchemas.\\n"
+                                    + "Original failure:\\n" + record.message
+                    );
+                }
+
+                private String ignoredMissingSchema(String message, ValidationConfig config) {
+                    if (config == null) {
+                        return null;
+                    }
+                    for (String schema : bracketedValuesAfterMarker(message, "无效的模式名")) {
+                        if (config.ignoresMissingSchema(schema)) {
+                            return schema;
                         }
                     }
                     return null;
@@ -6992,12 +7023,14 @@ class DmSqlValidationTestGenerator {
                 private void appendSchemaObjectSummary(StringBuilder markdown, List<ValidationRecord> records) {
                     Map<String, Long> missingTables = schemaIssueCounts(records, "无效的表或视图名");
                     Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式");
-                    if (missingTables.isEmpty() && missingColumns.isEmpty()) {
+                    Map<String, Long> missingSchemas = schemaIssueCounts(records, "无效的模式名");
+                    if (missingTables.isEmpty() && missingColumns.isEmpty() && missingSchemas.isEmpty()) {
                         return;
                     }
                     markdown.append("## 库表对象缺失热点\\n\\n");
                     appendCountSummary(markdown, "缺失表/视图", "对象", missingTables, 20);
                     appendCountSummary(markdown, "缺失字段", "字段", missingColumns, 30);
+                    appendCountSummary(markdown, "缺失 schema", "schema", missingSchemas, 20);
                 }
 
                 private Map<String, Long> schemaIssueCounts(List<ValidationRecord> records, String... markers) {
@@ -7464,6 +7497,8 @@ class DmSqlValidationTestGenerator {
                     appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(records, "无效的表或视图名"));
                     json.append(", ");
                     appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式"));
+                    json.append(", ");
+                    appendJsonCountArray(json, "missingSchemas", schemaIssueCounts(records, "无效的模式名"));
                     json.append("}");
                 }
 
@@ -8921,6 +8956,7 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> excludedMethods = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingTables = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingColumns = new LinkedHashSet<>();
+                    private final Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
 
                     static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
@@ -9085,12 +9121,23 @@ class DmSqlValidationTestGenerator {
                                 addIgnoredMissingColumns(parseYamlValue(trimmed.substring("missingColumns:".length())));
                                 continue;
                             }
+                            if (isValidationIgnoreSection(section) && indent == 2 && trimmed.startsWith("missingSchemas:")) {
+                                section = "validationMissingSchemas";
+                                currentMethod = null;
+                                valueMode = "";
+                                addIgnoredMissingSchemas(parseYamlValue(trimmed.substring("missingSchemas:".length())));
+                                continue;
+                            }
                             if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredMissingTables(parseYamlValue(trimmed.substring(2)));
                                 continue;
                             }
                             if ("validationMissingColumns".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredMissingColumns(parseYamlValue(trimmed.substring(2)));
+                                continue;
+                            }
+                            if ("validationMissingSchemas".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                                addIgnoredMissingSchemas(parseYamlValue(trimmed.substring(2)));
                                 continue;
                             }
                             if ("validationMethods".equals(section) && indent == 4 && trimmed.endsWith(":")) {
@@ -9129,7 +9176,8 @@ class DmSqlValidationTestGenerator {
                     private boolean isValidationIgnoreSection(String section) {
                         return "validationIgnores".equals(section)
                                 || "validationMissingTables".equals(section)
-                                || "validationMissingColumns".equals(section);
+                                || "validationMissingColumns".equals(section)
+                                || "validationMissingSchemas".equals(section);
                     }
 
                     private void addIgnoredMissingTables(Object value) {
@@ -9200,6 +9248,28 @@ class DmSqlValidationTestGenerator {
                         return false;
                     }
 
+                    private void addIgnoredMissingSchemas(Object value) {
+                        if (value instanceof Collection<?>) {
+                            for (Object item : (Collection<?>) value) {
+                                addIgnoredMissingSchema(String.valueOf(item));
+                            }
+                        } else if (value != null) {
+                            addIgnoredMissingSchema(String.valueOf(value));
+                        }
+                    }
+
+                    private void addIgnoredMissingSchema(String schema) {
+                        String normalized = normalizeMissingSchemaName(schema);
+                        if (!isBlank(normalized)) {
+                            ignoredMissingSchemas.add(normalized);
+                        }
+                    }
+
+                    boolean ignoresMissingSchema(String schema) {
+                        String normalized = normalizeMissingSchemaName(schema);
+                        return !isBlank(normalized) && ignoredMissingSchemas.contains(normalized);
+                    }
+
                     private String normalizeMissingTableName(String table) {
                         if (table == null) {
                             return "";
@@ -9220,6 +9290,16 @@ class DmSqlValidationTestGenerator {
                             return "";
                         }
                         return column.trim()
+                                .replace("\\"", "")
+                                .replace("`", "")
+                                .toLowerCase(Locale.ROOT);
+                    }
+
+                    private String normalizeMissingSchemaName(String schema) {
+                        if (schema == null) {
+                            return "";
+                        }
+                        return schema.trim()
                                 .replace("\\"", "")
                                 .replace("`", "")
                                 .toLowerCase(Locale.ROOT);
