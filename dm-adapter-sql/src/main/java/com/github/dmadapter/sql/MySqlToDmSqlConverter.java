@@ -70,6 +70,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
+    public static final String MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE =
+            "MYSQL_UTF8_CHARACTER_TYPE_LENGTH_TO_DM_BYTES";
     public static final String MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE = "MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY";
     public static final String MYSQL_ALTER_AUTO_INCREMENT_RESET_RULE = "MYSQL_ALTER_AUTO_INCREMENT_RESET_TO_DM";
     public static final String MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE = "MYSQL_CREATE_TABLE_OPTIONS_REMOVED";
@@ -350,6 +352,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (collateClauseConversion.changed()) {
             converted = collateClauseConversion.convertedSql();
             rules.add(MYSQL_COLLATE_CLAUSE_REMOVAL_RULE);
+        }
+
+        GenericConversion utf8CharacterTypeLengthConversion = expandMysqlUtf8CharacterTypeLengths(converted);
+        if (utf8CharacterTypeLengthConversion.changed()) {
+            converted = utf8CharacterTypeLengthConversion.convertedSql();
+            rules.add(MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE);
         }
 
         GenericConversion characterSetClauseConversion = removeMysqlCharacterSetClauses(converted);
@@ -1111,12 +1119,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
-    private int readMysqlCharacterSetClauseEnd(String sql, int index) {
+    private CharacterSetClause readMysqlCharacterSetClause(String sql, int index) {
         int cursor;
         if (startsKeyword(sql, index, "CHARACTER")) {
             int setIndex = skipWhitespace(sql, index + "CHARACTER".length());
             if (!startsKeyword(sql, setIndex, "SET")) {
-                return -1;
+                return null;
             }
             cursor = skipWhitespace(sql, setIndex + "SET".length());
         } else if (startsKeyword(sql, index, "CHARSET")) {
@@ -1125,16 +1133,142 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 cursor = skipWhitespace(sql, cursor + 1);
             }
         } else {
-            return -1;
+            return null;
         }
         int charsetStart = cursor;
         while (cursor < sql.length() && isIdentifierPart(sql.charAt(cursor))) {
             cursor++;
         }
         if (cursor == charsetStart) {
-            return -1;
+            return null;
         }
-        return skipWhitespace(sql, cursor);
+        return new CharacterSetClause(sql.substring(charsetStart, cursor), skipWhitespace(sql, cursor));
+    }
+
+    private int readMysqlCharacterSetClauseEnd(String sql, int index) {
+        CharacterSetClause clause = readMysqlCharacterSetClause(sql, index);
+        return clause == null ? -1 : clause.endIndex();
+    }
+
+    private GenericConversion expandMysqlUtf8CharacterTypeLengths(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String body = sql.substring(openParenIndex + 1, closeParenIndex);
+        List<TopLevelArgument> definitions = splitTopLevelArguments(body);
+        List<String> convertedDefinitions = new ArrayList<>();
+        boolean changed = false;
+        for (TopLevelArgument definition : definitions) {
+            GenericConversion conversion = expandMysqlUtf8CharacterTypeLength(definition.text());
+            convertedDefinitions.add(conversion.convertedSql());
+            changed = changed || conversion.changed();
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(
+                sql.substring(0, openParenIndex + 1)
+                        + String.join(",", convertedDefinitions)
+                        + sql.substring(closeParenIndex),
+                true
+        );
+    }
+
+    private GenericConversion expandMysqlUtf8CharacterTypeLength(String definition) {
+        StringBuilder converted = new StringBuilder(definition.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < definition.length()) {
+            char current = definition.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(definition, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(definition, index, converted);
+            } else if (startsMyBatisPlaceholder(definition, index)) {
+                index = appendMyBatisPlaceholder(definition, index, converted);
+            } else if (startsLineComment(definition, index)) {
+                index = appendUntilLineEnd(definition, index, converted);
+            } else if (startsBlockComment(definition, index)) {
+                index = appendUntilBlockCommentEnd(definition, index, converted);
+            } else if (isIdentifierStart(current)) {
+                IdentifierToken token = readIdentifierToken(definition, index);
+                NumericTypeRewrite rewrite = token == null ? null : readMysqlUtf8CharacterTypeLengthRewrite(definition, token);
+                if (rewrite == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(rewrite.replacement());
+                    index = rewrite.endIndex();
+                    changed = true;
+                    appendSpaceBeforeNextTokenIfNeeded(converted, definition, index);
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : definition, changed);
+    }
+
+    private NumericTypeRewrite readMysqlUtf8CharacterTypeLengthRewrite(String definition, IdentifierToken token) {
+        String upper = token.text().toUpperCase(Locale.ROOT);
+        if (!Set.of("CHAR", "VARCHAR").contains(upper)) {
+            return null;
+        }
+        int openParenIndex = skipWhitespace(definition, token.endIndex());
+        if (openParenIndex >= definition.length() || definition.charAt(openParenIndex) != '(') {
+            return null;
+        }
+        int closeParenIndex = readSimpleNumericTypeModifierEnd(definition, openParenIndex, false);
+        if (closeParenIndex < 0) {
+            return null;
+        }
+        int charsetIndex = skipWhitespace(definition, closeParenIndex);
+        CharacterSetClause charset = readMysqlCharacterSetClause(definition, charsetIndex);
+        if (charset == null) {
+            return null;
+        }
+        int multiplier = mysqlUtf8BytesPerCharacter(charset.name());
+        if (multiplier == 1) {
+            return null;
+        }
+        Integer length = parsePositiveInteger(definition.substring(openParenIndex + 1, closeParenIndex - 1).trim());
+        if (length == null) {
+            return null;
+        }
+        long expandedLength = (long) length * multiplier;
+        if (expandedLength > Integer.MAX_VALUE) {
+            return null;
+        }
+        return new NumericTypeRewrite(
+                closeParenIndex,
+                token.text() + "(" + expandedLength + ")"
+        );
+    }
+
+    private int mysqlUtf8BytesPerCharacter(String charset) {
+        String normalized = charset.toLowerCase(Locale.ROOT).replace('-', '_');
+        if ("utf8".equals(normalized) || "utf8mb3".equals(normalized)) {
+            return 3;
+        }
+        if ("utf8mb4".equals(normalized)) {
+            return 4;
+        }
+        return 1;
     }
 
     private GenericConversion convertMysqlAutoIncrement(String sql) {
@@ -6672,6 +6806,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record NumericTypeRewrite(int endIndex, String replacement) {
+    }
+
+    private record CharacterSetClause(String name, int endIndex) {
     }
 
     private record BooleanLiteralComparison(int endIndex, String replacement) {
