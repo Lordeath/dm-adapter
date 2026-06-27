@@ -3419,6 +3419,18 @@ class DmSqlValidationTestGenerator {
                         return LocalDateTime.parse(text).atZone(ZoneId.systemDefault()).toInstant();
                     } catch (Exception ignored) {
                     }
+                    for (String pattern : new String[] {
+                            "yyyy-MM-dd HH:mm:ss",
+                            "yyyy-MM-dd HH:mm:ss.S",
+                            "yyyy-MM-dd HH:mm:ss.SSS"
+                    }) {
+                        try {
+                            return LocalDateTime.parse(text, DateTimeFormatter.ofPattern(pattern))
+                                    .atZone(ZoneId.systemDefault())
+                                    .toInstant();
+                        } catch (Exception ignored) {
+                        }
+                    }
                     try {
                         return LocalDate.parse(text).atStartOfDay(ZoneId.systemDefault()).toInstant();
                     } catch (Exception ignored) {
@@ -4288,11 +4300,14 @@ class DmSqlValidationTestGenerator {
                         return false;
                     }
                     String text = ((String) value).trim();
-                    if (isGeneratedPlaceholderText(text)) {
-                        return true;
+                    if (isConfiguredDateTimeLiteral(text)) {
+                        return false;
                     }
-                    String normalized = normalizeName(valueName);
-                    return isDateLikeParameterName(normalized) && configuredInstant(text) != null;
+                    return isGeneratedPlaceholderText(text);
+                }
+
+                private boolean isConfiguredDateTimeLiteral(String value) {
+                    return configuredInstant(stripSqlLiteralQuotes(value)) != null;
                 }
 
                 private boolean isGeneratedPlaceholderText(String value) {
@@ -8422,10 +8437,11 @@ class DmSqlValidationTestGenerator {
                 private String pojoSummary(Object value, int depth, String valueName) {
                     StringBuilder summary = new StringBuilder(value.getClass().getSimpleName()).append("{");
                     int count = 0;
+                    int fieldLimit = 32;
                     Class<?> currentType = value.getClass();
-                    while (currentType != null && !Object.class.equals(currentType) && count < 8) {
+                    while (currentType != null && !Object.class.equals(currentType) && count < fieldLimit) {
                         for (Field field : currentType.getDeclaredFields()) {
-                            if (count >= 8) {
+                            if (count >= fieldLimit) {
                                 break;
                             }
                             if (Modifier.isStatic(field.getModifiers())) {
