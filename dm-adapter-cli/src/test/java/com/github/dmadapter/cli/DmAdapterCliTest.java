@@ -764,7 +764,14 @@ class DmAdapterCliTest {
                 .contains("metadata.addDefaultValue(expression, null);")
                 .contains("statement.hasDefaultValue(valueName)")
                 .contains("&& \"ID\".equalsIgnoreCase(stripSqlLiteralQuotes(text))")
-                .contains("return quoteSqlLiteral(\"1\");");
+                .contains("return quoteSqlLiteral(\"1\");")
+                .contains("private ValidationRecord skippedRegexpPlaceholderRecord(")
+                .contains("isRegexpMemoryLimitFailure(summary)")
+                .contains("hasGeneratedRegexpPlaceholderParameter(mapperMethod, parameters)")
+                .contains("\"regexp-placeholder\"")
+                .contains("private boolean hasRegexpOperatorIssue(String message)")
+                .contains("lower.contains(\"regexp_like\")")
+                .contains("lower.contains(\"正则表达式\")");
         assertThat(generatedTestSource)
                 .contains("Map<String, Object> normalizedParams = normalizeValidationParameterMap(new LinkedHashMap<>(params));")
                 .contains("!normalizedParams.containsKey(field.getName())")
