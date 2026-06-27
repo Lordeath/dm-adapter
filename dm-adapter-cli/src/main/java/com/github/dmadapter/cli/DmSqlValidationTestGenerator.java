@@ -1077,7 +1077,14 @@ class DmSqlValidationTestGenerator {
                 private DynamicIdentifierMetadata dynamicIdentifierMetadata(Element statement) {
                     DynamicIdentifierMetadata metadata = new DynamicIdentifierMetadata();
                     SqlStatementContext sqlContext = sqlStatementContext(statement);
-                    collectDynamicIdentifierMetadata(statement, new LinkedHashMap<>(), metadata, false, sqlContext);
+                    collectDynamicIdentifierMetadata(
+                            statement,
+                            new LinkedHashMap<>(),
+                            metadata,
+                            false,
+                            Collections.emptySet(),
+                            sqlContext
+                    );
                     addDmlColumnReferences(statement, metadata, sqlContext);
                     return metadata;
                 }
@@ -1087,6 +1094,7 @@ class DmSqlValidationTestGenerator {
                         Map<String, String> foreachCollections,
                         DynamicIdentifierMetadata metadata,
                         boolean insideSet,
+                        Set<String> optionalDynamicExpressions,
                         SqlStatementContext sqlContext
                 ) {
                     if (node instanceof Element) {
@@ -1095,6 +1103,7 @@ class DmSqlValidationTestGenerator {
                         boolean currentInsideSet = insideSet
                                 || "set".equals(element.getTagName())
                                 || isSetTrimElement(element);
+                        Set<String> currentOptionalDynamicExpressions = optionalDynamicExpressions;
                         if ("foreach".equals(element.getTagName())) {
                             String item = element.getAttribute("item");
                             String index = element.getAttribute("index");
@@ -1139,6 +1148,11 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         if ("if".equals(element.getTagName()) || "when".equals(element.getTagName())) {
+                            Set<String> optionalExpressions = optionalDynamicSqlFragmentNames(element.getAttribute("test"));
+                            if (!optionalExpressions.isEmpty()) {
+                                currentOptionalDynamicExpressions = new LinkedHashSet<>(optionalDynamicExpressions);
+                                currentOptionalDynamicExpressions.addAll(optionalExpressions);
+                            }
                             BranchCondition condition = branchCondition(element.getAttribute("test"));
                             if (condition != null) {
                                 metadata.addDefaultValue(condition.parameterName, condition.defaultValue);
@@ -1154,6 +1168,7 @@ class DmSqlValidationTestGenerator {
                                     currentForeachCollections,
                                     metadata,
                                     currentInsideSet,
+                                    currentOptionalDynamicExpressions,
                                     sqlContext
                             );
                         }
@@ -1173,6 +1188,7 @@ class DmSqlValidationTestGenerator {
                                 text,
                                 dynamicMatcher.start(),
                                 dynamicMatcher.end(),
+                                optionalDynamicExpressions,
                                 sqlContext
                         );
                     }
@@ -1217,6 +1233,7 @@ class DmSqlValidationTestGenerator {
                         String text,
                         int startIndex,
                         int endIndex,
+                        Set<String> optionalDynamicExpressions,
                         SqlStatementContext sqlContext
                 ) {
                     List<String> parts = pathParts(expression);
@@ -1242,6 +1259,11 @@ class DmSqlValidationTestGenerator {
                         }
                         return;
                     }
+                    if (optionalDynamicExpressions != null
+                            && optionalDynamicExpressions.contains(normalizeName(expression))) {
+                        metadata.addDefaultValue(expression, null);
+                        return;
+                    }
                     if (shouldUseNullDefault(expression)) {
                         metadata.addDefaultValue(expression, null);
                         return;
@@ -1256,6 +1278,33 @@ class DmSqlValidationTestGenerator {
                     } else {
                         metadata.addDynamicIdentifierName(parts.get(parts.size() - 1));
                     }
+                }
+
+                private Set<String> optionalDynamicSqlFragmentNames(String test) {
+                    Set<String> names = new LinkedHashSet<>();
+                    if (test == null || isBlank(test)) {
+                        return names;
+                    }
+                    Matcher notNull = Pattern.compile(
+                            "(?i)([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*!=\\\\s*null"
+                    ).matcher(test);
+                    while (notNull.find()) {
+                        names.add(normalizeName(notNull.group(1)));
+                    }
+                    Matcher rightNotEmpty = Pattern.compile(
+                            "(?i)([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*!=\\\\s*(?:''|\\\"\\\")"
+                    ).matcher(test);
+                    while (rightNotEmpty.find()) {
+                        names.add(normalizeName(rightNotEmpty.group(1)));
+                    }
+                    Matcher leftNotEmpty = Pattern.compile(
+                            "(?i)(?:''|\\\"\\\")\\\\s*!=\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)"
+                    ).matcher(test);
+                    while (leftNotEmpty.find()) {
+                        names.add(normalizeName(leftNotEmpty.group(1)));
+                    }
+                    names.remove("");
+                    return names;
                 }
 
                 private void addValueExpression(
@@ -3346,6 +3395,13 @@ class DmSqlValidationTestGenerator {
                     }
                     String normalized = normalizeName(valueName);
                     String text = ((String) configuredValue).trim();
+                    if (statement != null
+                            && statement.hasDefaultValue(valueName)
+                            && existingDefault == null
+                            && isRegexpSqlFragmentName(normalized)
+                            && "ID".equalsIgnoreCase(stripSqlLiteralQuotes(text))) {
+                        return null;
+                    }
                     if (isRegexpSqlFragmentName(normalized)
                             && "ID".equalsIgnoreCase(stripSqlLiteralQuotes(text))) {
                         return quoteSqlLiteral("1");

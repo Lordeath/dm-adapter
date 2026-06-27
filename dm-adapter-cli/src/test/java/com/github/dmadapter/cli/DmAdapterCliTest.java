@@ -759,6 +759,10 @@ class DmAdapterCliTest {
                 .contains("normalized.startsWith(\"sum\")")
                 .contains("value.put(beforeCurrentFlagKey, null);")
                 .contains("isRegexpSqlFragmentName(normalizeName(valueName))")
+                .contains("private Set<String> optionalDynamicSqlFragmentNames(String test)")
+                .contains("optionalDynamicExpressions.contains(normalizeName(expression))")
+                .contains("metadata.addDefaultValue(expression, null);")
+                .contains("statement.hasDefaultValue(valueName)")
                 .contains("&& \"ID\".equalsIgnoreCase(stripSqlLiteralQuotes(text))")
                 .contains("return quoteSqlLiteral(\"1\");");
         assertThat(generatedTestSource)
