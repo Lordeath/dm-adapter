@@ -1933,6 +1933,10 @@ class DmSqlValidationTestGenerator {
                     if (normalized.contains("code")) {
                         return "CODE";
                     }
+                    String temporalDefault = defaultTemporalString(normalized);
+                    if (temporalDefault != null) {
+                        return temporalDefault;
+                    }
                     if (isDateLikeParameterName(normalized)) {
                         return java.sql.Timestamp.valueOf("2024-01-01 00:00:00");
                     }
@@ -1982,6 +1986,10 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isNumericTextParameterName(normalized)) {
                         return BigDecimal.ONE;
+                    }
+                    String temporalDefault = defaultTemporalString(normalized);
+                    if (temporalDefault != null) {
+                        return temporalDefault;
                     }
                     if (isDateLikeParameterName(normalized)) {
                         return "2024-01-01 00:00:00";
@@ -3701,6 +3709,7 @@ class DmSqlValidationTestGenerator {
                     String text = value == null ? "" : value.trim();
                     return "test".equalsIgnoreCase(text)
                             || "CODE".equalsIgnoreCase(text)
+                            || "ID".equalsIgnoreCase(text)
                             || "1=1".equals(text)
                             || "1".equals(text);
                 }
@@ -4095,6 +4104,18 @@ class DmSqlValidationTestGenerator {
                             && !isDateLikeParameterName(normalized);
                 }
 
+                private boolean shouldKeepConfiguredCollectionValue(String valueName, Object configuredValue, Object defaultValue) {
+                    if (!(configuredValue instanceof Collection<?>) || !(defaultValue instanceof Collection<?>)) {
+                        return true;
+                    }
+                    Object configuredFirst = firstCollectionElement((Collection<?>) configuredValue);
+                    Object defaultFirst = firstCollectionElement((Collection<?>) defaultValue);
+                    if (configuredFirst == null || defaultFirst == null) {
+                        return true;
+                    }
+                    return shouldKeepConfiguredValue(valueName, configuredFirst, defaultFirst);
+                }
+
                 private boolean isGeneratedPlaceholderValue(String valueName, Object value) {
                     if (!(value instanceof String)) {
                         return false;
@@ -4111,6 +4132,7 @@ class DmSqlValidationTestGenerator {
                     String text = stripSqlLiteralQuotes(value == null ? "" : value.trim());
                     return "test".equalsIgnoreCase(text)
                             || "CODE".equalsIgnoreCase(text)
+                            || "ID".equalsIgnoreCase(text)
                             || "2024-01-01".equals(text)
                             || "2024-01-01 00:00:00".equals(text)
                             || "2024-01-01 00:00:00.0".equals(text);
@@ -4868,6 +4890,20 @@ class DmSqlValidationTestGenerator {
                             );
                             continue;
                         }
+                        if (existing instanceof Collection<?>
+                                && configuredValue instanceof Collection<?>
+                                && !shouldKeepConfiguredCollectionValue(entryPath, configuredValue, existing)) {
+                            continue;
+                        }
+                        if (existing != null
+                                && configuredValue != null
+                                && !(existing instanceof Map<?, ?>)
+                                && !(configuredValue instanceof Map<?, ?>)
+                                && !(existing instanceof Collection<?>)
+                                && !(configuredValue instanceof Collection<?>)
+                                && !shouldKeepConfiguredValue(entryPath, configuredValue, existing)) {
+                            continue;
+                        }
                         if (configuredValue == null && shouldPreserveConfiguredNullDefault(entryPath, existing, statement)) {
                             continue;
                         }
@@ -5275,6 +5311,9 @@ class DmSqlValidationTestGenerator {
                     if (normalized.contains("month")) {
                         return "202401";
                     }
+                    if (normalized.contains("accountbook")) {
+                        return "202401";
+                    }
                     if (normalized.contains("orderno")
                             || "orders".equals(normalized)
                             || normalized.contains("billno")
@@ -5342,8 +5381,9 @@ class DmSqlValidationTestGenerator {
                     if (isNumericTextParameterName(normalized)) {
                         return "1";
                     }
-                    if (isDateLikeParameterName(normalized)) {
-                        return "2024-01-01 00:00:00";
+                    String temporalDefault = defaultTemporalString(normalized);
+                    if (temporalDefault != null) {
+                        return temporalDefault;
                     }
                     if (normalized.contains("comparison")) {
                         return "EQUAL";
@@ -5352,6 +5392,38 @@ class DmSqlValidationTestGenerator {
                         return "EQUAL";
                     }
                     return "test";
+                }
+
+                private String defaultTemporalString(String normalizedName) {
+                    if (isDateLikeParameterName(normalizedName)) {
+                        return "2024-01-01 00:00:00";
+                    }
+                    if (isDayOfMonthParameterName(normalizedName)) {
+                        return "1";
+                    }
+                    if (isMonthLikeParameterName(normalizedName)) {
+                        return "202401";
+                    }
+                    if (isYearLikeParameterName(normalizedName)) {
+                        return "2024";
+                    }
+                    return null;
+                }
+
+                private String defaultSqlFragmentForName(String normalizedName) {
+                    if (isDateLikeParameterName(normalizedName)) {
+                        return "'2024-01-01'";
+                    }
+                    if (isDayOfMonthParameterName(normalizedName)) {
+                        return "1";
+                    }
+                    if (isMonthLikeParameterName(normalizedName)) {
+                        return "202401";
+                    }
+                    if (isYearLikeParameterName(normalizedName)) {
+                        return "2024";
+                    }
+                    return null;
                 }
 
                 private String defaultDynamicIdentifier(String valueName) {
@@ -5391,6 +5463,10 @@ class DmSqlValidationTestGenerator {
                     if (isRawSqlInjectionName(normalized)) {
                         return "";
                     }
+                    String nameBasedFragmentDefault = defaultSqlFragmentForName(normalized);
+                    if (nameBasedFragmentDefault != null) {
+                        return quoteAwareDynamicSqlFragmentDefault(nameBasedFragmentDefault, text, startIndex, endIndex);
+                    }
                     if (isLikelyDynamicIdentifierName(normalized)) {
                         return defaultDynamicIdentifier(expression);
                     }
@@ -5428,6 +5504,12 @@ class DmSqlValidationTestGenerator {
                                 startIndex,
                                 endIndex
                         );
+                    }
+                    String nameBasedFragmentDefault = defaultSqlFragmentForName(
+                            isBlank(propertyName) ? normalizedCollection : normalizedProperty
+                    );
+                    if (nameBasedFragmentDefault != null) {
+                        return quoteAwareDynamicSqlFragmentDefault(nameBasedFragmentDefault, text, startIndex, endIndex);
                     }
                     if (isOrderFieldName(normalizedProperty) || isOrderFieldName(normalizedCollection)
                             || isOrderDirectionName(normalizedProperty) || isOrderDirectionName(normalizedCollection)) {
@@ -5738,13 +5820,43 @@ class DmSqlValidationTestGenerator {
                     return "date".equals(normalizedName)
                             || "time".equals(normalizedName)
                             || normalizedName.endsWith("date")
+                            || normalizedName.endsWith("datestart")
+                            || normalizedName.endsWith("dateend")
                             || normalizedName.endsWith("datetime")
                             || normalizedName.endsWith("timestamp")
                             || (normalizedName.endsWith("time") && !normalizedName.endsWith("parttime"))
+                            || normalizedName.endsWith("timestart")
+                            || normalizedName.endsWith("timeend")
                             || "starttime".equals(normalizedName)
                             || "endtime".equals(normalizedName)
                             || "begintime".equals(normalizedName)
-                            || "finishtime".equals(normalizedName);
+                            || "finishtime".equals(normalizedName)
+                            || normalizedName.contains("operatordate")
+                            || normalizedName.contains("shouldchargedate")
+                            || normalizedName.contains("firstday")
+                            || normalizedName.contains("lastday")
+                            || normalizedName.contains("startday")
+                            || normalizedName.contains("endday");
+                }
+
+                private boolean isDayOfMonthParameterName(String normalizedName) {
+                    return "day".equals(normalizedName)
+                            || "closingday".equals(normalizedName)
+                            || "settlementday".equals(normalizedName)
+                            || "billday".equals(normalizedName);
+                }
+
+                private boolean isMonthLikeParameterName(String normalizedName) {
+                    return "month".equals(normalizedName)
+                            || normalizedName.contains("accountbook")
+                            || normalizedName.contains("month");
+                }
+
+                private boolean isYearLikeParameterName(String normalizedName) {
+                    return "year".equals(normalizedName)
+                            || normalizedName.endsWith("year")
+                            || normalizedName.contains("thisyear")
+                            || normalizedName.contains("lastyear");
                 }
 
                 private boolean isNumericTextParameterName(String normalizedName) {
