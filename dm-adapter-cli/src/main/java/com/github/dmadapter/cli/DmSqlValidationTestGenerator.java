@@ -1263,7 +1263,10 @@ class DmSqlValidationTestGenerator {
                         return;
                     }
                     if (jdbcType != null && !isBlank(jdbcType)) {
-                        metadata.addDefaultValue(parts.get(parts.size() - 1), defaultValueForJdbcType(parts.get(parts.size() - 1), jdbcType));
+                        String propertyName = parts.get(parts.size() - 1);
+                        Object defaultValue = defaultValueForJdbcType(propertyName, jdbcType);
+                        metadata.addDefaultValue(propertyName, defaultValue);
+                        metadata.addDefaultValue(expression, defaultValue);
                     }
                 }
 
@@ -1794,10 +1797,11 @@ class DmSqlValidationTestGenerator {
                             continue;
                         }
                         String propertyName = parts.size() == 1 ? parts.get(0) : parts.get(parts.size() - 1);
-                        metadata.addDefaultValue(
-                                propertyName,
-                                defaultValueForSetParameter(propertyName, jdbcType(valueMatcher.group(2)))
-                        );
+                        Object defaultValue = defaultValueForSetParameter(propertyName, jdbcType(valueMatcher.group(2)));
+                        metadata.addDefaultValue(propertyName, defaultValue);
+                        if (parts.size() > 1) {
+                            metadata.addDefaultValue(valueMatcher.group(1), defaultValue);
+                        }
                     }
                 }
 
