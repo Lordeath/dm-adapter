@@ -1018,6 +1018,57 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateSetRewritesOrderByLimitOneToRowidSubquery() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.BillsharingMapper">
+                    <update id="updateLatestBillsharingByCustomerId">
+                        UPDATE ns_bill_billsharing
+                        <set>
+                            <if test="customerId != null">
+                                customerId = #{customerId,jdbcType=INTEGER},
+                            </if>
+                            <if test="payTime != null">
+                                payTime = #{payTime,jdbcType=TIMESTAMP},
+                            </if>
+                        </set>
+                        where customerId = #{customerId,jdbcType=INTEGER} order by createTime desc limit 1
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/BillsharingMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BillsharingMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BillsharingMapper.xml"));
+        assertThat(rewritten)
+                .contains("""
+                        where ROWID in (select rid from (select ROWID rid from ns_bill_billsharing where customerId = #{customerId,jdbcType=INTEGER} order by createTime desc) where ROWNUM &lt;= 1)
+                        """.strip())
+                .doesNotContain("order by createTime desc limit 1");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicUpdateSetAddsMissingCommasBetweenConditionalAssignments() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

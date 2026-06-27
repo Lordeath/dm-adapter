@@ -655,6 +655,11 @@ public class MapperXmlRewriter {
                 appliedRules.add(MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE);
                 converted = dynamicSetCommas.text();
             }
+            DynamicBodyConversion dynamicUpdateOrderLimitOne = convertDynamicUpdateOrderLimitOneWithSetClause(converted);
+            if (dynamicUpdateOrderLimitOne.changed()) {
+                addAppliedRules(appliedRules, dynamicUpdateOrderLimitOne.appliedRules());
+                converted = dynamicUpdateOrderLimitOne.convertedBody();
+            }
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
 
@@ -2767,6 +2772,79 @@ public class MapperXmlRewriter {
         );
     }
 
+    private DynamicBodyConversion convertDynamicUpdateOrderLimitOneWithSetClause(String body) {
+        int statementEnd = body.length();
+        while (statementEnd > 0 && Character.isWhitespace(body.charAt(statementEnd - 1))) {
+            statementEnd--;
+        }
+        String trailing = body.substring(statementEnd);
+        if (statementEnd > 0 && body.charAt(statementEnd - 1) == ';') {
+            statementEnd--;
+            trailing = body.substring(statementEnd);
+        }
+
+        String statement = body.substring(0, statementEnd);
+        int updateIndex = leadingWhitespaceLength(statement);
+        if (!isKeywordAt(statement, updateIndex, "UPDATE")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        TrimBlock setBlock = findMyBatisSetBlock(statement, updateIndex + "UPDATE".length(), statement.length());
+        if (setBlock == null) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        String tableName = statement.substring(updateIndex + "UPDATE".length(), setBlock.openingStart()).strip();
+        if (!isSimpleQualifiedIdentifierExpression(tableName)) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        String tail = statement.substring(setBlock.closingEnd());
+        int whereIndex = findTopLevelKeywordSkippingXml(tail, "WHERE", 0);
+        if (whereIndex < 0 || !tail.substring(0, whereIndex).isBlank()) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int orderIndex = findTopLevelKeywordSkippingXml(tail, "ORDER", whereIndex + "WHERE".length());
+        if (orderIndex < 0) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int byIndex = skipWhitespace(tail, orderIndex + "ORDER".length());
+        if (!isKeywordAt(tail, byIndex, "BY")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int limitIndex = findTopLevelKeywordSkippingXml(tail, "LIMIT", byIndex + "BY".length());
+        if (limitIndex < 0 || !isOnlyLimitOne(tail.substring(limitIndex + "LIMIT".length()))) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        String whereClause = tail.substring(whereIndex + "WHERE".length(), orderIndex).strip();
+        String orderClause = tail.substring(byIndex + "BY".length(), limitIndex).strip();
+        if (whereClause.isBlank()
+                || orderClause.isBlank()
+                || containsXmlMarkup(whereClause)
+                || containsXmlMarkup(orderClause)) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        String converted = statement.substring(0, setBlock.closingEnd())
+                + tail.substring(0, whereIndex)
+                + "where ROWID in (select rid from (select ROWID rid from "
+                + tableName
+                + " where "
+                + whereClause
+                + " order by "
+                + orderClause
+                + ") where ROWNUM &lt;= 1)"
+                + trailing;
+        return new DynamicBodyConversion(
+                body,
+                converted,
+                List.of(MySqlToDmSqlConverter.MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE),
+                List.of(),
+                true
+        );
+    }
+
     private TextSegmentConversion convertSqlTextWithXmlTags(
             String value,
             String statementKey,
@@ -2903,6 +2981,36 @@ public class MapperXmlRewriter {
         return findTopLevelKeywordSkippingXml(value, "JOIN", 0) >= 0;
     }
 
+    private TrimBlock findMyBatisSetBlock(String body, int start, int end) {
+        int index = Math.max(0, start);
+        while (index >= 0 && index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                return null;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "set".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "set", end);
+                if (closingStart < 0) {
+                    return null;
+                }
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                return new TrimBlock(
+                        tagStart,
+                        tag.endIndex(),
+                        closingStart,
+                        closingEnd < 0 ? closingStart : closingEnd + 1
+                );
+            }
+            index = tag.endIndex();
+        }
+        return null;
+    }
+
     private int findTopLevelKeywordSkippingXml(String value, String keyword, int start) {
         int depth = 0;
         int index = Math.max(0, start);
@@ -2930,6 +3038,46 @@ public class MapperXmlRewriter {
             }
         }
         return -1;
+    }
+
+    private boolean isOnlyLimitOne(String tail) {
+        return tail != null && tail.strip().equals("1");
+    }
+
+    private boolean containsXmlMarkup(String value) {
+        return value != null && value.indexOf('<') >= 0;
+    }
+
+    private boolean isSimpleQualifiedIdentifierExpression(String value) {
+        int index = skipWhitespace(value, 0);
+        if (index >= value.length()) {
+            return false;
+        }
+        int partEnd = readIdentifierOrVariableEnd(value, index);
+        if (partEnd <= index) {
+            return false;
+        }
+        index = skipWhitespace(value, partEnd);
+        while (index < value.length() && value.charAt(index) == '.') {
+            index = skipWhitespace(value, index + 1);
+            int nextPartEnd = readIdentifierOrVariableEnd(value, index);
+            if (nextPartEnd <= index) {
+                return false;
+            }
+            index = skipWhitespace(value, nextPartEnd);
+        }
+        return index == value.length();
+    }
+
+    private int readIdentifierOrVariableEnd(String value, int start) {
+        if (start < value.length()
+                && value.charAt(start) == '$'
+                && start + 1 < value.length()
+                && value.charAt(start + 1) == '{') {
+            return skipMyBatisPlaceholder(value, start);
+        }
+        IdentifierToken token = readIdentifierToken(value, start);
+        return token == null ? -1 : token.endIndex();
     }
 
     private boolean containsJoinKeyword(String value) {
