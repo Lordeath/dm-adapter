@@ -124,6 +124,34 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void replacesDanglingCommaWhenAddingMissingJdbcType() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/NsSystemUserMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NsSystemUserMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert into ns_system_user (create_user_name)
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.createUserName,})
+                        </foreach>
+                    </insert>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("ns_system_user", Map.of("create_user_name", "VARCHAR"))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/NsSystemUserMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(rewritten)
+                .contains("#{item.createUserName,jdbcType=VARCHAR}")
+                .doesNotContain(",,jdbcType");
+    }
+
+    @Test
     void castsStringPojoNumericPlaceholderFromDamengColumnMetadata() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
