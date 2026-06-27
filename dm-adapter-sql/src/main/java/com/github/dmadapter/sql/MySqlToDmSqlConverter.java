@@ -33,6 +33,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
+    public static final String MYSQL_CONCAT_TO_DM_OPERATOR_RULE = "MYSQL_CONCAT_TO_DM_OPERATOR";
     public static final String MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE =
             "MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR";
     public static final String MYSQL_HAVING_AGGREGATE_ALIAS_RULE = "MYSQL_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
@@ -508,6 +509,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (locateNumericNeedleConversion.changed()) {
             converted = locateNumericNeedleConversion.convertedSql();
             rules.add(MYSQL_LOCATE_NUMERIC_NEEDLE_RULE);
+        }
+
+        GenericConversion concatConversion = convertConcat(converted);
+        if (concatConversion.changed()) {
+            converted = concatConversion.convertedSql();
+            rules.add(MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
         }
 
         GenericConversion informationSchemaColumnsConversion = convertInformationSchemaColumns(converted);
@@ -4146,14 +4153,24 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (expression.isBlank()) {
             return null;
         }
-        if (splitTopLevelArguments(expression).size() != 1) {
+        List<TopLevelArgument> expressionArguments = splitTopLevelArguments(expression);
+        if (expressionArguments.isEmpty()) {
+            return null;
+        }
+        if (distinct && expressionArguments.size() != 1) {
+            return null;
+        }
+        String listaggExpression = expressionArguments.size() == 1
+                ? expression
+                : concatenateArguments(expressionArguments);
+        if (listaggExpression == null) {
             return null;
         }
 
         if (orderBy.isBlank()) {
-            orderBy = expression;
+            orderBy = listaggExpression;
         }
-        return "LISTAGG(" + (distinct ? "DISTINCT " : "") + expression + ", " + separator + ") WITHIN GROUP (ORDER BY " + orderBy + ")";
+        return "LISTAGG(" + (distinct ? "DISTINCT " : "") + listaggExpression + ", " + separator + ") WITHIN GROUP (ORDER BY " + orderBy + ")";
     }
 
     private GroupConcatOrderBy extractTrailingGroupConcatSeparator(String orderBy) {
@@ -4174,6 +4191,64 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return new GroupConcatOrderBy(trimmedOrderBy, separator);
+    }
+
+    private GenericConversion convertConcat(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "CONCAT")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CONCAT");
+                String replacement = functionCall == null ? null : rewriteConcat(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteConcat(FunctionCall concatCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(concatCall.body());
+        if (arguments.isEmpty()) {
+            return null;
+        }
+        return concatenateArguments(arguments);
+    }
+
+    private String concatenateArguments(List<TopLevelArgument> arguments) {
+        StringBuilder expression = new StringBuilder();
+        for (TopLevelArgument argument : arguments) {
+            String text = argument.text().trim();
+            if (text.isBlank() || text.contains("${")) {
+                return null;
+            }
+            if (!expression.isEmpty()) {
+                expression.append(" || ");
+            }
+            expression.append("(").append(text).append(")");
+        }
+        return expression.toString();
     }
 
     private GenericConversion convertSubstringIndex(String sql) {
