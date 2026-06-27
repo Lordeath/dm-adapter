@@ -577,6 +577,7 @@ class DmSqlValidationTestGenerator {
                         "ordernos",
                         "ordernolist",
                         "orders",
+                        "monthlist",
                         "accountbooklist",
                         "allitem",
                         "chargedetailids",
@@ -5271,6 +5272,9 @@ class DmSqlValidationTestGenerator {
 
                 private Object defaultCollectionElement(String collectionName) {
                     String normalized = normalizeName(collectionName);
+                    if (normalized.contains("month")) {
+                        return "202401";
+                    }
                     if (normalized.contains("orderno")
                             || "orders".equals(normalized)
                             || normalized.contains("billno")
