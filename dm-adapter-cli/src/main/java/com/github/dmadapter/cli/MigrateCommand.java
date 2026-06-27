@@ -27,8 +27,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 @Command(name = "migrate", description = "Create a low-intrusion Dameng migration plan or apply it.")
 public class MigrateCommand implements Callable<Integer> {
@@ -236,7 +234,7 @@ public class MigrateCommand implements Callable<Integer> {
             if (!needsKeyColumns) {
                 continue;
             }
-            String tableName = extractInsertTableName(sql);
+            String tableName = InsertColumnExtractor.tableName(sql);
             if (tableName.isBlank()) {
                 continue;
             }
@@ -246,78 +244,10 @@ public class MigrateCommand implements Callable<Integer> {
             }
             String key = methodKey + "|" + DamengMetadataReader.normalizeTableName(tableName);
             if (seen.add(key)) {
-                candidates.add(new RewriteConfigCandidate(methodKey, tableName, extractInsertColumns(sql, tableName)));
+                candidates.add(new RewriteConfigCandidate(methodKey, tableName, InsertColumnExtractor.columns(sql, tableName)));
             }
         }
         return candidates;
-    }
-
-    private String extractInsertTableName(String sql) {
-        Matcher matcher = Pattern.compile(
-                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+([^\\s(<]+)"
-        ).matcher(sql == null ? "" : sql);
-        return matcher.find()
-                ? matcher.group(1).replace("`", "").replace("\"", "").trim()
-                : "";
-    }
-
-    private List<String> extractInsertColumns(String sql, String tableName) {
-        if (sql == null || sql.isBlank() || tableName == null || tableName.isBlank()) {
-            return List.of();
-        }
-        Matcher matcher = Pattern.compile(
-                "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+"
-                        + Pattern.quote(tableName)
-                        + "\\s*(?<tail>[\\s\\S]*)"
-        ).matcher(sql);
-        if (!matcher.find()) {
-            return List.of();
-        }
-        String tail = matcher.group("tail");
-        String columnList = parenthesizedColumnList(tail).orElseGet(() -> looseColumnList(tail));
-        if (columnList.isBlank()) {
-            return List.of();
-        }
-        return splitColumns(columnList);
-    }
-
-    private Optional<String> parenthesizedColumnList(String text) {
-        int open = text.indexOf('(');
-        if (open < 0) {
-            return Optional.empty();
-        }
-        int depth = 0;
-        for (int i = open; i < text.length(); i++) {
-            char current = text.charAt(i);
-            if (current == '(') {
-                depth++;
-            } else if (current == ')') {
-                depth--;
-                if (depth == 0) {
-                    return Optional.of(text.substring(open + 1, i));
-                }
-            }
-        }
-        return Optional.empty();
-    }
-
-    private String looseColumnList(String text) {
-        Matcher valuesMatcher = Pattern.compile("(?is)\\bvalues\\b").matcher(text);
-        if (!valuesMatcher.find()) {
-            return "";
-        }
-        return text.substring(0, valuesMatcher.start());
-    }
-
-    private List<String> splitColumns(String columnList) {
-        List<String> columns = new ArrayList<>();
-        for (String part : columnList.split(",")) {
-            String column = part.replace("`", "").replace("\"", "").trim();
-            if (column.matches("[A-Za-z_][A-Za-z0-9_]*")) {
-                columns.add(column);
-            }
-        }
-        return columns;
     }
 
     private AdapterContext previewContext(AdapterContext context) {
