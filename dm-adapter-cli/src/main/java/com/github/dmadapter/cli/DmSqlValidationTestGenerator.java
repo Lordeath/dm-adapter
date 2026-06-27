@@ -1799,8 +1799,10 @@ class DmSqlValidationTestGenerator {
                         String propertyName = parts.size() == 1 ? parts.get(0) : parts.get(parts.size() - 1);
                         Object defaultValue = defaultValueForSetParameter(propertyName, jdbcType(valueMatcher.group(2)));
                         metadata.addDefaultValue(propertyName, defaultValue);
+                        metadata.addSetDefaultValue(propertyName);
                         if (parts.size() > 1) {
                             metadata.addDefaultValue(valueMatcher.group(1), defaultValue);
+                            metadata.addSetDefaultValue(valueMatcher.group(1));
                         }
                     }
                 }
@@ -3752,7 +3754,10 @@ class DmSqlValidationTestGenerator {
                                         return ValueResult.unresolved("Cannot assign null to primitive field "
                                                 + targetType.getName() + "." + field.getName() + ".");
                                     }
-                                    field.setAccessible(true);
+                                    Object existingDefault = field.get(instance);
+                                    if (shouldPreserveConfiguredNullDefault(field.getName(), existingDefault, statement)) {
+                                        continue;
+                                    }
                                     field.set(instance, null);
                                     continue;
                                 }
@@ -3797,6 +3802,25 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.unresolved("Failed to apply configured parameters to "
                                 + targetType.getName() + ": " + e.getMessage());
                     }
+                }
+
+                private boolean shouldPreserveConfiguredNullDefault(
+                        String valueName,
+                        Object existingDefault,
+                        MapperStatement statement
+                ) {
+                    if (statement == null
+                            || existingDefault == null
+                            || (!statement.setDefaultValue(valueName) && !statement.hasSetDefaultUnder(valueName))) {
+                        return false;
+                    }
+                    if (existingDefault instanceof Map) {
+                        return !((Map<?, ?>) existingDefault).isEmpty();
+                    }
+                    if (existingDefault instanceof Collection) {
+                        return !((Collection<?>) existingDefault).isEmpty();
+                    }
+                    return true;
                 }
 
                 private ValueResult defaultValue(Class<?> targetType, Type genericType, int depth) {
@@ -4357,6 +4381,9 @@ class DmSqlValidationTestGenerator {
                                     statement,
                                     entryPath
                             );
+                            continue;
+                        }
+                        if (configuredValue == null && shouldPreserveConfiguredNullDefault(entryPath, existing, statement)) {
                             continue;
                         }
                         target.put(entry.getKey(), configuredValue);
@@ -8613,6 +8640,14 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.hasDefaultValue(valueName);
                     }
 
+                    private boolean setDefaultValue(String valueName) {
+                        return dynamicIdentifierMetadata.setDefaultValue(valueName);
+                    }
+
+                    private boolean hasSetDefaultUnder(String valueName) {
+                        return dynamicIdentifierMetadata.hasSetDefaultUnder(valueName);
+                    }
+
                     private Map<String, Object> defaultValues() {
                         return dynamicIdentifierMetadata.defaultValues();
                     }
@@ -8704,6 +8739,7 @@ class DmSqlValidationTestGenerator {
                     private final Map<String, ColumnReference> defaultColumnReferences = new LinkedHashMap<>();
                     private final Map<String, Object> defaultValues = new LinkedHashMap<>();
                     private final Map<String, Object> namedDefaultValues = new LinkedHashMap<>();
+                    private final Set<String> setDefaultValueNames = new LinkedHashSet<>();
                     private final Set<String> valueExpressionNames = new LinkedHashSet<>();
 
                     private void addDynamicIdentifierName(String valueName) {
@@ -8811,6 +8847,13 @@ class DmSqlValidationTestGenerator {
                         if (!isBlank(normalizedPropertyName)) {
                             defaultValues.putIfAbsent(normalizedPropertyName, value);
                             namedDefaultValues.putIfAbsent(propertyName, value);
+                        }
+                    }
+
+                    private void addSetDefaultValue(String propertyName) {
+                        String normalizedPropertyName = normalizeMetadataName(propertyName);
+                        if (!isBlank(normalizedPropertyName)) {
+                            setDefaultValueNames.add(normalizedPropertyName);
                         }
                     }
 
@@ -8949,6 +8992,27 @@ class DmSqlValidationTestGenerator {
 
                     private boolean hasDefaultValue(String valueName) {
                         return containsMetadataName(defaultValues.keySet(), valueName);
+                    }
+
+                    private boolean setDefaultValue(String valueName) {
+                        return containsMetadataName(setDefaultValueNames, valueName);
+                    }
+
+                    private boolean hasSetDefaultUnder(String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        if (isBlank(normalized)) {
+                            return false;
+                        }
+                        if (setDefaultValueNames.contains(normalized)) {
+                            return true;
+                        }
+                        for (String setDefaultValueName : setDefaultValueNames) {
+                            if (setDefaultValueName.startsWith(normalized + ".")
+                                    || normalized.startsWith(setDefaultValueName + ".")) {
+                                return true;
+                            }
+                        }
+                        return false;
                     }
 
                     private Map<String, Object> defaultValues() {
