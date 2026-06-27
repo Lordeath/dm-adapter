@@ -3742,9 +3742,19 @@ class DmSqlValidationTestGenerator {
                                     continue;
                                 }
                                 field.setAccessible(true);
+                                Object rawConfigured = params.get(field.getName());
+                                if (rawConfigured == null) {
+                                    if (field.getType().isPrimitive()) {
+                                        return ValueResult.unresolved("Cannot assign null to primitive field "
+                                                + targetType.getName() + "." + field.getName() + ".");
+                                    }
+                                    field.setAccessible(true);
+                                    field.set(instance, null);
+                                    continue;
+                                }
                                 Object existingDefault = field.get(instance);
                                 Object configured = normalizeConfiguredDynamicIdentifierValue(
-                                        params.get(field.getName()),
+                                        rawConfigured,
                                         statement,
                                         field.getName(),
                                         existingDefault
@@ -6795,6 +6805,7 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("无效的列名\\\\s*\\\\[\\\\s*test\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("无效的列名\\\\s*\\\\[\\\\s*ID\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?=\\\\s*(?:(?:or|and|where|group\\\\s+by|order\\\\s+by)\\\\b|\\\\))").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\(\\\\s*(?:is\\\\s+(?:not\\\\s+)?null|(?:or|and)\\\\s*(?:=|<>|!=|>=|<=|>|<|like\\\\b|in\\\\s*\\\\())").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:and|or)\\\\s+ID(?:\\\\s|$)").matcher(message).find()
                             || Pattern.compile("\\\\b[A-Za-z_][A-Za-z0-9_$.]*\\\\s+(?:not\\\\s+)?in\\\\s*\\\\(\\\\s*ID\\\\s*\\\\)", Pattern.CASE_INSENSITIVE).matcher(message).find();
                 }
