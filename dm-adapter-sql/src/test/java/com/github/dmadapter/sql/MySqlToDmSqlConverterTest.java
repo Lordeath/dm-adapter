@@ -486,8 +486,11 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select DATEADD(MINUTE, 120, CONCAT(DATE(checkDate), ' ', onOffTime)) from record");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+                .isEqualTo("select DATEADD(MINUTE, 120, (DATE(checkDate)) || (' ') || (onOffTime)) from record");
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
+        );
     }
 
     @Test
@@ -550,8 +553,11 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select DATEADD(DAY, 1 - 1, TO_DATE(CONCAT(EXTRACT(YEAR FROM #{day}), '-01-01'), 'YYYY-MM-DD')) from dual");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE);
+                .isEqualTo("select DATEADD(DAY, 1 - 1, TO_DATE((EXTRACT(YEAR FROM #{day})) || ('-01-01'), 'YYYY-MM-DD')) from dual");
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE,
+                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
+        );
     }
 
     @Test
@@ -590,11 +596,12 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select DATE_FORMAT(LAST_DAY(DATEADD(MONTH, QUARTER (#{day}) * 3-1, DATEADD(DAY, 1 - 1, TO_DATE(CONCAT(EXTRACT(YEAR FROM #{day}), '-01-01'), 'YYYY-MM-DD')))),'%Y-%m-%d 23:59:59')");
+                .isEqualTo("select DATE_FORMAT(LAST_DAY(DATEADD(MONTH, QUARTER (#{day}) * 3-1, DATEADD(DAY, 1 - 1, TO_DATE((EXTRACT(YEAR FROM #{day})) || ('-01-01'), 'YYYY-MM-DD')))),'%Y-%m-%d 23:59:59')");
         assertThat(result.appliedRules())
                 .containsExactly(
                         MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE,
-                        MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE
+                        MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE,
+                        MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
                 );
     }
 
@@ -658,6 +665,19 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsGroupConcatMultipleExpressionsToListaggConcatenation() {
+        SqlConversionResult result = converter.convert(
+                "select GROUP_CONCAT(chargeItemName,'/',NVL(chargeStandardName,'')) from ns_meter_standard"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select LISTAGG((chargeItemName) || ('/') || (NVL(chargeStandardName,'')), ',') WITHIN GROUP (ORDER BY (chargeItemName) || ('/') || (NVL(chargeStandardName,''))) from ns_meter_standard");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
     void convertsSubstringIndexGroupConcatFirstItemToRegexpSubstrListagg() {
         SqlConversionResult result = converter.convert(
                 "select SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT rs.owner_id order by rs.house_owner_relationship_id desc , ','),',',1) from owner_house_relationship rs"
@@ -689,11 +709,47 @@ class MySqlToDmSqlConverterTest {
 
     @Test
     void doesNotConvertGroupConcatWithMultipleTopLevelExpressions() {
-        SqlConversionResult result = converter.convert("select GROUP_CONCAT(first_name, last_name) from user");
+        SqlConversionResult result = converter.convert("select GROUP_CONCAT(DISTINCT first_name, last_name) from user");
 
         assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.reason()).contains("GROUP_CONCAT");
+    }
+
+    @Test
+    void convertsMysqlConcatToDamengConcatenationOperator() {
+        SqlConversionResult result = converter.convert(
+                "select CONCAT(cd.PreinctName, '-', cd.HouseName) as userAddress from Charge_CustomerChargeDetail cd"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select (cd.PreinctName) || ('-') || (cd.HouseName) as userAddress from Charge_CustomerChargeDetail cd");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
+    }
+
+    @Test
+    void convertsSingleArgumentMysqlConcatToWrappedExpression() {
+        SqlConversionResult result = converter.convert(
+                "select CONCAT(DATE_FORMAT(CalcStartDate,'%Y-%m-%d')) as CalcStartDate from detail"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select (DATE_FORMAT(CalcStartDate,'%Y-%m-%d')) as CalcStartDate from detail");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
+    }
+
+    @Test
+    void doesNotConvertMysqlConcatWithDynamicIdentifier() {
+        SqlConversionResult result = converter.convert(
+                "select concat(${remarkField}, '\\n') from customer"
+        );
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
     }
 
     @Test
@@ -1565,8 +1621,11 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select * from schedule where LOCATE(CAST(#{precinctId} AS VARCHAR(64)), concat(',', s3.precinctID, ',')) > 0");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_LOCATE_NUMERIC_NEEDLE_RULE);
+                .isEqualTo("select * from schedule where LOCATE(CAST(#{precinctId} AS VARCHAR(64)), (',') || (s3.precinctID) || (',')) > 0");
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_LOCATE_NUMERIC_NEEDLE_RULE,
+                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
+        );
     }
 
     @Test
