@@ -77,6 +77,16 @@ class ValidationTestRunnerTest {
     }
 
     @Test
+    void targetsGeneratedValidationTestByFullyQualifiedClassName() {
+        ValidationTestGenerationResult result = generationResult(
+                tempDir.resolve("src/test/java/com/example/system/DmSqlValidationTest.java")
+        );
+
+        assertThat(new ValidationTestRunner().mavenCommand(result))
+                .contains("-Dtest=com.example.system.DmSqlValidationTest");
+    }
+
+    @Test
     void includesMavenCommandAndWorkingDirectoryInRunOutput() {
         RecordingShutdownHookRegistry shutdownHooks = new RecordingShutdownHookRegistry();
         ValidationTestRunner runner = new ValidationTestRunner(
@@ -485,11 +495,15 @@ class ValidationTestRunnerTest {
     }
 
     private ValidationTestGenerationResult generationResult() {
+        return generationResult(tempDir.resolve("src/test/java/DmSqlValidationTest.java"));
+    }
+
+    private ValidationTestGenerationResult generationResult(Path testPath) {
         return new ValidationTestGenerationResult(
                 tempDir,
                 tempDir,
                 tempDir.resolve(".dm-adapter/sql-validation.yml"),
-                tempDir.resolve("src/test/java/DmSqlValidationTest.java"),
+                testPath,
                 List.of(),
                 List.of()
         );
