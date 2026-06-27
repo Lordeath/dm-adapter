@@ -220,6 +220,40 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
+    void learnsIdentityInsertTablesFromPreviousValidationReport() throws Exception {
+        Path adapterDir = tempDir.resolve(".dm-adapter");
+        Files.createDirectories(adapterDir);
+        Files.writeString(adapterDir.resolve("sql-validation-report.json"), """
+                {
+                  "records": [
+                    {
+                      "status": "FAILED",
+                      "summary": "仅当指定列列表，且SET IDENTITY_INSERT为ON时，才能对自增列赋值",
+                      "message": "### SQL: INSERT INTO ns_bill_openbill_interface_log_history ( id, name ) values (?, ?) ### Cause: dm.jdbc.driver.DMException: 仅当指定列列表，且SET IDENTITY_INSERT为ON时，才能对自增列赋值"
+                    }
+                  ]
+                }
+                """);
+        Path config = adapterDir.resolve("sql-rewrite.yml");
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(),
+                Map.of(),
+                false
+        );
+
+        assertThat(update.warnings())
+                .contains("Learned identityInsertTables entry ns_bill_openbill_interface_log_history from previous Dameng SQL validation report.");
+        assertThat(update.rewriteConfig().requiresIdentityInsert("ns_bill_openbill_interface_log_history")).isTrue();
+        assertThat(Files.readString(config))
+                .contains("identityInsertTables:")
+                .contains("- \"ns_bill_openbill_interface_log_history\"");
+    }
+
+    @Test
     void doesNotInferKeyColumnsWhenInsertColumnsCannotBeParsed() throws Exception {
         Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(

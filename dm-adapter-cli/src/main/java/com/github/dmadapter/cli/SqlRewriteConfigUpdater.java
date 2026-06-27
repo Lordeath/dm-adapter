@@ -1,5 +1,7 @@
 package com.github.dmadapter.cli;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dmadapter.core.AdapterContext;
 import com.github.dmadapter.core.FileChange;
 import com.github.dmadapter.mybatis.SqlRewriteConfig;
@@ -19,6 +21,7 @@ import java.util.Set;
 
 class SqlRewriteConfigUpdater {
     private final UpsertKeyInference inference = new UpsertKeyInference();
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     SqlRewriteConfigUpdate update(
             AdapterContext context,
@@ -28,12 +31,19 @@ class SqlRewriteConfigUpdater {
             Map<String, TableKeyMetadata> metadataByTable,
             boolean metadataAvailable
     ) {
-        if (candidates.isEmpty()) {
+        List<String> warnings = new ArrayList<>();
+        List<String> learnedIdentityInsertTables = identityInsertTablesFromPreviousValidationReport(context, warnings);
+        if (candidates.isEmpty() && learnedIdentityInsertTables.isEmpty()) {
             return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), List.of());
         }
 
         RewriteConfigModel model = RewriteConfigModel.load(rewriteConfigPath);
-        List<String> warnings = new ArrayList<>();
+        for (String table : learnedIdentityInsertTables) {
+            if (model.ensureIdentityInsertTable(table)) {
+                warnings.add("Learned identityInsertTables entry " + table
+                        + " from previous Dameng SQL validation report.");
+            }
+        }
         Map<String, List<String>> inferredMethodKeys = new LinkedHashMap<>();
         Map<String, List<UpsertKeyInference.InferenceResult>> tableInferenceResults = new LinkedHashMap<>();
 
@@ -119,8 +129,14 @@ class SqlRewriteConfigUpdater {
                 loadedRewriteConfig.ignoredMissingTables(),
                 loadedRewriteConfig.ignoredMissingColumns(),
                 loadedRewriteConfig.ignoredMissingSchemas(),
-                loadedRewriteConfig.identityInsertTables()
+                mergedIdentityInsertTables(loadedRewriteConfig, model)
         );
+    }
+
+    private Set<String> mergedIdentityInsertTables(SqlRewriteConfig loadedRewriteConfig, RewriteConfigModel model) {
+        Set<String> identityInsertTables = new LinkedHashSet<>(loadedRewriteConfig.identityInsertTables());
+        identityInsertTables.addAll(model.identityInsertTables());
+        return identityInsertTables;
     }
 
     private Optional<FileChange> writeIfChanged(AdapterContext context, Path rewriteConfigPath, RewriteConfigModel model) {
@@ -169,10 +185,54 @@ class SqlRewriteConfigUpdater {
         return normalized;
     }
 
+    private List<String> identityInsertTablesFromPreviousValidationReport(
+            AdapterContext context,
+            List<String> warnings
+    ) {
+        Path report = context.projectRoot().resolve(".dm-adapter/sql-validation-report.json");
+        if (!Files.isRegularFile(report)) {
+            return List.of();
+        }
+        try {
+            JsonNode records = objectMapper.readTree(report.toFile()).path("records");
+            if (!records.isArray()) {
+                return List.of();
+            }
+            Set<String> tables = new LinkedHashSet<>();
+            for (JsonNode record : records) {
+                if (!"FAILED".equalsIgnoreCase(record.path("status").asText())) {
+                    continue;
+                }
+                String text = record.path("summary").asText("")
+                        + "\n"
+                        + record.path("message").asText("");
+                if (!isIdentityInsertFailure(text)) {
+                    continue;
+                }
+                String table = InsertColumnExtractor.tableName(text);
+                if (!table.isBlank()) {
+                    tables.add(table);
+                }
+            }
+            return List.copyOf(tables);
+        } catch (IOException e) {
+            warnings.add("Could not inspect previous SQL validation report for identityInsertTables hints: "
+                    + e.getMessage());
+            return List.of();
+        }
+    }
+
+    private boolean isIdentityInsertFailure(String text) {
+        String lower = text == null ? "" : text.toLowerCase(Locale.ROOT);
+        return lower.contains("set identity_insert")
+                && (text.contains("自增列") || lower.contains("identity"));
+    }
+
     private static final class RewriteConfigModel {
         private final LinkedHashMap<String, List<String>> tableKeys = new LinkedHashMap<>();
         private final LinkedHashMap<String, List<String>> methodKeys = new LinkedHashMap<>();
         private final List<String> identityInsertLines = new ArrayList<>();
+        private final LinkedHashSet<String> identityInsertTables = new LinkedHashSet<>();
         private final List<String> validationIgnoreLines = new ArrayList<>();
         private final List<String> validationArgsLines = new ArrayList<>();
 
@@ -246,6 +306,26 @@ class SqlRewriteConfigUpdater {
             return result;
         }
 
+        Set<String> identityInsertTables() {
+            return Set.copyOf(identityInsertTables);
+        }
+
+        boolean ensureIdentityInsertTable(String table) {
+            if (table == null || table.isBlank()) {
+                return false;
+            }
+            String normalized = normalizeTableName(table);
+            boolean exists = identityInsertTables.stream()
+                    .map(this::normalizeTableName)
+                    .anyMatch(normalized::equals);
+            if (exists) {
+                return false;
+            }
+            identityInsertTables.add(table.trim());
+            rebuildIdentityInsertLines();
+            return true;
+        }
+
         String toYaml() {
             StringBuilder yaml = new StringBuilder();
             yaml.append("# dm-adapter SQL rewrite config.\n")
@@ -290,6 +370,7 @@ class SqlRewriteConfigUpdater {
 
         private void parse(List<String> lines) {
             identityInsertLines.addAll(topLevelBlockStartingWith(lines, "identityInsertTables:"));
+            identityInsertTables.addAll(parseIdentityInsertTables(identityInsertLines));
             validationArgsLines.addAll(topLevelBlock(lines, "validationArgs:"));
             validationIgnoreLines.addAll(topLevelBlock(lines, "validationIgnores:"));
             String section = "";
@@ -341,6 +422,32 @@ class SqlRewriteConfigUpdater {
                     }
                 }
             }
+        }
+
+        private void rebuildIdentityInsertLines() {
+            identityInsertLines.clear();
+            identityInsertLines.add("identityInsertTables:");
+            identityInsertTables.forEach(table -> identityInsertLines.add("  - " + quoteValue(table)));
+        }
+
+        private static List<String> parseIdentityInsertTables(List<String> lines) {
+            List<String> tables = new ArrayList<>();
+            for (String line : lines) {
+                String withoutComment = stripComment(line);
+                String trimmed = withoutComment.trim();
+                int indent = leadingSpaces(withoutComment);
+                if (indent == 0 && trimmed.startsWith("identityInsertTables:")) {
+                    tables.addAll(parseInlineList(trimmed.substring("identityInsertTables:".length())));
+                    continue;
+                }
+                if (indent >= 2 && trimmed.startsWith("- ")) {
+                    String table = unquote(trimmed.substring(2).trim());
+                    if (!table.isBlank()) {
+                        tables.add(table);
+                    }
+                }
+            }
+            return tables;
         }
 
         private static List<String> topLevelBlock(List<String> lines, String header) {
