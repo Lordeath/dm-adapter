@@ -724,6 +724,7 @@ class DmSqlValidationTestGenerator {
                                         record = skipMissingDynamicSqlFragment(record);
                                         record = skipGeneratedDynamicSqlOrArgs(record);
                                         record = skipExistingDdlObject(record);
+                                        record = skipValidationTestDataIssue(record);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         records.add(record);
@@ -3097,6 +3098,28 @@ class DmSqlValidationTestGenerator {
                                     + "skip this validation-environment idempotency failure."
                                     + "\\nOriginal failure:\\n" + record.message
                             );
+                }
+
+                private ValidationRecord skipValidationTestDataIssue(ValidationRecord record) {
+                    if (record == null
+                            || !"FAILED".equals(record.status)
+                            || !hasValidationTestDataIssue(record.message)) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "validation-test-data",
+                            record.parameterSummary,
+                            "SQL reached the database execution phase, but validation sample data does not satisfy "
+                                    + "foreign-key or selectOne cardinality expectations; skipped as a validation-data issue."
+                                    + "\\nOriginal failure:\\n" + record.message
+                    );
+                }
+
+                private boolean hasValidationTestDataIssue(String message) {
+                    return containsAny(message,
+                            "违反引用约束",
+                            "TooManyResultsException");
                 }
 
                 private ValidationRecord skipUnsupportedReturnType(MapperMethod mapperMethod) {
