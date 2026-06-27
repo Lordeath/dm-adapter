@@ -2348,6 +2348,52 @@ class MapperMigratorTest {
                 .containsExactly(MapperXmlRewriter.MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
     }
 
+    @Test
+    void quotesDynamicKeywordAliasReferencesSplitAcrossXmlNodes() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/OwnerHouseResultMapper.xml", """
+                select base.house_id,
+                       cluster.house_id as clusterId,
+                       cluster.cluster_no as clusterNo
+                <choose>
+                    <when test="includeBuilder != null">
+                       ,cluster.builder
+                    </when>
+                </choose>
+                from owner_house_base_info base
+                left join owner_house_cluster_info cluster on base.cluster_id = cluster.house_id
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/OwnerHouseResultMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/OwnerHouseResultMapper.xml"));
+        assertThat(rewritten)
+                .contains("\"cluster\".house_id as clusterId")
+                .contains("\"cluster\".cluster_no as clusterNo")
+                .contains(",\"cluster\".builder")
+                .contains("left join owner_house_cluster_info \"cluster\" on base.cluster_id = \"cluster\".house_id")
+                .doesNotContain(" cluster.house_id as clusterId")
+                .doesNotContain(" cluster.cluster_no as clusterNo");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE
+                );
+    }
+
     private int countMatches(String value, String needle) {
         int count = 0;
         int index = 0;
