@@ -29,6 +29,8 @@ public class MapperXmlRewriter {
     public static final String MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE = "MYBATIS_DYNAMIC_SET_MISSING_COMMA";
     public static final String MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE =
             "MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT";
+    public static final String MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE =
+            "MYBATIS_DYNAMIC_WHERE_MISSING_AND";
     public static final String MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE =
             "MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA";
     public static final String MYBATIS_STATIC_WHERE_MISSING_AND_RULE =
@@ -99,6 +101,10 @@ public class MapperXmlRewriter {
     private static final Pattern WHERE_PREDICATE_START_PATTERN = Pattern.compile(
             "(?is)^\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
                     + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))*\\s*"
+                    + "(?:=|<>|!=|>=|<=|>|<|in\\b|like\\b|between\\b|is\\b)"
+    );
+    private static final Pattern WHERE_FUNCTION_PREDICATE_START_PATTERN = Pattern.compile(
+            "(?is)^\\s*[A-Za-z_][A-Za-z0-9_$]*\\s*\\([^)]*\\)\\s*"
                     + "(?:=|<>|!=|>=|<=|>|<|in\\b|like\\b|between\\b|is\\b)"
     );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
@@ -639,6 +645,11 @@ public class MapperXmlRewriter {
         if (staticWhereAnd.changed()) {
             converted = staticWhereAnd.text();
             appliedRules.add(MYBATIS_STATIC_WHERE_MISSING_AND_RULE);
+        }
+        TextRewrite dynamicWhereAnd = addMissingDynamicWhereAnd(converted);
+        if (dynamicWhereAnd.changed()) {
+            converted = dynamicWhereAnd.text();
+            appliedRules.add(MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE);
         }
 
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
@@ -3771,7 +3782,8 @@ public class MapperXmlRewriter {
                 || stripped.contains("<![CDATA[")) {
             return false;
         }
-        return WHERE_PREDICATE_START_PATTERN.matcher(stripped).find();
+        return WHERE_PREDICATE_START_PATTERN.matcher(stripped).find()
+                || WHERE_FUNCTION_PREDICATE_START_PATTERN.matcher(stripped).find();
     }
 
     private boolean isFollowedByForeachTag(String body, int start) {
@@ -3793,6 +3805,178 @@ public class MapperXmlRewriter {
             return stripped.regionMatches(true, 0, "<foreach", 0, "<foreach".length());
         }
         return false;
+    }
+
+    private TextRewrite addMissingDynamicWhereAnd(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "where".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "where", body.length());
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                addMissingDynamicWhereAndInRange(body, tag.endIndex(), closingStart, replacements);
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+            } else {
+                index = tag.endIndex();
+            }
+        }
+        return applyTextReplacements(body, replacements);
+    }
+
+    private void addMissingDynamicWhereAndInRange(
+            String body,
+            int start,
+            int end,
+            List<TextReplacement> replacements
+    ) {
+        String lastMeaningfulLine = "";
+        int index = start;
+        while (index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                lastMeaningfulLine = addMissingDynamicWhereAndInText(
+                        body,
+                        index,
+                        end,
+                        lastMeaningfulLine
+                );
+                return;
+            }
+            if (tagStart > index) {
+                lastMeaningfulLine = addMissingDynamicWhereAndInText(
+                        body,
+                        index,
+                        tagStart,
+                        lastMeaningfulLine
+                );
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "if".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "if", end);
+                if (closingStart >= 0) {
+                    int closingEnd = body.indexOf('>', closingStart + 1);
+                    if (closingEnd >= 0 && closingEnd + 1 <= end) {
+                        String ifBody = body.substring(tag.endIndex(), closingStart);
+                        String firstLine = firstMeaningfulSqlLine(ifBody);
+                        if (isDynamicWherePredicateFragment(ifBody)
+                                && !startsWithWhereConnector(firstLine)
+                                && !isAfterOpenWhereConnector(lastMeaningfulLine)) {
+                            int insertionIndex = firstNonWhitespaceIndex(body, tag.endIndex(), closingStart);
+                            replacements.add(new TextReplacement(insertionIndex, insertionIndex, "and "));
+                            lastMeaningfulLine = "and " + firstLine;
+                        } else if (!firstLine.isBlank()) {
+                            lastMeaningfulLine = firstLine;
+                        }
+                        index = closingEnd + 1;
+                        continue;
+                    }
+                }
+            } else if (!tag.closing() && !tag.selfClosing() && isNestedDynamicWhereContainer(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), tag.name(), end);
+                if (closingStart >= 0) {
+                    int closingEnd = body.indexOf('>', closingStart + 1);
+                    index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+                    continue;
+                }
+            }
+            index = tag.endIndex();
+        }
+    }
+
+    private String addMissingDynamicWhereAndInText(
+            String body,
+            int start,
+            int end,
+            String lastMeaningfulLine
+    ) {
+        int lineStart = start;
+        String previousLine = lastMeaningfulLine;
+        while (lineStart < end) {
+            int lineEnd = body.indexOf('\n', lineStart);
+            if (lineEnd < 0 || lineEnd >= end) {
+                lineEnd = end;
+            }
+            int contentEnd = lineEnd;
+            if (contentEnd > lineStart && body.charAt(contentEnd - 1) == '\r') {
+                contentEnd--;
+            }
+            String line = body.substring(lineStart, contentEnd);
+            String stripped = line.strip();
+            if (!isIgnorableSqlLine(stripped)) {
+                previousLine = stripped;
+            }
+            lineStart = lineEnd < end ? lineEnd + 1 : end;
+        }
+        return previousLine;
+    }
+
+    private boolean isDynamicWherePredicateFragment(String fragment) {
+        if (fragment == null || fragment.isBlank()) {
+            return false;
+        }
+        if (DYNAMIC_XML_TAG_PATTERN.matcher(fragment).find()) {
+            return false;
+        }
+        String firstLine = firstMeaningfulSqlLine(fragment);
+        return !firstLine.isBlank()
+                && (startsWithWhereConnector(firstLine) || isStaticWherePredicateLine(firstLine));
+    }
+
+    private boolean isNestedDynamicWhereContainer(String tagName) {
+        if (tagName == null) {
+            return false;
+        }
+        String normalized = tagName.toLowerCase(Locale.ROOT);
+        return "foreach".equals(normalized)
+                || "choose".equals(normalized)
+                || "when".equals(normalized)
+                || "otherwise".equals(normalized)
+                || "trim".equals(normalized);
+    }
+
+    private String firstMeaningfulSqlLine(String fragment) {
+        int lineStart = 0;
+        while (lineStart < fragment.length()) {
+            int lineEnd = fragment.indexOf('\n', lineStart);
+            if (lineEnd < 0) {
+                lineEnd = fragment.length();
+            }
+            String line = fragment.substring(lineStart, lineEnd).strip();
+            if (!isIgnorableSqlLine(line)) {
+                return line;
+            }
+            lineStart = lineEnd < fragment.length() ? lineEnd + 1 : fragment.length();
+        }
+        return "";
+    }
+
+    private boolean startsWithWhereConnector(String value) {
+        return WHERE_CONNECTOR_LINE_PATTERN.matcher(value == null ? "" : value).find();
+    }
+
+    private boolean isAfterOpenWhereConnector(String previousLine) {
+        if (previousLine == null || previousLine.isBlank()) {
+            return false;
+        }
+        return WHERE_TRAILING_OPEN_CONNECTOR_PATTERN.matcher(previousLine).matches()
+                || WHERE_TRAILING_CONNECTOR_PATTERN.matcher(previousLine).matches();
     }
 
     private int nextLineStart(String value, int lineEnd) {

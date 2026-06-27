@@ -6637,6 +6637,9 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_USER_VARIABLE";
                     }
+                    if (hasTestDataOrConstraintIssue(message)) {
+                        return "TEST_DATA_OR_CONSTRAINT";
+                    }
                     if (hasMissingDynamicIdentifierIssue(message)) {
                         return "DYNAMIC_IDENTIFIER_PARAMETER";
                     }
@@ -6804,17 +6807,6 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(message).find()) {
                         return "INSERT_VALUES_ASSIGNMENT";
                     }
-                    if (containsAny(message,
-                            "非空约束",
-                            "违反列[",
-                            "长度超出定义",
-                            "类型转换异常",
-                            "唯一性约束",
-                            "非法的时间日期类型数据",
-                            "SET IDENTITY_INSERT",
-                            "自增列")) {
-                        return "TEST_DATA_OR_CONSTRAINT";
-                    }
                     return category(record) + "_OTHER";
                 }
 
@@ -6850,7 +6842,6 @@ class DmSqlValidationTestGenerator {
                     String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("sql语句为null或空值")
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\binsert\\\\s+into\\\\s*\\\\(").matcher(value).find()
-                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\s+(?:set|where)\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)无效的表或视图名\\\\s*\\\\[\\\\s*(?:t|b|ID)\\\\s*][\\\\s\\\\S]*?### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join|update|into|table)\\\\s+(?:t|b|ID)\\\\b").matcher(value).find();
                 }
@@ -6923,6 +6914,7 @@ class DmSqlValidationTestGenerator {
                     String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
                             || hasUnbalancedSqlParentheses(value)
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(value).find()
@@ -6932,6 +6924,18 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*(?:=|<>|!=|>=|<=|>|<|like)\\\\s*(?:\\\\?|\\\\d+|'[^']*'|\\\\([^)]*\\\\))\\\\s+" + identifier + "\\\\s+(?:in\\\\s*\\\\(|=|<>|!=|>=|<=|>|<|like\\\\b|is\\\\b)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(value).find();
+                }
+
+                private boolean hasTestDataOrConstraintIssue(String message) {
+                    return containsAny(message,
+                            "非空约束",
+                            "违反列[",
+                            "长度超出定义",
+                            "类型转换异常",
+                            "唯一性约束",
+                            "非法的时间日期类型数据",
+                            "SET IDENTITY_INSERT",
+                            "自增列");
                 }
 
                 private boolean hasUnbalancedSqlParentheses(String message) {
@@ -7115,6 +7119,16 @@ class DmSqlValidationTestGenerator {
                     if (hasDamengCtasBindParameter(message)) {
                         return "SQL_SYNTAX";
                     }
+                    if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
+                    }
+                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的变量名", "无效的模式名", "无法解析的成员访问表达式")) {
+                        return "TEST_SCHEMA";
+                    }
+                    if (hasTestDataOrConstraintIssue(message)
+                            || containsAny(message, "数据类型不匹配", "NumberFormatException", "违反引用约束")) {
+                        return "TEST_DATA_OR_SCHEMA";
+                    }
                     if (hasMissingDynamicIdentifierIssue(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
@@ -7130,26 +7144,6 @@ class DmSqlValidationTestGenerator {
                             || hasMysqlUpdateJoinMultiTarget(message)
                             || hasOriginalXmlSyntaxDefect(message)) {
                         return "SQL_SYNTAX";
-                    }
-                    if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
-                        return "METHOD_ARGS_OR_BINDING";
-                    }
-                    if (containsAny(message, "无效的表或视图名", "无效的列名", "无效的变量名", "无效的模式名", "无法解析的成员访问表达式")) {
-                        return "TEST_SCHEMA";
-                    }
-                    if (containsAny(message,
-                            "非空约束",
-                            "违反列[",
-                            "长度超出定义",
-                            "类型转换异常",
-                            "数据类型不匹配",
-                            "NumberFormatException",
-                            "唯一性约束",
-                            "违反引用约束",
-                            "非法的时间日期类型数据",
-                            "SET IDENTITY_INSERT",
-                            "自增列")) {
-                        return "TEST_DATA_OR_SCHEMA";
                     }
                     if (containsAny(message,
                             "语法分析出错",

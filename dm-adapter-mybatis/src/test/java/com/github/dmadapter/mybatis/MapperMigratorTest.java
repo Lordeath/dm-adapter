@@ -1233,6 +1233,106 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicWhereAddsMissingAndBeforeConditionalPredicates() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CarryOverTaskMapper">
+                    <select id="selectByCondition" parameterType="com.example.CarryOverTask" resultType="map">
+                        select *
+                        from charge_auto_carry_over_task
+                        <where>
+                            <if test="enterpriseId != null">
+                                enterprise_id = #{enterpriseId,jdbcType=BIGINT}
+                            </if>
+                            <if test="organizationId != null">
+                                organization_id = #{organizationId,jdbcType=BIGINT}
+                            </if>
+                            <if test="taskName != null">
+                                task_name = #{taskName,jdbcType=VARCHAR}
+                            </if>
+                        </where>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CarryOverTaskMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CarryOverTaskMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CarryOverTaskMapper.xml"));
+        assertThat(rewritten)
+                .contains("and enterprise_id = #{enterpriseId")
+                .contains("and organization_id = #{organizationId")
+                .contains("and task_name = #{taskName");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE);
+    }
+
+    @Test
+    void dynamicWhereAddsMissingAndBeforeConditionalFunctionPredicate() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="selectShouldPaymentKFS" parameterType="map" resultType="map">
+                        select *
+                        from Charge_CustomerChargeDetail c
+                        <where>
+                            and c.OwnerId = #{ownerId}
+                            <if test="isAccount != null">
+                                ifnull(uncancelAccountAmount, 0) != 0
+                            </if>
+                            <if test="isKongzhi != null">
+                                and ifnull(c.isKongzhi, 0) = #{isKongzhi}
+                            </if>
+                        </where>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml"));
+        assertThat(rewritten)
+                .contains("and NVL(uncancelAccountAmount, 0) != 0")
+                .contains("and NVL(c.isKongzhi, 0) = #{isKongzhi}")
+                .doesNotContain("and and");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains("IFNULL_TO_NVL", MapperXmlRewriter.MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE);
+    }
+
+    @Test
     void dynamicUpdateSetAddsMissingCommasBetweenConditionalAssignments() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
