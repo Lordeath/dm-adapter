@@ -2559,6 +2559,59 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicHavingMovesSimpleConditionWithoutMovingTrailingSemicolon() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ProcessMapper">
+                    <select id="getDoneInstCount">
+                        SELECT count(DISTINCT id_) AS "count", type_id_ AS "typeId"
+                        FROM (
+                            SELECT wfInst.id_, wfInst.type_id_
+                            FROM bpm_check_opinion bco
+                            INNER JOIN bpm_pro_inst wfInst ON bco.PROC_INST_ID_ = wfInst.ID_
+                            WHERE auditor_ = #{ew.paramNameValuePairs.userId}
+                            <if test="ew.paramNameValuePairs.leaders != null">
+                            </if>
+                        ) AS combined
+                        GROUP BY combined.type_id_
+                        HAVING combined.type_id_ IS NOT NULL;
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ProcessMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ProcessMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ProcessMapper.xml"));
+        assertThat(rewritten)
+                .contains("WHERE\n")
+                .contains("combined.type_id_ IS NOT NULL")
+                .contains("GROUP BY combined.type_id_")
+                .doesNotContain("combined.type_id_ IS NOT NULL;\n")
+                .doesNotContain("HAVING combined.type_id_ IS NOT NULL");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicHavingKeepsComplexOrConditionsForManualReview() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

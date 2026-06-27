@@ -1850,7 +1850,7 @@ public class MapperXmlRewriter {
     private String joinMovedConditions(List<String> conditions, boolean prefixAnd) {
         StringBuilder joined = new StringBuilder();
         for (String condition : conditions) {
-            String normalized = removeLeadingBooleanConnector(condition).strip();
+            String normalized = stripTrailingSqlTerminator(removeLeadingBooleanConnector(condition).strip());
             if (normalized.isBlank()) {
                 continue;
             }
@@ -1862,6 +1862,14 @@ public class MapperXmlRewriter {
             joined.append(normalized);
         }
         return joined.toString();
+    }
+
+    private String stripTrailingSqlTerminator(String value) {
+        String stripped = value.stripTrailing();
+        if (stripped.endsWith(";")) {
+            return stripped.substring(0, stripped.length() - 1).stripTrailing();
+        }
+        return stripped;
     }
 
     private String insertMovedHavingConditions(
