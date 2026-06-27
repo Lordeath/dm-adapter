@@ -797,6 +797,12 @@ class DmAdapterCliTest {
                 .contains("isYearLikeParameterName")
                 .contains("hasTemporalRangeQualifier")
                 .contains("isDayOfMonthParameterName")
+                .contains("DateTimeFormatter.ofPattern(\"yyyy-MM-dd HH:mm:ss\")")
+                .contains("\"yyyy-MM-dd HH:mm:ss.S\"")
+                .contains("\"yyyy-MM-dd HH:mm:ss.SSS\"")
+                .contains("private boolean isConfiguredDateTimeLiteral(String value)")
+                .contains("if (isConfiguredDateTimeLiteral(text))")
+                .contains("int fieldLimit = 32;")
                 .contains("shouldKeepConfiguredCollectionValue")
                 .contains("\"ID\".equalsIgnoreCase(text)")
                 .contains("private Set<String> optionalDynamicSqlFragmentNames(String test)")
@@ -829,6 +835,8 @@ class DmAdapterCliTest {
                 .contains("private boolean hasRegexpOperatorIssue(String message)")
                 .contains("lower.contains(\"regexp_like\")")
                 .contains("lower.contains(\"正则表达式\")");
+        assertThat(generatedTestSource)
+                .doesNotContain("return isDateLikeParameterName(normalized) && configuredInstant(text) != null;");
         assertThat(generatedTestSource)
                 .contains("Map<String, Object> normalizedParams = normalizeValidationParameterMap(new LinkedHashMap<>(params));")
                 .contains("!normalizedParams.containsKey(field.getName())")
