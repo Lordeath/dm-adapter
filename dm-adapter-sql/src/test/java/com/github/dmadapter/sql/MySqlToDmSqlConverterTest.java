@@ -295,6 +295,25 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesDuplicateWhereKeywordOutsideIgnoredText() {
+        SqlConversionResult result = converter.convert("""
+                update charge_allowance_detail
+                set isdelete = 1
+                where where id = #{id} and note = 'where where'
+                -- where where should stay in comments
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update charge_allowance_detail
+                set isdelete = 1
+                where id = #{id} and note = 'where where'
+                -- where where should stay in comments
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DUPLICATE_WHERE_KEYWORD_RULE);
+    }
+
+    @Test
     void convertsMysqlConvertDecimalToCast() {
         SqlConversionResult result = converter.convert(
                 "SELECT CONVERT(NVL(SUM(charging_area),0), DECIMAL(16,6)) as chargingArea from owner_house_result"
