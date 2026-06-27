@@ -1574,7 +1574,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesMysqlUpdateJoinThatSetsJoinedTableForManualReview() {
+    void convertsMysqlUpdateJoinThatSetsMultipleAliasesToDamengBlock() {
         SqlConversionResult result = converter.convert("""
                 update ns_quality_check_schedule_task a
                 join ns_quality_check_schedule_task_user u on a.ID = u.checkScheduleTaskID
@@ -1582,9 +1582,14 @@ class MySqlToDmSqlConverterTest {
                 where a.ID = #{id}
                 """);
 
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.changed()).isFalse();
-        assertThat(result.reason()).contains("UPDATE JOIN");
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                BEGIN
+                update ns_quality_check_schedule_task_user u set u.checkUserID = #{userId} from ns_quality_check_schedule_task a where a.ID = u.checkScheduleTaskID and a.ID = #{id};
+                update ns_quality_check_schedule_task a set a.transferType = 1 from ns_quality_check_schedule_task_user u where a.ID = u.checkScheduleTaskID and a.ID = #{id};
+                END;""");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
     }
 
     @Test
