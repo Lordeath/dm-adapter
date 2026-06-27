@@ -34,6 +34,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
     public static final String MYSQL_CONCAT_TO_DM_OPERATOR_RULE = "MYSQL_CONCAT_TO_DM_OPERATOR";
+    public static final String MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE =
+            "MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT";
     public static final String MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE =
             "MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR";
     public static final String MYSQL_HAVING_AGGREGATE_ALIAS_RULE = "MYSQL_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
@@ -516,6 +518,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (locateNumericNeedleConversion.changed()) {
             converted = locateNumericNeedleConversion.convertedSql();
             rules.add(MYSQL_LOCATE_NUMERIC_NEEDLE_RULE);
+        }
+
+        GenericConversion likePlaceholderLiteralConversion = convertLikePlaceholderLiteralConcatenation(converted);
+        if (likePlaceholderLiteralConversion.changed()) {
+            converted = likePlaceholderLiteralConversion.convertedSql();
+            rules.add(MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE);
         }
 
         GenericConversion concatConversion = convertConcat(converted);
@@ -4303,6 +4311,84 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return expression.toString();
     }
 
+    private GenericConversion convertLikePlaceholderLiteralConcatenation(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsKeyword(sql, index, "LIKE")) {
+                LikePlaceholderLiteralConcat concat = readLikePlaceholderLiteralConcat(sql, index);
+                if (concat == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(sql, index, concat.operandStartIndex());
+                    converted.append(concat.replacement());
+                    index = concat.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private LikePlaceholderLiteralConcat readLikePlaceholderLiteralConcat(String sql, int likeIndex) {
+        int operandStart = skipWhitespace(sql, likeIndex + "LIKE".length());
+        if (sql.startsWith("#{", operandStart)) {
+            int placeholderEnd = skipMyBatisPlaceholder(sql, operandStart);
+            int literalStart = skipWhitespace(sql, placeholderEnd);
+            SingleQuotedStringLiteral literal = readClosedSingleQuotedStringLiteral(sql, literalStart);
+            if (literal == null) {
+                return null;
+            }
+            String placeholder = sql.substring(operandStart, placeholderEnd);
+            String literalText = sql.substring(literalStart, literal.nextIndex());
+            return new LikePlaceholderLiteralConcat(
+                    operandStart,
+                    literal.nextIndex(),
+                    "(" + placeholder + ") || (" + literalText + ")"
+            );
+        }
+        SingleQuotedStringLiteral literal = readClosedSingleQuotedStringLiteral(sql, operandStart);
+        if (literal == null) {
+            return null;
+        }
+        int placeholderStart = skipWhitespace(sql, literal.nextIndex());
+        if (!sql.startsWith("#{", placeholderStart)) {
+            return null;
+        }
+        int placeholderEnd = skipMyBatisPlaceholder(sql, placeholderStart);
+        String literalText = sql.substring(operandStart, literal.nextIndex());
+        String placeholder = sql.substring(placeholderStart, placeholderEnd);
+        return new LikePlaceholderLiteralConcat(
+                operandStart,
+                placeholderEnd,
+                "(" + literalText + ") || (" + placeholder + ")"
+        );
+    }
+
+    private SingleQuotedStringLiteral readClosedSingleQuotedStringLiteral(String sql, int start) {
+        if (start >= sql.length() || sql.charAt(start) != '\'') {
+            return null;
+        }
+        SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(sql, start);
+        return literal.closed() ? literal : null;
+    }
+
     private GenericConversion convertSubstringIndex(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
@@ -5402,6 +5488,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record GroupConcatOrderBy(String orderBy, String separator) {
+    }
+
+    private record LikePlaceholderLiteralConcat(int operandStartIndex, int endIndex, String replacement) {
     }
 
     private record SingleQuotedStringLiteral(String value, int nextIndex, boolean closed) {
