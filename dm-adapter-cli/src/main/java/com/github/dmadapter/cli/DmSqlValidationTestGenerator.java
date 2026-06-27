@@ -709,6 +709,7 @@ class DmSqlValidationTestGenerator {
                                     long startedAt = System.currentTimeMillis();
                                     ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
                                     record = skipIgnoredMissingTable(record, config);
+                                    record = skipIgnoredMissingColumn(record, config);
                                     records.add(record);
                                     logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                                 }
@@ -2771,6 +2772,38 @@ class DmSqlValidationTestGenerator {
                     for (String table : bracketedValuesAfterMarker(message, "无效的表或视图名")) {
                         if (config.ignoresMissingTable(table)) {
                             return table;
+                        }
+                    }
+                    return null;
+                }
+
+                private ValidationRecord skipIgnoredMissingColumn(ValidationRecord record, ValidationConfig config) {
+                    if (record == null || !"FAILED".equals(record.status)) {
+                        return record;
+                    }
+                    String ignoredColumn = ignoredMissingColumn(record.message, config);
+                    if (ignoredColumn == null) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "ignored-missing-column",
+                            record.parameterSummary,
+                            "Ignored missing column [" + ignoredColumn
+                                    + "] by .dm-adapter/sql-rewrite.yml validationIgnores.missingColumns.\\n"
+                                    + "Original failure:\\n" + record.message
+                    );
+                }
+
+                private String ignoredMissingColumn(String message, ValidationConfig config) {
+                    if (config == null) {
+                        return null;
+                    }
+                    for (String marker : listOf("无效的列名", "无效的变量名", "无法解析的成员访问表达式")) {
+                        for (String column : bracketedValuesAfterMarker(message, marker)) {
+                            if (config.ignoresMissingColumn(column)) {
+                                return column;
+                            }
                         }
                     }
                     return null;
@@ -5690,6 +5723,30 @@ class DmSqlValidationTestGenerator {
                     return result;
                 }
 
+                private List<String> mergeMissingColumnIgnores(List<String> originalLines, List<String> suggestedColumns) {
+                    List<String> result = new ArrayList<>(originalLines);
+                    int ignoreStart = topLevelSectionStart(result, "validationIgnores:");
+                    if (ignoreStart < 0) {
+                        if (!result.isEmpty() && !isBlank(result.get(result.size() - 1))) {
+                            result.add("");
+                        }
+                        result.add("validationIgnores:");
+                        result.add("  missingColumns:");
+                        appendMissingColumnSuggestions(result, suggestedColumns);
+                        return result;
+                    }
+                    int ignoreEnd = topLevelSectionEnd(result, ignoreStart);
+                    int missingColumnsStart = missingColumnsSectionStart(result, ignoreStart, ignoreEnd);
+                    if (missingColumnsStart < 0) {
+                        result.add(ignoreEnd++, "  missingColumns:");
+                        appendMissingColumnSuggestions(result, ignoreEnd, suggestedColumns);
+                        return result;
+                    }
+                    int missingColumnsEnd = missingTablesSectionEnd(result, missingColumnsStart, ignoreEnd);
+                    appendMissingColumnSuggestions(result, missingColumnsEnd, suggestedColumns);
+                    return result;
+                }
+
                 private void appendMissingTableSuggestions(List<String> lines, List<String> suggestedTables) {
                     appendMissingTableSuggestions(lines, lines.size(), suggestedTables);
                 }
@@ -5702,11 +5759,34 @@ class DmSqlValidationTestGenerator {
                     lines.addAll(index, suggestionLines);
                 }
 
+                private void appendMissingColumnSuggestions(List<String> lines, List<String> suggestedColumns) {
+                    appendMissingColumnSuggestions(lines, lines.size(), suggestedColumns);
+                }
+
+                private void appendMissingColumnSuggestions(List<String> lines, int index, List<String> suggestedColumns) {
+                    List<String> suggestionLines = new ArrayList<>();
+                    for (String column : suggestedColumns) {
+                        suggestionLines.add("#    - " + quoteYaml(column));
+                    }
+                    lines.addAll(index, suggestionLines);
+                }
+
                 private int missingTablesSectionStart(List<String> lines, int start, int end) {
                     for (int i = start + 1; i < end; i++) {
                         String withoutComment = stripYamlComment(lines.get(i));
                         if (leadingSpaces(withoutComment) == 2
                                 && withoutComment.trim().startsWith("missingTables:")) {
+                            return i;
+                        }
+                    }
+                    return -1;
+                }
+
+                private int missingColumnsSectionStart(List<String> lines, int start, int end) {
+                    for (int i = start + 1; i < end; i++) {
+                        String withoutComment = stripYamlComment(lines.get(i));
+                        if (leadingSpaces(withoutComment) == 2
+                                && withoutComment.trim().startsWith("missingColumns:")) {
                             return i;
                         }
                     }
@@ -5781,6 +5861,67 @@ class DmSqlValidationTestGenerator {
                                 || existing.equals(leaf)
                                 || missingTableLeaf(existing).equals(normalized)
                                 || missingTableLeaf(existing).equals(leaf)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                private Set<String> existingMissingColumnIgnoreEntries(List<String> lines) {
+                    Set<String> existing = new LinkedHashSet<>();
+                    String section = "";
+                    boolean missingColumns = false;
+                    for (String line : lines) {
+                        boolean commented = line.trim().startsWith("#");
+                        String effectiveLine = commented ? line.substring(line.indexOf('#') + 1) : stripYamlComment(line);
+                        String trimmed = effectiveLine.trim();
+                        if (isBlank(trimmed) || "{}".equals(trimmed)) {
+                            continue;
+                        }
+                        int indent = leadingSpaces(effectiveLine);
+                        if (!commented && indent == 0 && "validationIgnores:".equals(trimmed)) {
+                            section = "validationIgnores";
+                            missingColumns = false;
+                            continue;
+                        }
+                        if (!commented && indent == 0) {
+                            section = "";
+                            missingColumns = false;
+                            continue;
+                        }
+                        if ("validationIgnores".equals(section) && indent == 2 && trimmed.startsWith("missingColumns:")) {
+                            missingColumns = true;
+                            addMissingColumnEntries(existing, yamlStringList(trimmed.substring("missingColumns:".length())));
+                            continue;
+                        }
+                        if ("validationIgnores".equals(section) && missingColumns && indent >= 4 && trimmed.startsWith("- ")) {
+                            addMissingColumnEntries(existing, yamlStringList(trimmed.substring(2)));
+                            continue;
+                        }
+                        if ("validationIgnores".equals(section) && !commented && indent <= 2) {
+                            missingColumns = false;
+                        }
+                    }
+                    return existing;
+                }
+
+                private void addMissingColumnEntries(Set<String> existing, List<String> columns) {
+                    for (String column : columns) {
+                        String normalized = normalizeMissingColumnName(column);
+                        if (!isBlank(normalized)) {
+                            existing.add(normalized);
+                        }
+                    }
+                }
+
+                private boolean containsMissingColumn(Set<String> existingColumns, String column) {
+                    String normalized = normalizeMissingColumnName(column);
+                    String leaf = missingColumnLeaf(normalized);
+                    for (String existing : existingColumns) {
+                        if (existing.equals(normalized)
+                                || existing.equals(leaf)
+                                || missingColumnLeaf(existing).equals(normalized)
+                                || missingColumnLeaf(existing).equals(leaf)) {
                             return true;
                         }
                     }
@@ -5874,6 +6015,21 @@ class DmSqlValidationTestGenerator {
                 private String missingTableLeaf(String table) {
                     int dot = table == null ? -1 : table.lastIndexOf('.');
                     return dot >= 0 && dot + 1 < table.length() ? table.substring(dot + 1) : table;
+                }
+
+                private String normalizeMissingColumnName(String column) {
+                    if (column == null) {
+                        return "";
+                    }
+                    return column.trim()
+                            .replace("\\"", "")
+                            .replace("`", "")
+                            .toLowerCase(Locale.ROOT);
+                }
+
+                private String missingColumnLeaf(String column) {
+                    int dot = column == null ? -1 : column.lastIndexOf('.');
+                    return dot >= 0 && dot + 1 < column.length() ? column.substring(dot + 1) : column;
                 }
 
             """,
@@ -5973,14 +6129,22 @@ class DmSqlValidationTestGenerator {
                         List<ValidationRecord> failedRecords
                 ) throws IOException {
                     Map<String, String> suggestedTables = new LinkedHashMap<>();
+                    Map<String, String> suggestedColumns = new LinkedHashMap<>();
                     for (ValidationRecord record : failedRecords) {
                         for (String table : bracketedValuesAfterMarker(record.message, "无效的表或视图名")) {
                             if (!config.ignoresMissingTable(table)) {
                                 suggestedTables.putIfAbsent(normalizeMissingTableName(table), table);
                             }
                         }
+                        for (String marker : listOf("无效的列名", "无效的变量名", "无法解析的成员访问表达式")) {
+                            for (String column : bracketedValuesAfterMarker(record.message, marker)) {
+                                if (!config.ignoresMissingColumn(column)) {
+                                    suggestedColumns.putIfAbsent(normalizeMissingColumnName(column), column);
+                                }
+                            }
+                        }
                     }
-                    if (suggestedTables.isEmpty()) {
+                    if (suggestedTables.isEmpty() && suggestedColumns.isEmpty()) {
                         return;
                     }
                     Path rewriteConfigPath = projectRoot.resolve(REWRITE_CONFIG_PATH);
@@ -5988,20 +6152,34 @@ class DmSqlValidationTestGenerator {
                             ? Files.readAllLines(rewriteConfigPath, StandardCharsets.UTF_8)
                             : defaultRewriteConfigLines();
                     Set<String> existingTables = existingMissingTableIgnoreEntries(lines);
-                    List<String> missingSuggestions = new ArrayList<>();
+                    Set<String> existingColumns = existingMissingColumnIgnoreEntries(lines);
+                    List<String> missingTableSuggestions = new ArrayList<>();
                     for (Map.Entry<String, String> entry : suggestedTables.entrySet()) {
                         if (!containsMissingTable(existingTables, entry.getKey())) {
-                            missingSuggestions.add(entry.getValue());
+                            missingTableSuggestions.add(entry.getValue());
                         }
                     }
-                    if (missingSuggestions.isEmpty()) {
+                    List<String> missingColumnSuggestions = new ArrayList<>();
+                    for (Map.Entry<String, String> entry : suggestedColumns.entrySet()) {
+                        if (!containsMissingColumn(existingColumns, entry.getKey())) {
+                            missingColumnSuggestions.add(entry.getValue());
+                        }
+                    }
+                    if (missingTableSuggestions.isEmpty() && missingColumnSuggestions.isEmpty()) {
                         return;
                     }
-                    List<String> merged = mergeMissingTableIgnores(lines, missingSuggestions);
+                    List<String> merged = lines;
+                    if (!missingTableSuggestions.isEmpty()) {
+                        merged = mergeMissingTableIgnores(merged, missingTableSuggestions);
+                    }
+                    if (!missingColumnSuggestions.isEmpty()) {
+                        merged = mergeMissingColumnIgnores(merged, missingColumnSuggestions);
+                    }
                     Files.createDirectories(rewriteConfigPath.getParent());
                     writeString(rewriteConfigPath, String.join("\\n", merged) + "\\n", StandardCharsets.UTF_8);
-                    log("Updated missing table ignore suggestions in " + rewriteConfigPath + " for "
-                            + missingSuggestions.size() + " table(s).");
+                    log("Updated missing object ignore suggestions in " + rewriteConfigPath
+                            + " for " + missingTableSuggestions.size() + " table(s) and "
+                            + missingColumnSuggestions.size() + " column(s).");
                 }
 
                 private String markdown(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
@@ -6086,7 +6264,7 @@ class DmSqlValidationTestGenerator {
 
                 private void appendSchemaObjectSummary(StringBuilder markdown, List<ValidationRecord> records) {
                     Map<String, Long> missingTables = schemaIssueCounts(records, "无效的表或视图名");
-                    Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名", "无效的变量名");
+                    Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式");
                     if (missingTables.isEmpty() && missingColumns.isEmpty()) {
                         return;
                     }
@@ -6556,7 +6734,7 @@ class DmSqlValidationTestGenerator {
                     json.append("  \\"schemaObjectHotspots\\": {");
                     appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(records, "无效的表或视图名"));
                     json.append(", ");
-                    appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名", "无效的变量名"));
+                    appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式"));
                     json.append("}");
                 }
 
@@ -7961,6 +8139,7 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> includedMethods = new LinkedHashSet<>();
                     private final Set<String> excludedMethods = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingTables = new LinkedHashSet<>();
+                    private final Set<String> ignoredMissingColumns = new LinkedHashSet<>();
 
                     static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
@@ -8111,15 +8290,26 @@ class DmSqlValidationTestGenerator {
                                 valueMode = "";
                                 continue;
                             }
-                            if ("validationIgnores".equals(section) && indent == 2 && trimmed.startsWith("missingTables:")) {
+                            if (isValidationIgnoreSection(section) && indent == 2 && trimmed.startsWith("missingTables:")) {
                                 section = "validationMissingTables";
                                 currentMethod = null;
                                 valueMode = "";
                                 addIgnoredMissingTables(parseYamlValue(trimmed.substring("missingTables:".length())));
                                 continue;
                             }
+                            if (isValidationIgnoreSection(section) && indent == 2 && trimmed.startsWith("missingColumns:")) {
+                                section = "validationMissingColumns";
+                                currentMethod = null;
+                                valueMode = "";
+                                addIgnoredMissingColumns(parseYamlValue(trimmed.substring("missingColumns:".length())));
+                                continue;
+                            }
                             if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredMissingTables(parseYamlValue(trimmed.substring(2)));
+                                continue;
+                            }
+                            if ("validationMissingColumns".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                                addIgnoredMissingColumns(parseYamlValue(trimmed.substring(2)));
                                 continue;
                             }
                             if ("validationMethods".equals(section) && indent == 4 && trimmed.endsWith(":")) {
@@ -8153,6 +8343,12 @@ class DmSqlValidationTestGenerator {
                                         .params.put(key, value);
                             }
                         }
+                    }
+
+                    private boolean isValidationIgnoreSection(String section) {
+                        return "validationIgnores".equals(section)
+                                || "validationMissingTables".equals(section)
+                                || "validationMissingColumns".equals(section);
                     }
 
                     private void addIgnoredMissingTables(Object value) {
@@ -8189,6 +8385,40 @@ class DmSqlValidationTestGenerator {
                         return false;
                     }
 
+                    private void addIgnoredMissingColumns(Object value) {
+                        if (value instanceof Collection<?>) {
+                            for (Object item : (Collection<?>) value) {
+                                addIgnoredMissingColumn(String.valueOf(item));
+                            }
+                        } else if (value != null) {
+                            addIgnoredMissingColumn(String.valueOf(value));
+                        }
+                    }
+
+                    private void addIgnoredMissingColumn(String column) {
+                        String normalized = normalizeMissingColumnName(column);
+                        if (!isBlank(normalized)) {
+                            ignoredMissingColumns.add(normalized);
+                        }
+                    }
+
+                    boolean ignoresMissingColumn(String column) {
+                        String normalized = normalizeMissingColumnName(column);
+                        if (isBlank(normalized)) {
+                            return false;
+                        }
+                        String leaf = missingColumnLeaf(normalized);
+                        for (String ignored : ignoredMissingColumns) {
+                            if (ignored.equals(normalized)
+                                    || ignored.equals(leaf)
+                                    || missingColumnLeaf(ignored).equals(normalized)
+                                    || missingColumnLeaf(ignored).equals(leaf)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+
                     private String normalizeMissingTableName(String table) {
                         if (table == null) {
                             return "";
@@ -8202,6 +8432,21 @@ class DmSqlValidationTestGenerator {
                     private String missingTableLeaf(String table) {
                         int dot = table == null ? -1 : table.lastIndexOf('.');
                         return dot >= 0 && dot + 1 < table.length() ? table.substring(dot + 1) : table;
+                    }
+
+                    private String normalizeMissingColumnName(String column) {
+                        if (column == null) {
+                            return "";
+                        }
+                        return column.trim()
+                                .replace("\\"", "")
+                                .replace("`", "")
+                                .toLowerCase(Locale.ROOT);
+                    }
+
+                    private String missingColumnLeaf(String column) {
+                        int dot = column == null ? -1 : column.lastIndexOf('.');
+                        return dot >= 0 && dot + 1 < column.length() ? column.substring(dot + 1) : column;
                     }
 
                     boolean excludes(String methodKey) {

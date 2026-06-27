@@ -32,11 +32,19 @@ class SqlRewriteConfigLoaderTest {
                 "  missingTables:",
                 "    - \"ns_core_resourcecolumn_temp\"",
                 "#    - \"commented_table\"",
-                "    - \"NEWSEE_OWNER.owner_house\""
+                "    - \"NEWSEE_OWNER.owner_house\"",
+                "  missingColumns: [\"organization_id\", \"D.fullPath\"]",
+                "  missingTables: [\"b\"]",
+                "  missingColumns:",
+                "#    - \"commented_column\"",
+                "    - \"accountType\""
         ));
 
         assertThat(config.ignoredMissingTables())
-                .contains("ns_core_resourcecolumn_temp", "newsee_owner.owner_house")
+                .contains("ns_core_resourcecolumn_temp", "newsee_owner.owner_house", "b")
                 .doesNotContain("commented_table");
+        assertThat(config.ignoredMissingColumns())
+                .contains("organization_id", "d.fullpath", "accounttype")
+                .doesNotContain("commented_column");
     }
 }

@@ -113,6 +113,8 @@ class SqlRewriteConfigUpdaterTest {
                 validationIgnores:
                   missingTables:
                     - "ns_core_resourcecolumn_temp"
+                  missingColumns:
+                    - "organization_id"
                 """);
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
                 "com.example.UserMapper.updateExtend",
@@ -139,6 +141,8 @@ class SqlRewriteConfigUpdaterTest {
                 .contains("validationIgnores:")
                 .contains("missingTables:")
                 .contains("- \"ns_core_resourcecolumn_temp\"")
+                .contains("missingColumns:")
+                .contains("- \"organization_id\"")
                 .contains("\"com.example.UserMapper.updateExtend\":")
                 .contains("keyColumns: [\"user_id\"]");
     }
