@@ -776,6 +776,10 @@ class DmAdapterCliTest {
                 .contains("isRegexpMemoryLimitFailure(summary)")
                 .contains("hasGeneratedRegexpPlaceholderParameter(mapperMethod, parameters)")
                 .contains("\"regexp-placeholder\"")
+                .contains("record = skipMissingDynamicIdentifier(record);")
+                .contains("private ValidationRecord skipMissingDynamicIdentifier(ValidationRecord record)")
+                .contains("\"dynamic-identifier-parameter\"")
+                .contains("configure a real identifier in .dm-adapter/sql-rewrite.yml validationArgs")
                 .contains("private boolean hasRegexpOperatorIssue(String message)")
                 .contains("lower.contains(\"regexp_like\")")
                 .contains("lower.contains(\"正则表达式\")");
