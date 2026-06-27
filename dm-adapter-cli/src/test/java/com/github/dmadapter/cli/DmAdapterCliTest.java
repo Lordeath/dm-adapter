@@ -721,6 +721,8 @@ class DmAdapterCliTest {
                 .contains("metadata.addSetDefaultValue(valueMatcher.group(1));")
                 .contains("private boolean shouldPreserveConfiguredNullDefault(")
                 .contains("!statement.setDefaultValue(valueName) && !statement.hasSetDefaultUnder(valueName)")
+                .contains("&& !statementRequiredDefaultValue(valueName, statement)")
+                .contains("private boolean statementRequiredDefaultValue(String valueName, MapperStatement statement)")
                 .contains("configuredValue == null && shouldPreserveConfiguredNullDefault(entryPath, existing, statement)")
                 .contains("return dynamicIdentifierMetadata.hasSetDefaultUnder(valueName)");
     }
