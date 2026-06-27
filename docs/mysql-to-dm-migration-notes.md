@@ -28,6 +28,10 @@
 - MySQL `UPDATE ... JOIN ... SET ...`、多表 `DELETE`、`REPLACE INTO` 需要改写为达梦支持的 `MERGE`、相关子查询、`EXISTS` 或分步 SQL。
 - MySQL 用户变量如 `@rownum := @rownum + 1` 不能直接迁移，通常改为达梦窗口函数 `ROW_NUMBER() OVER (...)`。
 - MySQL 字符串拼接常见写法如 `LIKE #{name} '%'`、`CONCAT(a,b)`、`GROUP_CONCAT` 需要转换为达梦等价表达式。`#{}` 参数可以安全拼接，`${}` 动态片段必须保守处理。
+- MySQL `GROUP_CONCAT(DISTINCT a, ',', b)` 这类多参数聚合要先把参数拼接为一个表达式，再转为达梦 `LISTAGG(DISTINCT ..., ',') WITHIN GROUP (...)`，不能保留 MySQL 的多参数函数形态。
+- MySQL `CONVERT(expr, DECIMAL(n))`、`CONVERT(expr, DECIMAL(n,m))` 应转为 `CAST(expr AS DECIMAL(...))`，不能按达梦 `CONVERT` 函数原样保留。
+- MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE`、`ON UPDATE CURRENT_TIMESTAMP` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
+- MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。
 - MySQL 正则、日期、加密、编码、空值处理函数与达梦函数不完全一致，遇到 `REGEXP`、`DATE_FORMAT`、`STR_TO_DATE`、`IFNULL`、`IF`、`FIND_IN_SET`、`AES_ENCRYPT`、`TO_BASE64` 等函数时必须逐项确认达梦等价写法。
 
 ## MyBatis 迁移判断准则

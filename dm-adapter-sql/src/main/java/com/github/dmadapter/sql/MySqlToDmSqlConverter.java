@@ -108,7 +108,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^\\s*(.+?)\\s+AS\\s+SIGNED(?:\\s+INTEGER)?\\s*$"
     );
     private static final Pattern DECIMAL_TARGET_TYPE_PATTERN = Pattern.compile(
-            "(?is)^\\s*DECIMAL\\s*\\(\\s*\\d+\\s*,\\s*\\d+\\s*\\)\\s*$"
+            "(?is)^\\s*DECIMAL\\s*\\(\\s*\\d+\\s*(?:,\\s*\\d+)?\\s*\\)\\s*$"
     );
     private static final Pattern CHAR_TARGET_TYPE_PATTERN = Pattern.compile(
             "(?is)^\\s*CHAR(?:\\s*\\(\\s*\\d+\\s*\\))?\\s*$"
@@ -248,10 +248,24 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^\\s*select\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
                     + "(?<where>.+?)(?:\\s+order\\s+by\\s+ordinal_position\\s*(?<direction>asc|desc)?\\s*)?;?\\s*$"
     );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_TABLE_LIST_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+table_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
+                    + "table_name\\s+like\\s+(?<tableLike>.+?)\\s+and\\s+"
+                    + "table_schema\\s*=\\s*\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\)\\s+and\\s+"
+                    + "column_name\\s+not\\s+in\\s+(?<notIn>.+?)\\s+group\\s+by\\s+table_name\\s*;?\\s*$"
+    );
     private static final Pattern INFORMATION_SCHEMA_TABLES_PATTERN = Pattern.compile(
             "(?is)^\\s*select\\s+count\\s*\\(\\s*(?:\\*|1)\\s*\\)"
                     + "(?:\\s+(?:as\\s+)?(?<alias>[A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\"))?"
                     + "\\s+from\\s+information_schema\\s*\\.\\s*tables\\s+where\\s+(?<where>.+?)\\s*;?\\s*$"
+    );
+    private static final Pattern INFORMATION_SCHEMA_TABLES_DETAIL_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+table_name\\s+as\\s+(?<tableAlias>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "create_time\\s+as\\s+(?<createAlias>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "table_schema\\s+as\\s+(?<schemaAlias>" + DM_IDENTIFIER + ")\\s+"
+                    + "from\\s+information_schema\\s*\\.\\s*(?:tables|\"tables\")\\s+where\\s+"
+                    + "table_schema\\s*=\\s*\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\)\\s+and\\s+"
+                    + "table_name\\s+like\\s+(?<tableLike>.+?)\\s*;?\\s*$"
     );
     private static final Pattern METADATA_TABLE_NAME_CONDITION = Pattern.compile(
             "(?is)\\btable_name\\s*=\\s*(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*')"
@@ -1409,15 +1423,58 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             convertedDefinitions.add(conversion.convertedSql());
             changed = changed || conversion.changed();
         }
-        if (!changed) {
+        String convertedSql = changed
+                ? sql.substring(0, openParenIndex + 1)
+                        + String.join(",", convertedDefinitions)
+                        + sql.substring(closeParenIndex)
+                : sql;
+        GenericConversion tableCommentConversion = removeMysqlCreateTableTrailingComment(convertedSql);
+        if (tableCommentConversion.changed()) {
+            convertedSql = tableCommentConversion.convertedSql();
+            changed = true;
+        }
+        return changed ? new GenericConversion(convertedSql, true) : GenericConversion.unchanged(sql);
+    }
+
+    private GenericConversion removeMysqlCreateTableTrailingComment(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
             return GenericConversion.unchanged(sql);
         }
-        return new GenericConversion(
-                sql.substring(0, openParenIndex + 1)
-                        + String.join(",", convertedDefinitions)
-                        + sql.substring(closeParenIndex),
-                true
-        );
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int commentIndex = skipWhitespace(sql, closeParenIndex + 1);
+        if (!startsKeyword(sql, commentIndex, "COMMENT")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int cursor = skipWhitespace(sql, commentIndex + "COMMENT".length());
+        if (cursor < sql.length() && sql.charAt(cursor) == '=') {
+            cursor = skipWhitespace(sql, cursor + 1);
+        }
+        if (cursor >= sql.length()) {
+            return GenericConversion.unchanged(sql);
+        }
+        char quote = sql.charAt(cursor);
+        int commentEnd;
+        if (quote == '\'') {
+            commentEnd = skipSingleQuotedString(sql, cursor);
+        } else if (quote == '"') {
+            commentEnd = skipDoubleQuotedText(sql, cursor);
+        } else {
+            return GenericConversion.unchanged(sql);
+        }
+        int end = skipWhitespace(sql, commentEnd);
+        return new GenericConversion(sql.substring(0, commentIndex) + sql.substring(end), true);
     }
 
     private GenericConversion removeMysqlColumnCommentClause(String definition) {
@@ -2707,6 +2764,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertInformationSchemaColumns(String sql) {
+        GenericConversion tableListConversion = convertInformationSchemaColumnsTableList(sql);
+        if (tableListConversion.changed()) {
+            return tableListConversion;
+        }
         Matcher matcher = INFORMATION_SCHEMA_COLUMNS_PATTERN.matcher(sql);
         if (!matcher.matches()) {
             return GenericConversion.unchanged(sql);
@@ -2736,7 +2797,31 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(converted, true);
     }
 
+    private GenericConversion convertInformationSchemaColumnsTableList(String sql) {
+        Matcher matcher = INFORMATION_SCHEMA_COLUMNS_TABLE_LIST_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableLike = matcher.group("tableLike").trim();
+        String notIn = matcher.group("notIn").trim();
+        if (tableLike.isBlank() || notIn.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT TABLE_NAME\n"
+                + "FROM ALL_TAB_COLUMNS\n"
+                + "WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                + "AND TABLE_NAME LIKE UPPER(" + tableLike + ")\n"
+                + "AND COLUMN_NAME NOT IN\n"
+                + notIn
+                + "\nGROUP BY TABLE_NAME";
+        return new GenericConversion(converted, true);
+    }
+
     private GenericConversion convertInformationSchemaTables(String sql) {
+        GenericConversion tableDetailConversion = convertInformationSchemaTablesDetail(sql);
+        if (tableDetailConversion.changed()) {
+            return tableDetailConversion;
+        }
         Matcher matcher = INFORMATION_SCHEMA_TABLES_PATTERN.matcher(sql);
         if (!matcher.matches()) {
             return GenericConversion.unchanged(sql);
@@ -2763,6 +2848,25 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + tableName
                 + ")"
                 + (tableSchema.isBlank() ? "" : " AND OWNER = UPPER(" + tableSchema + ")");
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaTablesDetail(String sql) {
+        Matcher matcher = INFORMATION_SCHEMA_TABLES_DETAIL_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableLike = matcher.group("tableLike").trim();
+        if (tableLike.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT OBJECT_NAME AS " + matcher.group("tableAlias") + "\n"
+                + ", CREATED AS " + matcher.group("createAlias") + "\n"
+                + ", OWNER AS " + matcher.group("schemaAlias") + "\n"
+                + "FROM ALL_OBJECTS\n"
+                + "WHERE OBJECT_TYPE = 'TABLE'\n"
+                + "AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                + "AND OBJECT_NAME LIKE UPPER(" + tableLike + ")";
         return new GenericConversion(converted, true);
     }
 
@@ -5082,9 +5186,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         List<TopLevelArgument> expressionArguments = splitTopLevelArguments(expression);
         if (expressionArguments.isEmpty()) {
-            return null;
-        }
-        if (distinct && expressionArguments.size() != 1) {
             return null;
         }
         String listaggExpression = expressionArguments.size() == 1

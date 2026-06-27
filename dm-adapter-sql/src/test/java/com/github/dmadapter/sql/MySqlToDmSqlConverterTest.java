@@ -433,6 +433,31 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesMysqlCreateTableTrailingCommentForDameng() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE if not exists tmp_daily_property_rule (
+                    id bigint NOT NULL AUTO_INCREMENT,
+                    `dailyProperty` varchar(64) DEFAULT NULL,
+                    PRIMARY KEY (id)
+                ) COMMENT '物业日报表科目配置表';
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                CREATE TABLE if not exists tmp_daily_property_rule (
+                    id bigint NOT NULL IDENTITY(1,1),
+                    "dailyProperty" varchar(64) DEFAULT NULL,
+                    PRIMARY KEY (id)
+                ) ;
+                """);
+        assertThat(result.appliedRules()).contains(
+                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE
+        );
+        assertThat(result.convertedSql()).doesNotContainIgnoringCase("COMMENT");
+    }
+
+    @Test
     void convertsMysqlTruncateToDamengTruncateTable() {
         SqlConversionResult result = converter.convert("TRUNCATE tmp_static_report_precinct_steward_report;");
 
@@ -459,6 +484,18 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.MYSQL_CAST_SIGNED_RULE,
                 MySqlToDmSqlConverter.MYSQL_CONVERT_CHAR_RULE
         );
+    }
+
+    @Test
+    void convertsMysqlDecimalConvertWithSinglePrecisionForDameng() {
+        SqlConversionResult result = converter.convert(
+                "SELECT CONVERT(detail.taxRate*100, DECIMAL(12)) AS taxRate FROM ns_bill_billuseddetail detail"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT CAST(detail.taxRate*100 AS DECIMAL(12)) AS taxRate FROM ns_bill_billuseddetail detail");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONVERT_DECIMAL_RULE);
     }
 
     @Test
@@ -490,6 +527,7 @@ class MySqlToDmSqlConverterTest {
                 SELECT max(list.id) as remindId
                 FROM charge_reminder_list list
                 left join charge_reminder_list_charge_relationship ship on ship.remind_list_id = list.id
+                WHERE list.house_id in (1)
                 """);
 
         assertThat(result.changed()).isTrue();
@@ -497,6 +535,7 @@ class MySqlToDmSqlConverterTest {
                 SELECT max("list".id) as remindId
                 FROM charge_reminder_list "list"
                 left join charge_reminder_list_charge_relationship ship on ship.remind_list_id = "list".id
+                WHERE "list".house_id in (1)
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE);
     }
@@ -904,6 +943,19 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDistinctGroupConcatMultipleExpressionsToListaggConcatenation() {
+        SqlConversionResult result = converter.convert(
+                "select group_concat(DISTINCT precinctId ,',',chargeItemId ) as dataGroup from charge group by precinctId, chargeItemId"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select LISTAGG(DISTINCT (precinctId) || (',') || (chargeItemId), ',') WITHIN GROUP (ORDER BY (precinctId) || (',') || (chargeItemId)) as dataGroup from charge group by precinctId, chargeItemId");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
     void convertsSubstringIndexGroupConcatFirstItemToRegexpSubstrListagg() {
         SqlConversionResult result = converter.convert(
                 "select SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT rs.owner_id order by rs.house_owner_relationship_id desc , ','),',',1) from owner_house_relationship rs"
@@ -934,12 +986,14 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void doesNotConvertGroupConcatWithMultipleTopLevelExpressions() {
+    void convertsDistinctGroupConcatWithMultipleTopLevelExpressions() {
         SqlConversionResult result = converter.convert("select GROUP_CONCAT(DISTINCT first_name, last_name) from user");
 
-        assertThat(result.changed()).isFalse();
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.reason()).contains("GROUP_CONCAT");
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("select LISTAGG(DISTINCT (first_name) || (last_name), ',') WITHIN GROUP (ORDER BY (first_name) || (last_name)) from user");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
     }
 
     @Test
@@ -1865,6 +1919,40 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlInformationSchemaColumnsTableListQueryToAllTabColumns() {
+        SqlConversionResult result = converter.convert("""
+                SELECT table_name
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE table_name LIKE concat(#{tablePrefix},'%')
+                AND table_schema = (select DATABASE())
+                AND column_name not in
+                <foreach collection="columnNameList" item="item" open="(" close=")" separator=",">
+                    #{item}
+                </foreach>
+                group by table_name
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT TABLE_NAME
+                FROM ALL_TAB_COLUMNS
+                WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                AND TABLE_NAME LIKE UPPER((#{tablePrefix}) || ('%'))
+                AND COLUMN_NAME NOT IN
+                <foreach collection='columnNameList' item='item' open='(' close=')' separator=','>
+                    #{item}
+                </foreach>
+                GROUP BY TABLE_NAME""");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE,
+                        MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE
+                );
+    }
+
+    @Test
     void convertsMysqlInformationSchemaTablesQueryToAllTables() {
         SqlConversionResult result = converter.convert("""
                 SELECT COUNT(*) AS table_exists FROM information_schema.TABLES
@@ -1877,6 +1965,34 @@ class MySqlToDmSqlConverterTest {
                 .isEqualTo("SELECT COUNT(*) AS table_exists FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaTablesDetailQueryToAllObjects() {
+        SqlConversionResult result = converter.convert("""
+                select TABLE_NAME as tableName
+                , CREATE_TIME as createTime
+                , TABLE_SCHEMA as tableSchema
+                from information_schema.`TABLES`
+                where TABLE_SCHEMA = (SELECT DATABASE())
+                and TABLE_NAME like '${tablePrefix}%';
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT OBJECT_NAME AS tableName
+                , CREATED AS createTime
+                , OWNER AS tableSchema
+                FROM ALL_OBJECTS
+                WHERE OBJECT_TYPE = 'TABLE'
+                AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                AND OBJECT_NAME LIKE UPPER('${tablePrefix}%')""");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
+                        MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE
+                );
     }
 
     @Test
