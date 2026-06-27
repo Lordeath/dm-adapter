@@ -10,24 +10,37 @@ import java.util.Set;
 public record SqlRewriteConfig(
         Map<String, List<String>> tableKeyColumns,
         Map<String, List<String>> methodKeyColumns,
-        Set<String> ignoredMissingTables
+        Set<String> ignoredMissingTables,
+        Set<String> ignoredMissingColumns
 ) {
     public SqlRewriteConfig(Map<String, List<String>> tableKeyColumns, Map<String, List<String>> methodKeyColumns) {
-        this(tableKeyColumns, methodKeyColumns, Set.of());
+        this(tableKeyColumns, methodKeyColumns, Set.of(), Set.of());
+    }
+
+    public SqlRewriteConfig(
+            Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Set<String> ignoredMissingTables
+    ) {
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, Set.of());
     }
 
     public SqlRewriteConfig {
         tableKeyColumns = normalizeTableKeys(tableKeyColumns);
         methodKeyColumns = normalizeMethodKeys(methodKeyColumns);
         ignoredMissingTables = normalizeTables(ignoredMissingTables);
+        ignoredMissingColumns = normalizeColumns(ignoredMissingColumns);
     }
 
     public static SqlRewriteConfig empty() {
-        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of());
+        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of());
     }
 
     public boolean isEmpty() {
-        return tableKeyColumns.isEmpty() && methodKeyColumns.isEmpty() && ignoredMissingTables.isEmpty();
+        return tableKeyColumns.isEmpty()
+                && methodKeyColumns.isEmpty()
+                && ignoredMissingTables.isEmpty()
+                && ignoredMissingColumns.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {
@@ -93,6 +106,26 @@ public record SqlRewriteConfig(
             }
         }
         return Set.copyOf(normalized);
+    }
+
+    private static Set<String> normalizeColumns(Set<String> columns) {
+        if (columns == null || columns.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> normalized = new LinkedHashSet<>();
+        for (String column : columns) {
+            if (column != null && !column.isBlank()) {
+                normalized.add(normalizeColumnName(column));
+            }
+        }
+        return Set.copyOf(normalized);
+    }
+
+    private static String normalizeColumnName(String column) {
+        return column.trim()
+                .replace("\"", "")
+                .replace("`", "")
+                .toLowerCase(Locale.ROOT);
     }
 
     private static List<String> cleanColumns(List<String> columns) {

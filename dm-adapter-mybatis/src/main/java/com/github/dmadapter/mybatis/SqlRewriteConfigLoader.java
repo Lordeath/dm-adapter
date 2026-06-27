@@ -27,6 +27,7 @@ public class SqlRewriteConfigLoader {
         Map<String, List<String>> tableKeys = new LinkedHashMap<>();
         Map<String, List<String>> methodKeys = new LinkedHashMap<>();
         Set<String> ignoredMissingTables = new LinkedHashSet<>();
+        Set<String> ignoredMissingColumns = new LinkedHashSet<>();
         String section = "";
         String currentName = "";
         for (String line : lines) {
@@ -80,11 +81,19 @@ public class SqlRewriteConfigLoader {
                     methodKeys.put(currentName, keyColumns);
                 }
             }
-            if ("validationIgnores".equals(section)
+            if (isValidationIgnoresSection(section)
                     && indent == 2
                     && trimmed.startsWith("missingTables:")) {
                 section = "validationMissingTables";
                 ignoredMissingTables.addAll(parseInlineList(trimmed.substring("missingTables:".length())));
+                currentName = "";
+                continue;
+            }
+            if (isValidationIgnoresSection(section)
+                    && indent == 2
+                    && trimmed.startsWith("missingColumns:")) {
+                section = "validationMissingColumns";
+                ignoredMissingColumns.addAll(parseInlineList(trimmed.substring("missingColumns:".length())));
                 currentName = "";
                 continue;
             }
@@ -94,8 +103,20 @@ public class SqlRewriteConfigLoader {
                     ignoredMissingTables.add(table);
                 }
             }
+            if ("validationMissingColumns".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                String column = unquote(trimmed.substring(2).trim());
+                if (!column.isBlank()) {
+                    ignoredMissingColumns.add(column);
+                }
+            }
         }
-        return new SqlRewriteConfig(tableKeys, methodKeys, ignoredMissingTables);
+        return new SqlRewriteConfig(tableKeys, methodKeys, ignoredMissingTables, ignoredMissingColumns);
+    }
+
+    private boolean isValidationIgnoresSection(String section) {
+        return "validationIgnores".equals(section)
+                || "validationMissingTables".equals(section)
+                || "validationMissingColumns".equals(section);
     }
 
     private String stripComment(String line) {

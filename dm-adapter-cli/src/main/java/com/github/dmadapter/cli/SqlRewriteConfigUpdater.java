@@ -113,7 +113,12 @@ class SqlRewriteConfigUpdater {
             methodKeys.putIfAbsent(entry.getKey(), entry.getValue());
         }
         methodKeys.putAll(model.nonEmptyMethodKeys());
-        return new SqlRewriteConfig(tableKeys, methodKeys, loadedRewriteConfig.ignoredMissingTables());
+        return new SqlRewriteConfig(
+                tableKeys,
+                methodKeys,
+                loadedRewriteConfig.ignoredMissingTables(),
+                loadedRewriteConfig.ignoredMissingColumns()
+        );
     }
 
     private Optional<FileChange> writeIfChanged(AdapterContext context, Path rewriteConfigPath, RewriteConfigModel model) {
