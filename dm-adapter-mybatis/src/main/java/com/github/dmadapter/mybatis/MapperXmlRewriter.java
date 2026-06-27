@@ -82,7 +82,7 @@ public class MapperXmlRewriter {
                     + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))?\\s*="
     );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
-    private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\")";
+    private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|\\$\\{[^}]+})";
     private static final Pattern WRAPPING_IF_PATTERN = Pattern.compile(
             "(?is)^(?<leading>\\s*)(?<opening><if\\b[^>]*>)(?<body>[\\s\\S]*)(?<closing></if\\s*>)(?<trailing>\\s*)$"
     );
@@ -162,11 +162,25 @@ public class MapperXmlRewriter {
                     + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
                     + "(?<trailing>;?\\s*)$"
     );
+    private static final Pattern INSERT_IGNORE_TRIM_COLUMNS_VALUES_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)insert\\s+ignore\\s+into\\s+"
+                    + "(?<table>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?"
+                    + ")\\s*(?<columnsTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)\\s*"
+                    + "(?<valuesTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)"
+                    + "(?<trailing>;?\\s*)$"
+    );
     private static final Pattern FOREACH_TAG_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)</foreach\\s*>\\s*$"
     );
     private static final Pattern TRIM_TAG_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<opening><trim\\b[^>]*>)(?<body>[\\s\\S]*?)</trim\\s*>\\s*$"
+    );
+    private static final Pattern IF_BLOCK_PATTERN = Pattern.compile(
+            "(?is)(?<opening><if\\b[^>]*>)(?<body>[\\s\\S]*?)</if\\s*>"
     );
     private static final Set<String> AGGREGATE_FUNCTIONS = Set.of(
             "AVG",
@@ -2022,21 +2036,46 @@ public class MapperXmlRewriter {
             );
         } else {
             Matcher trimMatcher = BATCH_INSERT_IGNORE_TRIM_COLUMNS_PATTERN.matcher(candidate);
-            if (!trimMatcher.matches()) {
-                return body;
+            if (trimMatcher.matches()) {
+                String columns = trimColumnList(trimMatcher.group("columnsTrim"));
+                if (columns == null) {
+                    return body;
+                }
+                batchInsertValues = new BatchInsertValues(
+                        trimMatcher.group("leading"),
+                        trimMatcher.group("table"),
+                        columns,
+                        trimMatcher.group("foreach"),
+                        "",
+                        trimMatcher.group("trailing")
+                );
+            } else {
+                Matcher trimValuesMatcher = INSERT_IGNORE_TRIM_COLUMNS_VALUES_PATTERN.matcher(candidate);
+                if (!trimValuesMatcher.matches()) {
+                    return body;
+                }
+                String columns = trimColumnList(trimValuesMatcher.group("columnsTrim"));
+                String values = trimValuesList(trimValuesMatcher.group("valuesTrim"));
+                if (columns == null || values == null) {
+                    return body;
+                }
+                List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, trimValuesMatcher.group("table"));
+                if (keyColumns.isEmpty()) {
+                    return body;
+                }
+                String converted = convertConditionalTrimInsertIgnoreToMerge(
+                        trimValuesMatcher.group("leading"),
+                        trimValuesMatcher.group("table"),
+                        columns,
+                        values,
+                        keyColumns,
+                        trimValuesMatcher.group("trailing")
+                );
+                if (converted == null || converted.equals(candidate)) {
+                    return body;
+                }
+                return wrapper == null ? converted : wrapper.wrap(converted);
             }
-            String columns = trimColumnList(trimMatcher.group("columnsTrim"));
-            if (columns == null) {
-                return body;
-            }
-            batchInsertValues = new BatchInsertValues(
-                    trimMatcher.group("leading"),
-                    trimMatcher.group("table"),
-                    columns,
-                    trimMatcher.group("foreach"),
-                    "",
-                    trimMatcher.group("trailing")
-            );
         }
         List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, batchInsertValues.table());
         if (keyColumns.isEmpty()) {
@@ -2065,6 +2104,22 @@ public class MapperXmlRewriter {
         String openingTag = matcher.group("opening");
         if (!"(".equals(defaultString(xmlAttribute(openingTag, "prefix")).trim())
                 || !")".equals(defaultString(xmlAttribute(openingTag, "suffix")).trim())) {
+            return null;
+        }
+        return matcher.group("body");
+    }
+
+    private String trimValuesList(String trimXml) {
+        Matcher matcher = TRIM_TAG_PATTERN.matcher(trimXml);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String openingTag = matcher.group("opening");
+        String prefix = defaultString(xmlAttribute(openingTag, "prefix")).trim().replaceAll("\\s+", " ");
+        if (!"(".equals(prefix) && !"values (".equalsIgnoreCase(prefix)) {
+            return null;
+        }
+        if (!")".equals(defaultString(xmlAttribute(openingTag, "suffix")).trim())) {
             return null;
         }
         return matcher.group("body");
@@ -2243,6 +2298,131 @@ public class MapperXmlRewriter {
         converted.append(")\n")
                 .append(baseIndent)
                 .append("</foreach>")
+                .append(trailing);
+        return converted.toString();
+    }
+
+    private String convertConditionalTrimInsertIgnoreToMerge(
+            String leading,
+            String table,
+            String columnList,
+            String valueList,
+            List<String> keyColumns,
+            String trailing
+    ) {
+        List<ConditionalTrimItem> columns = conditionalTrimItems(columnList);
+        List<ConditionalTrimItem> values = conditionalTrimItems(valueList);
+        if (columns.isEmpty() || columns.size() != values.size()) {
+            return null;
+        }
+        List<String> normalizedKeys = normalizeIdentifiers(keyColumns);
+        List<String> columnNames = new ArrayList<>();
+        for (int i = 0; i < columns.size(); i++) {
+            ConditionalTrimItem column = columns.get(i);
+            ConditionalTrimItem value = values.get(i);
+            if (!column.test().equals(value.test())) {
+                return null;
+            }
+            String columnName = stripTrailingComma(column.content()).trim();
+            String valueExpression = stripTrailingComma(value.content()).trim();
+            if (columnName.isBlank() || valueExpression.isBlank()) {
+                return null;
+            }
+            columnNames.add(columnName);
+        }
+        List<Integer> keyIndexes = new ArrayList<>();
+        for (String keyColumn : normalizedKeys) {
+            int index = indexOfIdentifier(columnNames, keyColumn);
+            if (index < 0) {
+                return null;
+            }
+            keyIndexes.add(index);
+        }
+
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        String nestedIndent = childIndent + "    ";
+        StringBuilder converted = new StringBuilder();
+        converted.append(leading)
+                .append("MERGE INTO ")
+                .append(table)
+                .append(" t\n")
+                .append(baseIndent)
+                .append("USING (\n")
+                .append(childIndent)
+                .append("SELECT\n")
+                .append(nestedIndent)
+                .append("<trim suffixOverrides=\",\">\n");
+        for (int i = 0; i < columns.size(); i++) {
+            String columnName = columnNames.get(i);
+            String valueExpression = stripTrailingComma(values.get(i).content()).trim();
+            converted.append(nestedIndent)
+                    .append("    ")
+                    .append(columns.get(i).opening())
+                    .append("\n")
+                    .append(nestedIndent)
+                    .append("        ")
+                    .append(valueExpression)
+                    .append(" AS ")
+                    .append(dmIdentifier(columnName))
+                    .append(",\n")
+                    .append(nestedIndent)
+                    .append("    </if>\n");
+        }
+        converted.append(nestedIndent)
+                .append("</trim>\n")
+                .append(childIndent)
+                .append("FROM dual\n")
+                .append(baseIndent)
+                .append(") s\n")
+                .append(baseIndent)
+                .append("ON (");
+        for (int i = 0; i < keyIndexes.size(); i++) {
+            if (i > 0) {
+                converted.append(" AND ");
+            }
+            String keyColumn = columnNames.get(keyIndexes.get(i));
+            converted.append("t.")
+                    .append(dmIdentifier(keyColumn))
+                    .append(" = s.")
+                    .append(dmIdentifier(keyColumn));
+        }
+        converted.append(")\n")
+                .append(baseIndent)
+                .append("WHEN NOT MATCHED THEN INSERT\n")
+                .append(baseIndent)
+                .append("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">\n");
+        for (int i = 0; i < columns.size(); i++) {
+            String columnName = columnNames.get(i);
+            converted.append(childIndent)
+                    .append(columns.get(i).opening())
+                    .append("\n")
+                    .append(nestedIndent)
+                    .append(dmIdentifier(columnName))
+                    .append(",\n")
+                    .append(childIndent)
+                    .append("</if>\n");
+        }
+        converted.append(baseIndent)
+                .append("</trim>\n")
+                .append(baseIndent)
+                .append("VALUES\n")
+                .append(baseIndent)
+                .append("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">\n");
+        for (int i = 0; i < columns.size(); i++) {
+            String columnName = columnNames.get(i);
+            converted.append(childIndent)
+                    .append(columns.get(i).opening())
+                    .append("\n")
+                    .append(nestedIndent)
+                    .append("s.")
+                    .append(dmIdentifier(columnName))
+                    .append(",\n")
+                    .append(childIndent)
+                    .append("</if>\n");
+        }
+        converted.append(baseIndent)
+                .append("</trim>")
                 .append(trailing);
         return converted.toString();
     }
@@ -3235,6 +3415,43 @@ public class MapperXmlRewriter {
         return matcher.matches() ? matcher.group(1) : "";
     }
 
+    private List<ConditionalTrimItem> conditionalTrimItems(String trimBody) {
+        if (trimBody == null || trimBody.isBlank()) {
+            return List.of();
+        }
+        Matcher matcher = IF_BLOCK_PATTERN.matcher(trimBody);
+        List<ConditionalTrimItem> items = new ArrayList<>();
+        int previousEnd = 0;
+        while (matcher.find()) {
+            if (!trimBody.substring(previousEnd, matcher.start()).isBlank()) {
+                return List.of();
+            }
+            String opening = matcher.group("opening");
+            String test = defaultString(xmlAttribute(opening, "test")).trim();
+            String content = matcher.group("body");
+            if (test.isBlank() || stripTrailingComma(content).trim().isBlank()) {
+                return List.of();
+            }
+            items.add(new ConditionalTrimItem(opening, test, content));
+            previousEnd = matcher.end();
+        }
+        if (!trimBody.substring(previousEnd).isBlank()) {
+            return List.of();
+        }
+        return items;
+    }
+
+    private String stripTrailingComma(String value) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.trim();
+        if (trimmed.endsWith(",")) {
+            return trimmed.substring(0, trimmed.length() - 1).trim();
+        }
+        return trimmed;
+    }
+
     private TextRewrite addMissingDynamicSetCommas(String body) {
         List<TextReplacement> replacements = new ArrayList<>();
         int index = 0;
@@ -3677,6 +3894,9 @@ public class MapperXmlRewriter {
             String updates,
             String trailing
     ) {
+    }
+
+    private record ConditionalTrimItem(String opening, String test, String content) {
     }
 
     private record DynamicHavingConversion(

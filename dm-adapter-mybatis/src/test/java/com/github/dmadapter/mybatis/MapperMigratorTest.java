@@ -321,6 +321,69 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesConditionalTrimInsertIgnoreToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserExtMapper">
+                    <insert id="insertExt">
+                        insert ignore into ${schemaName}.user_ext
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                user_id,
+                            </if>
+                            <if test="state != null">
+                                state,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                #{id},
+                            </if>
+                            <if test="state != null">
+                                #{state},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserExtMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserExtMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.UserExtMapper.insertExt", List.of("user_id"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserExtMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ${schemaName}.user_ext t")
+                .contains("#{id} AS user_id")
+                .contains("#{state} AS \"state\"")
+                .contains("ON (t.user_id = s.user_id)")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .contains("s.user_id")
+                .doesNotContain("insert ignore");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
     void migrationRenamesDamengReservedColumnNamesInMapperSql() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",
