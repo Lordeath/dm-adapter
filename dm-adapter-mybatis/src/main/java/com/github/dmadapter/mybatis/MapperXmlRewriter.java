@@ -29,6 +29,8 @@ public class MapperXmlRewriter {
     public static final String MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE = "MYBATIS_DYNAMIC_SET_MISSING_COMMA";
     public static final String MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE =
             "MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA";
+    public static final String MYBATIS_STATIC_WHERE_MISSING_AND_RULE =
+            "MYBATIS_STATIC_WHERE_MISSING_AND";
     public static final String MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE =
             "MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE";
     public static final String MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
@@ -82,6 +84,17 @@ public class MapperXmlRewriter {
     private static final Pattern SET_ASSIGNMENT_START_PATTERN = Pattern.compile(
             "(?is)^\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
                     + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))?\\s*="
+    );
+    private static final Pattern BARE_WHERE_LINE_PATTERN = Pattern.compile("(?is)^\\s*where\\s*$");
+    private static final Pattern WHERE_CONNECTOR_LINE_PATTERN = Pattern.compile("(?is)^\\s*(?:and|or)\\b");
+    private static final Pattern WHERE_TRAILING_CONNECTOR_PATTERN = Pattern.compile("(?is).*\\b(?:and|or)\\s*$");
+    private static final Pattern WHERE_CLAUSE_BOUNDARY_LINE_PATTERN = Pattern.compile(
+            "(?is)^\\s*(?:group\\s+by|order\\s+by|having\\b|limit\\b|offset\\b|fetch\\b|union\\b|for\\b)"
+    );
+    private static final Pattern WHERE_PREDICATE_START_PATTERN = Pattern.compile(
+            "(?is)^\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
+                    + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))*\\s*"
+                    + "(?:=|<>|!=|>=|<=|>|<|in\\b|like\\b|between\\b|is\\b)"
     );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|\\$\\{[^}]+})";
@@ -605,6 +618,12 @@ public class MapperXmlRewriter {
         if (temporaryTableForeachLiteral.changed()) {
             converted = temporaryTableForeachLiteral.text();
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL_RULE);
+        }
+
+        TextRewrite staticWhereAnd = addMissingStaticWhereAnd(converted);
+        if (staticWhereAnd.changed()) {
+            converted = staticWhereAnd.text();
+            appliedRules.add(MYBATIS_STATIC_WHERE_MISSING_AND_RULE);
         }
 
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
@@ -3606,6 +3625,84 @@ public class MapperXmlRewriter {
             return trimmed.substring(0, trimmed.length() - 1).trim();
         }
         return trimmed;
+    }
+
+    private TextRewrite addMissingStaticWhereAnd(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        boolean inBareWhereClause = false;
+        boolean previousPredicateNeedsConnector = false;
+
+        int lineStart = 0;
+        while (lineStart < body.length()) {
+            int lineEnd = body.indexOf('\n', lineStart);
+            if (lineEnd < 0) {
+                lineEnd = body.length();
+            }
+            int contentEnd = lineEnd;
+            if (contentEnd > lineStart && body.charAt(contentEnd - 1) == '\r') {
+                contentEnd--;
+            }
+            String line = body.substring(lineStart, contentEnd);
+            String stripped = line.strip();
+            if (stripped.isEmpty() || stripped.startsWith("--") || stripped.startsWith("/*")) {
+                lineStart = nextLineStart(body, lineEnd);
+                continue;
+            }
+            if (BARE_WHERE_LINE_PATTERN.matcher(line).matches()) {
+                inBareWhereClause = true;
+                previousPredicateNeedsConnector = false;
+                lineStart = nextLineStart(body, lineEnd);
+                continue;
+            }
+            if (!inBareWhereClause) {
+                lineStart = nextLineStart(body, lineEnd);
+                continue;
+            }
+            if (WHERE_CLAUSE_BOUNDARY_LINE_PATTERN.matcher(line).find()) {
+                inBareWhereClause = false;
+                previousPredicateNeedsConnector = false;
+                lineStart = nextLineStart(body, lineEnd);
+                continue;
+            }
+            if (WHERE_CONNECTOR_LINE_PATTERN.matcher(line).find()) {
+                previousPredicateNeedsConnector = isStaticWherePredicateLine(line);
+                lineStart = nextLineStart(body, lineEnd);
+                continue;
+            }
+            if (previousPredicateNeedsConnector && isStaticWherePredicateLine(line)) {
+                int insertionIndex = firstNonWhitespaceIndex(body, lineStart, contentEnd);
+                replacements.add(new TextReplacement(insertionIndex, insertionIndex, "and "));
+            }
+            previousPredicateNeedsConnector = isStaticWherePredicateLine(line);
+            lineStart = nextLineStart(body, lineEnd);
+        }
+        return applyTextReplacements(body, replacements);
+    }
+
+    private boolean isStaticWherePredicateLine(String line) {
+        if (line == null || line.isBlank()) {
+            return false;
+        }
+        String stripped = line.stripLeading();
+        if (stripped.startsWith("<")
+                || stripped.startsWith(")")
+                || WHERE_TRAILING_CONNECTOR_PATTERN.matcher(stripped).matches()
+                || stripped.contains("<![CDATA[")) {
+            return false;
+        }
+        return WHERE_PREDICATE_START_PATTERN.matcher(stripped).find();
+    }
+
+    private int nextLineStart(String value, int lineEnd) {
+        return lineEnd < value.length() ? lineEnd + 1 : value.length();
+    }
+
+    private int firstNonWhitespaceIndex(String value, int start, int end) {
+        int index = start;
+        while (index < end && Character.isWhitespace(value.charAt(index))) {
+            index++;
+        }
+        return index;
     }
 
     private TextRewrite addMissingDynamicSetCommas(String body) {

@@ -1069,6 +1069,55 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicDeleteUpdateAddsMissingAndBetweenStaticWherePredicates() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ProcessDefPrecinctRelationMapper">
+                    <delete id="deleteBatchByProcessDefId" parameterType="java.util.List">
+                        update ns_process_def
+                        set delete_flag = 1
+                        where
+                        is_deleted = 0
+                        process_def_id in
+                        <foreach collection="processDefIds" item="item" open="(" close=")" separator=",">
+                            ${item}
+                        </foreach>
+                    </delete>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ProcessDefPrecinctRelationMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ProcessDefPrecinctRelationMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "src/main/resources/mapper-dm/ProcessDefPrecinctRelationMapper.xml"
+        ));
+        assertThat(rewritten)
+                .containsPattern("(?s)is_deleted = 0\\s+and process_def_id in")
+                .doesNotContain("is_deleted = 0\n        process_def_id in");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_STATIC_WHERE_MISSING_AND_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicUpdateSetAddsMissingCommasBetweenConditionalAssignments() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
