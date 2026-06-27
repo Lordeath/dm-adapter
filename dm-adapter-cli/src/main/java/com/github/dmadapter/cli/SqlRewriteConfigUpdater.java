@@ -117,7 +117,9 @@ class SqlRewriteConfigUpdater {
                 tableKeys,
                 methodKeys,
                 loadedRewriteConfig.ignoredMissingTables(),
-                loadedRewriteConfig.ignoredMissingColumns()
+                loadedRewriteConfig.ignoredMissingColumns(),
+                loadedRewriteConfig.ignoredMissingSchemas(),
+                loadedRewriteConfig.identityInsertTables()
         );
     }
 
@@ -170,6 +172,7 @@ class SqlRewriteConfigUpdater {
     private static final class RewriteConfigModel {
         private final LinkedHashMap<String, List<String>> tableKeys = new LinkedHashMap<>();
         private final LinkedHashMap<String, List<String>> methodKeys = new LinkedHashMap<>();
+        private final List<String> identityInsertLines = new ArrayList<>();
         private final List<String> validationIgnoreLines = new ArrayList<>();
         private final List<String> validationArgsLines = new ArrayList<>();
 
@@ -246,8 +249,12 @@ class SqlRewriteConfigUpdater {
         String toYaml() {
             StringBuilder yaml = new StringBuilder();
             yaml.append("# dm-adapter SQL rewrite config.\n")
-                    .append("# keyColumns may be inferred from Dameng primary/unique metadata when DM_SQL_VALIDATION is enabled.\n")
-                    .append("upsertKeys:\n")
+                    .append("# keyColumns may be inferred from Dameng primary/unique metadata when DM_SQL_VALIDATION is enabled.\n");
+            if (!identityInsertLines.isEmpty()) {
+                identityInsertLines.forEach(line -> yaml.append(line).append("\n"));
+                yaml.append("\n");
+            }
+            yaml.append("upsertKeys:\n")
                     .append("  tables:\n");
             if (tableKeys.isEmpty()) {
                 yaml.append("    {}\n");
@@ -282,6 +289,7 @@ class SqlRewriteConfigUpdater {
         }
 
         private void parse(List<String> lines) {
+            identityInsertLines.addAll(topLevelBlockStartingWith(lines, "identityInsertTables:"));
             validationArgsLines.addAll(topLevelBlock(lines, "validationArgs:"));
             validationIgnoreLines.addAll(topLevelBlock(lines, "validationIgnores:"));
             String section = "";
@@ -336,13 +344,21 @@ class SqlRewriteConfigUpdater {
         }
 
         private static List<String> topLevelBlock(List<String> lines, String header) {
+            return topLevelBlock(lines, trimmed -> header.equals(trimmed));
+        }
+
+        private static List<String> topLevelBlockStartingWith(List<String> lines, String headerPrefix) {
+            return topLevelBlock(lines, trimmed -> trimmed.startsWith(headerPrefix));
+        }
+
+        private static List<String> topLevelBlock(List<String> lines, java.util.function.Predicate<String> headerMatcher) {
             List<String> block = new ArrayList<>();
             boolean capturing = false;
             for (String line : lines) {
                 String trimmed = line.trim();
                 int indent = leadingSpaces(line);
                 if (!capturing) {
-                    if (indent == 0 && header.equals(trimmed)) {
+                    if (indent == 0 && headerMatcher.test(trimmed)) {
                         capturing = true;
                         block.add(line);
                     }

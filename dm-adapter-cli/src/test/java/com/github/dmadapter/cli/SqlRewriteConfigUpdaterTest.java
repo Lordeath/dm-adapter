@@ -2,6 +2,7 @@ package com.github.dmadapter.cli;
 
 import com.github.dmadapter.core.AdapterContext;
 import com.github.dmadapter.mybatis.SqlRewriteConfig;
+import com.github.dmadapter.mybatis.SqlRewriteConfigLoader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -171,6 +172,51 @@ class SqlRewriteConfigUpdaterTest {
                 .contains("\"role_perm\":")
                 .contains("\"com.example.UserMapper.insertIgnore\":")
                 .contains("keyColumns: []");
+    }
+
+    @Test
+    void preservesIdentityInsertTablesAndMissingSchemasWhenMaintainingRewriteConfig() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        Files.createDirectories(config.getParent());
+        Files.writeString(config, """
+                identityInsertTables:
+                  - "ns_bill_openbill_interface_log_history"
+
+                upsertKeys:
+                  tables:
+                    {}
+                  methods:
+                    {}
+
+                validationIgnores:
+                  missingSchemas:
+                    - "newsee-bill"
+                """);
+        SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.UserMapper.insertIgnore",
+                "role_perm",
+                List.of("role_id", "perm_id")
+        );
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                loaded,
+                List.of(candidate),
+                Map.of(),
+                false
+        );
+
+        assertThat(update.rewriteConfig().requiresIdentityInsert("ns_bill_openbill_interface_log_history")).isTrue();
+        assertThat(update.rewriteConfig().ignoredMissingSchemas()).contains("newsee-bill");
+        assertThat(Files.readString(config))
+                .contains("identityInsertTables:")
+                .contains("- \"ns_bill_openbill_interface_log_history\"")
+                .contains("validationIgnores:")
+                .contains("missingSchemas:")
+                .contains("- \"newsee-bill\"")
+                .contains("\"role_perm\":");
     }
 
     @Test
