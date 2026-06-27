@@ -743,6 +743,19 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsNestedMysqlConcatWithMyBatisPlaceholder() {
+        SqlConversionResult result = converter.convert(
+                "and cd.OwnerName like concat(concat(#{customerName}),'%')"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("and cd.OwnerName like ((#{customerName})) || ('%')");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
+    }
+
+    @Test
     void doesNotConvertMysqlConcatWithDynamicIdentifier() {
         SqlConversionResult result = converter.convert(
                 "select concat(${remarkField}, '\\n') from customer"
