@@ -7704,9 +7704,11 @@ class DmSqlValidationTestGenerator {
                     String parameterSummary = record.parameterSummary == null ? "" : record.parameterSummary;
                     return hasGeneratedDynamicIdentifierPlaceholder(message)
                             || Pattern.compile("(?im)^### SQL:\\\\s*(?:ID|test)\\\\s*$").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:\\\\s*(?:ID|test)(?:\\\\s*###|\\\\s*$)").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bdelete\\\\s+from\\\\s+\\\"?ID\\\"?\\\\b").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bcreate\\\\s+table(?:\\\\s+if\\\\s+not\\\\s+exists)?\\\\s+\\\"?ID\\\"?\\\\s*\\\\(").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join|into|update|table)\\\\s+\\\"?ID\\\"?\\\\b").matcher(message).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:from|join|into|update|table)\\\\s+'(?:ID|test|\\\\d{4}-\\\\d{2}-\\\\d{2})'(?:\\\\s|$)").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\s+ID\\\\s*(?:=|and|$)").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:and|or)\\\\s+1\\\\s*=\\\\s*1\\\\s*(?:=|in\\\\s*\\\\()").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bADD\\\\s+COLUMN\\\\s+`?null`?\\\\s+null\\\\b").matcher(message).find()
