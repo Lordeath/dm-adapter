@@ -2704,7 +2704,9 @@ class DmSqlValidationTestGenerator {
                         String paramName = paramAnnotationName(parameter);
                         if (!isBlank(paramName)) {
                             paramIndexesByName.computeIfAbsent(paramName, ignored -> new ArrayList<>()).add(i);
-                        } else if (method.getParameterCount() > 1 && simpleMapperParameterType(method.getParameterTypes()[i])) {
+                        } else if (method.getParameterCount() > 1
+                                && simpleMapperParameterType(method.getParameterTypes()[i])
+                                && !hasUsableActualParameterName(parameter, i)) {
                             missingSimpleParams.add(parameter.getName());
                         }
                     }
@@ -2729,6 +2731,14 @@ class DmSqlValidationTestGenerator {
                         );
                     }
                     return null;
+                }
+
+                private boolean hasUsableActualParameterName(Parameter parameter, int index) {
+                    if (parameter == null || !parameter.isNamePresent()) {
+                        return false;
+                    }
+                    String name = parameter.getName();
+                    return !isBlank(name) && !Pattern.compile("^(?:arg|param)\\\\d+$").matcher(name).matches();
                 }
 
                 private boolean simpleMapperParameterType(Class<?> type) {
