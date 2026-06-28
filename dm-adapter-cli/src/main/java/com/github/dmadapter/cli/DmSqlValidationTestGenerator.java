@@ -4021,8 +4021,8 @@ class DmSqlValidationTestGenerator {
                     }
                     String stripped = stripSqlLiteralQuotes(text);
                     if (isGeneratedDynamicIdentifierPlaceholder(stripped)) {
-                        if (existingDefault instanceof String) {
-                            String defaultText = ((String) existingDefault).trim();
+                        if (existingDefault != null) {
+                            String defaultText = String.valueOf(existingDefault).trim();
                             String strippedDefault = stripSqlLiteralQuotes(defaultText);
                             if (!isGeneratedDynamicIdentifierPlaceholder(strippedDefault)) {
                                 return defaultText;
@@ -5740,6 +5740,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (normalized.contains("accountbook")) {
                         return "202401";
+                    }
+                    if (isDateLikeParameterName(normalized)) {
+                        return "2024-01-01 00:00:00";
                     }
                     if (normalized.contains("orderno")
                             || "orders".equals(normalized)
