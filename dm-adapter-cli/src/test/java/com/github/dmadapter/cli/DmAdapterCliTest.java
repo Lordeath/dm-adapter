@@ -585,6 +585,8 @@ class DmAdapterCliTest {
                 .contains("recordKey(mapperMethod.key())")
                 .contains("javaMapperSignatureIssue")
                 .contains("simpleMapperParameterType")
+                .contains("hasUsableActualParameterName")
+                .contains("parameter.isNamePresent()")
                 .contains("paramAnnotationName")
                 .contains("JAVA_MAPPER_PARAM_ANNOTATION")
                 .contains("Java mapper method has multiple simple parameters without @Param")
