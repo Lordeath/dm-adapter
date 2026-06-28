@@ -8706,7 +8706,11 @@ class DmSqlValidationTestGenerator {
                             mapperMethodsBySimpleAndMethod.put(entry.getKey(), mapperMethodsByMethodName(entry.getValue()));
                         }
                         Map<String, Map<Integer, Class<?>>> actualTypes = new LinkedHashMap<>();
+                        long deadlineNanos = System.nanoTime() + 5_000_000_000L;
                         for (Path sourceFile : javaSourceFiles(projectRoot)) {
+                            if (System.nanoTime() > deadlineNanos) {
+                                break;
+                            }
                             try {
                                 scanSourceFile(
                                         sourceFile,
@@ -8756,6 +8760,7 @@ class DmSqlValidationTestGenerator {
                             return paths.filter(Files::isRegularFile)
                                     .filter(path -> path.getFileName().toString().endsWith(".java"))
                                     .filter(ActualParameterTypeIndex::isJavaSourcePath)
+                                    .filter(ActualParameterTypeIndex::isReasonableJavaSourceFile)
                                     .filter(path -> !path.toString().contains("/target/"))
                                     .filter(path -> !path.toString().contains("\\\\target\\\\"))
                                     .sorted()
@@ -8770,6 +8775,14 @@ class DmSqlValidationTestGenerator {
                         return value.contains("/src/main/java/") || value.contains("/src/test/java/");
                     }
 
+                    private static boolean isReasonableJavaSourceFile(Path path) {
+                        try {
+                            return Files.size(path) <= 262_144L;
+                        } catch (IOException e) {
+                            return false;
+                        }
+                    }
+
                     private static void scanSourceFile(
                             Path sourceFile,
                             Set<String> mapperSimpleNames,
@@ -8777,6 +8790,9 @@ class DmSqlValidationTestGenerator {
                             Map<String, Map<Integer, Class<?>>> actualTypes
                     ) throws IOException {
                         String source = stripCommentsPreservingLength(new String(Files.readAllBytes(sourceFile), StandardCharsets.UTF_8));
+                        if (source.length() > 262_144) {
+                            return;
+                        }
                         String packageName = packageName(source);
                         ImportIndex imports = ImportIndex.parse(source);
                         Map<String, Set<String>> mapperVariablesBySimpleName = mapperVariablesBySimpleName(source, mapperSimpleNames);
@@ -8842,7 +8858,7 @@ class DmSqlValidationTestGenerator {
                     private static Map<String, Set<String>> mapperVariablesBySimpleName(String source, Set<String> mapperSimpleNames) {
                         Pattern pattern = Pattern.compile(
                                 "(^|[^A-Za-z0-9_$])"
-                                        + "([A-Za-z_$][A-Za-z0-9_$.]*(?:\\\\s*<[^;(){}=]*>)?)"
+                                        + "([A-Za-z_$][A-Za-z0-9_$.]*)"
                                         + "\\\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\\\s*(?:[;=,)])"
                         );
                         Matcher matcher = pattern.matcher(source);
