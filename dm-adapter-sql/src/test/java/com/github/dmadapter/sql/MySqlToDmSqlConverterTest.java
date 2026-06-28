@@ -29,6 +29,19 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlCurrentSchemaFunctions() {
+        SqlConversionResult result = converter.convert("select schema(), database(), 'schema()' as raw");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), "
+                        + "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), 'schema()' as raw"
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_CURRENT_SCHEMA_FUNCTION_RULE);
+    }
+
+    @Test
     void convertsDoubleQuotedStringLiterals() {
         SqlConversionResult result = converter.convert(
                 "select * from user where status = \"ACTIVE\" and remark = \"Bob's \\\"note\\\"\""

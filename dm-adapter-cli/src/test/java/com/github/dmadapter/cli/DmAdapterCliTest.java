@@ -418,6 +418,7 @@ class DmAdapterCliTest {
                 .contains("mergeConfiguredCollectionElementMap")
                 .contains("coerceConfiguredValueToDefaultType")
                 .contains("isGeneratedPlaceholderValue")
+                .contains("metadata.addDynamicIdentifierName(expression)")
                 .contains("java.sql.Timestamp.valueOf(\"2024-01-01 00:00:00\")")
                 .contains("convertConfiguredValue")
                 .contains("suggestedArgumentConfig")

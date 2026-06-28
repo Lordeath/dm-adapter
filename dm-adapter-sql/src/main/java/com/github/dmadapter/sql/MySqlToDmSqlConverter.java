@@ -17,6 +17,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String UPDATE_SET_TABLE_ORDER_RULE = "UPDATE_SET_TABLE_ORDER_TO_STANDARD_UPDATE";
     public static final String MYSQL_DATE_SUB_INTERVAL_RULE = "MYSQL_DATE_SUB_INTERVAL_TO_DATEADD";
     public static final String MYSQL_DATE_SUB_NOW_DAY_RULE = MYSQL_DATE_SUB_INTERVAL_RULE;
+    public static final String MYSQL_CURRENT_SCHEMA_FUNCTION_RULE = "MYSQL_CURRENT_SCHEMA_FUNCTION_TO_DM";
     public static final String MYSQL_REGEXP_OPERATOR_RULE = "MYSQL_REGEXP_OPERATOR_TO_REGEXP_LIKE";
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_CAST_SIGNED_RULE = "MYSQL_CAST_SIGNED_TO_BIGINT";
@@ -97,6 +98,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final String TO_BASE64 = "TO_BASE64";
     private static final String AES_MANUAL_REVIEW_REASON =
             "AES_ENCRYPT/AES_DECRYPT is present but only Base64-wrapped AES password SQL is supported for automatic Dameng rewrite.";
+    private static final String DM_CURRENT_SCHEMA_EXPRESSION = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')";
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOW_PATTERN = Pattern.compile("\\bNOW\\s*\\(\\s*\\)", Pattern.CASE_INSENSITIVE);
@@ -707,6 +709,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (informationSchemaTablesConversion.changed()) {
             converted = informationSchemaTablesConversion.convertedSql();
             rules.add(MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+        }
+
+        GenericConversion currentSchemaFunctionConversion = convertMysqlCurrentSchemaFunctions(converted);
+        if (currentSchemaFunctionConversion.changed()) {
+            converted = currentSchemaFunctionConversion.convertedSql();
+            rules.add(MYSQL_CURRENT_SCHEMA_FUNCTION_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -3093,6 +3101,42 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + "AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
                 + "AND OBJECT_NAME LIKE UPPER(" + tableLike + ")";
         return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertMysqlCurrentSchemaFunctions(String sql) {
+        if (sql.toUpperCase(Locale.ROOT).contains("INFORMATION_SCHEMA")) {
+            return GenericConversion.unchanged(sql);
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                FunctionCall schemaCall = readFunctionCall(sql, index, "SCHEMA");
+                FunctionCall databaseCall = schemaCall == null ? readFunctionCall(sql, index, "DATABASE") : null;
+                FunctionCall functionCall = schemaCall == null ? databaseCall : schemaCall;
+                if (functionCall != null && functionCall.body().trim().isEmpty()) {
+                    appendFunctionReplacement(converted, DM_CURRENT_SCHEMA_EXPRESSION, sql, functionCall);
+                    index = functionCall.endIndex();
+                    changed = true;
+                } else {
+                    converted.append(current);
+                    index++;
+                }
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
     private GenericConversion convertLocateNumericNeedle(String sql) {
