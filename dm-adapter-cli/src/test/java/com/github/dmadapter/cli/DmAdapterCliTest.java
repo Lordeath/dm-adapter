@@ -80,7 +80,7 @@ class DmAdapterCliTest {
         assertThat(exitCode).isZero();
         assertThat(mapperDm)
                 .contains("<mapper namespace=\"com.example.AnnotationMapper\">")
-                .contains("<select id=\"selectNow\">")
+                .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
                 .contains("SYSDATE")
                 .contains("FETCH FIRST 1 ROWS ONLY")
                 .doesNotContain("NOW()");

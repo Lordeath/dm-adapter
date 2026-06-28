@@ -40,6 +40,9 @@ public class MapperAnnotationMigrator {
     private static final Pattern TYPE_PATTERN = Pattern.compile(
             "\\b(?:public\\s+)?(?:interface|class)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b"
     );
+    private static final Pattern IMPORT_PATTERN = Pattern.compile(
+            "(?m)^\\s*import\\s+((?:static\\s+)?[A-Za-z_][A-Za-z0-9_.*]*)\\s*;"
+    );
     private static final Pattern SQL_ANNOTATION_PATTERN = Pattern.compile(
             "@(Select|Insert|Update|Delete)\\b"
     );
@@ -249,7 +252,11 @@ public class MapperAnnotationMigrator {
                     + indent(sql, "            ")
                     + "\n        ]]>";
         }
-        return "\n    <" + statement.tagName() + " id=\"" + escapeXmlAttribute(statement.id()) + "\">\n"
+        String resultType = "";
+        if ("select".equals(statement.tagName()) && !statement.resultType().isBlank()) {
+            resultType = " resultType=\"" + escapeXmlAttribute(statement.resultType()) + "\"";
+        }
+        return "\n    <" + statement.tagName() + " id=\"" + escapeXmlAttribute(statement.id()) + "\"" + resultType + ">\n"
                 + body
                 + "\n    </" + statement.tagName() + ">\n";
     }
@@ -437,6 +444,7 @@ public class MapperAnnotationMigrator {
         if (packageName.isBlank() || simpleName.isBlank()) {
             return List.of();
         }
+        Map<String, String> imports = imports(source);
         Path moduleRoot = moduleRoot(javaFile);
         String namespace = packageName + "." + simpleName;
         List<AnnotationStatement> statements = new ArrayList<>();
@@ -461,20 +469,41 @@ public class MapperAnnotationMigrator {
             if (methodParen < 0) {
                 continue;
             }
-            String methodName = methodName(source.substring(methodStart, methodParen));
+            String signaturePrefix = source.substring(methodStart, methodParen);
+            String methodName = methodName(signaturePrefix);
             if (methodName.isBlank()) {
                 continue;
             }
+            String resultType = "Select".equals(annotationName)
+                    ? resultType(signaturePrefix, methodName, packageName, imports)
+                    : "";
             statements.add(new AnnotationStatement(
                     namespace,
                     simpleName,
                     methodName,
                     tagName(annotationName),
                     sql,
+                    resultType,
                     moduleRoot
             ));
         }
         return statements;
+    }
+
+    private Map<String, String> imports(String source) {
+        Map<String, String> imports = new LinkedHashMap<>();
+        Matcher matcher = IMPORT_PATTERN.matcher(source);
+        while (matcher.find()) {
+            String name = matcher.group(1);
+            if (name.startsWith("static ") || name.endsWith(".*")) {
+                continue;
+            }
+            int dot = name.lastIndexOf('.');
+            if (dot > 0 && dot + 1 < name.length()) {
+                imports.put(name.substring(dot + 1), name);
+            }
+        }
+        return imports;
     }
 
     private String firstGroup(Matcher matcher) {
@@ -674,6 +703,159 @@ public class MapperAnnotationMigrator {
         return matcher.find() ? matcher.group(1) : "";
     }
 
+    private String resultType(
+            String signaturePrefix,
+            String methodName,
+            String packageName,
+            Map<String, String> imports
+    ) {
+        String prefix = signaturePrefix.substring(0, signaturePrefix.length() - methodName.length()).trim();
+        String declaredType = stripMethodModifiers(prefix);
+        if (declaredType.isBlank() || "void".equals(declaredType)) {
+            return "";
+        }
+        String rowType = rowResultType(declaredType);
+        if (rowType.isBlank() || isTypeVariable(rowType)) {
+            return "java.lang.Object";
+        }
+        return resolveType(rowType, packageName, imports);
+    }
+
+    private String stripMethodModifiers(String value) {
+        String result = value.trim();
+        result = Pattern.compile("^(?:(?:public|protected|private|abstract|default|static|final|synchronized|native|strictfp)\\s+)+")
+                .matcher(result)
+                .replaceAll("");
+        while (result.startsWith("<")) {
+            int end = matchingGenericEnd(result, 0);
+            if (end < 0) {
+                break;
+            }
+            result = result.substring(end + 1).trim();
+        }
+        return result;
+    }
+
+    private String rowResultType(String declaredType) {
+        String type = normalizeType(declaredType);
+        String raw = rawType(type);
+        if (isCollectionType(raw) || "java.util.Optional".equals(raw) || "Optional".equals(raw)) {
+            String inner = firstGenericArgument(type);
+            return inner.isBlank() ? "java.lang.Object" : rowResultType(inner);
+        }
+        if ("Map".equals(raw) || "java.util.Map".equals(raw)) {
+            return "java.util.Map";
+        }
+        return type;
+    }
+
+    private String normalizeType(String value) {
+        String type = value.trim();
+        type = Pattern.compile("^(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\\([^)]*\\))?\\s+)+")
+                .matcher(type)
+                .replaceAll("");
+        while (type.endsWith("[]")) {
+            type = type.substring(0, type.length() - 2).trim();
+        }
+        if (type.startsWith("? extends ")) {
+            type = type.substring("? extends ".length()).trim();
+        } else if (type.startsWith("? super ")) {
+            type = type.substring("? super ".length()).trim();
+        }
+        return type;
+    }
+
+    private String rawType(String type) {
+        int generic = type.indexOf('<');
+        return generic < 0 ? type : type.substring(0, generic).trim();
+    }
+
+    private boolean isCollectionType(String rawType) {
+        return Set.of(
+                "List", "java.util.List",
+                "Collection", "java.util.Collection",
+                "Set", "java.util.Set",
+                "Iterable", "java.lang.Iterable",
+                "Iterator", "java.util.Iterator",
+                "Cursor", "org.apache.ibatis.cursor.Cursor"
+        ).contains(rawType);
+    }
+
+    private String firstGenericArgument(String type) {
+        int open = type.indexOf('<');
+        if (open < 0) {
+            return "";
+        }
+        int close = matchingGenericEnd(type, open);
+        if (close < 0) {
+            return "";
+        }
+        String content = type.substring(open + 1, close).trim();
+        int depth = 0;
+        for (int i = 0; i < content.length(); i++) {
+            char current = content.charAt(i);
+            if (current == '<') {
+                depth++;
+            } else if (current == '>') {
+                depth--;
+            } else if (current == ',' && depth == 0) {
+                return content.substring(0, i).trim();
+            }
+        }
+        return content;
+    }
+
+    private int matchingGenericEnd(String value, int openIndex) {
+        int depth = 0;
+        for (int i = openIndex; i < value.length(); i++) {
+            char current = value.charAt(i);
+            if (current == '<') {
+                depth++;
+            } else if (current == '>') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private boolean isTypeVariable(String type) {
+        return !type.contains(".")
+                && type.length() == 1
+                && Character.isUpperCase(type.charAt(0));
+    }
+
+    private String resolveType(String type, String packageName, Map<String, String> imports) {
+        String raw = rawType(type);
+        return switch (raw) {
+            case "boolean" -> "java.lang.Boolean";
+            case "byte" -> "java.lang.Byte";
+            case "short" -> "java.lang.Short";
+            case "int" -> "java.lang.Integer";
+            case "long" -> "java.lang.Long";
+            case "float" -> "java.lang.Float";
+            case "double" -> "java.lang.Double";
+            case "char" -> "java.lang.Character";
+            case "String" -> "java.lang.String";
+            case "Boolean", "Byte", "Short", "Integer", "Long", "Float", "Double", "Character", "Object" ->
+                    "java.lang." + raw;
+            case "BigDecimal" -> "java.math.BigDecimal";
+            case "BigInteger" -> "java.math.BigInteger";
+            case "Date" -> imports.getOrDefault("Date", "java.util.Date");
+            case "LocalDate" -> "java.time.LocalDate";
+            case "LocalDateTime" -> "java.time.LocalDateTime";
+            case "Map" -> "java.util.Map";
+            default -> {
+                if (raw.contains(".")) {
+                    yield raw;
+                }
+                yield imports.getOrDefault(raw, packageName + "." + raw);
+            }
+        };
+    }
+
     private String tagName(String annotationName) {
         return annotationName.toLowerCase(Locale.ROOT);
     }
@@ -684,6 +866,7 @@ public class MapperAnnotationMigrator {
             String id,
             String tagName,
             String sql,
+            String resultType,
             Path moduleRoot
     ) {
         private String key() {
