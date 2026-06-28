@@ -776,7 +776,7 @@ class DmSqlValidationTestGenerator {
                         Path projectRoot
                 ) {
                     log("Building MyBatis SqlSessionFactory...");
-                    Configuration configuration = new Configuration(new Environment(
+                    XmlOnlyConfiguration configuration = new XmlOnlyConfiguration(new Environment(
                             "dm-validation",
                             new JdbcTransactionFactory(),
                             dataSource(config)
@@ -803,7 +803,12 @@ class DmSqlValidationTestGenerator {
                                     mapperXmlFile.toString(),
                                     configuration.getSqlFragments()
                             );
-                            xmlMapperBuilder.parse();
+                            configuration.suppressMapperBinding(true);
+                            try {
+                                xmlMapperBuilder.parse();
+                            } finally {
+                                configuration.suppressMapperBinding(false);
+                            }
                         } catch (Exception e) {
                             throw new IllegalStateException("Failed to parse mapper XML: " + mapperXmlFile, e);
                         }
@@ -990,13 +995,6 @@ class DmSqlValidationTestGenerator {
                         MappedStatement mappedStatement = configuration.getMappedStatement(mapperStatement.key(), false);
                         Class<?> mapperInterface = mapperInterface(mapperStatement.namespace);
                         Method method = mapperInterface == null ? null : mapperMethod(mapperInterface, mapperStatement.id, config);
-                        if (mapperInterface != null && !configuration.hasMapper(mapperInterface)) {
-                            try {
-                                configuration.addMapper(mapperInterface);
-                            } catch (Exception ignored) {
-                                method = null;
-                            }
-                        }
                         MapperMethod mapperMethod = new MapperMethod(
                                 mapperStatement,
                                 mapperInterface,
@@ -2932,9 +2930,11 @@ class DmSqlValidationTestGenerator {
                     try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
                         try {
                             applySchema(sqlSession.getConnection(), schema);
-                            Object result = mapperMethod.method == null
-                                    ? invokeMappedStatement(sqlSession, mapperMethod, parameters.args.length == 0 ? null : parameters.args[0])
-                                    : invokeReflectively(sqlSession, mapperMethod, parameters.args);
+                            Object result = invokeMappedStatement(
+                                    sqlSession,
+                                    mapperMethod,
+                                    statementParameterObject(mapperMethod, parameters)
+                            );
                             sqlSession.rollback(true);
                             return ValidationRecord.passed(
                                     parameters.recordKey(mapperMethod.key()),
@@ -3375,6 +3375,76 @@ class DmSqlValidationTestGenerator {
                         throw new MapperInvocationException(e.getTargetException());
                     } catch (Exception e) {
                         throw new MapperInvocationException(e);
+                    }
+                }
+
+                private Object statementParameterObject(MapperMethod mapperMethod, ParameterResolution parameters) {
+                    if (parameters.args.length == 0) {
+                        return null;
+                    }
+                    if (mapperMethod.method == null) {
+                        return parameters.args.length == 1 ? parameters.args[0] : parameterMap(mapperMethod, parameters);
+                    }
+                    Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
+                    if (parameters.args.length == 1 && parameterTypes.length == 1) {
+                        Parameter parameter = mapperMethod.method.getParameters()[0];
+                        boolean hasParamAnnotation = !isBlank(paramAnnotationName(parameter));
+                        Class<?> parameterType = parameterTypes[0];
+                        if (!hasParamAnnotation
+                                && !simpleMapperParameterType(parameterType)
+                                && !isCollectionLikeParameter(parameterType)
+                                && !Map.class.isAssignableFrom(parameterType)) {
+                            return parameters.args[0];
+                        }
+                        if (!hasParamAnnotation && Map.class.isAssignableFrom(parameterType)) {
+                            return parameters.args[0];
+                        }
+                    }
+                    return parameterMap(mapperMethod, parameters);
+                }
+
+                private Map<String, Object> parameterMap(MapperMethod mapperMethod, ParameterResolution parameters) {
+                    Map<String, Object> map = new LinkedHashMap<>();
+                    if (mapperMethod.method == null) {
+                        for (int i = 0; i < parameters.args.length; i++) {
+                            map.put("arg" + i, parameters.args[i]);
+                            map.put("param" + (i + 1), parameters.args[i]);
+                        }
+                        return map;
+                    }
+                    Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
+                    int collectionParameterIndex = 0;
+                    for (int i = 0; i < parameters.args.length; i++) {
+                        Object value = parameters.args[i];
+                        String parameterName = parameterName(mapperMethod.method, i);
+                        boolean collectionLike = i < parameterTypes.length && isCollectionLikeParameter(parameterTypes[i]);
+                        String effectiveParameterName = mapperMethod.statement == null
+                                ? parameterName
+                                : mapperMethod.statement.parameterExpressionName(
+                                        i,
+                                        collectionLike ? collectionParameterIndex : -1,
+                                        parameterName
+                                );
+                        putParameter(map, parameterName, value);
+                        putParameter(map, effectiveParameterName, value);
+                        putParameter(map, "arg" + i, value);
+                        putParameter(map, "param" + (i + 1), value);
+                        if (collectionLike) {
+                            putParameter(map, "collection", value);
+                            if (value instanceof List<?>) {
+                                putParameter(map, "list", value);
+                            } else if (value != null && value.getClass().isArray()) {
+                                putParameter(map, "array", value);
+                            }
+                            collectionParameterIndex++;
+                        }
+                    }
+                    return map;
+                }
+
+                private void putParameter(Map<String, Object> map, String name, Object value) {
+                    if (!isBlank(name)) {
+                        map.putIfAbsent(name, value);
                     }
                 }
 
@@ -11025,6 +11095,23 @@ class DmSqlValidationTestGenerator {
                     private SetBranchParameterVariant(String parameterName, String literal) {
                         this.parameterName = parameterName;
                         this.literal = literal;
+                    }
+                }
+
+                private static final class XmlOnlyConfiguration extends Configuration {
+                    private boolean suppressMapperBinding;
+
+                    private XmlOnlyConfiguration(Environment environment) {
+                        super(environment);
+                    }
+
+                    private void suppressMapperBinding(boolean suppressMapperBinding) {
+                        this.suppressMapperBinding = suppressMapperBinding;
+                    }
+
+                    @Override
+                    public <T> boolean hasMapper(Class<T> type) {
+                        return suppressMapperBinding || super.hasMapper(type);
                     }
                 }
 
