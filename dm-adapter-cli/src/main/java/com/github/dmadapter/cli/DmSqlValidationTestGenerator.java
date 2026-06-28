@@ -6094,6 +6094,7 @@ class DmSqlValidationTestGenerator {
                 private boolean isDateLikeParameterName(String normalizedName) {
                     return "date".equals(normalizedName)
                             || "time".equals(normalizedName)
+                            || "now".equals(normalizedName)
                             || normalizedName.endsWith("date")
                             || normalizedName.endsWith("datestr")
                             || normalizedName.endsWith("datestart")

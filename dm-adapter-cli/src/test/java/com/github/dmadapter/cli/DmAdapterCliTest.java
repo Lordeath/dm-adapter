@@ -689,6 +689,7 @@ class DmAdapterCliTest {
                 .contains("isReasonableJavaSourceFile")
                 .contains("deadlineNanos")
                 .contains("auto:actual-type")
+                .contains("\"now\".equals(normalizedName)")
                 .contains("normalizedName.endsWith(\"datestr\")")
                 .doesNotContain("@SpringBootTest")
                 .doesNotContain("@ActiveProfiles")
