@@ -1418,6 +1418,7 @@ class DmSqlValidationTestGenerator {
                     }
                     Object contextualDefault = defaultDynamicSqlParameterValue(expression, text, startIndex, endIndex, sqlContext);
                     if (contextualDefault != null) {
+                        metadata.addDynamicIdentifierName(expression);
                         metadata.addDefaultValue(expression, contextualDefault);
                         return;
                     }
