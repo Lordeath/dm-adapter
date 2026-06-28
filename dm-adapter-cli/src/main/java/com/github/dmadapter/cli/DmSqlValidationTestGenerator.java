@@ -591,6 +591,7 @@ class DmSqlValidationTestGenerator {
                         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
                 private ValidationConfig currentConfig = new ValidationConfig();
                 private DbColumnMetadata dbColumnMetadata = DbColumnMetadata.empty();
+                private ActualParameterTypeIndex actualParameterTypeIndex = ActualParameterTypeIndex.empty();
 
                 @SafeVarargs
                 private static <T> List<T> listOf(T... values) {
@@ -671,6 +672,8 @@ class DmSqlValidationTestGenerator {
                                 UsageFilter usageFilter = MapperUsageIndex.build(projectRoot, config, mapperMethods);
                                 usageFilterReport = usageFilter.report();
                                 log("Usage filter: " + usageFilterReport.summary());
+                                actualParameterTypeIndex = ActualParameterTypeIndex.build(projectRoot, mapperMethods);
+                                log("Actual parameter type inference: " + actualParameterTypeIndex.summary());
                                 int index = 0;
                                 int total = mapperMethods.size();
                                 for (MapperMethod mapperMethod : mapperMethods) {
@@ -2605,15 +2608,27 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private ParameterResolution generatedParameters(MapperMethod mapperMethod) {
-                    Class<?>[] parameterTypes = mapperMethod.method.getParameterTypes();
-                    Type[] genericTypes = mapperMethod.method.getGenericParameterTypes();
-                    Object[] args = new Object[parameterTypes.length];
+                    Class<?>[] declaredParameterTypes = mapperMethod.method.getParameterTypes();
+                    Type[] declaredGenericTypes = mapperMethod.method.getGenericParameterTypes();
+                    Object[] args = new Object[declaredParameterTypes.length];
                     List<String> names = new ArrayList<>();
                     int collectionParameterIndex = 0;
-                    for (int i = 0; i < parameterTypes.length; i++) {
+                    boolean inferredActualType = false;
+                    for (int i = 0; i < declaredParameterTypes.length; i++) {
                         String parameterName = parameterName(mapperMethod.method, i);
                         names.add(parameterName);
-                        boolean collectionLike = isCollectionLikeParameter(parameterTypes[i]);
+                        Class<?> parameterType = actualParameterTypeIndex.actualType(
+                                mapperMethod.key(),
+                                i,
+                                declaredParameterTypes[i]
+                        );
+                        Type genericType = parameterType.equals(declaredParameterTypes[i])
+                                ? declaredGenericTypes[i]
+                                : parameterType;
+                        if (!parameterType.equals(declaredParameterTypes[i])) {
+                            inferredActualType = true;
+                        }
+                        boolean collectionLike = isCollectionLikeParameter(parameterType);
                         String effectiveParameterName = mapperMethod.statement.parameterExpressionName(
                                 i,
                                 collectionLike ? collectionParameterIndex : -1,
@@ -2624,8 +2639,8 @@ class DmSqlValidationTestGenerator {
                         }
                         ValueResult value = defaultValue(
                                 effectiveParameterName,
-                                parameterTypes[i],
-                                genericTypes[i],
+                                parameterType,
+                                genericType,
                                 0,
                                 mapperMethod.statement
                         );
@@ -2634,7 +2649,7 @@ class DmSqlValidationTestGenerator {
                         }
                         args[i] = value.value;
                     }
-                    return ParameterResolution.resolved("auto", args, names);
+                    return ParameterResolution.resolved(inferredActualType ? "auto:actual-type" : "auto", args, names);
                 }
 
                 private List<ParameterResolution> setBranchParameterVariants(
@@ -8660,6 +8675,360 @@ class DmSqlValidationTestGenerator {
 
                 """,
             """
+                private static final class ActualParameterTypeIndex {
+                    private final Map<String, Map<Integer, Class<?>>> actualTypes;
+
+                    private ActualParameterTypeIndex(Map<String, Map<Integer, Class<?>>> actualTypes) {
+                        this.actualTypes = actualTypes;
+                    }
+
+                    private static ActualParameterTypeIndex empty() {
+                        return new ActualParameterTypeIndex(emptyMap());
+                    }
+
+                    private static ActualParameterTypeIndex build(Path projectRoot, List<MapperMethod> mapperMethods) {
+                        Map<String, List<MapperMethod>> mapperMethodsBySimpleName = new LinkedHashMap<>();
+                        for (MapperMethod mapperMethod : mapperMethods) {
+                            if (mapperMethod.mapperInterface == null || mapperMethod.method == null) {
+                                continue;
+                            }
+                            mapperMethodsBySimpleName
+                                    .computeIfAbsent(mapperMethod.mapperInterface.getSimpleName(), key -> new ArrayList<>())
+                                    .add(mapperMethod);
+                        }
+                        if (mapperMethodsBySimpleName.isEmpty()) {
+                            return empty();
+                        }
+                        Map<String, Map<Integer, Class<?>>> actualTypes = new LinkedHashMap<>();
+                        for (Path sourceFile : javaSourceFiles(projectRoot)) {
+                            try {
+                                scanSourceFile(sourceFile, mapperMethodsBySimpleName, actualTypes);
+                            } catch (Exception ignored) {
+                            }
+                        }
+                        return actualTypes.isEmpty() ? empty() : new ActualParameterTypeIndex(actualTypes);
+                    }
+
+                    private Class<?> actualType(String statementKey, int parameterIndex, Class<?> declaredType) {
+                        Map<Integer, Class<?>> byIndex = actualTypes.get(statementKey);
+                        if (byIndex == null) {
+                            return declaredType;
+                        }
+                        Class<?> actualType = byIndex.get(parameterIndex);
+                        if (actualType == null
+                                || declaredType == null
+                                || actualType.equals(declaredType)
+                                || !declaredType.isAssignableFrom(actualType)) {
+                            return declaredType;
+                        }
+                        return actualType;
+                    }
+
+                    private String summary() {
+                        int count = 0;
+                        for (Map<Integer, Class<?>> byIndex : actualTypes.values()) {
+                            count += byIndex.size();
+                        }
+                        return count + " mapper parameter type(s) inferred from Java call sites.";
+                    }
+
+                    private static List<Path> javaSourceFiles(Path projectRoot) {
+                        try (Stream<Path> paths = Files.walk(projectRoot)) {
+                            return paths.filter(Files::isRegularFile)
+                                    .filter(path -> path.getFileName().toString().endsWith(".java"))
+                                    .filter(path -> !path.toString().contains("/target/"))
+                                    .filter(path -> !path.toString().contains("\\\\target\\\\"))
+                                    .sorted()
+                                    .collect(Collectors.toList());
+                        } catch (IOException e) {
+                            return listOf();
+                        }
+                    }
+
+                    private static void scanSourceFile(
+                            Path sourceFile,
+                            Map<String, List<MapperMethod>> mapperMethodsBySimpleName,
+                            Map<String, Map<Integer, Class<?>>> actualTypes
+                    ) throws IOException {
+                        String source = stripCommentsPreservingLength(new String(Files.readAllBytes(sourceFile), StandardCharsets.UTF_8));
+                        String packageName = packageName(source);
+                        ImportIndex imports = ImportIndex.parse(source);
+                        for (Map.Entry<String, List<MapperMethod>> entry : mapperMethodsBySimpleName.entrySet()) {
+                            String mapperSimpleName = entry.getKey();
+                            for (String mapperVariableName : mapperVariableNames(source, mapperSimpleName)) {
+                                for (MapperMethod mapperMethod : entry.getValue()) {
+                                    scanMapperMethodCalls(
+                                            source,
+                                            packageName,
+                                            imports,
+                                            mapperVariableName,
+                                            mapperMethod,
+                                            actualTypes
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    private static void scanMapperMethodCalls(
+                            String source,
+                            String packageName,
+                            ImportIndex imports,
+                            String mapperVariableName,
+                            MapperMethod mapperMethod,
+                            Map<String, Map<Integer, Class<?>>> actualTypes
+                    ) {
+                        Pattern callPattern = Pattern.compile(
+                                "(^|[^A-Za-z0-9_$])"
+                                        + Pattern.quote(mapperVariableName)
+                                        + "\\\\s*\\\\.\\\\s*"
+                                        + Pattern.quote(mapperMethod.method.getName())
+                                        + "\\\\s*\\\\("
+                        );
+                        Matcher matcher = callPattern.matcher(source);
+                        while (matcher.find()) {
+                            int argumentsStart = matcher.end();
+                            List<String> arguments = invocationArguments(source, argumentsStart);
+                            Class<?>[] declaredTypes = mapperMethod.method.getParameterTypes();
+                            for (int i = 0; i < arguments.size() && i < declaredTypes.length; i++) {
+                                String argumentName = simpleIdentifier(arguments.get(i));
+                                if (argumentName == null) {
+                                    continue;
+                                }
+                                String typeName = variableTypeBefore(source, matcher.start(), argumentName);
+                                Class<?> actualType = loadActualType(typeName, packageName, imports, declaredTypes[i]);
+                                if (actualType != null) {
+                                    actualTypes.computeIfAbsent(mapperMethod.key(), key -> new LinkedHashMap<>())
+                                            .putIfAbsent(i, actualType);
+                                }
+                            }
+                        }
+                    }
+
+                    private static Set<String> mapperVariableNames(String source, String mapperSimpleName) {
+                        Pattern pattern = Pattern.compile(
+                                "(^|[^A-Za-z0-9_$])"
+                                        + Pattern.quote(mapperSimpleName)
+                                        + "\\\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\\\s*(?:[;=,)])"
+                        );
+                        Matcher matcher = pattern.matcher(source);
+                        Set<String> names = new LinkedHashSet<>();
+                        while (matcher.find()) {
+                            names.add(matcher.group(2));
+                        }
+                        return names;
+                    }
+
+                    private static List<String> invocationArguments(String source, int argumentsStart) {
+                        List<String> arguments = new ArrayList<>();
+                        int depth = 0;
+                        int argumentStart = argumentsStart;
+                        for (int i = argumentsStart; i < source.length(); i++) {
+                            char ch = source.charAt(i);
+                            if (ch == '(') {
+                                depth++;
+                            } else if (ch == ')') {
+                                if (depth == 0) {
+                                    String argument = source.substring(argumentStart, i).trim();
+                                    if (!argument.isEmpty()) {
+                                        arguments.add(argument);
+                                    }
+                                    return arguments;
+                                }
+                                depth--;
+                            } else if (ch == ',' && depth == 0) {
+                                arguments.add(source.substring(argumentStart, i).trim());
+                                argumentStart = i + 1;
+                            }
+                        }
+                        return arguments;
+                    }
+
+                    private static String simpleIdentifier(String expression) {
+                        String value = expression == null ? "" : expression.trim();
+                        return value.matches("[A-Za-z_$][A-Za-z0-9_$]*") ? value : null;
+                    }
+
+                    private static String variableTypeBefore(String source, int beforeIndex, String variableName) {
+                        Pattern pattern = Pattern.compile(
+                                "([A-Za-z_$][A-Za-z0-9_$.]*(?:\\\\s*<[^;(){}=]*>)?)\\\\s+"
+                                        + Pattern.quote(variableName)
+                                        + "\\\\s*(?:[,)=;{])"
+                        );
+                        Matcher matcher = pattern.matcher(source.substring(0, beforeIndex));
+                        String typeName = null;
+                        while (matcher.find()) {
+                            typeName = matcher.group(1);
+                        }
+                        return cleanTypeName(typeName);
+                    }
+
+                    private static String cleanTypeName(String typeName) {
+                        if (typeName == null) {
+                            return null;
+                        }
+                        String value = typeName.trim();
+                        int genericStart = value.indexOf('<');
+                        if (genericStart >= 0) {
+                            value = value.substring(0, genericStart).trim();
+                        }
+                        int lastSpace = value.lastIndexOf(' ');
+                        if (lastSpace >= 0) {
+                            value = value.substring(lastSpace + 1).trim();
+                        }
+                        return value.isEmpty() ? null : value;
+                    }
+
+                    private static Class<?> loadActualType(
+                            String typeName,
+                            String packageName,
+                            ImportIndex imports,
+                            Class<?> declaredType
+                    ) {
+                        if (typeName == null || declaredType == null) {
+                            return null;
+                        }
+                        for (String className : imports.candidateClassNames(typeName, packageName)) {
+                            try {
+                                Class<?> actualType = Class.forName(className);
+                                if (!actualType.equals(declaredType) && declaredType.isAssignableFrom(actualType)) {
+                                    return actualType;
+                                }
+                            } catch (ClassNotFoundException ignored) {
+                            }
+                        }
+                        return null;
+                    }
+
+                    private static String packageName(String source) {
+                        for (String line : source.split("\\\\R")) {
+                            String trimmed = line.trim();
+                            if (trimmed.startsWith("package ") && trimmed.endsWith(";")) {
+                                return trimmed.substring("package ".length(), trimmed.length() - 1).trim();
+                            }
+                        }
+                        return "";
+                    }
+
+                    private static String stripCommentsPreservingLength(String source) {
+                        StringBuilder result = new StringBuilder(source.length());
+                        boolean lineComment = false;
+                        boolean blockComment = false;
+                        boolean stringLiteral = false;
+                        boolean charLiteral = false;
+                        for (int i = 0; i < source.length(); i++) {
+                            char ch = source.charAt(i);
+                            char next = i + 1 < source.length() ? source.charAt(i + 1) : '\\0';
+                            if (lineComment) {
+                                if (ch == '\\n' || ch == '\\r') {
+                                    lineComment = false;
+                                    result.append(ch);
+                                } else {
+                                    result.append(' ');
+                                }
+                                continue;
+                            }
+                            if (blockComment) {
+                                if (ch == '*' && next == '/') {
+                                    blockComment = false;
+                                    result.append("  ");
+                                    i++;
+                                } else {
+                                    result.append(ch == '\\n' || ch == '\\r' ? ch : ' ');
+                                }
+                                continue;
+                            }
+                            if (stringLiteral) {
+                                result.append(ch);
+                                if (ch == '\\\\' && next != '\\0') {
+                                    result.append(next);
+                                    i++;
+                                } else if (ch == '"') {
+                                    stringLiteral = false;
+                                }
+                                continue;
+                            }
+                            if (charLiteral) {
+                                result.append(ch);
+                                if (ch == '\\\\' && next != '\\0') {
+                                    result.append(next);
+                                    i++;
+                                } else if (ch == '\\'') {
+                                    charLiteral = false;
+                                }
+                                continue;
+                            }
+                            if (ch == '/' && next == '/') {
+                                lineComment = true;
+                                result.append("  ");
+                                i++;
+                            } else if (ch == '/' && next == '*') {
+                                blockComment = true;
+                                result.append("  ");
+                                i++;
+                            } else {
+                                result.append(ch);
+                                if (ch == '"') {
+                                    stringLiteral = true;
+                                } else if (ch == '\\'') {
+                                    charLiteral = true;
+                                }
+                            }
+                        }
+                        return result.toString();
+                    }
+
+                    private static final class ImportIndex {
+                        private final Map<String, String> imports;
+                        private final List<String> wildcardImports;
+
+                        private ImportIndex(Map<String, String> imports, List<String> wildcardImports) {
+                            this.imports = imports;
+                            this.wildcardImports = wildcardImports;
+                        }
+
+                        private static ImportIndex parse(String source) {
+                            Map<String, String> imports = new LinkedHashMap<>();
+                            List<String> wildcardImports = new ArrayList<>();
+                            for (String line : source.split("\\\\R")) {
+                                String trimmed = line.trim();
+                                if (!trimmed.startsWith("import ") || !trimmed.endsWith(";") || trimmed.startsWith("import static ")) {
+                                    continue;
+                                }
+                                String className = trimmed.substring("import ".length(), trimmed.length() - 1).trim();
+                                if (className.endsWith(".*")) {
+                                    wildcardImports.add(className.substring(0, className.length() - 2));
+                                } else {
+                                    int separator = className.lastIndexOf('.');
+                                    if (separator > 0) {
+                                        imports.put(className.substring(separator + 1), className);
+                                    }
+                                }
+                            }
+                            return new ImportIndex(imports, wildcardImports);
+                        }
+
+                        private List<String> candidateClassNames(String typeName, String packageName) {
+                            if (typeName.contains(".")) {
+                                return listOf(typeName);
+                            }
+                            List<String> candidates = new ArrayList<>();
+                            String imported = imports.get(typeName);
+                            if (imported != null) {
+                                candidates.add(imported);
+                            }
+                            if (packageName != null && !packageName.trim().isEmpty()) {
+                                candidates.add(packageName + "." + typeName);
+                            }
+                            for (String wildcardImport : wildcardImports) {
+                                candidates.add(wildcardImport + "." + typeName);
+                            }
+                            candidates.add("java.lang." + typeName);
+                            return candidates;
+                        }
+                    }
+                }
+
                 private static final class MapperUsageIndex {
                     private static UsageFilter build(
                             Path projectRoot,
