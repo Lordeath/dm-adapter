@@ -3758,8 +3758,13 @@ class DmSqlValidationTestGenerator {
                                         statement
                                 );
                                 if (scalarItem != MethodArgumentConfig.MISSING) {
-                                    ValueResult value = convertConfiguredValue(
+                                    Object normalizedScalarItem = normalizeConfiguredCollectionScalarValue(
+                                            valueName,
                                             scalarItem,
+                                            statement
+                                    );
+                                    ValueResult value = convertConfiguredValue(
+                                            normalizedScalarItem,
                                             nestedClass,
                                             nestedType,
                                             statement,
@@ -3781,7 +3786,8 @@ class DmSqlValidationTestGenerator {
                                 converted.add(configuredItem);
                                 continue;
                             }
-                            ValueResult value = convertConfiguredValue(item, nestedClass, nestedType, statement, valueName);
+                            Object normalizedItem = normalizeConfiguredCollectionScalarValue(valueName, item, statement);
+                            ValueResult value = convertConfiguredValue(normalizedItem, nestedClass, nestedType, statement, valueName);
                             if (!value.resolved) {
                                 return value;
                             }
@@ -3804,7 +3810,8 @@ class DmSqlValidationTestGenerator {
                         Object array = Array.newInstance(componentClass, rawCollection.size());
                         int index = 0;
                         for (Object item : rawCollection) {
-                            ValueResult value = convertConfiguredValue(item, componentClass, componentType, statement, valueName);
+                            Object normalizedItem = normalizeConfiguredCollectionScalarValue(valueName, item, statement);
+                            ValueResult value = convertConfiguredValue(normalizedItem, componentClass, componentType, statement, valueName);
                             if (!value.resolved) {
                                 return value;
                             }
@@ -3874,13 +3881,35 @@ class DmSqlValidationTestGenerator {
                 ) {
                     Object scalarItem = scalarConfiguredCollectionItem(collectionName, item, statement);
                     if (scalarItem != MethodArgumentConfig.MISSING) {
-                        ValueResult value = convertConfiguredValue(scalarItem, targetType, genericType, statement, collectionName);
+                        Object normalizedScalarItem = normalizeConfiguredCollectionScalarValue(
+                                collectionName,
+                                scalarItem,
+                                statement
+                        );
+                        ValueResult value = convertConfiguredValue(
+                                normalizedScalarItem,
+                                targetType,
+                                genericType,
+                                statement,
+                                collectionName
+                        );
                         if (value.resolved) {
                             return value;
                         }
                     }
                     for (Object candidate : item.values()) {
-                        ValueResult value = convertConfiguredValue(candidate, targetType, genericType, statement, collectionName);
+                        Object normalizedCandidate = normalizeConfiguredCollectionScalarValue(
+                                collectionName,
+                                candidate,
+                                statement
+                        );
+                        ValueResult value = convertConfiguredValue(
+                                normalizedCandidate,
+                                targetType,
+                                genericType,
+                                statement,
+                                collectionName
+                        );
                         if (value.resolved) {
                             return value;
                         }
@@ -4211,6 +4240,35 @@ class DmSqlValidationTestGenerator {
                     return defaultCollectionElement(collectionName);
                 }
 
+                private Object normalizeConfiguredCollectionScalarValue(
+                        String collectionName,
+                        Object configuredValue,
+                        MapperStatement statement
+                ) {
+                    if (!isGeneratedPlaceholderValue(collectionName, configuredValue)) {
+                        return configuredValue;
+                    }
+                    String normalized = normalizeName(collectionName);
+                    if (!shouldReplaceGeneratedCollectionPlaceholder(normalized)) {
+                        return configuredValue;
+                    }
+                    if (statement != null && statement.scalarCollectionParameter(collectionName)) {
+                        Object defaultValue = scalarConfiguredCollectionDefault(collectionName, statement);
+                        if (defaultValue != null) {
+                            return defaultValue;
+                        }
+                    }
+                    return defaultCollectionElement(collectionName);
+                }
+
+                private boolean shouldReplaceGeneratedCollectionPlaceholder(String normalizedName) {
+                    return isDateLikeParameterName(normalizedName)
+                            || isMonthLikeParameterName(normalizedName)
+                            || isYearLikeParameterName(normalizedName)
+                            || isIdLikeParameterName(normalizedName)
+                            || isNumericTextParameterName(normalizedName);
+                }
+
                 @SuppressWarnings("unchecked")
                 private Map<String, Object> mergeConfiguredCollectionElementMap(
                         Map<String, Object> defaultValue,
@@ -4382,9 +4440,9 @@ class DmSqlValidationTestGenerator {
                                 if (scalarItem == MethodArgumentConfig.MISSING) {
                                     return MethodArgumentConfig.MISSING;
                                 }
-                                converted.add(scalarItem);
+                                converted.add(normalizeConfiguredCollectionScalarValue(collectionName, scalarItem, statement));
                             } else {
-                                converted.add(item);
+                                converted.add(normalizeConfiguredCollectionScalarValue(collectionName, item, statement));
                             }
                         }
                         return converted;
@@ -10784,7 +10842,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private boolean dynamicIdentifierParameter(String valueName) {
-                        return dynamicIdentifierNames.contains(normalizeMetadataName(valueName));
+                        return containsMetadataName(dynamicIdentifierNames, valueName);
                     }
 
                     private boolean nonEmptyCollectionParameter(String valueName) {
