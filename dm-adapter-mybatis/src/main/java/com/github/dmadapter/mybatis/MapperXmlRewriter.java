@@ -273,10 +273,25 @@ public class MapperXmlRewriter {
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig
     ) {
+        return rewrite(inputPath, reportPath, writeChanges, sqlConverter, rewriteConfig, Set.of());
+    }
+
+    public MapperRewriteResult rewrite(
+            Path inputPath,
+            String reportPath,
+            boolean writeChanges,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig,
+            Set<String> statementKeysToRewrite
+    ) {
         List<SqlChange> automaticConversions = new ArrayList<>();
         List<SqlChange> manualReviewItems = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
         List<StatementReplacement> replacements = new ArrayList<>();
+        Set<String> restrictedStatementKeys = statementKeysToRewrite == null
+                ? Set.of()
+                : statementKeysToRewrite;
+        boolean restricted = !restrictedStatementKeys.isEmpty();
 
         Document document;
         try {
@@ -304,6 +319,9 @@ public class MapperXmlRewriter {
             String statementKey = statementKey(namespace, statementId);
             String originalSql = statement.getTextContent();
             if (statementId.isBlank()) {
+                if (restricted) {
+                    continue;
+                }
                 String reason = missingStatementIdReason(reportPath, statement.getTagName());
                 manualReviewItems.add(new SqlChange(
                         reportPath,
@@ -315,6 +333,9 @@ public class MapperXmlRewriter {
                         reason
                 ));
                 warnings.add(reason);
+                continue;
+            }
+            if (restricted && !restrictedStatementKeys.contains(statementKey)) {
                 continue;
             }
             if (hasElementChild(statement)) {
