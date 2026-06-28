@@ -10,6 +10,7 @@ import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.maven.PomModifier;
 import com.github.dmadapter.maven.PomTargetSelection;
 import com.github.dmadapter.maven.PomTargetSelector;
+import com.github.dmadapter.mybatis.MapperAnnotationMigrator;
 import com.github.dmadapter.mybatis.MapperMigrator;
 import com.github.dmadapter.mybatis.SqlRewriteConfig;
 import com.github.dmadapter.mybatis.SqlRewriteConfigLoader;
@@ -70,6 +71,7 @@ public class MigrateCommand implements Callable<Integer> {
     private final PomModifier pomModifier = new PomModifier();
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
     private final MapperMigrator mapperMigrator = new MapperMigrator();
+    private final MapperAnnotationMigrator mapperAnnotationMigrator = new MapperAnnotationMigrator();
     private final SqlRewriteConfigLoader sqlRewriteConfigLoader = new SqlRewriteConfigLoader();
     private final SqlRewriteConfigUpdater sqlRewriteConfigUpdater = new SqlRewriteConfigUpdater();
     private final DamengMetadataReader damengMetadataReader = new DamengMetadataReader();
@@ -146,10 +148,19 @@ public class MigrateCommand implements Callable<Integer> {
             );
             fileChanges.addAll(mapperMigrationResult.fileChanges());
             warnings.addAll(mapperMigrationResult.warnings());
+            MapperMigrationResult annotationMigrationResult = mapperAnnotationMigrator.migrate(
+                    scanResult,
+                    context,
+                    sqlConverter,
+                    rewriteConfigUpdate.rewriteConfig()
+            );
+            fileChanges.addAll(annotationMigrationResult.fileChanges());
+            warnings.addAll(annotationMigrationResult.warnings());
+            MapperMigrationResult combinedMigrationResult = combine(mapperMigrationResult, annotationMigrationResult);
             MapperJdbcTypeAlignmentResult jdbcTypeAlignmentResult = alignMapperJdbcTypes(context, scanResult);
             fileChanges.addAll(jdbcTypeAlignmentResult.fileChanges());
             warnings.addAll(jdbcTypeAlignmentResult.warnings());
-            if (hasAesBase64Conversion(mapperMigrationResult)) {
+            if (hasAesBase64Conversion(combinedMigrationResult)) {
                 warnings.addAll(aesBase64ConversionWarnings());
             }
 
@@ -157,11 +168,11 @@ public class MigrateCommand implements Callable<Integer> {
                     context,
                     scanResult,
                     fileChanges,
-                    mapperMigrationResult.automaticConversions(),
-                    mapperMigrationResult.manualReviewItems(),
+                    combinedMigrationResult.automaticConversions(),
+                    combinedMigrationResult.manualReviewItems(),
                     warnings
             );
-            printMigrationSummary(context, scanResult, mapperMigrationResult, fileChanges, warnings, reportPaths);
+            printMigrationSummary(context, scanResult, combinedMigrationResult, fileChanges, warnings, reportPaths);
             if (validationTestGenerationRequested()) {
                 ValidationTestGenerationResult validationResult = validationTestGenerator.generate(
                         context.projectRoot(),
@@ -259,6 +270,18 @@ public class MigrateCommand implements Callable<Integer> {
                 .reportDir(context.reportDir())
                 .mapperTargetDir(context.mapperTargetDir())
                 .build();
+    }
+
+    private MapperMigrationResult combine(MapperMigrationResult first, MapperMigrationResult second) {
+        List<com.github.dmadapter.core.SqlChange> automaticConversions = new ArrayList<>(first.automaticConversions());
+        automaticConversions.addAll(second.automaticConversions());
+        List<com.github.dmadapter.core.SqlChange> manualReviewItems = new ArrayList<>(first.manualReviewItems());
+        manualReviewItems.addAll(second.manualReviewItems());
+        List<FileChange> fileChanges = new ArrayList<>(first.fileChanges());
+        fileChanges.addAll(second.fileChanges());
+        List<String> warnings = new ArrayList<>(first.warnings());
+        warnings.addAll(second.warnings());
+        return new MapperMigrationResult(fileChanges, automaticConversions, manualReviewItems, warnings);
     }
 
     private MetadataLookupResult metadataForRewriteCandidates(
