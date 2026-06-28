@@ -49,6 +49,9 @@ public class MapperAnnotationMigrator {
     private static final Pattern METHOD_NAME_PATTERN = Pattern.compile(
             "([A-Za-z_][A-Za-z0-9_]*)\\s*$"
     );
+    private static final Pattern RESULT_MAPPING_ATTRIBUTE_PATTERN = Pattern.compile(
+            "\\b(?:resultType|resultMap)\\s*="
+    );
 
     private final MapperXmlRewriter mapperXmlRewriter;
 
@@ -72,18 +75,21 @@ public class MapperAnnotationMigrator {
         }
 
         Map<String, Path> targetByNamespace = mapperTargetByNamespace(scanResult, context);
-        Set<String> existingStatementKeys = existingStatementKeys(scanResult, targetByNamespace);
+        Set<String> sourceStatementKeys = sourceStatementKeys(scanResult);
+        Set<String> seenAnnotationKeys = new LinkedHashSet<>();
         Map<Path, List<AnnotationStatement>> statementsByTarget = new LinkedHashMap<>();
         for (AnnotationStatement statement : annotationStatements) {
-            if (existingStatementKeys.contains(statement.key())) {
+            if (sourceStatementKeys.contains(statement.key()) || !seenAnnotationKeys.add(statement.key())) {
                 continue;
             }
             Path target = targetByNamespace.getOrDefault(statement.namespace(), defaultTarget(context, statement));
             if (xmlHasStatement(target, statement.namespace(), statement.id())) {
+                if (statementNeedsResultType(target, statement)) {
+                    statementsByTarget.computeIfAbsent(target, ignored -> new ArrayList<>()).add(statement);
+                }
                 continue;
             }
             statementsByTarget.computeIfAbsent(target, ignored -> new ArrayList<>()).add(statement);
-            existingStatementKeys.add(statement.key());
         }
         if (statementsByTarget.isEmpty()) {
             return new MapperMigrationResult(List.of(), List.of(), List.of(), List.of());
@@ -226,9 +232,20 @@ public class MapperAnnotationMigrator {
         }
         StringBuilder additions = new StringBuilder();
         for (AnnotationStatement statement : statements) {
+            StatementXmlUpdate update = updateExistingStatementMetadata(xml, statement);
+            if (update.found()) {
+                xml = update.xml();
+                continue;
+            }
             additions.append(statementXml(statement));
         }
-        xml = xml.substring(0, mapperEnd) + additions + xml.substring(mapperEnd);
+        if (!additions.isEmpty()) {
+            mapperEnd = xml.lastIndexOf("</mapper>");
+            if (mapperEnd < 0) {
+                throw new IllegalStateException("Target mapper XML is missing </mapper>.");
+            }
+            xml = xml.substring(0, mapperEnd) + additions + xml.substring(mapperEnd);
+        }
         Files.writeString(target, xml, StandardCharsets.UTF_8);
     }
 
@@ -298,13 +315,10 @@ public class MapperAnnotationMigrator {
         return targetByNamespace;
     }
 
-    private Set<String> existingStatementKeys(ProjectScanResult scanResult, Map<String, Path> targetByNamespace) {
+    private Set<String> sourceStatementKeys(ProjectScanResult scanResult) {
         Set<String> keys = new LinkedHashSet<>();
         for (MapperXmlFile mapperXmlFile : scanResult.mapperXmlFiles()) {
             keys.addAll(statementKeys(Paths.get(mapperXmlFile.path())));
-        }
-        for (Path target : targetByNamespace.values()) {
-            keys.addAll(statementKeys(target));
         }
         return keys;
     }
@@ -343,6 +357,52 @@ public class MapperAnnotationMigrator {
             return false;
         }
         return statementKeys(mapperXml).contains(namespace + "." + statementId);
+    }
+
+    private boolean statementNeedsResultType(Path mapperXml, AnnotationStatement statement) {
+        if (!"select".equals(statement.tagName()) || statement.resultType().isBlank() || !Files.isRegularFile(mapperXml)) {
+            return false;
+        }
+        try {
+            String xml = Files.readString(mapperXml, StandardCharsets.UTF_8);
+            return startTag(xml, statement)
+                    .map(tag -> !RESULT_MAPPING_ATTRIBUTE_PATTERN.matcher(tag).find())
+                    .orElse(false);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private StatementXmlUpdate updateExistingStatementMetadata(String xml, AnnotationStatement statement) {
+        if (!"select".equals(statement.tagName()) || statement.resultType().isBlank()) {
+            return new StatementXmlUpdate(xml, false);
+        }
+        Matcher matcher = startTagPattern(statement).matcher(xml);
+        if (!matcher.find()) {
+            return new StatementXmlUpdate(xml, false);
+        }
+        String startTag = matcher.group();
+        if (RESULT_MAPPING_ATTRIBUTE_PATTERN.matcher(startTag).find()) {
+            return new StatementXmlUpdate(xml, true);
+        }
+        int insertAt = startTag.endsWith("/>") ? startTag.length() - 2 : startTag.length() - 1;
+        String updatedTag = startTag.substring(0, insertAt)
+                + " resultType=\"" + escapeXmlAttribute(statement.resultType()) + "\""
+                + startTag.substring(insertAt);
+        return new StatementXmlUpdate(xml.substring(0, matcher.start()) + updatedTag + xml.substring(matcher.end()), true);
+    }
+
+    private java.util.Optional<String> startTag(String xml, AnnotationStatement statement) {
+        Matcher matcher = startTagPattern(statement).matcher(xml);
+        return matcher.find() ? java.util.Optional.of(matcher.group()) : java.util.Optional.empty();
+    }
+
+    private Pattern startTagPattern(AnnotationStatement statement) {
+        String idPattern = "(?:\"" + Pattern.quote(statement.id()) + "\"|'" + Pattern.quote(statement.id()) + "')";
+        return Pattern.compile(
+                "<\\s*" + Pattern.quote(statement.tagName()) + "\\b(?=[^>]*\\bid\\s*=\\s*" + idPattern + ")[^>]*>",
+                Pattern.DOTALL
+        );
     }
 
     private Set<String> statementKeys(Path mapperXml) {
@@ -872,5 +932,8 @@ public class MapperAnnotationMigrator {
         private String key() {
             return namespace + "." + id;
         }
+    }
+
+    private record StatementXmlUpdate(String xml, boolean found) {
     }
 }

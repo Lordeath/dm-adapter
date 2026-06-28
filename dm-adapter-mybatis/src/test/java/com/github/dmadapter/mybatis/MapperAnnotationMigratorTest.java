@@ -109,6 +109,44 @@ class MapperAnnotationMigratorTest {
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"))).isFalse();
     }
 
+    @Test
+    void updatesExistingExtractedAnnotationSelectWithMissingResultType() throws Exception {
+        writeFile("src/main/resources/mapper-dm/VoucherTaskMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.VoucherTaskMapper">
+                    <select id="listIds">
+                        <![CDATA[select id from ns_bill_voucher_task]]>
+                    </select>
+                </mapper>
+                """);
+        writeFile("src/main/java/com/example/VoucherTaskMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Select;
+                import java.util.List;
+
+                public interface VoucherTaskMapper {
+                    @Select("select id from ns_bill_voucher_task")
+                    List<Long> listIds();
+                }
+                """);
+
+        MapperMigrationResult result = new MapperAnnotationMigrator().migrate(
+                scanResult(List.of()),
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String xml = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(xml)
+                .containsOnlyOnce("<select id=\"listIds\"")
+                .contains("<select id=\"listIds\" resultType=\"java.lang.Long\">");
+    }
+
     private ProjectScanResult scanResult(List<MapperXmlFile> mapperXmlFiles) {
         return new ProjectScanResult(
                 true,
