@@ -686,6 +686,8 @@ class DmAdapterCliTest {
                 .contains("mapperVariablesBySimpleName(source, mapperSimpleNames)")
                 .contains("mapperMethodsByMethodName(entry.getValue())")
                 .contains("isJavaSourcePath")
+                .contains("isReasonableJavaSourceFile")
+                .contains("deadlineNanos")
                 .contains("auto:actual-type")
                 .contains("normalizedName.endsWith(\"datestr\")")
                 .doesNotContain("@SpringBootTest")
