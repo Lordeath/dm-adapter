@@ -6095,11 +6095,13 @@ class DmSqlValidationTestGenerator {
                     return "date".equals(normalizedName)
                             || "time".equals(normalizedName)
                             || normalizedName.endsWith("date")
+                            || normalizedName.endsWith("datestr")
                             || normalizedName.endsWith("datestart")
                             || normalizedName.endsWith("dateend")
                             || normalizedName.endsWith("datetime")
                             || normalizedName.endsWith("timestamp")
                             || (normalizedName.endsWith("time") && !normalizedName.endsWith("parttime"))
+                            || normalizedName.endsWith("timestr")
                             || normalizedName.endsWith("timestart")
                             || normalizedName.endsWith("timeend")
                             || "starttime".equals(normalizedName)
@@ -8699,14 +8701,31 @@ class DmSqlValidationTestGenerator {
                         if (mapperMethodsBySimpleName.isEmpty()) {
                             return empty();
                         }
+                        Map<String, Map<String, List<MapperMethod>>> mapperMethodsBySimpleAndMethod = new LinkedHashMap<>();
+                        for (Map.Entry<String, List<MapperMethod>> entry : mapperMethodsBySimpleName.entrySet()) {
+                            mapperMethodsBySimpleAndMethod.put(entry.getKey(), mapperMethodsByMethodName(entry.getValue()));
+                        }
                         Map<String, Map<Integer, Class<?>>> actualTypes = new LinkedHashMap<>();
                         for (Path sourceFile : javaSourceFiles(projectRoot)) {
                             try {
-                                scanSourceFile(sourceFile, mapperMethodsBySimpleName, actualTypes);
+                                scanSourceFile(
+                                        sourceFile,
+                                        mapperMethodsBySimpleName.keySet(),
+                                        mapperMethodsBySimpleAndMethod,
+                                        actualTypes
+                                );
                             } catch (Exception ignored) {
                             }
                         }
                         return actualTypes.isEmpty() ? empty() : new ActualParameterTypeIndex(actualTypes);
+                    }
+
+                    private static Map<String, List<MapperMethod>> mapperMethodsByMethodName(List<MapperMethod> mapperMethods) {
+                        Map<String, List<MapperMethod>> byName = new LinkedHashMap<>();
+                        for (MapperMethod mapperMethod : mapperMethods) {
+                            byName.computeIfAbsent(mapperMethod.method.getName(), key -> new ArrayList<>()).add(mapperMethod);
+                        }
+                        return byName;
                     }
 
                     private Class<?> actualType(String statementKey, int parameterIndex, Class<?> declaredType) {
@@ -8736,6 +8755,7 @@ class DmSqlValidationTestGenerator {
                         try (Stream<Path> paths = Files.walk(projectRoot)) {
                             return paths.filter(Files::isRegularFile)
                                     .filter(path -> path.getFileName().toString().endsWith(".java"))
+                                    .filter(ActualParameterTypeIndex::isJavaSourcePath)
                                     .filter(path -> !path.toString().contains("/target/"))
                                     .filter(path -> !path.toString().contains("\\\\target\\\\"))
                                     .sorted()
@@ -8745,27 +8765,35 @@ class DmSqlValidationTestGenerator {
                         }
                     }
 
+                    private static boolean isJavaSourcePath(Path path) {
+                        String value = path.toString().replace('\\\\', '/');
+                        return value.contains("/src/main/java/") || value.contains("/src/test/java/");
+                    }
+
                     private static void scanSourceFile(
                             Path sourceFile,
-                            Map<String, List<MapperMethod>> mapperMethodsBySimpleName,
+                            Set<String> mapperSimpleNames,
+                            Map<String, Map<String, List<MapperMethod>>> mapperMethodsBySimpleAndMethod,
                             Map<String, Map<Integer, Class<?>>> actualTypes
                     ) throws IOException {
                         String source = stripCommentsPreservingLength(new String(Files.readAllBytes(sourceFile), StandardCharsets.UTF_8));
                         String packageName = packageName(source);
                         ImportIndex imports = ImportIndex.parse(source);
-                        for (Map.Entry<String, List<MapperMethod>> entry : mapperMethodsBySimpleName.entrySet()) {
-                            String mapperSimpleName = entry.getKey();
-                            for (String mapperVariableName : mapperVariableNames(source, mapperSimpleName)) {
-                                for (MapperMethod mapperMethod : entry.getValue()) {
-                                    scanMapperMethodCalls(
-                                            source,
-                                            packageName,
-                                            imports,
-                                            mapperVariableName,
-                                            mapperMethod,
-                                            actualTypes
-                                    );
-                                }
+                        Map<String, Set<String>> mapperVariablesBySimpleName = mapperVariablesBySimpleName(source, mapperSimpleNames);
+                        for (Map.Entry<String, Set<String>> entry : mapperVariablesBySimpleName.entrySet()) {
+                            Map<String, List<MapperMethod>> mapperMethodsByName = mapperMethodsBySimpleAndMethod.get(entry.getKey());
+                            if (mapperMethodsByName == null) {
+                                continue;
+                            }
+                            for (String mapperVariableName : entry.getValue()) {
+                                scanMapperMethodCalls(
+                                        source,
+                                        packageName,
+                                        imports,
+                                        mapperVariableName,
+                                        mapperMethodsByName,
+                                        actualTypes
+                                );
                             }
                         }
                     }
@@ -8775,48 +8803,68 @@ class DmSqlValidationTestGenerator {
                             String packageName,
                             ImportIndex imports,
                             String mapperVariableName,
-                            MapperMethod mapperMethod,
+                            Map<String, List<MapperMethod>> mapperMethodsByName,
                             Map<String, Map<Integer, Class<?>>> actualTypes
                     ) {
                         Pattern callPattern = Pattern.compile(
                                 "(^|[^A-Za-z0-9_$])"
                                         + Pattern.quote(mapperVariableName)
                                         + "\\\\s*\\\\.\\\\s*"
-                                        + Pattern.quote(mapperMethod.method.getName())
+                                        + "([A-Za-z_$][A-Za-z0-9_$]*)"
                                         + "\\\\s*\\\\("
                         );
                         Matcher matcher = callPattern.matcher(source);
                         while (matcher.find()) {
+                            List<MapperMethod> mapperMethods = mapperMethodsByName.get(matcher.group(2));
+                            if (mapperMethods == null) {
+                                continue;
+                            }
                             int argumentsStart = matcher.end();
                             List<String> arguments = invocationArguments(source, argumentsStart);
-                            Class<?>[] declaredTypes = mapperMethod.method.getParameterTypes();
-                            for (int i = 0; i < arguments.size() && i < declaredTypes.length; i++) {
-                                String argumentName = simpleIdentifier(arguments.get(i));
-                                if (argumentName == null) {
-                                    continue;
-                                }
-                                String typeName = variableTypeBefore(source, matcher.start(), argumentName);
-                                Class<?> actualType = loadActualType(typeName, packageName, imports, declaredTypes[i]);
-                                if (actualType != null) {
-                                    actualTypes.computeIfAbsent(mapperMethod.key(), key -> new LinkedHashMap<>())
-                                            .putIfAbsent(i, actualType);
+                            for (MapperMethod mapperMethod : mapperMethods) {
+                                Class<?>[] declaredTypes = mapperMethod.method.getParameterTypes();
+                                for (int i = 0; i < arguments.size() && i < declaredTypes.length; i++) {
+                                    String argumentName = simpleIdentifier(arguments.get(i));
+                                    if (argumentName == null) {
+                                        continue;
+                                    }
+                                    String typeName = variableTypeBefore(source, matcher.start(), argumentName);
+                                    Class<?> actualType = loadActualType(typeName, packageName, imports, declaredTypes[i]);
+                                    if (actualType != null) {
+                                        actualTypes.computeIfAbsent(mapperMethod.key(), key -> new LinkedHashMap<>())
+                                                .putIfAbsent(i, actualType);
+                                    }
                                 }
                             }
                         }
                     }
 
-                    private static Set<String> mapperVariableNames(String source, String mapperSimpleName) {
+                    private static Map<String, Set<String>> mapperVariablesBySimpleName(String source, Set<String> mapperSimpleNames) {
                         Pattern pattern = Pattern.compile(
                                 "(^|[^A-Za-z0-9_$])"
-                                        + Pattern.quote(mapperSimpleName)
+                                        + "([A-Za-z_$][A-Za-z0-9_$.]*(?:\\\\s*<[^;(){}=]*>)?)"
                                         + "\\\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\\\s*(?:[;=,)])"
                         );
                         Matcher matcher = pattern.matcher(source);
-                        Set<String> names = new LinkedHashSet<>();
+                        Map<String, Set<String>> variablesBySimpleName = new LinkedHashMap<>();
                         while (matcher.find()) {
-                            names.add(matcher.group(2));
+                            String mapperSimpleName = simpleTypeName(cleanTypeName(matcher.group(2)));
+                            if (!mapperSimpleNames.contains(mapperSimpleName)) {
+                                continue;
+                            }
+                            variablesBySimpleName
+                                    .computeIfAbsent(mapperSimpleName, key -> new LinkedHashSet<>())
+                                    .add(matcher.group(3));
                         }
-                        return names;
+                        return variablesBySimpleName;
+                    }
+
+                    private static String simpleTypeName(String typeName) {
+                        if (typeName == null) {
+                            return "";
+                        }
+                        int separator = typeName.lastIndexOf('.');
+                        return separator >= 0 ? typeName.substring(separator + 1) : typeName;
                     }
 
                     private static List<String> invocationArguments(String source, int argumentsStart) {
