@@ -6325,12 +6325,18 @@ class DmSqlValidationTestGenerator {
                             || "finishtime".equals(normalizedName)
                             || normalizedName.contains("operatordate")
                             || normalizedName.contains("shouldchargedate")
+                            || isDateTimeCollectionParameterName(normalizedName)
                             || (normalizedName.contains("date") && hasTemporalRangeQualifier(normalizedName))
                             || (normalizedName.contains("time") && hasTemporalRangeQualifier(normalizedName))
                             || normalizedName.contains("firstday")
                             || normalizedName.contains("lastday")
                             || normalizedName.contains("startday")
                             || normalizedName.contains("endday");
+                }
+
+                private boolean isDateTimeCollectionParameterName(String normalizedName) {
+                    return (normalizedName.endsWith("datelist") && !normalizedName.endsWith("updatelist"))
+                            || normalizedName.endsWith("timelist");
                 }
 
                 private boolean isDayOfMonthParameterName(String normalizedName) {

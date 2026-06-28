@@ -945,6 +945,7 @@ class DmAdapterCliTest {
                 .contains("Object nestedCollection = nestedConfiguredCollectionValue(")
                 .contains("normalizeConfiguredCollectionScalarValue(")
                 .contains("shouldReplaceGeneratedCollectionPlaceholder(")
+                .contains("isDateTimeCollectionParameterName(")
                 .contains("existingDefault,")
                 .contains("configured,")
                 .contains("field.getName()")
