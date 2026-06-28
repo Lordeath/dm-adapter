@@ -705,6 +705,12 @@ class DmSqlValidationTestGenerator {
                                         logProgress(index, total, unsupportedReturnType, 0L);
                                         continue;
                                     }
+                                    ValidationRecord signatureIssue = javaMapperSignatureIssue(mapperMethod);
+                                    if (signatureIssue != null) {
+                                        records.add(signatureIssue);
+                                        logProgress(index, total, signatureIssue, 0L);
+                                        continue;
+                                    }
                                     List<ParameterResolution> parameterVariants = resolveParameterVariants(mapperMethod, config);
                                     for (ParameterResolution parameters : parameterVariants) {
                                         String recordKey = parameters.recordKey(mapperMethod.key());
@@ -2688,8 +2694,74 @@ class DmSqlValidationTestGenerator {
                     return -1;
                 }
 
+                private ValidationRecord javaMapperSignatureIssue(MapperMethod mapperMethod) {
+                    if (mapperMethod == null || mapperMethod.method == null) {
+                        return null;
+                    }
+                    Method method = mapperMethod.method;
+                    Map<String, List<Integer>> paramIndexesByName = new LinkedHashMap<>();
+                    List<String> missingSimpleParams = new ArrayList<>();
+                    for (int i = 0; i < method.getParameterCount(); i++) {
+                        Parameter parameter = method.getParameters()[i];
+                        String paramName = paramAnnotationName(parameter);
+                        if (!isBlank(paramName)) {
+                            paramIndexesByName.computeIfAbsent(paramName, ignored -> new ArrayList<>()).add(i);
+                        } else if (method.getParameterCount() > 1 && simpleMapperParameterType(method.getParameterTypes()[i])) {
+                            missingSimpleParams.add(parameter.getName());
+                        }
+                    }
+                    for (Map.Entry<String, List<Integer>> entry : paramIndexesByName.entrySet()) {
+                        if (entry.getValue().size() > 1) {
+                            return ValidationRecord.failed(
+                                    mapperMethod.key(),
+                                    "java-mapper-signature",
+                                    "Java mapper signature has duplicate @Param(\\"" + entry.getKey()
+                                            + "\\") annotations at parameter indexes " + entry.getValue()
+                                            + ". Fix the Java mapper method @Param names instead of changing mapper XML parameter names."
+                            );
+                        }
+                    }
+                    if (!missingSimpleParams.isEmpty()) {
+                        return ValidationRecord.failed(
+                                mapperMethod.key(),
+                                "java-mapper-signature",
+                                "Java mapper method has multiple simple parameters without @Param: "
+                                        + String.join(", ", missingSimpleParams)
+                                        + ". Add @Param annotations in the Java mapper method instead of changing mapper XML parameter names."
+                        );
+                    }
+                    return null;
+                }
+
+                private boolean simpleMapperParameterType(Class<?> type) {
+                    if (type == null) {
+                        return false;
+                    }
+                    return type.isPrimitive()
+                            || type.isEnum()
+                            || String.class.equals(type)
+                            || CharSequence.class.isAssignableFrom(type)
+                            || Number.class.isAssignableFrom(type)
+                            || Boolean.class.equals(type)
+                            || Character.class.equals(type)
+                            || Date.class.isAssignableFrom(type)
+                            || java.time.temporal.Temporal.class.isAssignableFrom(type)
+                            || java.time.temporal.TemporalAccessor.class.isAssignableFrom(type)
+                            || UUID.class.equals(type)
+                            || BigDecimal.class.equals(type)
+                            || BigInteger.class.equals(type);
+                }
+
                 private String parameterName(Method method, int index) {
                     Parameter parameter = method.getParameters()[index];
+                    String paramName = paramAnnotationName(parameter);
+                    if (!isBlank(paramName)) {
+                        return paramName;
+                    }
+                    return parameter.getName();
+                }
+
+                private String paramAnnotationName(Parameter parameter) {
                     for (Annotation annotation : parameter.getAnnotations()) {
                         if ("org.apache.ibatis.annotations.Param".equals(annotation.annotationType().getName())) {
                             try {
@@ -2697,14 +2769,14 @@ class DmSqlValidationTestGenerator {
                                 if (value instanceof String) {
                                     String name = (String) value;
                                     if (!name.trim().isEmpty()) {
-                                        return name;
+                                        return name.trim();
                                     }
                                 }
                             } catch (Exception ignored) {
                             }
                         }
                     }
-                    return parameter.getName();
+                    return "";
                 }
 
                 private boolean isCollectionLikeParameter(Class<?> parameterType) {
@@ -7278,9 +7350,13 @@ class DmSqlValidationTestGenerator {
                     if (countsByPattern.containsKey("BROKEN_DYNAMIC_SQL_OR_ARGS")) {
                         markdown.append("- 检查 mapper 动态 SQL 分支和生成的示例参数；缺少逗号、空条件、非法动态占位符等问题通常属于 mapper 结构或验证参数问题。\\n");
                     }
+                    if (countsByPattern.containsKey("JAVA_MAPPER_PARAM_ANNOTATION")) {
+                        markdown.append("- 修正 Java mapper 方法签名中的 @Param 重名或多简单参数缺失 @Param；不要通过改 XML 参数名规避 Java 签名问题。\\n");
+                    }
                     if (containsAnyPattern(countsByPattern,
                             "NULL_COLLECTION_PARAMETER",
                             "BINDING_PARAMETER_NAME",
+                            "JAVA_MAPPER_PARAM_ANNOTATION",
                             "FOREACH_ITEM_BINDING",
                             "MAPPER_PROPERTY_NAME",
                             "METHOD_ARGS_OR_BINDING_OTHER",
@@ -7520,6 +7596,8 @@ class DmSqlValidationTestGenerator {
                             return "Mapper 属性名不匹配";
                         case "KEY_PROPERTY_PARAMETER_OBJECT_MISMATCH":
                             return "keyProperty 与参数对象不匹配";
+                        case "JAVA_MAPPER_PARAM_ANNOTATION":
+                            return "Java mapper @Param 注解问题";
                         case "INSERT_VALUES_ASSIGNMENT":
                             return "INSERT VALUES 中出现赋值表达式";
                         case "ORIGINAL_XML_SYNTAX_DEFECT":
@@ -7667,6 +7745,9 @@ class DmSqlValidationTestGenerator {
                     String lower = message.toLowerCase(Locale.ROOT);
                     if (isDatabaseConnectionFailure(message)) {
                         return "DATABASE_CONNECTION";
+                    }
+                    if (hasJavaMapperParamAnnotationIssue(message)) {
+                        return "JAVA_MAPPER_PARAM_ANNOTATION";
                     }
                     if (isMysqlMetadataSql(message)) {
                         return "MYSQL_METADATA_SQL";
@@ -8173,6 +8254,12 @@ class DmSqlValidationTestGenerator {
                     return record.parameterSource != null && record.parameterSource.startsWith("auto");
                 }
 
+                private boolean hasJavaMapperParamAnnotationIssue(String message) {
+                    String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
+                    return lower.contains("java mapper signature has duplicate @param")
+                            || lower.contains("java mapper method has multiple simple parameters without @param");
+                }
+
                 private boolean containsAnyPattern(Map<String, Long> countsByPattern, String... patterns) {
                     for (String pattern : patterns) {
                         if (countsByPattern.containsKey(pattern)) {
@@ -8201,6 +8288,9 @@ class DmSqlValidationTestGenerator {
                             "Parsing error was found in mapping",
                             "datasource.")) {
                         return "CONFIGURATION";
+                    }
+                    if (hasJavaMapperParamAnnotationIssue(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
                     }
                     if (containsAny(message,
                             "evaluated to a null value",
@@ -8280,7 +8370,7 @@ class DmSqlValidationTestGenerator {
                         return "information_schema、database() 等 MySQL 元数据 SQL 需要手工改成达梦写法。";
                     }
                     if ("METHOD_ARGS_OR_BINDING".equals(category)) {
-                        return "生成的示例参数未满足动态 SQL 或 @Param 绑定；请配置方法参数或检查 mapper 参数名。";
+                        return "生成的示例参数未满足动态 SQL 或 @Param 绑定；优先检查 Java mapper @Param 名称，必要时再配置方法参数。";
                     }
                     if ("SQL_SYNTAX".equals(category)) {
                         return "达梦拒绝了 SQL 语法；请检查 mapper-dm SQL，并手工处理未兼容的片段。";

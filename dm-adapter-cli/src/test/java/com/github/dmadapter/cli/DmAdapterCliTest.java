@@ -1,5 +1,6 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.mybatis.MapperAnnotationMigrator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
@@ -57,6 +58,34 @@ class DmAdapterCliTest {
                 .contains("<artifactId>DmJdbcDriver18</artifactId>");
         assertThat(Files.exists(tempDir.resolve("src/main/resources/application-dm.yml"))).isFalse();
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isTrue();
+    }
+
+    @Test
+    void migrateExtractsMybatisAnnotationSqlToMapperDmXml() throws Exception {
+        writeDemoProject();
+        writeFile("src/main/java/com/example/AnnotationMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Select;
+
+                public interface AnnotationMapper {
+                    @Select("select NOW() from dual limit 1")
+                    String selectNow();
+                }
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+
+        String mapperDm = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AnnotationMapper.xml"));
+        assertThat(exitCode).isZero();
+        assertThat(mapperDm)
+                .contains("<mapper namespace=\"com.example.AnnotationMapper\">")
+                .contains("<select id=\"selectNow\">")
+                .contains("SYSDATE")
+                .contains("FETCH FIRST 1 ROWS ONLY")
+                .doesNotContain("NOW()");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
+                .contains(MapperAnnotationMigrator.MYBATIS_ANNOTATION_SQL_TO_MAPPER_DM_XML_RULE);
     }
 
     @Test
@@ -554,6 +583,12 @@ class DmAdapterCliTest {
                 .contains("All configured schemas failed")
                 .contains("isRawSqlInjectionName")
                 .contains("recordKey(mapperMethod.key())")
+                .contains("javaMapperSignatureIssue")
+                .contains("simpleMapperParameterType")
+                .contains("paramAnnotationName")
+                .contains("JAVA_MAPPER_PARAM_ANNOTATION")
+                .contains("Java mapper method has multiple simple parameters without @Param")
+                .contains("Java mapper signature has duplicate @Param")
                 .contains("parameterName")
                 .contains("defaultString")
                 .contains("private static void writeString(Path path, String content, Charset charset)")
@@ -1473,6 +1508,13 @@ class DmAdapterCliTest {
                     </update>
                 </mapper>
                 """);
+    }
+
+    private Path writeFile(String relativePath, String content) throws Exception {
+        Path path = tempDir.resolve(relativePath);
+        Files.createDirectories(path.getParent());
+        Files.writeString(path, content);
+        return path;
     }
 
     private void writeMultiModuleProjectWithIndependentRootPom() throws Exception {
