@@ -174,7 +174,8 @@ public class MapperAnnotationMigrator {
                         target.toString(),
                         true,
                         sqlConverter,
-                        rewriteConfig
+                        rewriteConfig,
+                        annotationKeys(statements)
                 );
                 automaticConversions.addAll(annotationConversions(rewriteResult.automaticConversions(), statements));
                 manualReviewItems.addAll(annotationConversions(rewriteResult.manualReviewItems(), statements));
@@ -188,10 +189,7 @@ public class MapperAnnotationMigrator {
     }
 
     private List<SqlChange> annotationConversions(List<SqlChange> changes, List<AnnotationStatement> statements) {
-        Set<String> annotationKeys = new LinkedHashSet<>();
-        for (AnnotationStatement statement : statements) {
-            annotationKeys.add(statement.key());
-        }
+        Set<String> annotationKeys = annotationKeys(statements);
         List<SqlChange> result = new ArrayList<>();
         for (SqlChange change : changes) {
             if (!annotationKeys.contains(change.statementId())) {
@@ -208,6 +206,14 @@ public class MapperAnnotationMigrator {
             ));
         }
         return result;
+    }
+
+    private Set<String> annotationKeys(List<AnnotationStatement> statements) {
+        Set<String> annotationKeys = new LinkedHashSet<>();
+        for (AnnotationStatement statement : statements) {
+            annotationKeys.add(statement.key());
+        }
+        return annotationKeys;
     }
 
     private List<String> withAnnotationRule(List<String> rules) {

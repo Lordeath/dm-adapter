@@ -71,6 +71,47 @@ class MapperAnnotationMigratorTest {
     }
 
     @Test
+    void extractsAnnotationSqlWithoutRewritingExistingMapperDmStatements() throws Exception {
+        writeFile("src/main/resources/mapper-dm/VoucherTaskMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.VoucherTaskMapper">
+                    <insert id="insertSegment">
+                        INSERT INTO "newsee-system".ns_system_organization (organization_id)
+                        SELECT organization_id FROM ys_organization
+                    </insert>
+                </mapper>
+                """);
+        writeFile("src/main/java/com/example/VoucherTaskMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Select;
+
+                public interface VoucherTaskMapper {
+                    @Select("select NOW() from dual")
+                    String selectNow();
+                }
+                """);
+
+        MapperMigrationResult result = new MapperAnnotationMigrator().migrate(
+                scanResult(List.of()),
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String xml = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"));
+        assertThat(xml)
+                .contains("INSERT INTO \"newsee-system\".ns_system_organization")
+                .doesNotContain("INSERT INTO 'newsee-system'.ns_system_organization")
+                .contains("SYSDATE");
+        assertThat(result.automaticConversions())
+                .extracting(change -> change.statementId())
+                .containsExactly("com.example.VoucherTaskMapper.selectNow");
+    }
+
+    @Test
     void doesNotDuplicateAnnotationMethodWhenXmlStatementAlreadyExists() throws Exception {
         Path mapper = writeFile("src/main/resources/mapper/VoucherTaskMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
