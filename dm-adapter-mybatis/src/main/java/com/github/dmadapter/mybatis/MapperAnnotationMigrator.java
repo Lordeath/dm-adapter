@@ -13,6 +13,8 @@ import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -51,6 +53,12 @@ public class MapperAnnotationMigrator {
     );
     private static final Pattern RESULT_MAPPING_ATTRIBUTE_PATTERN = Pattern.compile(
             "\\b(?:resultType|resultMap)\\s*="
+    );
+    private static final Map<String, String> SQL_ANNOTATION_TAGS = Map.of(
+            "Lorg/apache/ibatis/annotations/Select;", "select",
+            "Lorg/apache/ibatis/annotations/Insert;", "insert",
+            "Lorg/apache/ibatis/annotations/Update;", "update",
+            "Lorg/apache/ibatis/annotations/Delete;", "delete"
     );
 
     private final MapperXmlRewriter mapperXmlRewriter;
@@ -463,6 +471,19 @@ public class MapperAnnotationMigrator {
     }
 
     private List<AnnotationStatement> scanAnnotationStatements(Path projectRoot) {
+        Map<String, AnnotationStatement> statements = new LinkedHashMap<>();
+        for (AnnotationStatement statement : scanJavaAnnotationStatements(projectRoot)) {
+            statements.putIfAbsent(statement.key(), statement);
+        }
+        for (AnnotationStatement statement : scanClassAnnotationStatements(projectRoot)) {
+            statements.putIfAbsent(statement.key(), statement);
+        }
+        List<AnnotationStatement> result = new ArrayList<>(statements.values());
+        result.sort(Comparator.comparing(AnnotationStatement::key));
+        return result;
+    }
+
+    private List<AnnotationStatement> scanJavaAnnotationStatements(Path projectRoot) {
         List<AnnotationStatement> statements = new ArrayList<>();
         try (Stream<Path> paths = Files.walk(projectRoot)) {
             paths.filter(Files::isRegularFile)
@@ -475,6 +496,38 @@ public class MapperAnnotationMigrator {
         }
         statements.sort(Comparator.comparing(AnnotationStatement::key));
         return statements;
+    }
+
+    private List<AnnotationStatement> scanClassAnnotationStatements(Path projectRoot) {
+        List<AnnotationStatement> statements = new ArrayList<>();
+        try (Stream<Path> paths = Files.walk(projectRoot)) {
+            paths.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(".class"))
+                    .filter(path -> !path.getFileName().toString().contains("$"))
+                    .filter(path -> isMainClassOutput(projectRoot, path))
+                    .filter(path -> !isIgnoredClassPath(projectRoot, path))
+                    .sorted()
+                    .forEach(path -> statements.addAll(scanClassFile(path)));
+        } catch (IOException ignored) {
+        }
+        statements.sort(Comparator.comparing(AnnotationStatement::key));
+        return statements;
+    }
+
+    private boolean isMainClassOutput(Path projectRoot, Path path) {
+        String normalized = projectRoot.toAbsolutePath().normalize().relativize(path.toAbsolutePath().normalize())
+                .toString()
+                .replace('\\', '/');
+        return normalized.contains("/target/classes/") || normalized.startsWith("target/classes/");
+    }
+
+    private boolean isIgnoredClassPath(Path projectRoot, Path path) {
+        String normalized = projectRoot.toAbsolutePath().normalize().relativize(path.toAbsolutePath().normalize())
+                .toString()
+                .replace('\\', '/');
+        return normalized.contains("/target/test-classes/")
+                || normalized.contains("/.git/")
+                || normalized.contains("/.idea/");
     }
 
     private boolean isMainJavaSource(Path path) {
@@ -554,6 +607,14 @@ public class MapperAnnotationMigrator {
             ));
         }
         return statements;
+    }
+
+    private List<AnnotationStatement> scanClassFile(Path classFile) {
+        try {
+            return new ClassAnnotationScanner(classFile).scan();
+        } catch (Exception ignored) {
+            return List.of();
+        }
     }
 
     private Map<String, String> imports(String source) {
@@ -926,6 +987,389 @@ public class MapperAnnotationMigrator {
         return annotationName.toLowerCase(Locale.ROOT);
     }
 
+    private static final class ClassAnnotationScanner {
+        private final Path classFile;
+        private final Object[] constantPool;
+        private String className = "";
+        private String simpleName = "";
+        private Path moduleRoot;
+
+        private ClassAnnotationScanner(Path classFile) {
+            this.classFile = classFile;
+            this.constantPool = new Object[0];
+        }
+
+        private ClassAnnotationScanner(Path classFile, Object[] constantPool) {
+            this.classFile = classFile;
+            this.constantPool = constantPool;
+        }
+
+        private List<AnnotationStatement> scan() throws IOException {
+            byte[] bytes = Files.readAllBytes(classFile);
+            try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes))) {
+                if (input.readInt() != 0xCAFEBABE) {
+                    return List.of();
+                }
+                input.readUnsignedShort();
+                input.readUnsignedShort();
+                Object[] pool = readConstantPool(input);
+                return new ClassAnnotationScanner(classFile, pool).scanBody(input);
+            }
+        }
+
+        private List<AnnotationStatement> scanBody(DataInputStream input) throws IOException {
+            input.readUnsignedShort();
+            int thisClass = input.readUnsignedShort();
+            input.readUnsignedShort();
+            className = className(thisClass);
+            if (className.isBlank()) {
+                return List.of();
+            }
+            int lastDot = className.lastIndexOf('.');
+            simpleName = lastDot < 0 ? className : className.substring(lastDot + 1);
+            moduleRoot = classModuleRoot(classFile);
+            skipInterfaces(input);
+            skipMembers(input);
+            List<AnnotationStatement> statements = readMethods(input);
+            skipAttributes(input);
+            return statements;
+        }
+
+        private Object[] readConstantPool(DataInputStream input) throws IOException {
+            int count = input.readUnsignedShort();
+            Object[] pool = new Object[count];
+            for (int i = 1; i < count; i++) {
+                int tag = input.readUnsignedByte();
+                switch (tag) {
+                    case 1 -> pool[i] = input.readUTF();
+                    case 3, 4 -> input.skipBytes(4);
+                    case 5, 6 -> {
+                        input.skipBytes(8);
+                        i++;
+                    }
+                    case 7, 8, 16, 19, 20 -> pool[i] = input.readUnsignedShort();
+                    case 9, 10, 11, 12, 17, 18 -> input.skipBytes(4);
+                    case 15 -> input.skipBytes(3);
+                    default -> throw new IOException("Unsupported class constant pool tag: " + tag);
+                }
+            }
+            return pool;
+        }
+
+        private void skipInterfaces(DataInputStream input) throws IOException {
+            int interfaces = input.readUnsignedShort();
+            input.skipBytes(interfaces * 2);
+        }
+
+        private void skipMembers(DataInputStream input) throws IOException {
+            skipMemberTable(input);
+        }
+
+        private void skipMemberTable(DataInputStream input) throws IOException {
+            int count = input.readUnsignedShort();
+            for (int i = 0; i < count; i++) {
+                input.skipBytes(6);
+                skipAttributes(input);
+            }
+        }
+
+        private List<AnnotationStatement> readMethods(DataInputStream input) throws IOException {
+            int count = input.readUnsignedShort();
+            List<AnnotationStatement> statements = new ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                input.readUnsignedShort();
+                String methodName = utf8(input.readUnsignedShort());
+                String descriptor = utf8(input.readUnsignedShort());
+                String signature = "";
+                List<ClassAnnotationSql> annotations = new ArrayList<>();
+                int attributes = input.readUnsignedShort();
+                for (int attributeIndex = 0; attributeIndex < attributes; attributeIndex++) {
+                    String attributeName = utf8(input.readUnsignedShort());
+                    int length = input.readInt();
+                    byte[] attributeBytes = input.readNBytes(length);
+                    try (DataInputStream attributeInput = new DataInputStream(new ByteArrayInputStream(attributeBytes))) {
+                        if ("Signature".equals(attributeName)) {
+                            signature = utf8(attributeInput.readUnsignedShort());
+                        } else if ("RuntimeVisibleAnnotations".equals(attributeName)) {
+                            annotations.addAll(readRuntimeVisibleAnnotations(attributeInput));
+                        }
+                    }
+                }
+                for (ClassAnnotationSql annotation : annotations) {
+                    String resultType = "select".equals(annotation.tagName())
+                            ? resultTypeFromClassSignature(descriptor, signature)
+                            : "";
+                    statements.add(new AnnotationStatement(
+                            className,
+                            simpleName,
+                            methodName,
+                            annotation.tagName(),
+                            annotation.sql(),
+                            resultType,
+                            moduleRoot
+                    ));
+                }
+            }
+            return statements;
+        }
+
+        private List<ClassAnnotationSql> readRuntimeVisibleAnnotations(DataInputStream input) throws IOException {
+            int count = input.readUnsignedShort();
+            List<ClassAnnotationSql> annotations = new ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                String descriptor = utf8(input.readUnsignedShort());
+                String tagName = SQL_ANNOTATION_TAGS.get(descriptor);
+                String sql = "";
+                int pairs = input.readUnsignedShort();
+                for (int pairIndex = 0; pairIndex < pairs; pairIndex++) {
+                    String elementName = utf8(input.readUnsignedShort());
+                    List<String> values = readElementValue(input);
+                    if ("value".equals(elementName)) {
+                        sql = String.join("\n", values).trim();
+                    }
+                }
+                if (tagName != null && !sql.isBlank()) {
+                    annotations.add(new ClassAnnotationSql(tagName, sql));
+                }
+            }
+            return annotations;
+        }
+
+        private List<String> readElementValue(DataInputStream input) throws IOException {
+            int tag = input.readUnsignedByte();
+            return switch (tag) {
+                case 's' -> List.of(utf8(input.readUnsignedShort()));
+                case '[' -> readElementValueArray(input);
+                case '@' -> {
+                    skipAnnotation(input);
+                    yield List.of();
+                }
+                case 'e' -> {
+                    input.skipBytes(4);
+                    yield List.of();
+                }
+                case 'c', 'B', 'C', 'D', 'F', 'I', 'J', 'S', 'Z' -> {
+                    input.skipBytes(2);
+                    yield List.of();
+                }
+                default -> List.of();
+            };
+        }
+
+        private List<String> readElementValueArray(DataInputStream input) throws IOException {
+            int count = input.readUnsignedShort();
+            List<String> values = new ArrayList<>();
+            for (int i = 0; i < count; i++) {
+                values.addAll(readElementValue(input));
+            }
+            return values;
+        }
+
+        private void skipAnnotation(DataInputStream input) throws IOException {
+            input.readUnsignedShort();
+            int pairs = input.readUnsignedShort();
+            for (int i = 0; i < pairs; i++) {
+                input.readUnsignedShort();
+                readElementValue(input);
+            }
+        }
+
+        private void skipAttributes(DataInputStream input) throws IOException {
+            int count = input.readUnsignedShort();
+            for (int i = 0; i < count; i++) {
+                input.readUnsignedShort();
+                int length = input.readInt();
+                input.skipBytes(length);
+            }
+        }
+
+        private String resultTypeFromClassSignature(String descriptor, String signature) {
+            String returnType = returnType(signature == null || signature.isBlank() ? descriptor : signature);
+            if (returnType.isBlank()) {
+                return "";
+            }
+            return rowType(returnType);
+        }
+
+        private String returnType(String methodSignature) {
+            int close = methodSignature.lastIndexOf(')');
+            if (close < 0 || close + 1 >= methodSignature.length()) {
+                return "";
+            }
+            return methodSignature.substring(close + 1);
+        }
+
+        private String rowType(String signature) {
+            String type = stripArrayAndWildcard(signature.trim());
+            if (type.isBlank() || "V".equals(type)) {
+                return "";
+            }
+            return switch (type.charAt(0)) {
+                case 'Z' -> "java.lang.Boolean";
+                case 'B' -> "java.lang.Byte";
+                case 'C' -> "java.lang.Character";
+                case 'S' -> "java.lang.Short";
+                case 'I' -> "java.lang.Integer";
+                case 'J' -> "java.lang.Long";
+                case 'F' -> "java.lang.Float";
+                case 'D' -> "java.lang.Double";
+                case 'T' -> "java.lang.Object";
+                case 'L' -> objectRowType(type);
+                default -> "java.lang.Object";
+            };
+        }
+
+        private String stripArrayAndWildcard(String signature) {
+            String result = signature;
+            while (result.startsWith("[")) {
+                result = result.substring(1);
+            }
+            if (result.startsWith("+") || result.startsWith("-")) {
+                result = result.substring(1);
+            }
+            if ("*".equals(result)) {
+                return "Ljava/lang/Object;";
+            }
+            return result;
+        }
+
+        private String objectRowType(String signature) {
+            int end = objectTypeEnd(signature, 0);
+            if (end < 0) {
+                return "java.lang.Object";
+            }
+            String content = signature.substring(1, end);
+            String raw = rawObjectType(content);
+            if (isCollectionResult(raw) || "java.util.Optional".equals(raw)) {
+                String argument = firstGenericArgument(content);
+                return argument.isBlank() ? "java.lang.Object" : rowType(argument);
+            }
+            if ("java.util.Map".equals(raw)) {
+                return "java.util.Map";
+            }
+            return raw;
+        }
+
+        private String rawObjectType(String content) {
+            int generic = content.indexOf('<');
+            String raw = generic < 0 ? content : content.substring(0, generic);
+            return raw.replace('/', '.');
+        }
+
+        private String firstGenericArgument(String content) {
+            int open = content.indexOf('<');
+            if (open < 0) {
+                return "";
+            }
+            int close = matchingGenericEnd(content, open);
+            if (close < 0 || open + 1 >= close) {
+                return "";
+            }
+            String genericContent = content.substring(open + 1, close);
+            int argumentEnd = typeSignatureEnd(genericContent, 0);
+            return argumentEnd < 0 ? "" : genericContent.substring(0, argumentEnd);
+        }
+
+        private int typeSignatureEnd(String value, int start) {
+            if (start >= value.length()) {
+                return -1;
+            }
+            char first = value.charAt(start);
+            if (first == '+' || first == '-') {
+                return typeSignatureEnd(value, start + 1);
+            }
+            if (first == '*') {
+                return start + 1;
+            }
+            while (first == '[' && start + 1 < value.length()) {
+                start++;
+                first = value.charAt(start);
+            }
+            if (first == 'L') {
+                int end = objectTypeEnd(value, start);
+                return end < 0 ? -1 : end + 1;
+            }
+            if (first == 'T') {
+                int end = value.indexOf(';', start);
+                return end < 0 ? -1 : end + 1;
+            }
+            return start + 1;
+        }
+
+        private int objectTypeEnd(String value, int start) {
+            int depth = 0;
+            for (int i = start + 1; i < value.length(); i++) {
+                char current = value.charAt(i);
+                if (current == '<') {
+                    depth++;
+                } else if (current == '>') {
+                    depth--;
+                } else if (current == ';' && depth == 0) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        private int matchingGenericEnd(String value, int openIndex) {
+            int depth = 0;
+            for (int i = openIndex; i < value.length(); i++) {
+                char current = value.charAt(i);
+                if (current == '<') {
+                    depth++;
+                } else if (current == '>') {
+                    depth--;
+                    if (depth == 0) {
+                        return i;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        private boolean isCollectionResult(String type) {
+            return Set.of(
+                    "java.util.List",
+                    "java.util.Collection",
+                    "java.util.Set",
+                    "java.lang.Iterable",
+                    "java.util.Iterator",
+                    "org.apache.ibatis.cursor.Cursor"
+            ).contains(type);
+        }
+
+        private String className(int classIndex) {
+            Object value = constantPool[classIndex];
+            if (value instanceof Integer nameIndex) {
+                return utf8(nameIndex).replace('/', '.');
+            }
+            return "";
+        }
+
+        private String utf8(int index) {
+            if (index <= 0 || index >= constantPool.length) {
+                return "";
+            }
+            Object value = constantPool[index];
+            if (value instanceof String string) {
+                return string;
+            }
+            if (value instanceof Integer nestedIndex) {
+                return utf8(nestedIndex);
+            }
+            return "";
+        }
+
+        private Path classModuleRoot(Path classFile) {
+            String normalized = classFile.toAbsolutePath().normalize().toString().replace('\\', '/');
+            int marker = normalized.indexOf("/target/classes/");
+            if (marker < 0) {
+                return classFile.toAbsolutePath().normalize().getParent();
+            }
+            return Paths.get(normalized.substring(0, marker));
+        }
+    }
+
     private record AnnotationStatement(
             String namespace,
             String simpleName,
@@ -941,5 +1385,8 @@ public class MapperAnnotationMigrator {
     }
 
     private record StatementXmlUpdate(String xml, boolean found) {
+    }
+
+    private record ClassAnnotationSql(String tagName, String sql) {
     }
 }

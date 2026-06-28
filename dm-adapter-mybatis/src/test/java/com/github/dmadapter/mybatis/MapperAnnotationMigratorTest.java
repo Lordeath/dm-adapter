@@ -10,7 +10,10 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -188,6 +191,34 @@ class MapperAnnotationMigratorTest {
                 .contains("<select id=\"listIds\" resultType=\"java.lang.Long\">");
     }
 
+    @Test
+    void extractsAnnotationSqlFromCompiledMapperClasses() throws Exception {
+        compileClassAnnotationFixture();
+
+        MapperMigrationResult result = new MapperAnnotationMigrator().migrate(
+                scanResult(List.of()),
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String xml = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/CompiledMapper.xml"));
+        assertThat(xml)
+                .contains("<mapper namespace=\"com.example.CompiledMapper\">")
+                .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
+                .contains("<select id=\"listIds\" resultType=\"java.lang.Long\">")
+                .contains("<update id=\"touch\">")
+                .contains("SYSDATE")
+                .contains("FETCH FIRST 1 ROWS ONLY")
+                .doesNotContain("NOW()");
+        assertThat(result.automaticConversions())
+                .extracting(change -> change.statementId())
+                .contains(
+                        "com.example.CompiledMapper.selectNow",
+                        "com.example.CompiledMapper.touch"
+                );
+    }
+
     private ProjectScanResult scanResult(List<MapperXmlFile> mapperXmlFiles) {
         return new ProjectScanResult(
                 true,
@@ -202,6 +233,79 @@ class MapperAnnotationMigratorTest {
 
     private Path writeFile(String relativePath, String content) throws Exception {
         Path path = tempDir.resolve(relativePath);
+        Files.createDirectories(path.getParent());
+        Files.writeString(path, content);
+        return path;
+    }
+
+    private void compileClassAnnotationFixture() throws Exception {
+        Path sourceRoot = tempDir.resolve("compiler-src");
+        Path output = tempDir.resolve("module/target/classes");
+        Path select = writeCompilerSource(sourceRoot, "org/apache/ibatis/annotations/Select.java", """
+                package org.apache.ibatis.annotations;
+
+                import java.lang.annotation.ElementType;
+                import java.lang.annotation.Retention;
+                import java.lang.annotation.RetentionPolicy;
+                import java.lang.annotation.Target;
+
+                @Retention(RetentionPolicy.RUNTIME)
+                @Target(ElementType.METHOD)
+                public @interface Select {
+                    String[] value();
+                }
+                """);
+        Path update = writeCompilerSource(sourceRoot, "org/apache/ibatis/annotations/Update.java", """
+                package org.apache.ibatis.annotations;
+
+                import java.lang.annotation.ElementType;
+                import java.lang.annotation.Retention;
+                import java.lang.annotation.RetentionPolicy;
+                import java.lang.annotation.Target;
+
+                @Retention(RetentionPolicy.RUNTIME)
+                @Target(ElementType.METHOD)
+                public @interface Update {
+                    String[] value();
+                }
+                """);
+        Path mapper = writeCompilerSource(sourceRoot, "com/example/CompiledMapper.java", """
+                package com.example;
+
+                import java.util.List;
+                import org.apache.ibatis.annotations.Select;
+                import org.apache.ibatis.annotations.Update;
+
+                public interface CompiledMapper {
+                    @Select("select NOW() from dual limit 1")
+                    String selectNow();
+
+                    @Select("select id from task")
+                    List<Long> listIds();
+
+                    @Update("update task set updated_at = NOW() where id = #{id}")
+                    int touch(Long id);
+                }
+                """);
+
+        Files.createDirectories(output);
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        assertThat(compiler).isNotNull();
+        List<String> args = new ArrayList<>();
+        args.add("-d");
+        args.add(output.toString());
+        args.add("-source");
+        args.add("17");
+        args.add("-target");
+        args.add("17");
+        args.add(select.toString());
+        args.add(update.toString());
+        args.add(mapper.toString());
+        assertThat(compiler.run(null, null, null, args.toArray(String[]::new))).isZero();
+    }
+
+    private Path writeCompilerSource(Path sourceRoot, String relativePath, String content) throws Exception {
+        Path path = sourceRoot.resolve(relativePath);
         Files.createDirectories(path.getParent());
         Files.writeString(path, content);
         return path;
