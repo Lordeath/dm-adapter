@@ -25,10 +25,14 @@ class MapperAnnotationMigratorTest {
 
                 import org.apache.ibatis.annotations.Select;
                 import org.apache.ibatis.annotations.Update;
+                import java.util.List;
 
                 public interface VoucherTaskMapper {
                     @Select("select NOW() from dual limit 1")
                     String selectNow();
+
+                    @Select("select id from ns_bill_voucher_task")
+                    List<Long> listIds();
 
                     @Update("update ns_bill_voucher_task " +
                             "set taskName = #{taskName}, " +
@@ -48,7 +52,8 @@ class MapperAnnotationMigratorTest {
         String xml = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"));
         assertThat(xml)
                 .contains("<mapper namespace=\"com.example.VoucherTaskMapper\">")
-                .contains("<select id=\"selectNow\">")
+                .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
+                .contains("<select id=\"listIds\" resultType=\"java.lang.Long\">")
                 .contains("<update id=\"update\">")
                 .contains("SYSDATE")
                 .contains("FETCH FIRST 1 ROWS ONLY")
