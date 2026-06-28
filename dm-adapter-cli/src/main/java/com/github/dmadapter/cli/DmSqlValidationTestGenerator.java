@@ -11110,7 +11110,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     @Override
-                    public <T> boolean hasMapper(Class<T> type) {
+                    public boolean hasMapper(Class<?> type) {
                         return suppressMapperBinding || super.hasMapper(type);
                     }
                 }
