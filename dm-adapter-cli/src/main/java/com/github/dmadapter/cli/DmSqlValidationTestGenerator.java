@@ -665,9 +665,9 @@ class DmSqlValidationTestGenerator {
                                 records.add(connectionFailure);
                                 log("FAILED database connection: " + connectionFailure.message);
                             } else {
-                                dbColumnMetadata = loadColumnMetadata(sqlSessionFactory, config);
                                 List<MapperMethod> mapperMethods = mapperMethods(sqlSessionFactory.getConfiguration(), mapperXmlFiles, config);
                                 log("Discovered mapper statements: " + mapperMethods.size());
+                                dbColumnMetadata = loadColumnMetadata(sqlSessionFactory, config, mapperMethods);
                                 if (mapperMethods.isEmpty()) {
                                     records.add(ValidationRecord.failed("(discovery)", "configuration",
                                             "No mapped statements were found in mapper XML files."));
@@ -884,11 +884,20 @@ class DmSqlValidationTestGenerator {
                     return dataSource;
                 }
 
-                private DbColumnMetadata loadColumnMetadata(SqlSessionFactory sqlSessionFactory, ValidationConfig config) {
-                    log("Loading database column metadata...");
+                private DbColumnMetadata loadColumnMetadata(
+                        SqlSessionFactory sqlSessionFactory,
+                        ValidationConfig config,
+                        List<MapperMethod> mapperMethods
+                ) {
+                    Set<String> tableNames = referencedTableNames(mapperMethods);
+                    if (tableNames.isEmpty()) {
+                        log("Database column metadata skipped: no referenced tables were found in mapper SQL.");
+                        return DbColumnMetadata.empty();
+                    }
+                    log("Loading database column metadata for " + tableNames.size() + " referenced table(s)...");
                     try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
                         Connection connection = sqlSession.getConnection();
-                        DbColumnMetadata metadata = DbColumnMetadata.load(connection, config.schemas());
+                        DbColumnMetadata metadata = DbColumnMetadata.load(connection, config.schemas(), tableNames);
                         log("Database column metadata loaded: " + metadata.columnCount() + " columns.");
                         return metadata;
                     } catch (Throwable e) {
@@ -896,6 +905,20 @@ class DmSqlValidationTestGenerator {
                                 + e.getClass().getSimpleName() + ": " + e.getMessage());
                         return DbColumnMetadata.empty();
                     }
+                }
+
+                private Set<String> referencedTableNames(List<MapperMethod> mapperMethods) {
+                    LinkedHashSet<String> tableNames = new LinkedHashSet<>();
+                    if (mapperMethods == null) {
+                        return tableNames;
+                    }
+                    for (MapperMethod mapperMethod : mapperMethods) {
+                        if (mapperMethod == null || mapperMethod.statement == null) {
+                            continue;
+                        }
+                        tableNames.addAll(mapperMethod.statement.referencedTableNames());
+                    }
+                    return tableNames;
                 }
 
                 private String required(String value, String key) {
@@ -10592,6 +10615,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private static final class DbColumnMetadata {
+                    private static final int METADATA_QUERY_TIMEOUT_SECONDS = 8;
                     private final Map<String, String> tableColumnTypes = new LinkedHashMap<>();
                     private final Map<String, Set<String>> columnTypes = new LinkedHashMap<>();
 
@@ -10599,51 +10623,51 @@ class DmSqlValidationTestGenerator {
                         return new DbColumnMetadata();
                     }
 
-                    private static DbColumnMetadata load(Connection connection, List<String> schemas) throws Exception {
+                    private static DbColumnMetadata load(
+                            Connection connection,
+                            List<String> schemas,
+                            Collection<String> tableNames
+                    ) throws Exception {
                         DbColumnMetadata metadata = new DbColumnMetadata();
                         List<String> targetSchemas = schemas == null ? listOf() : schemas;
-                        if (targetSchemas.isEmpty()) {
-                            metadata.readJdbcColumns(connection, "");
-                        } else {
-                            for (String schema : targetSchemas) {
-                                metadata.readJdbcColumns(connection, schema);
+                        LinkedHashSet<String> targetTables = new LinkedHashSet<>();
+                        if (tableNames != null) {
+                            for (String tableName : tableNames) {
+                                if (!isBlank(tableName)) {
+                                    targetTables.add(tableName);
+                                }
                             }
                         }
-                        if (metadata.columnCount() == 0) {
+                        if (targetTables.isEmpty()) {
+                            return metadata;
+                        }
+                        for (String tableName : targetTables) {
                             if (targetSchemas.isEmpty()) {
-                                metadata.readAllTabColumns(connection, "");
+                                metadata.readTableColumns(connection, "", tableName);
                             } else {
                                 for (String schema : targetSchemas) {
-                                    metadata.readAllTabColumns(connection, schema);
+                                    metadata.readTableColumns(connection, schema, tableName);
                                 }
                             }
                         }
                         return metadata;
                     }
 
-                    private void readJdbcColumns(Connection connection, String schema) throws Exception {
-                        DatabaseMetaData databaseMetaData = connection.getMetaData();
-                        String schemaPattern = schema == null || isBlank(schema) ? null : schema;
-                        try (ResultSet resultSet = databaseMetaData.getColumns(null, schemaPattern, "%", "%")) {
-                            while (resultSet.next()) {
-                                addColumn(
-                                        resultSet.getString("TABLE_NAME"),
-                                        resultSet.getString("COLUMN_NAME"),
-                                        resultSet.getString("TYPE_NAME")
-                                );
-                            }
+                    private void readTableColumns(Connection connection, String schema, String tableName) throws Exception {
+                        if (isBlank(tableName)) {
+                            return;
                         }
-                    }
-
-                    private void readAllTabColumns(Connection connection, String schema) throws Exception {
-                        String sql = schema == null || isBlank(schema)
-                                ? "select table_name, column_name, data_type from all_tab_columns"
-                                : "select table_name, column_name, data_type from all_tab_columns "
-                                        + "where owner = ? or upper(owner) = upper(?)";
-                        try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                            if (schema != null && !isBlank(schema)) {
+                        boolean schemaQualified = schema != null && !isBlank(schema);
+                        try (PreparedStatement statement = connection.prepareStatement(columnTypeQuerySql(schemaQualified))) {
+                            configureQueryTimeout(statement);
+                            if (schemaQualified) {
                                 statement.setString(1, schema);
                                 statement.setString(2, schema);
+                                statement.setString(3, tableName);
+                                statement.setString(4, tableName);
+                            } else {
+                                statement.setString(1, tableName);
+                                statement.setString(2, tableName);
                             }
                             try (ResultSet resultSet = statement.executeQuery()) {
                                 while (resultSet.next()) {
@@ -10654,6 +10678,26 @@ class DmSqlValidationTestGenerator {
                                     );
                                 }
                             }
+                        }
+                    }
+
+                    private String columnTypeQuerySql(boolean schemaQualified) {
+                        if (schemaQualified) {
+                            return "select table_name, column_name, data_type from all_tab_columns "
+                                    + "where (owner = ? or upper(owner) = upper(?)) "
+                                    + "and (table_name = ? or upper(table_name) = upper(?)) "
+                                    + "order by table_name, column_id";
+                        }
+                        return "select table_name, column_name, data_type from user_tab_columns "
+                                + "where table_name = ? or upper(table_name) = upper(?) "
+                                + "order by table_name, column_id";
+                    }
+
+                    private void configureQueryTimeout(Statement statement) {
+                        try {
+                            statement.setQueryTimeout(METADATA_QUERY_TIMEOUT_SECONDS);
+                        } catch (SQLException ignored) {
+                            // Column metadata only improves generated test values; drivers may ignore timeouts.
                         }
                     }
 
@@ -10813,6 +10857,10 @@ class DmSqlValidationTestGenerator {
 
                     private Set<String> collectionParameterNames() {
                         return dynamicIdentifierMetadata.collectionParameterNames();
+                    }
+
+                    private Set<String> referencedTableNames() {
+                        return dynamicIdentifierMetadata.referencedTableNames();
                     }
 
                     private boolean collectionParameter(String valueName) {
@@ -11180,6 +11228,30 @@ class DmSqlValidationTestGenerator {
 
                     private Set<String> collectionParameterNames() {
                         return copySet(namedCollectionParameterNames);
+                    }
+
+                    private Set<String> referencedTableNames() {
+                        LinkedHashSet<String> tableNames = new LinkedHashSet<>();
+                        addReferencedTableNames(tableNames, collectionColumnReferences.values());
+                        for (Map<String, ColumnReference> references : collectionElementColumnReferences.values()) {
+                            addReferencedTableNames(tableNames, references.values());
+                        }
+                        addReferencedTableNames(tableNames, defaultColumnReferences.values());
+                        return copySet(tableNames);
+                    }
+
+                    private void addReferencedTableNames(
+                            LinkedHashSet<String> tableNames,
+                            Collection<ColumnReference> columnReferences
+                    ) {
+                        if (columnReferences == null) {
+                            return;
+                        }
+                        for (ColumnReference columnReference : columnReferences) {
+                            if (columnReference != null && !isBlank(columnReference.tableName())) {
+                                tableNames.add(columnReference.tableName());
+                            }
+                        }
                     }
 
                     private String valueExpressionName(int index, String fallbackName) {
