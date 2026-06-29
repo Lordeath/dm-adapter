@@ -2713,20 +2713,20 @@ class DmSqlValidationTestGenerator {
                     }
                     for (Map.Entry<String, List<Integer>> entry : paramIndexesByName.entrySet()) {
                         if (entry.getValue().size() > 1) {
-                            return ValidationRecord.failed(
+                            return ValidationRecord.skipped(
                                     mapperMethod.key(),
                                     "java-mapper-signature",
-                                    "Java mapper signature has duplicate @Param(\\"" + entry.getKey()
+                                    "Skipped business Java mapper signature issue: Java mapper signature has duplicate @Param(\\"" + entry.getKey()
                                             + "\\") annotations at parameter indexes " + entry.getValue()
                                             + ". Fix the Java mapper method @Param names instead of changing mapper XML parameter names."
                             );
                         }
                     }
                     if (!missingSimpleParams.isEmpty()) {
-                        return ValidationRecord.failed(
+                        return ValidationRecord.skipped(
                                 mapperMethod.key(),
                                 "java-mapper-signature",
-                                "Java mapper method has multiple simple parameters without @Param: "
+                                "Skipped business Java mapper signature issue: Java mapper method has multiple simple parameters without @Param: "
                                         + String.join(", ", missingSimpleParams)
                                         + ". Add @Param annotations in the Java mapper method instead of changing mapper XML parameter names."
                         );

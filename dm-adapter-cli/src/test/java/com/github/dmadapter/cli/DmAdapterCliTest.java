@@ -593,6 +593,7 @@ class DmAdapterCliTest {
                 .contains("parameter.isNamePresent()")
                 .contains("paramAnnotationName")
                 .contains("JAVA_MAPPER_PARAM_ANNOTATION")
+                .contains("Skipped business Java mapper signature issue")
                 .contains("Java mapper method has multiple simple parameters without @Param")
                 .contains("Java mapper signature has duplicate @Param")
                 .contains("parameterName")
