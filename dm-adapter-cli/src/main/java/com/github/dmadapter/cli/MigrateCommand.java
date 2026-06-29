@@ -72,6 +72,7 @@ public class MigrateCommand implements Callable<Integer> {
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
     private final MapperMigrator mapperMigrator = new MapperMigrator();
     private final MapperAnnotationMigrator mapperAnnotationMigrator = new MapperAnnotationMigrator();
+    private final MapperJavaParamFixer mapperJavaParamFixer = new MapperJavaParamFixer();
     private final SqlRewriteConfigLoader sqlRewriteConfigLoader = new SqlRewriteConfigLoader();
     private final SqlRewriteConfigUpdater sqlRewriteConfigUpdater = new SqlRewriteConfigUpdater();
     private final DamengMetadataReader damengMetadataReader = new DamengMetadataReader();
@@ -157,6 +158,9 @@ public class MigrateCommand implements Callable<Integer> {
             fileChanges.addAll(annotationMigrationResult.fileChanges());
             warnings.addAll(annotationMigrationResult.warnings());
             MapperMigrationResult combinedMigrationResult = combine(mapperMigrationResult, annotationMigrationResult);
+            MapperJavaParamFixResult javaParamFixResult = mapperJavaParamFixer.fix(scanResult, context);
+            fileChanges.addAll(javaParamFixResult.fileChanges());
+            warnings.addAll(javaParamFixResult.warnings());
             MapperJdbcTypeAlignmentResult jdbcTypeAlignmentResult = alignMapperJdbcTypes(context, scanResult);
             fileChanges.addAll(jdbcTypeAlignmentResult.fileChanges());
             warnings.addAll(jdbcTypeAlignmentResult.warnings());
