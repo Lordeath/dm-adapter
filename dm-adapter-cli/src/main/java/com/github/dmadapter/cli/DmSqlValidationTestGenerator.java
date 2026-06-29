@@ -2760,16 +2760,26 @@ class DmSqlValidationTestGenerator {
                         Set<String> parameterReferences = mapperMethod.statement.parameterReferences();
                         if (parameterReferences.size() == 1
                                 && isBlank(paramAnnotationName(parameter))
-                                && simpleMapperParameterType(method.getParameterTypes()[0])
-                                && hasUsableActualParameterName(parameter, 0)) {
+                                && simpleMapperParameterType(method.getParameterTypes()[0])) {
                             String reference = parameterReferences.iterator().next();
-                            String actualName = parameter.getName();
-                            if (!reference.equals(actualName)) {
+                            if (hasUsableActualParameterName(parameter, 0)) {
+                                String actualName = parameter.getName();
+                                if (!reference.equals(actualName)) {
+                                    return ValidationRecord.skipped(
+                                            mapperMethod.key(),
+                                            "java-mapper-signature",
+                                            "Skipped business Java mapper signature issue: Java mapper method has a single simple parameter named "
+                                                    + actualName + " without @Param, but mapper XML references " + reference
+                                                    + ". Add @Param(\\\"" + reference
+                                                    + "\\\") in the Java mapper method instead of changing mapper XML parameter names."
+                                    );
+                                }
+                            } else {
                                 return ValidationRecord.skipped(
                                         mapperMethod.key(),
                                         "java-mapper-signature",
-                                        "Skipped business Java mapper signature issue: Java mapper method has a single simple parameter named "
-                                                + actualName + " without @Param, but mapper XML references " + reference
+                                        "Skipped business Java mapper signature issue: Java mapper method has a single simple parameter without @Param, "
+                                                + "but mapper XML references " + reference
                                                 + ". Add @Param(\\\"" + reference
                                                 + "\\\") in the Java mapper method instead of changing mapper XML parameter names."
                                 );

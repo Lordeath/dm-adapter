@@ -251,8 +251,8 @@ class MapperJdbcTypeAlignerTest {
         String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/BpmMapper.xml"));
         assertThat(result.fileChanges()).hasSize(1);
         assertThat(rewritten)
-                .contains("cp.auditor_ = #{userId,jdbcType=VARCHAR}")
-                .contains("task_id_ = #{taskId,jdbcType=VARCHAR}");
+                .contains("cp.auditor_ = #{userId,jdbcType=VARCHAR,javaType=String}")
+                .contains("task_id_ = #{taskId,jdbcType=VARCHAR,javaType=String}");
     }
 
     @Test
