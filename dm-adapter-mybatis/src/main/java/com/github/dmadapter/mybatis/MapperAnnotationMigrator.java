@@ -88,9 +88,7 @@ public class MapperAnnotationMigrator {
         Map<Path, List<AnnotationStatement>> statementsBySource = new LinkedHashMap<>();
         Set<String> seenSourceAnnotationKeys = new LinkedHashSet<>();
         for (AnnotationStatement statement : annotationStatements) {
-            if (!statement.sourceAvailable()
-                    || sourceStatementKeys.contains(statement.key())
-                    || !seenSourceAnnotationKeys.add(statement.key())) {
+            if (!seenSourceAnnotationKeys.add(statement.key())) {
                 continue;
             }
             Path source = sourceByNamespace.getOrDefault(statement.namespace(), defaultSourceTarget(statement));
@@ -402,6 +400,9 @@ public class MapperAnnotationMigrator {
     private Map<String, Path> mapperSourceByNamespace(ProjectScanResult scanResult) {
         Map<String, Path> sourceByNamespace = new LinkedHashMap<>();
         for (MapperXmlFile mapperXmlFile : scanResult.mapperXmlFiles()) {
+            if (isMapperDmXml(mapperXmlFile)) {
+                continue;
+            }
             Path source = Paths.get(mapperXmlFile.path());
             String namespace = namespace(source);
             if (!namespace.isBlank()) {
@@ -409,6 +410,14 @@ public class MapperAnnotationMigrator {
             }
         }
         return sourceByNamespace;
+    }
+
+    private boolean isMapperDmXml(MapperXmlFile mapperXmlFile) {
+        String relativePath = mapperXmlFile.resourcesRelativePath().replace('\\', '/');
+        String absolutePath = mapperXmlFile.path().replace('\\', '/');
+        return relativePath.startsWith("mapper-dm/")
+                || relativePath.contains("/mapper-dm/")
+                || absolutePath.contains("/mapper-dm/");
     }
 
     private Set<String> sourceStatementKeys(ProjectScanResult scanResult) {
