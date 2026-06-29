@@ -484,7 +484,7 @@ class DmSqlValidationTestGenerator {
     private static final String TEST_TEMPLATE = String.join("",
             """
             __PACKAGE_DECLARATION__import org.apache.ibatis.builder.xml.XMLMapperBuilder;
-            import org.apache.ibatis.datasource.unpooled.UnpooledDataSource;
+            import org.apache.ibatis.datasource.pooled.PooledDataSource;
             import org.apache.ibatis.mapping.Environment;
             import org.apache.ibatis.mapping.MappedStatement;
             import org.apache.ibatis.mapping.SqlCommandType;
@@ -844,12 +844,19 @@ class DmSqlValidationTestGenerator {
                     }
                 }
 
-                private UnpooledDataSource dataSource(ValidationConfig config) {
-                    UnpooledDataSource dataSource = new UnpooledDataSource();
+                private PooledDataSource dataSource(ValidationConfig config) {
+                    PooledDataSource dataSource = new PooledDataSource();
                     dataSource.setDriver(required(resolvePlaceholders(config.datasource.driverClassName), "datasource.driverClassName"));
                     dataSource.setUrl(required(resolvePlaceholders(config.datasource.url), "datasource.url"));
                     dataSource.setUsername(required(resolvePlaceholders(config.datasource.username), "datasource.username"));
                     dataSource.setPassword(optionalSecret(resolvePlaceholders(config.datasource.password), "datasource.password"));
+                    dataSource.setPoolMaximumActiveConnections(1);
+                    dataSource.setPoolMaximumIdleConnections(1);
+                    dataSource.setPoolMaximumCheckoutTime(30000);
+                    dataSource.setPoolTimeToWait(20000);
+                    dataSource.setPoolPingEnabled(true);
+                    dataSource.setPoolPingQuery("SELECT 1");
+                    dataSource.setPoolPingConnectionsNotUsedFor(1);
                     return dataSource;
                 }
 
