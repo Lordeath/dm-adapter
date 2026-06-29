@@ -566,6 +566,10 @@ class DmSqlValidationTestGenerator {
                 private static final String MARKDOWN_REPORT = ".dm-adapter/sql-validation-report.md";
                 private static final String JSON_REPORT = ".dm-adapter/sql-validation-report.json";
                 private static final Pattern PLACEHOLDER = Pattern.compile("\\\\$\\\\{([^}]+)}");
+                private static final int DATABASE_CONNECTION_ATTEMPTS =
+                        Math.max(1, Integer.getInteger("dm.sql.validation.connectionAttempts", 3));
+                private static final long DATABASE_CONNECTION_RETRY_DELAY_MILLIS =
+                        Math.max(0L, Long.getLong("dm.sql.validation.connectionRetryDelayMillis", 2000L));
                 private static final Set<String> DEFAULT_COLLECTION_PARAMETER_NAMES = new LinkedHashSet<>(Arrays.asList(
                         "list",
                         "collection",
@@ -819,28 +823,47 @@ class DmSqlValidationTestGenerator {
 
                 private ValidationRecord databaseConnectionFailure(SqlSessionFactory sqlSessionFactory) {
                     log("Checking database connection...");
-                    try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
-                        Connection connection = sqlSession.getConnection();
-                        try (Statement statement = connection.createStatement();
-                             ResultSet resultSet = statement.executeQuery("SELECT 1")) {
-                            if (resultSet.next()) {
-                                log("Database connection ready.");
-                                return null;
+                    Throwable lastFailure = null;
+                    for (int attempt = 1; attempt <= DATABASE_CONNECTION_ATTEMPTS; attempt++) {
+                        try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
+                            Connection connection = sqlSession.getConnection();
+                            try (Statement statement = connection.createStatement();
+                                 ResultSet resultSet = statement.executeQuery("SELECT 1")) {
+                                if (resultSet.next()) {
+                                    log("Database connection ready.");
+                                    return null;
+                                }
                             }
+                            lastFailure = new IllegalStateException(
+                                    "Dameng validation connection check did not return a result."
+                            );
+                        } catch (Throwable e) {
+                            lastFailure = e;
                         }
-                        return ValidationRecord.failed(
-                                "(database-connection)",
-                                "configuration",
-                                "Dameng validation connection check did not return a result."
-                        );
-                    } catch (Throwable e) {
-                        return ValidationRecord.failed(
-                                "(database-connection)",
-                                "configuration",
-                                "Failed to open Dameng validation connection. "
-                                        + "Check DM_JDBC_URL, DM_DB_USERNAME, DM_DB_PASSWORD and database availability.\\n"
-                                        + throwableSummary(e)
-                        );
+                        if (attempt < DATABASE_CONNECTION_ATTEMPTS) {
+                            log("Database connection attempt " + attempt + "/" + DATABASE_CONNECTION_ATTEMPTS
+                                    + " failed; retrying. Cause: " + throwableSummary(lastFailure));
+                            sleepBeforeConnectionRetry();
+                        }
+                    }
+                    return ValidationRecord.failed(
+                            "(database-connection)",
+                            "configuration",
+                            "Failed to open Dameng validation connection after "
+                                    + DATABASE_CONNECTION_ATTEMPTS + " attempt(s). "
+                                    + "Check DM_JDBC_URL, DM_DB_USERNAME, DM_DB_PASSWORD and database availability.\\n"
+                                    + throwableSummary(lastFailure)
+                    );
+                }
+
+                private void sleepBeforeConnectionRetry() {
+                    if (DATABASE_CONNECTION_RETRY_DELAY_MILLIS <= 0L) {
+                        return;
+                    }
+                    try {
+                        Thread.sleep(DATABASE_CONNECTION_RETRY_DELAY_MILLIS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
                     }
                 }
 
