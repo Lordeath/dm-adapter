@@ -8,6 +8,23 @@ import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlChange;
 import com.github.dmadapter.core.SqlConversionResult;
 import com.github.dmadapter.sql.SqlConverter;
+import com.github.javaparser.ParserConfiguration;
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.ArrayInitializerExpr;
+import com.github.javaparser.ast.expr.BinaryExpr;
+import com.github.javaparser.ast.expr.EnclosedExpr;
+import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.MemberValuePair;
+import com.github.javaparser.ast.expr.NormalAnnotationExpr;
+import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
+import com.github.javaparser.ast.expr.StringLiteralExpr;
+import com.github.javaparser.ast.expr.TextBlockLiteralExpr;
+import com.github.javaparser.ast.type.Type;
+import com.github.javaparser.printer.lexicalpreservation.LexicalPreservingPrinter;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -25,7 +42,6 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -36,23 +52,18 @@ public class MapperAnnotationMigrator {
     public static final String MYBATIS_ANNOTATION_SQL_TO_MAPPER_DM_XML_RULE =
             "MYBATIS_ANNOTATION_SQL_TO_MAPPER_DM_XML";
 
-    private static final Pattern PACKAGE_PATTERN = Pattern.compile(
-            "(?m)^\\s*package\\s+([A-Za-z_][A-Za-z0-9_.]*)\\s*;"
-    );
-    private static final Pattern TYPE_PATTERN = Pattern.compile(
-            "\\b(?:public\\s+)?(?:interface|class)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b"
-    );
     private static final Pattern IMPORT_PATTERN = Pattern.compile(
             "(?m)^\\s*import\\s+((?:static\\s+)?[A-Za-z_][A-Za-z0-9_.*]*)\\s*;"
     );
-    private static final Pattern SQL_ANNOTATION_PATTERN = Pattern.compile(
-            "@(Select|Insert|Update|Delete)\\b"
-    );
-    private static final Pattern METHOD_NAME_PATTERN = Pattern.compile(
-            "([A-Za-z_][A-Za-z0-9_]*)\\s*$"
-    );
     private static final Pattern RESULT_MAPPING_ATTRIBUTE_PATTERN = Pattern.compile(
             "\\b(?:resultType|resultMap)\\s*="
+    );
+    private static final Pattern UPDATE_SET_PATTERN = Pattern.compile(
+            "(?is)\\bupdate\\b[\\s\\S]*?\\bset\\b"
+    );
+    private static final Pattern WHERE_PATTERN = Pattern.compile("(?is)\\bwhere\\b");
+    private static final Pattern MISSING_UPDATE_SET_COMMA_PATTERN = Pattern.compile(
+            "([#$]\\{[^}]+})\\s+(?=(?:[`\"]?[A-Za-z_][A-Za-z0-9_.$]*[`\"]?\\s*=))"
     );
     private static final Map<String, String> SQL_ANNOTATION_TAGS = Map.of(
             "Lorg/apache/ibatis/annotations/Select;", "select",
@@ -60,6 +71,9 @@ public class MapperAnnotationMigrator {
             "Lorg/apache/ibatis/annotations/Update;", "update",
             "Lorg/apache/ibatis/annotations/Delete;", "delete"
     );
+    static {
+        StaticJavaParser.getParserConfiguration().setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
+    }
 
     private final MapperXmlRewriter mapperXmlRewriter;
 
@@ -86,6 +100,7 @@ public class MapperAnnotationMigrator {
         Map<String, Path> targetByNamespace = mapperTargetByNamespace(scanResult, context);
         Set<String> sourceStatementKeys = sourceStatementKeys(scanResult);
         Map<Path, List<AnnotationStatement>> statementsBySource = new LinkedHashMap<>();
+        Map<Path, List<AnnotationStatement>> existingStatementsBySource = new LinkedHashMap<>();
         Set<String> seenSourceAnnotationKeys = new LinkedHashSet<>();
         for (AnnotationStatement statement : annotationStatements) {
             if (!seenSourceAnnotationKeys.add(statement.key())) {
@@ -93,6 +108,7 @@ public class MapperAnnotationMigrator {
             }
             Path source = sourceByNamespace.getOrDefault(statement.namespace(), defaultSourceTarget(statement));
             if (xmlHasStatement(source, statement.namespace(), statement.id())) {
+                existingStatementsBySource.computeIfAbsent(source, ignored -> new ArrayList<>()).add(statement);
                 continue;
             }
             statementsBySource.computeIfAbsent(source, ignored -> new ArrayList<>()).add(statement);
@@ -113,18 +129,18 @@ public class MapperAnnotationMigrator {
             }
             statementsByTarget.computeIfAbsent(target, ignored -> new ArrayList<>()).add(statement);
         }
-        if (statementsBySource.isEmpty() && statementsByTarget.isEmpty()) {
+        if (statementsBySource.isEmpty() && existingStatementsBySource.isEmpty() && statementsByTarget.isEmpty()) {
             return new MapperMigrationResult(List.of(), List.of(), List.of(), List.of());
         }
 
         if (context.dryRun()) {
             return combine(
-                    dryRunSourceMigration(statementsBySource),
+                    dryRunSourceMigration(statementsBySource, existingStatementsBySource),
                     dryRunMigration(statementsByTarget, sqlConverter, rewriteConfig)
             );
         }
         return combine(
-                applySourceMigration(statementsBySource),
+                applySourceMigration(statementsBySource, existingStatementsBySource),
                 applyMigration(statementsByTarget, sqlConverter, rewriteConfig)
         );
     }
@@ -145,7 +161,10 @@ public class MapperAnnotationMigrator {
         return new MapperMigrationResult(fileChanges, automaticConversions, manualReviewItems, warnings);
     }
 
-    private MapperMigrationResult dryRunSourceMigration(Map<Path, List<AnnotationStatement>> statementsBySource) {
+    private MapperMigrationResult dryRunSourceMigration(
+            Map<Path, List<AnnotationStatement>> statementsBySource,
+            Map<Path, List<AnnotationStatement>> existingStatementsBySource
+    ) {
         List<FileChange> fileChanges = new ArrayList<>();
         for (Path source : statementsBySource.keySet()) {
             fileChanges.add(FileChange.planned(
@@ -154,12 +173,39 @@ public class MapperAnnotationMigrator {
                     "Extract MyBatis annotation SQL to mapper XML"
             ));
         }
+        for (List<AnnotationStatement> statements : existingStatementsBySource.values()) {
+            for (Path javaSource : javaSources(statements)) {
+                fileChanges.add(FileChange.planned(
+                        javaSource.toString(),
+                        "UPDATE",
+                        "Remove extracted MyBatis annotation SQL from Java mapper"
+                ));
+            }
+        }
         return new MapperMigrationResult(fileChanges, List.of(), List.of(), List.of());
     }
 
-    private MapperMigrationResult applySourceMigration(Map<Path, List<AnnotationStatement>> statementsBySource) {
+    private MapperMigrationResult applySourceMigration(
+            Map<Path, List<AnnotationStatement>> statementsBySource,
+            Map<Path, List<AnnotationStatement>> existingStatementsBySource
+    ) {
         List<FileChange> fileChanges = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
+        Map<Path, List<AnnotationStatement>> statementsToClean = new LinkedHashMap<>(existingStatementsBySource);
+        for (Map.Entry<Path, List<AnnotationStatement>> entry : existingStatementsBySource.entrySet()) {
+            Path source = entry.getKey();
+            try {
+                if (repairExistingAnnotationSql(source, entry.getValue())) {
+                    fileChanges.add(FileChange.applied(
+                            source.toString(),
+                            "UPDATE",
+                            "Fixed extracted MyBatis annotation SQL in mapper XML"
+                    ));
+                }
+            } catch (Exception e) {
+                warnings.add("Failed to fix extracted MyBatis annotation SQL in " + source + ": " + e.getMessage());
+            }
+        }
         for (Map.Entry<Path, List<AnnotationStatement>> entry : statementsBySource.entrySet()) {
             Path source = entry.getKey();
             boolean existed = Files.exists(source);
@@ -170,18 +216,67 @@ public class MapperAnnotationMigrator {
                         existed ? "UPDATE" : "CREATE",
                         "Extracted MyBatis annotation SQL to mapper XML"
                 ));
+                statementsToClean.computeIfAbsent(source, ignored -> new ArrayList<>()).addAll(entry.getValue());
             } catch (Exception e) {
                 warnings.add("Failed to extract MyBatis annotation SQL into " + source + ": " + e.getMessage());
-                continue;
-            }
-            try {
-                fileChanges.addAll(removeJavaSqlAnnotations(entry.getValue()));
-            } catch (Exception e) {
-                warnings.add("Failed to remove extracted MyBatis annotation SQL from Java mapper for "
-                        + source + ": " + e.getMessage());
             }
         }
+        try {
+            fileChanges.addAll(removeJavaSqlAnnotations(statementsToClean.values().stream()
+                    .flatMap(List::stream)
+                    .toList()));
+        } catch (Exception e) {
+            warnings.add("Failed to remove extracted MyBatis annotation SQL from Java mapper: " + e.getMessage());
+        }
         return new MapperMigrationResult(fileChanges, List.of(), List.of(), warnings);
+    }
+
+    private boolean repairExistingAnnotationSql(Path mapperXml, List<AnnotationStatement> statements) throws IOException {
+        if (!Files.isRegularFile(mapperXml)) {
+            return false;
+        }
+        String xml = Files.readString(mapperXml, StandardCharsets.UTF_8);
+        String updated = xml;
+        for (AnnotationStatement statement : statements) {
+            if (!"update".equals(statement.tagName())) {
+                continue;
+            }
+            updated = repairExistingStatementSql(updated, statement);
+        }
+        if (updated.equals(xml)) {
+            return false;
+        }
+        Files.writeString(mapperXml, updated, StandardCharsets.UTF_8);
+        return true;
+    }
+
+    private String repairExistingStatementSql(String xml, AnnotationStatement statement) {
+        Matcher matcher = startTagPattern(statement).matcher(xml);
+        StringBuilder updated = new StringBuilder();
+        int cursor = 0;
+        boolean changed = false;
+        while (matcher.find()) {
+            int bodyStart = matcher.end();
+            Matcher closing = Pattern.compile("(?is)</\\s*" + Pattern.quote(statement.tagName()) + "\\s*>")
+                    .matcher(xml);
+            closing.region(bodyStart, xml.length());
+            if (!closing.find()) {
+                break;
+            }
+            String body = xml.substring(bodyStart, closing.start());
+            String fixedBody = fixMissingUpdateSetCommas(body);
+            if (!fixedBody.equals(body)) {
+                updated.append(xml, cursor, bodyStart).append(fixedBody);
+                cursor = closing.start();
+                changed = true;
+            }
+            matcher.region(closing.end(), xml.length());
+        }
+        if (!changed) {
+            return xml;
+        }
+        updated.append(xml.substring(cursor));
+        return updated.toString();
     }
 
     private MapperMigrationResult dryRunMigration(
@@ -274,7 +369,7 @@ public class MapperAnnotationMigrator {
     private List<FileChange> removeJavaSqlAnnotations(List<AnnotationStatement> statements) throws IOException {
         Map<Path, List<AnnotationStatement>> statementsByJavaFile = new LinkedHashMap<>();
         for (AnnotationStatement statement : statements) {
-            if (statement.javaSource() != null && statement.annotationStart() >= 0 && statement.annotationEnd() > statement.annotationStart()) {
+            if (statement.javaSource() != null) {
                 statementsByJavaFile.computeIfAbsent(statement.javaSource(), ignored -> new ArrayList<>()).add(statement);
             }
         }
@@ -288,16 +383,7 @@ public class MapperAnnotationMigrator {
                 continue;
             }
             String source = Files.readString(javaFile, StandardCharsets.UTF_8);
-            String updated = source;
-            List<AnnotationStatement> ordered = entry.getValue().stream()
-                    .sorted(Comparator.comparingInt(AnnotationStatement::annotationStart).reversed())
-                    .toList();
-            for (AnnotationStatement statement : ordered) {
-                SourceRange range = annotationRemovalRange(updated, statement.annotationStart(), statement.annotationEnd());
-                if (range.valid()) {
-                    updated = updated.substring(0, range.start()) + updated.substring(range.end());
-                }
-            }
+            String updated = removeJavaSqlAnnotations(source, entry.getValue());
             if (!updated.equals(source)) {
                 Files.writeString(javaFile, updated, StandardCharsets.UTF_8);
                 fileChanges.add(FileChange.applied(
@@ -310,41 +396,47 @@ public class MapperAnnotationMigrator {
         return fileChanges;
     }
 
-    private SourceRange annotationRemovalRange(String source, int annotationStart, int annotationEnd) {
-        if (source == null
-                || annotationStart < 0
-                || annotationEnd <= annotationStart
-                || annotationStart >= source.length()) {
-            return new SourceRange(0, 0, false);
-        }
-        int start = annotationStart;
-        int lineStart = source.lastIndexOf('\n', annotationStart);
-        lineStart = lineStart < 0 ? 0 : lineStart + 1;
-        if (source.substring(lineStart, annotationStart).isBlank()) {
-            start = lineStart;
-        }
-        int end = Math.min(annotationEnd, source.length());
-        int afterHorizontalWhitespace = end;
-        while (afterHorizontalWhitespace < source.length()
-                && source.charAt(afterHorizontalWhitespace) != '\n'
-                && source.charAt(afterHorizontalWhitespace) != '\r'
-                && Character.isWhitespace(source.charAt(afterHorizontalWhitespace))) {
-            afterHorizontalWhitespace++;
-        }
-        if (afterHorizontalWhitespace < source.length()) {
-            if (source.charAt(afterHorizontalWhitespace) == '\r') {
-                afterHorizontalWhitespace++;
-                if (afterHorizontalWhitespace < source.length() && source.charAt(afterHorizontalWhitespace) == '\n') {
-                    afterHorizontalWhitespace++;
-                }
-                end = afterHorizontalWhitespace;
-            } else if (source.charAt(afterHorizontalWhitespace) == '\n') {
-                end = afterHorizontalWhitespace + 1;
+    private Set<Path> javaSources(List<AnnotationStatement> statements) {
+        Set<Path> javaSources = new LinkedHashSet<>();
+        for (AnnotationStatement statement : statements) {
+            if (statement.javaSource() != null) {
+                javaSources.add(statement.javaSource());
             }
-        } else {
-            end = afterHorizontalWhitespace;
         }
-        return new SourceRange(start, Math.min(end, source.length()), start < end);
+        return javaSources;
+    }
+
+    private String removeJavaSqlAnnotations(String source, List<AnnotationStatement> statements) {
+        Map<String, Set<String>> tagsByMethod = new LinkedHashMap<>();
+        for (AnnotationStatement statement : statements) {
+            tagsByMethod.computeIfAbsent(statement.id(), ignored -> new LinkedHashSet<>()).add(statement.tagName());
+        }
+        if (tagsByMethod.isEmpty()) {
+            return source;
+        }
+
+        CompilationUnit compilationUnit = StaticJavaParser.parse(source);
+        LexicalPreservingPrinter.setup(compilationUnit);
+        boolean changed = false;
+        for (MethodDeclaration method : compilationUnit.findAll(MethodDeclaration.class)) {
+            Set<String> tags = tagsByMethod.get(method.getNameAsString());
+            if (tags == null || tags.isEmpty()) {
+                continue;
+            }
+            List<AnnotationExpr> annotationsToRemove = method.getAnnotations().stream()
+                    .filter(annotation -> tags.contains(sqlAnnotationTag(annotation)))
+                    .toList();
+            for (AnnotationExpr annotation : annotationsToRemove) {
+                method.getAnnotations().remove(annotation);
+                changed = true;
+            }
+        }
+        if (!changed) {
+            return source;
+        }
+        String updated = LexicalPreservingPrinter.print(compilationUnit);
+        StaticJavaParser.parse(updated);
+        return updated;
     }
 
     private List<SqlChange> annotationConversions(List<SqlChange> changes, List<AnnotationStatement> statements) {
@@ -748,59 +840,151 @@ public class MapperAnnotationMigrator {
                 && !source.contains("@Delete")) {
             return List.of();
         }
-        String packageName = firstGroup(PACKAGE_PATTERN.matcher(source));
-        String simpleName = firstGroup(TYPE_PATTERN.matcher(source));
-        if (packageName.isBlank() || simpleName.isBlank()) {
+        CompilationUnit compilationUnit;
+        try {
+            compilationUnit = StaticJavaParser.parse(source);
+        } catch (Exception e) {
+            return List.of();
+        }
+        String packageName = compilationUnit.getPackageDeclaration()
+                .map(declaration -> declaration.getName().asString())
+                .orElse("");
+        if (packageName.isBlank()) {
             return List.of();
         }
         Map<String, String> imports = imports(source);
-        Path moduleRoot = moduleRoot(javaFile);
-        String namespace = packageName + "." + simpleName;
         List<AnnotationStatement> statements = new ArrayList<>();
-        Matcher matcher = SQL_ANNOTATION_PATTERN.matcher(source);
-        while (matcher.find()) {
-            String annotationName = matcher.group(1);
-            int expressionStart = skipWhitespace(source, matcher.end());
-            if (expressionStart >= source.length() || source.charAt(expressionStart) != '(') {
+        Path moduleRoot = moduleRoot(javaFile);
+        for (MethodDeclaration method : compilationUnit.findAll(MethodDeclaration.class)) {
+            ClassOrInterfaceDeclaration owner = method.findAncestor(ClassOrInterfaceDeclaration.class).orElse(null);
+            if (owner == null) {
                 continue;
             }
-            int expressionEnd = matchingParenthesis(source, expressionStart);
-            if (expressionEnd < 0) {
-                continue;
+            String simpleName = owner.getNameAsString();
+            String namespace = packageName + "." + simpleName;
+            for (AnnotationExpr annotation : method.getAnnotations()) {
+                String tagName = sqlAnnotationTag(annotation);
+                if (tagName.isBlank()) {
+                    continue;
+                }
+                String sql = annotationSql(annotation);
+                if (sql.isBlank()) {
+                    continue;
+                }
+                String resultType = "select".equals(tagName)
+                        ? resultType(method.getType(), packageName, imports)
+                        : "";
+                statements.add(new AnnotationStatement(
+                        namespace,
+                        simpleName,
+                        method.getNameAsString(),
+                        tagName,
+                        normalizeAnnotationSql(sql),
+                        resultType,
+                        moduleRoot,
+                        true,
+                        javaFile,
+                        -1,
+                        -1
+                ));
             }
-            String expression = source.substring(expressionStart + 1, expressionEnd);
-            String sql = annotationSql(expression);
-            if (sql.isBlank()) {
-                continue;
-            }
-            int methodStart = skipAnnotationsAndWhitespace(source, expressionEnd + 1);
-            int methodParen = source.indexOf('(', methodStart);
-            if (methodParen < 0) {
-                continue;
-            }
-            String signaturePrefix = source.substring(methodStart, methodParen);
-            String methodName = methodName(signaturePrefix);
-            if (methodName.isBlank()) {
-                continue;
-            }
-            String resultType = "Select".equals(annotationName)
-                    ? resultType(signaturePrefix, methodName, packageName, imports)
-                    : "";
-            statements.add(new AnnotationStatement(
-                    namespace,
-                    simpleName,
-                    methodName,
-                    tagName(annotationName),
-                    sql,
-                    resultType,
-                    moduleRoot,
-                    true,
-                    javaFile,
-                    matcher.start(),
-                    expressionEnd + 1
-            ));
         }
+        statements.sort(Comparator.comparing(AnnotationStatement::key));
         return statements;
+    }
+
+    private String sqlAnnotationTag(AnnotationExpr annotation) {
+        String name = annotation.getNameAsString();
+        int dot = name.lastIndexOf('.');
+        String simpleName = dot < 0 ? name : name.substring(dot + 1);
+        return switch (simpleName) {
+            case "Select" -> "select";
+            case "Insert" -> "insert";
+            case "Update" -> "update";
+            case "Delete" -> "delete";
+            default -> "";
+        };
+    }
+
+    private String annotationSql(AnnotationExpr annotation) {
+        if (annotation instanceof SingleMemberAnnotationExpr singleMemberAnnotation) {
+            return annotationSql(singleMemberAnnotation.getMemberValue());
+        }
+        if (annotation instanceof NormalAnnotationExpr normalAnnotation) {
+            for (MemberValuePair pair : normalAnnotation.getPairs()) {
+                if ("value".equals(pair.getNameAsString())) {
+                    return annotationSql(pair.getValue());
+                }
+            }
+        }
+        return "";
+    }
+
+    private String annotationSql(Expression expression) {
+        if (expression instanceof StringLiteralExpr stringLiteral) {
+            return stringLiteral.asString();
+        }
+        if (expression instanceof TextBlockLiteralExpr textBlockLiteral) {
+            return textBlockLiteral.asString();
+        }
+        if (expression instanceof EnclosedExpr enclosedExpr) {
+            return annotationSql(enclosedExpr.getInner());
+        }
+        if (expression instanceof BinaryExpr binaryExpr && binaryExpr.getOperator() == BinaryExpr.Operator.PLUS) {
+            String left = annotationSql(binaryExpr.getLeft());
+            String right = annotationSql(binaryExpr.getRight());
+            return left.isBlank() && right.isBlank() ? "" : left + right;
+        }
+        if (expression instanceof ArrayInitializerExpr arrayInitializer) {
+            List<String> values = new ArrayList<>();
+            for (Expression value : arrayInitializer.getValues()) {
+                String item = annotationSql(value);
+                if (item.isBlank()) {
+                    return "";
+                }
+                values.add(item);
+            }
+            return String.join(" ", values);
+        }
+        return "";
+    }
+
+    private String resultType(
+            Type declaredType,
+            String packageName,
+            Map<String, String> imports
+    ) {
+        String type = declaredType == null ? "" : declaredType.asString();
+        if (type.isBlank() || "void".equals(type)) {
+            return "";
+        }
+        String rowType = rowResultType(type);
+        if (rowType.isBlank() || isTypeVariable(rowType)) {
+            return "java.lang.Object";
+        }
+        return resolveType(rowType, packageName, imports);
+    }
+
+    private static String normalizeAnnotationSql(String sql) {
+        return fixMissingUpdateSetCommas(sql == null ? "" : sql.trim());
+    }
+
+    private static String fixMissingUpdateSetCommas(String sql) {
+        Matcher updateMatcher = UPDATE_SET_PATTERN.matcher(sql);
+        if (!updateMatcher.find()) {
+            return sql;
+        }
+        Matcher whereMatcher = WHERE_PATTERN.matcher(sql);
+        whereMatcher.region(updateMatcher.end(), sql.length());
+        if (!whereMatcher.find()) {
+            return sql;
+        }
+        String setBody = sql.substring(updateMatcher.end(), whereMatcher.start());
+        String fixedSetBody = MISSING_UPDATE_SET_COMMA_PATTERN.matcher(setBody).replaceAll("$1, ");
+        if (fixedSetBody.equals(setBody)) {
+            return sql;
+        }
+        return sql.substring(0, updateMatcher.end()) + fixedSetBody + sql.substring(whereMatcher.start());
     }
 
     private List<AnnotationStatement> scanClassFile(Path classFile) {
@@ -827,10 +1011,6 @@ public class MapperAnnotationMigrator {
         return imports;
     }
 
-    private String firstGroup(Matcher matcher) {
-        return matcher.find() ? matcher.group(1) : "";
-    }
-
     private Path moduleRoot(Path javaFile) {
         String normalized = javaFile.toAbsolutePath().normalize().toString().replace('\\', '/');
         int marker = normalized.indexOf("/src/main/java/");
@@ -838,223 +1018,6 @@ public class MapperAnnotationMigrator {
             return javaFile.toAbsolutePath().normalize().getParent();
         }
         return Paths.get(normalized.substring(0, marker));
-    }
-
-    private int skipAnnotationsAndWhitespace(String source, int index) {
-        int current = skipWhitespaceAndComments(source, index);
-        while (current < source.length() && source.charAt(current) == '@') {
-            Matcher matcher = Pattern.compile("@[A-Za-z_][A-Za-z0-9_.]*").matcher(source);
-            matcher.region(current, source.length());
-            if (!matcher.find()) {
-                return current;
-            }
-            current = skipWhitespaceAndComments(source, matcher.end());
-            if (current < source.length() && source.charAt(current) == '(') {
-                int end = matchingParenthesis(source, current);
-                if (end < 0) {
-                    return current;
-                }
-                current = end + 1;
-            }
-            current = skipWhitespaceAndComments(source, current);
-        }
-        return current;
-    }
-
-    private int skipWhitespace(String source, int index) {
-        int current = index;
-        while (current < source.length() && Character.isWhitespace(source.charAt(current))) {
-            current++;
-        }
-        return current;
-    }
-
-    private int skipWhitespaceAndComments(String source, int index) {
-        int current = skipWhitespace(source, index);
-        while (current + 1 < source.length()) {
-            if (source.charAt(current) == '/' && source.charAt(current + 1) == '/') {
-                int end = source.indexOf('\n', current + 2);
-                current = skipWhitespace(source, end < 0 ? source.length() : end + 1);
-                continue;
-            }
-            if (source.charAt(current) == '/' && source.charAt(current + 1) == '*') {
-                int end = source.indexOf("*/", current + 2);
-                current = skipWhitespace(source, end < 0 ? source.length() : end + 2);
-                continue;
-            }
-            break;
-        }
-        return current;
-    }
-
-    private int matchingParenthesis(String source, int openIndex) {
-        int depth = 0;
-        for (int i = openIndex; i < source.length(); i++) {
-            char current = source.charAt(i);
-            if (current == '"') {
-                if (i + 2 < source.length() && source.charAt(i + 1) == '"' && source.charAt(i + 2) == '"') {
-                    i = textBlockEnd(source, i + 3);
-                } else {
-                    i = stringEnd(source, i + 1);
-                }
-                continue;
-            }
-            if (current == '\'') {
-                i = charEnd(source, i + 1);
-                continue;
-            }
-            if (current == '(') {
-                depth++;
-            } else if (current == ')') {
-                depth--;
-                if (depth == 0) {
-                    return i;
-                }
-            }
-        }
-        return -1;
-    }
-
-    private int stringEnd(String source, int index) {
-        boolean escaped = false;
-        for (int i = index; i < source.length(); i++) {
-            char current = source.charAt(i);
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (current == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (current == '"') {
-                return i;
-            }
-        }
-        return source.length() - 1;
-    }
-
-    private int charEnd(String source, int index) {
-        boolean escaped = false;
-        for (int i = index; i < source.length(); i++) {
-            char current = source.charAt(i);
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (current == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (current == '\'') {
-                return i;
-            }
-        }
-        return source.length() - 1;
-    }
-
-    private int textBlockEnd(String source, int index) {
-        int end = source.indexOf("\"\"\"", index);
-        return end < 0 ? source.length() - 1 : end + 2;
-    }
-
-    private String annotationSql(String expression) {
-        StringBuilder sql = new StringBuilder();
-        int lastEnd = 0;
-        for (int i = 0; i < expression.length(); i++) {
-            if (expression.charAt(i) != '"') {
-                continue;
-            }
-            int literalStart = i;
-            String value;
-            int literalEnd;
-            if (i + 2 < expression.length()
-                    && expression.charAt(i + 1) == '"'
-                    && expression.charAt(i + 2) == '"') {
-                literalEnd = textBlockEnd(expression, i + 3);
-                value = expression.substring(i + 3, Math.max(i + 3, literalEnd - 2));
-            } else {
-                literalEnd = stringEnd(expression, i + 1);
-                value = unescapeJavaString(expression.substring(i + 1, literalEnd));
-            }
-            if (sql.length() > 0 && expression.substring(lastEnd, literalStart).contains(",")) {
-                sql.append('\n');
-            }
-            sql.append(value);
-            lastEnd = literalEnd + 1;
-            i = literalEnd;
-        }
-        return sql.toString().trim();
-    }
-
-    private String unescapeJavaString(String value) {
-        StringBuilder result = new StringBuilder();
-        boolean escaped = false;
-        for (int i = 0; i < value.length(); i++) {
-            char current = value.charAt(i);
-            if (!escaped) {
-                if (current == '\\') {
-                    escaped = true;
-                } else {
-                    result.append(current);
-                }
-                continue;
-            }
-            switch (current) {
-                case 'n' -> result.append('\n');
-                case 'r' -> result.append('\r');
-                case 't' -> result.append('\t');
-                case 'b' -> result.append('\b');
-                case 'f' -> result.append('\f');
-                case '"' -> result.append('"');
-                case '\'' -> result.append('\'');
-                case '\\' -> result.append('\\');
-                default -> result.append(current);
-            }
-            escaped = false;
-        }
-        if (escaped) {
-            result.append('\\');
-        }
-        return result.toString();
-    }
-
-    private String methodName(String signaturePrefix) {
-        Matcher matcher = METHOD_NAME_PATTERN.matcher(signaturePrefix);
-        return matcher.find() ? matcher.group(1) : "";
-    }
-
-    private String resultType(
-            String signaturePrefix,
-            String methodName,
-            String packageName,
-            Map<String, String> imports
-    ) {
-        String prefix = signaturePrefix.substring(0, signaturePrefix.length() - methodName.length()).trim();
-        String declaredType = stripMethodModifiers(prefix);
-        if (declaredType.isBlank() || "void".equals(declaredType)) {
-            return "";
-        }
-        String rowType = rowResultType(declaredType);
-        if (rowType.isBlank() || isTypeVariable(rowType)) {
-            return "java.lang.Object";
-        }
-        return resolveType(rowType, packageName, imports);
-    }
-
-    private String stripMethodModifiers(String value) {
-        String result = value.trim();
-        result = Pattern.compile("^(?:(?:public|protected|private|abstract|default|static|final|synchronized|native|strictfp)\\s+)+")
-                .matcher(result)
-                .replaceAll("");
-        while (result.startsWith("<")) {
-            int end = matchingGenericEnd(result, 0);
-            if (end < 0) {
-                break;
-            }
-            result = result.substring(end + 1).trim();
-        }
-        return result;
     }
 
     private String rowResultType(String declaredType) {
@@ -1177,10 +1140,6 @@ public class MapperAnnotationMigrator {
         };
     }
 
-    private String tagName(String annotationName) {
-        return annotationName.toLowerCase(Locale.ROOT);
-    }
-
     private static final class ClassAnnotationScanner {
         private final Path classFile;
         private final Object[] constantPool;
@@ -1298,7 +1257,7 @@ public class MapperAnnotationMigrator {
                             simpleName,
                             methodName,
                             annotation.tagName(),
-                            annotation.sql(),
+                            normalizeAnnotationSql(annotation.sql()),
                             resultType,
                             moduleRoot,
                             false,
@@ -1323,7 +1282,7 @@ public class MapperAnnotationMigrator {
                     String elementName = utf8(input.readUnsignedShort());
                     List<String> values = readElementValue(input);
                     if ("value".equals(elementName)) {
-                        sql = String.join("\n", values).trim();
+                        sql = String.join(" ", values).trim();
                     }
                 }
                 if (tagName != null && !sql.isBlank()) {
@@ -1592,6 +1551,4 @@ public class MapperAnnotationMigrator {
     private record ClassAnnotationSql(String tagName, String sql) {
     }
 
-    private record SourceRange(int start, int end, boolean valid) {
-    }
 }
