@@ -59,6 +59,11 @@ class MapperAnnotationMigratorTest {
                 .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
                 .contains("NOW()")
                 .contains("limit 1");
+        assertThat(Files.readString(tempDir.resolve("src/main/java/com/example/VoucherTaskMapper.java")))
+                .doesNotContain("@Select")
+                .doesNotContain("@Update")
+                .contains("String selectNow();")
+                .contains("int update(VoucherTask voucherTask);");
         assertThat(xml)
                 .contains("<mapper namespace=\"com.example.VoucherTaskMapper\">")
                 .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
@@ -67,7 +72,7 @@ class MapperAnnotationMigratorTest {
                 .contains("SYSDATE")
                 .contains("FETCH FIRST 1 ROWS ONLY")
                 .doesNotContain("NOW()");
-        assertThat(result.fileChanges()).hasSize(2);
+        assertThat(result.fileChanges()).hasSize(3);
         assertThat(result.automaticConversions())
                 .extracting(change -> change.statementId())
                 .contains(
@@ -193,7 +198,7 @@ class MapperAnnotationMigratorTest {
         );
 
         String xml = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"));
-        assertThat(result.fileChanges()).hasSize(2);
+        assertThat(result.fileChanges()).hasSize(3);
         assertThat(xml)
                 .containsOnlyOnce("<select id=\"listIds\"")
                 .contains("<select id=\"listIds\" resultType=\"java.lang.Long\">");

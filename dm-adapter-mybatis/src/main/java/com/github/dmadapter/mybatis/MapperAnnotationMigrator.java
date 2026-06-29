@@ -172,6 +172,13 @@ public class MapperAnnotationMigrator {
                 ));
             } catch (Exception e) {
                 warnings.add("Failed to extract MyBatis annotation SQL into " + source + ": " + e.getMessage());
+                continue;
+            }
+            try {
+                fileChanges.addAll(removeJavaSqlAnnotations(entry.getValue()));
+            } catch (Exception e) {
+                warnings.add("Failed to remove extracted MyBatis annotation SQL from Java mapper for "
+                        + source + ": " + e.getMessage());
             }
         }
         return new MapperMigrationResult(fileChanges, List.of(), List.of(), warnings);
@@ -262,6 +269,82 @@ public class MapperAnnotationMigrator {
         }
 
         return new MapperMigrationResult(fileChanges, automaticConversions, manualReviewItems, warnings);
+    }
+
+    private List<FileChange> removeJavaSqlAnnotations(List<AnnotationStatement> statements) throws IOException {
+        Map<Path, List<AnnotationStatement>> statementsByJavaFile = new LinkedHashMap<>();
+        for (AnnotationStatement statement : statements) {
+            if (statement.javaSource() != null && statement.annotationStart() >= 0 && statement.annotationEnd() > statement.annotationStart()) {
+                statementsByJavaFile.computeIfAbsent(statement.javaSource(), ignored -> new ArrayList<>()).add(statement);
+            }
+        }
+        if (statementsByJavaFile.isEmpty()) {
+            return List.of();
+        }
+        List<FileChange> fileChanges = new ArrayList<>();
+        for (Map.Entry<Path, List<AnnotationStatement>> entry : statementsByJavaFile.entrySet()) {
+            Path javaFile = entry.getKey();
+            if (!Files.isRegularFile(javaFile)) {
+                continue;
+            }
+            String source = Files.readString(javaFile, StandardCharsets.UTF_8);
+            String updated = source;
+            List<AnnotationStatement> ordered = entry.getValue().stream()
+                    .sorted(Comparator.comparingInt(AnnotationStatement::annotationStart).reversed())
+                    .toList();
+            for (AnnotationStatement statement : ordered) {
+                SourceRange range = annotationRemovalRange(updated, statement.annotationStart(), statement.annotationEnd());
+                if (range.valid()) {
+                    updated = updated.substring(0, range.start()) + updated.substring(range.end());
+                }
+            }
+            if (!updated.equals(source)) {
+                Files.writeString(javaFile, updated, StandardCharsets.UTF_8);
+                fileChanges.add(FileChange.applied(
+                        javaFile.toString(),
+                        "UPDATE",
+                        "Removed extracted MyBatis annotation SQL from Java mapper"
+                ));
+            }
+        }
+        return fileChanges;
+    }
+
+    private SourceRange annotationRemovalRange(String source, int annotationStart, int annotationEnd) {
+        if (source == null
+                || annotationStart < 0
+                || annotationEnd <= annotationStart
+                || annotationStart >= source.length()) {
+            return new SourceRange(0, 0, false);
+        }
+        int start = annotationStart;
+        int lineStart = source.lastIndexOf('\n', annotationStart);
+        lineStart = lineStart < 0 ? 0 : lineStart + 1;
+        if (source.substring(lineStart, annotationStart).isBlank()) {
+            start = lineStart;
+        }
+        int end = Math.min(annotationEnd, source.length());
+        int afterHorizontalWhitespace = end;
+        while (afterHorizontalWhitespace < source.length()
+                && source.charAt(afterHorizontalWhitespace) != '\n'
+                && source.charAt(afterHorizontalWhitespace) != '\r'
+                && Character.isWhitespace(source.charAt(afterHorizontalWhitespace))) {
+            afterHorizontalWhitespace++;
+        }
+        if (afterHorizontalWhitespace < source.length()) {
+            if (source.charAt(afterHorizontalWhitespace) == '\r') {
+                afterHorizontalWhitespace++;
+                if (afterHorizontalWhitespace < source.length() && source.charAt(afterHorizontalWhitespace) == '\n') {
+                    afterHorizontalWhitespace++;
+                }
+                end = afterHorizontalWhitespace;
+            } else if (source.charAt(afterHorizontalWhitespace) == '\n') {
+                end = afterHorizontalWhitespace + 1;
+            }
+        } else {
+            end = afterHorizontalWhitespace;
+        }
+        return new SourceRange(start, Math.min(end, source.length()), start < end);
     }
 
     private List<SqlChange> annotationConversions(List<SqlChange> changes, List<AnnotationStatement> statements) {
@@ -711,7 +794,10 @@ public class MapperAnnotationMigrator {
                     sql,
                     resultType,
                     moduleRoot,
-                    true
+                    true,
+                    javaFile,
+                    matcher.start(),
+                    expressionEnd + 1
             ));
         }
         return statements;
@@ -1215,7 +1301,10 @@ public class MapperAnnotationMigrator {
                             annotation.sql(),
                             resultType,
                             moduleRoot,
-                            false
+                            false,
+                            null,
+                            -1,
+                            -1
                     ));
                 }
             }
@@ -1487,7 +1576,10 @@ public class MapperAnnotationMigrator {
             String sql,
             String resultType,
             Path moduleRoot,
-            boolean sourceAvailable
+            boolean sourceAvailable,
+            Path javaSource,
+            int annotationStart,
+            int annotationEnd
     ) {
         private String key() {
             return namespace + "." + id;
@@ -1498,5 +1590,8 @@ public class MapperAnnotationMigrator {
     }
 
     private record ClassAnnotationSql(String tagName, String sql) {
+    }
+
+    private record SourceRange(int start, int end, boolean valid) {
     }
 }
