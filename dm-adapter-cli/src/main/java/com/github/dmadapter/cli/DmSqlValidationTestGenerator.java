@@ -571,6 +571,8 @@ class DmSqlValidationTestGenerator {
                         Math.max(1, Integer.getInteger("dm.sql.validation.connectionAttempts", 3));
                 private static final long DATABASE_CONNECTION_RETRY_DELAY_MILLIS =
                         Math.max(0L, Long.getLong("dm.sql.validation.connectionRetryDelayMillis", 2000L));
+                private static final int MAPPER_STATEMENT_TIMEOUT_SECONDS =
+                        Math.max(1, Integer.getInteger("dm.sql.validation.statementTimeoutSeconds", 30));
                 private static final Set<String> DEFAULT_COLLECTION_PARAMETER_NAMES = new LinkedHashSet<>(Arrays.asList(
                         "list",
                         "collection",
@@ -787,6 +789,8 @@ class DmSqlValidationTestGenerator {
                             new JdbcTransactionFactory(),
                             dataSource(config)
                     ));
+                    configuration.setDefaultStatementTimeout(MAPPER_STATEMENT_TIMEOUT_SECONDS);
+                    log("Mapper statement timeout: " + MAPPER_STATEMENT_TIMEOUT_SECONDS + " second(s).");
                     for (String packageName : config.typeAliasesPackages) {
                         String resolvedPackage = resolvePlaceholders(packageName);
                         log("Registering type aliases package: " + resolvedPackage);
