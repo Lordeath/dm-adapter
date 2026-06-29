@@ -153,6 +153,21 @@ class MapperJavaParamFixer {
             }
         }
         boolean needsParamImport = false;
+        if (parameters.size() == 1 && references.size() == 1) {
+            ParameterSegment parameter = parameters.get(0);
+            String reference = references.iterator().next();
+            if (parameter.paramAnnotationName().isBlank()
+                    && !parameter.variableName().isBlank()
+                    && !reference.equals(parameter.variableName())
+                    && simpleParameterType(parameter.typeText())) {
+                replacements.add(new Replacement(
+                        parameter.annotationInsertOffset(),
+                        parameter.annotationInsertOffset(),
+                        "@Param(\"" + reference + "\") "
+                ));
+                needsParamImport = true;
+            }
+        }
         if (parameters.size() > 1) {
             for (ParameterSegment parameter : parameters) {
                 if (!parameter.paramAnnotationName().isBlank()

@@ -1084,6 +1084,7 @@ class DmSqlValidationTestGenerator {
                                             id,
                                             setBranchParameterVariants(element),
                                             dynamicIdentifierMetadata(element, sqlFragments, namespace),
+                                            parameterReferences(element),
                                             generatedKeyProperties(element)
                                     ));
                                 }
@@ -1140,6 +1141,29 @@ class DmSqlValidationTestGenerator {
                             .map(String::trim)
                             .filter(value -> !isBlank(value))
                             .collect(Collectors.toCollection(LinkedHashSet::new));
+                }
+
+                private Set<String> parameterReferences(Element statement) {
+                    String text = statement == null ? "" : statement.getTextContent();
+                    Set<String> names = new LinkedHashSet<>();
+                    Matcher matcher = Pattern.compile("[#$]\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)(?:\\\\s*,[^}]*)?}")
+                            .matcher(text == null ? "" : text);
+                    while (matcher.find()) {
+                        String name = matcher.group(1);
+                        int dot = name.indexOf('.');
+                        if (dot >= 0) {
+                            name = name.substring(0, dot);
+                        }
+                        if (!isBlank(name) && !syntheticParameterName(name)) {
+                            names.add(name);
+                        }
+                    }
+                    return names;
+                }
+
+                private boolean syntheticParameterName(String name) {
+                    return setOf("_parameter", "param1", "param2", "param3", "param4", "param5",
+                            "arg0", "arg1", "arg2", "arg3", "list", "collection", "array").contains(name);
                 }
 
                 private List<SetBranchParameterVariant> setBranchParameterVariants(Element statement) {
@@ -2730,6 +2754,27 @@ class DmSqlValidationTestGenerator {
                                         + String.join(", ", missingSimpleParams)
                                         + ". Add @Param annotations in the Java mapper method instead of changing mapper XML parameter names."
                         );
+                    }
+                    if (method.getParameterCount() == 1) {
+                        Parameter parameter = method.getParameters()[0];
+                        Set<String> parameterReferences = mapperMethod.statement.parameterReferences();
+                        if (parameterReferences.size() == 1
+                                && isBlank(paramAnnotationName(parameter))
+                                && simpleMapperParameterType(method.getParameterTypes()[0])
+                                && hasUsableActualParameterName(parameter, 0)) {
+                            String reference = parameterReferences.iterator().next();
+                            String actualName = parameter.getName();
+                            if (!reference.equals(actualName)) {
+                                return ValidationRecord.skipped(
+                                        mapperMethod.key(),
+                                        "java-mapper-signature",
+                                        "Skipped business Java mapper signature issue: Java mapper method has a single simple parameter named "
+                                                + actualName + " without @Param, but mapper XML references " + reference
+                                                + ". Add @Param(\\\"" + reference
+                                                + "\\\") in the Java mapper method instead of changing mapper XML parameter names."
+                                );
+                            }
+                        }
                     }
                     return null;
                 }
@@ -10536,6 +10581,7 @@ class DmSqlValidationTestGenerator {
                     private final String id;
                     private final List<SetBranchParameterVariant> setBranchParameterVariants;
                     private final DynamicIdentifierMetadata dynamicIdentifierMetadata;
+                    private final Set<String> parameterReferences;
                     private final Set<String> generatedKeyProperties;
 
                     private MapperStatement(
@@ -10543,6 +10589,7 @@ class DmSqlValidationTestGenerator {
                             String id,
                             List<SetBranchParameterVariant> setBranchParameterVariants,
                             DynamicIdentifierMetadata dynamicIdentifierMetadata,
+                            Set<String> parameterReferences,
                             Set<String> generatedKeyProperties
                     ) {
                         this.namespace = namespace;
@@ -10553,6 +10600,9 @@ class DmSqlValidationTestGenerator {
                         this.dynamicIdentifierMetadata = dynamicIdentifierMetadata == null
                                 ? new DynamicIdentifierMetadata()
                                 : dynamicIdentifierMetadata;
+                        this.parameterReferences = copySet(parameterReferences == null
+                                ? setOf()
+                                : parameterReferences);
                         this.generatedKeyProperties = copySet(generatedKeyProperties == null
                                 ? setOf()
                                 : generatedKeyProperties);
@@ -10625,6 +10675,10 @@ class DmSqlValidationTestGenerator {
 
                     private Set<String> dynamicIdentifierNames() {
                         return dynamicIdentifierMetadata.dynamicIdentifierNames();
+                    }
+
+                    private Set<String> parameterReferences() {
+                        return parameterReferences;
                     }
 
                     private Set<String> collectionParameterNames() {
