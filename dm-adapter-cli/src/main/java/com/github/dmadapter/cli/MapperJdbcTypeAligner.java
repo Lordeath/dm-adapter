@@ -34,6 +34,9 @@ class MapperJdbcTypeAligner {
     private static final Pattern INSERT_TABLE_PATTERN = Pattern.compile(
             "(?is)(?<!<)\\binsert\\s+(?:ignore\\s+)?into\\s+(" + QUALIFIED_IDENTIFIER + ")"
     );
+    private static final Pattern FROM_JOIN_TABLE_PATTERN = Pattern.compile(
+            "(?is)\\b(?:from|join)\\s+(" + QUALIFIED_IDENTIFIER + ")(?:\\s+(?:as\\s+)?([A-Za-z_][A-Za-z0-9_$]*))?"
+    );
     private static final Pattern COLUMN_PLACEHOLDER_PATTERN = Pattern.compile(
             "(?is)(" + QUALIFIED_IDENTIFIER + ")\\s*(=|<>|!=|>=|<=|>|<)\\s*"
                     + "(#\\{\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)})"
@@ -56,6 +59,10 @@ class MapperJdbcTypeAligner {
     );
     private static final Pattern FOREACH_BLOCK_PATTERN = Pattern.compile("(?is)<foreach\\b[^>]*>([\\s\\S]*?)</foreach>");
     private static final Pattern VALUES_PATTERN = Pattern.compile("(?is)\\bvalues\\b");
+    private static final Set<String> SQL_ALIAS_STOP_WORDS = Set.of(
+            "where", "left", "right", "inner", "outer", "full", "cross", "join", "on", "group", "order",
+            "having", "union", "fetch", "limit", "offset", "connect", "start"
+    );
 
     Set<String> referencedTables(ProjectScanResult scanResult, AdapterContext context) {
         Set<String> tables = new LinkedHashSet<>();
@@ -154,6 +161,10 @@ class MapperJdbcTypeAligner {
         while (insertMatcher.find()) {
             addTable(tables, insertMatcher.group(1));
         }
+        Matcher fromJoinMatcher = FROM_JOIN_TABLE_PATTERN.matcher(text);
+        while (fromJoinMatcher.find()) {
+            addTable(tables, fromJoinMatcher.group(1));
+        }
     }
 
     private void addTable(Set<String> tables, String tableExpression) {
@@ -190,11 +201,13 @@ class MapperJdbcTypeAligner {
         String statementId = statementAttribute(statement, "id");
         String parameterType = statementAttribute(statement, "parameterType");
         Alignment current = alignUpdatePlaceholders(statement, columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
-        Alignment simpleInsert = alignSimpleInsertPlaceholders(current.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
+        Alignment comparisons = alignComparisonPlaceholders(current.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
+        Alignment simpleInsert = alignSimpleInsertPlaceholders(comparisons.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         Alignment structuredInsert = alignStructuredInsertPlaceholders(simpleInsert.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         return new Alignment(
                 structuredInsert.text(),
-                current.replacements() + simpleInsert.replacements() + structuredInsert.replacements()
+                current.replacements() + comparisons.replacements() + simpleInsert.replacements()
+                        + structuredInsert.replacements()
         );
     }
 
@@ -227,6 +240,47 @@ class MapperJdbcTypeAligner {
                 left.text(),
                 PLACEHOLDER_COLUMN_PATTERN,
                 table,
+                5,
+                1,
+                2,
+                parameterType,
+                mapperType,
+                statementId,
+                javaFieldTypes,
+                columnTypes
+        );
+        return new Alignment(right.text(), left.replacements() + right.replacements());
+    }
+
+    private Alignment alignComparisonPlaceholders(
+            String statement,
+            Map<String, Map<String, String>> columnTypes,
+            String parameterType,
+            String mapperType,
+            String statementId,
+            JavaFieldTypeMetadata javaFieldTypes
+    ) {
+        Map<String, String> statementTables = statementTables(statement);
+        if (statementTables.isEmpty()) {
+            return new Alignment(statement, 0);
+        }
+        Alignment left = alignColumnPlaceholderPattern(
+                statement,
+                COLUMN_PLACEHOLDER_PATTERN,
+                statementTables,
+                1,
+                3,
+                4,
+                parameterType,
+                mapperType,
+                statementId,
+                javaFieldTypes,
+                columnTypes
+        );
+        Alignment right = alignColumnPlaceholderPattern(
+                left.text(),
+                PLACEHOLDER_COLUMN_PATTERN,
+                statementTables,
                 5,
                 1,
                 2,
@@ -279,6 +333,123 @@ class MapperJdbcTypeAligner {
         }
         matcher.appendTail(output);
         return new Alignment(output.toString(), replacements);
+    }
+
+    private Alignment alignColumnPlaceholderPattern(
+            String text,
+            Pattern pattern,
+            Map<String, String> statementTables,
+            int columnGroup,
+            int placeholderGroup,
+            int expressionGroup,
+            String parameterType,
+            String mapperType,
+            String statementId,
+            JavaFieldTypeMetadata javaFieldTypes,
+            Map<String, Map<String, String>> columnTypes
+    ) {
+        Matcher matcher = pattern.matcher(text);
+        StringBuffer output = new StringBuffer();
+        int replacements = 0;
+        while (matcher.find()) {
+            String columnType = columnTypeForColumnExpression(matcher.group(columnGroup), statementTables, columnTypes);
+            String placeholder = matcher.group(placeholderGroup);
+            String alignedPlaceholder = alignPlaceholderJdbcType(
+                    placeholder,
+                    columnType,
+                    isStringParameterExpression(
+                            matcher.group(expressionGroup),
+                            parameterType,
+                            mapperType,
+                            statementId,
+                            text,
+                            javaFieldTypes
+                    )
+            );
+            if (!placeholder.equals(alignedPlaceholder)) {
+                replacements++;
+            }
+            String replacement = matcher.group().replace(placeholder, alignedPlaceholder);
+            matcher.appendReplacement(output, Matcher.quoteReplacement(replacement));
+        }
+        matcher.appendTail(output);
+        return new Alignment(output.toString(), replacements);
+    }
+
+    private Map<String, String> statementTables(String statement) {
+        Map<String, String> tables = new LinkedHashMap<>();
+        Matcher updateMatcher = UPDATE_TABLE_PATTERN.matcher(statement);
+        while (updateMatcher.find()) {
+            addStatementTable(tables, updateMatcher.group(1), "");
+        }
+        Matcher fromJoinMatcher = FROM_JOIN_TABLE_PATTERN.matcher(statement);
+        while (fromJoinMatcher.find()) {
+            addStatementTable(tables, fromJoinMatcher.group(1), fromJoinMatcher.group(2));
+        }
+        return tables;
+    }
+
+    private void addStatementTable(Map<String, String> tables, String tableExpression, String alias) {
+        String table = lastIdentifierPart(tableExpression);
+        if (table.isBlank()) {
+            return;
+        }
+        tables.put(normalizeIdentifier(table), table);
+        if (alias == null || alias.isBlank()) {
+            return;
+        }
+        String normalizedAlias = normalizeIdentifier(alias);
+        if (!SQL_ALIAS_STOP_WORDS.contains(normalizedAlias)) {
+            tables.put(normalizedAlias, table);
+        }
+    }
+
+    private String columnTypeForColumnExpression(
+            String columnExpression,
+            Map<String, String> statementTables,
+            Map<String, Map<String, String>> columnTypes
+    ) {
+        List<String> parts = Pattern.compile("\\s*\\.\\s*")
+                .splitAsStream(columnExpression == null ? "" : columnExpression.trim())
+                .map(this::cleanSqlIdentifier)
+                .filter(part -> !part.isBlank())
+                .toList();
+        if (parts.isEmpty()) {
+            return "";
+        }
+        String column = parts.get(parts.size() - 1);
+        if (parts.size() > 1) {
+            String qualifier = parts.get(parts.size() - 2);
+            String table = statementTables.getOrDefault(normalizeIdentifier(qualifier), qualifier);
+            String type = columnType(table, column, columnTypes);
+            if (!type.isBlank()) {
+                return type;
+            }
+        }
+        Set<String> tables = new LinkedHashSet<>(statementTables.values());
+        if (tables.size() == 1) {
+            String type = columnType(tables.iterator().next(), column, columnTypes);
+            if (!type.isBlank()) {
+                return type;
+            }
+        }
+        return uniqueColumnType(column, columnTypes);
+    }
+
+    private String uniqueColumnType(String column, Map<String, Map<String, String>> columnTypes) {
+        String found = "";
+        for (Map.Entry<String, Map<String, String>> table : columnTypes.entrySet()) {
+            String type = columnType(table.getKey(), column, columnTypes);
+            if (type.isBlank()) {
+                continue;
+            }
+            if (found.isBlank()) {
+                found = type;
+            } else if (!found.equalsIgnoreCase(type)) {
+                return "";
+            }
+        }
+        return found;
     }
 
     private Alignment alignSimpleInsertPlaceholders(

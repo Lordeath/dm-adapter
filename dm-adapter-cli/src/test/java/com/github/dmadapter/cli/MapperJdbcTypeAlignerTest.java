@@ -224,6 +224,38 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
+    void alignsSelectComparisonJdbcTypesFromDamengColumnMetadata() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/BpmMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.BpmMapper">
+                    <select id="getByAttendUserId" resultType="map">
+                        select distinct ist.* from bpm_pro_inst ist
+                        left join bpm_check_opinion cp on ist.id_ = cp.proc_inst_id_
+                        where cp.auditor_ = #{userId}
+                    </select>
+                    <select id="existByTaskId" resultType="integer">
+                        select count(1) from bpm_task_candidate where task_id_ = #{taskId}
+                    </select>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of(
+                        "bpm_check_opinion", Map.of("auditor_", "VARCHAR"),
+                        "bpm_task_candidate", Map.of("task_id_", "VARCHAR")
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/BpmMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(rewritten)
+                .contains("cp.auditor_ = #{userId,jdbcType=VARCHAR}")
+                .contains("task_id_ = #{taskId,jdbcType=VARCHAR}");
+    }
+
+    @Test
     void castsStringPojoNumericPlaceholderFromDamengColumnMetadata() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/OwnerHouseResultMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -575,11 +607,16 @@ class MapperJdbcTypeAlignerTest {
                     <update id="update">
                         update ns_core_dictionaryitem set name = #{name} where id = #{id}
                     </update>
+                    <select id="select">
+                        select area.* from ns_system_area area
+                        inner join ns_system_area_child child on child.area_id = area.id
+                        where area.id = #{id}
+                    </select>
                 </mapper>
                 """);
 
         assertThat(aligner.referencedTables(scanResult, AdapterContext.builder(tempDir).build()))
-                .containsExactlyInAnyOrder("ns_system_area", "ns_core_dictionaryitem");
+                .containsExactlyInAnyOrder("ns_system_area", "ns_core_dictionaryitem", "ns_system_area_child");
     }
 
     private ProjectScanResult writeMapperDm(String resourcesRelativePath, String content) throws Exception {

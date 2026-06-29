@@ -79,6 +79,33 @@ class MapperJavaParamFixerTest {
     }
 
     @Test
+    void addsMissingParamAnnotationForSingleSimpleParameterWithDifferentMapperXmlName() throws Exception {
+        writeMapper("OwnerHouseHouseInfoMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.OwnerHouseHouseInfoMapper">
+                    <select id="getHouseHouseInfoByIds" resultType="map">
+                        select * from owner_house_house_info where house_id in (${houseId})
+                    </select>
+                </mapper>
+                """);
+        Path javaFile = writeJava("com/example/OwnerHouseHouseInfoMapper.java", """
+                package com.example;
+
+                public interface OwnerHouseHouseInfoMapper {
+                    List<Object> getHouseHouseInfoByIds(String idList);
+                }
+                """);
+
+        MapperJavaParamFixResult result = fixer.fix(scanResult(), AdapterContext.builder(tempDir).build());
+
+        assertThat(result.warnings()).isEmpty();
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(Files.readString(javaFile))
+                .contains("import org.apache.ibatis.annotations.Param;")
+                .contains("getHouseHouseInfoByIds(@Param(\"houseId\") String idList)");
+    }
+
+    @Test
     void warnsAndSkipsUnreadableJavaSource() throws Exception {
         writeMapper("BadMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
