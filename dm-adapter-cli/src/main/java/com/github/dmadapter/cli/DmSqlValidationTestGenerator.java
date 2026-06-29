@@ -3492,7 +3492,16 @@ class DmSqlValidationTestGenerator {
                                         parameterName
                                 );
                         putParameter(map, parameterName, value);
-                        putParameter(map, effectiveParameterName, value);
+                        if (shouldPutEffectiveParameterName(
+                                mapperMethod.method,
+                                i,
+                                parameterName,
+                                effectiveParameterName,
+                                parameterTypes[i],
+                                collectionLike
+                        )) {
+                            putParameter(map, effectiveParameterName, value);
+                        }
                         putParameter(map, "arg" + i, value);
                         putParameter(map, "param" + (i + 1), value);
                         if (collectionLike) {
@@ -3506,6 +3515,27 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return map;
+                }
+
+                private boolean shouldPutEffectiveParameterName(
+                        Method method,
+                        int index,
+                        String parameterName,
+                        String effectiveParameterName,
+                        Class<?> parameterType,
+                        boolean collectionLike
+                ) {
+                    if (isBlank(effectiveParameterName) || effectiveParameterName.equals(parameterName)) {
+                        return true;
+                    }
+                    Parameter parameter = method.getParameters()[index];
+                    if (!isBlank(paramAnnotationName(parameter))) {
+                        return true;
+                    }
+                    if (collectionLike || Map.class.isAssignableFrom(parameterType)) {
+                        return true;
+                    }
+                    return hasUsableActualParameterName(parameter, index);
                 }
 
                 private void putParameter(Map<String, Object> map, String name, Object value) {
