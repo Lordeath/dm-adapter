@@ -210,8 +210,13 @@ class MapperAnnotationMigratorTest {
                 SqlRewriteConfig.empty()
         );
 
+        String sourceXml = Files.readString(tempDir.resolve("module/src/main/resources/mapper/CompiledMapper.xml"));
+        assertThat(sourceXml)
+                .contains("<mapper namespace=\"com.example.CompiledMapper\">")
+                .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
+                .contains("NOW()")
+                .contains("limit 1");
         String xml = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/CompiledMapper.xml"));
-        assertThat(Files.exists(tempDir.resolve("module/src/main/resources/mapper/CompiledMapper.xml"))).isFalse();
         assertThat(xml)
                 .contains("<mapper namespace=\"com.example.CompiledMapper\">")
                 .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
