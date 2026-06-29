@@ -106,6 +106,81 @@ class MapperJavaParamFixerTest {
     }
 
     @Test
+    void keepsExistingParamAnnotationWithValueAttribute() throws Exception {
+        writeMapper("NspaymentChargeDepositMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NspaymentChargeDepositMapper">
+                    <select id="getDepositBalance" resultType="map">
+                        select * from nspayment_charge_deposit
+                        where enterpriseId = #{enterpriseId}
+                          and orgId = #{orgId}
+                          and ownerId = #{ownerId}
+                          and precinctId = #{precinctId}
+                    </select>
+                </mapper>
+                """);
+        Path javaFile = writeJava("com/example/NspaymentChargeDepositMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Param;
+
+                public interface NspaymentChargeDepositMapper {
+                    NspaymentChargeDeposit getDepositBalance(@Param(value = "enterpriseId") Long enterpriseId,
+                                                             @Param(value = "orgId") Long orgId,
+                                                             @Param(value = "ownerId") Long ownerId,
+                                                             @Param(value = "precinctId") Long precinctId);
+                }
+                """);
+
+        MapperJavaParamFixResult result = fixer.fix(scanResult(), AdapterContext.builder(tempDir).build());
+
+        assertThat(result.warnings()).isEmpty();
+        assertThat(result.fileChanges()).isEmpty();
+        assertThat(Files.readString(javaFile))
+                .doesNotContain("@Param(\"enterpriseId\") @Param(value = \"enterpriseId\")")
+                .contains("@Param(value = \"enterpriseId\") Long enterpriseId")
+                .contains("@Param(value = \"precinctId\") Long precinctId");
+    }
+
+    @Test
+    void removesDuplicateParamAnnotationWithSameValue() throws Exception {
+        writeMapper("NspaymentChargeDepositMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NspaymentChargeDepositMapper">
+                    <select id="getDepositBalance" resultType="map">
+                        select * from nspayment_charge_deposit
+                        where enterpriseId = #{enterpriseId}
+                          and orgId = #{orgId}
+                          and ownerId = #{ownerId}
+                          and precinctId = #{precinctId}
+                    </select>
+                </mapper>
+                """);
+        Path javaFile = writeJava("com/example/NspaymentChargeDepositMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Param;
+
+                public interface NspaymentChargeDepositMapper {
+                    NspaymentChargeDeposit getDepositBalance(@Param("enterpriseId") @Param(value = "enterpriseId") Long enterpriseId,
+                                                             @Param("orgId") @Param(value = "orgId") Long orgId,
+                                                             @Param("ownerId") @Param(value = "ownerId") Long ownerId,
+                                                             @Param("precinctId") @Param(value = "precinctId") Long precinctId);
+                }
+                """);
+
+        MapperJavaParamFixResult result = fixer.fix(scanResult(), AdapterContext.builder(tempDir).build());
+
+        assertThat(result.warnings()).isEmpty();
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(Files.readString(javaFile))
+                .doesNotContain("@Param(\"enterpriseId\") @Param(value = \"enterpriseId\")")
+                .doesNotContain("@Param(\"precinctId\") @Param(value = \"precinctId\")")
+                .contains("@Param(value = \"enterpriseId\") Long enterpriseId")
+                .contains("@Param(value = \"precinctId\") Long precinctId");
+    }
+
+    @Test
     void warnsAndSkipsUnreadableJavaSource() throws Exception {
         writeMapper("BadMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>

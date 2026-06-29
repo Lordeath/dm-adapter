@@ -33,7 +33,7 @@ class MapperJavaParamFixer {
             "[#$]\\{\\s*([A-Za-z_][A-Za-z0-9_.$]*)(?:\\s*,[^}]*)?}"
     );
     private static final Pattern PARAM_ANNOTATION_PATTERN = Pattern.compile(
-            "@(?:org\\.apache\\.ibatis\\.annotations\\.)?Param\\s*\\(\\s*\"([^\"]+)\"\\s*\\)"
+            "@(?:org\\.apache\\.ibatis\\.annotations\\.)?Param\\s*\\(\\s*(?:value\\s*=\\s*)?\"([^\"]+)\"\\s*\\)"
     );
     private static final Pattern PACKAGE_PATTERN = Pattern.compile("(?m)^\\s*package\\s+[A-Za-z_][A-Za-z0-9_.]*\\s*;");
     private static final Pattern IMPORT_PATTERN = Pattern.compile("(?m)^\\s*import\\s+[^;]+;");
@@ -133,6 +133,7 @@ class MapperJavaParamFixer {
         List<Replacement> replacements = new ArrayList<>();
         Map<String, List<ParameterSegment>> byAnnotationName = new LinkedHashMap<>();
         for (ParameterSegment parameter : parameters) {
+            replacements.addAll(removeDuplicateParamAnnotations(parameter));
             if (!parameter.paramAnnotationName().isBlank()) {
                 byAnnotationName.computeIfAbsent(parameter.paramAnnotationName(), ignored -> new ArrayList<>()).add(parameter);
             }
@@ -185,6 +186,25 @@ class MapperJavaParamFixer {
             }
         }
         return new JavaMethodRewrite(replacements, needsParamImport);
+    }
+
+    private List<Replacement> removeDuplicateParamAnnotations(ParameterSegment parameter) {
+        List<ParamAnnotation> annotations = parameter.paramAnnotations();
+        if (annotations.size() < 2) {
+            return List.of();
+        }
+        Map<String, ParamAnnotation> lastByName = new LinkedHashMap<>();
+        for (ParamAnnotation annotation : annotations) {
+            lastByName.put(annotation.name(), annotation);
+        }
+        List<Replacement> replacements = new ArrayList<>();
+        Set<ParamAnnotation> annotationsToKeep = new LinkedHashSet<>(lastByName.values());
+        for (ParamAnnotation annotation : annotations) {
+            if (!annotationsToKeep.contains(annotation)) {
+                replacements.add(new Replacement(annotation.start(), annotation.end(), ""));
+            }
+        }
+        return replacements;
     }
 
     private Map<String, Map<String, Set<String>>> mapperParameterReferences(ProjectScanResult scanResult) {
@@ -328,13 +348,24 @@ class MapperJavaParamFixer {
         }
         String text = source.substring(trimmedStart, trimmedEnd);
         Matcher annotation = PARAM_ANNOTATION_PATTERN.matcher(text);
+        List<ParamAnnotation> paramAnnotations = new ArrayList<>();
+        while (annotation.find()) {
+            paramAnnotations.add(new ParamAnnotation(
+                    annotation.group(1),
+                    trimmedStart + annotation.start(),
+                    trimmedStart + annotation.end(),
+                    trimmedStart + annotation.start(1),
+                    trimmedStart + annotation.end(1)
+            ));
+        }
         String annotationName = "";
         int valueStart = -1;
         int valueEnd = -1;
-        if (annotation.find()) {
-            annotationName = annotation.group(1);
-            valueStart = trimmedStart + annotation.start(1);
-            valueEnd = trimmedStart + annotation.end(1);
+        if (!paramAnnotations.isEmpty()) {
+            ParamAnnotation firstAnnotation = paramAnnotations.get(0);
+            annotationName = firstAnnotation.name();
+            valueStart = firstAnnotation.valueStart();
+            valueEnd = firstAnnotation.valueEnd();
         }
         String withoutAnnotations = removeAnnotations(text).replace("final ", "").trim();
         Matcher variable = VARIABLE_NAME_PATTERN.matcher(withoutAnnotations);
@@ -350,7 +381,8 @@ class MapperJavaParamFixer {
                 annotationName,
                 valueStart,
                 valueEnd,
-                insertOffset
+                insertOffset,
+                paramAnnotations
         );
     }
 
@@ -498,13 +530,23 @@ class MapperJavaParamFixer {
     private record Replacement(int start, int end, String value) {
     }
 
+    private record ParamAnnotation(
+            String name,
+            int start,
+            int end,
+            int valueStart,
+            int valueEnd
+    ) {
+    }
+
     private record ParameterSegment(
             String variableName,
             String typeText,
             String paramAnnotationName,
             int annotationValueStart,
             int annotationValueEnd,
-            int annotationInsertOffset
+            int annotationInsertOffset,
+            List<ParamAnnotation> paramAnnotations
     ) {
     }
 }
