@@ -5,8 +5,10 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -18,6 +20,8 @@ import java.util.Optional;
 import java.util.Set;
 
 class DamengMetadataReader {
+    private static final int METADATA_QUERY_TIMEOUT_SECONDS = 8;
+
     Map<String, TableKeyMetadata> readTableKeys(
             DmValidationEnvironment environment,
             Optional<String> configuredSchema,
@@ -73,14 +77,13 @@ class DamengMetadataReader {
                 environment.password()
         )) {
             List<String> schemaCandidates = schemaCandidates(connection, environment, configuredSchema);
-            DatabaseMetaData databaseMetaData = connection.getMetaData();
             Map<String, Map<String, String>> metadata = new LinkedHashMap<>();
             for (String tableName : tableNames) {
                 QualifiedTable qualifiedTable = QualifiedTable.parse(tableName);
                 List<String> tableSchemas = qualifiedTable.schema().isBlank()
                         ? schemaCandidates
                         : List.of(qualifiedTable.schema());
-                Map<String, String> columns = readColumnTypes(databaseMetaData, tableSchemas, qualifiedTable.table());
+                Map<String, String> columns = readColumnTypes(connection, tableSchemas, qualifiedTable.table());
                 metadata.put(normalizeTableName(tableName), columns);
             }
             return metadata;
@@ -188,13 +191,13 @@ class DamengMetadataReader {
     }
 
     private Map<String, String> readColumnTypes(
-            DatabaseMetaData databaseMetaData,
+            Connection connection,
             List<String> schemaCandidates,
             String tableName
     ) throws SQLException {
         for (String schema : schemaCandidates.isEmpty() ? List.of("") : schemaCandidates) {
             for (String tableVariant : nameVariants(tableName)) {
-                Map<String, String> columns = readColumnTypes(databaseMetaData, blankToNull(schema), tableVariant);
+                Map<String, String> columns = readColumnTypes(connection, blankToNull(schema), tableVariant);
                 if (!columns.isEmpty()) {
                     return columns;
                 }
@@ -203,20 +206,46 @@ class DamengMetadataReader {
         return Map.of();
     }
 
-    private Map<String, String> readColumnTypes(DatabaseMetaData databaseMetaData, String schema, String tableName)
+    private Map<String, String> readColumnTypes(Connection connection, String schema, String tableName)
             throws SQLException {
         Map<String, String> columns = new LinkedHashMap<>();
-        try (ResultSet resultSet = databaseMetaData.getColumns(null, schema, tableName, "%")) {
-            while (resultSet.next()) {
-                String columnName = resultSet.getString("COLUMN_NAME");
-                String typeName = resultSet.getString("TYPE_NAME");
-                if (columnName == null || columnName.isBlank() || typeName == null || typeName.isBlank()) {
-                    continue;
+        boolean schemaQualified = schema != null && !schema.isBlank();
+        try (PreparedStatement statement = connection.prepareStatement(columnTypeQuerySql(schemaQualified))) {
+            configureQueryTimeout(statement);
+            if (schemaQualified) {
+                statement.setString(1, schema);
+                statement.setString(2, tableName);
+            } else {
+                statement.setString(1, tableName);
+            }
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    String columnName = resultSet.getString("COLUMN_NAME");
+                    String typeName = resultSet.getString("DATA_TYPE");
+                    if (columnName == null || columnName.isBlank() || typeName == null || typeName.isBlank()) {
+                        continue;
+                    }
+                    columns.putIfAbsent(normalizeIdentifier(columnName), typeName.toUpperCase(Locale.ROOT));
                 }
-                columns.putIfAbsent(normalizeIdentifier(columnName), typeName.toUpperCase(Locale.ROOT));
             }
         }
         return columns;
+    }
+
+    static String columnTypeQuerySql(boolean schemaQualified) {
+        if (schemaQualified) {
+            return "SELECT COLUMN_NAME, DATA_TYPE FROM ALL_TAB_COLUMNS "
+                    + "WHERE OWNER = ? AND TABLE_NAME = ? ORDER BY COLUMN_ID";
+        }
+        return "SELECT COLUMN_NAME, DATA_TYPE FROM USER_TAB_COLUMNS WHERE TABLE_NAME = ? ORDER BY COLUMN_ID";
+    }
+
+    private void configureQueryTimeout(Statement statement) {
+        try {
+            statement.setQueryTimeout(METADATA_QUERY_TIMEOUT_SECONDS);
+        } catch (SQLException ignored) {
+            // Metadata inference is an optimization; drivers that do not support timeouts can still query normally.
+        }
     }
 
     private Optional<TableConstraint> primaryKey(DatabaseMetaData databaseMetaData, String schema, String tableName)
