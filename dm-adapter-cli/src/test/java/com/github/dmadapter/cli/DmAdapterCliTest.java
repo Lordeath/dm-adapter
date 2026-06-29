@@ -475,6 +475,7 @@ class DmAdapterCliTest {
                 .contains("NestedCollection")
                 .contains("loadColumnMetadata")
                 .contains("DbColumnMetadata")
+                .contains("import java.sql.SQLException;")
                 .contains("referencedTableNames(mapperMethods)")
                 .contains("Loading database column metadata for ")
                 .contains("METADATA_QUERY_TIMEOUT_SECONDS")
