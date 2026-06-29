@@ -200,6 +200,44 @@ class MapperAnnotationMigratorTest {
     }
 
     @Test
+    void preservesExistingMapperLineSeparatorsWhenExtractingAnnotationSql() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/VoucherTaskMapper.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                        + "<mapper namespace=\"com.example.VoucherTaskMapper\">\n"
+                        + "    <select id=\"existing\">\n"
+                        + "        select 1\n"
+                        + "    </select>\n"
+                        + "</mapper>\n");
+        writeFile("src/main/java/com/example/VoucherTaskMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Select;
+
+                public interface VoucherTaskMapper {
+                    @Select("select NOW() from dual")
+                    String selectNow();
+                }
+                """);
+        ProjectScanResult scanResult = scanResult(List.of(new MapperXmlFile(
+                mapper.toString(),
+                tempDir.resolve("src/main/resources").toString(),
+                "mapper/VoucherTaskMapper.xml"
+        )));
+
+        new MapperAnnotationMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String xml = Files.readString(mapper);
+        assertThat(xml)
+                .doesNotContain("\r\n")
+                .contains("\n    <select id=\"selectNow\" resultType=\"java.lang.String\">\n");
+    }
+
+    @Test
     void extractsAnnotationSqlFromCompiledMapperClasses() throws Exception {
         compileClassAnnotationFixture();
 

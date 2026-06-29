@@ -308,6 +308,8 @@ public class MapperAnnotationMigrator {
             Files.writeString(target, newMapperXml(namespace), StandardCharsets.UTF_8);
         }
         String xml = Files.readString(target, StandardCharsets.UTF_8);
+        String lineSeparator = lineSeparator(xml);
+        String originalXml = xml;
         int mapperEnd = xml.lastIndexOf("</mapper>");
         if (mapperEnd < 0) {
             throw new IllegalStateException("Target mapper XML is missing </mapper>.");
@@ -319,7 +321,7 @@ public class MapperAnnotationMigrator {
                 xml = update.xml();
                 continue;
             }
-            additions.append(statementXml(statement));
+            additions.append(statementXml(statement, lineSeparator));
         }
         if (!additions.isEmpty()) {
             mapperEnd = xml.lastIndexOf("</mapper>");
@@ -328,7 +330,9 @@ public class MapperAnnotationMigrator {
             }
             xml = xml.substring(0, mapperEnd) + additions + xml.substring(mapperEnd);
         }
-        Files.writeString(target, xml, StandardCharsets.UTF_8);
+        if (!xml.equals(originalXml)) {
+            Files.writeString(target, normalizeLineSeparators(xml, lineSeparator), StandardCharsets.UTF_8);
+        }
     }
 
     private String newMapperXml(String namespace) {
@@ -341,23 +345,23 @@ public class MapperAnnotationMigrator {
                 """.formatted(namespace);
     }
 
-    private String statementXml(AnnotationStatement statement) {
+    private String statementXml(AnnotationStatement statement, String lineSeparator) {
         String sql = statement.sql().trim();
         String body;
         if (isScriptSql(sql)) {
-            body = indent(stripScript(sql), "        ");
+            body = indent(stripScript(sql), "        ", lineSeparator);
         } else {
-            body = "        <![CDATA[\n"
-                    + indent(sql, "            ")
-                    + "\n        ]]>";
+            body = "        <![CDATA[" + lineSeparator
+                    + indent(sql, "            ", lineSeparator)
+                    + lineSeparator + "        ]]>";
         }
         String resultType = "";
         if ("select".equals(statement.tagName()) && !statement.resultType().isBlank()) {
             resultType = " resultType=\"" + escapeXmlAttribute(statement.resultType()) + "\"";
         }
-        return "\n    <" + statement.tagName() + " id=\"" + escapeXmlAttribute(statement.id()) + "\"" + resultType + ">\n"
+        return lineSeparator + "    <" + statement.tagName() + " id=\"" + escapeXmlAttribute(statement.id()) + "\"" + resultType + ">" + lineSeparator
                 + body
-                + "\n    </" + statement.tagName() + ">\n";
+                + lineSeparator + "    </" + statement.tagName() + ">" + lineSeparator;
     }
 
     private boolean isScriptSql(String sql) {
@@ -371,11 +375,19 @@ public class MapperAnnotationMigrator {
         return stripped.trim();
     }
 
-    private String indent(String value, String indentation) {
+    private String indent(String value, String indentation, String lineSeparator) {
         return Pattern.compile("\\R").splitAsStream(value == null ? "" : value)
                 .map(line -> indentation + line)
-                .reduce((left, right) -> left + "\n" + right)
+                .reduce((left, right) -> left + lineSeparator + right)
                 .orElse(indentation);
+    }
+
+    private String lineSeparator(String value) {
+        return value != null && value.contains("\r\n") ? "\r\n" : "\n";
+    }
+
+    private String normalizeLineSeparators(String value, String lineSeparator) {
+        return Pattern.compile("\\R").matcher(value).replaceAll(Matcher.quoteReplacement(lineSeparator));
     }
 
     private String escapeXmlAttribute(String value) {
