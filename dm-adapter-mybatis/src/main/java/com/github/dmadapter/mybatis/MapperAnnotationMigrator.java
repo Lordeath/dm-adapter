@@ -82,8 +82,24 @@ public class MapperAnnotationMigrator {
             return new MapperMigrationResult(List.of(), List.of(), List.of(), List.of());
         }
 
+        Map<String, Path> sourceByNamespace = mapperSourceByNamespace(scanResult);
         Map<String, Path> targetByNamespace = mapperTargetByNamespace(scanResult, context);
         Set<String> sourceStatementKeys = sourceStatementKeys(scanResult);
+        Map<Path, List<AnnotationStatement>> statementsBySource = new LinkedHashMap<>();
+        Set<String> seenSourceAnnotationKeys = new LinkedHashSet<>();
+        for (AnnotationStatement statement : annotationStatements) {
+            if (!statement.sourceAvailable()
+                    || sourceStatementKeys.contains(statement.key())
+                    || !seenSourceAnnotationKeys.add(statement.key())) {
+                continue;
+            }
+            Path source = sourceByNamespace.getOrDefault(statement.namespace(), defaultSourceTarget(statement));
+            if (xmlHasStatement(source, statement.namespace(), statement.id())) {
+                continue;
+            }
+            statementsBySource.computeIfAbsent(source, ignored -> new ArrayList<>()).add(statement);
+        }
+
         Set<String> seenAnnotationKeys = new LinkedHashSet<>();
         Map<Path, List<AnnotationStatement>> statementsByTarget = new LinkedHashMap<>();
         for (AnnotationStatement statement : annotationStatements) {
@@ -99,14 +115,68 @@ public class MapperAnnotationMigrator {
             }
             statementsByTarget.computeIfAbsent(target, ignored -> new ArrayList<>()).add(statement);
         }
-        if (statementsByTarget.isEmpty()) {
+        if (statementsBySource.isEmpty() && statementsByTarget.isEmpty()) {
             return new MapperMigrationResult(List.of(), List.of(), List.of(), List.of());
         }
 
         if (context.dryRun()) {
-            return dryRunMigration(statementsByTarget, sqlConverter, rewriteConfig);
+            return combine(
+                    dryRunSourceMigration(statementsBySource),
+                    dryRunMigration(statementsByTarget, sqlConverter, rewriteConfig)
+            );
         }
-        return applyMigration(statementsByTarget, sqlConverter, rewriteConfig);
+        return combine(
+                applySourceMigration(statementsBySource),
+                applyMigration(statementsByTarget, sqlConverter, rewriteConfig)
+        );
+    }
+
+    private MapperMigrationResult combine(MapperMigrationResult left, MapperMigrationResult right) {
+        List<FileChange> fileChanges = new ArrayList<>();
+        fileChanges.addAll(left.fileChanges());
+        fileChanges.addAll(right.fileChanges());
+        List<SqlChange> automaticConversions = new ArrayList<>();
+        automaticConversions.addAll(left.automaticConversions());
+        automaticConversions.addAll(right.automaticConversions());
+        List<SqlChange> manualReviewItems = new ArrayList<>();
+        manualReviewItems.addAll(left.manualReviewItems());
+        manualReviewItems.addAll(right.manualReviewItems());
+        List<String> warnings = new ArrayList<>();
+        warnings.addAll(left.warnings());
+        warnings.addAll(right.warnings());
+        return new MapperMigrationResult(fileChanges, automaticConversions, manualReviewItems, warnings);
+    }
+
+    private MapperMigrationResult dryRunSourceMigration(Map<Path, List<AnnotationStatement>> statementsBySource) {
+        List<FileChange> fileChanges = new ArrayList<>();
+        for (Path source : statementsBySource.keySet()) {
+            fileChanges.add(FileChange.planned(
+                    source.toString(),
+                    Files.exists(source) ? "UPDATE" : "CREATE",
+                    "Extract MyBatis annotation SQL to mapper XML"
+            ));
+        }
+        return new MapperMigrationResult(fileChanges, List.of(), List.of(), List.of());
+    }
+
+    private MapperMigrationResult applySourceMigration(Map<Path, List<AnnotationStatement>> statementsBySource) {
+        List<FileChange> fileChanges = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+        for (Map.Entry<Path, List<AnnotationStatement>> entry : statementsBySource.entrySet()) {
+            Path source = entry.getKey();
+            boolean existed = Files.exists(source);
+            try {
+                writeAnnotationStatements(source, entry.getValue());
+                fileChanges.add(FileChange.applied(
+                        source.toString(),
+                        existed ? "UPDATE" : "CREATE",
+                        "Extracted MyBatis annotation SQL to mapper XML"
+                ));
+            } catch (Exception e) {
+                warnings.add("Failed to extract MyBatis annotation SQL into " + source + ": " + e.getMessage());
+            }
+        }
+        return new MapperMigrationResult(fileChanges, List.of(), List.of(), warnings);
     }
 
     private MapperMigrationResult dryRunMigration(
@@ -329,6 +399,18 @@ public class MapperAnnotationMigrator {
         return targetByNamespace;
     }
 
+    private Map<String, Path> mapperSourceByNamespace(ProjectScanResult scanResult) {
+        Map<String, Path> sourceByNamespace = new LinkedHashMap<>();
+        for (MapperXmlFile mapperXmlFile : scanResult.mapperXmlFiles()) {
+            Path source = Paths.get(mapperXmlFile.path());
+            String namespace = namespace(source);
+            if (!namespace.isBlank()) {
+                sourceByNamespace.put(namespace, source);
+            }
+        }
+        return sourceByNamespace;
+    }
+
     private Set<String> sourceStatementKeys(ProjectScanResult scanResult) {
         Set<String> keys = new LinkedHashSet<>();
         for (MapperXmlFile mapperXmlFile : scanResult.mapperXmlFiles()) {
@@ -364,6 +446,10 @@ public class MapperAnnotationMigrator {
             return moduleRoot.resolve("src/main/resources/mapper-dm/" + statement.simpleName() + ".xml");
         }
         return context.mapperTargetDir().resolve(statement.simpleName() + ".xml");
+    }
+
+    private Path defaultSourceTarget(AnnotationStatement statement) {
+        return statement.moduleRoot().resolve("src/main/resources/mapper/" + statement.simpleName() + ".xml");
     }
 
     private boolean xmlHasStatement(Path mapperXml, String namespace, String statementId) {
@@ -603,7 +689,8 @@ public class MapperAnnotationMigrator {
                     tagName(annotationName),
                     sql,
                     resultType,
-                    moduleRoot
+                    moduleRoot,
+                    true
             ));
         }
         return statements;
@@ -1106,7 +1193,8 @@ public class MapperAnnotationMigrator {
                             annotation.tagName(),
                             annotation.sql(),
                             resultType,
-                            moduleRoot
+                            moduleRoot,
+                            false
                     ));
                 }
             }
@@ -1377,7 +1465,8 @@ public class MapperAnnotationMigrator {
             String tagName,
             String sql,
             String resultType,
-            Path moduleRoot
+            Path moduleRoot,
+            boolean sourceAvailable
     ) {
         private String key() {
             return namespace + "." + id;

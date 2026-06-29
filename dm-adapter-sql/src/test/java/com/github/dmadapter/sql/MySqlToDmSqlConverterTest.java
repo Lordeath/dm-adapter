@@ -2040,6 +2040,35 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlInformationSchemaColumnsDynamicTableWithoutSchemaToAllTabColumns() {
+        SqlConversionResult result = converter.convert(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = '${taskTableName}';"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER('${taskTableName}') ORDER BY COLUMN_ID");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaColumnsDatabaseSchemaToCurrentSchema() {
+        SqlConversionResult result = converter.convert("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = '${taskTableName}' and table_schema = DATABASE()
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER('${taskTableName}') AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') ORDER BY COLUMN_ID");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
     void convertsMysqlInformationSchemaColumnsTableListQueryToAllTabColumns() {
         SqlConversionResult result = converter.convert("""
                 SELECT table_name
@@ -2109,6 +2138,22 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
                 .isEqualTo("SELECT COUNT(*) AS table_exists FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaTablesListQueryToAllTables() {
+        SqlConversionResult result = converter.convert("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = DATABASE() AND table_name LIKE '${tablePrefix}%'
+                group by table_name limit 500
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT TABLE_NAME FROM ALL_TABLES WHERE TABLE_NAME LIKE UPPER('${tablePrefix}%') AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') GROUP BY TABLE_NAME FETCH FIRST 500 ROWS ONLY");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }
