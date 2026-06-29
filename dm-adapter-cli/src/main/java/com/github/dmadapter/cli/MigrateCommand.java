@@ -28,9 +28,16 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @Command(name = "migrate", description = "Create a low-intrusion Dameng migration plan or apply it.")
 public class MigrateCommand implements Callable<Integer> {
+    private static final long DEFAULT_METADATA_READ_TIMEOUT_SECONDS = 12L;
+
     @Option(names = "--project", required = true, description = "Project root path.")
     private Path project;
 
@@ -309,10 +316,15 @@ public class MigrateCommand implements Callable<Integer> {
         }
         try {
             Optional<String> configuredSchema = configuredSchema(context);
-            Map<String, TableKeyMetadata> metadata = damengMetadataReader.readTableKeys(
-                    environment,
-                    configuredSchema,
-                    candidates.stream().map(RewriteConfigCandidate::tableName).distinct().toList()
+            Map<String, TableKeyMetadata> metadata = runWithMetadataTimeout(
+                    () -> damengMetadataReader.readTableKeys(
+                            environment,
+                            configuredSchema,
+                            candidates.stream().map(RewriteConfigCandidate::tableName).distinct().toList()
+                    ),
+                    metadataReadTimeoutSeconds(),
+                    TimeUnit.SECONDS,
+                    "Dameng metadata inference"
             );
             return new MetadataLookupResult(metadata, true, List.of());
         } catch (Exception e) {
@@ -344,10 +356,15 @@ public class MigrateCommand implements Callable<Integer> {
             return MapperJdbcTypeAlignmentResult.empty();
         }
         try {
-            Map<String, Map<String, String>> columnTypes = damengMetadataReader.readColumnTypes(
-                    environment,
-                    configuredSchema(context),
-                    tableNames
+            Map<String, Map<String, String>> columnTypes = runWithMetadataTimeout(
+                    () -> damengMetadataReader.readColumnTypes(
+                            environment,
+                            configuredSchema(context),
+                            tableNames
+                    ),
+                    metadataReadTimeoutSeconds(),
+                    TimeUnit.SECONDS,
+                    "Dameng mapper jdbcType metadata lookup"
             );
             MapperJdbcTypeAlignmentResult result = mapperJdbcTypeAligner.align(scanResult, context, columnTypes);
             if (result.fileChanges().isEmpty()) {
@@ -361,6 +378,32 @@ public class MigrateCommand implements Callable<Integer> {
                     List.of(),
                     List.of("Dameng mapper jdbcType alignment was skipped: " + redact(e.getMessage(), environment))
             );
+        }
+    }
+
+    static long metadataReadTimeoutSeconds() {
+        return Long.getLong("dm.adapter.metadataReadTimeoutSeconds", DEFAULT_METADATA_READ_TIMEOUT_SECONDS);
+    }
+
+    static <T> T runWithMetadataTimeout(
+            Callable<T> task,
+            long timeout,
+            TimeUnit unit,
+            String operation
+    ) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "dm-adapter-dameng-metadata");
+            thread.setDaemon(true);
+            return thread;
+        });
+        Future<T> future = executor.submit(task);
+        try {
+            return future.get(timeout, unit);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new IllegalStateException(operation + " timed out after " + timeout + " " + unit + ".", e);
+        } finally {
+            executor.shutdownNow();
         }
     }
 
