@@ -162,8 +162,117 @@ class MapperAnnotationMigratorTest {
                 SqlRewriteConfig.empty()
         );
 
-        assertThat(result.fileChanges()).isEmpty();
+        String javaSource = Files.readString(tempDir.resolve("src/main/java/com/example/VoucherTaskMapper.java"));
+        assertThat(javaSource)
+                .doesNotContain("@Select")
+                .contains("String selectNow();");
+        assertThat(result.fileChanges())
+                .extracting(change -> change.description())
+                .containsExactly("Removed extracted MyBatis annotation SQL from Java mapper");
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"))).isFalse();
+    }
+
+    @Test
+    void cleansVoucherTaskAnnotationSqlWhenXmlStatementsAlreadyExistAndRepairsMissingSetCommas() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/VoucherTaskMapper.xml", voucherTaskExistingXml());
+        writeFile("src/main/java/com/newsee/bill/dao/VoucherTaskMapper.java", voucherTaskMapperSource());
+        ProjectScanResult scanResult = scanResult(List.of(new MapperXmlFile(
+                mapper.toString(),
+                tempDir.resolve("src/main/resources").toString(),
+                "mapper/VoucherTaskMapper.xml"
+        )));
+
+        MapperMigrationResult result = new MapperAnnotationMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String xml = Files.readString(mapper);
+        assertThat(xml)
+                .containsOnlyOnce("id=\"insert\"")
+                .containsOnlyOnce("id=\"insertWithUpdateInfo\"")
+                .containsOnlyOnce("id=\"selectById\"")
+                .containsOnlyOnce("id=\"deleteItemRelByTaskId\"")
+                .containsOnlyOnce("id=\"deletePrecinctRelByTaskId\"")
+                .containsOnlyOnce("id=\"changeEnableFlag\"")
+                .containsOnlyOnce("id=\"deleteById\"")
+                .containsOnlyOnce("id=\"selectIncludeItemIdByTaskId\"")
+                .containsOnlyOnce("id=\"selectRelPrecinctIdByTaskId\"")
+                .containsOnlyOnce("id=\"selectByTaskName\"")
+                .containsOnlyOnce("id=\"selectRelOrganizationIdByTaskId\"")
+                .containsOnlyOnce("id=\"selectReceiptTask\"")
+                .containsOnlyOnce("id=\"sleep\"")
+                .containsOnlyOnce("id=\"realDeleteByTaskId\"")
+                .containsOnlyOnce("id=\"update\"")
+                .contains("voucherTemplateId    = #{voucherTemplateId}, accountBooK")
+                .contains("usedDateEnd    = #{usedDateEnd}, mergeFlag")
+                .contains("limit 1")
+                .contains("select SLEEP(${elapseSecond})")
+                .contains(" value (#{id}");
+
+        String javaSource = Files.readString(tempDir.resolve("src/main/java/com/newsee/bill/dao/VoucherTaskMapper.java"));
+        assertThat(javaSource)
+                .doesNotContain("@Insert")
+                .doesNotContain("@Select")
+                .doesNotContain("@Update")
+                .doesNotContain("@Delete")
+                .contains("int update(VoucherTask voucherTask);")
+                .contains("Long sleep(@Param(\"elapseSecond\") Long elapseSecond);");
+        assertThat(result.fileChanges())
+                .extracting(change -> change.description())
+                .contains(
+                        "Fixed extracted MyBatis annotation SQL in mapper XML",
+                        "Removed extracted MyBatis annotation SQL from Java mapper"
+                );
+    }
+
+    @Test
+    void javaParserExtractsArrayAndTextBlockSqlAndPreservesNonSqlAnnotations() throws Exception {
+        writeFile("src/main/java/com/example/ParserMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Select;
+                import org.apache.ibatis.annotations.Update;
+
+                public interface ParserMapper {
+                    @Deprecated
+                    @Select({"select ", "id from task"})
+                    Long selectId();
+
+                    @Update(value = \"""
+                            update task
+                            set name = #{name} owner = #{owner}
+                            where id = #{id}
+                            \""")
+                    int updateTask(Task task);
+                }
+                """);
+
+        MapperMigrationResult result = new MapperAnnotationMigrator().migrate(
+                scanResult(List.of()),
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String sourceXml = Files.readString(tempDir.resolve("src/main/resources/mapper/ParserMapper.xml"));
+        assertThat(sourceXml)
+                .contains("<select id=\"selectId\" resultType=\"java.lang.Long\">")
+                .containsPattern("select\\s+id from task")
+                .contains("<update id=\"updateTask\">")
+                .contains("name = #{name}, owner = #{owner}");
+        String javaSource = Files.readString(tempDir.resolve("src/main/java/com/example/ParserMapper.java"));
+        assertThat(javaSource)
+                .contains("@Deprecated")
+                .doesNotContain("@Select")
+                .doesNotContain("@Update")
+                .contains("Long selectId();")
+                .contains("int updateTask(Task task);");
+        assertThat(result.fileChanges())
+                .extracting(change -> change.description())
+                .contains("Removed extracted MyBatis annotation SQL from Java mapper");
     }
 
     @Test
@@ -274,6 +383,158 @@ class MapperAnnotationMigratorTest {
                         "com.example.CompiledMapper.selectNow",
                         "com.example.CompiledMapper.touch"
                 );
+        assertThat(result.fileChanges())
+                .noneSatisfy(change -> assertThat(change.path()).endsWith(".java"));
+    }
+
+    private String voucherTaskMapperSource() {
+        return """
+                package com.newsee.bill.dao;
+
+                import com.alibaba.fastjson.JSONObject;
+                import com.newsee.bill.dto.VoucherTaskRelDTO;
+                import com.newsee.bill.entity.VoucherTask;
+                import com.newsee.bill.entity.VoucherTaskItemRel;
+                import com.newsee.bill.entity.VoucherTaskPrecinctRel;
+                import org.apache.ibatis.annotations.*;
+                import org.springframework.stereotype.Repository;
+
+                import java.util.List;
+
+                @Repository
+                public interface VoucherTaskMapper {
+
+                    @Insert("insert into ns_bill_voucher_task (id, enterpriseId, organizationId, taskName, voucherType, voucherTypeDes, taskType, cron, cronDes, pushType, workTimeBegin, workTimeEnd, createUserId, createUserName, enableFlag, voucherTemplateId, accountBooK, documentTemplateId, operatorStart, operatorEnd, contrastAccountBook, houseIdJson, businessDate, voucherTypeCode, squareTypeIdJson, usedDateStart, usedDateEnd, mergeFlag) " +
+                            "value (#{id},#{enterpriseId},#{organizationId},#{taskName},#{voucherType},#{voucherTypeDes},#{taskType},#{cron},#{cronDes},#{pushType},#{workTimeBegin},#{workTimeEnd},#{createUserId},#{createUserName},#{enableFlag},#{voucherTemplateId},#{accountBooK},#{documentTemplateId},#{operatorStart},#{operatorEnd},#{contrastAccountBook},#{houseIdJson}, #{businessDate}, #{voucherTypeCode}, #{squareTypeIdJson}, #{usedDateStart}, #{usedDateEnd}, #{mergeFlag})")
+                    int insert(VoucherTask voucherTask);
+
+                    @Insert("insert into ns_bill_voucher_task (id, enterpriseId, organizationId, taskName, voucherType, voucherTypeDes, taskType, cron, cronDes, pushType, workTimeBegin, workTimeEnd, createUserId, createUserName, enableFlag, updateUserId, updateUserName, voucherTemplateId, accountBooK, documentTemplateId, operatorStart, operatorEnd, contrastAccountBook, houseIdJson, businessDate, voucherTypeCode, squareTypeIdJson, usedDateStart, usedDateEnd, mergeFlag) " +
+                            "value (#{id},#{enterpriseId},#{organizationId},#{taskName},#{voucherType},#{voucherTypeDes},#{taskType},#{cron},#{cronDes},#{pushType},#{workTimeBegin},#{workTimeEnd},#{createUserId},#{createUserName},#{enableFlag},#{updateUserId},#{updateUserName},#{voucherTemplateId},#{accountBooK},#{documentTemplateId},#{operatorStart},#{operatorEnd},#{contrastAccountBook},#{houseIdJson},#{businessDate}, #{voucherTypeCode}, #{squareTypeIdJson}, #{usedDateStart}, #{usedDateEnd}, #{mergeFlag})")
+                    int insertWithUpdateInfo(VoucherTask voucherTask);
+
+                    int insertPrecinctRel(List<VoucherTaskPrecinctRel> precinctRelList);
+
+                    int insertItemRel(List<VoucherTaskItemRel> itemRelList);
+
+                    @Select("select * from ns_bill_voucher_task where id = #{id} and deleteFlag = 0")
+                    VoucherTask selectById(@Param("id") Long id);
+
+                    @Update("update ns_bill_voucher_task " +
+                            "set taskName      = #{taskName}, " +
+                            "    voucherType   = #{voucherType}, " +
+                            "    voucherTypeDes= #{voucherTypeDes}, " +
+                            "    taskType      = #{taskType}, " +
+                            "    cron          = #{cron}, " +
+                            "    cronDes       = #{cronDes}, " +
+                            "    pushType      = #{pushType}, " +
+                            "    workTimeBegin = #{workTimeBegin}, " +
+                            "    workTimeEnd   = #{workTimeEnd}, " +
+                            "    updateUserId  = #{updateUserId}, " +
+                            "    updateUserName= #{updateUserName}, " +
+                            "    enableFlag    = #{enableFlag}, " +
+                            "    voucherTemplateId    = #{voucherTemplateId} " +
+                            "    accountBooK    = #{accountBooK} " +
+                            "    documentTemplateId    = #{documentTemplateId} " +
+                            "    operatorStart    = #{operatorStart} " +
+                            "    operatorEnd    = #{operatorEnd} " +
+                            "    contrastAccountBook    = #{contrastAccountBook} " +
+                            "    houseIdJson    = #{houseIdJson} " +
+                            "    businessDate    = #{businessDate} " +
+                            "    squareTypeIdJson    = #{squareTypeIdJson} " +
+                            "    usedDateStart    = #{usedDateStart} " +
+                            "    usedDateEnd    = #{usedDateEnd} " +
+                            "    mergeFlag    = #{mergeFlag} " +
+                            "where id = #{id}")
+                    int update(VoucherTask voucherTask);
+
+                    @Delete("delete from ns_bill_voucher_task_item_rel where taskId = #{taskId}")
+                    int deleteItemRelByTaskId(@Param("taskId") Long taskId);
+
+                    @Delete("delete from ns_bill_voucher_task_precinct_rel where taskId = #{taskId}")
+                    int deletePrecinctRelByTaskId(@Param("taskId") Long taskId);
+
+                    @Update("update ns_bill_voucher_task set enableFlag = #{enableFlag} where id = #{id}")
+                    int changeEnableFlag(VoucherTask voucherTask);
+
+                    @Update("update ns_bill_voucher_task set deleteFlag = 1,taskName = #{taskName},updateUserId = #{updateUserId},updateUserName = #{updateUserName} where id = #{id}")
+                    int deleteById(@Param("id") Long id, @Param("taskName") String taskName, @Param("updateUserId") Long updateUserId, @Param("updateUserName") String updateUserName);
+
+                    Integer countPage(JSONObject searchVo);
+                    List<VoucherTask> listPage(JSONObject searchVo);
+
+                    @Select("select itemId from ns_bill_voucher_task_item_rel where rel = 1 and deleteFlag = 0 and taskId = #{taskId}")
+                    List<Long> selectIncludeItemIdByTaskId(@Param("taskId") Long taskId);
+
+                    @Select("select precinctId from ns_bill_voucher_task_precinct_rel where deleteFlag = 0 and taskId = #{taskId}")
+                    List<Long> selectRelPrecinctIdByTaskId(@Param("taskId") Long taskId);
+
+                    @Select("select * from ns_bill_voucher_task where taskName = #{taskName} and deleteFlag = 0")
+                    VoucherTask selectByTaskName(@Param("taskName")String taskName);
+
+                    List<VoucherTaskRelDTO> selectRelByVoucherType(@Param("voucherType") Integer voucherType);
+
+                    @Select("select organizationId from ns_bill_voucher_task_precinct_rel where deleteFlag = 0 and taskId = #{taskId}")
+                    List<Long> selectRelOrganizationIdByTaskId(@Param("taskId") Long taskId);
+
+                    List<VoucherTaskRelDTO> selectImmediateByPrecinctAndVoucherType(@Param("precinctId") Long precinctId, @Param("voucherType") Integer voucherType);
+
+                    @Select("select * from ns_bill_voucher_task where enableFlag = 1 and deleteFlag = 0 and voucherType = #{voucherType} order by createDateTime desc limit 1")
+                    VoucherTask selectReceiptTask(@Param("voucherType") Integer voucherType);
+
+                    VoucherTask selectReceiptTaskByPrecinctId(@Param("precinctId") Long precinctId);
+
+                    @Select("select SLEEP(${elapseSecond})")
+                    Long sleep(@Param("elapseSecond") Long elapseSecond);
+
+                    @Delete("delete from ns_bill_voucher_task where id = #{taskId}")
+                    int realDeleteByTaskId(@Param("taskId") Long taskId);
+
+                    void updateBillVoucherBatch(@Param("precinctIds") List<Long> precinctIds,@Param("voucherTypeDes") String voucherTypeDes);
+
+                    List<VoucherTask> listTaskByPrecinctId(@Param("precinctId") Long precinctId, @Param("voucherType") Integer voucherType);
+                }
+                """;
+    }
+
+    private String voucherTaskExistingXml() {
+        return """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.newsee.bill.dao.VoucherTaskMapper">
+                    <insert id="insert">
+                        <![CDATA[
+                            insert into ns_bill_voucher_task (id) value (#{id})
+                        ]]>
+                    </insert>
+                    <insert id="insertWithUpdateInfo">
+                        <![CDATA[
+                            insert into ns_bill_voucher_task (id) value (#{id})
+                        ]]>
+                    </insert>
+                    <select id="selectById">
+                        <![CDATA[
+                            select * from ns_bill_voucher_task where id = #{id}
+                        ]]>
+                    </select>
+                    <update id="update">
+                        <![CDATA[
+                            update ns_bill_voucher_task set taskName = #{taskName}, voucherTemplateId    = #{voucherTemplateId}     accountBooK    = #{accountBooK}     usedDateEnd    = #{usedDateEnd}     mergeFlag    = #{mergeFlag} where id = #{id}
+                        ]]>
+                    </update>
+                    <delete id="deleteItemRelByTaskId"><![CDATA[delete from ns_bill_voucher_task_item_rel where taskId = #{taskId}]]></delete>
+                    <delete id="deletePrecinctRelByTaskId"><![CDATA[delete from ns_bill_voucher_task_precinct_rel where taskId = #{taskId}]]></delete>
+                    <update id="changeEnableFlag"><![CDATA[update ns_bill_voucher_task set enableFlag = #{enableFlag} where id = #{id}]]></update>
+                    <update id="deleteById"><![CDATA[update ns_bill_voucher_task set deleteFlag = 1 where id = #{id}]]></update>
+                    <select id="selectIncludeItemIdByTaskId"><![CDATA[select itemId from ns_bill_voucher_task_item_rel where taskId = #{taskId}]]></select>
+                    <select id="selectRelPrecinctIdByTaskId"><![CDATA[select precinctId from ns_bill_voucher_task_precinct_rel where taskId = #{taskId}]]></select>
+                    <select id="selectByTaskName"><![CDATA[select * from ns_bill_voucher_task where taskName = #{taskName}]]></select>
+                    <select id="selectRelOrganizationIdByTaskId"><![CDATA[select organizationId from ns_bill_voucher_task_precinct_rel where taskId = #{taskId}]]></select>
+                    <select id="selectReceiptTask"><![CDATA[select * from ns_bill_voucher_task where enableFlag = 1 and deleteFlag = 0 and voucherType = #{voucherType} order by createDateTime desc limit 1]]></select>
+                    <select id="sleep"><![CDATA[select SLEEP(${elapseSecond})]]></select>
+                    <delete id="realDeleteByTaskId"><![CDATA[delete from ns_bill_voucher_task where id = #{taskId}]]></delete>
+                </mapper>
+                """;
     }
 
     private ProjectScanResult scanResult(List<MapperXmlFile> mapperXmlFiles) {
