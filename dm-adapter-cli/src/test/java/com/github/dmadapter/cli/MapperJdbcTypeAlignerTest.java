@@ -224,7 +224,7 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
-    void alignsSelectComparisonJdbcTypesFromDamengColumnMetadata() throws Exception {
+    void alignsSelectComparisonJdbcTypesWithoutForcingJavaType() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/BpmMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <mapper namespace="com.example.BpmMapper">
@@ -251,8 +251,9 @@ class MapperJdbcTypeAlignerTest {
         String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/BpmMapper.xml"));
         assertThat(result.fileChanges()).hasSize(1);
         assertThat(rewritten)
-                .contains("cp.auditor_ = #{userId,jdbcType=VARCHAR,javaType=String}")
-                .contains("task_id_ = #{taskId,jdbcType=VARCHAR,javaType=String}");
+                .contains("cp.auditor_ = #{userId,jdbcType=VARCHAR}")
+                .contains("task_id_ = #{taskId,jdbcType=VARCHAR}")
+                .doesNotContain("javaType=String");
     }
 
     @Test
