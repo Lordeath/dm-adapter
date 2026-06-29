@@ -254,6 +254,140 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
+    void learnsTypeMismatchMethodsFromPreviousValidationReport() throws Exception {
+        Path adapterDir = tempDir.resolve(".dm-adapter");
+        Files.createDirectories(adapterDir);
+        Files.writeString(adapterDir.resolve("sql-validation-report.json"), """
+                {
+                  "records": [
+                    {
+                      "status": "FAILED",
+                      "failurePattern": "TEST_DATA_TYPE_MISMATCH",
+                      "key": "com.example.WorkCheckRecordWxMapper.batchInsert"
+                    },
+                    {
+                      "status": "FAILED",
+                      "failurePattern": "TEST_DATA_TYPE_MISMATCH",
+                      "key": "com.example.WorkCheckRecordWxMapper.generateCheckData"
+                    },
+                    {
+                      "status": "FAILED",
+                      "failurePattern": "DATABASE_CONNECTION",
+                      "key": "(database-connection)"
+                    }
+                  ]
+                }
+                """);
+        Path config = adapterDir.resolve("sql-rewrite.yml");
+        Files.writeString(config, """
+                validationIgnores:
+                  missingTables:
+                    - "legacy_table"
+                """);
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(),
+                Map.of(),
+                false
+        );
+
+        assertThat(update.warnings())
+                .contains(
+                        "Learned validationIgnores.typeMismatchMethods entry com.example.WorkCheckRecordWxMapper.batchInsert from previous Dameng SQL validation report.",
+                        "Learned validationIgnores.typeMismatchMethods entry com.example.WorkCheckRecordWxMapper.generateCheckData from previous Dameng SQL validation report."
+                );
+        assertThat(Files.readString(config))
+                .contains("validationIgnores:")
+                .contains("missingTables:")
+                .contains("- \"legacy_table\"")
+                .contains("typeMismatchMethods:")
+                .contains("- \"com.example.WorkCheckRecordWxMapper.batchInsert\"")
+                .contains("- \"com.example.WorkCheckRecordWxMapper.generateCheckData\"")
+                .doesNotContain("(database-connection)");
+    }
+
+    @Test
+    void doesNotDuplicateLearnedTypeMismatchMethods() throws Exception {
+        Path adapterDir = tempDir.resolve(".dm-adapter");
+        Files.createDirectories(adapterDir);
+        Files.writeString(adapterDir.resolve("sql-validation-report.json"), """
+                {
+                  "records": [
+                    {
+                      "status": "FAILED",
+                      "failurePattern": "TEST_DATA_TYPE_MISMATCH",
+                      "key": "com.example.WorkCheckRecordWxMapper.batchInsert"
+                    }
+                  ]
+                }
+                """);
+        Path config = adapterDir.resolve("sql-rewrite.yml");
+        Files.writeString(config, """
+                validationIgnores:
+                  typeMismatchMethods:
+                    - "com.example.WorkCheckRecordWxMapper.batchInsert"
+                  missingTables:
+                    - "legacy_table"
+                """);
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(),
+                Map.of(),
+                false
+        );
+
+        assertThat(update.warnings()).isEmpty();
+        assertThat(Files.readString(config))
+                .containsOnlyOnce("com.example.WorkCheckRecordWxMapper.batchInsert");
+    }
+
+    @Test
+    void appendsLearnedTypeMismatchMethodToInlineIgnoreList() throws Exception {
+        Path adapterDir = tempDir.resolve(".dm-adapter");
+        Files.createDirectories(adapterDir);
+        Files.writeString(adapterDir.resolve("sql-validation-report.json"), """
+                {
+                  "records": [
+                    {
+                      "status": "FAILED",
+                      "failurePattern": "TEST_DATA_TYPE_MISMATCH",
+                      "key": "com.example.WorkCheckRecordWxMapper.generateCheckData"
+                    }
+                  ]
+                }
+                """);
+        Path config = adapterDir.resolve("sql-rewrite.yml");
+        Files.writeString(config, """
+                validationIgnores:
+                  typeMismatchMethods: ["com.example.WorkCheckRecordWxMapper.batchInsert"]
+                  missingTables:
+                    - "legacy_table"
+                """);
+
+        updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(),
+                Map.of(),
+                false
+        );
+
+        assertThat(Files.readString(config))
+                .contains("typeMismatchMethods:\n")
+                .contains("- \"com.example.WorkCheckRecordWxMapper.batchInsert\"")
+                .contains("- \"com.example.WorkCheckRecordWxMapper.generateCheckData\"")
+                .contains("missingTables:")
+                .doesNotContain("typeMismatchMethods: [");
+    }
+
+    @Test
     void doesNotInferKeyColumnsWhenInsertColumnsCannotBeParsed() throws Exception {
         Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
