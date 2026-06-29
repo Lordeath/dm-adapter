@@ -84,6 +84,7 @@ public class MigrateCommand implements Callable<Integer> {
     private final SqlRewriteConfigUpdater sqlRewriteConfigUpdater = new SqlRewriteConfigUpdater();
     private final DamengMetadataReader damengMetadataReader = new DamengMetadataReader();
     private final MapperJdbcTypeAligner mapperJdbcTypeAligner = new MapperJdbcTypeAligner();
+    private final MavenCompilePreparer mavenCompilePreparer = new MavenCompilePreparer();
     private final ReportWriter reportWriter = new ReportWriter();
     private final DmSqlValidationTestGenerator validationTestGenerator = new DmSqlValidationTestGenerator();
     private final ValidationTestRunner validationTestRunner = new ValidationTestRunner();
@@ -156,6 +157,9 @@ public class MigrateCommand implements Callable<Integer> {
             );
             fileChanges.addAll(mapperMigrationResult.fileChanges());
             warnings.addAll(mapperMigrationResult.warnings());
+            if (shouldPrepareAnnotationClassScan(context)) {
+                warnings.addAll(mavenCompilePreparer.prepare(context.projectRoot(), appModule));
+            }
             MapperMigrationResult annotationMigrationResult = mapperAnnotationMigrator.migrate(
                     scanResult,
                     context,
@@ -232,6 +236,10 @@ public class MigrateCommand implements Callable<Integer> {
 
     private boolean validationTestGenerationRequested() {
         return generateValidationTest || appModule != null || config != null || (schema != null && !schema.isBlank());
+    }
+
+    private boolean shouldPrepareAnnotationClassScan(AdapterContext context) {
+        return !context.dryRun() && validationTestGenerationRequested();
     }
 
     private Path rewriteConfigPath(AdapterContext context) {
