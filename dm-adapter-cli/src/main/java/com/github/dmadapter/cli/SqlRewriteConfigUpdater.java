@@ -33,7 +33,8 @@ class SqlRewriteConfigUpdater {
     ) {
         List<String> warnings = new ArrayList<>();
         List<String> learnedIdentityInsertTables = identityInsertTablesFromPreviousValidationReport(context, warnings);
-        if (candidates.isEmpty() && learnedIdentityInsertTables.isEmpty()) {
+        List<String> learnedTypeMismatchMethods = typeMismatchMethodsFromPreviousValidationReport(context, warnings);
+        if (candidates.isEmpty() && learnedIdentityInsertTables.isEmpty() && learnedTypeMismatchMethods.isEmpty()) {
             return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), List.of());
         }
 
@@ -41,6 +42,12 @@ class SqlRewriteConfigUpdater {
         for (String table : learnedIdentityInsertTables) {
             if (model.ensureIdentityInsertTable(table)) {
                 warnings.add("Learned identityInsertTables entry " + table
+                        + " from previous Dameng SQL validation report.");
+            }
+        }
+        for (String method : learnedTypeMismatchMethods) {
+            if (model.ensureTypeMismatchMethod(method)) {
+                warnings.add("Learned validationIgnores.typeMismatchMethods entry " + method
                         + " from previous Dameng SQL validation report.");
             }
         }
@@ -228,12 +235,47 @@ class SqlRewriteConfigUpdater {
                 && (text.contains("自增列") || lower.contains("identity"));
     }
 
+    private List<String> typeMismatchMethodsFromPreviousValidationReport(
+            AdapterContext context,
+            List<String> warnings
+    ) {
+        Path report = context.projectRoot().resolve(".dm-adapter/sql-validation-report.json");
+        if (!Files.isRegularFile(report)) {
+            return List.of();
+        }
+        try {
+            JsonNode records = objectMapper.readTree(report.toFile()).path("records");
+            if (!records.isArray()) {
+                return List.of();
+            }
+            Set<String> methods = new LinkedHashSet<>();
+            for (JsonNode record : records) {
+                if (!"FAILED".equalsIgnoreCase(record.path("status").asText())) {
+                    continue;
+                }
+                if (!"TEST_DATA_TYPE_MISMATCH".equalsIgnoreCase(record.path("failurePattern").asText())) {
+                    continue;
+                }
+                String method = record.path("key").asText("").trim();
+                if (!method.isBlank() && !method.startsWith("(")) {
+                    methods.add(method);
+                }
+            }
+            return List.copyOf(methods);
+        } catch (IOException e) {
+            warnings.add("Could not inspect previous SQL validation report for typeMismatchMethods hints: "
+                    + e.getMessage());
+            return List.of();
+        }
+    }
+
     private static final class RewriteConfigModel {
         private final LinkedHashMap<String, List<String>> tableKeys = new LinkedHashMap<>();
         private final LinkedHashMap<String, List<String>> methodKeys = new LinkedHashMap<>();
         private final List<String> identityInsertLines = new ArrayList<>();
         private final LinkedHashSet<String> identityInsertTables = new LinkedHashSet<>();
         private final List<String> validationIgnoreLines = new ArrayList<>();
+        private final LinkedHashSet<String> typeMismatchMethods = new LinkedHashSet<>();
         private final List<String> validationArgsLines = new ArrayList<>();
 
         static RewriteConfigModel load(Path path) {
@@ -326,6 +368,19 @@ class SqlRewriteConfigUpdater {
             return true;
         }
 
+        boolean ensureTypeMismatchMethod(String method) {
+            if (method == null || method.isBlank()) {
+                return false;
+            }
+            String cleaned = method.trim();
+            if (typeMismatchMethods.contains(cleaned)) {
+                return false;
+            }
+            typeMismatchMethods.add(cleaned);
+            addValidationIgnoreListValue("typeMismatchMethods:", cleaned);
+            return true;
+        }
+
         String toYaml() {
             StringBuilder yaml = new StringBuilder();
             yaml.append("# dm-adapter SQL rewrite config.\n")
@@ -373,6 +428,7 @@ class SqlRewriteConfigUpdater {
             identityInsertTables.addAll(parseIdentityInsertTables(identityInsertLines));
             validationArgsLines.addAll(topLevelBlock(lines, "validationArgs:"));
             validationIgnoreLines.addAll(topLevelBlock(lines, "validationIgnores:"));
+            typeMismatchMethods.addAll(parseValidationIgnoreList(validationIgnoreLines, "typeMismatchMethods:"));
             String section = "";
             String currentName = "";
             for (String line : lines) {
@@ -430,6 +486,52 @@ class SqlRewriteConfigUpdater {
             identityInsertTables.forEach(table -> identityInsertLines.add("  - " + quoteValue(table)));
         }
 
+        private void addValidationIgnoreListValue(String header, String value) {
+            if (validationIgnoreLines.isEmpty()) {
+                validationIgnoreLines.add("validationIgnores:");
+            }
+            int headerIndex = validationIgnoreSectionIndex(header);
+            if (headerIndex < 0) {
+                validationIgnoreLines.add("  " + header);
+                validationIgnoreLines.add("    - " + quoteValue(value));
+                return;
+            }
+            String headerLine = validationIgnoreLines.get(headerIndex);
+            String withoutComment = stripComment(headerLine);
+            String inlineValues = withoutComment.trim().substring(header.length()).trim();
+            int insertIndex = headerIndex + 1;
+            if (!inlineValues.isBlank()) {
+                int headerIndent = leadingSpaces(withoutComment);
+                validationIgnoreLines.set(headerIndex, " ".repeat(headerIndent) + header);
+                for (String existing : parseInlineList(inlineValues)) {
+                    validationIgnoreLines.add(insertIndex, "    - " + quoteValue(existing));
+                    insertIndex++;
+                }
+            }
+            while (insertIndex < validationIgnoreLines.size()) {
+                String currentWithoutComment = stripComment(validationIgnoreLines.get(insertIndex));
+                String trimmed = currentWithoutComment.trim();
+                int indent = leadingSpaces(currentWithoutComment);
+                if (!trimmed.isBlank() && indent <= 2) {
+                    break;
+                }
+                insertIndex++;
+            }
+            validationIgnoreLines.add(insertIndex, "    - " + quoteValue(value));
+        }
+
+        private int validationIgnoreSectionIndex(String header) {
+            for (int i = 0; i < validationIgnoreLines.size(); i++) {
+                String withoutComment = stripComment(validationIgnoreLines.get(i));
+                String trimmed = withoutComment.trim();
+                int indent = leadingSpaces(withoutComment);
+                if (indent == 2 && trimmed.startsWith(header)) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
         private static List<String> parseIdentityInsertTables(List<String> lines) {
             List<String> tables = new ArrayList<>();
             for (String line : lines) {
@@ -448,6 +550,35 @@ class SqlRewriteConfigUpdater {
                 }
             }
             return tables;
+        }
+
+        private static List<String> parseValidationIgnoreList(List<String> lines, String header) {
+            List<String> values = new ArrayList<>();
+            boolean capturing = false;
+            for (String line : lines) {
+                String withoutComment = stripComment(line);
+                String trimmed = withoutComment.trim();
+                int indent = leadingSpaces(withoutComment);
+                if (indent == 2 && trimmed.startsWith(header)) {
+                    capturing = true;
+                    values.addAll(parseInlineList(trimmed.substring(header.length())));
+                    continue;
+                }
+                if (!capturing) {
+                    continue;
+                }
+                if (!trimmed.isBlank() && indent <= 2) {
+                    capturing = false;
+                    continue;
+                }
+                if (indent >= 4 && trimmed.startsWith("- ")) {
+                    String value = unquote(trimmed.substring(2).trim());
+                    if (!value.isBlank()) {
+                        values.add(value);
+                    }
+                }
+            }
+            return values;
         }
 
         private static List<String> topLevelBlock(List<String> lines, String header) {
