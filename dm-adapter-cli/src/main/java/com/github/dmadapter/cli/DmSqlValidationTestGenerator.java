@@ -738,6 +738,7 @@ class DmSqlValidationTestGenerator {
                                         record = skipGeneratedDynamicSqlOrArgs(record);
                                         record = skipExistingDdlObject(record);
                                         record = skipValidationTestDataIssue(record);
+                                        record = skipIgnoredTypeMismatchMethod(record, config);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         record = skipIgnoredMissingSchema(record, config);
@@ -3307,6 +3308,24 @@ class DmSqlValidationTestGenerator {
                             "违反引用约束",
                             "唯一性约束",
                             "TooManyResultsException");
+                }
+
+                private ValidationRecord skipIgnoredTypeMismatchMethod(ValidationRecord record, ValidationConfig config) {
+                    if (record == null
+                            || !"FAILED".equals(record.status)
+                            || config == null
+                            || !config.ignoresTypeMismatchMethod(record.key)
+                            || !"TEST_DATA_TYPE_MISMATCH".equals(failurePattern(record))) {
+                        return record;
+                    }
+                    return ValidationRecord.skipped(
+                            record.key,
+                            "ignored-type-mismatch-method",
+                            record.parameterSummary,
+                            "Ignored test data/schema type mismatch for method [" + record.key
+                                    + "] by .dm-adapter/sql-rewrite.yml validationIgnores.typeMismatchMethods.\\n"
+                                    + "Original failure:\\n" + record.message
+                    );
                 }
 
                 private ValidationRecord skipUnsupportedReturnType(MapperMethod mapperMethod) {
@@ -9857,6 +9876,7 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> ignoredMissingColumns = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
                     private final Set<String> ignoredNotNullColumns = new LinkedHashSet<>();
+                    private final Set<String> ignoredTypeMismatchMethods = new LinkedHashSet<>();
 
                     static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
@@ -10035,6 +10055,13 @@ class DmSqlValidationTestGenerator {
                                 addIgnoredNotNullColumns(parseYamlValue(trimmed.substring("notNullColumns:".length())));
                                 continue;
                             }
+                            if (isValidationIgnoreSection(section) && indent == 2 && trimmed.startsWith("typeMismatchMethods:")) {
+                                section = "validationTypeMismatchMethods";
+                                currentMethod = null;
+                                valueMode = "";
+                                addIgnoredTypeMismatchMethods(parseYamlValue(trimmed.substring("typeMismatchMethods:".length())));
+                                continue;
+                            }
                             if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredMissingTables(parseYamlValue(trimmed.substring(2)));
                                 continue;
@@ -10049,6 +10076,10 @@ class DmSqlValidationTestGenerator {
                             }
                             if ("validationNotNullColumns".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredNotNullColumns(parseYamlValue(trimmed.substring(2)));
+                                continue;
+                            }
+                            if ("validationTypeMismatchMethods".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
+                                addIgnoredTypeMismatchMethods(parseYamlValue(trimmed.substring(2)));
                                 continue;
                             }
                             if ("validationMethods".equals(section) && indent == 4 && trimmed.endsWith(":")) {
@@ -10089,7 +10120,8 @@ class DmSqlValidationTestGenerator {
                                 || "validationMissingTables".equals(section)
                                 || "validationMissingColumns".equals(section)
                                 || "validationMissingSchemas".equals(section)
-                                || "validationNotNullColumns".equals(section);
+                                || "validationNotNullColumns".equals(section)
+                                || "validationTypeMismatchMethods".equals(section);
                     }
 
                     private void addIgnoredMissingTables(Object value) {
@@ -10219,6 +10251,34 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         return false;
+                    }
+
+                    private void addIgnoredTypeMismatchMethods(Object value) {
+                        if (value instanceof Collection<?>) {
+                            for (Object item : (Collection<?>) value) {
+                                addIgnoredTypeMismatchMethod(String.valueOf(item));
+                            }
+                        } else if (value != null) {
+                            addIgnoredTypeMismatchMethod(String.valueOf(value));
+                        }
+                    }
+
+                    private void addIgnoredTypeMismatchMethod(String methodKey) {
+                        String normalized = methodKey == null ? "" : scalar(methodKey).trim();
+                        if (!isBlank(normalized)) {
+                            ignoredTypeMismatchMethods.add(normalized);
+                        }
+                    }
+
+                    boolean ignoresTypeMismatchMethod(String methodKey) {
+                        if (isBlank(methodKey)) {
+                            return false;
+                        }
+                        if (ignoredTypeMismatchMethods.contains(methodKey)) {
+                            return true;
+                        }
+                        int lastDot = methodKey.lastIndexOf('.');
+                        return lastDot > 0 && ignoredTypeMismatchMethods.contains(methodKey.substring(0, lastDot) + ".*");
                     }
 
                     private String normalizeMissingTableName(String table) {
