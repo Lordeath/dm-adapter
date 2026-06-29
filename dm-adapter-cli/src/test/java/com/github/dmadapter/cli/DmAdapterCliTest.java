@@ -599,6 +599,7 @@ class DmAdapterCliTest {
                 .contains("Java mapper method has multiple simple parameters without @Param")
                 .contains("Java mapper signature has duplicate @Param")
                 .contains("Java mapper method has a single simple parameter named")
+                .contains("Java mapper method has a single simple parameter without @Param")
                 .contains("parameterName")
                 .contains("defaultString")
                 .contains("private static void writeString(Path path, String content, Charset charset)")

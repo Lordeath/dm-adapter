@@ -49,6 +49,7 @@ class MapperJdbcTypeAligner {
             "#\\{\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)}"
     );
     private static final Pattern JDBC_TYPE_PATTERN = Pattern.compile("(?i)(jdbcType\\s*=\\s*)([A-Za-z0-9_]+)");
+    private static final Pattern JAVA_TYPE_PATTERN = Pattern.compile("(?i)javaType\\s*=");
     private static final Pattern MAPPER_NAMESPACE_PATTERN = Pattern.compile(
             "(?is)<mapper\\b[^>]*\\bnamespace\\s*=\\s*([\"'])(.*?)\\1"
     );
@@ -323,7 +324,8 @@ class MapperJdbcTypeAligner {
                             statementId,
                             text,
                             javaFieldTypes
-                    )
+                    ),
+                    false
             );
             if (!placeholder.equals(alignedPlaceholder)) {
                 replacements++;
@@ -354,17 +356,19 @@ class MapperJdbcTypeAligner {
         while (matcher.find()) {
             String columnType = columnTypeForColumnExpression(matcher.group(columnGroup), statementTables, columnTypes);
             String placeholder = matcher.group(placeholderGroup);
+            String expression = matcher.group(expressionGroup);
             String alignedPlaceholder = alignPlaceholderJdbcType(
                     placeholder,
                     columnType,
                     isStringParameterExpression(
-                            matcher.group(expressionGroup),
+                            expression,
                             parameterType,
                             mapperType,
                             statementId,
                             text,
                             javaFieldTypes
-                    )
+                    ),
+                    isTopLevelSimpleParameterExpression(expression)
             );
             if (!placeholder.equals(alignedPlaceholder)) {
                 replacements++;
@@ -589,7 +593,8 @@ class MapperJdbcTypeAligner {
             String alignedPlaceholder = alignPlaceholderJdbcType(
                     placeholder,
                     columnType,
-                    isStringParameterExpression(expression, parameterType, mapperType, statementId, text, javaFieldTypes)
+                    isStringParameterExpression(expression, parameterType, mapperType, statementId, text, javaFieldTypes),
+                    false
             );
             if (!placeholder.equals(alignedPlaceholder)) {
                 replacements++;
@@ -600,7 +605,12 @@ class MapperJdbcTypeAligner {
         return new Alignment(output.toString(), replacements);
     }
 
-    private String alignPlaceholderJdbcType(String placeholder, String columnType, boolean stringParameter) {
+    private String alignPlaceholderJdbcType(
+            String placeholder,
+            String columnType,
+            boolean stringParameter,
+            boolean topLevelSimpleParameter
+    ) {
         String targetJdbcType = jdbcTypeForColumnType(columnType);
         if (targetJdbcType.isBlank()) {
             return placeholder;
@@ -608,7 +618,19 @@ class MapperJdbcTypeAligner {
         if (stringParameter && (isNumericColumnType(columnType) || isTemporalColumnType(columnType))) {
             return "CAST(" + replaceOrAddJdbcType(placeholder, "VARCHAR") + " AS " + targetJdbcType + ")";
         }
-        return replaceOrAddJdbcType(placeholder, targetJdbcType);
+        String aligned = replaceOrAddJdbcType(placeholder, targetJdbcType);
+        if (topLevelSimpleParameter && "VARCHAR".equalsIgnoreCase(targetJdbcType)) {
+            aligned = addJavaTypeIfAbsent(aligned, "String");
+        }
+        return aligned;
+    }
+
+    private boolean isTopLevelSimpleParameterExpression(String expression) {
+        if (expression == null) {
+            return false;
+        }
+        String trimmed = expression.trim();
+        return !trimmed.isBlank() && !trimmed.contains(".");
     }
 
     private String replaceOrAddJdbcType(String placeholder, String targetJdbcType) {
@@ -637,6 +659,17 @@ class MapperJdbcTypeAligner {
         return placeholder.substring(0, matcher.start(2))
                 + targetJdbcType
                 + placeholder.substring(matcher.end(2));
+    }
+
+    private String addJavaTypeIfAbsent(String placeholder, String targetJavaType) {
+        if (JAVA_TYPE_PATTERN.matcher(placeholder).find()) {
+            return placeholder;
+        }
+        int close = placeholder.lastIndexOf('}');
+        if (close < 0) {
+            return placeholder;
+        }
+        return placeholder.substring(0, close) + ",javaType=" + targetJavaType + placeholder.substring(close);
     }
 
     private boolean isStringParameterExpression(
