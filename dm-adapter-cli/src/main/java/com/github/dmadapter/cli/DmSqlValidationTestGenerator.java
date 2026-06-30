@@ -4754,6 +4754,7 @@ class DmSqlValidationTestGenerator {
                     String defaultText = ((String) defaultValue).trim();
                     return isGeneratedPlaceholderText(defaultText)
                             && !isNumericTextParameterName(normalized)
+                            && !isNumericSqlFragmentName(normalized)
                             && !isCompactEnumStringName(normalized)
                             && !isDateLikeParameterName(normalized);
                 }
@@ -6475,6 +6476,7 @@ class DmSqlValidationTestGenerator {
                             || normalizedName.endsWith("statuslist")
                             || normalizedName.endsWith("flag")
                             || normalizedName.endsWith("flaglist")
+                            || normalizedName.endsWith("balance")
                             || normalizedName.endsWith("count")
                             || normalizedName.endsWith("countlist");
                 }
