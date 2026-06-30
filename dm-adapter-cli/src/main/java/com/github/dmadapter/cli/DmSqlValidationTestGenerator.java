@@ -4439,13 +4439,13 @@ class DmSqlValidationTestGenerator {
                     if (!isBlank(resolvedCollectionName)) {
                         collectionName = resolvedCollectionName;
                     }
-                    Object scalarDefault = statement.collectionScalarDefault(collectionName);
-                    if (scalarDefault != null) {
-                        return scalarDefault;
-                    }
                     String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
                     if (!isBlank(columnType)) {
                         return defaultCollectionElementForColumnType(collectionName, columnType);
+                    }
+                    Object scalarDefault = statement.collectionScalarDefault(collectionName);
+                    if (scalarDefault != null) {
+                        return scalarDefault;
                     }
                     Object sqlFragmentDefault = statement.collectionSqlFragmentDefault(collectionName);
                     if (sqlFragmentDefault != null) {
@@ -4466,6 +4466,12 @@ class DmSqlValidationTestGenerator {
                     );
                     if (strippedConfigured != MethodArgumentConfig.MISSING) {
                         configuredValue = strippedConfigured;
+                    }
+                    if (statement != null && statement.scalarCollectionParameter(collectionName)) {
+                        String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
+                        if (configuredValue instanceof Number && isCharacterColumnType(columnType)) {
+                            return String.valueOf(configuredValue);
+                        }
                     }
                     if (!isGeneratedPlaceholderValue(collectionName, configuredValue)) {
                         return configuredValue;
@@ -5212,13 +5218,6 @@ class DmSqlValidationTestGenerator {
                             }
                             return ValueResult.resolved(new ArrayList<>());
                         }
-                        Object scalarDefault = collectionScalarDefault;
-                        if (scalarDefault != null) {
-                            if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(listOf(scalarDefault)));
-                            }
-                            return ValueResult.resolved(new ArrayList<>(listOf(scalarDefault)));
-                        }
                         String columnType = statement == null
                                 ? ""
                                 : statement.collectionColumnType(valueName, dbColumnMetadata);
@@ -5228,6 +5227,13 @@ class DmSqlValidationTestGenerator {
                                 return ValueResult.resolved(new LinkedHashSet<>(listOf(elementValue)));
                             }
                             return ValueResult.resolved(new ArrayList<>(listOf(elementValue)));
+                        }
+                        Object scalarDefault = collectionScalarDefault;
+                        if (scalarDefault != null) {
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(scalarDefault)));
+                            }
+                            return ValueResult.resolved(new ArrayList<>(listOf(scalarDefault)));
                         }
                         Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);
                         if (sqlFragmentDefault != null) {
@@ -5891,15 +5897,15 @@ class DmSqlValidationTestGenerator {
                             && (statement == null || !statement.nonEmptyCollectionParameter(collectionName))) {
                         return new ArrayList<>();
                     }
-                    Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
-                    if (scalarDefault != null) {
-                        return new ArrayList<>(listOf(scalarDefault));
-                    }
                     String columnType = statement == null
                             ? ""
                             : statement.collectionColumnType(collectionName, dbColumnMetadata);
                     if (!isBlank(columnType)) {
                         return new ArrayList<>(listOf(defaultCollectionElementForColumnType(collectionName, columnType)));
+                    }
+                    Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
+                    if (scalarDefault != null) {
+                        return new ArrayList<>(listOf(scalarDefault));
                     }
                     Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(collectionName);
                     if (sqlFragmentDefault != null) {
@@ -5993,15 +5999,15 @@ class DmSqlValidationTestGenerator {
                     if (!collectionElementDefault.isEmpty()) {
                         value = new LinkedHashMap<>(collectionElementDefault);
                     } else {
-                        Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
-                        if (scalarDefault != null) {
-                            value = scalarDefault;
+                        String columnType = statement == null
+                            ? ""
+                            : statement.collectionColumnType(collectionName, dbColumnMetadata);
+                        if (!isBlank(columnType)) {
+                            value = defaultSqlFragmentForColumnType(collectionName, columnType);
                         } else {
-                            String columnType = statement == null
-                                ? ""
-                                : statement.collectionColumnType(collectionName, dbColumnMetadata);
-                            if (!isBlank(columnType)) {
-                                value = defaultSqlFragmentForColumnType(collectionName, columnType);
+                            Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
+                            if (scalarDefault != null) {
+                                value = scalarDefault;
                             } else {
                                 Object sqlFragmentDefault = statement == null
                                         ? null

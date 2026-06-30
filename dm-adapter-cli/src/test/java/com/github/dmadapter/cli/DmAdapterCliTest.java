@@ -1000,6 +1000,8 @@ class DmAdapterCliTest {
                 .contains("if (references == null && scalarCollectionParameter(collectionName))")
                 .contains("return scalarConfiguredCollectionDefault(collectionName, statement)")
                 .contains("statement.collectionScalarDefault(collectionName)")
+                .contains("configuredValue instanceof Number && isCharacterColumnType(columnType)")
+                .contains("return String.valueOf(configuredValue);")
                 .contains("stripConfiguredScalarCollectionLiteral(")
                 .contains("configuredValue = strippedConfigured;")
                 .contains("dynamicPlaceholderInsideSqlLiteral(text, startIndex, endIndex)")
@@ -1101,26 +1103,60 @@ class DmAdapterCliTest {
                 .contains("valueByMetadataName(collectionScalarDefaults, valueName)")
                 .contains("normalized.contains(\"month\")")
                 .contains("return \"202401\";");
-        int scalarDefaultIndex = generatedTestSource.indexOf("Object scalarDefault = collectionScalarDefault;");
-        int sqlFragmentDefaultIndex = generatedTestSource.indexOf(
-                "Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);"
-        );
+        int collectionBranchIndex = generatedTestSource.indexOf("if (Collection.class.isAssignableFrom(targetType)) {");
         int collectionColumnDefaultIndex = generatedTestSource.indexOf(
                 "String columnType = statement == null",
+                collectionBranchIndex
+        );
+        int scalarDefaultIndex = generatedTestSource.indexOf(
+                "Object scalarDefault = collectionScalarDefault;",
+                collectionColumnDefaultIndex
+        );
+        int sqlFragmentDefaultIndex = generatedTestSource.indexOf(
+                "Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);",
                 scalarDefaultIndex
         );
-        int mapCollectionScalarDefaultIndex = generatedTestSource.indexOf(
-                "Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);"
+        int defaultCollectionParameterIndex = generatedTestSource.indexOf("private Object defaultCollectionParameter(");
+        int defaultCollectionColumnDefaultIndex = generatedTestSource.indexOf(
+                "String columnType = statement == null",
+                defaultCollectionParameterIndex
         );
+        int defaultCollectionScalarDefaultIndex = generatedTestSource.indexOf(
+                "Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);",
+                defaultCollectionColumnDefaultIndex
+        );
+        int scalarConfiguredDefaultIndex = generatedTestSource.indexOf("private Object scalarConfiguredCollectionDefault(");
+        int scalarConfiguredColumnDefaultIndex = generatedTestSource.indexOf(
+                "String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);",
+                scalarConfiguredDefaultIndex
+        );
+        int scalarConfiguredScalarDefaultIndex = generatedTestSource.indexOf(
+                "Object scalarDefault = statement.collectionScalarDefault(collectionName);",
+                scalarConfiguredColumnDefaultIndex
+        );
+        int mapCollectionParameterIndex = generatedTestSource.indexOf("private Object defaultMapCollectionParameter(");
         int mapCollectionColumnDefaultIndex = generatedTestSource.indexOf(
                 "String columnType = statement == null",
-                mapCollectionScalarDefaultIndex
+                mapCollectionParameterIndex
         );
+        int mapCollectionScalarDefaultIndex = generatedTestSource.indexOf(
+                "Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);",
+                mapCollectionColumnDefaultIndex
+        );
+        assertThat(collectionBranchIndex).isGreaterThanOrEqualTo(0);
+        assertThat(collectionColumnDefaultIndex).isGreaterThan(collectionBranchIndex);
         assertThat(scalarDefaultIndex).isGreaterThanOrEqualTo(0);
-        assertThat(collectionColumnDefaultIndex).isGreaterThan(scalarDefaultIndex);
         assertThat(sqlFragmentDefaultIndex).isGreaterThan(scalarDefaultIndex);
+        assertThat(defaultCollectionParameterIndex).isGreaterThanOrEqualTo(0);
+        assertThat(defaultCollectionColumnDefaultIndex).isGreaterThan(defaultCollectionParameterIndex);
+        assertThat(defaultCollectionScalarDefaultIndex).isGreaterThan(defaultCollectionColumnDefaultIndex);
+        assertThat(scalarConfiguredDefaultIndex).isGreaterThanOrEqualTo(0);
+        assertThat(scalarConfiguredColumnDefaultIndex).isGreaterThan(scalarConfiguredDefaultIndex);
+        assertThat(scalarConfiguredScalarDefaultIndex).isGreaterThan(scalarConfiguredColumnDefaultIndex);
+        assertThat(mapCollectionParameterIndex).isGreaterThanOrEqualTo(0);
+        assertThat(mapCollectionColumnDefaultIndex).isGreaterThan(mapCollectionParameterIndex);
         assertThat(mapCollectionScalarDefaultIndex).isGreaterThanOrEqualTo(0);
-        assertThat(mapCollectionColumnDefaultIndex).isGreaterThan(mapCollectionScalarDefaultIndex);
+        assertThat(mapCollectionScalarDefaultIndex).isGreaterThan(mapCollectionColumnDefaultIndex);
     }
 
     @Test
