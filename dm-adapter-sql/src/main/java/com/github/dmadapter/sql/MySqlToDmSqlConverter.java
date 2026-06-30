@@ -5147,6 +5147,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = appendUntilLineEnd(sql, index, converted);
             } else if (startsBlockComment(sql, index)) {
                 index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                if (!identifier.closed()) {
+                    converted.append(sql, index, sql.length());
+                    index = sql.length();
+                } else {
+                    converted.append(sql, index, identifier.nextIndex());
+                    index = identifier.nextIndex();
+                }
             } else if (isIdentifierStart(current)) {
                 int end = index + 1;
                 while (end < sql.length() && isIdentifierPart(sql.charAt(end))) {

@@ -1371,6 +1371,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void leavesBacktickKeywordIdentifiersInsideGroupConcatNative() {
+        SqlConversionResult result = converter.convert(
+                "select GROUP_CONCAT(IF(`percent` IS NULL, '', `percent`) ORDER BY id SEPARATOR ';') from ns_equip_maintain_task_support"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("select LISTAGG(IF(`percent` IS NULL, '', `percent`), ';') WITHIN GROUP (ORDER BY id) from ns_equip_maintain_task_support");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
     void leavesBackticksInsideStringsCommentsAndIdentifiersNative() {
         SqlConversionResult result = converter.convert("""
                 select '`order`' as raw, `status` -- `comment`
