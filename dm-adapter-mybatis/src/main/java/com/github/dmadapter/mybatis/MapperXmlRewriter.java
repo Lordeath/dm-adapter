@@ -822,6 +822,10 @@ public class MapperXmlRewriter {
                 && !containsMysqlUserVariable(rewrittenBody)) {
             manualReviewReasons.removeIf(this::isMysqlUserVariableManualReviewReason);
         }
+        if (appliedRules.contains(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE)
+                && !containsMysqlMetadataSql(rewrittenBody)) {
+            manualReviewReasons.removeIf(this::isMysqlMetadataManualReviewReason);
+        }
         return new DynamicBodyConversion(
                 rawBody,
                 changed ? rewrittenBody : rawBody,
@@ -875,6 +879,12 @@ public class MapperXmlRewriter {
         if (keywordAliasReferences.changed()) {
             converted = keywordAliasReferences.text();
             appliedRules.add(MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE);
+        }
+
+        TextRewrite informationSchemaColumns = convertDynamicInformationSchemaColumns(converted);
+        if (informationSchemaColumns.changed()) {
+            converted = informationSchemaColumns.text();
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
         }
 
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
@@ -1369,6 +1379,69 @@ public class MapperXmlRewriter {
         return applyTextReplacements(body, replacements);
     }
 
+    private TextRewrite convertDynamicInformationSchemaColumns(String body) {
+        String expression = "(?:#\\{[^}]+}|\\$\\{[^}]+}|\\?|database\\s*\\(\\s*\\)"
+                + "|\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\)"
+                + "|'[^']*'|\"[^\"]*\"|`[^`]*`|[^\\s<]+)";
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*select\\s*"
+                        + "(?<include><include\\b[^>]*(?:/>|>\\s*</include\\s*>))\\s*"
+                        + "from\\s+information_schema\\s*\\.\\s*columns\\s*"
+                        + "where\\s+table_schema\\s*=\\s*(?<schema>"
+                        + expression
+                        + ")\\s*(?:<!--[\\s\\S]*?-->\\s*)*"
+                        + "and\\s+table_name\\s*=\\s*(?<table>"
+                        + expression
+                        + ")\\s*(?:<!--[\\s\\S]*?-->\\s*)*;?\\s*$"
+        ).matcher(body);
+        if (!matcher.matches()) {
+            return new TextRewrite(body, false);
+        }
+        String refId = defaultString(xmlAttribute(matcher.group("include"), "refid"));
+        if (!"Column_List".equalsIgnoreCase(refId.trim())) {
+            return new TextRewrite(body, false);
+        }
+        String leading = body.substring(0, leadingWhitespaceLength(body));
+        int trailingStart = trimTrailingWhitespaceIndex(body, 0, body.length());
+        String trailing = body.substring(trailingStart);
+        String converted = leading
+                + "SELECT\n"
+                + "    c.OWNER AS TABLE_SCHEMA,\n"
+                + "    c.TABLE_NAME,\n"
+                + "    c.COLUMN_NAME,\n"
+                + "    c.DATA_TYPE,\n"
+                + "    cc.COMMENTS AS COLUMN_COMMENT,\n"
+                + "    c.DATA_DEFAULT AS COLUMN_DEFAULT,\n"
+                + "    NULL AS CHARACTER_SET_NAME,\n"
+                + "    CASE c.NULLABLE WHEN 'Y' THEN 'YES' ELSE 'NO' END AS IS_NULLABLE\n"
+                + "FROM ALL_TAB_COLUMNS c\n"
+                + "LEFT JOIN ALL_COL_COMMENTS cc\n"
+                + "    ON cc.OWNER = c.OWNER\n"
+                + "    AND cc.TABLE_NAME = c.TABLE_NAME\n"
+                + "    AND cc.COLUMN_NAME = c.COLUMN_NAME\n"
+                + "WHERE c.OWNER = "
+                + damengMetadataExpression(matcher.group("schema"))
+                + "\n"
+                + "    AND c.TABLE_NAME = "
+                + damengMetadataExpression(matcher.group("table"))
+                + "\n"
+                + "ORDER BY c.COLUMN_ID"
+                + trailing;
+        return new TextRewrite(converted, true);
+    }
+
+    private String damengMetadataExpression(String expression) {
+        String trimmed = expression == null ? "" : expression.trim();
+        String normalized = trimmed.replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
+        if ("database()".equals(normalized) || "(selectdatabase())".equals(normalized)) {
+            return "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+        }
+        if (trimmed.startsWith("${") && trimmed.endsWith("}")) {
+            return "UPPER('" + trimmed.replace("'", "''") + "')";
+        }
+        return "UPPER(REPLACE(" + trimmed + ", '\"', ''))";
+    }
+
     private TextRewrite splitTemporaryTableBindSelect(String body) {
         Matcher matcher = DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_PATTERN.matcher(body);
         if (!matcher.find()) {
@@ -1584,6 +1657,21 @@ public class MapperXmlRewriter {
     private boolean isMysqlUserVariableManualReviewReason(String reason) {
         return reason != null
                 && (reason.contains("MySQL user variables") || reason.contains("@var"));
+    }
+
+    private boolean containsMysqlMetadataSql(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        return value.toUpperCase(Locale.ROOT).contains("INFORMATION_SCHEMA")
+                || Pattern.compile("(?i)\\bdatabase\\s*\\(").matcher(value).find();
+    }
+
+    private boolean isMysqlMetadataManualReviewReason(String reason) {
+        return reason != null
+                && (reason.contains("MySQL metadata SQL")
+                || reason.contains("information_schema")
+                || reason.contains("database()"));
     }
 
     private boolean isUserVariableNamePart(char value) {
@@ -5426,14 +5514,34 @@ public class MapperXmlRewriter {
         if (afterProperty >= value.length() || value.charAt(afterProperty) != '=') {
             return new TextRewrite(value, false);
         }
-        String column = resultMapColumnByProperty.get(normalizeIdentifier(property.text()));
-        if (column == null || normalizeIdentifier(column).equals(normalizeIdentifier(property.text()))) {
+        String normalizedProperty = normalizeIdentifier(property.text());
+        if (isQuotedIdentifier(property.text())
+                || isMappedResultColumn(resultMapColumnByProperty, normalizedProperty)) {
+            return new TextRewrite(value, false);
+        }
+        String column = resultMapColumnByProperty.get(normalizedProperty);
+        if (column == null || normalizeIdentifier(column).equals(normalizedProperty)) {
             return new TextRewrite(value, false);
         }
         return new TextRewrite(
                 value.substring(0, tokenStart) + column + value.substring(property.endIndex()),
                 true
         );
+    }
+
+    private boolean isQuotedIdentifier(String identifier) {
+        String trimmed = identifier == null ? "" : identifier.trim();
+        return (trimmed.startsWith("`") && trimmed.endsWith("`"))
+                || (trimmed.startsWith("\"") && trimmed.endsWith("\""));
+    }
+
+    private boolean isMappedResultColumn(Map<String, String> resultMapColumnByProperty, String normalizedIdentifier) {
+        for (String column : resultMapColumnByProperty.values()) {
+            if (normalizeIdentifier(column).equals(normalizedIdentifier)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private TextRewrite qualifyDynamicUpdateJoinSetTargets(String body) {
