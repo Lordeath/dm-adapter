@@ -4779,11 +4779,22 @@ class DmSqlValidationTestGenerator {
                     if (isConfiguredDateTimeLiteral(text)) {
                         return false;
                     }
+                    if (isDateLikeParameterName(normalizeName(valueName))
+                            && isGeneratedTemporalPlaceholderText(text)) {
+                        return true;
+                    }
                     return isGeneratedPlaceholderText(text);
                 }
 
                 private boolean isConfiguredDateTimeLiteral(String value) {
                     return configuredInstant(stripSqlLiteralQuotes(value)) != null;
+                }
+
+                private boolean isGeneratedTemporalPlaceholderText(String value) {
+                    String text = stripSqlLiteralQuotes(value == null ? "" : value.trim());
+                    return "2024".equals(text)
+                            || "202401".equals(text)
+                            || "20240101".equals(text);
                 }
 
                 private boolean isGeneratedPlaceholderText(String value) {
@@ -6653,6 +6664,7 @@ class DmSqlValidationTestGenerator {
                             || normalizedName.contains("firstday")
                             || normalizedName.contains("lastday")
                             || normalizedName.contains("startday")
+                            || normalizedName.contains("thisday")
                             || normalizedName.contains("endday");
                 }
 
