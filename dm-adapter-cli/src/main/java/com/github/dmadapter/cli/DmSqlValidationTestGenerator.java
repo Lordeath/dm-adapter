@@ -4423,10 +4423,6 @@ class DmSqlValidationTestGenerator {
                     if (!isBlank(resolvedCollectionName)) {
                         collectionName = resolvedCollectionName;
                     }
-                    Object sqlFragmentDefault = statement.collectionSqlFragmentDefault(collectionName);
-                    if (sqlFragmentDefault != null) {
-                        return sqlFragmentDefault;
-                    }
                     Object scalarDefault = statement.collectionScalarDefault(collectionName);
                     if (scalarDefault != null) {
                         return scalarDefault;
@@ -4434,6 +4430,10 @@ class DmSqlValidationTestGenerator {
                     String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
                     if (!isBlank(columnType)) {
                         return defaultCollectionElementForColumnType(collectionName, columnType);
+                    }
+                    Object sqlFragmentDefault = statement.collectionSqlFragmentDefault(collectionName);
+                    if (sqlFragmentDefault != null) {
+                        return sqlFragmentDefault;
                     }
                     return defaultCollectionElement(collectionName);
                 }
@@ -4443,6 +4443,14 @@ class DmSqlValidationTestGenerator {
                         Object configuredValue,
                         MapperStatement statement
                 ) {
+                    Object strippedConfigured = stripConfiguredScalarCollectionLiteral(
+                            collectionName,
+                            configuredValue,
+                            statement
+                    );
+                    if (strippedConfigured != MethodArgumentConfig.MISSING) {
+                        configuredValue = strippedConfigured;
+                    }
                     if (!isGeneratedPlaceholderValue(collectionName, configuredValue)) {
                         return configuredValue;
                     }
@@ -4457,6 +4465,29 @@ class DmSqlValidationTestGenerator {
                         }
                     }
                     return defaultCollectionElement(collectionName);
+                }
+
+                private Object stripConfiguredScalarCollectionLiteral(
+                        String collectionName,
+                        Object configuredValue,
+                        MapperStatement statement
+                ) {
+                    if (!(configuredValue instanceof String)
+                            || statement == null
+                            || !statement.scalarCollectionParameter(collectionName)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    Object scalarDefault = statement.collectionScalarDefault(collectionName);
+                    String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
+                    if (scalarDefault == null && isBlank(columnType)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    String text = ((String) configuredValue).trim();
+                    String stripped = stripSqlLiteralQuotes(text);
+                    if (stripped.equals(text)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    return stripped;
                 }
 
                 private boolean shouldReplaceGeneratedCollectionPlaceholder(String normalizedName) {
@@ -5769,12 +5800,12 @@ class DmSqlValidationTestGenerator {
                         return new ArrayList<>(listOf(defaultCollectionElementForColumnType(collectionName, columnType)));
                     }
                     Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(collectionName);
-                    if (sqlFragmentDefault != null) {
-                        return new ArrayList<>(listOf(sqlFragmentDefault));
-                    }
                     Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
                     if (scalarDefault != null) {
                         return new ArrayList<>(listOf(scalarDefault));
+                    }
+                    if (sqlFragmentDefault != null) {
+                        return new ArrayList<>(listOf(sqlFragmentDefault));
                     }
                     return new ArrayList<>(listOf(defaultCollectionElement(collectionName)));
                 }
