@@ -83,7 +83,7 @@ class DmAdapterCliTest {
                 .contains("limit 1");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
                 .contains("Extracted MyBatis annotation SQL to mapper-dm XML")
-                .contains("## Automatic SQL Conversions\n\nNo items.");
+                .contains("rules `MYSQL_TEMPORARY_TABLE_AS_SELECT_TO_DM`");
     }
 
     @Test

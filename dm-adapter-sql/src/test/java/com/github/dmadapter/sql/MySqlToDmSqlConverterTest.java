@@ -495,12 +495,13 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesMysqlTruncateNative() {
+    void convertsMysqlTruncateWithoutTableKeywordForDameng() {
         SqlConversionResult result = converter.convert("TRUNCATE tmp_static_report_precinct_steward_report;");
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql()).isEqualTo("TRUNCATE TABLE tmp_static_report_precinct_steward_report;");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_TRUNCATE_TABLE_RULE);
     }
 
     @Test
@@ -703,7 +704,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesMysqlTemporaryTableAsSelectNative() {
+    void convertsMysqlTemporaryTableAsSelectForDameng() {
         SqlConversionResult result = converter.convert("""
                 drop table if exists tmp_relationship_owner_20200204;
                 create TEMPORARY table tmp_relationship_owner_20200204
@@ -711,9 +712,36 @@ class MySqlToDmSqlConverterTest {
                 FROM owner_house_relationship rs
                 """);
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql()).isEqualTo("""
+                drop table if exists tmp_relationship_owner_20200204;
+                CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT rs.owner_id, rs.house_id
+                FROM owner_house_relationship rs
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+    }
+
+    @Test
+    void convertsMysqlTemporaryTableAsSelectBeforeMyBatisForeach() {
+        SqlConversionResult result = converter.convert("""
+                create temporary table t_${tmpTableName}
+                <foreach collection="list" item="item" separator=" union all ">
+                  select #{item.id} AS id from dual
+                </foreach>
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName} ON COMMIT PRESERVE ROWS AS <foreach collection='list' item='item' separator=' union all '>
+                  select #{item.id} AS id from dual
+                </foreach>
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE
+        );
     }
 
     @Test
@@ -2330,7 +2358,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void keepsNativeBooleanFunctionsWhileConvertingAggregations() {
+    void convertsNotIsNullWhileConvertingAggregations() {
         SqlConversionResult result = converter.convert("""
                 select count(sendState = 'SEND_SUCCESS' or null) smsSuccessCount,
                        !ISNULL(c.refMeterReadId) charged,
@@ -2341,12 +2369,13 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 select COUNT(CASE WHEN sendState = 'SEND_SUCCESS' THEN 1 END) smsSuccessCount,
-                       !ISNULL(c.refMeterReadId) charged,
+                       CASE WHEN c.refMeterReadId IS NOT NULL THEN 1 ELSE 0 END charged,
                        IF((isnull(xm.billType) = 1) OR (length(xm.billType) = 0), jt.billType, xm.billType) billType
                 from ns_sms_details
                 """);
         assertThat(result.appliedRules()).containsExactly(
                 MySqlToDmSqlConverter.MYSQL_COUNT_CONDITION_OR_NULL_RULE,
+                MySqlToDmSqlConverter.MYSQL_NOT_ISNULL_RULE,
                 MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE
         );
     }

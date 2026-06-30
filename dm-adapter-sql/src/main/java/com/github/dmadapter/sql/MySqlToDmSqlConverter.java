@@ -380,6 +380,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE);
         }
 
+        GenericConversion temporaryTableAsSelectConversion = convertMysqlTemporaryTableAsSelect(converted);
+        if (temporaryTableAsSelectConversion.changed()) {
+            converted = temporaryTableAsSelectConversion.convertedSql();
+            rules.add(MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+        }
+
         GenericConversion onUpdateTimestampConversion = removeMysqlOnUpdateCurrentTimestamp(converted);
         if (onUpdateTimestampConversion.changed()) {
             converted = onUpdateTimestampConversion.convertedSql();
@@ -390,6 +396,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (sessionVariableConversion.changed()) {
             converted = sessionVariableConversion.convertedSql();
             rules.add(MYSQL_SESSION_VARIABLE_NOOP_RULE);
+        }
+
+        GenericConversion truncateTableConversion = convertMysqlTruncateTableStatement(converted);
+        if (truncateTableConversion.changed()) {
+            converted = truncateTableConversion.convertedSql();
+            rules.add(MYSQL_TRUNCATE_TABLE_RULE);
         }
 
         GenericConversion duplicateWhereConversion = removeDuplicateWhereKeyword(converted);
@@ -565,6 +577,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (countDistinctIfConversion.changed()) {
             converted = countDistinctIfConversion.convertedSql();
             rules.add(MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE);
+        }
+
+        GenericConversion notIsNullConversion = convertNotIsNull(converted);
+        if (notIsNullConversion.changed()) {
+            converted = notIsNullConversion.convertedSql();
+            rules.add(MYSQL_NOT_ISNULL_RULE);
         }
 
         GenericConversion booleanOperatorConversion = convertBooleanOperatorsInIfConditions(converted);
@@ -2807,7 +2825,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (startsKeyword(sql, index, "AS")) {
             index = skipWhitespace(sql, index + "AS".length());
         }
-        if (!startsKeyword(sql, index, "SELECT")) {
+        if (!startsKeyword(sql, index, "SELECT") && !startsMyBatisXmlElement(sql, index, "foreach")) {
             return null;
         }
         String tableName = sql.substring(tableNameStart, tableNameEnd).trim();
@@ -2819,6 +2837,17 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index,
                 "CREATE GLOBAL TEMPORARY TABLE " + tableName + " ON COMMIT PRESERVE ROWS AS "
         );
+    }
+
+    private boolean startsMyBatisXmlElement(String sql, int index, String elementName) {
+        if (index >= sql.length() || sql.charAt(index) != '<') {
+            return false;
+        }
+        int nameIndex = skipWhitespace(sql, index + 1);
+        if (nameIndex >= sql.length() || sql.charAt(nameIndex) == '/') {
+            return false;
+        }
+        return startsKeyword(sql, nameIndex, elementName);
     }
 
     private int readCreateTableNameEnd(String sql, int start) {
@@ -5099,9 +5128,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     converted.append(current);
                     index++;
                 } else {
+                    String expression = functionCall.body().trim();
+                    if (expression.isBlank()) {
+                        converted.append(current);
+                        index++;
+                        continue;
+                    }
                     converted.append("CASE WHEN ")
-                            .append(sql, functionStart, functionCall.endIndex())
-                            .append(" THEN 0 ELSE 1 END");
+                            .append(expression)
+                            .append(" IS NOT NULL THEN 1 ELSE 0 END");
                     index = functionCall.endIndex();
                     changed = true;
                 }
