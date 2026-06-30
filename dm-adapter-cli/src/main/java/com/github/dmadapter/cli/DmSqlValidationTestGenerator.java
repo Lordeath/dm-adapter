@@ -3897,12 +3897,20 @@ class DmSqlValidationTestGenerator {
                     if (Collection.class.isAssignableFrom(targetType) && rawValue instanceof Collection) {
                         Type nestedType = firstGenericArgument(genericType);
                         Class<?> nestedClass = rawClass(nestedType);
+                        String collectionValueName = requiredCollectionValueName(valueName, statement);
+                        if (isBlank(collectionValueName)) {
+                            collectionValueName = valueName;
+                        }
+                        boolean scalarCharacterCollection = scalarCollectionUsesCharacterColumn(
+                                collectionValueName,
+                                statement
+                        );
                         Collection<?> rawCollection = (Collection<?>) rawValue;
                         Collection<Object> converted = Set.class.isAssignableFrom(targetType)
                                 ? new LinkedHashSet<>()
                                 : new ArrayList<>();
                         Map<String, Object> defaultElement = configuredCollectionElementDefault(
-                                valueName,
+                                collectionValueName,
                                 targetType,
                                 genericType,
                                 statement
@@ -3928,7 +3936,7 @@ class DmSqlValidationTestGenerator {
                                             nestedClass,
                                             nestedType,
                                             statement,
-                                            valueName
+                                            collectionValueName
                                     );
                                     if (!value.resolved) {
                                         return value;
@@ -3937,20 +3945,35 @@ class DmSqlValidationTestGenerator {
                                     continue;
                                 }
                                 if (rawCollectionElementType(genericType)
-                                        && configuredCollectionObjectItem(valueName, (Map<?, ?>) item, statement)) {
+                                        && configuredCollectionObjectItem(collectionValueName, (Map<?, ?>) item, statement)) {
                                     Map<String, Object> configuredItem = new LinkedHashMap<>((Map<String, Object>) item);
                                     configuredItem = mergeConfiguredCollectionElementMap(
                                             new LinkedHashMap<>(defaultElement),
                                             configuredItem,
                                             statement,
-                                            valueName
+                                            collectionValueName
                                     );
                                     converted.add(configuredItem);
                                     continue;
                                 }
+                                if (scalarCharacterCollection) {
+                                    Object scalarItem = scalarConfiguredCollectionItem(
+                                            collectionValueName,
+                                            (Map<?, ?>) item,
+                                            statement
+                                    );
+                                    if (scalarItem != MethodArgumentConfig.MISSING) {
+                                        converted.add(normalizeConfiguredCollectionScalarValue(
+                                                collectionValueName,
+                                                scalarItem,
+                                                statement
+                                        ));
+                                        continue;
+                                    }
+                                }
                                 if (scalarCollectionElementType(nestedClass)) {
                                     ValueResult value = configuredScalarCollectionElement(
-                                            valueName,
+                                            collectionValueName,
                                             (Map<?, ?>) item,
                                             nestedClass,
                                             nestedType,
@@ -3963,13 +3986,13 @@ class DmSqlValidationTestGenerator {
                                     continue;
                                 }
                                 Object scalarItem = scalarConfiguredCollectionItem(
-                                        valueName,
+                                        collectionValueName,
                                         (Map<?, ?>) item,
                                         statement
                                 );
                                 if (scalarItem != MethodArgumentConfig.MISSING) {
                                     Object normalizedScalarItem = normalizeConfiguredCollectionScalarValue(
-                                            valueName,
+                                            collectionValueName,
                                             scalarItem,
                                             statement
                                     );
@@ -3978,7 +4001,7 @@ class DmSqlValidationTestGenerator {
                                             nestedClass,
                                             nestedType,
                                             statement,
-                                            valueName
+                                            collectionValueName
                                     );
                                     if (!value.resolved) {
                                         return value;
@@ -3991,13 +4014,17 @@ class DmSqlValidationTestGenerator {
                                         new LinkedHashMap<>(defaultElement),
                                         configuredItem,
                                         statement,
-                                        valueName
+                                        collectionValueName
                                 );
                                 converted.add(configuredItem);
                                 continue;
                             }
-                            Object normalizedItem = normalizeConfiguredCollectionScalarValue(valueName, item, statement);
-                            ValueResult value = convertConfiguredValue(normalizedItem, nestedClass, nestedType, statement, valueName);
+                            Object normalizedItem = normalizeConfiguredCollectionScalarValue(collectionValueName, item, statement);
+                            if (scalarCharacterCollection) {
+                                converted.add(normalizedItem);
+                                continue;
+                            }
+                            ValueResult value = convertConfiguredValue(normalizedItem, nestedClass, nestedType, statement, collectionValueName);
                             if (!value.resolved) {
                                 return value;
                             }
@@ -4161,9 +4188,13 @@ class DmSqlValidationTestGenerator {
                         return null;
                     }
                     if (rawValue instanceof Collection) {
-                        Map<String, Object> defaultElement = typedCollectionElementDefault(valueName, statement);
+                        String collectionValueName = requiredCollectionValueName(valueName, statement);
+                        if (isBlank(collectionValueName)) {
+                            collectionValueName = valueName;
+                        }
+                        Map<String, Object> defaultElement = typedCollectionElementDefault(collectionValueName, statement);
                         if (defaultElement.isEmpty() && statement != null) {
-                            defaultElement = firstMapElementDefault(statement.collectionScalarDefault(valueName));
+                            defaultElement = firstMapElementDefault(statement.collectionScalarDefault(collectionValueName));
                         }
                         Collection<Object> converted = rawValue instanceof Set
                                 ? new LinkedHashSet<>()
@@ -4171,13 +4202,13 @@ class DmSqlValidationTestGenerator {
                         for (Object item : (Collection<?>) rawValue) {
                             if (item instanceof Map<?, ?>) {
                                 Object scalarItem = scalarConfiguredCollectionItem(
-                                        valueName,
+                                        collectionValueName,
                                         (Map<?, ?>) item,
                                         statement
                                 );
                                 if (scalarItem != MethodArgumentConfig.MISSING) {
                                     converted.add(normalizeConfiguredCollectionScalarValue(
-                                            valueName,
+                                            collectionValueName,
                                             scalarItem,
                                             statement
                                     ));
@@ -4187,14 +4218,13 @@ class DmSqlValidationTestGenerator {
                                         new LinkedHashMap<>(defaultElement),
                                         new LinkedHashMap<>((Map<String, Object>) item),
                                         statement,
-                                        valueName
+                                        collectionValueName
                                 ));
                             } else {
-                                converted.add(normalizeConfiguredDynamicIdentifierValue(
+                                converted.add(normalizeConfiguredCollectionScalarValue(
+                                        collectionValueName,
                                         item,
-                                        statement,
-                                        valueName,
-                                        statement.collectionSqlFragmentDefault(valueName)
+                                        statement
                                 ));
                             }
                         }
@@ -4355,11 +4385,13 @@ class DmSqlValidationTestGenerator {
                         Map<?, ?> item,
                         MapperStatement statement
                 ) {
+                    String resolvedCollectionName = resolvedScalarCollectionName(collectionName, statement);
                     if (statement == null
                             || item == null
-                            || !statement.scalarCollectionParameter(collectionName)) {
+                            || !statement.scalarCollectionParameter(resolvedCollectionName)) {
                         return MethodArgumentConfig.MISSING;
                     }
+                    collectionName = resolvedCollectionName;
                     if (configuredCollectionObjectItem(collectionName, item, statement)) {
                         return MethodArgumentConfig.MISSING;
                     }
@@ -4435,10 +4467,8 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object scalarConfiguredCollectionDefault(String collectionName, MapperStatement statement) {
-                    String resolvedCollectionName = statement.scalarCollectionName(collectionName);
-                    if (!isBlank(resolvedCollectionName)) {
-                        collectionName = resolvedCollectionName;
-                    }
+                    String resolvedCollectionName = resolvedScalarCollectionName(collectionName, statement);
+                    collectionName = resolvedCollectionName;
                     String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
                     if (!isBlank(columnType)) {
                         return defaultCollectionElementForColumnType(collectionName, columnType);
@@ -4454,39 +4484,66 @@ class DmSqlValidationTestGenerator {
                     return defaultCollectionElement(collectionName);
                 }
 
+                private boolean scalarCollectionUsesCharacterColumn(String collectionName, MapperStatement statement) {
+                    if (statement == null) {
+                        return false;
+                    }
+                    String resolvedCollectionName = resolvedScalarCollectionName(collectionName, statement);
+                    if (!statement.scalarCollectionParameter(resolvedCollectionName)) {
+                        return false;
+                    }
+                    String columnType = statement.collectionColumnType(resolvedCollectionName, dbColumnMetadata);
+                    return isCharacterColumnType(columnType);
+                }
+
+                private String resolvedScalarCollectionName(String collectionName, MapperStatement statement) {
+                    if (statement == null) {
+                        return collectionName;
+                    }
+                    String resolvedCollectionName = statement.scalarCollectionName(collectionName);
+                    if (!isBlank(resolvedCollectionName)) {
+                        return resolvedCollectionName;
+                    }
+                    String requiredCollectionName = requiredCollectionValueName(collectionName, statement);
+                    return !isBlank(requiredCollectionName) && statement.scalarCollectionParameter(requiredCollectionName)
+                            ? requiredCollectionName
+                            : collectionName;
+                }
+
                 private Object normalizeConfiguredCollectionScalarValue(
                         String collectionName,
                         Object configuredValue,
                         MapperStatement statement
                 ) {
+                    String resolvedCollectionName = resolvedScalarCollectionName(collectionName, statement);
                     Object strippedConfigured = stripConfiguredScalarCollectionLiteral(
-                            collectionName,
+                            resolvedCollectionName,
                             configuredValue,
                             statement
                     );
                     if (strippedConfigured != MethodArgumentConfig.MISSING) {
                         configuredValue = strippedConfigured;
                     }
-                    if (statement != null && statement.scalarCollectionParameter(collectionName)) {
-                        String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
+                    if (statement != null && statement.scalarCollectionParameter(resolvedCollectionName)) {
+                        String columnType = statement.collectionColumnType(resolvedCollectionName, dbColumnMetadata);
                         if (configuredValue instanceof Number && isCharacterColumnType(columnType)) {
                             return String.valueOf(configuredValue);
                         }
                     }
-                    if (!isGeneratedPlaceholderValue(collectionName, configuredValue)) {
+                    if (!isGeneratedPlaceholderValue(resolvedCollectionName, configuredValue)) {
                         return configuredValue;
                     }
-                    String normalized = normalizeName(collectionName);
+                    String normalized = normalizeName(resolvedCollectionName);
                     if (!shouldReplaceGeneratedCollectionPlaceholder(normalized)) {
                         return configuredValue;
                     }
-                    if (statement != null && statement.scalarCollectionParameter(collectionName)) {
-                        Object defaultValue = scalarConfiguredCollectionDefault(collectionName, statement);
+                    if (statement != null && statement.scalarCollectionParameter(resolvedCollectionName)) {
+                        Object defaultValue = scalarConfiguredCollectionDefault(resolvedCollectionName, statement);
                         if (defaultValue != null) {
                             return defaultValue;
                         }
                     }
-                    return defaultCollectionElement(collectionName);
+                    return defaultCollectionElement(resolvedCollectionName);
                 }
 
                 private Object stripConfiguredScalarCollectionLiteral(
@@ -4494,13 +4551,14 @@ class DmSqlValidationTestGenerator {
                         Object configuredValue,
                         MapperStatement statement
                 ) {
+                    String resolvedCollectionName = resolvedScalarCollectionName(collectionName, statement);
                     if (!(configuredValue instanceof String)
                             || statement == null
-                            || !statement.scalarCollectionParameter(collectionName)) {
+                            || !statement.scalarCollectionParameter(resolvedCollectionName)) {
                         return MethodArgumentConfig.MISSING;
                     }
-                    Object scalarDefault = statement.collectionScalarDefault(collectionName);
-                    String columnType = statement.collectionColumnType(collectionName, dbColumnMetadata);
+                    Object scalarDefault = statement.collectionScalarDefault(resolvedCollectionName);
+                    String columnType = statement.collectionColumnType(resolvedCollectionName, dbColumnMetadata);
                     if (scalarDefault == null && isBlank(columnType)) {
                         return MethodArgumentConfig.MISSING;
                     }
@@ -4674,9 +4732,11 @@ class DmSqlValidationTestGenerator {
                         Object configuredValue,
                         MapperStatement statement
                 ) {
-                    if (statement == null || !statement.scalarCollectionParameter(collectionName)) {
+                    String resolvedCollectionName = resolvedScalarCollectionName(collectionName, statement);
+                    if (statement == null || !statement.scalarCollectionParameter(resolvedCollectionName)) {
                         return MethodArgumentConfig.MISSING;
                     }
+                    collectionName = resolvedCollectionName;
                     if (configuredValue instanceof Collection) {
                         Collection<Object> converted = configuredValue instanceof Set
                                 ? new LinkedHashSet<>()

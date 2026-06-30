@@ -1002,6 +1002,14 @@ class DmAdapterCliTest {
                 .contains("statement.collectionScalarDefault(collectionName)")
                 .contains("configuredValue instanceof Number && isCharacterColumnType(columnType)")
                 .contains("return String.valueOf(configuredValue);")
+                .contains("boolean scalarCharacterCollection = scalarCollectionUsesCharacterColumn(")
+                .contains("if (scalarCharacterCollection) {")
+                .contains("converted.add(normalizedItem);")
+                .contains("private boolean scalarCollectionUsesCharacterColumn(")
+                .contains("private String resolvedScalarCollectionName(")
+                .contains("String requiredCollectionName = requiredCollectionValueName(collectionName, statement);")
+                .contains("String resolvedCollectionName = resolvedScalarCollectionName(collectionName, statement);")
+                .contains("String columnType = statement.collectionColumnType(resolvedCollectionName, dbColumnMetadata);")
                 .contains("stripConfiguredScalarCollectionLiteral(")
                 .contains("configuredValue = strippedConfigured;")
                 .contains("dynamicPlaceholderInsideSqlLiteral(text, startIndex, endIndex)")
@@ -1021,7 +1029,7 @@ class DmAdapterCliTest {
                 .contains("String.class.equals(targetType) && rawValue instanceof String")
                 .contains("statement == null ? null : statement.defaultValue(valueName)")
                 .contains("field.getGenericType(),\n                            statement,\n                            field.getName()")
-                .contains("configuredItem,\n                            statement,\n                            valueName")
+                .contains("configuredItem,\n                            statement,\n                            collectionValueName")
                 .contains("nestedCollection.directElement")
                 .contains("defaultDirectNestedForeachCollectionValue(")
                 .contains("addDirectNestedForeachBranchDefaults(element, item, elementDefault)")
@@ -1030,9 +1038,9 @@ class DmAdapterCliTest {
                 .contains("isCollectionOfCollections(existing)")
                 .contains("firstCollectionElement(")
                 .contains("firstMapElementDefault(")
-                .contains("defaultElement = firstMapElementDefault(statement.collectionScalarDefault(valueName))")
+                .contains("defaultElement = firstMapElementDefault(statement.collectionScalarDefault(collectionValueName))")
                 .contains("converted.add(normalizeConfiguredCollectionScalarValue(\n"
-                        + "                            valueName,\n"
+                        + "                            collectionValueName,\n"
                         + "                            scalarItem,\n"
                         + "                            statement")
                 .contains("Map<String, Object> nestedDefault = firstMapElementDefault(values)")
