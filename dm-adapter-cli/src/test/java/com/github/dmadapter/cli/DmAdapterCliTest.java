@@ -1045,8 +1045,22 @@ class DmAdapterCliTest {
         int sqlFragmentDefaultIndex = generatedTestSource.indexOf(
                 "Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);"
         );
+        int collectionColumnDefaultIndex = generatedTestSource.indexOf(
+                "String columnType = statement == null",
+                scalarDefaultIndex
+        );
+        int mapCollectionScalarDefaultIndex = generatedTestSource.indexOf(
+                "Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);"
+        );
+        int mapCollectionColumnDefaultIndex = generatedTestSource.indexOf(
+                "String columnType = statement == null",
+                mapCollectionScalarDefaultIndex
+        );
         assertThat(scalarDefaultIndex).isGreaterThanOrEqualTo(0);
+        assertThat(collectionColumnDefaultIndex).isGreaterThan(scalarDefaultIndex);
         assertThat(sqlFragmentDefaultIndex).isGreaterThan(scalarDefaultIndex);
+        assertThat(mapCollectionScalarDefaultIndex).isGreaterThanOrEqualTo(0);
+        assertThat(mapCollectionColumnDefaultIndex).isGreaterThan(mapCollectionScalarDefaultIndex);
     }
 
     @Test

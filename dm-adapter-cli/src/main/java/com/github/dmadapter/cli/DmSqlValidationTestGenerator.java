@@ -5186,6 +5186,13 @@ class DmSqlValidationTestGenerator {
                             }
                             return ValueResult.resolved(new ArrayList<>());
                         }
+                        Object scalarDefault = collectionScalarDefault;
+                        if (scalarDefault != null) {
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(scalarDefault)));
+                            }
+                            return ValueResult.resolved(new ArrayList<>(listOf(scalarDefault)));
+                        }
                         String columnType = statement == null
                                 ? ""
                                 : statement.collectionColumnType(valueName, dbColumnMetadata);
@@ -5195,13 +5202,6 @@ class DmSqlValidationTestGenerator {
                                 return ValueResult.resolved(new LinkedHashSet<>(listOf(elementValue)));
                             }
                             return ValueResult.resolved(new ArrayList<>(listOf(elementValue)));
-                        }
-                        Object scalarDefault = collectionScalarDefault;
-                        if (scalarDefault != null) {
-                            if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(listOf(scalarDefault)));
-                            }
-                            return ValueResult.resolved(new ArrayList<>(listOf(scalarDefault)));
                         }
                         Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);
                         if (sqlFragmentDefault != null) {
@@ -5805,6 +5805,10 @@ class DmSqlValidationTestGenerator {
                             && (statement == null || !statement.nonEmptyCollectionParameter(collectionName))) {
                         return new ArrayList<>();
                     }
+                    Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
+                    if (scalarDefault != null) {
+                        return new ArrayList<>(listOf(scalarDefault));
+                    }
                     String columnType = statement == null
                             ? ""
                             : statement.collectionColumnType(collectionName, dbColumnMetadata);
@@ -5812,10 +5816,6 @@ class DmSqlValidationTestGenerator {
                         return new ArrayList<>(listOf(defaultCollectionElementForColumnType(collectionName, columnType)));
                     }
                     Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(collectionName);
-                    Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
-                    if (scalarDefault != null) {
-                        return new ArrayList<>(listOf(scalarDefault));
-                    }
                     if (sqlFragmentDefault != null) {
                         return new ArrayList<>(listOf(sqlFragmentDefault));
                     }
