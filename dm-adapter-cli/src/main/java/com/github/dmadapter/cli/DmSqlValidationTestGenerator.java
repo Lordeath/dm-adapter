@@ -5605,6 +5605,16 @@ class DmSqlValidationTestGenerator {
                             target.put(entry.getKey(), nestedCollection);
                             continue;
                         }
+                        Object collection = configuredCollectionValue(
+                                existing,
+                                configuredValue,
+                                statement,
+                                entryPath
+                        );
+                        if (collection != MethodArgumentConfig.MISSING) {
+                            target.put(entry.getKey(), collection);
+                            continue;
+                        }
                         Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configuredValue, statement);
                         if (scalarCollection != MethodArgumentConfig.MISSING) {
                             target.put(entry.getKey(), scalarCollection);
@@ -5646,6 +5656,43 @@ class DmSqlValidationTestGenerator {
                         }
                         target.put(entry.getKey(), configuredValue);
                     }
+                }
+
+                @SuppressWarnings("unchecked")
+                private Object configuredCollectionValue(
+                        Object existing,
+                        Object configuredValue,
+                        MapperStatement statement,
+                        String pathPrefix
+                ) {
+                    if (!(existing instanceof Collection<?>) || !(configuredValue instanceof Collection<?>)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    Object defaultItem = firstCollectionElement((Collection<?>) existing);
+                    if (!(defaultItem instanceof Map<?, ?>)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    Map<String, Object> defaultElement = new LinkedHashMap<>((Map<String, Object>) defaultItem);
+                    if (defaultElement.isEmpty()) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    Collection<?> configuredCollection = (Collection<?>) configuredValue;
+                    Collection<Object> mergedItems = configuredCollection instanceof Set<?>
+                            ? new LinkedHashSet<>()
+                            : new ArrayList<>();
+                    for (Object item : configuredCollection) {
+                        if (item instanceof Map<?, ?>) {
+                            mergedItems.add(mergeConfiguredCollectionElementMap(
+                                    new LinkedHashMap<>(defaultElement),
+                                    new LinkedHashMap<>((Map<String, Object>) item),
+                                    statement,
+                                    pathPrefix
+                            ));
+                        } else {
+                            mergedItems.add(item);
+                        }
+                    }
+                    return mergedItems;
                 }
 
                 @SuppressWarnings("unchecked")
