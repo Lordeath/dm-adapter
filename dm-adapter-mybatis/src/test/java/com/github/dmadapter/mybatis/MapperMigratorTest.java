@@ -500,6 +500,63 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesBacktickBatchInsertIgnoreToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentExtMapper">
+                    <insert id="insertSplitBatch">
+                        INSERT ignore INTO `ns_payment_chargepayment_ext` (
+                            `payment_id`,
+                            `payBillCompany`,
+                            `carry_voucher_status`
+                        ) VALUES
+                        <foreach collection="list" item="item" separator=",">
+                        (
+                            #{item.id,jdbcType=BIGINT},
+                            #{item.payBillCompany,jdbcType=VARCHAR},
+                            CAST(#{item.carryVoucherStatus,jdbcType=VARCHAR} AS INTEGER)
+                        )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentExtMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentExtMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.PaymentExtMapper.insertSplitBatch", List.of("payment_id"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentExtMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO `ns_payment_chargepayment_ext` t")
+                .contains("#{item.id,jdbcType=BIGINT} AS payment_id")
+                .contains("CAST(#{item.carryVoucherStatus,jdbcType=VARCHAR} AS INTEGER) AS carry_voucher_status")
+                .contains("ON (t.payment_id = s.payment_id)")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContain("INSERT ignore");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
     void migrationRewritesConditionalTrimInsertIgnoreToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
