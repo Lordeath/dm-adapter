@@ -1625,10 +1625,10 @@ public class MapperXmlRewriter {
         if (scope.havingIndex() < 0 || scope.groupIndex() < 0) {
             return ScopeHavingConversion.unchanged(body);
         }
-        Map<String, String> aggregateAliases = aggregateSelectAliases(
+        Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(
                 body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
         );
-        Map<String, String> selectAliases = selectAliases(
+        Map<String, SelectAlias> selectAliases = selectAliases(
                 body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
         );
         int havingStart = scope.havingIndex() + "HAVING".length();
@@ -1687,7 +1687,7 @@ public class MapperXmlRewriter {
         if (scope.groupIndex() < 0) {
             return ScopeHavingConversion.unchanged(body);
         }
-        Map<String, String> aggregateAliases = aggregateSelectAliases(
+        Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(
                 body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
         );
         if (aggregateAliases.isEmpty()) {
@@ -1715,8 +1715,8 @@ public class MapperXmlRewriter {
     private HavingRewrite rewriteHavingContent(
             String originalHavingContent,
             String rewrittenHavingContent,
-            Map<String, String> aggregateAliases,
-            Map<String, String> selectAliases
+            Map<String, SelectAlias> aggregateAliases,
+            Map<String, SelectAlias> selectAliases
     ) {
         List<ConditionPart> rewrittenParts = splitTopLevelAndConditions(rewrittenHavingContent);
         if (rewrittenParts.isEmpty()) {
@@ -1797,8 +1797,8 @@ public class MapperXmlRewriter {
 
     private boolean isMovableSimpleHavingCondition(
             String condition,
-            Map<String, String> aggregateAliases,
-            Map<String, String> selectAliases
+            Map<String, SelectAlias> aggregateAliases,
+            Map<String, SelectAlias> selectAliases
     ) {
         String normalized = stripXmlMarkup(condition);
         if (normalized.isBlank()) {
@@ -1827,12 +1827,13 @@ public class MapperXmlRewriter {
         return containsComparisonOperator(normalized);
     }
 
-    private boolean containsExpandedSelectAliasExpression(String condition, Map<String, String> selectAliases) {
+    private boolean containsExpandedSelectAliasExpression(String condition, Map<String, SelectAlias> selectAliases) {
         if (selectAliases.isEmpty()) {
             return false;
         }
         String comparableCondition = compactSqlForAliasComparison(condition);
-        for (String expression : selectAliases.values()) {
+        for (SelectAlias selectAlias : selectAliases.values()) {
+            String expression = selectAlias.expression();
             if (!isComputedSelectAliasExpression(expression) || containsAggregateFunction(expression)) {
                 continue;
             }
@@ -2119,15 +2120,15 @@ public class MapperXmlRewriter {
         return null;
     }
 
-    private TextRewrite replaceAggregateAliases(String value, Map<String, String> aggregateAliases) {
+    private TextRewrite replaceAggregateAliases(String value, Map<String, SelectAlias> aggregateAliases) {
         return replaceAliases(value, aggregateAliases);
     }
 
-    private TextRewrite replaceSelectAliases(String value, Map<String, String> selectAliases) {
+    private TextRewrite replaceSelectAliases(String value, Map<String, SelectAlias> selectAliases) {
         return replaceAliases(value, selectAliases);
     }
 
-    private TextRewrite replaceAliases(String value, Map<String, String> aliases) {
+    private TextRewrite replaceAliases(String value, Map<String, SelectAlias> aliases) {
         if (aliases.isEmpty()) {
             return new TextRewrite(value, false);
         }
@@ -2153,10 +2154,9 @@ public class MapperXmlRewriter {
                     index++;
                     continue;
                 }
-                String expression = aliases.get(identifierKey(token.text()));
-                char previous = previousNonWhitespace(value, index);
-                if (expression != null && previous != '.' && previous != '(') {
-                    replacements.add(new TextReplacement(index, token.endIndex(), "(" + expression + ")"));
+                SelectAlias alias = aliases.get(identifierKey(token.text()));
+                if (alias != null && shouldReplaceAliasToken(value, index, token, alias)) {
+                    replacements.add(new TextReplacement(index, token.endIndex(), "(" + alias.expression() + ")"));
                 }
                 index = token.endIndex();
             } else {
@@ -2164,6 +2164,15 @@ public class MapperXmlRewriter {
             }
         }
         return applyTextReplacements(value, replacements);
+    }
+
+    private boolean shouldReplaceAliasToken(String value, int index, IdentifierToken token, SelectAlias alias) {
+        char previous = previousNonWhitespace(value, index);
+        char next = nextNonWhitespace(value, token.endIndex());
+        if (previous == '.' || next == '(') {
+            return false;
+        }
+        return previous != '(' || token.text().equals(alias.alias());
     }
 
     private TextRewrite applyTextReplacements(String value, List<TextReplacement> replacements) {
@@ -2181,23 +2190,23 @@ public class MapperXmlRewriter {
         return new TextRewrite(converted.toString(), true);
     }
 
-    private Map<String, String> aggregateSelectAliases(String selectList) {
-        Map<String, String> aliases = new LinkedHashMap<>();
+    private Map<String, SelectAlias> aggregateSelectAliases(String selectList) {
+        Map<String, SelectAlias> aliases = new LinkedHashMap<>();
         for (String item : splitTopLevelComma(selectList)) {
             SelectAlias selectAlias = selectAlias(item);
             if (selectAlias != null && containsAggregateFunction(selectAlias.expression())) {
-                aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias.expression());
+                aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias);
             }
         }
         return aliases;
     }
 
-    private Map<String, String> selectAliases(String selectList) {
-        Map<String, String> aliases = new LinkedHashMap<>();
+    private Map<String, SelectAlias> selectAliases(String selectList) {
+        Map<String, SelectAlias> aliases = new LinkedHashMap<>();
         for (String item : splitTopLevelComma(selectList)) {
             SelectAlias selectAlias = selectAlias(item);
             if (selectAlias != null) {
-                aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias.expression());
+                aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias);
             }
         }
         return aliases;

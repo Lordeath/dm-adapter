@@ -2343,13 +2343,16 @@ class MapperMigratorTest {
                     <select id="collectAccountChanges">
                         SELECT
                         concat(account_book, '/', charge_item) AS dataGroup,
+                        concat(account_book, '/', history_charge_item) AS historyDataGroup,
                         sum(charge_sum) totalAmount
                         from charge_account
                         where tenant_id = #{tenantId}
                         <if test="enabled != null">
                         </if>
                         GROUP BY account_book, charge_item
-                        HAVING dataGroup is not null and totalAmount != 0
+                        HAVING dataGroup is not null
+                        and ifnull(dataGroup,'') != ifnull(historyDataGroup,'')
+                        and totalAmount != 0
                     </select>
                 </mapper>
                 """;
@@ -2373,8 +2376,12 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReportMapper.xml"));
         assertThat(rewritten)
                 .contains("HAVING (concat(account_book, '/', charge_item)) is not null")
+                .contains("ifnull((concat(account_book, '/', charge_item)),'') != "
+                        + "ifnull((concat(account_book, '/', history_charge_item)),'')")
                 .contains("and (sum(charge_sum)) != 0")
                 .doesNotContain("\n        and (concat(account_book, '/', charge_item)) is not null")
+                .doesNotContain("ifnull(dataGroup")
+                .doesNotContain("ifnull(historyDataGroup")
                 .doesNotContain("and dataGroup is not null")
                 .doesNotContain("HAVING dataGroup is not null");
         assertThat(result.automaticConversions()).hasSize(1);
