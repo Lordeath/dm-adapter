@@ -5840,15 +5840,34 @@ public class MapperXmlRewriter {
             List<TextReplacement> replacements
     ) {
         Map<String, List<SetAssignment>> seenAssignments = new LinkedHashMap<>();
+        Map<SetAssignment, List<String>> conditionGuards = new LinkedHashMap<>();
+        Set<SetAssignment> removedAssignments = new LinkedHashSet<>();
         int index = start;
         while (index < end) {
             int tagStart = body.indexOf('<', index);
             if (tagStart < 0 || tagStart >= end) {
-                removeDuplicateSetAssignmentsFromText(body, index, end, seenAssignments, replacements);
+                removeDuplicateSetAssignmentsFromText(
+                        body,
+                        index,
+                        end,
+                        seenAssignments,
+                        replacements,
+                        conditionGuards,
+                        removedAssignments
+                );
+                addSetAssignmentConditionGuardReplacements(conditionGuards, removedAssignments, replacements);
                 return;
             }
             if (tagStart > index) {
-                removeDuplicateSetAssignmentsFromText(body, index, tagStart, seenAssignments, replacements);
+                removeDuplicateSetAssignmentsFromText(
+                        body,
+                        index,
+                        tagStart,
+                        seenAssignments,
+                        replacements,
+                        conditionGuards,
+                        removedAssignments
+                );
             }
             XmlTag tag = readXmlTag(body, tagStart);
             if (tag == null) {
@@ -5861,9 +5880,15 @@ public class MapperXmlRewriter {
                     int closingEnd = body.indexOf('>', closingStart + 1);
                     if (closingEnd >= 0 && closingEnd + 1 <= end) {
                         String ifBody = body.substring(tag.endIndex(), closingStart);
-                        String condition = readIfTestAttribute(body.substring(tagStart, tag.endIndex()));
+                        IfTestAttribute condition = readIfTestAttribute(body, tagStart, tag.endIndex());
                         SetAssignment assignment = readSetAssignment(ifBody, condition, tagStart, closingEnd + 1);
-                        deduplicateSetAssignment(assignment, seenAssignments, replacements);
+                        deduplicateSetAssignment(
+                                assignment,
+                                seenAssignments,
+                                replacements,
+                                conditionGuards,
+                                removedAssignments
+                        );
                         index = closingEnd + 1;
                         continue;
                     }
@@ -5871,6 +5896,7 @@ public class MapperXmlRewriter {
             }
             index = tag.endIndex();
         }
+        addSetAssignmentConditionGuardReplacements(conditionGuards, removedAssignments, replacements);
     }
 
     private void removeDuplicateSetAssignmentsFromText(
@@ -5878,7 +5904,9 @@ public class MapperXmlRewriter {
             int start,
             int end,
             Map<String, List<SetAssignment>> seenAssignments,
-            List<TextReplacement> replacements
+            List<TextReplacement> replacements,
+            Map<SetAssignment, List<String>> conditionGuards,
+            Set<SetAssignment> removedAssignments
     ) {
         int lineStart = start;
         while (lineStart < end) {
@@ -5894,18 +5922,37 @@ public class MapperXmlRewriter {
                     ? lineEnd + 1
                     : lineEnd;
             String line = body.substring(lineStart, contentEnd);
-            SetAssignment assignment = readSetAssignment(line, "", lineStart, replacementEnd);
-            deduplicateSetAssignment(assignment, seenAssignments, replacements);
+            SetAssignment assignment = readSetAssignment(line, null, lineStart, replacementEnd);
+            deduplicateSetAssignment(
+                    assignment,
+                    seenAssignments,
+                    replacements,
+                    conditionGuards,
+                    removedAssignments
+            );
             lineStart = lineEnd < end ? lineEnd + 1 : end;
         }
     }
 
-    private String readIfTestAttribute(String openingTag) {
-        Matcher matcher = IF_OPENING_TAG_PATTERN.matcher(openingTag);
-        return matcher.find() ? normalizeExpressionForComparison(matcher.group(2)) : "";
+    private IfTestAttribute readIfTestAttribute(String body, int tagStart, int tagEnd) {
+        Matcher matcher = IF_OPENING_TAG_PATTERN.matcher(body.substring(tagStart, tagEnd));
+        if (!matcher.find()) {
+            return null;
+        }
+        return new IfTestAttribute(
+                matcher.group(2),
+                normalizeExpressionForComparison(matcher.group(2)),
+                tagStart + matcher.start(2),
+                tagStart + matcher.end(2)
+        );
     }
 
-    private SetAssignment readSetAssignment(String fragment, String condition, int startIndex, int endIndex) {
+    private SetAssignment readSetAssignment(
+            String fragment,
+            IfTestAttribute condition,
+            int startIndex,
+            int endIndex
+    ) {
         if (fragment == null || fragment.isBlank()) {
             return null;
         }
@@ -5923,7 +5970,10 @@ public class MapperXmlRewriter {
         return new SetAssignment(
                 normalizeSetAssignmentColumn(matcher.group(1)),
                 normalizeExpressionForComparison(rhs),
-                condition == null ? "" : condition,
+                condition == null ? "" : condition.normalized(),
+                condition == null ? "" : condition.raw(),
+                condition == null ? -1 : condition.startIndex(),
+                condition == null ? -1 : condition.endIndex(),
                 startIndex,
                 endIndex
         );
@@ -5986,7 +6036,9 @@ public class MapperXmlRewriter {
     private void deduplicateSetAssignment(
             SetAssignment assignment,
             Map<String, List<SetAssignment>> seenAssignments,
-            List<TextReplacement> replacements
+            List<TextReplacement> replacements,
+            Map<SetAssignment, List<String>> conditionGuards,
+            Set<SetAssignment> removedAssignments
     ) {
         if (assignment == null) {
             return;
@@ -6001,6 +6053,7 @@ public class MapperXmlRewriter {
                         && setAssignmentConditionsCanOverlap(previous.condition(), assignment.condition()))
                 .toList();
         if (duplicates.isEmpty()) {
+            addOverlappingSetAssignmentGuards(assignment, seenForColumn, conditionGuards);
             rememberSetAssignment(assignment, seenAssignments);
             return;
         }
@@ -6011,15 +6064,100 @@ public class MapperXmlRewriter {
                     previous.endIndex(),
                     ""
             )));
+            removedAssignments.addAll(duplicates);
             seenForColumn.removeAll(duplicates);
             rememberSetAssignment(assignment, seenAssignments);
             return;
         }
         replacements.add(new TextReplacement(assignment.startIndex(), assignment.endIndex(), ""));
+        removedAssignments.add(assignment);
+    }
+
+    private void addOverlappingSetAssignmentGuards(
+            SetAssignment assignment,
+            List<SetAssignment> seenForColumn,
+            Map<SetAssignment, List<String>> conditionGuards
+    ) {
+        String exclusion = simpleNonNullConditionExclusion(assignment.condition());
+        if (exclusion.isBlank()) {
+            return;
+        }
+        for (SetAssignment previous : seenForColumn) {
+            if (sameSetAssignmentValue(previous, assignment)
+                    || previous.conditionStartIndex() < 0
+                    || !setAssignmentConditionsMayOverlap(previous.condition(), assignment.condition())) {
+                continue;
+            }
+            List<String> guards = conditionGuards.computeIfAbsent(previous, ignored -> new ArrayList<>());
+            if (!guards.contains(exclusion)) {
+                guards.add(exclusion);
+            }
+        }
+    }
+
+    private void addSetAssignmentConditionGuardReplacements(
+            Map<SetAssignment, List<String>> conditionGuards,
+            Set<SetAssignment> removedAssignments,
+            List<TextReplacement> replacements
+    ) {
+        for (Map.Entry<SetAssignment, List<String>> entry : conditionGuards.entrySet()) {
+            SetAssignment assignment = entry.getKey();
+            if (removedAssignments.contains(assignment) || entry.getValue().isEmpty()) {
+                continue;
+            }
+            String guardedCondition = "(" + assignment.rawCondition().strip() + ") and "
+                    + String.join(" and ", entry.getValue());
+            replacements.add(new TextReplacement(
+                    assignment.conditionStartIndex(),
+                    assignment.conditionEndIndex(),
+                    guardedCondition
+            ));
+        }
     }
 
     private boolean setAssignmentConditionsCanOverlap(String left, String right) {
         return left.isBlank() || right.isBlank() || left.equals(right);
+    }
+
+    private boolean setAssignmentConditionsMayOverlap(String left, String right) {
+        if (left.isBlank() || right.isBlank() || left.equals(right)) {
+            return true;
+        }
+        String leftNonNull = simpleNonNullConditionProperty(left);
+        String rightNull = simpleNullConditionProperty(right);
+        if (!leftNonNull.isBlank() && leftNonNull.equals(rightNull)) {
+            return false;
+        }
+        String leftNull = simpleNullConditionProperty(left);
+        String rightNonNull = simpleNonNullConditionProperty(right);
+        return leftNull.isBlank() || !leftNull.equals(rightNonNull);
+    }
+
+    private String simpleNonNullConditionExclusion(String condition) {
+        String property = simpleNonNullConditionProperty(condition);
+        return property.isBlank() ? "" : property + " == null";
+    }
+
+    private String simpleNonNullConditionProperty(String condition) {
+        return simpleConditionProperty(condition, "!=null", "null!=");
+    }
+
+    private String simpleNullConditionProperty(String condition) {
+        return simpleConditionProperty(condition, "==null", "null==");
+    }
+
+    private String simpleConditionProperty(String condition, String suffixOperator, String prefixOperator) {
+        if (condition == null || condition.isBlank()) {
+            return "";
+        }
+        Matcher suffix = Pattern.compile("(?is)^([A-Za-z_][A-Za-z0-9_$.]*)" + Pattern.quote(suffixOperator) + "$")
+                .matcher(condition);
+        if (suffix.matches()) {
+            return suffix.group(1);
+        }
+        Matcher prefix = Pattern.compile("(?is)^" + Pattern.quote(prefixOperator) + "([A-Za-z_][A-Za-z0-9_$.]*)$")
+                .matcher(condition);
+        return prefix.matches() ? prefix.group(1) : "";
     }
 
     private boolean sameSetAssignmentValue(SetAssignment left, SetAssignment right) {
@@ -6642,9 +6780,15 @@ public class MapperXmlRewriter {
             String column,
             String valueExpression,
             String condition,
+            String rawCondition,
+            int conditionStartIndex,
+            int conditionEndIndex,
             int startIndex,
             int endIndex
     ) {
+    }
+
+    private record IfTestAttribute(String raw, String normalized, int startIndex, int endIndex) {
     }
 
     private record DynamicHavingConversion(
