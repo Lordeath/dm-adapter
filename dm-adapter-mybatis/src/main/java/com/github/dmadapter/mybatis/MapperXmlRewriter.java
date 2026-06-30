@@ -35,6 +35,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_WHERE_MISSING_AND";
     public static final String MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE =
             "MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA";
+    public static final String MYBATIS_FOREACH_TUPLE_MISSING_COMMA_RULE =
+            "MYBATIS_FOREACH_TUPLE_MISSING_COMMA";
     public static final String MYBATIS_STATIC_WHERE_MISSING_AND_RULE =
             "MYBATIS_STATIC_WHERE_MISSING_AND";
     public static final String MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE =
@@ -87,9 +89,16 @@ public class MapperXmlRewriter {
             "(?is)(?<prefix>\\binsert\\s+into\\b[\\s\\S]*?<trim\\b[^>]*>[\\s\\S]*?</trim>\\s*values\\s*)"
                     + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
     );
+    private static final Pattern INSERT_VALUES_FOREACH_PATTERN = Pattern.compile(
+            "(?is)(?<prefix>\\binsert\\s+into\\b[\\s\\S]*?\\bvalues\\s*)"
+                    + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
+    );
     private static final Pattern FOREACH_BLOCK_PATTERN = Pattern.compile("(?is)<foreach\\b[^>]*>[\\s\\S]*?</foreach>");
     private static final Pattern FOREACH_WITH_BODY_PATTERN = Pattern.compile(
             "(?is)^(?<opening><foreach\\b[^>]*>)(?<body>[\\s\\S]*?)(?<closing></foreach\\s*>)$"
+    );
+    private static final Pattern ADJACENT_MYBATIS_PLACEHOLDER_LINES_PATTERN = Pattern.compile(
+            "([#$]\\{[^}]+})([ \\t]*)(\\r\\n|\\r|\\n)(\\s*)(?=[#$]\\{)"
     );
     private static final Pattern IF_OPENING_TAG_PATTERN = Pattern.compile(
             "(?is)<if\\b[^>]*\\btest\\s*=\\s*([\"'])(.*?)\\1[^>]*>"
@@ -989,6 +998,12 @@ public class MapperXmlRewriter {
         if (dynamicInsertTrimCommas.changed()) {
             appliedRules.add(MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE);
             converted = dynamicInsertTrimCommas.text();
+        }
+
+        TextRewrite foreachTupleCommas = addMissingForeachTupleCommas(converted);
+        if (foreachTupleCommas.changed()) {
+            appliedRules.add(MYBATIS_FOREACH_TUPLE_MISSING_COMMA_RULE);
+            converted = foreachTupleCommas.text();
         }
 
         String withoutTrailingCommas = removeForeachTrailingCommas(converted);
@@ -4810,6 +4825,47 @@ public class MapperXmlRewriter {
         }
         matcher.appendTail(converted);
         return new TextRewrite(changed ? converted.toString() : body, changed);
+    }
+
+    private TextRewrite addMissingForeachTupleCommas(String body) {
+        Matcher matcher = INSERT_VALUES_FOREACH_PATTERN.matcher(body);
+        StringBuffer converted = new StringBuffer(body.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            PreservedForeach preservedForeach = readPreservedForeach(matcher.group("foreach"));
+            if (preservedForeach == null) {
+                continue;
+            }
+            TextRewrite tuple = addMissingForeachTupleBodyCommas(preservedForeach.body());
+            if (!tuple.changed()) {
+                continue;
+            }
+            String replacement = matcher.group("prefix")
+                    + preservedForeach.openingTag()
+                    + tuple.text()
+                    + preservedForeach.closingTag();
+            matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return new TextRewrite(changed ? converted.toString() : body, changed);
+    }
+
+    private TextRewrite addMissingForeachTupleBodyCommas(String foreachBody) {
+        ParenthesizedBody parenthesizedBody = outerParenthesizedBody(foreachBody);
+        if (parenthesizedBody == null) {
+            return new TextRewrite(foreachBody, false);
+        }
+        String rewritten = ADJACENT_MYBATIS_PLACEHOLDER_LINES_PATTERN
+                .matcher(parenthesizedBody.content())
+                .replaceAll("$1,$2$3$4");
+        if (rewritten.equals(parenthesizedBody.content())) {
+            return new TextRewrite(foreachBody, false);
+        }
+        return new TextRewrite(
+                parenthesizedBody.leading() + rewritten + parenthesizedBody.trailing(),
+                true
+        );
     }
 
     private PreservedForeach readPreservedForeach(String block) {

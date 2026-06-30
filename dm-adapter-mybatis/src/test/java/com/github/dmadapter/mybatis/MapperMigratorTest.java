@@ -2309,6 +2309,61 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicBatchInsertAddsMissingCommaBetweenForeachTuplePlaceholders() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.WorkbenchAppMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert into ns_soss_workbench_app
+                        (
+                            `enterpriseId`,
+                            `organizationId`,
+                            `orderIndex`,
+                            `moduleIcon`
+                        )
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (
+                            #{item.enterpriseId,jdbcType=BIGINT},
+                            #{item.organizationId,jdbcType=BIGINT},
+                            #{item.orderIndex,jdbcType=INTEGER}
+                            #{item.moduleIcon,jdbcType=VARCHAR}
+                            )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/WorkbenchAppMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/WorkbenchAppMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/WorkbenchAppMapper.xml"));
+        assertThat(rewritten)
+                .contains("#{item.orderIndex,jdbcType=INTEGER},\n            #{item.moduleIcon,jdbcType=VARCHAR}")
+                .doesNotContain("#{item.orderIndex,jdbcType=INTEGER}\n            #{item.moduleIcon,jdbcType=VARCHAR}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_FOREACH_TUPLE_MISSING_COMMA_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicBatchInsertQualifiesBareListItemReferences() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
