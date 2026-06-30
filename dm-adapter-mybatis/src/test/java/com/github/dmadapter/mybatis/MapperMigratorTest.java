@@ -733,6 +733,55 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesDuplicateStatementIdsByOccurrenceAndPreservesRownumPseudoColumn() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.BpmCheckOpinionMapper">
+                    <select id="getLastOpinionByProcId" resultType="map">
+                        select * from bpm_check_opinion
+                        where PROC_INST_ID_ = #{procId} and FORM_DATA_ is not null
+                        order by complete_time_ desc limit 1 offset 0
+                    </select>
+
+                    <select id="getLastOpinionByProcId" databaseId="oracle" resultType="map">
+                        select "OK" as marker from bpm_check_opinion
+                        where PROC_INST_ID_ = #{procId} and FORM_DATA_ is not null
+                        and ROWNUM = 1
+                        order by complete_time_ desc
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/BpmCheckOpinionMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BpmCheckOpinionMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BpmCheckOpinionMapper.xml"));
+        assertThat(rewritten)
+                .contains("order by complete_time_ desc limit 1 offset 0")
+                .contains("select 'OK' as marker from bpm_check_opinion")
+                .contains("and ROWNUM = 1")
+                .doesNotContain("ROWNUM_ = 1");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+    }
+
+    @Test
     void rewritingPreservesMapperDoctypeAndUnchangedFormatting() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

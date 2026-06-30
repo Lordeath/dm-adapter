@@ -187,6 +187,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void preservesRownumPseudoColumnLimitPredicate() {
+        SqlConversionResult result = converter.convert("""
+                select * from bpm_check_opinion
+                where proc_inst_id_ = #{procId} and ROWNUM = 1
+                order by complete_time_ desc
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
     void doesNotRenameReservedColumnNamesInsideStringsCommentsOrPlaceholders() {
         SqlConversionResult result = converter.convert("""
                 select rowid from user
