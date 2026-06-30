@@ -1038,6 +1038,12 @@ class DmAdapterCliTest {
                 .contains("valueByMetadataName(collectionScalarDefaults, valueName)")
                 .contains("normalized.contains(\"month\")")
                 .contains("return \"202401\";");
+        int scalarDefaultIndex = generatedTestSource.indexOf("Object scalarDefault = collectionScalarDefault;");
+        int sqlFragmentDefaultIndex = generatedTestSource.indexOf(
+                "Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);"
+        );
+        assertThat(scalarDefaultIndex).isGreaterThanOrEqualTo(0);
+        assertThat(sqlFragmentDefaultIndex).isGreaterThan(scalarDefaultIndex);
     }
 
     @Test
