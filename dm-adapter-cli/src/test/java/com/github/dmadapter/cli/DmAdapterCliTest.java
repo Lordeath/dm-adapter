@@ -872,6 +872,8 @@ class DmAdapterCliTest {
                 .contains("isMonthLikeParameterName")
                 .contains("isYearLikeParameterName")
                 .contains("hasTemporalRangeQualifier")
+                .contains("shouldPreferConfiguredSqlFragmentDefault")
+                .contains("configuredDefault != null && shouldPreferConfiguredSqlFragmentDefault(valueName)")
                 .contains("isDayOfMonthParameterName")
                 .contains("DateTimeFormatter.ofPattern(\"yyyy-MM-dd HH:mm:ss\")")
                 .contains("\"yyyy-MM-dd HH:mm:ss.S\"")
