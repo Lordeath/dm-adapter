@@ -1518,7 +1518,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesMysqlUpdateJoinNative() {
+    void convertsDerivedTableMysqlUpdateJoinToDamengUpdateFrom() {
         SqlConversionResult result = converter.convert("""
                 update ys_organization y inner join (
                     select a.organization_id
@@ -1530,13 +1530,21 @@ class MySqlToDmSqlConverterTest {
                 where y.organization_id =c.organization_id and y.sync_organization_parent_id is not null
                 """);
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql()).contains("""
+                update ys_organization y set is_deleted =1 from (
+                    select a.organization_id
+                    from ys_organization a
+                    left join ys_organization b on a.sync_organization_parent_id=b.sync_organization_id
+                    where b.is_deleted=1 and a.is_deleted=0
+                ) c where y.organization_id =c.organization_id and y.sync_organization_parent_id is not null
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
     }
 
     @Test
-    void leavesMysqlUpdateJoinNativeWhileQuotingKeywordColumns() {
+    void convertsDerivedTableMysqlUpdateJoinBeforeQuotingKeywordColumns() {
         SqlConversionResult result = converter.convert("""
                 update ns_system_pre_organization y inner join (
                     select a.organization_id from ns_system_pre_organization a
@@ -1547,13 +1555,26 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                update ns_system_pre_organization y inner join (
+                update ns_system_pre_organization y set sync_flag=2,"DESC" = 'NsOrgParentNotExist' from (
                     select a.organization_id from ns_system_pre_organization a
-                ) c on c.organization_id = y.organization_id
-                set y.sync_flag=2,y."DESC" = 'NsOrgParentNotExist'
-                where y.organization_id =c.organization_id
+                ) c where c.organization_id = y.organization_id and y.organization_id =c.organization_id
                 """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void leavesOrdinaryMysqlUpdateJoinNative() {
+        SqlConversionResult result = converter.convert("""
+                update ns_system_user nu
+                inner join ys_user c on nu.ys_user_id = c.sso_user_id
+                set nu.user_name = c.user_name,
+                    nu.update_time = now()
+                where nu.enterprise_id = #{enterpriseId}
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
