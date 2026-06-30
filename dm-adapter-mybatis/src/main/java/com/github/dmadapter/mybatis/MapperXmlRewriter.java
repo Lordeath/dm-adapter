@@ -49,6 +49,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE =
             "MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION";
+    public static final String MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION_RULE =
+            "MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION";
     public static final String MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE =
             "MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE";
     public static final String MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE =
@@ -1643,8 +1645,16 @@ public class MapperXmlRewriter {
         TextRewrite selectAliasRewrite = replaceSelectAliases(havingRewrite.remainingHaving(), selectAliases);
         boolean aggregateAliasChanged = aggregateAliasRewrite.changed();
         boolean selectAliasChanged = selectAliasRewrite.changed();
+        Map<String, SelectAlias> havingSelectAliases = selectAliasChanged
+                ? referencedAliases(havingRewrite.remainingHaving(), selectAliases, true)
+                : Map.of();
+        int groupStart = scope.groupIndex() + "GROUP BY".length();
+        TextRewrite groupByAliasRewrite = selectAliasChanged
+                ? replaceSelectAliases(body.substring(groupStart, scope.havingIndex()), havingSelectAliases)
+                : new TextRewrite(body.substring(groupStart, scope.havingIndex()), false);
+        boolean groupByAliasChanged = groupByAliasRewrite.changed();
         boolean movedConditions = !havingRewrite.movedConditions().isBlank();
-        if (!aggregateAliasChanged && !selectAliasChanged && !movedConditions) {
+        if (!aggregateAliasChanged && !selectAliasChanged && !groupByAliasChanged && !movedConditions) {
             return ScopeHavingConversion.unchanged(body);
         }
 
@@ -1652,10 +1662,13 @@ public class MapperXmlRewriter {
         if (movedConditions) {
             String remainingHaving = selectAliasRewrite.text();
             if (remainingHaving.isBlank()) {
-                converted = converted.substring(0, scope.havingIndex())
+                converted = converted.substring(0, groupStart)
+                        + groupByAliasRewrite.text()
                         + converted.substring(scope.havingEnd());
             } else {
-                converted = converted.substring(0, havingStart)
+                converted = converted.substring(0, groupStart)
+                        + groupByAliasRewrite.text()
+                        + converted.substring(scope.havingIndex(), havingStart)
                         + remainingHaving
                         + converted.substring(scope.havingEnd());
             }
@@ -1665,7 +1678,9 @@ public class MapperXmlRewriter {
                     havingRewrite.movedConditions()
             );
         } else {
-            converted = converted.substring(0, havingStart)
+            converted = converted.substring(0, groupStart)
+                    + groupByAliasRewrite.text()
+                    + converted.substring(scope.havingIndex(), havingStart)
                     + selectAliasRewrite.text()
                     + converted.substring(scope.havingEnd());
         }
@@ -1676,6 +1691,9 @@ public class MapperXmlRewriter {
         }
         if (selectAliasChanged) {
             rules.add(MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE);
+        }
+        if (groupByAliasChanged) {
+            rules.add(MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION_RULE);
         }
         if (movedConditions) {
             rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
@@ -2126,6 +2144,50 @@ public class MapperXmlRewriter {
 
     private TextRewrite replaceSelectAliases(String value, Map<String, SelectAlias> selectAliases) {
         return replaceAliases(value, selectAliases, true);
+    }
+
+    private Map<String, SelectAlias> referencedAliases(
+            String value,
+            Map<String, SelectAlias> aliases,
+            boolean allowFunctionArgumentExactMatch
+    ) {
+        if (aliases.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, SelectAlias> referenced = new LinkedHashMap<>();
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? value.length() : end + "-->".length();
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int end = value.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? value.length() : end + "]]>".length();
+            } else if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (isIdentifierStart(value.charAt(index))) {
+                IdentifierToken token = readIdentifierToken(value, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                String key = identifierKey(token.text());
+                SelectAlias alias = aliases.get(key);
+                if (alias != null && shouldReplaceAliasToken(value, index, token, alias,
+                        allowFunctionArgumentExactMatch)) {
+                    referenced.putIfAbsent(key, alias);
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return referenced;
     }
 
     private TextRewrite replaceAliases(
