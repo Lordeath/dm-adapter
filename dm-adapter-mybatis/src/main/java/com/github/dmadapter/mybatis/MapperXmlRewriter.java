@@ -311,6 +311,7 @@ public class MapperXmlRewriter {
                 ? Set.of()
                 : statementKeysToRewrite;
         boolean restricted = !restrictedStatementKeys.isEmpty();
+        Map<String, Integer> statementOccurrences = new LinkedHashMap<>();
 
         Document document;
         try {
@@ -335,17 +336,19 @@ public class MapperXmlRewriter {
         String xml = null;
         boolean changed = false;
         for (Element statement : statementElements(document)) {
+            String tagName = statement.getTagName();
             String statementId = statement.getAttribute("id");
+            int occurrenceIndex = statementOccurrenceIndex(statementOccurrences, tagName, statementId);
             String statementKey = statementKey(namespace, statementId);
             String originalSql = statement.getTextContent();
             if (statementId.isBlank()) {
                 if (restricted) {
                     continue;
                 }
-                String reason = missingStatementIdReason(reportPath, statement.getTagName());
+                String reason = missingStatementIdReason(reportPath, tagName);
                 manualReviewItems.add(new SqlChange(
                         reportPath,
-                        "(missing id: <" + statement.getTagName() + ">)",
+                        "(missing id: <" + tagName + ">)",
                         originalSql,
                         originalSql,
                         List.of(),
@@ -362,10 +365,10 @@ public class MapperXmlRewriter {
                 if (xml == null) {
                     xml = readXml(inputPath);
                 }
-                StatementBody statementBody = findStatementBody(xml, statement.getTagName(), statementId, 0);
+                StatementBody statementBody = findStatementBody(xml, tagName, statementId, occurrenceIndex);
                 DynamicBodyConversion dynamicBodyConversion =
                         convertDynamicXmlTextSegments(
-                                statement.getTagName(),
+                                tagName,
                                 statementKey,
                                 statementBody.rawBody(),
                                 sqlConverter,
@@ -373,7 +376,7 @@ public class MapperXmlRewriter {
                                 resultMapColumnByProperty
                         );
                 dynamicBodyConversion = wrapDynamicIdentityInsertIfConfigured(
-                        statement.getTagName(),
+                        tagName,
                         statementBody.rawBody(),
                         dynamicBodyConversion,
                         rewriteConfig
@@ -389,8 +392,9 @@ public class MapperXmlRewriter {
                 ));
                 if (dynamicBodyConversion.changed()) {
                     replacements.add(StatementReplacement.dynamicBody(
-                            statement.getTagName(),
+                            tagName,
                             statementId,
+                            occurrenceIndex,
                             dynamicBodyConversion.convertedBody()
                     ));
                     automaticConversions.add(new SqlChange(
@@ -418,7 +422,7 @@ public class MapperXmlRewriter {
                     ? conversionResult.convertedSql()
                     : commentSafeSql;
             addAppliedRules(staticRules, conversionResult.appliedRules());
-            String identityInsertTable = identityInsertTableName(statement.getTagName(), originalSql, rewriteConfig);
+            String identityInsertTable = identityInsertTableName(tagName, originalSql, rewriteConfig);
             if (!identityInsertTable.isBlank() && !containsIdentityInsert(convertedSql)) {
                 convertedSql = wrapIdentityInsertSql(convertedSql, identityInsertTable);
                 staticRules.add(DAMENG_IDENTITY_INSERT_RULE);
@@ -430,8 +434,9 @@ public class MapperXmlRewriter {
             }
             if (!convertedSql.equals(originalSql)) {
                 replacements.add(StatementReplacement.staticSql(
-                        statement.getTagName(),
+                        tagName,
                         statementId,
+                        occurrenceIndex,
                         convertedSql
                 ));
                 automaticConversions.add(new SqlChange(
@@ -462,6 +467,13 @@ public class MapperXmlRewriter {
             writeReplacements(inputPath, replacements);
         }
         return new MapperRewriteResult(automaticConversions, manualReviewItems, warnings);
+    }
+
+    private int statementOccurrenceIndex(Map<String, Integer> occurrences, String tagName, String statementId) {
+        String key = tagName + "\u0000" + statementId;
+        int occurrenceIndex = occurrences.getOrDefault(key, 0);
+        occurrences.put(key, occurrenceIndex + 1);
+        return occurrenceIndex;
     }
 
     private String missingStatementIdReason(String reportPath, String tagName) {
@@ -673,19 +685,17 @@ public class MapperXmlRewriter {
         try {
             Files.createDirectories(path.getParent());
             String xml = Files.readString(path, StandardCharsets.UTF_8);
-            int searchFrom = 0;
             for (StatementReplacement replacement : replacements) {
                 StatementBody statementBody = findStatementBody(
                         xml,
                         replacement.tagName(),
                         replacement.statementId(),
-                        searchFrom
+                        replacement.occurrenceIndex()
                 );
                 String rewrittenBody = replacement.convertedBody() == null
                         ? rewrittenBody(statementBody.rawBody(), replacement.convertedSql())
                         : replacement.convertedBody();
                 xml = xml.substring(0, statementBody.start()) + rewrittenBody + xml.substring(statementBody.end());
-                searchFrom = statementBody.start() + rewrittenBody.length();
             }
             Files.writeString(path, xml, StandardCharsets.UTF_8);
         } catch (IOException e) {
@@ -693,9 +703,12 @@ public class MapperXmlRewriter {
         }
     }
 
-    private StatementBody findStatementBody(String xml, String tagName, String statementId, int searchFrom) {
+    private StatementBody findStatementBody(String xml, String tagName, String statementId, int occurrenceIndex) {
         if (statementId.isBlank()) {
             throw new IllegalStateException("Mapper statement id is required for text-preserving rewrite.");
+        }
+        if (occurrenceIndex < 0) {
+            throw new IllegalStateException("Failed to locate mapper statement: " + statementId);
         }
 
         String quotedTag = Pattern.quote(tagName);
@@ -704,8 +717,10 @@ public class MapperXmlRewriter {
                 "(?s)<\\s*" + quotedTag + "\\b(?=[^>]*\\bid\\s*=\\s*(?:\"" + quotedId + "\"|'" + quotedId + "'))[^>]*>"
         );
         Matcher openingMatcher = openingPattern.matcher(xml);
-        if (!openingMatcher.find(searchFrom)) {
-            throw new IllegalStateException("Failed to locate mapper statement: " + statementId);
+        for (int currentOccurrence = 0; currentOccurrence <= occurrenceIndex; currentOccurrence++) {
+            if (!openingMatcher.find()) {
+                throw new IllegalStateException("Failed to locate mapper statement: " + statementId);
+            }
         }
 
         Pattern closingPattern = Pattern.compile("(?s)</\\s*" + quotedTag + "\\s*>");
@@ -6871,13 +6886,29 @@ public class MapperXmlRewriter {
     private record XmlTag(String name, boolean closing, boolean selfClosing, int endIndex) {
     }
 
-    private record StatementReplacement(String tagName, String statementId, String convertedSql, String convertedBody) {
-        private static StatementReplacement staticSql(String tagName, String statementId, String convertedSql) {
-            return new StatementReplacement(tagName, statementId, convertedSql, null);
+    private record StatementReplacement(
+            String tagName,
+            String statementId,
+            int occurrenceIndex,
+            String convertedSql,
+            String convertedBody
+    ) {
+        private static StatementReplacement staticSql(
+                String tagName,
+                String statementId,
+                int occurrenceIndex,
+                String convertedSql
+        ) {
+            return new StatementReplacement(tagName, statementId, occurrenceIndex, convertedSql, null);
         }
 
-        private static StatementReplacement dynamicBody(String tagName, String statementId, String convertedBody) {
-            return new StatementReplacement(tagName, statementId, null, convertedBody);
+        private static StatementReplacement dynamicBody(
+                String tagName,
+                String statementId,
+                int occurrenceIndex,
+                String convertedBody
+        ) {
+            return new StatementReplacement(tagName, statementId, occurrenceIndex, null, convertedBody);
         }
     }
 

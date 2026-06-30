@@ -47,7 +47,9 @@ public final class DamengReservedColumnRenamer {
                     end++;
                 }
                 String identifier = sql.substring(index, end);
-                String renamed = renameColumnName(identifier);
+                String renamed = shouldPreserveRownumPseudoColumn(sql, index, end)
+                        ? identifier
+                        : renameColumnName(identifier);
                 converted.append(renamed);
                 changed = changed || !identifier.equals(renamed);
                 index = end;
@@ -68,6 +70,67 @@ public final class DamengReservedColumnRenamer {
 
     public static boolean isReservedColumnName(String columnName) {
         return columnName != null && RESERVED_COLUMN_NAMES.contains(columnName.toUpperCase(Locale.ROOT));
+    }
+
+    private static boolean shouldPreserveRownumPseudoColumn(String sql, int start, int end) {
+        if (!"ROWNUM".equalsIgnoreCase(sql.substring(start, end))) {
+            return false;
+        }
+        if (previousNonWhitespace(sql, start) == '.' || nextNonWhitespace(sql, end) == '.') {
+            return false;
+        }
+        int operatorStart = skipWhitespace(sql, end);
+        int valueStart = comparisonOperatorEnd(sql, operatorStart);
+        if (valueStart < 0) {
+            return false;
+        }
+        valueStart = skipWhitespace(sql, valueStart);
+        return startsNumericLiteral(sql, valueStart);
+    }
+
+    private static char previousNonWhitespace(String value, int index) {
+        int current = index - 1;
+        while (current >= 0 && Character.isWhitespace(value.charAt(current))) {
+            current--;
+        }
+        return current < 0 ? '\0' : value.charAt(current);
+    }
+
+    private static char nextNonWhitespace(String value, int index) {
+        int current = skipWhitespace(value, index);
+        return current >= value.length() ? '\0' : value.charAt(current);
+    }
+
+    private static int skipWhitespace(String value, int index) {
+        int current = Math.max(0, index);
+        while (current < value.length() && Character.isWhitespace(value.charAt(current))) {
+            current++;
+        }
+        return current;
+    }
+
+    private static int comparisonOperatorEnd(String value, int index) {
+        if (index >= value.length()) {
+            return -1;
+        }
+        char current = value.charAt(index);
+        if (current == '=' || current == '<' || current == '>') {
+            if (index + 1 < value.length() && value.charAt(index + 1) == '=') {
+                return index + 2;
+            }
+            return index + 1;
+        }
+        return -1;
+    }
+
+    private static boolean startsNumericLiteral(String value, int index) {
+        if (index >= value.length()) {
+            return false;
+        }
+        if ((value.charAt(index) == '+' || value.charAt(index) == '-') && index + 1 < value.length()) {
+            index++;
+        }
+        return Character.isDigit(value.charAt(index));
     }
 
     private static int appendSingleQuotedString(String sql, int start, StringBuilder converted) {
