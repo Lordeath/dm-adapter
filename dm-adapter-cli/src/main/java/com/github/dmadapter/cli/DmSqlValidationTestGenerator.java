@@ -4697,7 +4697,11 @@ class DmSqlValidationTestGenerator {
                         if (scalarItem == MethodArgumentConfig.MISSING) {
                             return MethodArgumentConfig.MISSING;
                         }
-                        return new ArrayList<>(listOf(scalarItem));
+                        return new ArrayList<>(listOf(normalizeConfiguredCollectionScalarValue(
+                                collectionName,
+                                scalarItem,
+                                statement
+                        )));
                     }
                     return MethodArgumentConfig.MISSING;
                 }
