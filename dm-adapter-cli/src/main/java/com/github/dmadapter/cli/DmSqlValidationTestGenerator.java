@@ -1513,10 +1513,22 @@ class DmSqlValidationTestGenerator {
                             return;
                         }
                         if (parts.size() == 1) {
-                            metadata.addCollectionSqlFragmentDefault(
+                            Object defaultValue = defaultDynamicSqlFragmentValue(
                                     collection,
-                                    defaultDynamicSqlFragmentValue(collection, "", text, startIndex, endIndex, sqlContext)
+                                    "",
+                                    text,
+                                    startIndex,
+                                    endIndex,
+                                    sqlContext
                             );
+                            if (dynamicPlaceholderInsideSqlLiteral(text, startIndex, endIndex)) {
+                                metadata.addCollectionScalarDefault(
+                                        collection,
+                                        stripSqlLiteralQuotes(String.valueOf(defaultValue))
+                                );
+                            } else {
+                                metadata.addCollectionSqlFragmentDefault(collection, defaultValue);
+                            }
                         } else {
                             metadata.addCollectionDefault(
                                     collection,
