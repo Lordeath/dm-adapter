@@ -4863,7 +4863,7 @@ public class MapperXmlRewriter {
             return new TextRewrite(foreachBody, false);
         }
         return new TextRewrite(
-                parenthesizedBody.leading() + rewritten + parenthesizedBody.trailing(),
+                parenthesizedBody.leading() + "(" + rewritten + ")" + parenthesizedBody.trailing(),
                 true
         );
     }
