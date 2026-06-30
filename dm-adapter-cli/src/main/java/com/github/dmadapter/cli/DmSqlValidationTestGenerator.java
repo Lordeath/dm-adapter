@@ -4779,7 +4779,8 @@ class DmSqlValidationTestGenerator {
                     if (isConfiguredDateTimeLiteral(text)) {
                         return false;
                     }
-                    if (isDateLikeParameterName(normalizeName(valueName))
+                    String normalizedName = normalizeName(valueName);
+                    if (shouldReplaceGeneratedTemporalPlaceholder(normalizedName)
                             && isGeneratedTemporalPlaceholderText(text)) {
                         return true;
                     }
@@ -4795,6 +4796,11 @@ class DmSqlValidationTestGenerator {
                     return "2024".equals(text)
                             || "202401".equals(text)
                             || "20240101".equals(text);
+                }
+
+                private boolean shouldReplaceGeneratedTemporalPlaceholder(String normalizedName) {
+                    return isDateLikeParameterName(normalizedName)
+                            && !"firstdayofyear".equals(normalizedName);
                 }
 
                 private boolean isGeneratedPlaceholderText(String value) {
