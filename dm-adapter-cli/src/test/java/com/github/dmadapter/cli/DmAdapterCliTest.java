@@ -593,7 +593,7 @@ class DmAdapterCliTest {
                 .contains("statusDisplay")
                 .contains("categoryDisplay")
                 .contains("failurePatternDisplay")
-                .contains("quotedIdentifier(currentConfig.primarySchema())")
+                .contains("defaultSchemaIdentifier(valueName)")
                 .contains("validationSchemas")
                 .contains("invokeMapperMethodWithSchema")
                 .contains("isPrimitiveNullReturnFailure")
@@ -948,6 +948,8 @@ class DmAdapterCliTest {
                 .contains("statement.collectionScalarDefault(collectionName)")
                 .contains("mergeConfiguredParameterMap(value, configuredParams, statement, \"\")")
                 .contains("scalarConfiguredCollectionValue(entryPath, configuredValue, statement)")
+                .contains("mapConfiguredCollectionValue(existing, configuredValue, statement, entryPath)")
+                .contains("return new ArrayList<>(listOf(merged));")
                 .contains("scalarCollectionElementType(nestedClass)")
                 .contains("configuredScalarCollectionElement(")
                 .contains("for (Object candidate : item.values())")
@@ -1100,6 +1102,10 @@ class DmAdapterCliTest {
                 .contains("schema: \"newsee-charge-10,newsee-bill-10,newsee-owner\"");
         assertThat(Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java")))
                 .contains("primarySchema()")
+                .contains("defaultSchemaIdentifier(valueName)")
+                .contains("matchingConfiguredSchema(normalized, currentConfig.schemas())")
+                .contains("schemaQualifierName(normalizedName)")
+                .contains("normalizedSchema.contains(qualifier)")
                 .contains("SCHEMA FALLBACK");
     }
 
