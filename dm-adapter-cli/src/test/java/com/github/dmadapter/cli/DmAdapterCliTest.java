@@ -1217,6 +1217,8 @@ class DmAdapterCliTest {
                 .contains("return stripSqlLiteralQuotes(value);")
                 .contains("previousNonWhitespaceIndex(text, startIndex - 1)")
                 .contains("nextNonWhitespaceIndex(text, endIndex)")
+                .contains("Matcher directItemMatcher = Pattern.compile(")
+                .contains("if (!dynamicPlaceholderInsideSqlLiteral(text, directItemMatcher.start(), directItemMatcher.end()))")
                 .contains("defaultText.equals(strippedDefault)")
                 .contains("!configuredText.equals(strippedConfigured)")
                 .contains("&& isGeneratedPlaceholderText(defaultText)")
