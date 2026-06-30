@@ -6803,6 +6803,7 @@ class DmSqlValidationTestGenerator {
                             || normalizedName.endsWith("type")
                             || normalizedName.endsWith("sex")
                             || normalizedName.endsWith("unit")
+                            || normalizedName.endsWith("level")
                             || normalizedName.endsWith("period")
                             || normalizedName.endsWith("frequency")
                             || normalizedName.endsWith("source")
