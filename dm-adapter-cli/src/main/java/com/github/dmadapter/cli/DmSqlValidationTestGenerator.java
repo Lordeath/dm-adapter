@@ -5854,12 +5854,25 @@ class DmSqlValidationTestGenerator {
                     if (!isBlank(columnType) && !isCharacterColumnType(columnType)) {
                         return defaultValueForColumnType(valueName, Object.class, columnType);
                     }
+                    if (configuredDefault != null && isDateTimeDefaultValue(configuredDefault)) {
+                        return defaultStringDateTimeForConfiguredDefault(configuredDefault);
+                    }
                     if (configuredDefault != null) {
                         return configuredDefault;
                     }
                     return isBlank(columnType)
                             ? null
                             : defaultValueForColumnType(valueName, Object.class, columnType);
+                }
+
+                private String defaultStringDateTimeForConfiguredDefault(Object value) {
+                    if (value instanceof java.sql.Time || value instanceof LocalTime) {
+                        return "00:00:00";
+                    }
+                    if (value instanceof java.sql.Date || value instanceof LocalDate) {
+                        return "2024-01-01";
+                    }
+                    return "2024-01-01 00:00:00";
                 }
 
                 private boolean shouldPreferConfiguredSqlFragmentDefault(String valueName) {
