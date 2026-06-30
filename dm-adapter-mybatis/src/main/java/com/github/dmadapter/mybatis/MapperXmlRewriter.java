@@ -827,6 +827,16 @@ public class MapperXmlRewriter {
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
             converted = temporaryTableAsSelect.text();
         }
+        TextRewrite dynamicTemporaryTableBindSelect = splitTemporaryTableBindSelect(converted);
+        if (dynamicTemporaryTableBindSelect.changed()) {
+            appliedRules.add(MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE);
+            converted = dynamicTemporaryTableBindSelect.text();
+        }
+        TextRewrite temporaryTableBindSelect = splitTemporaryTableAsSelectWithBindParameters(converted);
+        if (temporaryTableBindSelect.changed()) {
+            appliedRules.add(MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE);
+            converted = temporaryTableBindSelect.text();
+        }
 
         String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
         if (!foreachMerge.equals(converted)) {
@@ -1289,43 +1299,210 @@ public class MapperXmlRewriter {
 
     private TextRewrite splitTemporaryTableBindSelect(String body) {
         Matcher matcher = DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_PATTERN.matcher(body);
-        StringBuffer converted = new StringBuffer();
-        boolean changed = false;
-        while (matcher.find()) {
-            String tableName = matcher.group("table");
-            String inner = matcher.group("inner");
-            String dynamicInsertSelectList = inner
-                    .replaceAll("(?is)#\\{\\s*field\\.fieldValue\\s*(?:,[^}]*)?}", "?");
-            String bindValueList = inner
-                    .replaceAll("(?is)#\\{\\s*field\\.fieldValue\\s*(?:,[^}]*)?}\\s+AS\\s+\\$\\{\\s*field\\.fieldName\\s*}", "#{field.fieldValue}");
-            String replacement = "BEGIN\n"
-                    + "      EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE "
-                    + tableName
-                    + "\n"
-                    + "      (\n"
-                    + "      <foreach collection=\"list[0]\" item=\"field\" separator=\",\">\n"
-                    + "        ${field.fieldName} VARCHAR(4000)\n"
-                    + "      </foreach>\n"
-                    + "      ) ON COMMIT PRESERVE ROWS';\n"
-                    + "      <foreach collection=\"list\" item=\"item\" separator=\";\">\n"
-                    + "        EXECUTE IMMEDIATE 'insert into "
-                    + tableName
-                    + "\n"
-                    + "        select\n"
-                    + "        "
-                    + dynamicInsertSelectList
-                    + "\n"
-                    + "        from dual' USING\n"
-                    + "        "
-                    + bindValueList
-                    + "\n"
-                    + "      </foreach>;\n"
-                    + "END;";
-            matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
-            changed = true;
+        if (!matcher.find()) {
+            return new TextRewrite(body, false);
         }
-        matcher.appendTail(converted);
-        return new TextRewrite(changed ? converted.toString() : body, changed);
+        String trailing = body.substring(matcher.end()).strip();
+        if (!body.substring(0, matcher.start()).isBlank() || !(trailing.isEmpty() || ";".equals(trailing))) {
+            return new TextRewrite(body, false);
+        }
+        String tableName = matcher.group("table");
+        String inner = matcher.group("inner");
+        String dynamicInsertSelectList = inner
+                .replaceAll("(?is)#\\{\\s*field\\.fieldValue\\s*(?:,[^}]*)?}", "?");
+        String bindValueList = inner
+                .replaceAll("(?is)#\\{\\s*field\\.fieldValue\\s*(?:,[^}]*)?}\\s+AS\\s+\\$\\{\\s*field\\.fieldName\\s*}", "#{field.fieldValue}");
+        String baseIndent = indentationOfLastLine(body.substring(0, matcher.start()));
+        String statementIndent = baseIndent + "    ";
+        String replacement = "BEGIN\n"
+                + statementIndent + "EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE "
+                + tableName
+                + "\n"
+                + statementIndent + "(\n"
+                + statementIndent + "<foreach collection=\"list[0]\" item=\"field\" separator=\",\">\n"
+                + statementIndent + "    ${field.fieldName} VARCHAR(4000)\n"
+                + statementIndent + "</foreach>\n"
+                + statementIndent + ") ON COMMIT PRESERVE ROWS';\n"
+                + statementIndent + "<foreach collection=\"list\" item=\"item\" separator=\";\">\n"
+                + statementIndent + "    EXECUTE IMMEDIATE 'insert into "
+                + tableName
+                + "\n"
+                + statementIndent + "    select\n"
+                + statementIndent + "    "
+                + dynamicInsertSelectList
+                + "\n"
+                + statementIndent + "    from dual' USING\n"
+                + statementIndent + "    "
+                + bindValueList
+                + "\n"
+                + statementIndent + "</foreach>;\n"
+                + baseIndent + "END;";
+        return new TextRewrite(
+                body.substring(0, matcher.start()) + replacement + body.substring(matcher.end()),
+                true
+        );
+    }
+
+    private TextRewrite splitTemporaryTableAsSelectWithBindParameters(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? body.length() : end + "-->".length();
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int end = body.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? body.length() : end + "]]>".length();
+            } else if (body.startsWith("--", index)) {
+                int end = body.indexOf('\n', index + 2);
+                index = end < 0 ? body.length() : end;
+            } else if (body.startsWith("/*", index)) {
+                int end = body.indexOf("*/", index + 2);
+                index = end < 0 ? body.length() : end + 2;
+            } else if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(body, index, current);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (isKeywordAt(body, index, "CREATE")) {
+                TemporaryTableSelectStatement statement = readTemporaryTableAsSelectStatement(body, index);
+                if (statement == null) {
+                    index++;
+                    continue;
+                }
+                if (isSingleTemporaryTableStatement(body, statement) && containsMyBatisBindParameter(
+                        body,
+                        statement.selectIndex(),
+                        statement.endIndex()
+                )) {
+                    String replacement = splitTemporaryTableAsSelectReplacement(body, statement);
+                    if (replacement != null) {
+                        replacements.add(new TextReplacement(statement.createIndex(), statement.endIndex(), replacement));
+                    }
+                }
+                index = statement.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(body, replacements);
+    }
+
+    private boolean isSingleTemporaryTableStatement(String body, TemporaryTableSelectStatement statement) {
+        String leading = body.substring(0, statement.createIndex());
+        String trailing = body.substring(statement.endIndex()).strip();
+        return leading.isBlank() && (trailing.isEmpty() || ";".equals(trailing));
+    }
+
+    private boolean containsMyBatisBindParameter(String body, int start, int end) {
+        int index = Math.max(0, start);
+        int limit = Math.min(body.length(), end);
+        while (index < limit) {
+            if (startsMyBatisPlaceholder(body, index)) {
+                return true;
+            }
+            index++;
+        }
+        return false;
+    }
+
+    private String splitTemporaryTableAsSelectReplacement(String body, TemporaryTableSelectStatement statement) {
+        String selectSql = stripTrailingStatementSemicolon(
+                body.substring(statement.selectIndex(), statement.endIndex())
+        ).stripTrailing();
+        String emptySelect = emptyTemporaryTableSelect(selectSql);
+        if (emptySelect == null || containsMyBatisBindParameter(emptySelect, 0, emptySelect.length())) {
+            return null;
+        }
+        String baseIndent = indentationOfLastLine(body.substring(0, statement.createIndex()));
+        String statementIndent = baseIndent + "    ";
+        String createSql = "CREATE GLOBAL TEMPORARY TABLE "
+                + statement.tableName()
+                + " ON COMMIT PRESERVE ROWS AS\n"
+                + emptySelect.stripLeading();
+        String insertSql = "INSERT INTO "
+                + statement.tableName()
+                + "\n"
+                + selectSql.stripLeading();
+        return "BEGIN\n"
+                + indentMultiline(createSql, statementIndent)
+                + ";\n"
+                + indentMultiline(insertSql, statementIndent)
+                + ";\n"
+                + baseIndent
+                + "END;";
+    }
+
+    private String emptyTemporaryTableSelect(String selectSql) {
+        if (Pattern.compile("(?is)<\\s*/?\\s*where\\b").matcher(selectSql).find()) {
+            return null;
+        }
+        SqlView view = sqlView(selectSql);
+        List<SelectScope> scopes = selectScopes(view.text());
+        SelectScope scope = scopes.stream()
+                .filter(candidate -> candidate.depth() == 0)
+                .findFirst()
+                .orElse(null);
+        if (scope == null) {
+            return null;
+        }
+        int whereIndex = findTopLevelKeyword(
+                view.text(),
+                "WHERE",
+                scope.fromIndex() + "FROM".length(),
+                scope.scopeEnd(),
+                scope.depth()
+        );
+        if (whereIndex >= 0) {
+            int whereEnd = findClauseEnd(
+                    view.text(),
+                    whereIndex + "WHERE".length(),
+                    scope.scopeEnd(),
+                    scope.depth()
+            );
+            return selectSql.substring(0, whereIndex)
+                    + "WHERE 1 = 0\n"
+                    + selectSql.substring(whereEnd);
+        }
+        int insertIndex = firstTemporaryTableEmptyPredicateInsertionIndex(view.text(), scope);
+        return selectSql.substring(0, insertIndex)
+                + "\nWHERE 1 = 0\n"
+                + selectSql.substring(insertIndex);
+    }
+
+    private int firstTemporaryTableEmptyPredicateInsertionIndex(String view, SelectScope scope) {
+        int start = scope.fromIndex() + "FROM".length();
+        int insertIndex = scope.scopeEnd();
+        int groupIndex = findTopLevelGroupBy(view, start, scope.scopeEnd(), scope.depth());
+        if (groupIndex >= 0) {
+            insertIndex = Math.min(insertIndex, groupIndex);
+        }
+        for (String keyword : List.of("HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH", "UNION")) {
+            int keywordIndex = findTopLevelKeyword(view, keyword, start, scope.scopeEnd(), scope.depth());
+            if (keywordIndex >= 0) {
+                insertIndex = Math.min(insertIndex, keywordIndex);
+            }
+        }
+        return insertIndex;
+    }
+
+    private String indentMultiline(String value, String indent) {
+        String[] lines = value.split("\\R", -1);
+        StringBuilder indented = new StringBuilder(value.length() + lines.length * indent.length());
+        for (int i = 0; i < lines.length; i++) {
+            if (i > 0) {
+                indented.append('\n');
+            }
+            if (lines[i].isBlank()) {
+                indented.append(lines[i]);
+            } else {
+                indented.append(indent).append(lines[i]);
+            }
+        }
+        return indented.toString();
     }
 
     private DynamicHavingConversion convertDynamicHavingClauses(String body) {
