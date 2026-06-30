@@ -822,6 +822,12 @@ public class MapperXmlRewriter {
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
 
+        TextRewrite temporaryTableAsSelect = convertDynamicTemporaryTableAsSelectPrefix(converted);
+        if (temporaryTableAsSelect.changed()) {
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+            converted = temporaryTableAsSelect.text();
+        }
+
         String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
         if (!foreachMerge.equals(converted)) {
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);

@@ -2119,7 +2119,7 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("create TEMPORARY table tmp_relationship_owner_20200204")
+                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT")
                 .contains("#{houseId,jdbcType=BIGINT}")
                 .doesNotContain("${houseId}");
     }
@@ -2161,7 +2161,7 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("create TEMPORARY table tmp_owner")
+                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS SELECT")
                 .contains("#{item.houseId}")
                 .doesNotContain("${item}");
     }
@@ -2204,7 +2204,7 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("create temporary table t_${tmpTableName}")
+                .contains("CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName} ON COMMIT PRESERVE ROWS AS")
                 .contains("<foreach collection=\"list\" item=\"item\" separator=\" union all \">")
                 .contains("<foreach collection=\"item\" item=\"field\" separator=\",\">")
                 .contains("#{field.fieldValue} AS ${field.fieldName}")
