@@ -4176,7 +4176,11 @@ class DmSqlValidationTestGenerator {
                                         statement
                                 );
                                 if (scalarItem != MethodArgumentConfig.MISSING) {
-                                    converted.add(scalarItem);
+                                    converted.add(normalizeConfiguredCollectionScalarValue(
+                                            valueName,
+                                            scalarItem,
+                                            statement
+                                    ));
                                     continue;
                                 }
                                 converted.add(mergeConfiguredCollectionElementMap(
@@ -5911,18 +5915,22 @@ class DmSqlValidationTestGenerator {
                     if (!collectionElementDefault.isEmpty()) {
                         value = new LinkedHashMap<>(collectionElementDefault);
                     } else {
-                        String columnType = statement == null
+                        Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
+                        if (scalarDefault != null) {
+                            value = scalarDefault;
+                        } else {
+                            String columnType = statement == null
                                 ? ""
                                 : statement.collectionColumnType(collectionName, dbColumnMetadata);
-                        if (!isBlank(columnType)) {
-                            value = defaultSqlFragmentForColumnType(collectionName, columnType);
-                        } else {
-                            Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(collectionName);
-                            if (sqlFragmentDefault != null) {
-                                value = sqlFragmentDefault;
+                            if (!isBlank(columnType)) {
+                                value = defaultSqlFragmentForColumnType(collectionName, columnType);
                             } else {
-                                Object scalarDefault = statement == null ? null : statement.collectionScalarDefault(collectionName);
-                                value = scalarDefault != null ? scalarDefault : defaultDynamicSqlFragmentValue(collectionName, "value");
+                                Object sqlFragmentDefault = statement == null
+                                        ? null
+                                        : statement.collectionSqlFragmentDefault(collectionName);
+                                value = sqlFragmentDefault != null
+                                        ? sqlFragmentDefault
+                                        : defaultDynamicSqlFragmentValue(collectionName, "value");
                             }
                         }
                     }

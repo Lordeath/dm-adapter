@@ -975,6 +975,10 @@ class DmAdapterCliTest {
                 .contains("firstCollectionElement(")
                 .contains("firstMapElementDefault(")
                 .contains("defaultElement = firstMapElementDefault(statement.collectionScalarDefault(valueName))")
+                .contains("converted.add(normalizeConfiguredCollectionScalarValue(\n"
+                        + "                            valueName,\n"
+                        + "                            scalarItem,\n"
+                        + "                            statement")
                 .contains("Map<String, Object> nestedDefault = firstMapElementDefault(values)")
                 .contains("Map<String, Object> scalarDefault = firstMapElementDefault(")
                 .contains("statement.collectionScalarDefault(collectionName)")
@@ -997,6 +1001,7 @@ class DmAdapterCliTest {
                 .contains("if (scalarItem == MethodArgumentConfig.MISSING) {")
                 .contains("return MethodArgumentConfig.MISSING;")
                 .contains("return new ArrayList<>(listOf(normalizeConfiguredCollectionScalarValue(")
+                .contains("value = scalarDefault;")
                 .contains("isGeneratedDynamicIdentifierPlaceholder(")
                 .contains("isLikelyDynamicIdentifierName(normalized)")
                 .contains("configuredArgs.valueFor(parameterName, effectiveParameterName, i)")
