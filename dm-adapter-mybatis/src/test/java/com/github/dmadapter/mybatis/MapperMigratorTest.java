@@ -2348,7 +2348,7 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("#{item.id},\n            #{item.name}");
+                .contains("(\n            #{item.id},\n            #{item.name}\n            )");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_FOREACH_TUPLE_MISSING_COMMA_RULE);
@@ -2460,7 +2460,9 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/WorkbenchAppMapper.xml"));
         assertThat(rewritten)
+                .contains("(\n            #{item.enterpriseId,jdbcType=BIGINT},")
                 .contains("#{item.orderIndex,jdbcType=INTEGER},\n            #{item.moduleIcon,jdbcType=VARCHAR}")
+                .contains("#{item.moduleIcon,jdbcType=VARCHAR}\n            )")
                 .doesNotContain("#{item.orderIndex,jdbcType=INTEGER}\n            #{item.moduleIcon,jdbcType=VARCHAR}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
