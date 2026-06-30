@@ -1907,6 +1907,26 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesTrailingStatementSemicolonsFromMapperSql() {
+        SqlConversionResult result = converter.convert("""
+                update ys_organization
+                set update_time = sys_time
+                where update_time != sys_time;
+                ;
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ys_organization
+                set update_time = sys_time
+                where update_time != sys_time
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_TRAILING_SEMICOLON_REMOVAL_RULE);
+    }
+
+    @Test
     void ignoresMysqlUserVariableMarkersInsideSafeText() {
         SqlConversionResult result = converter.convert("""
                 select '@rn := 1' as sample, #{userName}

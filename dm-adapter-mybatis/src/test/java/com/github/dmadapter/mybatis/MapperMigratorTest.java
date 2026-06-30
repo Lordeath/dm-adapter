@@ -1833,6 +1833,63 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateMergesAdjacentSetTrimBlocks() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateBatchPostManager">
+                        update ns_system_user a
+                        left join ys_user b on a.ys_user_id = b.sso_user_id
+                        <trim prefix="set" suffixOverrides=",">
+                            <trim prefix="user_key_post_manager = case" suffix="end,">
+                                <foreach collection="list" item="item">
+                                    when b.manager_sso_user_id = #{item.employNo} then #{item.userId}
+                                </foreach>
+                            </trim>
+                        </trim>
+                        <trim prefix="set" suffixOverrides=",">
+                            <trim prefix="user_key_post_manager_name = case" suffix="end,">
+                                <foreach collection="list" item="item">
+                                    when b.manager_sso_user_id = #{item.employNo} then #{item.userName}
+                                </foreach>
+                            </trim>
+                        </trim>
+                        where b.enterprise_id = #{enterpriseId}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(countMatches(rewritten, "prefix=\"set\"")).isEqualTo(1);
+        assertThat(rewritten)
+                .contains("user_key_post_manager = case")
+                .contains("user_key_post_manager_name = case");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicUpdateSetRemovesDuplicateAssignments() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

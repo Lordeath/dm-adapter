@@ -71,6 +71,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE =
             "MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_REMOVED";
+    public static final String MYSQL_TRAILING_SEMICOLON_REMOVAL_RULE = "MYSQL_TRAILING_SEMICOLON_REMOVED";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
     public static final String MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE =
@@ -674,6 +675,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
         }
 
+        GenericConversion trailingSemicolonConversion = removeTrailingStatementSemicolons(converted);
+        if (trailingSemicolonConversion.changed()) {
+            converted = trailingSemicolonConversion.convertedSql();
+            rules.add(MYSQL_TRAILING_SEMICOLON_REMOVAL_RULE);
+        }
+
         String unsupportedReason = unsupportedReason(converted);
         if (!unsupportedReason.isBlank()) {
             return manualReviewResult(original, converted, rules, unsupportedReason);
@@ -913,6 +920,34 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private boolean isMysqlUserVariableNamePart(char value) {
         return Character.isLetterOrDigit(value) || value == '_' || value == '$';
+    }
+
+    private GenericConversion removeTrailingStatementSemicolons(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String stripped = sql.stripLeading();
+        if (startsKeyword(stripped, 0, "BEGIN") || startsKeyword(stripped, 0, "DECLARE")) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        int trailingStart = sql.length();
+        while (trailingStart > 0 && Character.isWhitespace(sql.charAt(trailingStart - 1))) {
+            trailingStart--;
+        }
+        int contentEnd = trailingStart;
+        int semicolonCount = 0;
+        while (contentEnd > 0 && sql.charAt(contentEnd - 1) == ';') {
+            semicolonCount++;
+            contentEnd--;
+            while (contentEnd > 0 && Character.isWhitespace(sql.charAt(contentEnd - 1))) {
+                contentEnd--;
+            }
+        }
+        if (semicolonCount < 2) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(sql.substring(0, contentEnd) + sql.substring(trailingStart), true);
     }
 
     private String leadingWhitespace(String value) {

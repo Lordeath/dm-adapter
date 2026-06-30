@@ -29,6 +29,8 @@ public class MapperXmlRewriter {
     public static final String MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE = "MYBATIS_DYNAMIC_SET_MISSING_COMMA";
     public static final String MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE =
             "MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT";
+    public static final String MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED_RULE =
+            "MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED";
     public static final String MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE =
             "MYBATIS_DYNAMIC_WHERE_MISSING_AND";
     public static final String MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE =
@@ -872,6 +874,11 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
+            TextRewrite mergedSetTrims = mergeConsecutiveDynamicSetTrimBlocks(converted);
+            if (mergedSetTrims.changed()) {
+                appliedRules.add(MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED_RULE);
+                converted = mergedSetTrims.text();
+            }
             TextRewrite dynamicSetCommas = addMissingDynamicSetCommas(converted);
             if (dynamicSetCommas.changed()) {
                 appliedRules.add(MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE);
@@ -5157,6 +5164,73 @@ public class MapperXmlRewriter {
             }
         }
         return applyTextReplacements(body, replacements);
+    }
+
+    private TextRewrite mergeConsecutiveDynamicSetTrimBlocks(String body) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!isSetTrimOpening(body, tagStart, tag)) {
+                index = tag.endIndex();
+                continue;
+            }
+
+            int currentClosingStart = findClosingTag(body, tag.endIndex(), "trim", body.length());
+            if (currentClosingStart < 0) {
+                index = tag.endIndex();
+                continue;
+            }
+            int currentClosingEnd = xmlTagEnd(body, currentClosingStart);
+            while (currentClosingEnd > currentClosingStart) {
+                int nextStart = skipWhitespace(body, currentClosingEnd);
+                XmlTag nextTag = nextStart < body.length() && body.charAt(nextStart) == '<'
+                        ? readXmlTag(body, nextStart)
+                        : null;
+                if (!isSetTrimOpening(body, nextStart, nextTag)) {
+                    break;
+                }
+                replacements.add(new TextReplacement(
+                        currentClosingStart,
+                        nextTag.endIndex(),
+                        body.substring(currentClosingEnd, nextStart)
+                ));
+                int nextClosingStart = findClosingTag(body, nextTag.endIndex(), "trim", body.length());
+                if (nextClosingStart < 0) {
+                    break;
+                }
+                currentClosingStart = nextClosingStart;
+                currentClosingEnd = xmlTagEnd(body, currentClosingStart);
+            }
+            index = currentClosingEnd > currentClosingStart ? currentClosingEnd : tag.endIndex();
+        }
+        replacements.sort((left, right) -> Integer.compare(left.startIndex(), right.startIndex()));
+        return applyTextReplacements(body, replacements);
+    }
+
+    private boolean isSetTrimOpening(String body, int tagStart, XmlTag tag) {
+        if (tag == null
+                || tag.closing()
+                || tag.selfClosing()
+                || !"trim".equalsIgnoreCase(tag.name())) {
+            return false;
+        }
+        String openingTag = body.substring(tagStart, tag.endIndex());
+        Matcher matcher = Pattern.compile("(?is)\\bprefix\\s*=\\s*([\"'])(.*?)\\1").matcher(openingTag);
+        return matcher.find() && "set".equalsIgnoreCase(matcher.group(2).trim());
+    }
+
+    private int xmlTagEnd(String body, int tagStart) {
+        int end = body.indexOf('>', tagStart);
+        return end < 0 ? tagStart : end + 1;
     }
 
     private TextRewrite removeDuplicateDynamicSetAssignments(String body) {
