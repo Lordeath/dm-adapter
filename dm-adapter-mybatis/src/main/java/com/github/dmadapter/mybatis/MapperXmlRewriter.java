@@ -802,24 +802,6 @@ public class MapperXmlRewriter {
             addAppliedRules(appliedRules, havingConversion.appliedRules());
         }
 
-        TextRewrite temporaryTableAsSelectPrefix = convertDynamicTemporaryTableAsSelectPrefix(converted);
-        if (temporaryTableAsSelectPrefix.changed()) {
-            converted = temporaryTableAsSelectPrefix.text();
-            appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
-        }
-
-        TextRewrite temporaryTableBindSelect = splitTemporaryTableBindSelect(converted);
-        if (temporaryTableBindSelect.changed()) {
-            converted = temporaryTableBindSelect.text();
-            appliedRules.add(MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE);
-        }
-
-        TextRewrite temporaryTableForeachLiteral = inlineTemporaryTableAsSelectForeachItemParameters(converted);
-        if (temporaryTableForeachLiteral.changed()) {
-            converted = temporaryTableForeachLiteral.text();
-            appliedRules.add(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL_RULE);
-        }
-
         TextRewrite staticWhereAnd = addMissingStaticWhereAnd(converted);
         if (staticWhereAnd.changed()) {
             converted = staticWhereAnd.text();
@@ -865,22 +847,6 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
-            DynamicBodyConversion dynamicUpdateJoinWithSet = convertDynamicUpdateJoinWithSetClause(
-                    converted,
-                    statementKey,
-                    sqlConverter,
-                    rewriteConfig
-            );
-            if (dynamicUpdateJoinWithSet.changed()) {
-                addAppliedRules(appliedRules, dynamicUpdateJoinWithSet.appliedRules());
-                addManualReviewReasons(manualReviewReasons, dynamicUpdateJoinWithSet.manualReviewReasons());
-                converted = dynamicUpdateJoinWithSet.convertedBody();
-            }
-            String dynamicUpdateJoin = convertDynamicUpdateJoin(converted);
-            if (!dynamicUpdateJoin.equals(converted)) {
-                appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
-                converted = dynamicUpdateJoin;
-            }
             TextRewrite dynamicSetCommas = addMissingDynamicSetCommas(converted);
             if (dynamicSetCommas.changed()) {
                 appliedRules.add(MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE);

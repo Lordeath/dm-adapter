@@ -1,6 +1,4 @@
 package com.github.dmadapter.cli;
-
-import com.github.dmadapter.mybatis.MapperAnnotationMigrator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
@@ -81,11 +79,11 @@ class DmAdapterCliTest {
         assertThat(mapperDm)
                 .contains("<mapper namespace=\"com.example.AnnotationMapper\">")
                 .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
-                .contains("SYSDATE")
-                .contains("FETCH FIRST 1 ROWS ONLY")
-                .doesNotContain("NOW()");
+                .contains("NOW()")
+                .contains("limit 1");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
-                .contains(MapperAnnotationMigrator.MYBATIS_ANNOTATION_SQL_TO_MAPPER_DM_XML_RULE);
+                .contains("Extracted MyBatis annotation SQL to mapper-dm XML")
+                .contains("## Automatic SQL Conversions\n\nNo items.");
     }
 
     @Test
