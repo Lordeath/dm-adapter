@@ -2350,7 +2350,7 @@ class MapperMigratorTest {
                         where tenant_id = #{tenantId}
                         <if test="enabled != null">
                         </if>
-                        GROUP BY account_book, charge_item
+                        GROUP BY dataGroup, historyDataGroup
                         HAVING dataGroup is not null
                         and ifnull(dataGroup,'') != ifnull(historyDataGroup,'')
                         and totalAmount != 0
@@ -2376,6 +2376,8 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReportMapper.xml"));
         assertThat(rewritten)
+                .contains("GROUP BY (concat(account_book, '/', charge_item)), "
+                        + "(concat(account_book, '/', history_charge_item))")
                 .contains("HAVING (concat(account_book, '/', charge_item)) is not null")
                 .contains("ifnull((concat(account_book, '/', charge_item)),'') != "
                         + "ifnull((concat(account_book, '/', history_charge_item)),'')")
@@ -2389,7 +2391,8 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(
                         MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE,
-                        MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION_RULE
                 );
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
