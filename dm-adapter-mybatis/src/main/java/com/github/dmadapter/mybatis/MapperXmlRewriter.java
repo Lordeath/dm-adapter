@@ -1628,7 +1628,7 @@ public class MapperXmlRewriter {
         Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(
                 body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
         );
-        Map<String, SelectAlias> selectAliases = selectAliases(
+        Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(
                 body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
         );
         int havingStart = scope.havingIndex() + "HAVING".length();
@@ -2121,14 +2121,18 @@ public class MapperXmlRewriter {
     }
 
     private TextRewrite replaceAggregateAliases(String value, Map<String, SelectAlias> aggregateAliases) {
-        return replaceAliases(value, aggregateAliases);
+        return replaceAliases(value, aggregateAliases, false);
     }
 
     private TextRewrite replaceSelectAliases(String value, Map<String, SelectAlias> selectAliases) {
-        return replaceAliases(value, selectAliases);
+        return replaceAliases(value, selectAliases, true);
     }
 
-    private TextRewrite replaceAliases(String value, Map<String, SelectAlias> aliases) {
+    private TextRewrite replaceAliases(
+            String value,
+            Map<String, SelectAlias> aliases,
+            boolean allowFunctionArgumentExactMatch
+    ) {
         if (aliases.isEmpty()) {
             return new TextRewrite(value, false);
         }
@@ -2155,7 +2159,8 @@ public class MapperXmlRewriter {
                     continue;
                 }
                 SelectAlias alias = aliases.get(identifierKey(token.text()));
-                if (alias != null && shouldReplaceAliasToken(value, index, token, alias)) {
+                if (alias != null && shouldReplaceAliasToken(value, index, token, alias,
+                        allowFunctionArgumentExactMatch)) {
                     replacements.add(new TextReplacement(index, token.endIndex(), "(" + alias.expression() + ")"));
                 }
                 index = token.endIndex();
@@ -2166,13 +2171,19 @@ public class MapperXmlRewriter {
         return applyTextReplacements(value, replacements);
     }
 
-    private boolean shouldReplaceAliasToken(String value, int index, IdentifierToken token, SelectAlias alias) {
+    private boolean shouldReplaceAliasToken(
+            String value,
+            int index,
+            IdentifierToken token,
+            SelectAlias alias,
+            boolean allowFunctionArgumentExactMatch
+    ) {
         char previous = previousNonWhitespace(value, index);
         char next = nextNonWhitespace(value, token.endIndex());
         if (previous == '.' || next == '(') {
             return false;
         }
-        return previous != '(' || token.text().equals(alias.alias());
+        return previous != '(' || (allowFunctionArgumentExactMatch && token.text().equals(alias.alias()));
     }
 
     private TextRewrite applyTextReplacements(String value, List<TextReplacement> replacements) {
@@ -2201,11 +2212,11 @@ public class MapperXmlRewriter {
         return aliases;
     }
 
-    private Map<String, SelectAlias> selectAliases(String selectList) {
+    private Map<String, SelectAlias> nonAggregateSelectAliases(String selectList) {
         Map<String, SelectAlias> aliases = new LinkedHashMap<>();
         for (String item : splitTopLevelComma(selectList)) {
             SelectAlias selectAlias = selectAlias(item);
-            if (selectAlias != null) {
+            if (selectAlias != null && !containsAggregateFunction(selectAlias.expression())) {
                 aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias);
             }
         }
