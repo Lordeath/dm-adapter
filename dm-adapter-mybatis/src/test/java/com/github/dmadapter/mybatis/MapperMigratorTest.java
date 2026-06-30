@@ -2291,7 +2291,7 @@ class MapperMigratorTest {
                     <select id="collectByType">
                         SELECT
                         ChargeItem as typeName,
-                        SUM(ChargePaid) as chargePaid
+                        SUM(chargePaid) as chargePaid
                         from NS_Payment_ChargePayment
                         <where>
                             IsDelete = 0
@@ -2324,7 +2324,8 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReportMapper.xml"));
         assertThat(rewritten)
-                .contains("HAVING (SUM(ChargePaid)) != 0")
+                .contains("HAVING (SUM(chargePaid)) != 0")
+                .doesNotContain("SUM((SUM(chargePaid)))")
                 .doesNotContain("HAVING chargePaid != 0");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
