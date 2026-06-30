@@ -2645,7 +2645,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (arguments.size() != 2) {
             return null;
         }
-        String expression = arguments.get(0).text().trim();
+        String expression = convertDecimalConvertFunctions(arguments.get(0).text()).convertedSql().trim();
         String targetType = arguments.get(1).text().trim();
         if (expression.isBlank() || !DECIMAL_TARGET_TYPE_PATTERN.matcher(targetType).matches()) {
             return null;
