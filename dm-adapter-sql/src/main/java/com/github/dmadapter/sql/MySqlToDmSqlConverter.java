@@ -518,6 +518,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(UPDATE_SET_TABLE_ORDER_RULE);
         }
 
+        GenericConversion updateJoinConversion = convertMysqlUpdateJoin(converted);
+        if (updateJoinConversion.changed()) {
+            converted = updateJoinConversion.convertedSql();
+            rules.add(MYSQL_UPDATE_JOIN_RULE);
+        }
+
         AesBase64Conversion aesBase64Conversion = convertBase64Aes(converted);
         if (aesBase64Conversion.changed()) {
             converted = aesBase64Conversion.convertedSql();
@@ -3457,6 +3463,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (target.isBlank() || joinSource.isBlank()) {
             return GenericConversion.unchanged(sql);
         }
+        JoinSource splitJoin = splitJoinSource(joinSource);
+        if (splitJoin.sourceSql().isBlank() || !splitJoin.sourceSql().startsWith("(")) {
+            return GenericConversion.unchanged(sql);
+        }
         int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
         int statementEnd = stripTrailingSemicolon(sql);
         String setClause = sql.substring(setIndex + "SET".length(), whereIndex < 0 ? statementEnd : whereIndex).trim();
@@ -3465,29 +3475,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return GenericConversion.unchanged(sql);
         }
         if (updatesJoinedTableAlias(target, setClause)) {
-            GenericConversion multiTargetConversion = convertMultiTargetMysqlUpdateJoin(
-                    sql,
-                    updateIndex,
-                    target,
-                    joinSource,
-                    setClause,
-                    whereClause,
-                    statementEnd
-            );
-            if (multiTargetConversion.changed()) {
-                return multiTargetConversion;
-            }
             return GenericConversion.unchanged(sql);
         }
 
-        JoinSource splitJoin = splitJoinSource(joinSource);
-        if (splitJoin.sourceSql().isBlank()) {
-            return GenericConversion.unchanged(sql);
-        }
         if (findTopLevelKeyword(splitJoin.sourceSql(), "JOIN", 0) >= 0
                 || findTopLevelKeyword(splitJoin.conditionSql(), "JOIN", 0) >= 0) {
             return GenericConversion.unchanged(sql);
         }
+        String convertedSetClause = stripTargetAliasFromUpdateSetClause(target, setClause);
         List<String> whereParts = new ArrayList<>();
         if (!splitJoin.conditionSql().isBlank()) {
             whereParts.add(splitJoin.conditionSql());
@@ -3501,7 +3496,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 .append("update ")
                 .append(target)
                 .append(" set ")
-                .append(setClause)
+                .append(convertedSetClause)
                 .append(" from ")
                 .append(splitJoin.sourceSql());
         if (!whereParts.isEmpty()) {
@@ -3509,6 +3504,41 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private String stripTargetAliasFromUpdateSetClause(String target, String setClause) {
+        String targetAlias = updateTargetAlias(target);
+        if (targetAlias.isBlank()) {
+            return setClause;
+        }
+        StringBuilder converted = new StringBuilder(setClause.length());
+        int lastCopiedIndex = 0;
+        boolean changed = false;
+        for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
+            Matcher matcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
+            if (!matcher.find() || !normalizeIdentifierKey(matcher.group("alias")).equals(targetAlias)) {
+                continue;
+            }
+            converted.append(setClause, lastCopiedIndex, assignment.startIndex());
+            converted.append(assignment.text(), 0, matcher.start("alias"));
+            converted.append(updateSetColumnWithoutTargetAlias(matcher.group("column")));
+            converted.append(assignment.text().substring(matcher.end("column")));
+            lastCopiedIndex = assignment.endIndex();
+            changed = true;
+        }
+        if (!changed) {
+            return setClause;
+        }
+        converted.append(setClause.substring(lastCopiedIndex));
+        return converted.toString();
+    }
+
+    private String updateSetColumnWithoutTargetAlias(String column) {
+        String unquoted = unquoteIdentifier(column);
+        if ("DESC".equalsIgnoreCase(unquoted)) {
+            return "\"DESC\"";
+        }
+        return column;
     }
 
     private GenericConversion convertMultiTargetMysqlUpdateJoin(
