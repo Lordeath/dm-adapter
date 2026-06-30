@@ -1111,25 +1111,43 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesSingleArgumentMysqlConcatNative() {
+    void convertsSingleArgumentMysqlConcatToInnerExpression() {
         SqlConversionResult result = converter.convert(
                 "select CONCAT(DATE_FORMAT(CalcStartDate,'%Y-%m-%d')) as CalcStartDate from detail"
         );
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql())
+                .isEqualTo("select DATE_FORMAT(CalcStartDate,'%Y-%m-%d') as CalcStartDate from detail");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_ARGUMENT_CONCAT_RULE);
     }
 
     @Test
-    void leavesNestedMysqlConcatWithMyBatisPlaceholderNative() {
+    void convertsNestedSingleArgumentMysqlConcatWithMyBatisPlaceholder() {
         SqlConversionResult result = converter.convert(
                 "and cd.OwnerName like concat(concat(#{customerName}),'%')"
         );
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql()).isEqualTo("and cd.OwnerName like concat(#{customerName},'%')");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_ARGUMENT_CONCAT_RULE);
+    }
+
+    @Test
+    void convertsOwnerLikeNestedSingleArgumentMysqlConcat() {
+        SqlConversionResult result = converter.convert(
+                "and (i.house_full_name like concat('%', concat(#{ownerName}), '%') "
+                        + "or c.owner_name like concat(concat(#{ownerName}), '%'))"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("and (i.house_full_name like concat('%', #{ownerName}, '%') "
+                        + "or c.owner_name like concat(#{ownerName}, '%'))");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SINGLE_ARGUMENT_CONCAT_RULE);
     }
 
     @Test
