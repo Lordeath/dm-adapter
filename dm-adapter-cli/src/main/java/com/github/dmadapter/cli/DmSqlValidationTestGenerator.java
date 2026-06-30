@@ -2438,10 +2438,19 @@ class DmSqlValidationTestGenerator {
                             && ("value".equals(normalizedItem) || "val".equals(normalizedItem) || "item".equals(normalizedItem))) {
                         return true;
                     }
-                    return element != null
-                            && Pattern.compile("\\\\$\\\\{\\\\s*" + Pattern.quote(item == null ? "" : item) + "\\\\s*}")
-                                    .matcher(element.getTextContent() == null ? "" : element.getTextContent())
-                                    .find();
+                    if (element == null) {
+                        return false;
+                    }
+                    String text = element.getTextContent() == null ? "" : element.getTextContent();
+                    Matcher directItemMatcher = Pattern.compile(
+                            "\\\\$\\\\{\\\\s*" + Pattern.quote(item == null ? "" : item) + "\\\\s*}"
+                    ).matcher(text);
+                    while (directItemMatcher.find()) {
+                        if (!dynamicPlaceholderInsideSqlLiteral(text, directItemMatcher.start(), directItemMatcher.end())) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
 
                 private boolean isMapForeachCollectionName(String normalizedName) {
