@@ -2082,7 +2082,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicTemporaryTableAsSelectSplitsScalarForeachBindings() throws Exception {
+    void dynamicTemporaryTableAsSelectKeepsScalarForeachBindings() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -2119,19 +2119,12 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("BEGIN")
-                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS")
-                .contains("WHERE 1 = 0")
-                .contains("INSERT INTO tmp_relationship_owner_20200204")
+                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT")
                 .contains("#{houseId,jdbcType=BIGINT}")
-                .contains("GROUP BY rs.house_id")
                 .doesNotContain("${houseId}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
-                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
-                );
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
     }
 
     @Test
@@ -2171,18 +2164,12 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("BEGIN")
-                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS")
-                .contains("WHERE 1 = 0")
-                .contains("INSERT INTO tmp_owner")
+                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS SELECT")
                 .contains("#{item.houseId}")
                 .doesNotContain("${item}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
-                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
-                );
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
     }
 
     @Test
