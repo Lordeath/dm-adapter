@@ -2335,6 +2335,67 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicSelectRemovesUnusedUserVariableInitializerAcrossXmlTags() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ReportMapper">
+                    <select id="arrears">
+                        SELECT *
+                        FROM (
+                            SELECT
+                                @g := 1
+                                ,ROW_NUMBER() OVER(PARTITION BY house_id ORDER BY account_book) n
+                                ,house_id
+                                <choose>
+                                    <when test="includeMoney">
+                                        ,sum(arrears) arrears
+                                    </when>
+                                    <otherwise>
+                                        ,0 arrears
+                                    </otherwise>
+                                </choose>
+                                ,account_book
+                            FROM charge_detail
+                            <where>
+                                is_delete = 0
+                            </where>
+                        ) t
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ReportMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ReportMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReportMapper.xml"));
+        assertThat(rewritten)
+                .doesNotContain("@g := 1")
+                .contains("ROW_NUMBER() OVER(PARTITION BY house_id ORDER BY account_book) n")
+                .contains(",house_id")
+                .contains("<choose>");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicHavingRewritesComputedSelectAliasWithoutMovingItToWhere() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -2950,6 +3011,48 @@ class MapperMigratorTest {
                         MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
                         MapperXmlRewriter.MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE
                 );
+    }
+
+    @Test
+    void removesUnusedMysqlUserVariableInitializerSplitAcrossDynamicXmlNodes() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
+                select wrapped.id
+                from (
+                    select @unused := 0, u.id
+                    <if test="includeName">
+                        , u.name
+                    </if>
+                    from sys_user u
+                ) wrapped
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("select u.id")
+                .contains(", u.name")
+                .doesNotContain("@unused");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason())
+                .doesNotContain("@var")
+                .doesNotContain("MySQL user variables");
     }
 
     private int countMatches(String value, String needle) {

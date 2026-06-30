@@ -774,6 +774,10 @@ public class MapperXmlRewriter {
             addManualReviewReasons(manualReviewReasons, structuralConversion.manualReviewReasons());
             changed = true;
         }
+        if (appliedRules.contains(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE)
+                && !containsMysqlUserVariable(rewrittenBody)) {
+            manualReviewReasons.removeIf(this::isMysqlUserVariableManualReviewReason);
+        }
         return new DynamicBodyConversion(
                 rawBody,
                 changed ? rewrittenBody : rawBody,
@@ -804,6 +808,12 @@ public class MapperXmlRewriter {
         if (havingConversion.changed()) {
             converted = havingConversion.convertedBody();
             addAppliedRules(appliedRules, havingConversion.appliedRules());
+        }
+
+        TextRewrite unusedUserVariableSelectItem = removeUnusedUserVariableSelectItems(converted);
+        if (unusedUserVariableSelectItem.changed()) {
+            converted = unusedUserVariableSelectItem.text();
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
         }
 
         TextRewrite staticWhereAnd = addMissingStaticWhereAnd(converted);
@@ -1358,6 +1368,171 @@ public class MapperXmlRewriter {
             guard++;
         }
         return new DynamicHavingConversion(body, converted, appliedRules, changed);
+    }
+
+    private TextRewrite removeUnusedUserVariableSelectItems(String body) {
+        SqlView view = sqlView(body);
+        List<TextReplacement> replacements = new ArrayList<>();
+        for (SelectScope scope : selectScopes(view.text())) {
+            if (previousNonWhitespace(view.text(), scope.selectIndex()) != '(') {
+                continue;
+            }
+            int selectListStart = scope.selectIndex() + "SELECT".length();
+            List<SelectListPart> items = splitTopLevelSelectListParts(
+                    body,
+                    view.text(),
+                    selectListStart,
+                    scope.fromIndex(),
+                    scope.depth()
+            );
+            if (items.size() < 2) {
+                continue;
+            }
+            List<SelectListPart> keptItems = new ArrayList<>();
+            boolean removed = false;
+            for (SelectListPart item : items) {
+                UserVariableInitialization initialization = userVariableInitializationSelectItem(item.text());
+                if (initialization != null
+                        && !containsUserVariableReference(view.text(), initialization.name(), item.startIndex(), item.endIndex())) {
+                    removed = true;
+                } else {
+                    keptItems.add(item);
+                }
+            }
+            if (!removed || keptItems.isEmpty()) {
+                continue;
+            }
+            replacements.add(new TextReplacement(
+                    selectListStart,
+                    scope.fromIndex(),
+                    rebuildSelectList(body.substring(selectListStart, scope.fromIndex()), keptItems, selectListStart)
+            ));
+        }
+        replacements.sort((left, right) -> Integer.compare(left.startIndex(), right.startIndex()));
+        return applyTextReplacements(body, replacements);
+    }
+
+    private List<SelectListPart> splitTopLevelSelectListParts(
+            String body,
+            String view,
+            int start,
+            int end,
+            int targetDepth
+    ) {
+        List<SelectListPart> parts = new ArrayList<>();
+        int depth = depthAt(view, start);
+        int partStart = start;
+        int index = start;
+        while (index < end) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (current == ',' && depth == targetDepth) {
+                parts.add(new SelectListPart(body.substring(partStart, index), partStart, index));
+                index++;
+                partStart = index;
+            } else {
+                index++;
+            }
+        }
+        parts.add(new SelectListPart(body.substring(partStart, end), partStart, end));
+        return parts;
+    }
+
+    private String rebuildSelectList(String originalSelectList, List<SelectListPart> keptItems, int selectListStart) {
+        StringBuilder rebuilt = new StringBuilder(originalSelectList.length());
+        String leadingWhitespace = leadingWhitespace(originalSelectList);
+        SelectListPart first = keptItems.get(0);
+        if (first.startIndex() > selectListStart) {
+            rebuilt.append(leadingWhitespace);
+            rebuilt.append(first.text().stripLeading());
+        } else {
+            rebuilt.append(first.text());
+        }
+        for (int i = 1; i < keptItems.size(); i++) {
+            rebuilt.append(',');
+            rebuilt.append(keptItems.get(i).text());
+        }
+        return rebuilt.toString();
+    }
+
+    private UserVariableInitialization userVariableInitializationSelectItem(String item) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*:=\\s*"
+                        + "(?:[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)|NULL|TRUE|FALSE|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")\\s*$"
+        ).matcher(item == null ? "" : item);
+        return matcher.matches() ? new UserVariableInitialization(matcher.group("name")) : null;
+    }
+
+    private boolean containsUserVariableReference(String view, String variableName, int excludedStart, int excludedEnd) {
+        int index = 0;
+        while (index < view.length()) {
+            if (index >= excludedStart && index < excludedEnd) {
+                index = excludedEnd;
+                continue;
+            }
+            if (view.charAt(index) == '@') {
+                if (index + 1 < view.length() && view.charAt(index + 1) == '@') {
+                    index += 2;
+                    continue;
+                }
+                int nameStart = index + 1;
+                int nameEnd = nameStart;
+                while (nameEnd < view.length() && isUserVariableNamePart(view.charAt(nameEnd))) {
+                    nameEnd++;
+                }
+                if (nameEnd > nameStart
+                        && view.substring(nameStart, nameEnd).equalsIgnoreCase(variableName)) {
+                    return true;
+                }
+                index = nameEnd > nameStart ? nameEnd : index + 1;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private boolean containsMysqlUserVariable(String body) {
+        String view = sqlView(body == null ? "" : body).text();
+        int index = 0;
+        while (index < view.length()) {
+            if (view.charAt(index) == '@') {
+                if (index + 1 < view.length() && view.charAt(index + 1) == '@') {
+                    index += 2;
+                    continue;
+                }
+                int nameStart = index + 1;
+                if (nameStart < view.length() && isUserVariableNamePart(view.charAt(nameStart))) {
+                    return true;
+                }
+            }
+            index++;
+        }
+        return false;
+    }
+
+    private boolean isMysqlUserVariableManualReviewReason(String reason) {
+        return reason != null
+                && (reason.contains("MySQL user variables") || reason.contains("@var"));
+    }
+
+    private boolean isUserVariableNamePart(char value) {
+        return Character.isLetterOrDigit(value) || value == '_' || value == '$';
+    }
+
+    private String leadingWhitespace(String value) {
+        int index = 0;
+        while (index < value.length() && Character.isWhitespace(value.charAt(index))) {
+            index++;
+        }
+        return value.substring(0, index);
     }
 
     private TextRewrite inlineTemporaryTableAsSelectForeachItemParameters(String body) {
@@ -5833,6 +6008,12 @@ public class MapperXmlRewriter {
     }
 
     private record SqlView(String text) {
+    }
+
+    private record SelectListPart(String text, int startIndex, int endIndex) {
+    }
+
+    private record UserVariableInitialization(String name) {
     }
 
     private record TrimBlock(int openingStart, int contentStart, int contentEnd, int closingEnd) {
