@@ -2502,6 +2502,56 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicHavingMovesSimpleConditionsIntoExistingWhereWithoutJoiningGroupBy() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <select id="selectUsers">
+                        select status, count(*) countValue
+                        from sys_user
+                        where tenant_id = #{tenantId}
+                        <if test="enabled != null">
+                        </if>
+                        group by status
+                        having status is not null and tenant_id is not null
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("and status is not null")
+                .contains("and tenant_id is not null")
+                .contains("group by status")
+                .doesNotContain("nullgroup")
+                .doesNotContain("nullGROUP")
+                .doesNotContain("having status is not null");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicHavingMovesSimpleConditionWithoutMovingTrailingSemicolon() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

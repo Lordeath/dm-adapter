@@ -618,6 +618,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsNestedMysqlConvertDecimalToCast() {
+        SqlConversionResult result = converter.convert(
+                "SELECT CONVERT(CONVERT(price * area, DECIMAL(12, 2)) * ratio, DECIMAL(12, 2)) AS chargeSum"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT CAST(CAST(price * area AS DECIMAL(12, 2)) * ratio AS DECIMAL(12, 2)) AS chargeSum");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONVERT_DECIMAL_RULE);
+    }
+
+    @Test
     void convertsMysqlGbkOrderConvertToDamengNlssort() {
         SqlConversionResult result = converter.convert(
                 "select id from NS_Payment_ChargePayment ORDER BY CreateTime DESC,CONVERT(ChargeItem USING GBK) asc"

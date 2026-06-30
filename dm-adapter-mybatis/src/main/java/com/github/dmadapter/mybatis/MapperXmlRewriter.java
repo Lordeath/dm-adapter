@@ -1892,6 +1892,8 @@ public class MapperXmlRewriter {
             String insertion = "\n" + indent + indentBlock(joinMovedConditions(List.of(movedConditions), true), indent);
             return body.substring(0, whereBlock.closingStart())
                     + insertion
+                    + "\n"
+                    + indent
                     + body.substring(whereBlock.closingStart());
         }
 
@@ -1901,6 +1903,8 @@ public class MapperXmlRewriter {
             String insertion = "\n" + indent + indentBlock(joinMovedConditions(List.of(movedConditions), true), indent);
             return body.substring(0, scope.groupIndex())
                     + insertion
+                    + "\n"
+                    + indent
                     + body.substring(scope.groupIndex());
         }
 
