@@ -1,7 +1,9 @@
 package com.github.dmadapter.cli;
 
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -45,10 +47,11 @@ final class UpsertKeyInference {
     }
 
     private List<TableConstraint> usableConstraints(RewriteConfigCandidate candidate, List<TableConstraint> constraints) {
-        Set<String> insertedColumns = normalizedColumns(candidate.insertColumns());
+        Map<String, String> insertedColumns = normalizedColumnsByOriginal(candidate.insertColumns());
         return constraints.stream()
                 .filter(constraint -> !constraint.columns().isEmpty())
-                .filter(constraint -> insertedColumns.containsAll(normalizedColumns(constraint.columns())))
+                .map(constraint -> candidateColumnConstraint(constraint, insertedColumns))
+                .flatMap(Optional::stream)
                 .toList();
     }
 
@@ -61,6 +64,31 @@ final class UpsertKeyInference {
             }
         }
         return normalized;
+    }
+
+    private Map<String, String> normalizedColumnsByOriginal(List<String> columns) {
+        Map<String, String> normalized = new LinkedHashMap<>();
+        for (String column : columns) {
+            String clean = DamengMetadataReader.normalizeIdentifier(column);
+            if (!clean.isBlank() && clean.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+                normalized.putIfAbsent(clean, column);
+            }
+        }
+        return normalized;
+    }
+
+    private Optional<TableConstraint> candidateColumnConstraint(
+            TableConstraint constraint,
+            Map<String, String> insertedColumns
+    ) {
+        List<String> candidateColumns = constraint.columns().stream()
+                .map(DamengMetadataReader::normalizeIdentifier)
+                .map(insertedColumns::get)
+                .toList();
+        if (candidateColumns.stream().anyMatch(column -> column == null || column.isBlank())) {
+            return Optional.empty();
+        }
+        return Optional.of(new TableConstraint(constraint.name(), constraint.type(), candidateColumns));
     }
 
     private String describe(List<TableConstraint> constraints) {

@@ -1,0 +1,443 @@
+package com.github.dmadapter.cli;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+
+final class ProjectDdlKeyMetadataReader {
+    private static final Pattern CREATE_TABLE_PATTERN = Pattern.compile(
+            "(?is)\\bcreate\\s+table\\s+(?:if\\s+not\\s+exists\\s+)?"
+                    + "(?<table>(?:`[^`]+`|\"[^\"]+\"|\\[[^\\]]+\\]|[A-Za-z0-9_$-]+)"
+                    + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|\\[[^\\]]+\\]|[A-Za-z0-9_$-]+))?)\\s*\\("
+    );
+    private static final Set<String> SKIPPED_DIRECTORIES = Set.of(
+            ".git",
+            ".dm-adapter",
+            "target",
+            "build",
+            "out",
+            "node_modules"
+    );
+
+    Map<String, TableKeyMetadata> readTableKeys(Path projectRoot, List<String> tableNames) throws IOException {
+        if (projectRoot == null || !Files.isDirectory(projectRoot) || tableNames == null || tableNames.isEmpty()) {
+            return Map.of();
+        }
+        Set<String> targetTables = new LinkedHashSet<>();
+        for (String tableName : tableNames) {
+            String normalized = DamengMetadataReader.normalizeTableName(tableName);
+            if (!normalized.isBlank()) {
+                targetTables.add(normalized);
+            }
+        }
+        if (targetTables.isEmpty()) {
+            return Map.of();
+        }
+
+        Map<String, List<TableConstraint>> constraintsByTable = new LinkedHashMap<>();
+        try (Stream<Path> paths = Files.walk(projectRoot)) {
+            List<Path> sqlFiles = paths
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".sql"))
+                    .filter(path -> !isUnderSkippedDirectory(projectRoot, path))
+                    .sorted()
+                    .toList();
+            for (Path sqlFile : sqlFiles) {
+                readSqlFile(sqlFile, targetTables, constraintsByTable);
+            }
+        }
+
+        Map<String, TableKeyMetadata> metadata = new LinkedHashMap<>();
+        constraintsByTable.forEach((table, constraints) -> {
+            List<TableConstraint> uniqueConstraints = deduplicate(constraints);
+            if (!uniqueConstraints.isEmpty()) {
+                metadata.put(table, new TableKeyMetadata(table, uniqueConstraints));
+            }
+        });
+        return metadata;
+    }
+
+    private boolean isUnderSkippedDirectory(Path projectRoot, Path path) {
+        Path relative = projectRoot.relativize(path);
+        for (Path part : relative) {
+            if (SKIPPED_DIRECTORIES.contains(part.toString())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void readSqlFile(
+            Path sqlFile,
+            Set<String> targetTables,
+            Map<String, List<TableConstraint>> constraintsByTable
+    ) throws IOException {
+        String sql = stripComments(new String(Files.readAllBytes(sqlFile), StandardCharsets.UTF_8));
+        Matcher matcher = CREATE_TABLE_PATTERN.matcher(sql);
+        int searchStart = 0;
+        while (matcher.find(searchStart)) {
+            String tableName = normalizeDdlTableName(matcher.group("table"));
+            int openIndex = matcher.end() - 1;
+            int closeIndex = findMatchingParenthesis(sql, openIndex);
+            if (closeIndex < 0) {
+                searchStart = matcher.end();
+                continue;
+            }
+            if (targetTables.contains(tableName)) {
+                List<TableConstraint> constraints = constraintsByTable.computeIfAbsent(tableName, ignored -> new ArrayList<>());
+                constraints.addAll(parseTableBody(tableName, sql.substring(openIndex + 1, closeIndex)));
+            }
+            searchStart = closeIndex + 1;
+        }
+    }
+
+    private String normalizeDdlTableName(String expression) {
+        String cleaned = expression == null ? "" : expression.replaceAll("\\s+", "");
+        int dotIndex = cleaned.lastIndexOf('.');
+        if (dotIndex >= 0) {
+            cleaned = cleaned.substring(dotIndex + 1);
+        }
+        return DamengMetadataReader.normalizeTableName(unquoteIdentifier(cleaned));
+    }
+
+    private List<TableConstraint> parseTableBody(String tableName, String body) {
+        List<TableConstraint> constraints = new ArrayList<>();
+        for (String definition : splitTopLevelComma(body)) {
+            String trimmed = definition.strip();
+            if (trimmed.isBlank()) {
+                continue;
+            }
+            parseTableConstraint(tableName, trimmed).ifPresent(constraints::add);
+            parseColumnConstraint(tableName, trimmed).ifPresent(constraints::add);
+        }
+        return constraints;
+    }
+
+    private Optional<TableConstraint> parseTableConstraint(String tableName, String definition) {
+        String lower = stripSingleQuotedLiterals(definition).strip().toLowerCase(Locale.ROOT);
+        if (lower.startsWith("primary key")) {
+            return columnsInFirstParentheses(definition)
+                    .map(columns -> new TableConstraint(
+                            "PRIMARY",
+                            TableConstraint.ConstraintType.PRIMARY_KEY,
+                            columns
+                    ));
+        }
+        if (lower.startsWith("unique ")) {
+            return parseUniqueConstraint(definition, "UK_" + tableName.toUpperCase(Locale.ROOT));
+        }
+        if (!lower.startsWith("constraint ")) {
+            return Optional.empty();
+        }
+        IdentifierToken constraintName = identifierAt(definition, "constraint".length());
+        if (constraintName == null) {
+            return Optional.empty();
+        }
+        String rest = definition.substring(constraintName.end()).stripLeading();
+        String restLower = stripSingleQuotedLiterals(rest).toLowerCase(Locale.ROOT);
+        if (restLower.startsWith("primary key")) {
+            return columnsInFirstParentheses(rest)
+                    .map(columns -> new TableConstraint(
+                            constraintName.value(),
+                            TableConstraint.ConstraintType.PRIMARY_KEY,
+                            columns
+                    ));
+        }
+        if (restLower.startsWith("unique ")) {
+            return parseUniqueConstraint(rest, constraintName.value());
+        }
+        return Optional.empty();
+    }
+
+    private Optional<TableConstraint> parseUniqueConstraint(String definition, String defaultName) {
+        int offset = wordEnd(definition, 0);
+        IdentifierToken typeToken = identifierAt(definition, offset);
+        if (typeToken != null
+                && ("key".equalsIgnoreCase(typeToken.value()) || "index".equalsIgnoreCase(typeToken.value()))) {
+            offset = typeToken.end();
+        }
+        IdentifierToken nameToken = identifierAt(definition, offset);
+        String name = defaultName;
+        if (nameToken != null) {
+            int next = skipWhitespace(definition, nameToken.end());
+            if (next < definition.length() && definition.charAt(next) != '(') {
+                name = nameToken.value();
+                offset = nameToken.end();
+            } else if (next < definition.length() && definition.charAt(next) == '(') {
+                name = nameToken.value();
+            }
+        }
+        String constraintName = name;
+        String columnText = definition.substring(offset);
+        return columnsInFirstParentheses(columnText)
+                .map(columns -> new TableConstraint(
+                        constraintName,
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        columns
+                ));
+    }
+
+    private Optional<TableConstraint> parseColumnConstraint(String tableName, String definition) {
+        IdentifierToken column = identifierAt(definition, 0);
+        if (column == null || isConstraintKeyword(column.value())) {
+            return Optional.empty();
+        }
+        String keywordText = stripSingleQuotedLiterals(definition.substring(column.end())).toLowerCase(Locale.ROOT);
+        if (Pattern.compile("(?is)\\bprimary\\s+key\\b").matcher(keywordText).find()) {
+            return Optional.of(new TableConstraint(
+                    "PRIMARY",
+                    TableConstraint.ConstraintType.PRIMARY_KEY,
+                    List.of(column.value())
+            ));
+        }
+        if (Pattern.compile("(?is)\\bunique\\b").matcher(keywordText).find()) {
+            return Optional.of(new TableConstraint(
+                    "UK_" + tableName.toUpperCase(Locale.ROOT) + "_" + column.value(),
+                    TableConstraint.ConstraintType.UNIQUE_KEY,
+                    List.of(column.value())
+            ));
+        }
+        return Optional.empty();
+    }
+
+    private boolean isConstraintKeyword(String word) {
+        return "primary".equalsIgnoreCase(word)
+                || "unique".equalsIgnoreCase(word)
+                || "key".equalsIgnoreCase(word)
+                || "index".equalsIgnoreCase(word)
+                || "constraint".equalsIgnoreCase(word);
+    }
+
+    private Optional<List<String>> columnsInFirstParentheses(String text) {
+        int openIndex = text.indexOf('(');
+        if (openIndex < 0) {
+            return Optional.empty();
+        }
+        int closeIndex = findMatchingParenthesis(text, openIndex);
+        if (closeIndex < 0) {
+            return Optional.empty();
+        }
+        List<String> columns = new ArrayList<>();
+        for (String part : splitTopLevelComma(text.substring(openIndex + 1, closeIndex))) {
+            IdentifierToken column = identifierAt(part, 0);
+            if (column != null && !column.value().isBlank()) {
+                columns.add(column.value());
+            }
+        }
+        return columns.isEmpty() ? Optional.empty() : Optional.of(columns);
+    }
+
+    private List<TableConstraint> deduplicate(List<TableConstraint> constraints) {
+        List<TableConstraint> result = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (TableConstraint constraint : constraints) {
+            String key = constraint.type() + ":" + normalizedColumns(constraint.columns());
+            if (seen.add(key)) {
+                result.add(constraint);
+            }
+        }
+        return result;
+    }
+
+    private List<String> normalizedColumns(List<String> columns) {
+        return columns.stream()
+                .map(DamengMetadataReader::normalizeIdentifier)
+                .toList();
+    }
+
+    private List<String> splitTopLevelComma(String text) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        char quote = '\0';
+        for (int i = 0; i < text.length(); i++) {
+            char current = text.charAt(i);
+            if (quote != '\0') {
+                if (current == quote) {
+                    quote = '\0';
+                }
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+                continue;
+            }
+            if (current == '(') {
+                depth++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+            } else if (current == ',' && depth == 0) {
+                parts.add(text.substring(start, i));
+                start = i + 1;
+            }
+        }
+        parts.add(text.substring(start));
+        return parts;
+    }
+
+    private int findMatchingParenthesis(String text, int openIndex) {
+        int depth = 0;
+        char quote = '\0';
+        for (int i = openIndex; i < text.length(); i++) {
+            char current = text.charAt(i);
+            if (quote != '\0') {
+                if (current == quote) {
+                    quote = '\0';
+                }
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+                continue;
+            }
+            if (current == '(') {
+                depth++;
+            } else if (current == ')') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private String stripComments(String sql) {
+        StringBuilder stripped = new StringBuilder(sql.length());
+        char quote = '\0';
+        for (int i = 0; i < sql.length(); i++) {
+            char current = sql.charAt(i);
+            if (quote != '\0') {
+                stripped.append(current);
+                if (current == quote) {
+                    quote = '\0';
+                }
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+                stripped.append(current);
+                continue;
+            }
+            if (current == '-' && i + 1 < sql.length() && sql.charAt(i + 1) == '-') {
+                i += 2;
+                while (i < sql.length() && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') {
+                    i++;
+                }
+                stripped.append('\n');
+                continue;
+            }
+            if (current == '#') {
+                while (i < sql.length() && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') {
+                    i++;
+                }
+                stripped.append('\n');
+                continue;
+            }
+            if (current == '/' && i + 1 < sql.length() && sql.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < sql.length() && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) {
+                    if (sql.charAt(i) == '\n') {
+                        stripped.append('\n');
+                    }
+                    i++;
+                }
+                i++;
+                continue;
+            }
+            stripped.append(current);
+        }
+        return stripped.toString();
+    }
+
+    private String stripSingleQuotedLiterals(String text) {
+        StringBuilder stripped = new StringBuilder(text.length());
+        boolean inQuote = false;
+        for (int i = 0; i < text.length(); i++) {
+            char current = text.charAt(i);
+            if (current == '\'') {
+                inQuote = !inQuote;
+                stripped.append(' ');
+                continue;
+            }
+            stripped.append(inQuote ? ' ' : current);
+        }
+        return stripped.toString();
+    }
+
+    private IdentifierToken identifierAt(String text, int offset) {
+        int start = skipWhitespace(text, offset);
+        if (start >= text.length() || text.charAt(start) == '(') {
+            return null;
+        }
+        char current = text.charAt(start);
+        if (current == '`' || current == '"') {
+            int end = text.indexOf(current, start + 1);
+            if (end < 0) {
+                return null;
+            }
+            return new IdentifierToken(text.substring(start + 1, end), end + 1);
+        }
+        if (current == '[') {
+            int end = text.indexOf(']', start + 1);
+            if (end < 0) {
+                return null;
+            }
+            return new IdentifierToken(text.substring(start + 1, end), end + 1);
+        }
+        int end = start;
+        while (end < text.length()) {
+            char c = text.charAt(end);
+            if (Character.isWhitespace(c) || c == '(' || c == ',' || c == ')') {
+                break;
+            }
+            end++;
+        }
+        if (end == start) {
+            return null;
+        }
+        return new IdentifierToken(unquoteIdentifier(text.substring(start, end)), end);
+    }
+
+    private int skipWhitespace(String text, int offset) {
+        int index = Math.max(0, offset);
+        while (index < text.length() && Character.isWhitespace(text.charAt(index))) {
+            index++;
+        }
+        return index;
+    }
+
+    private int wordEnd(String text, int offset) {
+        int start = skipWhitespace(text, offset);
+        int end = start;
+        while (end < text.length() && Character.isLetter(text.charAt(end))) {
+            end++;
+        }
+        return end;
+    }
+
+    private String unquoteIdentifier(String identifier) {
+        String cleaned = identifier == null ? "" : identifier.trim();
+        if ((cleaned.startsWith("`") && cleaned.endsWith("`"))
+                || (cleaned.startsWith("\"") && cleaned.endsWith("\""))
+                || (cleaned.startsWith("[") && cleaned.endsWith("]"))) {
+            return cleaned.substring(1, cleaned.length() - 1);
+        }
+        return cleaned;
+    }
+
+    private record IdentifierToken(String value, int end) {
+    }
+}

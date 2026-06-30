@@ -51,4 +51,27 @@ class InsertColumnExtractorTest {
         assertThat(InsertColumnExtractor.columns(sql, "user_extend"))
                 .containsExactly("user_id", "key_name");
     }
+
+    @Test
+    void extractsFixedColumnFromDynamicMapColumnList() {
+        String sql = """
+                INSERT INTO ns_project_management_extend (foreignKeyId
+                    <foreach collection="dynamicMap.keys" item="key" open="," separator=",">
+                        `${key}`
+                    </foreach>
+                )
+                VALUES (#{id, jdbcType=BIGINT}
+                    <foreach collection="dynamicMap.values" item="value" open="," separator=",">
+                        #{value}
+                    </foreach>
+                )
+                ON DUPLICATE KEY UPDATE
+                    <foreach collection="dynamicMap" index="key" item="value" separator=",">
+                        `${key}` = VALUES(`${key}`)
+                    </foreach>
+                """;
+
+        assertThat(InsertColumnExtractor.columns(sql, "ns_project_management_extend"))
+                .containsExactly("foreignKeyId");
+    }
 }
