@@ -5505,6 +5505,11 @@ class DmSqlValidationTestGenerator {
                             target.put(entry.getKey(), scalarCollection);
                             continue;
                         }
+                        Object mapCollection = mapConfiguredCollectionValue(existing, configuredValue, statement, entryPath);
+                        if (mapCollection != MethodArgumentConfig.MISSING) {
+                            target.put(entry.getKey(), mapCollection);
+                            continue;
+                        }
                         if (existing == null && isGeneratedNullPlaceholderValue(configuredValue)) {
                             continue;
                         }
@@ -5536,6 +5541,29 @@ class DmSqlValidationTestGenerator {
                         }
                         target.put(entry.getKey(), configuredValue);
                     }
+                }
+
+                @SuppressWarnings("unchecked")
+                private Object mapConfiguredCollectionValue(
+                        Object existing,
+                        Object configuredValue,
+                        MapperStatement statement,
+                        String pathPrefix
+                ) {
+                    if (!(existing instanceof Collection<?>) || !(configuredValue instanceof Map<?, ?>)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    Object first = firstCollectionElement((Collection<?>) existing);
+                    if (!(first instanceof Map<?, ?>)) {
+                        return MethodArgumentConfig.MISSING;
+                    }
+                    Map<String, Object> merged = mergeConfiguredCollectionElementMap(
+                            new LinkedHashMap<>((Map<String, Object>) first),
+                            new LinkedHashMap<>((Map<String, Object>) configuredValue),
+                            statement,
+                            pathPrefix
+                    );
+                    return new ArrayList<>(listOf(merged));
                 }
 
                 @SuppressWarnings("unchecked")
@@ -6091,9 +6119,41 @@ class DmSqlValidationTestGenerator {
                     if (isSchemaIdentifierName(normalized)
                             && currentConfig != null
                             && !isBlank(currentConfig.primarySchema())) {
-                        return quotedIdentifier(currentConfig.primarySchema());
+                        return defaultSchemaIdentifier(valueName);
                     }
                     return "ID";
+                }
+
+                private String defaultSchemaIdentifier(String valueName) {
+                    String normalized = normalizeName(valueName);
+                    String defaultSchema = matchingConfiguredSchema(normalized, currentConfig.schemas());
+                    if (isBlank(defaultSchema)) {
+                        defaultSchema = currentConfig.primarySchema();
+                    }
+                    return quotedIdentifier(defaultSchema);
+                }
+
+                private String matchingConfiguredSchema(String normalizedName, List<String> schemas) {
+                    String qualifier = schemaQualifierName(normalizedName);
+                    if (qualifier.length() < 3) {
+                        return "";
+                    }
+                    for (String schema : schemas) {
+                        String normalizedSchema = normalizeName(schema);
+                        if (normalizedSchema.contains(qualifier)) {
+                            return schema;
+                        }
+                    }
+                    return "";
+                }
+
+                private String schemaQualifierName(String normalizedName) {
+                    for (String suffix : new String[] {"schemaname", "schema", "databasename", "database"}) {
+                        if (normalizedName.endsWith(suffix) && normalizedName.length() > suffix.length()) {
+                            return normalizedName.substring(0, normalizedName.length() - suffix.length());
+                        }
+                    }
+                    return "";
                 }
 
                 private String defaultDynamicSqlFragmentValue(String collectionName, String propertyName) {
