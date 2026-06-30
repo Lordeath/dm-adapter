@@ -875,6 +875,8 @@ class DmAdapterCliTest {
                 .contains("isYearLikeParameterName")
                 .contains("isGeneratedTemporalPlaceholderText(text)")
                 .contains("private boolean isGeneratedTemporalPlaceholderText(String value)")
+                .contains("private boolean shouldReplaceGeneratedTemporalPlaceholder(String normalizedName)")
+                .contains("&& !\"firstdayofyear\".equals(normalizedName)")
                 .contains("normalizedName.contains(\"thisday\")")
                 .contains("hasTemporalRangeQualifier")
                 .contains("shouldPreferConfiguredSqlFragmentDefault")
