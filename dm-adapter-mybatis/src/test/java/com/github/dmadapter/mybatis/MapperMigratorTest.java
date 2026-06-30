@@ -2082,7 +2082,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicTemporaryTableAsSelectInlinesScalarForeachItems() throws Exception {
+    void dynamicTemporaryTableAsSelectSplitsScalarForeachBindings() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -2119,9 +2119,19 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT")
+                .contains("BEGIN")
+                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS")
+                .contains("WHERE 1 = 0")
+                .contains("INSERT INTO tmp_relationship_owner_20200204")
                 .contains("#{houseId,jdbcType=BIGINT}")
+                .contains("GROUP BY rs.house_id")
                 .doesNotContain("${houseId}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
+                );
     }
 
     @Test
@@ -2161,9 +2171,18 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS SELECT")
+                .contains("BEGIN")
+                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS")
+                .contains("WHERE 1 = 0")
+                .contains("INSERT INTO tmp_owner")
                 .contains("#{item.houseId}")
                 .doesNotContain("${item}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
+                );
     }
 
     @Test
@@ -2204,11 +2223,23 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName} ON COMMIT PRESERVE ROWS AS")
-                .contains("<foreach collection=\"list\" item=\"item\" separator=\" union all \">")
+                .contains("BEGIN")
+                .contains("EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName}")
+                .contains(") ON COMMIT PRESERVE ROWS'")
+                .contains("<foreach collection=\"list[0]\" item=\"field\" separator=\",\">")
+                .contains("${field.fieldName} VARCHAR(4000)")
+                .contains("<foreach collection=\"list\" item=\"item\" separator=\";\">")
+                .contains("EXECUTE IMMEDIATE 'insert into t_${tmpTableName}")
                 .contains("<foreach collection=\"item\" item=\"field\" separator=\",\">")
-                .contains("#{field.fieldValue} AS ${field.fieldName}")
-                .doesNotContain("BEGIN");
+                .contains("#{field.fieldValue}")
+                .contains("USING")
+                .doesNotContain("#{field.fieldValue} AS ${field.fieldName}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
+                );
     }
 
     @Test
