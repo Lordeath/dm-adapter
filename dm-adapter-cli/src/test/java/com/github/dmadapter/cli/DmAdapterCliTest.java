@@ -570,6 +570,8 @@ class DmAdapterCliTest {
                 .contains("normalizedName.endsWith(\"source\")")
                 .contains("normalizedName.endsWith(\"entity\")")
                 .contains("normalizedName.endsWith(\"level\")")
+                .contains("\"shelves\".equals(normalizedName)")
+                .contains("\"servicework\".equals(normalizedName)")
                 .contains("normalizedName.contains(\"collectionorsettlement\")")
                 .contains("normalizedName.contains(\"rewardorpunish\")")
                 .contains("isOptionalSearchParameterName")

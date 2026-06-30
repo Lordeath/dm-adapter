@@ -6808,6 +6808,8 @@ class DmSqlValidationTestGenerator {
                             || normalizedName.endsWith("frequency")
                             || normalizedName.endsWith("source")
                             || normalizedName.endsWith("entity")
+                            || "shelves".equals(normalizedName)
+                            || "servicework".equals(normalizedName)
                             || normalizedName.startsWith("has")
                             || normalizedName.startsWith("sync")
                             || "syncpwd".equals(normalizedName)
