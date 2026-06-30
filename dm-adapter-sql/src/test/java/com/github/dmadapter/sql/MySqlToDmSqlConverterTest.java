@@ -1872,6 +1872,41 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesUnusedMysqlUserVariableInitializerFromDerivedSelect() {
+        SqlConversionResult result = converter.convert("""
+                select wrapped.id
+                from (
+                    select @unused := 0, user.id
+                    from user
+                ) wrapped
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select wrapped.id
+                from (
+                    select user.id
+                    from user
+                ) wrapped
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
+    }
+
+    @Test
+    void keepsMysqlUserVariableInitializerWhenVariableIsReferencedElsewhere() {
+        SqlConversionResult result = converter.convert("""
+                select @rn := @rn + 1 row_num, t.*
+                from bill t, (select @rn := 0, 1 as seed) vars
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("@var");
+    }
+
+    @Test
     void ignoresMysqlUserVariableMarkersInsideSafeText() {
         SqlConversionResult result = converter.convert("""
                 select '@rn := 1' as sample, #{userName}
@@ -2247,6 +2282,54 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.changed()).isFalse();
         assertThat(result.reason()).contains("REGEXP");
+    }
+
+    @Test
+    void removesUnusedUserVariableInitializerFromDerivedSelect() {
+        SqlConversionResult result = converter.convert("""
+                select *
+                from (
+                    select
+                        @g := 1
+                        ,row_number() over(order by id) n
+                        ,id
+                    from user
+                ) t
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .doesNotContain("@g")
+                .contains("select\n        row_number() over(order by id) n")
+                .contains("        ,id\n    from user");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
+    }
+
+    @Test
+    void keepsReferencedUserVariableInitializerForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                select *
+                from (
+                    select @g := 1, @g := @g + 1 as n, id
+                    from user
+                ) t
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("MySQL user variables");
+        assertThat(result.convertedSql()).contains("@g := 1");
+    }
+
+    @Test
+    void keepsTopLevelUserVariableInitializerForManualReview() {
+        SqlConversionResult result = converter.convert("select @g := 1, id from user");
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("MySQL user variables");
     }
 
     @Test

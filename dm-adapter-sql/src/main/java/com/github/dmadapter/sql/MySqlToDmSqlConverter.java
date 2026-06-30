@@ -69,6 +69,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CONVERT_CHAR_RULE = "MYSQL_CONVERT_CHAR_TO_CAST";
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
+    public static final String MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE =
+            "MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_REMOVED";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
     public static final String MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE =
@@ -666,6 +668,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
         }
 
+        GenericConversion unusedUserVariableSelectItemConversion = removeUnusedUserVariableSelectItems(converted);
+        if (unusedUserVariableSelectItemConversion.changed()) {
+            converted = unusedUserVariableSelectItemConversion.convertedSql();
+            rules.add(MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
+        }
+
         String unsupportedReason = unsupportedReason(converted);
         if (!unsupportedReason.isBlank()) {
             return manualReviewResult(original, converted, rules, unsupportedReason);
@@ -759,6 +767,160 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private boolean isMysqlUserVariablePart(char value) {
         return Character.isLetterOrDigit(value) || value == '_' || value == '$' || value == '.' || value == '`';
+    }
+
+    private GenericConversion removeUnusedUserVariableSelectItems(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "SELECT")) {
+                addUnusedUserVariableSelectItemReplacement(sql, index, replacements);
+                index += "SELECT".length();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(sql, replacements);
+    }
+
+    private void addUnusedUserVariableSelectItemReplacement(
+            String sql,
+            int selectIndex,
+            List<TextReplacement> replacements
+    ) {
+        if (previousNonWhitespace(sql, selectIndex) != '(') {
+            return;
+        }
+        int selectListStart = selectIndex + "SELECT".length();
+        int fromIndex = findTopLevelKeyword(sql, "FROM", selectListStart);
+        if (fromIndex < 0) {
+            return;
+        }
+        String selectList = sql.substring(selectListStart, fromIndex);
+        List<TopLevelArgument> items = splitTopLevelArguments(selectList);
+        if (items.size() < 2) {
+            return;
+        }
+        List<TopLevelArgument> keptItems = new ArrayList<>();
+        boolean removed = false;
+        for (TopLevelArgument item : items) {
+            UserVariableInitialization initialization = userVariableInitializationSelectItem(item.text());
+            int itemStart = selectListStart + item.startIndex();
+            int itemEnd = selectListStart + item.endIndex();
+            if (initialization != null
+                    && !containsMysqlUserVariableReference(sql, initialization.name(), itemStart, itemEnd)) {
+                removed = true;
+            } else {
+                keptItems.add(item);
+            }
+        }
+        if (!removed || keptItems.isEmpty()) {
+            return;
+        }
+        replacements.add(new TextReplacement(
+                selectListStart,
+                fromIndex,
+                rebuildSelectList(selectList, keptItems)
+        ));
+    }
+
+    private String rebuildSelectList(String originalSelectList, List<TopLevelArgument> keptItems) {
+        StringBuilder rebuilt = new StringBuilder(originalSelectList.length());
+        String leadingWhitespace = leadingWhitespace(originalSelectList);
+        TopLevelArgument first = keptItems.get(0);
+        if (first.startIndex() > 0) {
+            rebuilt.append(leadingWhitespace);
+            rebuilt.append(first.text().stripLeading());
+        } else {
+            rebuilt.append(first.text());
+        }
+        for (int i = 1; i < keptItems.size(); i++) {
+            rebuilt.append(',');
+            rebuilt.append(keptItems.get(i).text());
+        }
+        return rebuilt.toString();
+    }
+
+    private UserVariableInitialization userVariableInitializationSelectItem(String item) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*:=\\s*"
+                        + "(?:[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)|NULL|TRUE|FALSE|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")\\s*$"
+        ).matcher(item == null ? "" : item);
+        return matcher.matches() ? new UserVariableInitialization(matcher.group("name")) : null;
+    }
+
+    private boolean containsMysqlUserVariableReference(
+            String sql,
+            String variableName,
+            int excludedStart,
+            int excludedEnd
+    ) {
+        int index = 0;
+        while (index < sql.length()) {
+            if (index >= excludedStart && index < excludedEnd) {
+                index = excludedEnd;
+                continue;
+            }
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '@') {
+                if (index + 1 < sql.length() && sql.charAt(index + 1) == '@') {
+                    index += 2;
+                    continue;
+                }
+                int nameStart = index + 1;
+                int nameEnd = nameStart;
+                while (nameEnd < sql.length() && isMysqlUserVariableNamePart(sql.charAt(nameEnd))) {
+                    nameEnd++;
+                }
+                if (nameEnd > nameStart
+                        && sql.substring(nameStart, nameEnd).equalsIgnoreCase(variableName)) {
+                    return true;
+                }
+                index = nameEnd > nameStart ? nameEnd : index + 1;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private boolean isMysqlUserVariableNamePart(char value) {
+        return Character.isLetterOrDigit(value) || value == '_' || value == '$';
+    }
+
+    private String leadingWhitespace(String value) {
+        int index = 0;
+        while (index < value.length() && Character.isWhitespace(value.charAt(index))) {
+            index++;
+        }
+        return value.substring(0, index);
     }
 
     private GenericConversion convertSingleQuotedAliases(String sql) {
@@ -6995,6 +7157,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record TopLevelArgument(String text, int startIndex, int endIndex) {
+    }
+
+    private record UserVariableInitialization(String name) {
     }
 
     private record GroupConcatOrderBy(String orderBy, String separator) {
