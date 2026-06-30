@@ -48,6 +48,27 @@ class UpsertKeyInferenceTest {
     }
 
     @Test
+    void keepsInsertColumnSpellingWhenConstraintCaseDiffers() {
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.PrecinctMapper.updateExtend",
+                "ns_project_management_extend",
+                List.of("foreignKeyId")
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("ns_project_management_extend", List.of(
+                new TableConstraint(
+                        "ns_project_management_extend_foreignerKeyId_Index",
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        List.of("foreignkeyId")
+                )
+        ));
+
+        UpsertKeyInference.InferenceResult result = inference.infer(candidate, metadata).orElseThrow();
+
+        assertThat(result.inferred()).isTrue();
+        assertThat(result.keyColumns()).containsExactly("foreignKeyId");
+    }
+
+    @Test
     void leavesAmbiguousUniqueKeysUnresolved() {
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
                 "com.example.UserMapper.upsert",

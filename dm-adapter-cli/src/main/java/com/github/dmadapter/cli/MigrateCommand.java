@@ -22,6 +22,7 @@ import picocli.CommandLine.Option;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -83,6 +84,7 @@ public class MigrateCommand implements Callable<Integer> {
     private final SqlRewriteConfigLoader sqlRewriteConfigLoader = new SqlRewriteConfigLoader();
     private final SqlRewriteConfigUpdater sqlRewriteConfigUpdater = new SqlRewriteConfigUpdater();
     private final DamengMetadataReader damengMetadataReader = new DamengMetadataReader();
+    private final ProjectDdlKeyMetadataReader projectDdlKeyMetadataReader = new ProjectDdlKeyMetadataReader();
     private final MapperJdbcTypeAligner mapperJdbcTypeAligner = new MapperJdbcTypeAligner();
     private final MavenCompilePreparer mavenCompilePreparer = new MavenCompilePreparer();
     private final ReportWriter reportWriter = new ReportWriter();
@@ -310,21 +312,24 @@ public class MigrateCommand implements Callable<Integer> {
         if (candidates.isEmpty()) {
             return new MetadataLookupResult(Map.of(), false, List.of());
         }
+        List<String> warnings = new ArrayList<>();
+        Map<String, TableKeyMetadata> ddlMetadata = projectDdlMetadataForRewriteCandidates(context, candidates, warnings);
         DmValidationEnvironment environment = DmValidationEnvironment.fromSystem();
         if (!environment.validationEnabled()) {
-            return new MetadataLookupResult(Map.of(), false, List.of());
+            return new MetadataLookupResult(ddlMetadata, !ddlMetadata.isEmpty(), warnings);
         }
         if (!environment.ready()) {
+            warnings.add("DM_SQL_VALIDATION is true but metadata inference was skipped because required variables are missing: "
+                    + environment.missingVariables());
             return new MetadataLookupResult(
-                    Map.of(),
-                    false,
-                    List.of("DM_SQL_VALIDATION is true but metadata inference was skipped because required variables are missing: "
-                            + environment.missingVariables())
+                    ddlMetadata,
+                    !ddlMetadata.isEmpty(),
+                    warnings
             );
         }
         try {
             Optional<String> configuredSchema = configuredSchema(context);
-            Map<String, TableKeyMetadata> metadata = runWithMetadataTimeout(
+            Map<String, TableKeyMetadata> dmMetadata = runWithMetadataTimeout(
                     () -> damengMetadataReader.readTableKeys(
                             environment,
                             configuredSchema,
@@ -334,13 +339,70 @@ public class MigrateCommand implements Callable<Integer> {
                     TimeUnit.SECONDS,
                     "Dameng metadata inference"
             );
-            return new MetadataLookupResult(metadata, true, List.of());
+            Map<String, TableKeyMetadata> metadata = mergeMetadata(dmMetadata, ddlMetadata);
+            return new MetadataLookupResult(metadata, !metadata.isEmpty(), warnings);
         } catch (Exception e) {
+            warnings.add("Dameng metadata inference was skipped: " + redact(e.getMessage(), environment));
             return new MetadataLookupResult(
-                    Map.of(),
-                    false,
-                    List.of("Dameng metadata inference was skipped: " + redact(e.getMessage(), environment))
+                    ddlMetadata,
+                    !ddlMetadata.isEmpty(),
+                    warnings
             );
+        }
+    }
+
+    private Map<String, TableKeyMetadata> projectDdlMetadataForRewriteCandidates(
+            AdapterContext context,
+            List<RewriteConfigCandidate> candidates,
+            List<String> warnings
+    ) {
+        try {
+            return projectDdlKeyMetadataReader.readTableKeys(
+                    context.projectRoot(),
+                    candidates.stream().map(RewriteConfigCandidate::tableName).distinct().toList()
+            );
+        } catch (Exception e) {
+            warnings.add("Project DDL metadata inference was skipped: " + e.getMessage());
+            return Map.of();
+        }
+    }
+
+    private Map<String, TableKeyMetadata> mergeMetadata(
+            Map<String, TableKeyMetadata> primary,
+            Map<String, TableKeyMetadata> secondary
+    ) {
+        Map<String, TableKeyMetadata> merged = new LinkedHashMap<>();
+        if (primary != null) {
+            primary.forEach((table, metadata) -> merged.put(
+                    DamengMetadataReader.normalizeTableName(table),
+                    metadata
+            ));
+        }
+        if (secondary != null) {
+            secondary.forEach((table, metadata) -> {
+                String normalizedTable = DamengMetadataReader.normalizeTableName(table);
+                merged.merge(normalizedTable, metadata, this::mergeMetadata);
+            });
+        }
+        return merged;
+    }
+
+    private TableKeyMetadata mergeMetadata(TableKeyMetadata primary, TableKeyMetadata secondary) {
+        List<TableConstraint> constraints = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        addConstraints(constraints, seen, primary.constraints());
+        addConstraints(constraints, seen, secondary.constraints());
+        return new TableKeyMetadata(primary.tableName().isBlank() ? secondary.tableName() : primary.tableName(), constraints);
+    }
+
+    private void addConstraints(List<TableConstraint> constraints, Set<String> seen, List<TableConstraint> additions) {
+        for (TableConstraint constraint : additions) {
+            String key = constraint.type() + ":" + constraint.columns().stream()
+                    .map(DamengMetadataReader::normalizeIdentifier)
+                    .toList();
+            if (seen.add(key)) {
+                constraints.add(constraint);
+            }
         }
     }
 

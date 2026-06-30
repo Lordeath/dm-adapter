@@ -263,6 +263,44 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateInfersUpsertKeyColumnsFromProjectDdl() throws Exception {
+        writeDemoProject();
+        Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="updateExtend">
+                        INSERT INTO user_extend (user_id, key_name)
+                        VALUES (#{userId}, #{keyName})
+                        ON DUPLICATE KEY UPDATE key_name = VALUES(key_name)
+                    </insert>
+                </mapper>
+                """);
+        writeFile("sql/schema.sql", """
+                CREATE TABLE IF NOT EXISTS `user_extend` (
+                  `id` bigint NOT NULL AUTO_INCREMENT,
+                  `user_id` bigint NOT NULL,
+                  `key_name` varchar(64) DEFAULT NULL,
+                  PRIMARY KEY (`id`),
+                  UNIQUE KEY `uk_user_extend_user` (`user_id`)
+                ) ENGINE=InnoDB;
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-rewrite.yml")))
+                .contains("\"user_extend\":")
+                .contains("\"com.example.UserMapper.updateExtend\":")
+                .contains("keyColumns: [\"user_id\"]");
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .contains("MERGE INTO user_extend t")
+                .contains("ON (t.user_id = s.user_id)")
+                .doesNotContain("ON DUPLICATE KEY UPDATE");
+    }
+
+    @Test
     void migrateUsesExplicitRewriteConfigForUpsertMerge() throws Exception {
         writeDemoProject();
         Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """

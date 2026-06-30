@@ -81,8 +81,12 @@ final class InsertColumnExtractor {
     }
 
     private static List<String> splitColumns(String columnList) {
+        String sanitized = columnList
+                .replaceAll("(?is)<!--.*?-->", "\n")
+                .replaceAll("(?is)<[^>]+>", "\n")
+                .replaceAll("(?s)[$#]\\{[^}]+}", " ");
         List<String> columns = new ArrayList<>();
-        for (String part : columnList.split(",")) {
+        for (String part : sanitized.split(",")) {
             String column = part.replace("`", "").replace("\"", "").trim();
             if (column.matches("[A-Za-z_][A-Za-z0-9_]*")) {
                 columns.add(column);
