@@ -1392,6 +1392,7 @@ class MapperMigratorTest {
                         INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id
                         SET nu.AD_account = c.`AD_account`,
                             nu.sentry_id = case c.`sentry_id` when "0" then nu.sentry_id else c.`sentry_id` end,
+                            nu.user_password = to_base64(AES_ENCRYPT(c.`password`, "WJ19938888")),
                             nu.update_time = now()
                         <if test="isFromV8 != null and (isFromV8 == '1' or isFromV8 == 1)">
                             ,nu.v8_user_id = c.sso_user_id
@@ -1424,11 +1425,18 @@ class MapperMigratorTest {
                 .contains("UPDATE ns_system_user nu")
                 .contains("INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id")
                 .contains("SET nu.AD_account = c.`AD_account`")
-                .contains("nu.sentry_id = case c.`sentry_id` when \"0\" then nu.sentry_id else c.`sentry_id` end")
+                .contains("nu.sentry_id = case c.`sentry_id` when '0' then nu.sentry_id else c.`sentry_id` end")
+                .contains("nu.user_password = TO_BASE64(SF_ENCRYPT_CHAR(c.`password`, 513, 'WJ19938888', NULL))")
                 .contains("nu.update_time = now()")
                 .contains(",nu.v8_user_id = c.sso_user_id")
                 .contains("WHERE\n            nu.enterprise_id = #{enterpriseId}");
-        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.automaticConversions())
+                .singleElement()
+                .satisfies(change -> assertThat(change.appliedRules())
+                        .containsExactly(
+                                "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                                MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
+                        ));
     }
 
     @Test
@@ -1947,6 +1955,61 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED_RULE);
+    }
+
+    @Test
+    void dynamicUpdateSetNormalizesPropertyTargetsFromResultMap() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.FileMapper">
+                    <resultMap id="BaseResultMap" type="com.example.File">
+                        <id column="file_id" property="fileId"/>
+                        <result column="path" property="path"/>
+                        <result column="decrypted_after_date" property="decryptedAfterDate"/>
+                    </resultMap>
+                    <update id="updateByPrimaryKeySelective">
+                        update ns_system_file
+                        <set>
+                            <if test="path != null">
+                                path = #{path},
+                            </if>
+                            <if test="decryptedAfterDate != null">
+                                decryptedAfterDate = #{decryptedAfterDate},
+                            </if>
+                        </set>
+                        where file_id = #{fileId}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/FileMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/FileMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/FileMapper.xml"));
+        assertThat(rewritten)
+                .contains("path = #{path}")
+                .contains("decrypted_after_date = #{decryptedAfterDate}")
+                .doesNotContain("decryptedAfterDate = #{decryptedAfterDate}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
 
     @Test

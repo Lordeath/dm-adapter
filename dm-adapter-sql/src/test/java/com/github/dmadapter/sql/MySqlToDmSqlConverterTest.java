@@ -104,6 +104,27 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void safeDynamicTextSegmentRulesDoNotRewriteUpdateJoinPrefix() {
+        SqlConversionResult result = converter.convertDynamicTextSegmentSafeRules(
+                "UPDATE ns_system_user nu INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id "
+                        + "SET nu.sentry_id = case c.`sentry_id` when \"0\" then nu.sentry_id else c.`sentry_id` end, "
+                        + "nu.user_password = to_base64(AES_ENCRYPT(c.`password`, \"WJ19938888\"))"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("UPDATE ns_system_user nu INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id SET")
+                .contains("when '0' then")
+                .contains("TO_BASE64(SF_ENCRYPT_CHAR(c.`password`, 513, 'WJ19938888', NULL))")
+                .doesNotContain(" from ");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
+                );
+    }
+
+    @Test
     void convertsBase64WrappedAesDecryptToDamengAes128Ecb() {
         SqlConversionResult result = converter.convert(
                 "select AES_DECRYPT(FROM_BASE64(user_password), 'XXXXXXXX') from user"

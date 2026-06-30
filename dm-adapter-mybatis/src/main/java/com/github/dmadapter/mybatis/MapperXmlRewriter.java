@@ -47,6 +47,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED_RULE =
             "MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED";
+    public static final String MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE =
+            "MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN";
     public static final String MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE =
             "MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED";
     public static final String MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE =
@@ -320,6 +322,7 @@ public class MapperXmlRewriter {
         String namespace = document.getDocumentElement() == null
                 ? ""
                 : document.getDocumentElement().getAttribute("namespace");
+        Map<String, String> resultMapColumnByProperty = resultMapColumnByProperty(document);
         String xml = null;
         boolean changed = false;
         for (Element statement : statementElements(document)) {
@@ -357,7 +360,8 @@ public class MapperXmlRewriter {
                                 statementKey,
                                 statementBody.rawBody(),
                                 sqlConverter,
-                                rewriteConfig
+                                rewriteConfig,
+                                resultMapColumnByProperty
                         );
                 dynamicBodyConversion = wrapDynamicIdentityInsertIfConfigured(
                         statement.getTagName(),
@@ -612,6 +616,40 @@ public class MapperXmlRewriter {
         return elements;
     }
 
+    private Map<String, String> resultMapColumnByProperty(Document document) {
+        Map<String, String> columnsByProperty = new LinkedHashMap<>();
+        Set<String> ambiguousProperties = new LinkedHashSet<>();
+        NodeList resultMaps = document.getElementsByTagName("resultMap");
+        for (int i = 0; i < resultMaps.getLength(); i++) {
+            Node resultMap = resultMaps.item(i);
+            NodeList children = resultMap.getChildNodes();
+            for (int j = 0; j < children.getLength(); j++) {
+                Node child = children.item(j);
+                if (!(child instanceof Element element)
+                        || (!"id".equals(element.getTagName()) && !"result".equals(element.getTagName()))) {
+                    continue;
+                }
+                String property = element.getAttribute("property");
+                String column = element.getAttribute("column");
+                if (!isSimpleBareIdentifier(property) || !isSimpleBareIdentifier(column)) {
+                    continue;
+                }
+                String normalizedProperty = normalizeIdentifier(property);
+                String existingColumn = columnsByProperty.get(normalizedProperty);
+                if (existingColumn == null) {
+                    columnsByProperty.put(normalizedProperty, column.trim());
+                    continue;
+                }
+                if (!normalizeIdentifier(existingColumn).equals(normalizeIdentifier(column))) {
+                    columnsByProperty.remove(normalizedProperty);
+                    ambiguousProperties.add(normalizedProperty);
+                }
+            }
+        }
+        ambiguousProperties.forEach(columnsByProperty::remove);
+        return columnsByProperty;
+    }
+
     private boolean hasElementChild(Element statement) {
         NodeList children = statement.getChildNodes();
         for (int i = 0; i < children.getLength(); i++) {
@@ -703,7 +741,8 @@ public class MapperXmlRewriter {
             String statementKey,
             String rawBody,
             SqlConverter sqlConverter,
-            SqlRewriteConfig rewriteConfig
+            SqlRewriteConfig rewriteConfig,
+            Map<String, String> resultMapColumnByProperty
     ) {
         StringBuilder convertedBody = new StringBuilder(rawBody.length());
         List<String> appliedRules = new ArrayList<>();
@@ -770,7 +809,8 @@ public class MapperXmlRewriter {
                 statementKey,
                 rewrittenBody,
                 sqlConverter,
-                rewriteConfig
+                rewriteConfig,
+                resultMapColumnByProperty
         );
         if (structuralConversion.changed()) {
             rewrittenBody = structuralConversion.convertedBody();
@@ -796,7 +836,8 @@ public class MapperXmlRewriter {
             String statementKey,
             String body,
             SqlConverter sqlConverter,
-            SqlRewriteConfig rewriteConfig
+            SqlRewriteConfig rewriteConfig,
+            Map<String, String> resultMapColumnByProperty
     ) {
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
@@ -880,6 +921,14 @@ public class MapperXmlRewriter {
             if (mergedSetTrims.changed()) {
                 appliedRules.add(MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED_RULE);
                 converted = mergedSetTrims.text();
+            }
+            TextRewrite propertyColumnTargets = normalizeDynamicSetPropertyColumns(
+                    converted,
+                    resultMapColumnByProperty
+            );
+            if (propertyColumnTargets.changed()) {
+                appliedRules.add(MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE);
+                converted = propertyColumnTargets.text();
             }
             TextRewrite qualifiedUpdateJoinSetTargets = qualifyDynamicUpdateJoinSetTargets(converted);
             if (qualifiedUpdateJoinSetTargets.changed()) {
@@ -5223,6 +5272,170 @@ public class MapperXmlRewriter {
         return applyTextReplacements(body, replacements);
     }
 
+    private TextRewrite normalizeDynamicSetPropertyColumns(
+            String body,
+            Map<String, String> resultMapColumnByProperty
+    ) {
+        if (resultMapColumnByProperty == null || resultMapColumnByProperty.isEmpty()) {
+            return new TextRewrite(body, false);
+        }
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "set".equalsIgnoreCase(tag.name())) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "set", body.length());
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                normalizeSetPropertyColumnsInRange(
+                        body,
+                        tag.endIndex(),
+                        closingStart,
+                        resultMapColumnByProperty,
+                        replacements
+                );
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && isSetTrimOpening(body, tagStart, tag)) {
+                int closingStart = findClosingTag(body, tag.endIndex(), "trim", body.length());
+                if (closingStart < 0) {
+                    index = tag.endIndex();
+                    continue;
+                }
+                normalizeSetPropertyColumnsInRange(
+                        body,
+                        tag.endIndex(),
+                        closingStart,
+                        resultMapColumnByProperty,
+                        replacements
+                );
+                int closingEnd = body.indexOf('>', closingStart + 1);
+                index = closingEnd < 0 ? closingStart + 1 : closingEnd + 1;
+                continue;
+            }
+            index = tag.endIndex();
+        }
+        replacements.sort((left, right) -> Integer.compare(left.startIndex(), right.startIndex()));
+        return applyTextReplacements(body, replacements);
+    }
+
+    private void normalizeSetPropertyColumnsInRange(
+            String body,
+            int start,
+            int end,
+            Map<String, String> resultMapColumnByProperty,
+            List<TextReplacement> replacements
+    ) {
+        int index = start;
+        while (index < end) {
+            if (body.startsWith("<![CDATA[", index)) {
+                int cdataEnd = body.indexOf("]]>", index + "<![CDATA[".length());
+                if (cdataEnd < 0 || cdataEnd > end) {
+                    return;
+                }
+                normalizeSetPropertyColumnsFromText(
+                        body,
+                        index + "<![CDATA[".length(),
+                        cdataEnd,
+                        resultMapColumnByProperty,
+                        replacements
+                );
+                index = cdataEnd + "]]>".length();
+                continue;
+            }
+            if (body.startsWith("<!--", index)) {
+                int commentEnd = body.indexOf("-->", index + "<!--".length());
+                if (commentEnd < 0 || commentEnd + "-->".length() > end) {
+                    return;
+                }
+                index = commentEnd + "-->".length();
+                continue;
+            }
+            int tagStart = body.indexOf('<', index);
+            int textEnd = tagStart < 0 || tagStart > end ? end : tagStart;
+            if (textEnd > index) {
+                normalizeSetPropertyColumnsFromText(
+                        body,
+                        index,
+                        textEnd,
+                        resultMapColumnByProperty,
+                        replacements
+                );
+            }
+            if (tagStart < 0 || tagStart >= end) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            index = tag == null ? tagStart + 1 : tag.endIndex();
+        }
+    }
+
+    private void normalizeSetPropertyColumnsFromText(
+            String body,
+            int start,
+            int end,
+            Map<String, String> resultMapColumnByProperty,
+            List<TextReplacement> replacements
+    ) {
+        int lineStart = start;
+        while (lineStart < end) {
+            int lineEnd = body.indexOf('\n', lineStart);
+            if (lineEnd < 0 || lineEnd > end) {
+                lineEnd = end;
+            }
+            int contentEnd = lineEnd;
+            if (contentEnd > lineStart && body.charAt(contentEnd - 1) == '\r') {
+                contentEnd--;
+            }
+            TextRewrite rewrite = normalizeSetPropertyColumnExpression(
+                    body.substring(lineStart, contentEnd),
+                    resultMapColumnByProperty
+            );
+            if (rewrite.changed()) {
+                replacements.add(new TextReplacement(lineStart, contentEnd, rewrite.text()));
+            }
+            lineStart = lineEnd < end ? lineEnd + 1 : end;
+        }
+    }
+
+    private TextRewrite normalizeSetPropertyColumnExpression(
+            String value,
+            Map<String, String> resultMapColumnByProperty
+    ) {
+        int tokenStart = leadingWhitespaceLength(value);
+        IdentifierToken property = readIdentifierToken(value, tokenStart);
+        if (property == null) {
+            return new TextRewrite(value, false);
+        }
+        int afterProperty = skipWhitespace(value, property.endIndex());
+        if (afterProperty < value.length() && value.charAt(afterProperty) == '.') {
+            return new TextRewrite(value, false);
+        }
+        if (afterProperty >= value.length() || value.charAt(afterProperty) != '=') {
+            return new TextRewrite(value, false);
+        }
+        String column = resultMapColumnByProperty.get(normalizeIdentifier(property.text()));
+        if (column == null || normalizeIdentifier(column).equals(normalizeIdentifier(property.text()))) {
+            return new TextRewrite(value, false);
+        }
+        return new TextRewrite(
+                value.substring(0, tokenStart) + column + value.substring(property.endIndex()),
+                true
+        );
+    }
+
     private TextRewrite qualifyDynamicUpdateJoinSetTargets(String body) {
         int statementEnd = body.length();
         while (statementEnd > 0 && Character.isWhitespace(body.charAt(statementEnd - 1))) {
@@ -6044,7 +6257,10 @@ public class MapperXmlRewriter {
             SqlRewriteConfig rewriteConfig,
             boolean followedByDynamicWhere
     ) {
-        if (followedByDynamicWhere && isUpdateJoinWithoutWhere(text)) {
+        if (isUpdateJoinWithoutWhere(text)) {
+            if (!followedByDynamicWhere) {
+                return convertUpdateJoinPrefixTextSegment(text, sqlConverter);
+            }
             return new TextSegmentConversion(
                     text,
                     List.of(),
@@ -6052,9 +6268,34 @@ public class MapperXmlRewriter {
                     false
             );
         }
-        if (isUpdateJoinWithoutWhere(text)) {
+        return convertPlainTextSegment(text, statementKey, sqlConverter, rewriteConfig);
+    }
+
+    private TextSegmentConversion convertUpdateJoinPrefixTextSegment(String text, SqlConverter sqlConverter) {
+        if (!(sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter)) {
             return new TextSegmentConversion(text, List.of(), List.of(), false);
         }
+        SqlConversionResult conversionResult = mySqlToDmSqlConverter.convertDynamicTextSegmentSafeRules(text);
+        List<String> manualReviewReasons = conversionResult.manualReviewRequired()
+                ? List.of(conversionResult.reason())
+                : List.of();
+        if (!conversionResult.changed()) {
+            return new TextSegmentConversion(text, List.of(), manualReviewReasons, false);
+        }
+        return new TextSegmentConversion(
+                conversionResult.convertedSql(),
+                conversionResult.appliedRules(),
+                manualReviewReasons,
+                true
+        );
+    }
+
+    private TextSegmentConversion convertPlainTextSegment(
+            String text,
+            String statementKey,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig
+    ) {
         SqlConversionResult conversionResult =
                 sqlConverter.convert(text, rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(text)));
         List<String> manualReviewReasons = conversionResult.manualReviewRequired()

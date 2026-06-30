@@ -851,6 +851,9 @@ class DmAdapterCliTest {
                 .contains("depth == 0 && statement != null && statement.hasDefaultParameterMap()")
                 .contains("? defaultParameterMap(statement)")
                 .contains("putDefaultParameterValue(value, valueName, collectionValue)")
+                .contains("isDateTimeDefaultValue(configuredDefault)")
+                .contains("defaultStringDateTimeForConfiguredDefault(configuredDefault)")
+                .contains("private String defaultStringDateTimeForConfiguredDefault(Object value)")
                 .contains("Map<String, Object> defaultValue = nestedProperty")
                 .contains("? defaultMapCollectionValue(valueName, statement)")
                 .contains(": defaultMapParameterValue(valueName, statement)");

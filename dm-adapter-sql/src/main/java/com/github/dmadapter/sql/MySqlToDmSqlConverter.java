@@ -302,6 +302,45 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return convert(sql, List.of());
     }
 
+    public SqlConversionResult convertDynamicTextSegmentSafeRules(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return SqlConversionResult.unchanged(sql == null ? "" : sql);
+        }
+        String original = sql;
+        String converted = original;
+        List<String> rules = new ArrayList<>();
+
+        DoubleQuotedStringConversion doubleQuotedStringConversion = convertDoubleQuotedStringLiterals(converted);
+        if (doubleQuotedStringConversion.changed()) {
+            converted = doubleQuotedStringConversion.convertedSql();
+            rules.add("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+        }
+
+        AesBase64Conversion aesBase64Conversion = convertBase64Aes(converted);
+        if (aesBase64Conversion.changed()) {
+            converted = aesBase64Conversion.convertedSql();
+            rules.add(MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE);
+        }
+
+        String reason = "";
+        if (containsAesFunction(converted)) {
+            AesBase64Conversion remainingAesConversion = convertBase64Aes(converted);
+            if (!remainingAesConversion.changed() || containsAesFunction(remainingAesConversion.convertedSql())) {
+                reason = AES_MANUAL_REVIEW_REASON;
+            }
+        }
+        if (!converted.equals(original) && !reason.isBlank()) {
+            return SqlConversionResult.changedWithManualReview(original, converted, rules, reason);
+        }
+        if (!converted.equals(original)) {
+            return SqlConversionResult.changed(original, converted, rules);
+        }
+        if (!reason.isBlank()) {
+            return SqlConversionResult.manualReview(original, reason);
+        }
+        return SqlConversionResult.unchanged(original);
+    }
+
     @Override
     public SqlConversionResult convert(String sql, List<String> upsertKeyColumns) {
         if (sql == null || sql.isBlank()) {
