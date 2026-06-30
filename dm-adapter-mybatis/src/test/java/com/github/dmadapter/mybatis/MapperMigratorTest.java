@@ -951,6 +951,64 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicInformationSchemaColumnsWithIncludeIsRewrittenToDamengMetadataViews() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CommonMapper">
+                    <sql id="Column_List">
+                        TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT, COLUMN_DEFAULT,
+                        CHARACTER_SET_NAME, IS_NULLABLE
+                    </sql>
+                    <select id="selectTableInfo" parameterType="java.util.Map" resultType="java.util.HashMap">
+                        SELECT
+                            <include refid="Column_List" />
+                        FROM information_schema.columns
+                        WHERE TABLE_SCHEMA = #{tableSchema}
+                        <!-- table filter -->
+                        AND TABLE_NAME = #{tableName}
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CommonMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CommonMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CommonMapper.xml"));
+        assertThat(rewritten)
+                .contains("c.OWNER AS TABLE_SCHEMA")
+                .contains("FROM ALL_TAB_COLUMNS c")
+                .contains("LEFT JOIN ALL_COL_COMMENTS cc")
+                .contains("WHERE c.OWNER = UPPER(REPLACE(#{tableSchema}, '\"', ''))")
+                .contains("AND c.TABLE_NAME = UPPER(REPLACE(#{tableName}, '\"', ''))")
+                .contains("ORDER BY c.COLUMN_ID")
+                .doesNotContain("information_schema.columns")
+                .doesNotContain("<include refid=\"Column_List\"");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason())
+                .contains("dynamic XML")
+                .doesNotContain("information_schema")
+                .doesNotContain("database()");
+    }
+
+    @Test
     void dynamicMapOnDuplicateKeyUpdateIsRewrittenToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -2010,6 +2068,65 @@ class MapperMigratorTest {
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE);
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
+    void dynamicUpdateSetDoesNotRewriteExplicitColumnsFromResultMap() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ReminderMapper">
+                    <resultMap id="BaseResultMap" type="com.example.Reminder">
+                        <id column="id" property="id"/>
+                        <result column="treeCode" property="classification"/>
+                        <result column="classification" property="classificationName"/>
+                        <result column="decrypted_after_date" property="decryptedAfterDate"/>
+                    </resultMap>
+                    <update id="updateById">
+                        update ns_system_reminder_configuration
+                        <set>
+                            <if test="classification != null">
+                                `classification` = #{classification},
+                            </if>
+                            <if test="treeCode != null">
+                                `treeCode` = #{treeCode},
+                            </if>
+                            <if test="decryptedAfterDate != null">
+                                decryptedAfterDate = #{decryptedAfterDate},
+                            </if>
+                        </set>
+                        where id = #{id}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ReminderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ReminderMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReminderMapper.xml"));
+        assertThat(rewritten)
+                .contains("`classification` = #{classification}")
+                .contains("`treeCode` = #{treeCode}")
+                .contains("decrypted_after_date = #{decryptedAfterDate}")
+                .doesNotContain("treeCode = #{classification}")
+                .doesNotContain("decryptedAfterDate = #{decryptedAfterDate}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE);
     }
 
     @Test
