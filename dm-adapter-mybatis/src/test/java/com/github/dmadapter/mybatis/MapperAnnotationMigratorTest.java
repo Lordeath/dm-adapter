@@ -69,19 +69,10 @@ class MapperAnnotationMigratorTest {
                 .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
                 .contains("<select id=\"listIds\" resultType=\"java.lang.Long\">")
                 .contains("<update id=\"update\">")
-                .contains("SYSDATE")
-                .contains("FETCH FIRST 1 ROWS ONLY")
-                .doesNotContain("NOW()");
+                .contains("NOW()")
+                .contains("limit 1");
         assertThat(result.fileChanges()).hasSize(3);
-        assertThat(result.automaticConversions())
-                .extracting(change -> change.statementId())
-                .contains(
-                        "com.example.VoucherTaskMapper.selectNow",
-                        "com.example.VoucherTaskMapper.update"
-                );
-        assertThat(result.automaticConversions())
-                .allSatisfy(change -> assertThat(change.appliedRules())
-                        .contains(MapperAnnotationMigrator.MYBATIS_ANNOTATION_SQL_TO_MAPPER_DM_XML_RULE));
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
@@ -121,10 +112,8 @@ class MapperAnnotationMigratorTest {
         assertThat(xml)
                 .contains("INSERT INTO \"newsee-system\".ns_system_organization")
                 .doesNotContain("INSERT INTO 'newsee-system'.ns_system_organization")
-                .contains("SYSDATE");
-        assertThat(result.automaticConversions())
-                .extracting(change -> change.statementId())
-                .containsExactly("com.example.VoucherTaskMapper.selectNow");
+                .contains("select NOW() from dual");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
@@ -374,15 +363,9 @@ class MapperAnnotationMigratorTest {
                 .contains("<select id=\"selectNow\" resultType=\"java.lang.String\">")
                 .contains("<select id=\"listIds\" resultType=\"java.lang.Long\">")
                 .contains("<update id=\"touch\">")
-                .contains("SYSDATE")
-                .contains("FETCH FIRST 1 ROWS ONLY")
-                .doesNotContain("NOW()");
-        assertThat(result.automaticConversions())
-                .extracting(change -> change.statementId())
-                .contains(
-                        "com.example.CompiledMapper.selectNow",
-                        "com.example.CompiledMapper.touch"
-                );
+                .contains("NOW()")
+                .contains("limit 1");
+        assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.fileChanges())
                 .noneSatisfy(change -> assertThat(change.path()).endsWith(".java"));
     }

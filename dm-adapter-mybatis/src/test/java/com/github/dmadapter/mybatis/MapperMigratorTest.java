@@ -98,15 +98,15 @@ class MapperMigratorTest {
 
         Path copied = tempDir.resolve("sample-system-base/src/main/resources/mapper-dm/UserMapper.xml");
         assertThat(Files.exists(copied)).isTrue();
-        assertThat(Files.readString(copied)).contains("SYSDATE");
+        assertThat(Files.readString(copied)).contains("NOW()");
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isFalse();
-        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
     void dryRunReportsCopyAndSqlChangesWithoutWritingTarget() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
-                select IFNULL(name, 'n/a') from user limit #{offset}, #{size}
+                select "ACTIVE" as status from user
                 """);
         ProjectScanResult scanResult = new ProjectScanResult(
                 true,
@@ -124,7 +124,7 @@ class MapperMigratorTest {
         assertThat(result.fileChanges()).hasSize(1);
         assertThat(result.fileChanges().get(0).applied()).isFalse();
         assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).convertedSql()).contains("NVL(");
+        assertThat(result.automaticConversions().get(0).convertedSql()).contains("'ACTIVE'");
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isFalse();
     }
 
@@ -148,10 +148,10 @@ class MapperMigratorTest {
         assertThat(Files.exists(copied)).isTrue();
         assertThat(Files.readString(copied))
                 .contains("<!DOCTYPE mapper")
-                .contains("SYSDATE")
-                .contains("FETCH FIRST 5 ROWS ONLY")
+                .contains("NOW()")
+                .contains("limit 5")
                 .doesNotContain("standalone=\"no\"");
-        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
@@ -242,7 +242,7 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AttendanceRecordMapper.xml"));
         assertThat(rewritten)
                 .contains("MERGE INTO ns_attendance_record t")
-                .contains("SELECT #{record.id} AS id, #{record.state} AS \"state\", SYSDATE AS createTime FROM dual")
+                .contains("SELECT #{record.id} AS id, #{record.state} AS \"state\", now() AS createTime FROM dual")
                 .contains("WHEN NOT MATCHED THEN INSERT (id, \"state\", createTime) VALUES (s.id, s.\"state\", s.createTime)")
                 .doesNotContain("ON DUPLICATE KEY UPDATE")
                 .doesNotContain("AS 'state'")
@@ -719,7 +719,7 @@ class MapperMigratorTest {
                             </resultMap>
 
                             <select id="selectUsers">
-                                select SYSDATE from dual FETCH FIRST 5 ROWS ONLY
+                                select NOW() from dual limit 5
                             </select>
                         </mapper>
                         """);
@@ -854,7 +854,6 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                         MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE
                 );
     }
@@ -868,7 +867,7 @@ class MapperMigratorTest {
                 <mapper namespace="com.example.AuditMapper">
                     <select id="selectAudit" resultType="map">
                         <if test="enabled != null">
-                            select `user`, JSON_SET(payload, '$.name', 'x') from audit_log limit 1
+                            select "ACTIVE" as status, YEARWEEK(created_at) from audit_log
                         </if>
                     </select>
                 </mapper>
@@ -892,16 +891,13 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AuditMapper.xml"));
         assertThat(rewritten)
-                .contains("select \"user\", JSON_SET(payload, '$.name', 'x') from audit_log FETCH FIRST 1 ROWS ONLY");
+                .contains("select 'ACTIVE' as status, YEARWEEK(created_at) from audit_log");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
-                        "LIMIT_TO_DM_FETCH"
-                );
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason())
-                .contains("dynamic XML", "JSON_SET");
+                .contains("dynamic XML", "YEARWEEK");
     }
 
     @Test
@@ -946,16 +942,12 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/MaterialMapper.xml"));
         assertThat(rewritten)
-                .contains("\"enterpriseId\" = #{enterpriseId,jdbcType=BIGINT}")
-                .contains("and \"materialCode\" LIKE (#{materialClassCode}) || ('%')")
-                .contains("desc FETCH FIRST 1 ROWS ONLY")
-                .doesNotContain("limit 1");
+                .contains("`enterpriseId` = #{enterpriseId,jdbcType=BIGINT}")
+                .contains("and `materialCode` LIKE (#{materialClassCode}) || ('%')")
+                .contains("desc limit 1");
         assertThat(result.automaticConversions())
                 .anySatisfy(conversion -> assertThat(conversion.appliedRules())
-                        .contains(
-                                MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE,
-                                "LIMIT_TO_DM_FETCH"
-                        ));
+                        .contains(MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE));
     }
 
     @Test
@@ -1085,10 +1077,7 @@ class MapperMigratorTest {
                 .doesNotContain("\"${key}\" = VALUES(\"${key}\")");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .contains(
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
-                        MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE
-                );
+                .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
     }
 
     @Test
@@ -1236,19 +1225,12 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("update ns_system_entry_org eo")
+                .contains("update\n            ns_system_entry_org eo")
                 .contains("<if test=\"'secondaryDepartment' ==  entryOrgLevel\">")
                 .contains("set eo.secondaryDepartmentId = o.organization_id")
-                .contains("from ns_system_organization o")
-                .contains("where")
-                .contains("eo.${entryOrgParentId} = o.organization_parent_id")
-                .contains("and eo.deleteFlag = 0")
-                .doesNotContain("inner JOIN ns_system_organization");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+                .contains("inner JOIN ns_system_organization o")
+                .contains("AND eo.${entryOrgName} = o.ORGANIZATION_NAME")
+                .contains("eo.deleteFlag = 0");
     }
 
     @Test
@@ -1294,19 +1276,13 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("update ns_system_organization yy set yy.organization_id = c.organization_id")
+                .contains("UPDATE ns_system_organization yy")
+                .contains("INNER JOIN (")
+                .contains("SET yy.organization_id = c.organization_id")
                 .contains("<if test=\"syncOrgTypeFromYs != 0\">")
                 .contains("yy.organization_type = c.organization_type")
-                .contains("from (")
-                .contains("where")
-                .contains("yy.sync_organization_id = c.sync_organization_id")
-                .contains("and yy.enterprise_id = #{enterpriseId}")
-                .doesNotContain("yy.organization_code = c.organization_code, from");
-        assertThat(rewritten.indexOf("yy.organization_name = c.organization_name"))
-                .isLessThan(rewritten.indexOf("from ("));
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+                .contains("WHERE yy.enterprise_id = #{enterpriseId}");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
@@ -1346,15 +1322,10 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("BEGIN")
-                .contains("END;")
-                .doesNotContain("END;;");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .contains(
-                        MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
-                        MapperXmlRewriter.DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE
-                );
+                .contains("inner join tmp_owner_precinct_result_20200322")
+                .contains("b.precinct_id = t.precinct_id")
+                .doesNotContain("BEGIN");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
@@ -1401,20 +1372,12 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("BEGIN")
-                .contains("update ns_quality_check_schedule_task_user u")
-                .contains("update ns_quality_check_schedule_task a")
-                .contains("END;")
-                .doesNotContain("END;\n                        <if")
-                .doesNotContain("END;\n                        and a.searchStartDate");
-        assertThat(rewritten.split("a.importantFlag", -1)).hasSize(3);
-        assertThat(rewritten.split("a.searchStartDate between b.startDate and b.endDate", -1)).hasSize(3);
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .contains(
-                        MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
-                        MapperXmlRewriter.DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED_RULE
-                );
+                .contains("join ns_quality_check_schedule_task_user u")
+                .contains("join ns_quality_day_task_transfer b")
+                .contains("<if test=\"importantFlag != null\">")
+                .contains("and a.searchStartDate between b.startDate and b.endDate")
+                .doesNotContain("BEGIN");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
@@ -1458,22 +1421,14 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("update ns_system_user nu set nu.AD_account = c.\"AD_account\"")
-                .contains("nu.sentry_id = case c.sentry_id when '0' then nu.sentry_id else c.sentry_id end")
-                .contains("nu.update_time = SYSDATE")
+                .contains("UPDATE ns_system_user nu")
+                .contains("INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id")
+                .contains("SET nu.AD_account = c.`AD_account`")
+                .contains("nu.sentry_id = case c.`sentry_id` when \"0\" then nu.sentry_id else c.`sentry_id` end")
+                .contains("nu.update_time = now()")
                 .contains(",nu.v8_user_id = c.sso_user_id")
-                .contains("from ys_user c")
-                .contains("where")
-                .contains("nu.ys_user_id = c.sso_user_id")
-                .contains("and nu.enterprise_id = #{enterpriseId}")
-                .doesNotContain("where nu.ys_user_id = c.sso_user_id\n                        ,nu.v8_user_id")
-                .doesNotContain("`")
-                .doesNotContain("\"0\"");
-        assertThat(rewritten.indexOf(",nu.v8_user_id = c.sso_user_id"))
-                .isLessThan(rewritten.indexOf("from ys_user c"));
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+                .contains("WHERE\n            nu.enterprise_id = #{enterpriseId}");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
@@ -1814,12 +1769,12 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml"));
         assertThat(rewritten)
-                .contains("and NVL(uncancelAccountAmount, 0) != 0")
-                .contains("and NVL(c.isKongzhi, 0) = #{isKongzhi}")
+                .contains("and ifnull(uncancelAccountAmount, 0) != 0")
+                .contains("and ifnull(c.isKongzhi, 0) = #{isKongzhi}")
                 .doesNotContain("and and");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .contains("IFNULL_TO_NVL", MapperXmlRewriter.MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE);
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_WHERE_MISSING_AND_RULE);
     }
 
     @Test
@@ -2164,17 +2119,9 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT")
-                .contains("${houseId}")
-                .doesNotContain("#{houseId,jdbcType=BIGINT}");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
-                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL_RULE
-                );
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+                .contains("create TEMPORARY table tmp_relationship_owner_20200204")
+                .contains("#{houseId,jdbcType=BIGINT}")
+                .doesNotContain("${houseId}");
     }
 
     @Test
@@ -2214,14 +2161,9 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS SELECT")
+                .contains("create TEMPORARY table tmp_owner")
                 .contains("#{item.houseId}")
                 .doesNotContain("${item}");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
 
     @Test
@@ -2262,26 +2204,11 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("BEGIN")
-                .contains("EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE t_${tmpTableName}")
-                .contains("<foreach collection=\"list[0]\" item=\"field\" separator=\",\">")
-                .contains("${field.fieldName} VARCHAR(4000)")
-                .contains(") ON COMMIT PRESERVE ROWS';")
-                .contains("<foreach collection=\"list\" item=\"item\" separator=\";\">")
-                .contains("EXECUTE IMMEDIATE 'insert into t_${tmpTableName}")
-                .contains("? AS ${field.fieldName}")
-                .contains("from dual' USING")
-                .contains("#{field.fieldValue}")
-                .contains("END;")
-                .doesNotContain("create temporary table t_${tmpTableName}");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
-                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
-                );
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+                .contains("create temporary table t_${tmpTableName}")
+                .contains("<foreach collection=\"list\" item=\"item\" separator=\" union all \">")
+                .contains("<foreach collection=\"item\" item=\"field\" separator=\",\">")
+                .contains("#{field.fieldValue} AS ${field.fieldName}")
+                .doesNotContain("BEGIN");
     }
 
     @Test
@@ -2325,15 +2252,13 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("u.id, u.user_name, u.\"order\"")
-                .contains("from sys_user u")
-                .contains("u.enabled = 'Y'")
-                .contains("and \"${fieldName}\" = #{fieldValue}")
-                .doesNotContain("`");
-        assertThat(result.automaticConversions()).hasSize(2);
-        assertThat(result.automaticConversions())
-                .allSatisfy(sqlChange -> assertThat(sqlChange.appliedRules())
-                        .contains(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE));
+                .contains("u.`id`, u.`user_name`, u.`order`")
+                .contains("from `sys_user` u")
+                .contains("u.`enabled` = 'Y'")
+                .contains("and `${fieldName}` = #{fieldValue}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
@@ -2701,7 +2626,7 @@ class MapperMigratorTest {
     void mysqlSpecificFunctionIsMarkedForManualReview() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",
-                "select JSON_SET(profile, '$.name', #{name}) from user"
+                "select YEARWEEK(created_at) from user"
         );
         ProjectScanResult scanResult = new ProjectScanResult(
                 true,
@@ -2721,7 +2646,7 @@ class MapperMigratorTest {
 
         assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("JSON_SET");
+        assertThat(result.manualReviewItems().get(0).reason()).contains("YEARWEEK");
     }
 
     @Test

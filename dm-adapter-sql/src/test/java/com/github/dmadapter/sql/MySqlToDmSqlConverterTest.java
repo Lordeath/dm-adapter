@@ -11,21 +11,21 @@ class MySqlToDmSqlConverterTest {
     private final MySqlToDmSqlConverter converter = new MySqlToDmSqlConverter();
 
     @Test
-    void convertsIfnullAndNow() {
+    void leavesIfnullAndNowNative() {
         SqlConversionResult result = converter.convert("select IFNULL(name, 'n/a'), NOW() from user");
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("select NVL(name, 'n/a'), SYSDATE from user");
-        assertThat(result.appliedRules()).containsExactly("IFNULL_TO_NVL", "NOW_TO_SYSDATE");
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsMysqlSysdateFunction() {
+    void leavesMysqlSysdateFunctionNative() {
         SqlConversionResult result = converter.convert("insert into audit_log(create_time) values (SYSDATE())");
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("insert into audit_log(create_time) values (SYSDATE)");
-        assertThat(result.appliedRules()).containsExactly("SYSDATE_FUNCTION_TO_SYSDATE");
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -54,13 +54,13 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsDoubleQuotedStringLiteralsBeforeOtherSafeRules() {
+    void convertsDoubleQuotedStringLiteralsBeforeNativeFunctions() {
         SqlConversionResult result = converter.convert("select IFNULL(status, \"UNKNOWN\") from user");
 
         assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("select NVL(status, 'UNKNOWN') from user");
+        assertThat(result.convertedSql()).isEqualTo("select IFNULL(status, 'UNKNOWN') from user");
         assertThat(result.appliedRules())
-                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING", "IFNULL_TO_NVL");
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
     }
 
     @Test
@@ -188,20 +188,21 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsSimpleLimitWithOffset() {
+    void leavesSimpleSelectLimitWithOffsetNative() {
         SqlConversionResult result = converter.convert("select * from user order by id limit 10, 20");
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("select * from user order by id OFFSET 10 ROWS FETCH NEXT 20 ROWS ONLY");
-        assertThat(result.appliedRules()).containsExactly("LIMIT_OFFSET_TO_DM_FETCH");
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsLimitWithMyBatisPlaceholders() {
+    void leavesSelectLimitWithMyBatisPlaceholdersNative() {
         SqlConversionResult result = converter.convert("select * from user limit #{offset}, #{size}");
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("select * from user OFFSET #{offset} ROWS FETCH NEXT #{size} ROWS ONLY");
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -216,13 +217,10 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).isEqualTo("""
                 from ns_wms_material
                 where materialCode LIKE (#{materialClassCode}) || ('%')
-                order by id desc FETCH FIRST 1 ROWS ONLY
-                """.stripTrailing());
+                order by id desc limit 1
+                """);
         assertThat(result.appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE,
-                        "LIMIT_TO_DM_FETCH"
-                );
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE);
     }
 
     @Test
@@ -232,8 +230,8 @@ class MySqlToDmSqlConverterTest {
         );
 
         assertThat(result.changed()).isFalse();
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.reason()).contains("LIMIT");
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -376,17 +374,15 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table if not exists tmp_budget_payment_receipt (
-                  id bigint NOT NULL IDENTITY(1,1),
-                  "chargeItem" varchar(600) DEFAULT NULL,
-                  PRIMARY KEY (id)
+                  `id` bigint NOT NULL AUTO_INCREMENT,
+                  `chargeItem` varchar(600) DEFAULT NULL,
+                  PRIMARY KEY (`id`)
                 )
                 """);
         assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                 MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE,
                 MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE,
-                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
         );
     }
@@ -404,13 +400,12 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table tmp_charge_precinct (
-                  "IsCheck" varchar(30) DEFAULT '审核通过',
-                  "EmojiName" varchar(40) DEFAULT NULL,
-                  "Flag" char(8) DEFAULT NULL
+                  `IsCheck` varchar(30) DEFAULT '审核通过',
+                  `EmojiName` varchar(40) DEFAULT NULL,
+                  `Flag` char(8) DEFAULT NULL
                 )
                 """);
         assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                 MySqlToDmSqlConverter.MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE,
                 MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE
         );
@@ -431,10 +426,10 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .contains("id bigint NOT NULL IDENTITY(1,1)")
-                .contains("\"type\" int DEFAULT NULL")
-                .contains("\"doneFlag\" tinyint DEFAULT NULL")
-                .contains("PRIMARY KEY (id)")
+                .contains("`id` bigint NOT NULL AUTO_INCREMENT")
+                .contains("`type` int DEFAULT NULL")
+                .contains("`doneFlag` tinyint DEFAULT NULL")
+                .contains("PRIMARY KEY (`id`)")
                 .doesNotContain("bigint(20)")
                 .doesNotContain("int(2)")
                 .doesNotContain("tinyint(1)")
@@ -446,9 +441,7 @@ class MySqlToDmSqlConverterTest {
                 .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP")
                 .doesNotContainIgnoringCase("COMMENT");
         assertThat(result.appliedRules()).contains(
-                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
-                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
                 MySqlToDmSqlConverter.MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_USING_BTREE_REMOVAL_RULE,
@@ -469,12 +462,11 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table tmp_should_amortize_detail (
-                  "chargeSum" DECIMAL(38,2) DEFAULT '0.00',
-                  ratio numeric(38,38) DEFAULT NULL
+                  `chargeSum` DECIMAL(38,2) DEFAULT '0.00',
+                  `ratio` numeric(38,38) DEFAULT NULL
                 )
                 """);
         assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                 MySqlToDmSqlConverter.MYSQL_DECIMAL_PRECISION_CAP_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
         );
@@ -493,34 +485,31 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 CREATE TABLE if not exists tmp_daily_property_rule (
-                    id bigint NOT NULL IDENTITY(1,1),
-                    "dailyProperty" varchar(64) DEFAULT NULL,
+                    id bigint NOT NULL AUTO_INCREMENT,
+                    `dailyProperty` varchar(64) DEFAULT NULL,
                     PRIMARY KEY (id)
                 ) ;
                 """);
-        assertThat(result.appliedRules()).contains(
-                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
-                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE
-        );
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE);
         assertThat(result.convertedSql()).doesNotContainIgnoringCase("COMMENT");
     }
 
     @Test
-    void convertsMysqlTruncateToDamengTruncateTable() {
+    void leavesMysqlTruncateNative() {
         SqlConversionResult result = converter.convert("TRUNCATE tmp_static_report_precinct_steward_report;");
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("TRUNCATE TABLE tmp_static_report_precinct_steward_report;");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_TRUNCATE_TABLE_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsMysqlAlterTableAutoIncrementResetForDameng() {
+    void leavesMysqlAlterTableAutoIncrementResetNative() {
         SqlConversionResult result = converter.convert("ALTER TABLE ns_contract_info AUTO_INCREMENT = 1");
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("SET IDENTITY_INSERT ns_contract_info OFF");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_ALTER_AUTO_INCREMENT_RESET_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -572,7 +561,6 @@ class MySqlToDmSqlConverterTest {
                 join owner_house_base_info stat on stat.house_id = "cluster".house_id
                 """);
         assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                 MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
                 MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE
         );
@@ -695,9 +683,11 @@ class MySqlToDmSqlConverterTest {
                          CROSS JOIN owner_customer_family_info family
                          inner join owner_customer_result customer
                                     on base.house_id = family.house_id
-                                       and family.owner_id = customer.owner_id OFFSET #{offset} ROWS FETCH NEXT #{rows} ROWS ONLY""");
+                                       and family.owner_id = customer.owner_id
+                limit #{offset},#{rows}
+                """);
         assertThat(result.appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_IMPLICIT_CROSS_JOIN_RULE, "LIMIT_OFFSET_TO_DM_FETCH");
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_IMPLICIT_CROSS_JOIN_RULE);
     }
 
     @Test
@@ -713,7 +703,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsMysqlTemporaryTableAsSelectToDamengGlobalTemporaryTable() {
+    void leavesMysqlTemporaryTableAsSelectNative() {
         SqlConversionResult result = converter.convert("""
                 drop table if exists tmp_relationship_owner_20200204;
                 create TEMPORARY table tmp_relationship_owner_20200204
@@ -721,13 +711,9 @@ class MySqlToDmSqlConverterTest {
                 FROM owner_house_relationship rs
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                drop table if exists tmp_relationship_owner_20200204;
-                CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT rs.owner_id, rs.house_id
-                FROM owner_house_relationship rs
-                """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -808,11 +794,8 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select DATEADD(MINUTE, 120, (DATE(checkDate)) || (' ') || (onOffTime)) from record");
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE,
-                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
-        );
+                .isEqualTo("select DATEADD(MINUTE, 120, CONCAT(DATE(checkDate), ' ', onOffTime)) from record");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
     }
 
     @Test
@@ -875,11 +858,8 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select DATEADD(DAY, 1 - 1, TO_DATE((EXTRACT(YEAR FROM #{day})) || ('-01-01'), 'YYYY-MM-DD')) from dual");
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE,
-                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
-        );
+                .isEqualTo("select DATEADD(DAY, 1 - 1, TO_DATE(CONCAT(EXTRACT(YEAR FROM #{day}), '-01-01'), 'YYYY-MM-DD')) from dual");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE);
     }
 
     @Test
@@ -918,12 +898,11 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select DATE_FORMAT(LAST_DAY(DATEADD(MONTH, QUARTER (#{day}) * 3-1, DATEADD(DAY, 1 - 1, TO_DATE((EXTRACT(YEAR FROM #{day})) || ('-01-01'), 'YYYY-MM-DD')))),'%Y-%m-%d 23:59:59')");
+                .isEqualTo("select DATE_FORMAT(LAST_DAY(DATEADD(MONTH, QUARTER (#{day}) * 3-1, DATEADD(DAY, 1 - 1, TO_DATE(CONCAT(EXTRACT(YEAR FROM #{day}), '-01-01'), 'YYYY-MM-DD')))),'%Y-%m-%d 23:59:59')");
         assertThat(result.appliedRules())
                 .containsExactly(
                         MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE,
-                        MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE,
-                        MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
+                        MySqlToDmSqlConverter.MYSQL_MAKEDATE_RULE
                 );
     }
 
@@ -1025,7 +1004,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsSubstringIndexGroupConcatFirstItemToRegexpSubstrListagg() {
+    void leavesSubstringIndexNativeAfterGroupConcatRewrite() {
         SqlConversionResult result = converter.convert(
                 "select SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT rs.owner_id order by rs.house_owner_relationship_id desc , ','),',',1) from owner_house_relationship rs"
         );
@@ -1033,25 +1012,19 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("select REGEXP_SUBSTR(LISTAGG(DISTINCT rs.owner_id, ',') WITHIN GROUP (ORDER BY rs.house_owner_relationship_id desc), '[^,]+', 1, 1) from owner_house_relationship rs");
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE,
-                MySqlToDmSqlConverter.MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE
-        );
+                .isEqualTo("select SUBSTRING_INDEX(LISTAGG(DISTINCT rs.owner_id, ',') WITHIN GROUP (ORDER BY rs.house_owner_relationship_id desc),',',1) from owner_house_relationship rs");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
     }
 
     @Test
-    void convertsSubstringIndexNegativeOneToLastToken() {
+    void leavesSubstringIndexNegativeOneNative() {
         SqlConversionResult result = converter.convert(
                 "select SUBSTRING_INDEX(ys_ets_code,'-',-1) as ysEtsCode from owner_house_base_info"
         );
 
-        assertThat(result.changed()).isTrue();
+        assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql())
-                .isEqualTo("select REGEXP_SUBSTR(ys_ets_code, '[^\\-]+$', 1, 1) as ysEtsCode from owner_house_base_info");
-        assertThat(result.appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE);
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -1066,42 +1039,36 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsMysqlConcatToDamengConcatenationOperator() {
+    void leavesMysqlConcatNative() {
         SqlConversionResult result = converter.convert(
                 "select CONCAT(cd.PreinctName, '-', cd.HouseName) as userAddress from Charge_CustomerChargeDetail cd"
         );
 
-        assertThat(result.changed()).isTrue();
+        assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql())
-                .isEqualTo("select (cd.PreinctName) || ('-') || (cd.HouseName) as userAddress from Charge_CustomerChargeDetail cd");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsSingleArgumentMysqlConcatToWrappedExpression() {
+    void leavesSingleArgumentMysqlConcatNative() {
         SqlConversionResult result = converter.convert(
                 "select CONCAT(DATE_FORMAT(CalcStartDate,'%Y-%m-%d')) as CalcStartDate from detail"
         );
 
-        assertThat(result.changed()).isTrue();
+        assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql())
-                .isEqualTo("select (DATE_FORMAT(CalcStartDate,'%Y-%m-%d')) as CalcStartDate from detail");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsNestedMysqlConcatWithMyBatisPlaceholder() {
+    void leavesNestedMysqlConcatWithMyBatisPlaceholderNative() {
         SqlConversionResult result = converter.convert(
                 "and cd.OwnerName like concat(concat(#{customerName}),'%')"
         );
 
-        assertThat(result.changed()).isTrue();
+        assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql())
-                .isEqualTo("and cd.OwnerName like ((#{customerName})) || ('%')");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE);
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -1113,11 +1080,10 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("select * from ns_wms_material where \"materialCode\" LIKE (#{materialClassCode}) || ('%')");
+                .isEqualTo("select * from ns_wms_material where `materialCode` LIKE (#{materialClassCode}) || ('%')");
         assertThat(result.appliedRules())
                 .containsExactly(
                         "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
                         MySqlToDmSqlConverter.MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE
                 );
     }
@@ -1179,7 +1145,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsNotFindInSetToEqualsZero() {
+    void leavesNotFindInSetNativeAfterGroupConcatRewrite() {
         SqlConversionResult result = converter.convert("""
                 select orderNo, group_concat(callStatus) allCallStatus
                 from ns_bill_order_pay_info
@@ -1193,18 +1159,17 @@ class MySqlToDmSqlConverterTest {
                 select orderNo, LISTAGG(callStatus, ',') WITHIN GROUP (ORDER BY callStatus) allCallStatus
                 from ns_bill_order_pay_info
                 group by orderNo
-                having find_in_set('1', (LISTAGG(callStatus, ',') WITHIN GROUP (ORDER BY callStatus))) = 0
+                having !find_in_set('1', (LISTAGG(callStatus, ',') WITHIN GROUP (ORDER BY callStatus)))
                 """);
         assertThat(result.appliedRules())
                 .containsExactly(
                         MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE,
-                        MySqlToDmSqlConverter.MYSQL_HAVING_AGGREGATE_ALIAS_RULE,
-                        MySqlToDmSqlConverter.MYSQL_NOT_FIND_IN_SET_RULE
+                        MySqlToDmSqlConverter.MYSQL_HAVING_AGGREGATE_ALIAS_RULE
                 );
     }
 
     @Test
-    void convertsNotFindInSetOutsideHavingWithoutChangingCommentsOrStrings() {
+    void leavesNotFindInSetOutsideHavingNative() {
         String sql = """
                 select * from bill
                 where ! FIND_IN_SET(#{status}, status_list)
@@ -1214,14 +1179,9 @@ class MySqlToDmSqlConverterTest {
 
         SqlConversionResult result = converter.convert(sql);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                select * from bill
-                where FIND_IN_SET(#{status}, status_list) = 0
-                  and note = '!find_in_set(1, x)'
-                  -- !find_in_set(1, x)
-                """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_NOT_FIND_IN_SET_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
     }
 
     @Test
@@ -1236,7 +1196,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsBacktickQuotedHavingAggregateAliasWithoutChangingStringLiterals() {
+    void leavesBacktickQuotedHavingAggregateAliasNative() {
         SqlConversionResult result = converter.convert("""
                 select SUM(amount) AS `totalAmount`, item_id
                 from bill
@@ -1244,18 +1204,9 @@ class MySqlToDmSqlConverterTest {
                 having `totalAmount` > 0 and remark <> 'totalAmount'
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                select SUM(amount) AS "totalAmount", item_id
-                from bill
-                group by item_id
-                having (SUM(amount)) > 0 and remark <> 'totalAmount'
-                """);
-        assertThat(result.appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
-                        MySqlToDmSqlConverter.MYSQL_HAVING_AGGREGATE_ALIAS_RULE
-                );
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -1283,19 +1234,16 @@ class MySqlToDmSqlConverterTest {
     @Test
     void keepsSafeConversionsWhenRemainingSqlNeedsManualReview() {
         SqlConversionResult result = converter.convert(
-                "select `user`, JSON_SET(payload, '$.name', 'x') from audit_log limit 1"
+                "select \"ACTIVE\" as status, YEARWEEK(created_at) from audit_log"
         );
 
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select \"user\", JSON_SET(payload, '$.name', 'x') from audit_log FETCH FIRST 1 ROWS ONLY");
-        assertThat(result.reason()).contains("JSON_SET");
+                .isEqualTo("select 'ACTIVE' as status, YEARWEEK(created_at) from audit_log");
+        assertThat(result.reason()).contains("YEARWEEK");
         assertThat(result.appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
-                        "LIMIT_TO_DM_FETCH"
-                );
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
     }
 
     @Test
@@ -1311,53 +1259,48 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsBacktickIdentifiers() {
+    void leavesBacktickIdentifiersNativeWhileStillConvertingStrings() {
         SqlConversionResult result = converter.convert(
                 "select u.`id`, u.`user_name`, `${item.fieldName}` from `sys_user` u where u.`enabled` = \"Y\""
         );
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select u.id, u.user_name, \"${item.fieldName}\" from sys_user u where u.enabled = 'Y'");
+                .isEqualTo("select u.`id`, u.`user_name`, `${item.fieldName}` from `sys_user` u where u.`enabled` = 'Y'");
         assertThat(result.appliedRules())
-                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
     }
 
     @Test
-    void quotesBacktickIdentifiersThatNeedCasePreservation() {
+    void leavesBacktickIdentifiersThatNeedCasePreservationNative() {
         SqlConversionResult result = converter.convert(
                 "select `foreignerKeyId`, t.`extField`, `${key}` from `ns_other_information_extend` t"
         );
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql())
-                .isEqualTo("select \"foreignerKeyId\", t.\"extField\", \"${key}\" from ns_other_information_extend t");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void quotesBacktickIdentifiersThatAreReservedOrContainSpecialCharacters() {
+    void leavesReservedOrSpecialBacktickIdentifiersNative() {
         SqlConversionResult result = converter.convert("select `order`, `newsee-system`.`user-table` from `user`");
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("select \"order\", \"newsee-system\".\"user-table\" from \"user\"");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void doesNotConvertBackticksInsideStringsOrComments() {
+    void leavesBackticksInsideStringsCommentsAndIdentifiersNative() {
         SqlConversionResult result = converter.convert("""
                 select '`order`' as raw, `status` -- `comment`
                 from user /* `block` */
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                select '`order`' as raw, status -- `comment`
-                from user /* `block` */
-                """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -1474,13 +1417,10 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).isEqualTo("""
                 select id
                 from ns_contract_template
-                where REGEXP_LIKE(departmentIds, ('(^|,)(') || (#{seeOrganizationIds,jdbcType=VARCHAR}) || (')(,|$)'))
+                where REGEXP_LIKE(departmentIds, CONCAT( '(^|,)(',#{seeOrganizationIds,jdbcType=VARCHAR}, ')(,|$)'))
                 order by id desc
                 """);
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_REGEXP_OPERATOR_RULE,
-                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
-        );
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_REGEXP_OPERATOR_RULE);
     }
 
     @Test
@@ -1578,7 +1518,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsMysqlUpdateJoinToDamengUpdateFrom() {
+    void leavesMysqlUpdateJoinNative() {
         SqlConversionResult result = converter.convert("""
                 update ys_organization y inner join (
                     select a.organization_id
@@ -1590,20 +1530,13 @@ class MySqlToDmSqlConverterTest {
                 where y.organization_id =c.organization_id and y.sync_organization_parent_id is not null
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                update ys_organization y set y.is_deleted =1 from (
-                    select a.organization_id
-                    from ys_organization a
-                    left join ys_organization b on a.sync_organization_parent_id=b.sync_organization_id
-                    where b.is_deleted=1 and a.is_deleted=0
-                ) c where y.organization_id =c.organization_id and y.sync_organization_parent_id is not null
-                """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsMysqlUpdateJoinOnConditionToDamengUpdateFromWhereCondition() {
+    void leavesMysqlUpdateJoinNativeWhileQuotingKeywordColumns() {
         SqlConversionResult result = converter.convert("""
                 update ns_system_pre_organization y inner join (
                     select a.organization_id from ns_system_pre_organization a
@@ -1614,19 +1547,17 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                update ns_system_pre_organization y set y.sync_flag=2,y."DESC" = 'NsOrgParentNotExist' from (
+                update ns_system_pre_organization y inner join (
                     select a.organization_id from ns_system_pre_organization a
-                ) c where c.organization_id = y.organization_id and y.organization_id =c.organization_id
+                ) c on c.organization_id = y.organization_id
+                set y.sync_flag=2,y."DESC" = 'NsOrgParentNotExist'
+                where y.organization_id =c.organization_id
                 """);
-        assertThat(result.appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
-                        MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE
-                );
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
     }
 
     @Test
-    void convertsMultipleMysqlUpdateJoinStatementsInOneMapperStatement() {
+    void leavesMultipleMysqlUpdateJoinStatementsNative() {
         SqlConversionResult result = converter.convert("""
                 update ns_system_organization_detail od inner join ns_system_organization o on od.organization_id =o.organization_id
                     set od.organization_type = o.organization_type,od.organization_nature = o.organization_nature,od.organization_path = o.organization_path;
@@ -1635,16 +1566,13 @@ class MySqlToDmSqlConverterTest {
                     set od.affiliated_organization_type = o.organization_type,od.affiliated_organization_nature = o.organization_nature,od.affiliated_organization_path = o.organization_path;
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql())
-                .contains("update ns_system_organization_detail od set od.organization_type = o.organization_type,od.organization_nature = o.organization_nature,od.organization_path = o.organization_path from ns_system_organization o where od.organization_id =o.organization_id;")
-                .contains("update ns_system_organization_detail od set od.affiliated_organization_type = o.organization_type,od.affiliated_organization_nature = o.organization_nature,od.affiliated_organization_path = o.organization_path from ns_system_organization o where od.affiliated_organization_id =o.organization_id;")
-                .doesNotContain("inner join");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsMysqlUpdateJoinThatSetsMultipleAliasesToDamengBlock() {
+    void leavesMysqlUpdateJoinThatSetsMultipleAliasesNative() {
         SqlConversionResult result = converter.convert("""
                 update ns_quality_check_schedule_task a
                 join ns_quality_check_schedule_task_user u on a.ID = u.checkScheduleTaskID
@@ -1652,14 +1580,9 @@ class MySqlToDmSqlConverterTest {
                 where a.ID = #{id}
                 """);
 
-        assertThat(result.changed()).isTrue();
+        assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo("""
-                BEGIN
-                update ns_quality_check_schedule_task_user u set u.checkUserID = #{userId} from ns_quality_check_schedule_task a where a.ID = u.checkScheduleTaskID and a.ID = #{id};
-                update ns_quality_check_schedule_task a set a.transferType = 1 from ns_quality_check_schedule_task_user u where a.ID = u.checkScheduleTaskID and a.ID = #{id};
-                END;""");
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -1697,7 +1620,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void marksComplexMultiJoinUpdateForManualReview() {
+    void leavesComplexMultiJoinUpdateNative() {
         SqlConversionResult result = converter.convert("""
                 update ys_role_permission_exp yrpe
                 inner join ns_core_resourcebutton ncrb on yrpe.button_id = ncrb.id
@@ -1707,8 +1630,8 @@ class MySqlToDmSqlConverterTest {
                 """);
 
         assertThat(result.changed()).isFalse();
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.reason()).contains("UPDATE JOIN");
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -1837,14 +1760,11 @@ class MySqlToDmSqlConverterTest {
     @Test
     void marksMySqlSpecificFunctionsForManualReview() {
         List<String> functionNames = List.of(
+                "DATE_ADD",
                 "DATE_SUB",
-                "STR_TO_DATE",
-                "UNIX_TIMESTAMP",
-                "FROM_UNIXTIME",
-                "TIMESTAMPDIFF",
-                "CONCAT_WS",
-                "JSON_UNQUOTE",
-                "JSON_SET"
+                "MAKEDATE",
+                "PERIOD_DIFF",
+                "YEARWEEK"
         );
 
         for (String functionName : functionNames) {
@@ -1857,6 +1777,49 @@ class MySqlToDmSqlConverterTest {
             assertThat(result.convertedSql()).isEqualTo(result.originalSql());
             assertThat(result.reason()).contains(functionName);
         }
+    }
+
+    @Test
+    void leavesDameng53CompatibleMysqlFunctionsNative() {
+        List<String> sqlItems = List.of(
+                "select STR_TO_DATE('202401', '%Y%m') from dual",
+                "select UNIX_TIMESTAMP(created_at), FROM_UNIXTIME(0) from user",
+                "select TIMESTAMPDIFF(DAY, start_at, end_at) from user",
+                "select CONCAT_WS('-', province, city) from user",
+                "select JSON_SET(payload, '$.name', 'x'), JSON_UNQUOTE(JSON_QUOTE('x')) from audit_log"
+        );
+
+        for (String sql : sqlItems) {
+            SqlConversionResult result = converter.convert(sql);
+
+            assertThat(result.changed()).isFalse();
+            assertThat(result.manualReviewRequired()).isFalse();
+            assertThat(result.convertedSql()).isEqualTo(sql);
+        }
+    }
+
+    @Test
+    void marksMysqlUserVariablesForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                select @rn := @rn + 1 row_num, t.*
+                from bill t, (select @rn := 0) vars
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason()).contains("@var");
+    }
+
+    @Test
+    void ignoresMysqlUserVariableMarkersInsideSafeText() {
+        SqlConversionResult result = converter.convert("""
+                select '@rn := 1' as sample, #{userName}
+                -- @rn := 1
+                from user
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
     }
 
     @Test
@@ -2088,7 +2051,7 @@ class MySqlToDmSqlConverterTest {
                 SELECT TABLE_NAME
                 FROM ALL_TAB_COLUMNS
                 WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
-                AND TABLE_NAME LIKE UPPER((#{tablePrefix}) || ('%'))
+                AND TABLE_NAME LIKE UPPER(concat(#{tablePrefix},'%'))
                 AND COLUMN_NAME NOT IN
                 <foreach collection='columnNameList' item='item' open='(' close=')' separator=','>
                     #{item}
@@ -2097,7 +2060,6 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.appliedRules())
                 .containsExactly(
                         "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
-                        MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE,
                         MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE
                 );
     }
@@ -2118,13 +2080,10 @@ class MySqlToDmSqlConverterTest {
                 SELECT TABLE_NAME
                 FROM ALL_TAB_COLUMNS
                 WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
-                AND TABLE_NAME LIKE UPPER((#{tablePrefix}) || ('%'))
+                AND TABLE_NAME LIKE UPPER(concat(#{tablePrefix},'%'))
                 AND COLUMN_NAME NOT IN""");
         assertThat(result.appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE,
-                        MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE
-                );
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
     }
 
     @Test
@@ -2180,10 +2139,7 @@ class MySqlToDmSqlConverterTest {
                 AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
                 AND OBJECT_NAME LIKE UPPER('${tablePrefix}%')""");
         assertThat(result.appliedRules())
-                .containsExactly(
-                        MySqlToDmSqlConverter.MYSQL_BACKTICK_IDENTIFIER_RULE,
-                        MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE
-                );
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }
 
     @Test
@@ -2209,11 +2165,8 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select * from schedule where LOCATE(CAST(#{precinctId} AS VARCHAR(64)), (',') || (s3.precinctID) || (',')) > 0");
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_LOCATE_NUMERIC_NEEDLE_RULE,
-                MySqlToDmSqlConverter.MYSQL_CONCAT_TO_DM_OPERATOR_RULE
-        );
+                .isEqualTo("select * from schedule where LOCATE(CAST(#{precinctId} AS VARCHAR(64)), concat(',', s3.precinctID, ',')) > 0");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_LOCATE_NUMERIC_NEEDLE_RULE);
     }
 
     @Test
@@ -2285,13 +2238,10 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                select DATEDIFF(MONTH, min(TO_DATE(AccountBook, 'YYYYMM')), SYSDATE)
+                select DATEDIFF(MONTH, min(str_to_date(AccountBook, '%Y%m')), SYSDATE)
                 from Charge_CustomerChargeDetail
                 """);
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_STR_TO_DATE_YEARMONTH_RULE,
-                MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE
-        );
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
     }
 
     @Test
@@ -2310,18 +2260,15 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsMysqlDateDiffTwoArgumentForm() {
+    void leavesMysqlDateDiffTwoArgumentFormNative() {
         SqlConversionResult result = converter.convert("""
                 select DATEDIFF(DATEADD(MONTH, 1, startDate), CURDATE())
                 from ns_contract_info
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                select DATEDIFF(DAY, CURDATE(), DATEADD(MONTH, 1, startDate))
-                from ns_contract_info
-                """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATEDIFF_2ARG_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -2335,15 +2282,12 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                select DATEDIFF(DAY, CURDATE(), DATEADD(MONTH,
+                select DATEDIFF(DATEADD(MONTH,
                     DATEDIFF(MONTH, startDate, CURDATE()),
-                    startDate))
+                    startDate), CURDATE())
                 from ns_contract_info
                 """);
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE,
-                MySqlToDmSqlConverter.MYSQL_DATEDIFF_2ARG_RULE
-        );
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
     }
 
     @Test
@@ -2365,7 +2309,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsMysqlBooleanAggregationAndNotIsNullExpressions() {
+    void keepsNativeBooleanFunctionsWhileConvertingAggregations() {
         SqlConversionResult result = converter.convert("""
                 select count(sendState = 'SEND_SUCCESS' or null) smsSuccessCount,
                        !ISNULL(c.refMeterReadId) charged,
@@ -2376,15 +2320,13 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 select COUNT(CASE WHEN sendState = 'SEND_SUCCESS' THEN 1 END) smsSuccessCount,
-                       CASE WHEN ISNULL(c.refMeterReadId) THEN 0 ELSE 1 END charged,
-                       CASE WHEN (isnull(xm.billType) = 1) OR (length(xm.billType) = 0) THEN jt.billType ELSE xm.billType END billType
+                       !ISNULL(c.refMeterReadId) charged,
+                       IF((isnull(xm.billType) = 1) OR (length(xm.billType) = 0), jt.billType, xm.billType) billType
                 from ns_sms_details
                 """);
         assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_NOT_ISNULL_RULE,
                 MySqlToDmSqlConverter.MYSQL_COUNT_CONDITION_OR_NULL_RULE,
-                MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE,
-                MySqlToDmSqlConverter.MYSQL_IF_TO_CASE_RULE
+                MySqlToDmSqlConverter.MYSQL_BOOLEAN_OPERATOR_RULE
         );
     }
 
@@ -2409,23 +2351,16 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsBooleanLiteralComparisonsOnLikelyBooleanColumns() {
+    void leavesBooleanLiteralComparisonsNative() {
         SqlConversionResult result = converter.convert("""
                 delete from owner_house_result
                 where house_id = #{houseId} and is_current_record = true
                   and deleteFlag != false
                 """);
 
-        assertThat(result.changed()).isTrue();
+        assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo("""
-                delete from owner_house_result
-                where house_id = #{houseId} and is_current_record = 1
-                  and deleteFlag != 0
-                """);
-        assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_BOOLEAN_LITERAL_COMPARISON_RULE
-        );
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -2471,33 +2406,27 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsMysqlIfFunctionToCaseExpression() {
+    void leavesMysqlIfFunctionNative() {
         SqlConversionResult result = converter.convert("""
                 select sum(amount) / if(count(DISTINCT log.id) = 0, 1, count(DISTINCT log.id)) as avgAmount
                 from payment_log log
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                select sum(amount) / CASE WHEN count(DISTINCT log.id) = 0 THEN 1 ELSE count(DISTINCT log.id) END as avgAmount
-                from payment_log log
-                """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_IF_TO_CASE_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
-    void convertsMysqlIfFunctionWithImplicitAliasToCaseExpression() {
+    void leavesMysqlIfFunctionWithImplicitAliasNative() {
         SqlConversionResult result = converter.convert("""
                 select if(e.isMustCheck = 1,'是','否')isMustCheckValue,d.equipName
                 from ns_equip_equip e
                 """);
 
-        assertThat(result.changed()).isTrue();
-        assertThat(result.convertedSql()).isEqualTo("""
-                select CASE WHEN e.isMustCheck = 1 THEN '是' ELSE '否' END isMustCheckValue,d.equipName
-                from ns_equip_equip e
-                """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_IF_TO_CASE_RULE);
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
@@ -2513,11 +2442,11 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void marksAmbiguousLimitForManualReview() {
+    void leavesSelectLimitWithPlaceholdersNative() {
         SqlConversionResult result = converter.convert("select * from user limit ?, ?");
 
-        assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.changed()).isFalse();
-        assertThat(result.reason()).contains("LIMIT");
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 }
