@@ -1,0 +1,166 @@
+-- 这些是 mysql.sql 中 MySQL 语法示例对应的达梦写法。
+-- 验证目标：jdbc:dm://192.168.1.53:5236，用户 SYSDBA，验证日期 2026-06-30。
+-- 每个 Dxx 小节都与 mysql.sql 中相同编号的小节一一对应。
+
+DROP TRIGGER IF EXISTS TRG_DMADAPTER_DIFF_TOUCH_BU;
+DROP TABLE IF EXISTS DMADAPTER_DIFF_BASIC;
+DROP TABLE IF EXISTS DMADAPTER_DIFF_KV;
+DROP TABLE IF EXISTS DMADAPTER_DIFF_DDL;
+DROP TABLE IF EXISTS DMADAPTER_DIFF_TOUCH;
+
+CREATE TABLE DMADAPTER_DIFF_BASIC (
+    id INT PRIMARY KEY,
+    name VARCHAR(50),
+    status VARCHAR(20),
+    csv VARCHAR(100),
+    create_time TIMESTAMP,
+    amount VARCHAR(20),
+    flag INT
+);
+
+INSERT INTO DMADAPTER_DIFF_BASIC(id, name, status, csv, create_time, amount, flag) VALUES
+(1, 'alice', 'ACTIVE', '1,2,10', TIMESTAMP '2026-06-30 10:11:12', '12.30', 1);
+
+INSERT INTO DMADAPTER_DIFF_BASIC(id, name, status, csv, create_time, amount, flag) VALUES
+(2, 'bob', 'INACTIVE', '3,4', TIMESTAMP '2026-06-29 09:00:00', '8', 0);
+
+CREATE TABLE DMADAPTER_DIFF_KV (
+    id INT PRIMARY KEY,
+    val VARCHAR(50)
+);
+
+INSERT INTO DMADAPTER_DIFF_KV(id, val) VALUES (1, 'old');
+
+-- D01：字符串字面量使用单引号。
+SELECT id
+FROM DMADAPTER_DIFF_BASIC
+WHERE status = 'ACTIVE';
+
+-- D02：使用普通别名，或使用双引号标识符作为别名。
+SELECT COUNT(*) AS "totalCount"
+FROM DMADAPTER_DIFF_BASIC;
+
+-- D03：字符串聚合改用 LISTAGG。
+SELECT LISTAGG(name, ',') WITHIN GROUP (ORDER BY name) AS names
+FROM DMADAPTER_DIFF_BASIC;
+
+-- D04：正则匹配改用 REGEXP_LIKE。
+SELECT id
+FROM DMADAPTER_DIFF_BASIC
+WHERE REGEXP_LIKE(name, '^a');
+
+-- D05：日期加法改用 DATEADD。
+SELECT DATEADD(DAY, 1, create_time) AS next_day
+FROM DMADAPTER_DIFF_BASIC;
+
+-- D06：日期减法改用负数间隔的 DATEADD。
+SELECT DATEADD(DAY, -1, create_time) AS prev_day
+FROM DMADAPTER_DIFF_BASIC;
+
+-- D07：数值类型转换改用 CAST。
+SELECT CAST(amount AS DECIMAL(10, 2)) AS amount_num
+FROM DMADAPTER_DIFF_BASIC;
+
+-- D08：达梦不使用 UNSIGNED，改为达梦支持的数值类型。
+SELECT CAST(id AS BIGINT) AS id_num
+FROM DMADAPTER_DIFF_BASIC;
+
+-- D09：行号改用窗口函数。
+SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, id
+FROM DMADAPTER_DIFF_BASIC
+ORDER BY id;
+
+-- D10：插入或更新改用 MERGE。
+MERGE INTO DMADAPTER_DIFF_KV t
+USING (SELECT 1 AS id, 'new' AS val FROM DUAL) s
+ON (t.id = s.id)
+WHEN MATCHED THEN UPDATE SET t.val = s.val
+WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val);
+
+-- D11：覆盖式写入改用 MERGE。
+MERGE INTO DMADAPTER_DIFF_KV t
+USING (SELECT 1 AS id, 'replace_new' AS val FROM DUAL) s
+ON (t.id = s.id)
+WHEN MATCHED THEN UPDATE SET t.val = s.val
+WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val);
+
+-- D12：忽略重复键插入可改为 INSERT ... SELECT ... WHERE NOT EXISTS。
+INSERT INTO DMADAPTER_DIFF_KV(id, val)
+SELECT 1, 'ignored'
+FROM DUAL
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM DMADAPTER_DIFF_KV
+    WHERE id = 1
+);
+
+-- D13：用子查询先筛选目标行，替代 UPDATE ORDER BY LIMIT。
+UPDATE DMADAPTER_DIFF_BASIC
+SET status = 'NEW'
+WHERE id = (
+    SELECT id
+    FROM (
+        SELECT id
+        FROM DMADAPTER_DIFF_BASIC
+        ORDER BY id
+    )
+    WHERE ROWNUM = 1
+);
+
+-- D14：查询达梦数据字典视图，替代 DESCRIBE。
+SELECT column_name, data_type
+FROM user_tab_columns
+WHERE table_name = 'DMADAPTER_DIFF_BASIC'
+ORDER BY column_id;
+
+-- D15：查询达梦数据字典视图，替代 SHOW TABLES。
+SELECT table_name
+FROM user_tables
+WHERE table_name LIKE 'DMADAPTER_DIFF_%'
+ORDER BY table_name;
+
+-- D16：查询达梦数据字典视图，替代 information_schema。
+SELECT COUNT(*)
+FROM all_tables
+WHERE owner = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+  AND table_name = 'DMADAPTER_DIFF_BASIC';
+
+-- D17：当前 schema 使用 SYS_CONTEXT 获取。
+SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS current_schema
+FROM DUAL;
+
+-- D18：将 PERIOD_DIFF(YYYYMM, YYYYMM) 展开为月份差计算。
+SELECT (FLOOR(202606 / 100) * 12 + MOD(202606, 100))
+     - (FLOOR(202501 / 100) * 12 + MOD(202501, 100)) AS month_diff
+FROM DUAL;
+
+-- D19：用 DATEADD 构造 MAKEDATE(year, day_of_year) 的等价结果。
+SELECT DATEADD(DAY, 181 - 1, TO_DATE('2026-01-01', 'YYYY-MM-DD')) AS the_day
+FROM DUAL;
+
+-- D20：使用 VALUES 复数写法。
+INSERT INTO DMADAPTER_DIFF_KV(id, val)
+VALUES (3, 'v3');
+
+-- D21：达梦中建表、注释和索引拆成独立语句。
+CREATE TABLE DMADAPTER_DIFF_DDL (
+    id INT,
+    name VARCHAR(20)
+);
+
+COMMENT ON TABLE DMADAPTER_DIFF_DDL IS '表注释';
+COMMENT ON COLUMN DMADAPTER_DIFF_DDL.id IS '编号';
+CREATE INDEX IDX_DMADAPTER_DIFF_DDL_NAME ON DMADAPTER_DIFF_DDL(name);
+
+-- D22：ON UPDATE CURRENT_TIMESTAMP 改为触发器，或由应用 SQL 维护更新时间。
+CREATE TABLE DMADAPTER_DIFF_TOUCH (
+    id INT PRIMARY KEY,
+    updated_at TIMESTAMP DEFAULT SYSDATE
+);
+
+CREATE OR REPLACE TRIGGER TRG_DMADAPTER_DIFF_TOUCH_BU
+BEFORE UPDATE ON DMADAPTER_DIFF_TOUCH
+FOR EACH ROW
+BEGIN
+    :NEW.updated_at := SYSDATE;
+END;
