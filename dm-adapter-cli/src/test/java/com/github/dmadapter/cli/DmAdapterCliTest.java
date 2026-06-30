@@ -1049,7 +1049,14 @@ class DmAdapterCliTest {
         String generatedTestSource = Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"));
         assertThat(exitCode).isZero();
         assertThat(generatedTestSource)
-                .contains("Map<String, Element> sqlFragments = sqlFragments(root, namespace);")
+                .contains("Map<String, Element> globalSqlFragments = globalSqlFragments(mapperXmlFiles);")
+                .contains("statements.addAll(mapperStatements(mapperXmlFile, globalSqlFragments));")
+                .contains("Map<String, Element> sqlFragments = new LinkedHashMap<>(globalSqlFragments);")
+                .contains("sqlFragments.putAll(sqlFragments(root, namespace));")
+                .contains("private Map<String, Element> globalSqlFragments(List<Path> mapperXmlFiles)")
+                .contains("fragments.putAll(qualifiedSqlFragments(root, namespace));")
+                .contains("private Map<String, Element> qualifiedSqlFragments(Element mapperRoot, String namespace)")
+                .contains("if (entry.getKey().indexOf('.') >= 0)")
                 .contains("private Map<String, Element> sqlFragments(Element mapperRoot, String namespace)")
                 .contains("dynamicIdentifierMetadata(element, sqlFragments, namespace)")
                 .contains("if (\"include\".equals(element.getTagName()))")

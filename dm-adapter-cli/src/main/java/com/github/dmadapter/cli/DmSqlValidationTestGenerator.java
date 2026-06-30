@@ -1108,14 +1108,19 @@ class DmSqlValidationTestGenerator {
 
                 private List<MapperStatement> mapperStatements(List<Path> mapperXmlFiles) {
                     List<MapperStatement> statements = new ArrayList<>();
+                    Map<String, Element> globalSqlFragments = globalSqlFragments(mapperXmlFiles);
                     for (Path mapperXmlFile : mapperXmlFiles) {
-                        statements.addAll(mapperStatements(mapperXmlFile));
+                        statements.addAll(mapperStatements(mapperXmlFile, globalSqlFragments));
                     }
                     statements.sort(Comparator.comparing(MapperStatement::key));
                     return statements;
                 }
 
                 private List<MapperStatement> mapperStatements(Path mapperXmlFile) {
+                    return mapperStatements(mapperXmlFile, emptyMap());
+                }
+
+                private List<MapperStatement> mapperStatements(Path mapperXmlFile, Map<String, Element> globalSqlFragments) {
                     try {
                         Document document = parseXml(mapperXmlFile);
                         Element root = document.getDocumentElement();
@@ -1126,7 +1131,8 @@ class DmSqlValidationTestGenerator {
                         if (namespace == null || isBlank(namespace)) {
                             return listOf();
                         }
-                        Map<String, Element> sqlFragments = sqlFragments(root, namespace);
+                        Map<String, Element> sqlFragments = new LinkedHashMap<>(globalSqlFragments);
+                        sqlFragments.putAll(sqlFragments(root, namespace));
                         List<MapperStatement> statements = new ArrayList<>();
                         NodeList children = root.getChildNodes();
                         for (int i = 0; i < children.getLength(); i++) {
@@ -1153,6 +1159,36 @@ class DmSqlValidationTestGenerator {
                     } catch (Exception e) {
                         return listOf();
                     }
+                }
+
+                private Map<String, Element> globalSqlFragments(List<Path> mapperXmlFiles) {
+                    Map<String, Element> fragments = new LinkedHashMap<>();
+                    for (Path mapperXmlFile : mapperXmlFiles) {
+                        try {
+                            Document document = parseXml(mapperXmlFile);
+                            Element root = document.getDocumentElement();
+                            if (root == null || !"mapper".equals(root.getTagName())) {
+                                continue;
+                            }
+                            String namespace = root.getAttribute("namespace");
+                            if (namespace == null || isBlank(namespace)) {
+                                continue;
+                            }
+                            fragments.putAll(qualifiedSqlFragments(root, namespace));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    return fragments;
+                }
+
+                private Map<String, Element> qualifiedSqlFragments(Element mapperRoot, String namespace) {
+                    Map<String, Element> fragments = new LinkedHashMap<>();
+                    for (Map.Entry<String, Element> entry : sqlFragments(mapperRoot, namespace).entrySet()) {
+                        if (entry.getKey().indexOf('.') >= 0) {
+                            fragments.put(entry.getKey(), entry.getValue());
+                        }
+                    }
+                    return fragments;
                 }
 
                 private Map<String, Element> sqlFragments(Element mapperRoot, String namespace) {
