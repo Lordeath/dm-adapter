@@ -5184,19 +5184,19 @@ class DmSqlValidationTestGenerator {
                             }
                             return ValueResult.resolved(new ArrayList<>(listOf(elementValue)));
                         }
-                        Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);
-                        if (sqlFragmentDefault != null) {
-                            if (Set.class.isAssignableFrom(targetType)) {
-                                return ValueResult.resolved(new LinkedHashSet<>(listOf(sqlFragmentDefault)));
-                            }
-                            return ValueResult.resolved(new ArrayList<>(listOf(sqlFragmentDefault)));
-                        }
                         Object scalarDefault = collectionScalarDefault;
                         if (scalarDefault != null) {
                             if (Set.class.isAssignableFrom(targetType)) {
                                 return ValueResult.resolved(new LinkedHashSet<>(listOf(scalarDefault)));
                             }
                             return ValueResult.resolved(new ArrayList<>(listOf(scalarDefault)));
+                        }
+                        Object sqlFragmentDefault = statement == null ? null : statement.collectionSqlFragmentDefault(valueName);
+                        if (sqlFragmentDefault != null) {
+                            if (Set.class.isAssignableFrom(targetType)) {
+                                return ValueResult.resolved(new LinkedHashSet<>(listOf(sqlFragmentDefault)));
+                            }
+                            return ValueResult.resolved(new ArrayList<>(listOf(sqlFragmentDefault)));
                         }
                         ValueResult nestedValue = defaultValue(valueName, rawClass(nestedType), nestedType, depth + 1, statement);
                         if (!nestedValue.resolved) {
