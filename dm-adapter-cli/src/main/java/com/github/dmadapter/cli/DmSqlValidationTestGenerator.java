@@ -5664,6 +5664,9 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object defaultParameterMapValue(String valueName, Object configuredDefault, MapperStatement statement) {
+                    if (configuredDefault != null && shouldPreferConfiguredSqlFragmentDefault(valueName)) {
+                        return configuredDefault;
+                    }
                     String columnType = statement == null ? "" : statement.defaultColumnType(valueName, dbColumnMetadata);
                     if (!isBlank(columnType) && isDateTimeColumnType(columnType)) {
                         return defaultStringDateTimeForColumnType(columnType);
@@ -5677,6 +5680,10 @@ class DmSqlValidationTestGenerator {
                     return isBlank(columnType)
                             ? null
                             : defaultValueForColumnType(valueName, Object.class, columnType);
+                }
+
+                private boolean shouldPreferConfiguredSqlFragmentDefault(String valueName) {
+                    return defaultSqlFragmentForName(normalizeName(valueName)) != null;
                 }
 
                 private Object defaultCollectionParameter(String collectionName, MapperStatement statement) {
