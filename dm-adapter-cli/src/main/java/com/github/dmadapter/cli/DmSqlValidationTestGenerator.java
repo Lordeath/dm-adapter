@@ -8298,6 +8298,10 @@ class DmSqlValidationTestGenerator {
                     return Pattern.compile(
                             "\\\\bcreate\\\\s+(?:global\\\\s+)?temporary\\\\s+table\\\\b[\\\\s\\\\S]*?\\\\bas\\\\s+select\\\\b[\\\\s\\\\S]*?\\\\?\\\\s+as\\\\s+(?:\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)",
                             Pattern.CASE_INSENSITIVE
+                    ).matcher(message).find()
+                            || Pattern.compile(
+                            "\\\\bcreate\\\\s+(?:global\\\\s+)?temporary\\\\s+table\\\\b[\\\\s\\\\S]*?\\\\bas\\\\s+select\\\\b[\\\\s\\\\S]*?\\\\?",
+                            Pattern.CASE_INSENSITIVE
                     ).matcher(message).find();
                 }
 

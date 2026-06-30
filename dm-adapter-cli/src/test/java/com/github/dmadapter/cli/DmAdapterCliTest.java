@@ -686,6 +686,7 @@ class DmAdapterCliTest {
                 .contains("MYSQL_TEMPORARY_TABLE_AS_SELECT")
                 .contains("DM_CTAS_BIND_PARAMETER")
                 .contains("hasDamengCtasBindParameter")
+                .contains("\\\\bas\\\\s+select\\\\b[\\\\s\\\\S]*?\\\\?")
                 .contains("CREATE TABLE AS SELECT 中使用 JDBC 绑定参数")
                 .contains("DAMENG_KEYWORD_TABLE_ALIAS")
                 .contains("hasGeneratedDynamicIdentifierPlaceholder")
