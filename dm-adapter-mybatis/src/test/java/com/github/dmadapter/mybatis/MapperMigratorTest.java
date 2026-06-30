@@ -2334,6 +2334,60 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicHavingRewritesComputedSelectAliasWithoutMovingItToWhere() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ReportMapper">
+                    <select id="collectAccountChanges">
+                        SELECT
+                        concat(account_book, '/', charge_item) AS dataGroup,
+                        sum(charge_sum) totalAmount
+                        from charge_account
+                        where tenant_id = #{tenantId}
+                        <if test="enabled != null">
+                        </if>
+                        GROUP BY account_book, charge_item
+                        HAVING dataGroup is not null and totalAmount != 0
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ReportMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ReportMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReportMapper.xml"));
+        assertThat(rewritten)
+                .contains("HAVING (concat(account_book, '/', charge_item)) is not null")
+                .contains("and (sum(charge_sum)) != 0")
+                .doesNotContain("\n        and (concat(account_book, '/', charge_item)) is not null")
+                .doesNotContain("and dataGroup is not null")
+                .doesNotContain("HAVING dataGroup is not null");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE
+                );
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicTrimHavingRewritesAggregateAlias() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
