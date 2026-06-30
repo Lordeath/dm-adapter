@@ -136,7 +136,7 @@ public class MapperXmlRewriter {
                     + "(?:=|<>|!=|>=|<=|>|<|in\\b|like\\b|between\\b|is\\b)"
     );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
-    private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|\\$\\{[^}]+})";
+    private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`|\\$\\{[^}]+})";
     private static final Pattern WRAPPING_IF_PATTERN = Pattern.compile(
             "(?is)^(?<leading>\\s*)(?<opening><if\\b[^>]*>)(?<body>[\\s\\S]*)(?<closing></if\\s*>)(?<trailing>\\s*)$"
     );
