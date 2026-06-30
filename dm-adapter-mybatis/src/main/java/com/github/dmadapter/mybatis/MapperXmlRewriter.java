@@ -45,6 +45,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE =
             "MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM";
+    public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED_RULE =
+            "MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED";
     public static final String MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE =
             "MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED";
     public static final String MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE =
@@ -878,6 +880,11 @@ public class MapperXmlRewriter {
             if (mergedSetTrims.changed()) {
                 appliedRules.add(MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED_RULE);
                 converted = mergedSetTrims.text();
+            }
+            TextRewrite qualifiedUpdateJoinSetTargets = qualifyDynamicUpdateJoinSetTargets(converted);
+            if (qualifiedUpdateJoinSetTargets.changed()) {
+                appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED_RULE);
+                converted = qualifiedUpdateJoinSetTargets.text();
             }
             TextRewrite dynamicSetCommas = addMissingDynamicSetCommas(converted);
             if (dynamicSetCommas.changed()) {
@@ -5214,6 +5221,192 @@ public class MapperXmlRewriter {
         }
         replacements.sort((left, right) -> Integer.compare(left.startIndex(), right.startIndex()));
         return applyTextReplacements(body, replacements);
+    }
+
+    private TextRewrite qualifyDynamicUpdateJoinSetTargets(String body) {
+        int statementEnd = body.length();
+        while (statementEnd > 0 && Character.isWhitespace(body.charAt(statementEnd - 1))) {
+            statementEnd--;
+        }
+        if (statementEnd > 0 && body.charAt(statementEnd - 1) == ';') {
+            statementEnd--;
+        }
+        String statement = body.substring(0, statementEnd);
+        int updateIndex = leadingWhitespaceLength(statement);
+        if (!isKeywordAt(statement, updateIndex, "UPDATE")) {
+            return new TextRewrite(body, false);
+        }
+
+        int joinIndex = findTopLevelKeywordSkippingXml(statement, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return new TextRewrite(body, false);
+        }
+        TrimBlock setBlock = findMyBatisDynamicSetBlock(statement, joinIndex + "JOIN".length(), statement.length());
+        if (setBlock == null || setBlock.openingStart() <= joinIndex) {
+            return new TextRewrite(body, false);
+        }
+
+        int joinTypeStart = dynamicJoinTypeStart(statement, joinIndex);
+        String target = statement.substring(updateIndex + "UPDATE".length(), joinTypeStart).strip();
+        String targetAlias = updateTargetAlias(target);
+        if (targetAlias.isBlank() || !isSimpleBareIdentifier(targetAlias) || containsJoinKeyword(target)) {
+            return new TextRewrite(body, false);
+        }
+
+        List<TextReplacement> replacements = new ArrayList<>();
+        qualifySetTargetsInRange(body, setBlock.contentStart(), setBlock.contentEnd(), targetAlias, replacements);
+        replacements.sort((left, right) -> Integer.compare(left.startIndex(), right.startIndex()));
+        return applyTextReplacements(body, replacements);
+    }
+
+    private TrimBlock findMyBatisDynamicSetBlock(String body, int start, int end) {
+        int index = Math.max(0, start);
+        while (index >= 0 && index < end) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                return null;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing()) {
+                if ("set".equalsIgnoreCase(tag.name())) {
+                    int closingStart = findClosingTag(body, tag.endIndex(), "set", end);
+                    if (closingStart < 0) {
+                        return null;
+                    }
+                    int closingEnd = body.indexOf('>', closingStart + 1);
+                    return new TrimBlock(
+                            tagStart,
+                            tag.endIndex(),
+                            closingStart,
+                            closingEnd < 0 ? closingStart : closingEnd + 1
+                    );
+                }
+                if (isSetTrimOpening(body, tagStart, tag)) {
+                    int closingStart = findClosingTag(body, tag.endIndex(), "trim", end);
+                    if (closingStart < 0) {
+                        return null;
+                    }
+                    int closingEnd = body.indexOf('>', closingStart + 1);
+                    return new TrimBlock(
+                            tagStart,
+                            tag.endIndex(),
+                            closingStart,
+                            closingEnd < 0 ? closingStart : closingEnd + 1
+                    );
+                }
+            }
+            index = tag.endIndex();
+        }
+        return null;
+    }
+
+    private String updateTargetAlias(String target) {
+        String stripped = target == null ? "" : target.strip();
+        if (stripped.isBlank() || containsXmlMarkup(stripped)) {
+            return "";
+        }
+        Matcher matcher = Pattern.compile("(?is)^.+?\\s+(?:AS\\s+)?(" + DM_IDENTIFIER + ")\\s*$")
+                .matcher(stripped);
+        if (!matcher.matches()) {
+            return "";
+        }
+        String alias = matcher.group(1).trim();
+        return isSqlClauseKeyword(alias) ? "" : alias;
+    }
+
+    private boolean isSimpleBareIdentifier(String value) {
+        IdentifierToken token = readIdentifierToken(value, 0);
+        return token != null && token.endIndex() == value.length() && !value.contains("${");
+    }
+
+    private void qualifySetTargetsInRange(
+            String body,
+            int start,
+            int end,
+            String targetAlias,
+            List<TextReplacement> replacements
+    ) {
+        int index = start;
+        while (index < end) {
+            int tagStart = body.indexOf('<', index);
+            int textEnd = tagStart < 0 || tagStart > end ? end : tagStart;
+            addSetTargetQualification(body, index, textEnd, targetAlias, replacements);
+            if (tagStart < 0 || tagStart >= end) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (!tag.closing() && !tag.selfClosing() && "trim".equalsIgnoreCase(tag.name())) {
+                addTrimPrefixSetTargetQualification(body, tagStart, tag.endIndex(), targetAlias, replacements);
+            }
+            index = tag.endIndex();
+        }
+    }
+
+    private void addTrimPrefixSetTargetQualification(
+            String body,
+            int tagStart,
+            int tagEnd,
+            String targetAlias,
+            List<TextReplacement> replacements
+    ) {
+        String openingTag = body.substring(tagStart, tagEnd);
+        Matcher matcher = Pattern.compile("(?is)\\bprefix\\s*=\\s*([\"'])(.*?)\\1").matcher(openingTag);
+        if (!matcher.find()) {
+            return;
+        }
+        String prefix = matcher.group(2);
+        TextRewrite qualified = qualifySetTargetExpression(prefix, targetAlias);
+        if (qualified.changed()) {
+            replacements.add(new TextReplacement(
+                    tagStart + matcher.start(2),
+                    tagStart + matcher.end(2),
+                    qualified.text()
+            ));
+        }
+    }
+
+    private void addSetTargetQualification(
+            String body,
+            int start,
+            int end,
+            String targetAlias,
+            List<TextReplacement> replacements
+    ) {
+        String text = body.substring(start, end);
+        TextRewrite qualified = qualifySetTargetExpression(text, targetAlias);
+        if (qualified.changed()) {
+            replacements.add(new TextReplacement(start, end, qualified.text()));
+        }
+    }
+
+    private TextRewrite qualifySetTargetExpression(String value, String targetAlias) {
+        int tokenStart = leadingWhitespaceLength(value);
+        IdentifierToken column = readIdentifierToken(value, tokenStart);
+        if (column == null) {
+            return new TextRewrite(value, false);
+        }
+        int afterColumn = skipWhitespace(value, column.endIndex());
+        if (afterColumn < value.length() && value.charAt(afterColumn) == '.') {
+            return new TextRewrite(value, false);
+        }
+        if (afterColumn >= value.length() || value.charAt(afterColumn) != '=') {
+            return new TextRewrite(value, false);
+        }
+        return new TextRewrite(
+                value.substring(0, tokenStart)
+                        + targetAlias
+                        + "."
+                        + value.substring(tokenStart),
+                true
+        );
     }
 
     private boolean isSetTrimOpening(String body, int tagStart, XmlTag tag) {
