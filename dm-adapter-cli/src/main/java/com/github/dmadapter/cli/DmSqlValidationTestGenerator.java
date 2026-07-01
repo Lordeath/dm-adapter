@@ -5868,6 +5868,12 @@ class DmSqlValidationTestGenerator {
                             target.put(entry.getKey(), scalarCollection);
                             continue;
                         }
+                        if (existing instanceof Collection<?>
+                                && configuredValue instanceof Map<?, ?>
+                                && !statementRequiredCollectionValue(entryPath, statement)) {
+                            target.put(entry.getKey(), configuredValue);
+                            continue;
+                        }
                         Object mapCollection = mapConfiguredCollectionValue(existing, configuredValue, statement, entryPath);
                         if (mapCollection != MethodArgumentConfig.MISSING) {
                             target.put(entry.getKey(), mapCollection);

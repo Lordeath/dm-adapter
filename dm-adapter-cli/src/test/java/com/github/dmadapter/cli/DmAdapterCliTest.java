@@ -977,7 +977,9 @@ class DmAdapterCliTest {
                 .contains("Object rawConfigured = normalizedParams.get(field.getName())")
                 .contains("Map.class.isAssignableFrom(mapperMethod.parameterType)")
                 .contains("configuredParameterMap(")
-                .contains("(Map<String, Object>) configuredArgs.args.get(0)");
+                .contains("(Map<String, Object>) configuredArgs.args.get(0)")
+                .contains("configuredValue instanceof Map<?, ?>")
+                .contains("&& !statementRequiredCollectionValue(entryPath, statement)");
     }
 
     @Test
