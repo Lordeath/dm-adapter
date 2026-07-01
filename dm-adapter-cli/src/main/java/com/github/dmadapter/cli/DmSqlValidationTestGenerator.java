@@ -2434,10 +2434,6 @@ class DmSqlValidationTestGenerator {
                     if (isMapForeachCollectionName(normalizedCollection)) {
                         return true;
                     }
-                    if (!isBlank(normalizedIndex)
-                            && ("value".equals(normalizedItem) || "val".equals(normalizedItem) || "item".equals(normalizedItem))) {
-                        return true;
-                    }
                     if (element == null) {
                         return false;
                     }
@@ -2445,10 +2441,19 @@ class DmSqlValidationTestGenerator {
                     Matcher directItemMatcher = Pattern.compile(
                             "\\\\$\\\\{\\\\s*" + Pattern.quote(item == null ? "" : item) + "\\\\s*}"
                     ).matcher(text);
+                    boolean directItemPlaceholder = false;
                     while (directItemMatcher.find()) {
+                        directItemPlaceholder = true;
                         if (!dynamicPlaceholderInsideSqlLiteral(text, directItemMatcher.start(), directItemMatcher.end())) {
                             return true;
                         }
+                    }
+                    if (directItemPlaceholder) {
+                        return false;
+                    }
+                    if (!isBlank(normalizedIndex)
+                            && ("value".equals(normalizedItem) || "val".equals(normalizedItem) || "item".equals(normalizedItem))) {
+                        return true;
                     }
                     return false;
                 }
