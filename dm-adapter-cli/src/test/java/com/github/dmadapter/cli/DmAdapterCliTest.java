@@ -980,7 +980,8 @@ class DmAdapterCliTest {
                 .contains("(Map<String, Object>) configuredArgs.args.get(0)")
                 .contains("configuredValue instanceof Map<?, ?>")
                 .contains("configuredMapOverridesGeneratedCollection(existing, configuredValue, statement, entryPath)")
-                .contains("&& !statementExactCollectionValue(valueName, statement)")
+                .contains("return !statementExactCollectionValue(valueName, statement)")
+                .contains("return existing == null && !statementRequiredCollectionValue(valueName, statement)")
                 .contains("private boolean exactCollectionParameter(String valueName)");
     }
 
