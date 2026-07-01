@@ -4,7 +4,7 @@
 
 - JDBC：`jdbc:dm://192.168.1.53:5236`
 - 用户：`SYSDBA`
-- 日期：`2026-06-30`
+- 日期：`2026-07-01`
 - 原则：MySQL 写法必须在该达梦环境实际执行失败，才列为需要改写的差异。
 
 ## 输出文件
@@ -67,11 +67,10 @@
 | D19 | `MAKEDATE(year, day)` | `DATEADD(DAY, day - 1, TO_DATE(...))` | 函数不可解析 |
 | D20 | `INSERT ... VALUE (...)` | `INSERT ... VALUES (...)` | 单数 `VALUE` 语法错误 |
 | D21 | 建表内 `COMMENT`、`KEY ... USING BTREE`、`ENGINE`、`CHARSET`、表注释 | 建表、`COMMENT ON`、`CREATE INDEX` 分开写 | 建表选项语法错误 |
-| D22 | `ON UPDATE CURRENT_TIMESTAMP` | 触发器或应用 SQL 维护更新时间 | `ON UPDATE` 列属性无效 |
+| D22 | `ON UPDATE CURRENT_TIMESTAMP` | `ON UPDATE NOW()` | 53 环境不接受 `ON UPDATE CURRENT_TIMESTAMP`，但支持 `ON UPDATE NOW()` 且不需要触发器 |
 
 ## 分类建议
 
-- 工具可自动转换：D01-D08、D13-D20、D21 中的注释/索引/表选项拆分。
+- 工具可自动转换：D01-D08、D13-D20、D21 中的注释/索引/表选项拆分、D22 的 `ON UPDATE CURRENT_TIMESTAMP` 到 `ON UPDATE NOW()`。
 - 需要结合唯一键或业务语义确认：D10、D11、D12。可用 `MERGE`，但更新列、缺省列和触发器行为要按业务确认。
-- 建议人工确认：D22。触发器等价于自动更新时间，但如果原业务显式传更新时间，应避免重复覆盖。
 - 不应再默认转换：`CONCAT`、`LIMIT`、反引号、`FIND_IN_SET`、`DATE_FORMAT`、`STR_TO_DATE`、`UPDATE JOIN`、`DELETE JOIN`，因为本次环境验证均可执行。
