@@ -5924,9 +5924,16 @@ class DmSqlValidationTestGenerator {
                         return false;
                     }
                     if (existing instanceof Collection<?>) {
-                        return !statementExactCollectionValue(valueName, statement);
+                        return !statementExactCollectionValue(valueName, statement)
+                                || statementObjectPathParameter(valueName, statement);
                     }
-                    return existing == null && !statementRequiredCollectionValue(valueName, statement);
+                    return existing == null
+                            && (!statementRequiredCollectionValue(valueName, statement)
+                            || statementObjectPathParameter(valueName, statement));
+                }
+
+                private boolean statementObjectPathParameter(String valueName, MapperStatement statement) {
+                    return statement != null && statement.hasDefaultUnder(valueName);
                 }
 
                 @SuppressWarnings("unchecked")
@@ -11360,6 +11367,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.hasDefaultValue(valueName);
                     }
 
+                    private boolean hasDefaultUnder(String valueName) {
+                        return dynamicIdentifierMetadata.hasDefaultUnder(valueName);
+                    }
+
                     private boolean setDefaultValue(String valueName) {
                         return dynamicIdentifierMetadata.setDefaultValue(valueName);
                     }
@@ -11729,6 +11740,22 @@ class DmSqlValidationTestGenerator {
 
                     private boolean hasDefaultValue(String valueName) {
                         return containsMetadataName(defaultValues.keySet(), valueName);
+                    }
+
+                    private boolean hasDefaultUnder(String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        if (isBlank(normalized)) {
+                            return false;
+                        }
+                        if (defaultValues.containsKey(normalized)) {
+                            return true;
+                        }
+                        for (String defaultValueName : defaultValues.keySet()) {
+                            if (defaultValueName.startsWith(normalized + ".")) {
+                                return true;
+                            }
+                        }
+                        return false;
                     }
 
                     private boolean setDefaultValue(String valueName) {
