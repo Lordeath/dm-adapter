@@ -1291,6 +1291,7 @@ class DmSqlValidationTestGenerator {
                                             setBranchParameterVariants(element),
                                             dynamicIdentifierMetadata(element, sqlFragments, namespace),
                                             parameterReferences(element),
+                                            parameterPathReferences(element),
                                             generatedKeyProperties(element)
                                     ));
                                 }
@@ -1391,6 +1392,21 @@ class DmSqlValidationTestGenerator {
                             name = name.substring(0, dot);
                         }
                         if (!isBlank(name) && !syntheticParameterName(name)) {
+                            names.add(name);
+                        }
+                    }
+                    return names;
+                }
+
+                private Set<String> parameterPathReferences(Element statement) {
+                    String text = statement == null ? "" : statement.getTextContent();
+                    Set<String> names = new LinkedHashSet<>();
+                    Matcher matcher = Pattern.compile("[#$]\\\\{\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)(?:\\\\s*,[^}]*)?}")
+                            .matcher(text == null ? "" : text);
+                    while (matcher.find()) {
+                        String name = matcher.group(1);
+                        List<String> parts = pathParts(name);
+                        if (!parts.isEmpty() && !syntheticParameterName(parts.get(0))) {
                             names.add(name);
                         }
                     }
@@ -5933,7 +5949,8 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean statementObjectPathParameter(String valueName, MapperStatement statement) {
-                    return statement != null && statement.hasDefaultUnder(valueName);
+                    return statement != null
+                            && (statement.hasDefaultUnder(valueName) || statement.hasParameterPathUnder(valueName));
                 }
 
                 @SuppressWarnings("unchecked")
@@ -11288,6 +11305,7 @@ class DmSqlValidationTestGenerator {
                     private final List<SetBranchParameterVariant> setBranchParameterVariants;
                     private final DynamicIdentifierMetadata dynamicIdentifierMetadata;
                     private final Set<String> parameterReferences;
+                    private final Set<String> parameterPathReferences;
                     private final Set<String> generatedKeyProperties;
 
                     private MapperStatement(
@@ -11296,6 +11314,7 @@ class DmSqlValidationTestGenerator {
                             List<SetBranchParameterVariant> setBranchParameterVariants,
                             DynamicIdentifierMetadata dynamicIdentifierMetadata,
                             Set<String> parameterReferences,
+                            Set<String> parameterPathReferences,
                             Set<String> generatedKeyProperties
                     ) {
                         this.namespace = namespace;
@@ -11309,6 +11328,9 @@ class DmSqlValidationTestGenerator {
                         this.parameterReferences = copySet(parameterReferences == null
                                 ? setOf()
                                 : parameterReferences);
+                        this.parameterPathReferences = copySet(parameterPathReferences == null
+                                ? setOf()
+                                : parameterPathReferences);
                         this.generatedKeyProperties = copySet(generatedKeyProperties == null
                                 ? setOf()
                                 : generatedKeyProperties);
@@ -11369,6 +11391,20 @@ class DmSqlValidationTestGenerator {
 
                     private boolean hasDefaultUnder(String valueName) {
                         return dynamicIdentifierMetadata.hasDefaultUnder(valueName);
+                    }
+
+                    private boolean hasParameterPathUnder(String valueName) {
+                        String normalized = DynamicIdentifierMetadata.normalizeMetadataName(valueName);
+                        if (isBlank(normalized)) {
+                            return false;
+                        }
+                        for (String parameterPathReference : parameterPathReferences) {
+                            String reference = DynamicIdentifierMetadata.normalizeMetadataName(parameterPathReference);
+                            if (reference.startsWith(normalized + ".")) {
+                                return true;
+                            }
+                        }
+                        return false;
                     }
 
                     private boolean setDefaultValue(String valueName) {
