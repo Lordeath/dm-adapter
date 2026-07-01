@@ -985,6 +985,9 @@ class DmAdapterCliTest {
                 .contains("return existing == null")
                 .contains("private boolean statementObjectPathParameter(String valueName, MapperStatement statement)")
                 .contains("private boolean hasDefaultUnder(String valueName)")
+                .contains("parameterPathReferences(element)")
+                .contains("private Set<String> parameterPathReferences(Element statement)")
+                .contains("private boolean hasParameterPathUnder(String valueName)")
                 .contains("private boolean exactCollectionParameter(String valueName)");
     }
 
