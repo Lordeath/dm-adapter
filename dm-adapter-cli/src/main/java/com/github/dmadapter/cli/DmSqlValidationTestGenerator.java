@@ -5853,6 +5853,10 @@ class DmSqlValidationTestGenerator {
                             target.put(entry.getKey(), nestedCollection);
                             continue;
                         }
+                        if (configuredMapOverridesGeneratedCollection(existing, configuredValue, statement, entryPath)) {
+                            target.put(entry.getKey(), configuredValue);
+                            continue;
+                        }
                         Object collection = configuredCollectionValue(
                                 existing,
                                 configuredValue,
@@ -5866,12 +5870,6 @@ class DmSqlValidationTestGenerator {
                         Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configuredValue, statement);
                         if (scalarCollection != MethodArgumentConfig.MISSING) {
                             target.put(entry.getKey(), scalarCollection);
-                            continue;
-                        }
-                        if (existing instanceof Collection<?>
-                                && configuredValue instanceof Map<?, ?>
-                                && !statementExactCollectionValue(entryPath, statement)) {
-                            target.put(entry.getKey(), configuredValue);
                             continue;
                         }
                         Object mapCollection = mapConfiguredCollectionValue(existing, configuredValue, statement, entryPath);
@@ -5910,6 +5908,17 @@ class DmSqlValidationTestGenerator {
                         }
                         target.put(entry.getKey(), configuredValue);
                     }
+                }
+
+                private boolean configuredMapOverridesGeneratedCollection(
+                        Object existing,
+                        Object configuredValue,
+                        MapperStatement statement,
+                        String valueName
+                ) {
+                    return existing instanceof Collection<?>
+                            && configuredValue instanceof Map<?, ?>
+                            && !statementExactCollectionValue(valueName, statement);
                 }
 
                 @SuppressWarnings("unchecked")
