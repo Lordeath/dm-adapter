@@ -5870,7 +5870,7 @@ class DmSqlValidationTestGenerator {
                         }
                         if (existing instanceof Collection<?>
                                 && configuredValue instanceof Map<?, ?>
-                                && !statementRequiredCollectionValue(entryPath, statement)) {
+                                && !statementExactCollectionValue(entryPath, statement)) {
                             target.put(entry.getKey(), configuredValue);
                             continue;
                         }
@@ -6922,6 +6922,10 @@ class DmSqlValidationTestGenerator {
                             || statement.collectionParameter(valueName)
                             || statement.mapCollectionParameter(valueName)
                             || statement.scalarCollectionParameter(valueName));
+                }
+
+                private boolean statementExactCollectionValue(String valueName, MapperStatement statement) {
+                    return statement != null && statement.exactCollectionParameter(valueName);
                 }
 
                 private boolean statementRequiredDefaultValue(String valueName, MapperStatement statement) {
@@ -11371,6 +11375,10 @@ class DmSqlValidationTestGenerator {
                         return dynamicIdentifierMetadata.collectionParameter(valueName);
                     }
 
+                    private boolean exactCollectionParameter(String valueName) {
+                        return dynamicIdentifierMetadata.exactCollectionParameter(valueName);
+                    }
+
                     private boolean mapCollectionParameter(String valueName) {
                         return dynamicIdentifierMetadata.mapCollectionParameter(valueName);
                     }
@@ -11593,6 +11601,11 @@ class DmSqlValidationTestGenerator {
 
                     private boolean collectionParameter(String valueName) {
                         return containsMetadataName(collectionParameterNames, valueName);
+                    }
+
+                    private boolean exactCollectionParameter(String valueName) {
+                        String normalized = normalizeMetadataName(valueName);
+                        return !isBlank(normalized) && collectionParameterNames.contains(normalized);
                     }
 
                     private boolean mapCollectionParameter(String valueName) {

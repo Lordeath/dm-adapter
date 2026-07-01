@@ -979,7 +979,8 @@ class DmAdapterCliTest {
                 .contains("configuredParameterMap(")
                 .contains("(Map<String, Object>) configuredArgs.args.get(0)")
                 .contains("configuredValue instanceof Map<?, ?>")
-                .contains("&& !statementRequiredCollectionValue(entryPath, statement)");
+                .contains("&& !statementExactCollectionValue(entryPath, statement)")
+                .contains("private boolean exactCollectionParameter(String valueName)");
     }
 
     @Test
