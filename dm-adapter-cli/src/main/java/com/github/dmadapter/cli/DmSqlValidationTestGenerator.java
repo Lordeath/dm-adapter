@@ -4788,6 +4788,10 @@ class DmSqlValidationTestGenerator {
                                 entryPath,
                                 existing
                         );
+                        if (configuredMapOverridesGeneratedCollection(existing, configured, statement, entryPath)) {
+                            merged.put(entry.getKey(), configured);
+                            continue;
+                        }
                         Object scalarCollection = scalarConfiguredCollectionValue(entryPath, configured, statement);
                         if (scalarCollection != MethodArgumentConfig.MISSING) {
                             merged.put(entry.getKey(), scalarCollection);
@@ -5916,9 +5920,13 @@ class DmSqlValidationTestGenerator {
                         MapperStatement statement,
                         String valueName
                 ) {
-                    return existing instanceof Collection<?>
-                            && configuredValue instanceof Map<?, ?>
-                            && !statementExactCollectionValue(valueName, statement);
+                    if (!(configuredValue instanceof Map<?, ?>)) {
+                        return false;
+                    }
+                    if (existing instanceof Collection<?>) {
+                        return !statementExactCollectionValue(valueName, statement);
+                    }
+                    return existing == null && !statementRequiredCollectionValue(valueName, statement);
                 }
 
                 @SuppressWarnings("unchecked")
