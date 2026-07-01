@@ -462,6 +462,8 @@ class DmAdapterCliTest {
                 .contains("configuredParameterMap")
                 .contains("mergeConfiguredParameterMap")
                 .contains("configuredParameterMap(mapperMethod.statement, configuredArgs.params)")
+                .contains("configuredArgs.args.size() == 1")
+                .contains("Map.class.isAssignableFrom(parameterTypes[0])")
                 .contains("configuredArgs.args.get(i)")
                 .contains("effectiveParameterName")
                 .contains("configuredCollectionElementDefault")
@@ -976,6 +978,39 @@ class DmAdapterCliTest {
                 .contains("Map.class.isAssignableFrom(mapperMethod.parameterType)")
                 .contains("configuredParameterMap(")
                 .contains("(Map<String, Object>) configuredArgs.args.get(0)");
+    }
+
+    @Test
+    void generateValidationTestPreservesExistingIncludedAndExcludedMethods() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+        writeFile(".dm-adapter/sql-validation.yml", """
+                includedMethods:
+                  - com.example.UserMapper.selectUsers
+                excludedMethods:
+                  - com.example.UserMapper.deleteAll
+                  - "com.example.LegacyMapper.*"
+                """);
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        String config = Files.readString(tempDir.resolve(".dm-adapter/sql-validation.yml"));
+        assertThat(exitCode).isZero();
+        assertThat(config)
+                .contains("""
+                        includedMethods:
+                          - "com.example.UserMapper.selectUsers"
+                        """)
+                .contains("""
+                        excludedMethods:
+                          - "com.example.UserMapper.deleteAll"
+                          - "com.example.LegacyMapper.*"
+                        """)
+                .doesNotContain("  # - com.example.UserMapper.deleteAll");
     }
 
     @Test
