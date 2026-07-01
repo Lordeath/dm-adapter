@@ -972,7 +972,10 @@ class DmAdapterCliTest {
         assertThat(generatedTestSource)
                 .contains("Map<String, Object> normalizedParams = normalizeValidationParameterMap(new LinkedHashMap<>(params));")
                 .contains("!normalizedParams.containsKey(field.getName())")
-                .contains("Object rawConfigured = normalizedParams.get(field.getName())");
+                .contains("Object rawConfigured = normalizedParams.get(field.getName())")
+                .contains("Map.class.isAssignableFrom(mapperMethod.parameterType)")
+                .contains("configuredParameterMap(")
+                .contains("(Map<String, Object>) configuredArgs.args.get(0)");
     }
 
     @Test

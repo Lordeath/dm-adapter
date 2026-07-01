@@ -2998,6 +2998,18 @@ class DmSqlValidationTestGenerator {
                         return ParameterResolution.resolved("configured", new Object[] { namedParameters });
                     }
                     if (configuredArgs != null && configuredArgs.args.size() == 1) {
+                        if (Map.class.isAssignableFrom(mapperMethod.parameterType)
+                                && configuredArgs.args.get(0) instanceof Map<?, ?>) {
+                            return ParameterResolution.resolved(
+                                    "configured",
+                                    new Object[] {
+                                            configuredParameterMap(
+                                                    mapperMethod.statement,
+                                                    (Map<String, Object>) configuredArgs.args.get(0)
+                                            )
+                                    }
+                            );
+                        }
                         boolean collectionLike = isCollectionLikeParameter(mapperMethod.parameterType);
                         String parameterName = mapperMethod.statement == null
                                 ? "arg0"
