@@ -26,7 +26,7 @@
 
 ## 适用项目
 
-- Java 17 + Maven 项目。
+- Maven 项目。
 - Spring Boot + MyBatis XML mapper。
 - MySQL 迁移到达梦 8。
 - 希望保留原 MySQL mapper，同时生成达梦适配路径。
@@ -84,46 +84,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
 
 ---
 
-## 4. 命令速查
-
-## 构建工具
-
-```bash
-mvn test
-mvn -pl dm-adapter-cli -am package
-```
-
-## 扫描项目
-
-```bash
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
-  scan --project ./demo
-```
-
-## 执行迁移
-
-```bash
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
-  migrate --project ./demo
-```
-
-## 迁移并生成验证测试
-
-```bash
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
-  migrate --project ./demo --app-module demo-rest --schema sample-system
-```
-
-## 查看最近一次迁移摘要
-
-```bash
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
-  report --project ./demo
-```
-
----
-
-## 5. 运行后会改什么
+## 4. 运行后会改什么
 
 ## POM
 
@@ -157,7 +118,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
 
 ---
 
-## 6. Mapper 迁移策略
+## 5. Mapper 迁移策略
 
 ## 定位 mapper
 
@@ -180,7 +141,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
 
 ---
 
-## 7. SQL 主要规则：自动转换
+## 6. SQL 主要规则：自动转换
 
 以下规则以“达梦环境验证失败、且工具能安全等价改写”为前提。
 
@@ -213,7 +174,7 @@ status = 'ACTIVE'
 
 ---
 
-## 8. SQL 主要规则：保留与人工确认
+## 7. SQL 主要规则：保留与人工确认
 
 ## 已验证可执行时保留原样
 
@@ -250,7 +211,7 @@ status = 'ACTIVE'
 
 ---
 
-## 9. 达梦 SQL 验证测试
+## 8. 达梦 SQL 验证测试
 
 ## 运行方式
 
@@ -284,7 +245,7 @@ mvn -Dtest=DmSqlValidationTest -DskipTests=false -Dmaven.test.skip=false test
 
 ---
 
-## 10. 失败项处理与重跑闭环
+## 9. 失败项处理与重跑闭环
 
 ## 先看失败类型
 
@@ -357,4 +318,3 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
 目标：
 
 > 让每个失败项都能明确归类：工具规则待增强、原 SQL 待修、测试库待补、配置待补、或确认跳过。
-
