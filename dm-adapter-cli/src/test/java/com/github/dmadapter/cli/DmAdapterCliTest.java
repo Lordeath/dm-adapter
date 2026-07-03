@@ -36,6 +36,38 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateDryRunAcceptsSqlScriptOptionsAndWritesSeparateReport() throws Exception {
+        writeDemoProject();
+        writeFile("sql/v2/20260423_system.sql", "select \"SYSTEM\" from dual;\n");
+
+        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+                "migrate",
+                "--project",
+                tempDir.toString(),
+                "--dry-run",
+                "--schema",
+                "newsee-bill",
+                "--system_schema",
+                "newsee-system",
+                "--sql-root",
+                "sql/v2",
+                "--sql-root-out",
+                "sql/v2-dm"
+        );
+
+        Path sqlScriptReport = tempDir.resolve(".dm-adapter/dm-adapter-sql-script-report.md");
+        assertThat(exitCode).isZero();
+        assertThat(Files.exists(tempDir.resolve("sql/v2-dm"))).isFalse();
+        assertThat(Files.exists(tempDir.resolve(".dm-adapter/dm-adapter-report.md"))).isTrue();
+        assertThat(Files.exists(sqlScriptReport)).isTrue();
+        assertThat(Files.readString(sqlScriptReport))
+                .contains("SQL Script Migration Report")
+                .contains("20260423_system.sql")
+                .contains("newsee-system")
+                .contains("Dry run; SQL script validation skipped.");
+    }
+
+    @Test
     void scanWritesScanReport() throws Exception {
         writeDemoProject();
 

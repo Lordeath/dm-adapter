@@ -7,6 +7,7 @@ import com.github.dmadapter.core.FileChange;
 import com.github.dmadapter.core.MapperMigrationResult;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.ProjectScanResult;
+import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.maven.PomModifier;
 import com.github.dmadapter.maven.PomTargetSelection;
 import com.github.dmadapter.maven.PomTargetSelector;
@@ -75,6 +76,15 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods in the generated validation test; supports comma-separated fallback schemas; implies --generate-validation-test.")
     private String schema;
 
+    @Option(names = "--sql-root", description = "Root directory of MySQL SQL scripts or stored procedure scripts to migrate.")
+    private Path sqlRoot;
+
+    @Option(names = "--sql-root-out", description = "Output directory for converted Dameng SQL scripts.")
+    private Path sqlRootOut;
+
+    @Option(names = {"--system-schema", "--system_schema"}, description = "Dameng schema for validating *_system.sql scripts.")
+    private String systemSchema;
+
     private final ProjectScanner projectScanner = new ProjectScanner();
     private final PomModifier pomModifier = new PomModifier();
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
@@ -90,6 +100,10 @@ public class MigrateCommand implements Callable<Integer> {
     private final ReportWriter reportWriter = new ReportWriter();
     private final DmSqlValidationTestGenerator validationTestGenerator = new DmSqlValidationTestGenerator();
     private final ValidationTestRunner validationTestRunner = new ValidationTestRunner();
+    private final SqlScriptMigrator sqlScriptMigrator = new SqlScriptMigrator(
+            new MySqlToDmSqlConverter(),
+            new SqlScriptValidator()
+    );
 
     @Override
     public Integer call() {
@@ -97,6 +111,7 @@ public class MigrateCommand implements Callable<Integer> {
             AdapterContext context = buildContext();
             validateSupportedDatabases(context);
             validateValidationTestGeneration(context);
+            validateSqlScriptMigrationOptions();
             ProjectScanResult scanResult = projectScanner.scan(context);
 
             List<FileChange> fileChanges = new ArrayList<>();
@@ -189,7 +204,9 @@ public class MigrateCommand implements Callable<Integer> {
                     combinedMigrationResult.manualReviewItems(),
                     warnings
             );
+            SqlScriptReportResult sqlScriptReportResult = migrateSqlScripts(context);
             printMigrationSummary(context, scanResult, combinedMigrationResult, fileChanges, warnings, reportPaths);
+            printSqlScriptSummary(sqlScriptReportResult);
             if (validationTestGenerationRequested()) {
                 ValidationTestGenerationResult validationResult = validationTestGenerator.generate(
                         context.projectRoot(),
@@ -236,8 +253,23 @@ public class MigrateCommand implements Callable<Integer> {
         }
     }
 
+    private void validateSqlScriptMigrationOptions() {
+        if (sqlRoot == null && sqlRootOut == null) {
+            return;
+        }
+        if (sqlRoot == null) {
+            throw new DmAdapterException("--sql-root is required when --sql-root-out is provided.");
+        }
+        if (sqlRootOut == null) {
+            throw new DmAdapterException("--sql-root-out is required when --sql-root is provided.");
+        }
+    }
+
     private boolean validationTestGenerationRequested() {
-        return generateValidationTest || appModule != null || config != null || (schema != null && !schema.isBlank());
+        return generateValidationTest
+                || appModule != null
+                || config != null
+                || ((schema != null && !schema.isBlank()) && !sqlScriptMigrationRequested());
     }
 
     private boolean shouldPrepareAnnotationClassScan(AdapterContext context) {
@@ -521,6 +553,27 @@ public class MigrateCommand implements Callable<Integer> {
         return reportWriter.writeMigrationReport(report, context.reportDir());
     }
 
+    private boolean sqlScriptMigrationRequested() {
+        return sqlRoot != null;
+    }
+
+    private SqlScriptReportResult migrateSqlScripts(AdapterContext context) throws Exception {
+        if (!sqlScriptMigrationRequested()) {
+            return null;
+        }
+        SqlScriptMigrationReport report = sqlScriptMigrator.migrate(new SqlScriptMigrationRequest(
+                context.projectRoot(),
+                sqlRoot,
+                sqlRootOut,
+                context.dryRun(),
+                configuredSchema(context).orElse(""),
+                systemSchema,
+                DmValidationEnvironment.fromSystem()
+        ));
+        ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
+        return new SqlScriptReportResult(report, reportPaths);
+    }
+
     private boolean hasAesBase64Conversion(MapperMigrationResult mapperMigrationResult) {
         return mapperMigrationResult.automaticConversions().stream()
                 .flatMap(sqlChange -> sqlChange.appliedRules().stream())
@@ -556,6 +609,24 @@ public class MigrateCommand implements Callable<Integer> {
         }
     }
 
+    private void printSqlScriptSummary(SqlScriptReportResult result) {
+        if (result == null) {
+            return;
+        }
+        SqlScriptMigrationReport report = result.report();
+        CliLogger.info("SQL script migration " + (report.dryRun() ? "dry-run" : "completed") + ".");
+        CliLogger.info("SQL script files: " + report.scannedFileCount());
+        CliLogger.info("SQL script converted files: " + report.convertedFileCount());
+        CliLogger.info("SQL script manual review SQL items: " + report.manualReviewSqlCount());
+        CliLogger.info("SQL script validation success SQL count: " + report.validationSuccessCount());
+        CliLogger.info("SQL script validation failed SQL count: " + report.validationFailureCount());
+        CliLogger.info("SQL script report: " + result.reportPaths().markdownPath());
+        if (!report.warnings().isEmpty()) {
+            CliLogger.info("SQL script warnings:");
+            report.warnings().forEach(warning -> CliLogger.info("- " + warning));
+        }
+    }
+
     private record MetadataLookupResult(
             Map<String, TableKeyMetadata> metadataByTable,
             boolean available,
@@ -565,5 +636,8 @@ public class MigrateCommand implements Callable<Integer> {
             metadataByTable = Map.copyOf(metadataByTable == null ? Map.of() : metadataByTable);
             warnings = List.copyOf(warnings == null ? List.of() : warnings);
         }
+    }
+
+    private record SqlScriptReportResult(SqlScriptMigrationReport report, ReportPaths reportPaths) {
     }
 }
