@@ -5,6 +5,10 @@ import com.github.dmadapter.core.FileChange;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlChange;
+import com.github.dmadapter.core.SqlScriptFileResult;
+import com.github.dmadapter.core.SqlScriptManualReviewItem;
+import com.github.dmadapter.core.SqlScriptMigrationReport;
+import com.github.dmadapter.core.SqlScriptValidationFailure;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -18,6 +22,8 @@ public class ReportWriter {
     public static final String SCAN_REPORT_JSON = "dm-adapter-scan-report.json";
     public static final String MIGRATION_REPORT_MARKDOWN = "dm-adapter-report.md";
     public static final String MIGRATION_REPORT_JSON = "dm-adapter-report.json";
+    public static final String SQL_SCRIPT_REPORT_MARKDOWN = "dm-adapter-sql-script-report.md";
+    public static final String SQL_SCRIPT_REPORT_JSON = "dm-adapter-sql-script-report.json";
 
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
@@ -36,6 +42,16 @@ public class ReportWriter {
         Path markdownPath = reportDir.resolve(MIGRATION_REPORT_MARKDOWN);
         Path jsonPath = reportDir.resolve(MIGRATION_REPORT_JSON);
         Files.writeString(markdownPath, migrationMarkdown(redactedReport), StandardCharsets.UTF_8);
+        objectMapper.writerWithDefaultPrettyPrinter().writeValue(jsonPath.toFile(), redactedReport);
+        return new ReportPaths(markdownPath, jsonPath);
+    }
+
+    public ReportPaths writeSqlScriptMigrationReport(SqlScriptMigrationReport report, Path reportDir) throws IOException {
+        Files.createDirectories(reportDir);
+        SqlScriptMigrationReport redactedReport = redactSensitiveSql(report);
+        Path markdownPath = reportDir.resolve(SQL_SCRIPT_REPORT_MARKDOWN);
+        Path jsonPath = reportDir.resolve(SQL_SCRIPT_REPORT_JSON);
+        Files.writeString(markdownPath, sqlScriptMarkdown(redactedReport), StandardCharsets.UTF_8);
         objectMapper.writerWithDefaultPrettyPrinter().writeValue(jsonPath.toFile(), redactedReport);
         return new ReportPaths(markdownPath, jsonPath);
     }
@@ -61,6 +77,28 @@ public class ReportWriter {
         appendSqlChanges(markdown, "Automatic SQL Conversions", report.autoConvertedSqlItems());
         appendSqlChanges(markdown, "Manual Review SQL Items", report.manualReviewSqlItems());
         appendWarnings(markdown, report.riskWarnings());
+        return markdown.toString();
+    }
+
+    private String sqlScriptMarkdown(SqlScriptMigrationReport report) {
+        StringBuilder markdown = new StringBuilder();
+        markdown.append("# dm-adapter SQL Script Migration Report\n\n");
+        markdown.append("- Project: `").append(report.projectRoot()).append("`\n");
+        markdown.append("- SQL root: `").append(report.sqlRoot()).append("`\n");
+        markdown.append("- SQL root out: `").append(report.sqlRootOut()).append("`\n");
+        markdown.append("- Dry run: `").append(report.dryRun()).append("`\n");
+        markdown.append("- Scanned SQL files: `").append(report.scannedFileCount()).append("`\n");
+        markdown.append("- Converted files: `").append(report.convertedFileCount()).append("`\n");
+        markdown.append("- Manual review SQL items: `").append(report.manualReviewSqlCount()).append("`\n");
+        markdown.append("- Validation attempted: `").append(report.validationAttempted()).append("`\n");
+        markdown.append("- Validation status: `").append(report.validationStatus()).append("`\n");
+        markdown.append("- Validation success SQL count: `").append(report.validationSuccessCount()).append("`\n");
+        markdown.append("- Validation failed SQL count: `").append(report.validationFailureCount()).append("`\n\n");
+
+        appendSqlScriptFiles(markdown, report.files());
+        appendSqlScriptManualReviewItems(markdown, report.manualReviewItems());
+        appendSqlScriptValidationFailures(markdown, report.validationFailures());
+        appendWarnings(markdown, report.warnings());
         return markdown.toString();
     }
 
@@ -110,6 +148,67 @@ public class ReportWriter {
         markdown.append("\n");
     }
 
+    private void appendSqlScriptFiles(StringBuilder markdown, List<SqlScriptFileResult> files) {
+        markdown.append("## Script Files\n\n");
+        if (files.isEmpty()) {
+            markdown.append("No files.\n\n");
+            return;
+        }
+        markdown.append("| Source | Output | Schema | System | Statements | Converted | Manual Review | Validation OK | Validation Failed |\n");
+        markdown.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
+        for (SqlScriptFileResult file : files) {
+            markdown.append("| `").append(file.sourceFile()).append("` | `")
+                    .append(file.outputFile()).append("` | `")
+                    .append(file.schema()).append("` | `")
+                    .append(file.systemScript()).append("` | ")
+                    .append(file.statementCount()).append(" | ")
+                    .append(file.convertedStatementCount()).append(" | ")
+                    .append(file.manualReviewStatementCount()).append(" | ")
+                    .append(file.validationSuccessCount()).append(" | ")
+                    .append(file.validationFailureCount()).append(" |\n");
+        }
+        markdown.append("\n");
+    }
+
+    private void appendSqlScriptManualReviewItems(
+            StringBuilder markdown,
+            List<SqlScriptManualReviewItem> manualReviewItems
+    ) {
+        markdown.append("## Manual Review SQL Items\n\n");
+        if (manualReviewItems.isEmpty()) {
+            markdown.append("No items.\n\n");
+            return;
+        }
+        for (SqlScriptManualReviewItem item : manualReviewItems) {
+            markdown.append("- `").append(item.sourceFile()).append("` statement `")
+                    .append(item.statementIndex()).append("` reason: ")
+                    .append(item.reason()).append("\n");
+            markdown.append("  - Original: `").append(compact(item.originalSql())).append("`\n");
+            markdown.append("  - Converted: `").append(compact(item.convertedSql())).append("`\n");
+        }
+        markdown.append("\n");
+    }
+
+    private void appendSqlScriptValidationFailures(
+            StringBuilder markdown,
+            List<SqlScriptValidationFailure> validationFailures
+    ) {
+        markdown.append("## Validation Failures\n\n");
+        if (validationFailures.isEmpty()) {
+            markdown.append("No failures.\n\n");
+            return;
+        }
+        for (SqlScriptValidationFailure failure : validationFailures) {
+            markdown.append("- `").append(failure.outputFile()).append("` statement `")
+                    .append(failure.statementIndex()).append("` schema `")
+                    .append(failure.schema()).append("` category `")
+                    .append(failure.category()).append("`\n");
+            markdown.append("  - Error: ").append(failure.errorSummary()).append("\n");
+            markdown.append("  - SQL: `").append(failure.failedSqlSummary()).append("`\n");
+        }
+        markdown.append("\n");
+    }
+
     private void appendWarnings(StringBuilder markdown, List<String> warnings) {
         markdown.append("## Risk Warnings\n\n");
         if (warnings.isEmpty()) {
@@ -146,6 +245,26 @@ public class ReportWriter {
         );
     }
 
+    private SqlScriptMigrationReport redactSensitiveSql(SqlScriptMigrationReport report) {
+        return new SqlScriptMigrationReport(
+                report.projectRoot(),
+                report.sqlRoot(),
+                report.sqlRootOut(),
+                report.dryRun(),
+                report.scannedFileCount(),
+                report.convertedFileCount(),
+                report.manualReviewSqlCount(),
+                report.validationAttempted(),
+                report.validationStatus(),
+                report.validationSuccessCount(),
+                report.validationFailureCount(),
+                report.files(),
+                redactManualReviewItems(report.manualReviewItems()),
+                redactValidationFailures(report.validationFailures()),
+                report.warnings()
+        );
+    }
+
     private List<SqlChange> redactSqlChanges(List<SqlChange> sqlChanges) {
         return sqlChanges.stream()
                 .map(sqlChange -> new SqlChange(
@@ -156,6 +275,33 @@ public class ReportWriter {
                         sqlChange.appliedRules(),
                         sqlChange.manualReviewRequired(),
                         sqlChange.reason()
+                ))
+                .toList();
+    }
+
+    private List<SqlScriptManualReviewItem> redactManualReviewItems(List<SqlScriptManualReviewItem> items) {
+        return items.stream()
+                .map(item -> new SqlScriptManualReviewItem(
+                        item.sourceFile(),
+                        item.outputFile(),
+                        item.statementIndex(),
+                        item.reason(),
+                        redactSql(item.originalSql()),
+                        redactSql(item.convertedSql())
+                ))
+                .toList();
+    }
+
+    private List<SqlScriptValidationFailure> redactValidationFailures(List<SqlScriptValidationFailure> failures) {
+        return failures.stream()
+                .map(failure -> new SqlScriptValidationFailure(
+                        failure.sourceFile(),
+                        failure.outputFile(),
+                        failure.schema(),
+                        failure.statementIndex(),
+                        failure.category(),
+                        failure.errorSummary(),
+                        redactSql(failure.failedSqlSummary())
                 ))
                 .toList();
     }
