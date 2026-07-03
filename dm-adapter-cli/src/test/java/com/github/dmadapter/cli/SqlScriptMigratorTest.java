@@ -55,7 +55,7 @@ class SqlScriptMigratorTest {
         assertThat(Files.readString(sqlRootOut.resolve("20260423.sql")))
                 .doesNotContain("DELIMITER")
                 .doesNotContain("DEFINER")
-                .contains("CREATE PROCEDURE bill_proc()")
+                .contains("CREATE OR REPLACE PROCEDURE bill_proc() AS")
                 .contains("select 'ACTIVE' from dual;");
         assertThat(Files.readString(sqlRootOut.resolve("nested/20260423_system.sql")))
                 .contains("select 'SYSTEM' from dual;");
@@ -65,7 +65,8 @@ class SqlScriptMigratorTest {
         assertThat(validator.files)
                 .filteredOn(SqlScriptMigrator.PlannedSqlScriptFile::systemScript)
                 .singleElement()
-                .satisfies(file -> assertThat(file.outputDisplay()).endsWith("nested/20260423_system.sql"));
+                .satisfies(file -> assertThat(file.outputDisplay().replace('\\', '/'))
+                        .endsWith("nested/20260423_system.sql"));
     }
 
     @Test
@@ -156,6 +157,137 @@ class SqlScriptMigratorTest {
         assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
                 .contains("PREPARE stmt FROM 'select 1'")
                 .contains("EXECUTE stmt");
+    }
+
+    @Test
+    void convertsCommonProcedureMetadataChecksToDamengSyntax() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE add_col()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database()) AND table_name = 'demo' AND column_name = 'code'
+                          AND CHARACTER_MAXIMUM_LENGTH < 128
+                          AND NUMERIC_SCALE = 0
+                    ) THEN
+                        alter table demo add code varchar(128) null comment '编码';
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
+                        WHERE table_name = 'demo' AND table_schema = (SELECT DATABASE()) AND INDEX_NAME = 'idx_demo_code'
+                    ) THEN
+                        ALTER TABLE demo ADD INDEX idx_demo_code (code(32));
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
+                        WHERE table_name = 'demo' AND table_schema = (SELECT DATABASE()) AND INDEX_NAME = 'idx_demo_title'
+                    ) THEN
+                        CREATE INDEX idx_demo_title ON demo(title(20));
+                    END IF;
+                    IF EXISTS (
+                        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database()) AND table_name = 'demo' AND column_name = 'code'
+                    ) THEN
+                        alter table demo modify column code varchar(256) character set utf8mb3 collate utf8mb3_general_ci;
+                    END IF;
+                    IF EXISTS (
+                        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database()) AND table_name = 'demo' AND column_name = 'amount'
+                    ) THEN
+                        alter table demo modify column amount decimal(14, 2) null, modify column tax decimal(14, 2) null;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL add_col();
+                DROP PROCEDURE IF EXISTS add_col;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "newsee-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE add_col() AS")
+                .contains("ALL_TAB_COLUMNS")
+                .contains("ALL_IND_COLUMNS")
+                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("CHAR_LENGTH")
+                .contains("DATA_SCALE")
+                .contains("EXECUTE IMMEDIATE 'alter table demo add code varchar(128) null'")
+                .contains("COLUMN_NAME IN ('code')")
+                .contains("HAVING COUNT(DISTINCT COLUMN_NAME) = 1")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_code ON demo (code)'")
+                .contains("COLUMN_NAME IN ('title')")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title ON demo (title)'")
+                .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code varchar(256)'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY tax decimal(14, 2) null';")
+                .doesNotContain("information_schema")
+                .doesNotContain("database()")
+                .doesNotContain("NUMERIC_SCALE")
+                .doesNotContain("INDEX_NAME = 'idx_demo_code'")
+                .doesNotContain("code(32)")
+                .doesNotContain("title(20)")
+                .doesNotContain("character set utf8mb3")
+                .doesNotContain("collate utf8mb3_general_ci")
+                .doesNotContain("comment '编码'");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(
+                                SqlScriptMigrator.MYSQL_CREATE_PROCEDURE_TO_DM_RULE,
+                                SqlScriptMigrator.MYSQL_SCRIPT_METADATA_TO_DM_RULE,
+                                SqlScriptMigrator.MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVAL_RULE,
+                                SqlScriptMigrator.MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE
+                        ));
+    }
+
+    @Test
+    void convertsCreateTableOptionsWhenStatementHasLeadingComments() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("table.sql"), """
+                -- business note
+                CREATE TABLE IF NOT EXISTS demo_table (
+                    `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT 'id',
+                    `code` varchar(64) CHARACTER SET utf8 DEFAULT NULL COMMENT 'code',
+                    PRIMARY KEY (`id`) USING BTREE,
+                    KEY `idx_demo_code` (`code`) USING BTREE
+                ) ENGINE=InnoDB DEFAULT COLLATE=utf8mb4_0900_ai_ci;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "newsee-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("table.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .startsWith("-- business note")
+                .contains("`id` bigint NOT NULL AUTO_INCREMENT")
+                .contains("`code` varchar(192) DEFAULT NULL")
+                .doesNotContain("KEY `idx_demo_code`")
+                .doesNotContainIgnoringCase("USING BTREE")
+                .doesNotContainIgnoringCase("ENGINE")
+                .doesNotContainIgnoringCase("COMMENT");
     }
 
     @Test

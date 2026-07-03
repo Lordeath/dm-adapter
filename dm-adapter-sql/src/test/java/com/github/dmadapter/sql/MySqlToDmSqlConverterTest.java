@@ -528,6 +528,22 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesMysqlCreateTableTrailingCharacterSetForDameng() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE if not exists third_party_order_log (
+                    id bigint NOT NULL AUTO_INCREMENT,
+                    name varchar(64)
+                ) CHARACTER SET = utf8mb4;
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .doesNotContainIgnoringCase("CHARACTER SET")
+                .contains(") ;");
+        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE);
+    }
+
+    @Test
     void convertsMysqlTruncateWithoutTableKeywordForDameng() {
         SqlConversionResult result = converter.convert("TRUNCATE tmp_static_report_precinct_steward_report;");
 
