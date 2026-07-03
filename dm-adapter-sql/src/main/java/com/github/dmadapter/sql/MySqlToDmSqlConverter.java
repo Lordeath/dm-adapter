@@ -1330,6 +1330,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 return null;
             }
             cursor = skipWhitespace(sql, setIndex + "SET".length());
+            if (cursor < sql.length() && sql.charAt(cursor) == '=') {
+                cursor = skipWhitespace(sql, cursor + 1);
+            }
         } else if (startsKeyword(sql, index, "CHARSET")) {
             cursor = skipWhitespace(sql, index + "CHARSET".length());
             if (cursor < sql.length() && sql.charAt(cursor) == '=') {
@@ -1818,7 +1821,57 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             convertedSql = tableCommentConversion.convertedSql();
             changed = true;
         }
+        GenericConversion tableCharsetConversion = removeMysqlCreateTableTrailingCharset(convertedSql);
+        if (tableCharsetConversion.changed()) {
+            convertedSql = tableCharsetConversion.convertedSql();
+            changed = true;
+        }
         return changed ? new GenericConversion(convertedSql, true) : GenericConversion.unchanged(sql);
+    }
+
+    private GenericConversion removeMysqlCreateTableTrailingCharset(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int optionStart = skipWhitespace(sql, closeParenIndex + 1);
+        int optionEnd = readMysqlCreateTableTrailingCharsetEnd(sql, optionStart);
+        if (optionEnd < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(sql.substring(0, optionStart) + sql.substring(optionEnd), true);
+    }
+
+    private int readMysqlCreateTableTrailingCharsetEnd(String sql, int index) {
+        if (startsKeyword(sql, index, "DEFAULT")) {
+            int cursor = skipWhitespace(sql, index + "DEFAULT".length());
+            if (startsKeyword(sql, cursor, "CHARSET") || startsKeyword(sql, cursor, "CHARACTER")) {
+                return readMysqlCharacterSetClauseEnd(sql, cursor);
+            }
+            if (startsKeyword(sql, cursor, "COLLATE")) {
+                return readMysqlCollateClauseEnd(sql, cursor);
+            }
+            return -1;
+        }
+        if (startsKeyword(sql, index, "CHARSET") || startsKeyword(sql, index, "CHARACTER")) {
+            return readMysqlCharacterSetClauseEnd(sql, index);
+        }
+        if (startsKeyword(sql, index, "COLLATE")) {
+            return readMysqlCollateClauseEnd(sql, index);
+        }
+        return -1;
     }
 
     private GenericConversion removeMysqlCreateTableTrailingComment(String sql) {
