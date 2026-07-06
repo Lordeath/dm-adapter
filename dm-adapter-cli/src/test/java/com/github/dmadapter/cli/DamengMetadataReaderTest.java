@@ -7,8 +7,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class DamengMetadataReaderTest {
     @Test
     void splitSchemaListTrimsSkipsBlanksAndKeepsOrder() {
-        assertThat(DamengMetadataReader.splitSchemaList(" newsee-charge-10, newsee-bill-10,,newsee-owner,newsee-bill-10 "))
-                .containsExactly("newsee-charge-10", "newsee-bill-10", "newsee-owner");
+        assertThat(DamengMetadataReader.splitSchemaList(" sample-charge-10, sample-bill-10,,sample-owner,sample-bill-10 "))
+                .containsExactly("sample-charge-10", "sample-bill-10", "sample-owner");
     }
 
     @Test

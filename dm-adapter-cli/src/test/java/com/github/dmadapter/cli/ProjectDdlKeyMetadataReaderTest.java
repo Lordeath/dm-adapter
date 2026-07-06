@@ -61,7 +61,7 @@ class ProjectDdlKeyMetadataReaderTest {
         Path ddl = tempDir.resolve("sql/schema.sql");
         Files.createDirectories(ddl.getParent());
         Files.writeString(ddl, """
-                CREATE TABLE IF NOT EXISTS `newsee-soss`.`ns_project_management_extend` (
+                CREATE TABLE IF NOT EXISTS `sample-soss`.`ns_project_management_extend` (
                   `extendId` bigint NOT NULL AUTO_INCREMENT,
                   `foreignkeyId` bigint NOT NULL,
                   PRIMARY KEY (`extendId`) USING BTREE,

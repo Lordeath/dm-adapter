@@ -23,12 +23,12 @@ class MavenCompilePreparerTest {
     @Test
     void compilesSelectedReactorModuleBeforeClassAnnotationScan() throws Exception {
         writePom(tempDir.resolve("pom.xml"), "root", "<modules><module>app</module></modules>");
-        writePom(tempDir.resolve("app/pom.xml"), "newsee-bill-rest", "");
+        writePom(tempDir.resolve("app/pom.xml"), "sample-bill-rest", "");
         List<List<String>> commands = new ArrayList<>();
         List<Path> workingDirectories = new ArrayList<>();
         MavenCompilePreparer preparer = preparer(commands, workingDirectories, processWithOutput("ok\n", 0), "Linux");
 
-        List<String> warnings = preparer.prepare(tempDir, Path.of("newsee-bill-rest"));
+        List<String> warnings = preparer.prepare(tempDir, Path.of("sample-bill-rest"));
 
         assertThat(warnings).isEmpty();
         assertThat(workingDirectories).containsExactly(tempDir.toAbsolutePath().normalize());
@@ -40,12 +40,12 @@ class MavenCompilePreparerTest {
     @Test
     void compilesStandaloneModuleFromModuleDirectory() throws Exception {
         writePom(tempDir.resolve("pom.xml"), "root", "");
-        writePom(tempDir.resolve("app/pom.xml"), "newsee-bill-rest", "");
+        writePom(tempDir.resolve("app/pom.xml"), "sample-bill-rest", "");
         List<List<String>> commands = new ArrayList<>();
         List<Path> workingDirectories = new ArrayList<>();
         MavenCompilePreparer preparer = preparer(commands, workingDirectories, processWithOutput("ok\n", 0), "Linux");
 
-        List<String> warnings = preparer.prepare(tempDir, Path.of("newsee-bill-rest"));
+        List<String> warnings = preparer.prepare(tempDir, Path.of("sample-bill-rest"));
 
         assertThat(warnings).isEmpty();
         assertThat(workingDirectories).containsExactly(tempDir.resolve("app").toAbsolutePath().normalize());

@@ -30,31 +30,31 @@ class SqlRewriteConfigLoaderTest {
         SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
                 "identityInsertTables:",
                 "  - \"ns_equip_area_class\"",
-                "identityInsertTables: [\"NEWSEE_OWNER.owner_house\"]",
+                "identityInsertTables: [\"SAMPLE_OWNER.owner_house\"]",
                 "validationIgnores:",
                 "  missingTables:",
                 "    - \"ns_core_resourcecolumn_temp\"",
                 "#    - \"commented_table\"",
-                "    - \"NEWSEE_OWNER.owner_house\"",
+                "    - \"SAMPLE_OWNER.owner_house\"",
                 "  missingColumns: [\"organization_id\", \"D.fullPath\"]",
-                "  missingSchemas: [\"NEWSEE-QUARTZ\"]",
+                "  missingSchemas: [\"SAMPLE-QUARTZ\"]",
                 "  missingTables: [\"b\"]",
                 "  missingColumns:",
                 "#    - \"commented_column\"",
                 "    - \"accountType\"",
                 "  missingSchemas:",
                 "#    - \"commented_schema\"",
-                "    - \"NEWSEE-SCHEDULER\""
+                "    - \"SAMPLE-SCHEDULER\""
         ));
 
         assertThat(config.ignoredMissingTables())
-                .contains("ns_core_resourcecolumn_temp", "newsee_owner.owner_house", "b")
+                .contains("ns_core_resourcecolumn_temp", "sample_owner.owner_house", "b")
                 .doesNotContain("commented_table");
         assertThat(config.ignoredMissingColumns())
                 .contains("organization_id", "d.fullpath", "accounttype")
                 .doesNotContain("commented_column");
         assertThat(config.ignoredMissingSchemas())
-                .contains("newsee-quartz", "newsee-scheduler")
+                .contains("sample-quartz", "sample-scheduler")
                 .doesNotContain("commented_schema");
         assertThat(config.requiresIdentityInsert("ns_equip_area_class")).isTrue();
         assertThat(config.requiresIdentityInsert("owner_house")).isTrue();

@@ -83,7 +83,7 @@ class MapperAnnotationMigratorTest {
                         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
                 <mapper namespace="com.example.VoucherTaskMapper">
                     <insert id="insertSegment">
-                        INSERT INTO "newsee-system".ns_system_organization (organization_id)
+                        INSERT INTO "sample-system".ns_system_organization (organization_id)
                         SELECT organization_id FROM ys_organization
                     </insert>
                 </mapper>
@@ -110,8 +110,8 @@ class MapperAnnotationMigratorTest {
                 .contains("select NOW() from dual");
         String xml = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"));
         assertThat(xml)
-                .contains("INSERT INTO \"newsee-system\".ns_system_organization")
-                .doesNotContain("INSERT INTO 'newsee-system'.ns_system_organization")
+                .contains("INSERT INTO \"sample-system\".ns_system_organization")
+                .doesNotContain("INSERT INTO 'sample-system'.ns_system_organization")
                 .contains("select NOW() from dual");
         assertThat(result.automaticConversions()).isEmpty();
     }
@@ -164,7 +164,7 @@ class MapperAnnotationMigratorTest {
     @Test
     void cleansVoucherTaskAnnotationSqlWhenXmlStatementsAlreadyExistAndRepairsMissingSetCommas() throws Exception {
         Path mapper = writeFile("src/main/resources/mapper/VoucherTaskMapper.xml", voucherTaskExistingXml());
-        writeFile("src/main/java/com/newsee/bill/dao/VoucherTaskMapper.java", voucherTaskMapperSource());
+        writeFile("src/main/java/com/sample/bill/dao/VoucherTaskMapper.java", voucherTaskMapperSource());
         ProjectScanResult scanResult = scanResult(List.of(new MapperXmlFile(
                 mapper.toString(),
                 tempDir.resolve("src/main/resources").toString(),
@@ -201,7 +201,7 @@ class MapperAnnotationMigratorTest {
                 .contains("select SLEEP(${elapseSecond})")
                 .contains(" value (#{id}");
 
-        String javaSource = Files.readString(tempDir.resolve("src/main/java/com/newsee/bill/dao/VoucherTaskMapper.java"));
+        String javaSource = Files.readString(tempDir.resolve("src/main/java/com/sample/bill/dao/VoucherTaskMapper.java"));
         assertThat(javaSource)
                 .doesNotContain("@Insert")
                 .doesNotContain("@Select")
@@ -372,13 +372,13 @@ class MapperAnnotationMigratorTest {
 
     private String voucherTaskMapperSource() {
         return """
-                package com.newsee.bill.dao;
+                package com.sample.bill.dao;
 
                 import com.alibaba.fastjson.JSONObject;
-                import com.newsee.bill.dto.VoucherTaskRelDTO;
-                import com.newsee.bill.entity.VoucherTask;
-                import com.newsee.bill.entity.VoucherTaskItemRel;
-                import com.newsee.bill.entity.VoucherTaskPrecinctRel;
+                import com.sample.bill.dto.VoucherTaskRelDTO;
+                import com.sample.bill.entity.VoucherTask;
+                import com.sample.bill.entity.VoucherTaskItemRel;
+                import com.sample.bill.entity.VoucherTaskPrecinctRel;
                 import org.apache.ibatis.annotations.*;
                 import org.springframework.stereotype.Repository;
 
@@ -484,7 +484,7 @@ class MapperAnnotationMigratorTest {
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
                         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
-                <mapper namespace="com.newsee.bill.dao.VoucherTaskMapper">
+                <mapper namespace="com.sample.bill.dao.VoucherTaskMapper">
                     <insert id="insert">
                         <![CDATA[
                             insert into ns_bill_voucher_task (id) value (#{id})

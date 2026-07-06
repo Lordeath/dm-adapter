@@ -122,7 +122,7 @@ class ReportWriterTest {
                 List.of(new SqlScriptFileResult(
                         "20260205.sql",
                         tempDir.resolve("sql/v2-dm/20260205.sql").toString(),
-                        "newsee-bill",
+                        "sample-bill",
                         false,
                         true,
                         true,
@@ -151,7 +151,7 @@ class ReportWriterTest {
                 List.of(new SqlScriptValidationFailure(
                         "20260205.sql",
                         tempDir.resolve("sql/v2-dm/20260205.sql").toString(),
-                        "newsee-bill",
+                        "sample-bill",
                         3,
                         "SQL_EXECUTION",
                         "String truncated",

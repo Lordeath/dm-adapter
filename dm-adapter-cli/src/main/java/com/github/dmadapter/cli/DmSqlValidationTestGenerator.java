@@ -271,7 +271,7 @@ class DmSqlValidationTestGenerator {
                     # Optional Dameng schema. Use comma-separated schemas to validate against fallback schemas.
                     # Quoted schema names such as sample-system are supported.
                     # schema: "sample-system"
-                    # schema: "newsee-charge-10,newsee-bill-10,newsee-owner"
+                    # schema: "sample-charge-10,sample-bill-10,sample-owner"
 
                     """);
         } else {
@@ -299,7 +299,7 @@ class DmSqlValidationTestGenerator {
                 # Skip mapper methods that are not referenced by project target/classes bytecode.
                 usageFilterEnabled: true
                 usageClassDirectories:
-                  # - newsee-system-base/target/classes
+                  # - sample-system-base/target/classes
 
                 # Configure sample method arguments by mapperClass.method.
                 # Missing methods are invoked with conservative generated parameters when possible.

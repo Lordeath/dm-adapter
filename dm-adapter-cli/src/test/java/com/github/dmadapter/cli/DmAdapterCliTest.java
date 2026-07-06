@@ -46,9 +46,9 @@ class DmAdapterCliTest {
                 tempDir.toString(),
                 "--dry-run",
                 "--schema",
-                "newsee-bill",
+                "sample-bill",
                 "--system_schema",
-                "newsee-system",
+                "sample-system",
                 "--sql-root",
                 "sql/v2",
                 "--sql-root-out",
@@ -63,7 +63,7 @@ class DmAdapterCliTest {
         assertThat(Files.readString(sqlScriptReport))
                 .contains("达梦 SQL 脚本转换报告")
                 .contains("20260423_system.sql")
-                .contains("newsee-system")
+                .contains("sample-system")
                 .contains("dry-run 模式；已跳过 SQL 脚本试执行。");
     }
 
@@ -183,7 +183,7 @@ class DmAdapterCliTest {
                 "--app-module",
                 "sample-system-rest",
                 "--schema",
-                "newsee-system"
+                "sample-system"
         );
 
         Path config = tempDir.resolve(".dm-adapter/sql-validation.yml");
@@ -193,7 +193,7 @@ class DmAdapterCliTest {
         assertThat(Files.exists(tempDir.resolve("sample-system-base/src/main/resources/mapper-dm/UserMapper.xml"))).isTrue();
         assertThat(Files.exists(tempDir.resolve("sample-system-rest/src/test/java/com/example/DmSqlValidationTest.java"))).isTrue();
         assertThat(Files.readString(config))
-                .contains("schema: \"newsee-system\"")
+                .contains("schema: \"sample-system\"")
                 .contains("sample-system-base/src/main/resources/mapper-dm/**/*.xml")
                 .doesNotContain("sample-system-base/src/main/resources/mapper/**/*.xml");
     }
@@ -1319,12 +1319,12 @@ class DmAdapterCliTest {
                 "--project",
                 tempDir.toString(),
                 "--schema",
-                "newsee-charge-10,newsee-bill-10,newsee-owner"
+                "sample-charge-10,sample-bill-10,sample-owner"
         );
 
         assertThat(exitCode).isZero();
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation.yml")))
-                .contains("schema: \"newsee-charge-10,newsee-bill-10,newsee-owner\"");
+                .contains("schema: \"sample-charge-10,sample-bill-10,sample-owner\"");
         assertThat(Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java")))
                 .contains("primarySchema()")
                 .contains("defaultSchemaIdentifier(valueName)")
@@ -1483,7 +1483,7 @@ class DmAdapterCliTest {
                          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
                     <modelVersion>4.0.0</modelVersion>
                     <groupId>com.example</groupId>
-                    <artifactId>newsee-fastdfs</artifactId>
+                    <artifactId>sample-fastdfs</artifactId>
                     <version>0.0.1-SNAPSHOT</version>
                 </project>
                 """);
@@ -1510,12 +1510,12 @@ class DmAdapterCliTest {
                 "--project",
                 tempDir.toString(),
                 "--app-module",
-                "newsee-fastdfs"
+                "sample-fastdfs"
         );
 
         assertThat(exitCode).isZero();
         assertThat(Files.exists(tempDir.resolve("fastdfs-service/src/test/java/com/example/fastdfs/DmSqlValidationTest.java"))).isTrue();
-        assertThat(Files.exists(tempDir.resolve("newsee-fastdfs/src/test/java/com/example/fastdfs/DmSqlValidationTest.java"))).isFalse();
+        assertThat(Files.exists(tempDir.resolve("sample-fastdfs/src/test/java/com/example/fastdfs/DmSqlValidationTest.java"))).isFalse();
     }
 
     @Test
@@ -1715,7 +1715,7 @@ class DmAdapterCliTest {
                             ${item}
                         </foreach>
                     </delete>
-                    <select id="listPageWithScopedCollections" parameterType="com.newsee.common.vo.SearchVo">
+                    <select id="listPageWithScopedCollections" parameterType="com.sample.common.vo.SearchVo">
                         select id
                         from user
                         <where>

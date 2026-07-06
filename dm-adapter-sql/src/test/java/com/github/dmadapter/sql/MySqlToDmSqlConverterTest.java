@@ -1391,7 +1391,7 @@ class MySqlToDmSqlConverterTest {
 
     @Test
     void leavesReservedOrSpecialBacktickIdentifiersNative() {
-        SqlConversionResult result = converter.convert("select `order`, `newsee-system`.`user-table` from `user`");
+        SqlConversionResult result = converter.convert("select `order`, `sample-system`.`user-table` from `user`");
 
         assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
@@ -2185,14 +2185,14 @@ class MySqlToDmSqlConverterTest {
     void convertsMysqlInformationSchemaColumnsQueryToAllTabColumns() {
         SqlConversionResult result = converter.convert("""
                 SELECT column_name FROM information_schema.COLUMNS
-                WHERE TABLE_NAME =? and TABLE_SCHEMA='newsee-quality'
+                WHERE TABLE_NAME =? and TABLE_SCHEMA='sample-quality'
                 ORDER BY ORDINAL_POSITION asc
                 """);
 
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('newsee-quality') ORDER BY COLUMN_ID ASC");
+                .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('sample-quality') ORDER BY COLUMN_ID ASC");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
     }
@@ -2341,13 +2341,13 @@ class MySqlToDmSqlConverterTest {
     void convertsMysqlInformationSchemaTablesQueryWithSchemaToAllTables() {
         SqlConversionResult result = converter.convert("""
                 SELECT COUNT(1) table_count FROM information_schema.tables
-                WHERE TABLE_SCHEMA = 'newsee-contract' AND TABLE_NAME = ?
+                WHERE TABLE_SCHEMA = 'sample-contract' AND TABLE_NAME = ?
                 """);
 
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("SELECT COUNT(*) AS table_count FROM ALL_TABLES WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('newsee-contract')");
+                .isEqualTo("SELECT COUNT(*) AS table_count FROM ALL_TABLES WHERE TABLE_NAME = UPPER(?) AND OWNER = UPPER('sample-contract')");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }

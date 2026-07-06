@@ -40,8 +40,8 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "newsee-bill",
-                "newsee-system",
+                "sample-bill",
+                "sample-system",
                 DmValidationEnvironment.from(Map.of())
         ));
 
@@ -62,7 +62,7 @@ class SqlScriptMigratorTest {
                 .contains("select 'SYSTEM' from dual;");
         assertThat(validator.files)
                 .extracting(SqlScriptMigrator.PlannedSqlScriptFile::schema)
-                .containsExactly("newsee-bill", "newsee-system");
+                .containsExactly("sample-bill", "sample-system");
         assertThat(validator.files)
                 .filteredOn(SqlScriptMigrator.PlannedSqlScriptFile::systemScript)
                 .singleElement()
@@ -107,8 +107,8 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 true,
-                "newsee-bill",
-                "newsee-system",
+                "sample-bill",
+                "sample-system",
                 DmValidationEnvironment.from(Map.of(
                         "DM_SQL_VALIDATION", "true",
                         "DM_JDBC_URL", "jdbc:dm://example:5236",
@@ -138,8 +138,8 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "newsee-bill",
-                "newsee-system",
+                "sample-bill",
+                "sample-system",
                 DmValidationEnvironment.from(Map.of("DM_SQL_VALIDATION", "true"))
         ));
 
@@ -171,7 +171,7 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "newsee-bill",
+                "sample-bill",
                 "",
                 DmValidationEnvironment.from(Map.of())
         ));
@@ -212,7 +212,7 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "newsee-bill",
+                "sample-bill",
                 "",
                 DmValidationEnvironment.from(Map.of())
         ));
@@ -259,7 +259,7 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "newsee-bill",
+                "sample-bill",
                 "",
                 DmValidationEnvironment.from(Map.of())
         ));
@@ -323,7 +323,7 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "newsee-bill",
+                "sample-bill",
                 "",
                 DmValidationEnvironment.from(Map.of())
         ));
@@ -386,7 +386,7 @@ class SqlScriptMigratorTest {
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "newsee-bill",
+                "sample-bill",
                 "",
                 DmValidationEnvironment.from(Map.of())
         ));
@@ -418,7 +418,7 @@ class SqlScriptMigratorTest {
         SqlScriptValidationRun result = validator.validate(List.of(new SqlScriptMigrator.PlannedSqlScriptFile(
                 "20260423.sql",
                 "20260423.sql",
-                "newsee-bill",
+                "sample-bill",
                 false,
                 true,
                 false,
