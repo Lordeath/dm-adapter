@@ -42,6 +42,34 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsStrToDateHourSecondIntervalToDateaddSecond() {
+        SqlConversionResult result = converter.convert("""
+                select str_to_date(( date_format( a.`workDate`, '%Y-%m-%d' ) + INTERVAL '23:59:59' HOUR_SECOND ), '%Y-%m-%d %H:%i:%s' )
+                from ns_user_workcheck a
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("DATEADD(SECOND, 86399, CAST(date_format( a.`workDate`, '%Y-%m-%d' ) AS DATETIME))")
+                .doesNotContain("HOUR_SECOND")
+                .doesNotContain("str_to_date");
+        assertThat(result.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_HOUR_SECOND_INTERVAL_RULE);
+    }
+
+    @Test
+    void ignoresUnsupportedKeywordsInsideCommentsForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                select 1
+                -- ON DUPLICATE KEY UPDATE is mentioned in a migration note.
+                from dual
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
     void ignoresMysqlMetadataReferencesInsideCommentsAndStrings() {
         SqlConversionResult result = converter.convert("""
                 select 1 as ok

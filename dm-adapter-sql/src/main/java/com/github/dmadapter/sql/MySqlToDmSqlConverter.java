@@ -98,6 +98,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
+    public static final String MYSQL_HOUR_SECOND_INTERVAL_RULE =
+            "MYSQL_HOUR_SECOND_INTERVAL_TO_DATEADD_SECOND";
 
     private static final int DM_AES128_ECB_ALGORITHM_ID = 513;
     private static final String AES_ENCRYPT = "AES_ENCRYPT";
@@ -141,7 +143,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^[+-]?(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})$"
     );
     private static final List<String> MYSQL_INTERVAL_UNITS =
-            List.of("YEAR", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE", "SECOND");
+            List.of("HOUR_SECOND", "YEAR", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE", "SECOND");
     private static final List<String> MYSQL_SELECT_MODIFIERS_TO_REMOVE = List.of(
             "SQL_BIG_RESULT",
             "SQL_SMALL_RESULT",
@@ -481,6 +483,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_SUBDATE_RULE);
         }
 
+        GenericConversion hourSecondIntervalConversion = convertStrToDateHourSecondInterval(converted);
+        if (hourSecondIntervalConversion.changed()) {
+            converted = hourSecondIntervalConversion.convertedSql();
+            rules.add(MYSQL_HOUR_SECOND_INTERVAL_RULE);
+        }
+
         GenericConversion dateAddIntervalConversion = convertDateAddInterval(converted);
         if (dateAddIntervalConversion.changed()) {
             converted = dateAddIntervalConversion.convertedSql();
@@ -767,11 +775,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private String unsupportedReason(String sql) {
-        String upper = sql.toUpperCase(Locale.ROOT);
-        if (upper.contains("ON DUPLICATE KEY UPDATE")) {
+        if (containsPatternOutsideIgnoredText(
+                sql,
+                Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
+        )) {
             return "ON DUPLICATE KEY UPDATE requires configured keyColumns for safe Dameng MERGE rewrite.";
         }
-        if (upper.contains("REPLACE INTO")) {
+        if (containsPatternOutsideIgnoredText(
+                sql,
+                Pattern.compile("(?is)\\bREPLACE\\s+INTO\\b")
+        )) {
             return "REPLACE INTO has no safe automatic Dameng rewrite in MVP.";
         }
         if (GROUP_CONCAT_PATTERN.matcher(sql).find()) {
@@ -2657,13 +2670,26 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     String amount = current == '-'
                             ? negatedIntervalAmount(addition.intervalExpression().amount())
                             : addition.intervalExpression().amount();
+                    String unit = addition.intervalExpression().unit();
+                    String rewrittenUnit = unit;
+                    if ("HOUR_SECOND".equalsIgnoreCase(unit)) {
+                        String seconds = hourSecondIntervalSeconds(addition.intervalExpression().amount());
+                        if (seconds == null) {
+                            index++;
+                            continue;
+                        }
+                        amount = current == '-' ? "-" + seconds : seconds;
+                        rewrittenUnit = "SECOND";
+                    }
                     converted.append(sql, lastCopiedIndex, addition.leftExpression().startIndex());
                     converted.append("DATEADD(")
-                            .append(addition.intervalExpression().unit())
+                            .append(rewrittenUnit)
                             .append(", ")
                             .append(amount)
                             .append(", ")
-                            .append(addition.leftExpression().text())
+                            .append("HOUR_SECOND".equalsIgnoreCase(unit)
+                                    ? "CAST(" + addition.leftExpression().text() + " AS DATETIME)"
+                                    : addition.leftExpression().text())
                             .append(")");
                     lastCopiedIndex = addition.intervalExpression().endIndex();
                     index = lastCopiedIndex;
@@ -2875,6 +2901,119 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + " - 1, TO_DATE(CONCAT("
                 + yearExpression
                 + ", '-01-01'), 'YYYY-MM-DD'))";
+    }
+
+    private GenericConversion convertStrToDateHourSecondInterval(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "STR_TO_DATE")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "STR_TO_DATE");
+                String replacement = functionCall == null ? null : rewriteStrToDateHourSecondInterval(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteStrToDateHourSecondInterval(FunctionCall strToDateCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(strToDateCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String format = normalizedStringLiteral(arguments.get(1).text());
+        if (!"'%Y-%m-%d %H:%i:%s'".equalsIgnoreCase(format)) {
+            return null;
+        }
+        String expression = stripOuterParentheses(arguments.get(0).text().trim());
+        int plusIndex = findTopLevelChar(expression, '+', 0);
+        int minusIndex = findTopLevelChar(expression, '-', 0);
+        int operatorIndex;
+        char operator;
+        if (plusIndex >= 0 && (minusIndex < 0 || plusIndex < minusIndex)) {
+            operatorIndex = plusIndex;
+            operator = '+';
+        } else if (minusIndex >= 0) {
+            operatorIndex = minusIndex;
+            operator = '-';
+        } else {
+            return null;
+        }
+        DateIntervalAddition addition = readDateIntervalAddition(expression, operatorIndex);
+        if (addition == null || !"HOUR_SECOND".equalsIgnoreCase(addition.intervalExpression().unit())) {
+            return null;
+        }
+        String seconds = hourSecondIntervalSeconds(addition.intervalExpression().amount());
+        if (seconds == null) {
+            return null;
+        }
+        return "DATEADD(SECOND, "
+                + (operator == '-' ? "-" : "")
+                + seconds
+                + ", CAST("
+                + addition.leftExpression().text()
+                + " AS DATETIME))";
+    }
+
+    private String stripOuterParentheses(String expression) {
+        String converted = expression.strip();
+        boolean changed;
+        do {
+            changed = false;
+            if (converted.startsWith("(")) {
+                int close = findMatchingParen(converted, 0);
+                if (close == converted.length() - 1) {
+                    converted = converted.substring(1, close).strip();
+                    changed = true;
+                }
+            }
+        } while (changed);
+        return converted;
+    }
+
+    private String hourSecondIntervalSeconds(String amount) {
+        String stripped = amount.strip();
+        if (!stripped.startsWith("'")) {
+            return null;
+        }
+        SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(stripped, 0);
+        if (!literal.closed() || literal.nextIndex() != stripped.length()) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?is)^(\\d{1,3}):(\\d{1,2}):(\\d{1,2})$")
+                .matcher(literal.value().strip());
+        if (!matcher.matches()) {
+            return null;
+        }
+        long hours = Long.parseLong(matcher.group(1));
+        long minutes = Long.parseLong(matcher.group(2));
+        long seconds = Long.parseLong(matcher.group(3));
+        if (minutes > 59 || seconds > 59) {
+            return null;
+        }
+        return Long.toString(hours * 3600 + minutes * 60 + seconds);
     }
 
     private GenericConversion convertStrToDateYearMonth(String sql) {
@@ -6810,6 +6949,35 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             } else if (startsKeyword(sql, index, keyword)) {
                 return true;
             } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private boolean containsPatternOutsideIgnoredText(String sql, Pattern pattern) {
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                Matcher matcher = pattern.matcher(sql);
+                matcher.region(index, sql.length());
+                if (matcher.lookingAt()) {
+                    return true;
+                }
                 index++;
             }
         }
