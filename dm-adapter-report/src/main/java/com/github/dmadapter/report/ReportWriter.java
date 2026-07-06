@@ -82,23 +82,23 @@ public class ReportWriter {
 
     private String sqlScriptMarkdown(SqlScriptMigrationReport report) {
         StringBuilder markdown = new StringBuilder();
-        markdown.append("# dm-adapter SQL Script Migration Report\n\n");
-        markdown.append("- Project: `").append(report.projectRoot()).append("`\n");
-        markdown.append("- SQL root: `").append(report.sqlRoot()).append("`\n");
-        markdown.append("- SQL root out: `").append(report.sqlRootOut()).append("`\n");
-        markdown.append("- Dry run: `").append(report.dryRun()).append("`\n");
-        markdown.append("- Scanned SQL files: `").append(report.scannedFileCount()).append("`\n");
-        markdown.append("- Converted files: `").append(report.convertedFileCount()).append("`\n");
-        markdown.append("- Manual review SQL items: `").append(report.manualReviewSqlCount()).append("`\n");
-        markdown.append("- Validation attempted: `").append(report.validationAttempted()).append("`\n");
-        markdown.append("- Validation status: `").append(report.validationStatus()).append("`\n");
-        markdown.append("- Validation success SQL count: `").append(report.validationSuccessCount()).append("`\n");
-        markdown.append("- Validation failed SQL count: `").append(report.validationFailureCount()).append("`\n\n");
+        markdown.append("# 达梦 SQL 脚本转换报告\n\n");
+        markdown.append("- 项目目录：`").append(report.projectRoot()).append("`\n");
+        markdown.append("- 原始 SQL 目录：`").append(report.sqlRoot()).append("`\n");
+        markdown.append("- 达梦 SQL 输出目录：`").append(report.sqlRootOut()).append("`\n");
+        markdown.append("- dry-run 模式：`").append(yesNo(report.dryRun())).append("`\n");
+        markdown.append("- 扫描 SQL 文件数：`").append(report.scannedFileCount()).append("`\n");
+        markdown.append("- 已转换文件数：`").append(report.convertedFileCount()).append("`\n");
+        markdown.append("- 需人工确认 SQL 数：`").append(report.manualReviewSqlCount()).append("`\n");
+        markdown.append("- 是否执行达梦试执行：`").append(yesNo(report.validationAttempted())).append("`\n");
+        markdown.append("- 试执行状态：`").append(sqlScriptStatus(report.validationStatus())).append("`\n");
+        markdown.append("- 试执行成功 SQL 数：`").append(report.validationSuccessCount()).append("`\n");
+        markdown.append("- 试执行失败 SQL 数：`").append(report.validationFailureCount()).append("`\n\n");
 
         appendSqlScriptFiles(markdown, report.files());
         appendSqlScriptManualReviewItems(markdown, report.manualReviewItems());
         appendSqlScriptValidationFailures(markdown, report.validationFailures());
-        appendWarnings(markdown, report.warnings());
+        appendSqlScriptWarnings(markdown, report.warnings());
         return markdown.toString();
     }
 
@@ -149,18 +149,18 @@ public class ReportWriter {
     }
 
     private void appendSqlScriptFiles(StringBuilder markdown, List<SqlScriptFileResult> files) {
-        markdown.append("## Script Files\n\n");
+        markdown.append("## 脚本文件\n\n");
         if (files.isEmpty()) {
-            markdown.append("No files.\n\n");
+            markdown.append("没有扫描到 SQL 文件。\n\n");
             return;
         }
-        markdown.append("| Source | Output | Schema | System | Statements | Converted | Manual Review | Validation OK | Validation Failed |\n");
+        markdown.append("| 原始文件 | 输出文件 | 执行 schema | 系统脚本 | SQL 语句数 | 自动转换数 | 人工确认数 | 试执行成功数 | 试执行失败数 |\n");
         markdown.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
         for (SqlScriptFileResult file : files) {
             markdown.append("| `").append(file.sourceFile()).append("` | `")
                     .append(file.outputFile()).append("` | `")
                     .append(file.schema()).append("` | `")
-                    .append(file.systemScript()).append("` | ")
+                    .append(yesNo(file.systemScript())).append("` | ")
                     .append(file.statementCount()).append(" | ")
                     .append(file.convertedStatementCount()).append(" | ")
                     .append(file.manualReviewStatementCount()).append(" | ")
@@ -174,17 +174,17 @@ public class ReportWriter {
             StringBuilder markdown,
             List<SqlScriptManualReviewItem> manualReviewItems
     ) {
-        markdown.append("## Manual Review SQL Items\n\n");
+        markdown.append("## 需人工确认的 SQL\n\n");
         if (manualReviewItems.isEmpty()) {
-            markdown.append("No items.\n\n");
+            markdown.append("没有需要人工确认的 SQL。\n\n");
             return;
         }
         for (SqlScriptManualReviewItem item : manualReviewItems) {
-            markdown.append("- `").append(item.sourceFile()).append("` statement `")
-                    .append(item.statementIndex()).append("` reason: ")
-                    .append(item.reason()).append("\n");
-            markdown.append("  - Original: `").append(compact(item.originalSql())).append("`\n");
-            markdown.append("  - Converted: `").append(compact(item.convertedSql())).append("`\n");
+            markdown.append("- `").append(item.sourceFile()).append("` 第 `")
+                    .append(item.statementIndex()).append("` 条 SQL，原因：")
+                    .append(sqlScriptReason(item.reason())).append("\n");
+            markdown.append("  - 原始 SQL：`").append(compact(item.originalSql())).append("`\n");
+            markdown.append("  - 转换后 SQL：`").append(compact(item.convertedSql())).append("`\n");
         }
         markdown.append("\n");
     }
@@ -193,20 +193,31 @@ public class ReportWriter {
             StringBuilder markdown,
             List<SqlScriptValidationFailure> validationFailures
     ) {
-        markdown.append("## Validation Failures\n\n");
+        markdown.append("## 达梦试执行失败\n\n");
         if (validationFailures.isEmpty()) {
-            markdown.append("No failures.\n\n");
+            markdown.append("没有试执行失败的 SQL。\n\n");
             return;
         }
         for (SqlScriptValidationFailure failure : validationFailures) {
-            markdown.append("- `").append(failure.outputFile()).append("` statement `")
-                    .append(failure.statementIndex()).append("` schema `")
-                    .append(failure.schema()).append("` category `")
+            markdown.append("- `").append(failure.outputFile()).append("` 第 `")
+                    .append(failure.statementIndex()).append("` 条 SQL，schema `")
+                    .append(failure.schema()).append("`，分类 `")
                     .append(failure.category()).append("`\n");
-            markdown.append("  - Error: ").append(failure.errorSummary()).append("\n");
-            markdown.append("  - SQL: `").append(failure.failedSqlSummary()).append("`\n");
+            markdown.append("  - 错误摘要：").append(failure.errorSummary()).append("\n");
+            markdown.append("  - 失败 SQL：`").append(failure.failedSqlSummary()).append("`\n");
         }
         markdown.append("\n");
+    }
+
+    private void appendSqlScriptWarnings(StringBuilder markdown, List<String> warnings) {
+        markdown.append("## 风险提示\n\n");
+        if (warnings.isEmpty()) {
+            markdown.append("没有风险提示。\n");
+            return;
+        }
+        for (String warning : warnings) {
+            markdown.append("- ").append(sqlScriptStatus(warning)).append("\n");
+        }
     }
 
     private void appendWarnings(StringBuilder markdown, List<String> warnings) {
@@ -229,6 +240,94 @@ public class ReportWriter {
             return compact;
         }
         return compact.substring(0, 237) + "...";
+    }
+
+    private String yesNo(boolean value) {
+        return value ? "是" : "否";
+    }
+
+    private String sqlScriptStatus(String status) {
+        if (status == null || status.isBlank()) {
+            return "";
+        }
+        if (status.equals("Dry run; SQL script validation skipped.")) {
+            return "dry-run 模式；已跳过 SQL 脚本试执行。";
+        }
+        if (status.equals("No SQL script files were found.")) {
+            return "未找到 SQL 脚本文件。";
+        }
+        if (status.equals("DM_SQL_VALIDATION is not true; SQL script validation skipped.")) {
+            return "DM_SQL_VALIDATION 不是 true；已跳过 SQL 脚本试执行。";
+        }
+        if (status.startsWith("DM_SQL_VALIDATION is true but required variables are missing: ")) {
+            return "DM_SQL_VALIDATION=true，但缺少必要环境变量："
+                    + status.substring("DM_SQL_VALIDATION is true but required variables are missing: ".length());
+        }
+        if (status.equals("Dameng SQL script validation passed.")) {
+            return "达梦 SQL 脚本试执行通过。";
+        }
+        if (status.equals("Dameng SQL script validation completed with failed SQL statements.")) {
+            return "达梦 SQL 脚本试执行完成，但存在失败 SQL。";
+        }
+        if (status.startsWith("Dameng SQL script validation connection failed: ")) {
+            return "达梦 SQL 脚本试执行连接失败："
+                    + status.substring("Dameng SQL script validation connection failed: ".length());
+        }
+        if (status.equals("Dameng SQL script validation was skipped because the connection could not be opened.")) {
+            return "达梦 SQL 脚本试执行因无法建立连接而跳过。";
+        }
+        if (status.startsWith("SQL script validation uses the first schema from ")) {
+            return status
+                    .replace("SQL script validation uses the first schema from ", "SQL 脚本试执行使用 ")
+                    .replace(": ", " 的第一个 schema：");
+        }
+        if (status.startsWith("System SQL script has no --system-schema and will use the current connection schema: ")) {
+            return "系统 SQL 脚本未指定 --system-schema，将使用当前连接 schema："
+                    + status.substring("System SQL script has no --system-schema and will use the current connection schema: ".length());
+        }
+        return status;
+    }
+
+    private String sqlScriptReason(String reason) {
+        if (reason == null || reason.isBlank()) {
+            return "";
+        }
+        if (reason.startsWith("可疑字段长度修改")) {
+            return reason;
+        }
+        if (reason.equals("MySQL user variables such as @var require ROW_NUMBER, explicit variables, or procedure-level rewrite for Dameng.")) {
+            return "MySQL 用户变量（如 @var）不能直接迁移到达梦；建议改为 ROW_NUMBER()、显式变量，或按存储过程语义人工重写。";
+        }
+        if (reason.equals("MySQL metadata SQL such as information_schema/database() requires manual Dameng rewrite.")) {
+            return "MySQL 元数据查询（如 information_schema/database()）需要人工确认达梦等价写法。";
+        }
+        if (reason.equals("MySQL procedure HANDLER syntax needs manual confirmation for Dameng.")) {
+            return "MySQL 存储过程 HANDLER 语法需要人工确认达梦等价写法。";
+        }
+        if (reason.equals("MySQL SIGNAL SQLSTATE handling needs manual confirmation for Dameng.")) {
+            return "MySQL SIGNAL SQLSTATE 异常处理需要人工确认达梦等价写法。";
+        }
+        if (reason.equals("MySQL dynamic SQL in procedures needs manual confirmation for Dameng.")) {
+            return "MySQL 存储过程动态 SQL 需要人工确认达梦等价写法。";
+        }
+        if (reason.equals("Trigger syntax differs between MySQL and Dameng and needs manual confirmation.")) {
+            return "MySQL 与达梦触发器语法差异较大，需要人工确认。";
+        }
+        if (reason.equals("GROUP_CONCAT requires manual confirmation for Dameng aggregate syntax.")) {
+            return "GROUP_CONCAT 聚合语法需要人工确认达梦等价写法。";
+        }
+        if (reason.equals("REGEXP requires manual confirmation because Dameng regular-expression syntax may differ from MySQL.")) {
+            return "REGEXP 正则语法可能与 MySQL 不同，需要人工确认达梦等价写法。";
+        }
+        if (reason.equals("LIMIT on non-SELECT DML requires manual confirmation for Dameng.")) {
+            return "非 SELECT DML 上的 LIMIT 需要人工确认达梦等价写法。";
+        }
+        String suffix = " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
+        if (reason.endsWith(suffix)) {
+            return "`" + reason.substring(0, reason.length() - suffix.length())
+                    + "` 需要人工确认，达梦支持情况或语法可能与 MySQL 不同。";
+        }
+        return reason;
     }
 
     private MigrationReport redactSensitiveSql(MigrationReport report) {

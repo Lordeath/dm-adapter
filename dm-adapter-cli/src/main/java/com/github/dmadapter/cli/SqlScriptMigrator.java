@@ -31,11 +31,31 @@ class SqlScriptMigrator {
     static final String MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE =
             "MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE";
 
+    private static final String SUSPICIOUS_LENGTH_MODIFY_REASON =
+            "可疑字段长度修改：当前 SQL 把字段改为 varchar(%s)，但前置判断没有使用“字符类型且长度小于 %s”的安全加长条件；"
+                    + "如果原字段是 TEXT/CLOB 或 varchar 长度已经大于目标值，执行 MODIFY 可能会缩短字段并导致数据截断。"
+                    + "建议先修原始 SQL：仅当 DATA_TYPE/column_type 为 char 或 varchar，"
+                    + "且 CHARACTER_MAXIMUM_LENGTH 小于目标长度时才执行 ALTER，"
+                    + "例如 DATA_TYPE IN ('char','varchar') AND CHARACTER_MAXIMUM_LENGTH < %s；TEXT/CLOB 不要自动收窄。";
+
     private static final Pattern CREATE_DEFINER_PATTERN = Pattern.compile(
             "(?is)^\\s*CREATE\\s+DEFINER\\s*=\\s*(?:`[^`]+`@`[^`]+`|'[^']+'@'[^']+'|\\S+)\\s+"
     );
     private static final Pattern CREATE_PROCEDURE_BODY_PATTERN = Pattern.compile(
             "(?is)^(\\s*)CREATE\\s+(?:OR\\s+REPLACE\\s+)?PROCEDURE\\s+(.+?)\\s+BEGIN\\b"
+    );
+    private static final Pattern LENGTH_EQUALITY_PATTERN = Pattern.compile(
+            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*=\\s*(\\d+)\\b"
+    );
+    private static final Pattern LENGTH_RANGE_PATTERN = Pattern.compile(
+            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*(<=|>=|<|>)\\s*(\\d+)\\b"
+    );
+    private static final Pattern COLUMN_TYPE_GUARD_PATTERN = Pattern.compile(
+            "(?is)\\b(?:DATA_TYPE|COLUMN_TYPE)\\b"
+    );
+    private static final Pattern VARCHAR_MODIFY_PATTERN = Pattern.compile(
+            "(?is)\\bALTER\\s+TABLE\\b(?:(?!;).)*?\\bMODIFY(?:\\s+COLUMN)?\\b(?:(?!;).)*?"
+                    + "\\b(?:VAR)?CHAR\\s*\\(\\s*(\\d+)\\s*\\)"
     );
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final List<TextReplacement> SCRIPT_METADATA_REPLACEMENTS = List.of(
@@ -1062,12 +1082,74 @@ class SqlScriptMigrator {
     }
 
     private String manualReviewReason(String sql) {
+        String suspiciousLengthModifyReason = suspiciousLengthModifyReason(sql);
+        if (!suspiciousLengthModifyReason.isBlank()) {
+            return suspiciousLengthModifyReason;
+        }
         for (Map.Entry<Pattern, String> entry : MANUAL_REVIEW_PATTERNS.entrySet()) {
             if (entry.getKey().matcher(sql).find()) {
                 return entry.getValue();
             }
         }
         return "";
+    }
+
+    private String suspiciousLengthModifyReason(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return "";
+        }
+        Matcher modifyMatcher = VARCHAR_MODIFY_PATTERN.matcher(sql);
+        while (modifyMatcher.find()) {
+            String targetLength = modifyMatcher.group(1);
+            String context = lengthModifyContext(sql, modifyMatcher.start(), modifyMatcher.end());
+            if (hasLengthEqualityForTarget(context, targetLength)
+                    && !hasSafeLengthIncreaseGuard(context, targetLength)) {
+                return SUSPICIOUS_LENGTH_MODIFY_REASON.formatted(targetLength, targetLength, targetLength);
+            }
+        }
+        return "";
+    }
+
+    private String lengthModifyContext(String sql, int modifyStart, int modifyEnd) {
+        int contextStart = previousIfKeywordIndex(sql, modifyStart);
+        if (contextStart < 0) {
+            contextStart = 0;
+        }
+        return sql.substring(contextStart, modifyEnd);
+    }
+
+    private int previousIfKeywordIndex(String sql, int beforeIndex) {
+        Matcher matcher = Pattern.compile("(?is)\\bIF\\b").matcher(sql);
+        int previous = -1;
+        while (matcher.find() && matcher.start() < beforeIndex) {
+            previous = matcher.start();
+        }
+        return previous;
+    }
+
+    private boolean hasLengthEqualityForTarget(String sql, String targetLength) {
+        Matcher matcher = LENGTH_EQUALITY_PATTERN.matcher(sql);
+        while (matcher.find()) {
+            if (matcher.group(1).equals(targetLength)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasSafeLengthIncreaseGuard(String sql, String targetLength) {
+        if (!COLUMN_TYPE_GUARD_PATTERN.matcher(sql).find()) {
+            return false;
+        }
+        Matcher matcher = LENGTH_RANGE_PATTERN.matcher(sql);
+        while (matcher.find()) {
+            String operator = matcher.group(1);
+            String length = matcher.group(2);
+            if (length.equals(targetLength) && ("<".equals(operator) || "<=".equals(operator))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Path resolvePath(Path projectRoot, Path path) {
