@@ -90,6 +90,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_SESSION_VARIABLE_NOOP_RULE = "MYSQL_SESSION_VARIABLE_TO_NOOP";
     public static final String MYSQL_TRUNCATE_TABLE_RULE = "MYSQL_TRUNCATE_TABLE_TO_DM";
     public static final String DUPLICATE_WHERE_KEYWORD_RULE = "DUPLICATE_WHERE_KEYWORD_REMOVED";
+    public static final String MYSQL_DUPLICATE_UPDATE_SET_LITERAL_RULE =
+            "MYSQL_DUPLICATE_UPDATE_SET_LITERAL_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
@@ -451,6 +453,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (duplicateWhereConversion.changed()) {
             converted = duplicateWhereConversion.convertedSql();
             rules.add(DUPLICATE_WHERE_KEYWORD_RULE);
+        }
+
+        GenericConversion duplicateUpdateSetConversion = deduplicateLiteralUpdateSetAssignments(converted);
+        if (duplicateUpdateSetConversion.changed()) {
+            converted = duplicateUpdateSetConversion.convertedSql();
+            rules.add(MYSQL_DUPLICATE_UPDATE_SET_LITERAL_RULE);
         }
 
         GenericConversion dateSubConversion = convertDateSubInterval(converted);
@@ -2167,6 +2175,149 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql, lastCopiedIndex, sql.length());
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion deduplicateLiteralUpdateSetAssignments(String sql) {
+        List<StatementSegment> statements = splitTopLevelStatements(sql);
+        if (statements.size() > 1) {
+            StringBuilder converted = new StringBuilder(sql.length());
+            boolean changed = false;
+            for (StatementSegment statement : statements) {
+                GenericConversion conversion = deduplicateSingleLiteralUpdateSetAssignments(statement.sql());
+                converted.append(conversion.convertedSql()).append(statement.separator());
+                changed = changed || conversion.changed();
+            }
+            return changed ? new GenericConversion(converted.toString(), true) : GenericConversion.unchanged(sql);
+        }
+        return deduplicateSingleLiteralUpdateSetAssignments(sql);
+    }
+
+    private GenericConversion deduplicateSingleLiteralUpdateSetAssignments(String sql) {
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int setIndex = findTopLevelKeyword(sql, "SET", updateIndex + "UPDATE".length());
+        if (setIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
+        int orderIndex = findTopLevelKeyword(sql, "ORDER", setIndex + "SET".length());
+        int limitIndex = findTopLevelKeyword(sql, "LIMIT", setIndex + "SET".length());
+        int setEnd = minPositive(whereIndex, orderIndex, limitIndex, statementEnd);
+        String setClause = sql.substring(setIndex + "SET".length(), setEnd);
+        List<TopLevelArgument> assignments = splitTopLevelArguments(setClause);
+        if (assignments.size() < 2) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        Map<String, Integer> lastIndexByColumn = new LinkedHashMap<>();
+        Map<String, Boolean> simpleByColumn = new LinkedHashMap<>();
+        List<String> columns = new ArrayList<>(assignments.size());
+        for (int i = 0; i < assignments.size(); i++) {
+            AssignmentParts assignment = updateAssignmentParts(assignments.get(i).text());
+            if (assignment == null) {
+                return GenericConversion.unchanged(sql);
+            }
+            columns.add(assignment.columnKey());
+            lastIndexByColumn.put(assignment.columnKey(), i);
+            simpleByColumn.merge(assignment.columnKey(), assignment.simpleLiteralValue(), Boolean::logicalAnd);
+        }
+        boolean hasDuplicate = lastIndexByColumn.size() < assignments.size();
+        if (!hasDuplicate || simpleByColumn.values().stream().anyMatch(simple -> !simple)) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<String> keptAssignments = new ArrayList<>();
+        for (int i = 0; i < assignments.size(); i++) {
+            if (lastIndexByColumn.get(columns.get(i)) == i) {
+                keptAssignments.add(assignments.get(i).text().trim());
+            }
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        converted.append(sql, 0, setIndex + "SET".length());
+        converted.append(' ');
+        converted.append(String.join(", ", keptAssignments));
+        if (setEnd < sql.length()
+                && !Character.isWhitespace(converted.charAt(converted.length() - 1))
+                && !Character.isWhitespace(sql.charAt(setEnd))) {
+            converted.append(' ');
+        }
+        converted.append(sql, setEnd, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private int minPositive(int... values) {
+        int min = Integer.MAX_VALUE;
+        for (int value : values) {
+            if (value >= 0 && value < min) {
+                min = value;
+            }
+        }
+        return min == Integer.MAX_VALUE ? -1 : min;
+    }
+
+    private AssignmentParts updateAssignmentParts(String assignment) {
+        int equalsIndex = topLevelEqualsIndex(assignment);
+        if (equalsIndex < 0) {
+            return null;
+        }
+        String column = assignment.substring(0, equalsIndex).trim();
+        String value = assignment.substring(equalsIndex + 1).trim();
+        if (column.isBlank() || value.isBlank()) {
+            return null;
+        }
+        return new AssignmentParts(normalizeIdentifierKey(column), isSimpleLiteralOrNull(value));
+    }
+
+    private int topLevelEqualsIndex(String value) {
+        int depth = 0;
+        int index = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(value, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(value, index);
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (startsLineComment(value, index)) {
+                index = skipUntilLineEnd(value, index);
+            } else if (startsBlockComment(value, index)) {
+                index = skipUntilBlockCommentEnd(value, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (current == '=' && depth == 0) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private boolean isSimpleLiteralOrNull(String value) {
+        String stripped = value.strip();
+        if (stripped.equalsIgnoreCase("NULL")) {
+            return true;
+        }
+        if (Pattern.compile("[-+]?\\d+(?:\\.\\d+)?").matcher(stripped).matches()) {
+            return true;
+        }
+        if (stripped.startsWith("'")) {
+            SingleQuotedStringLiteral literal = readSingleQuotedStringLiteral(stripped, 0);
+            return literal.closed() && literal.nextIndex() == stripped.length();
+        }
+        if (stripped.startsWith("\"")) {
+            DoubleQuotedStringLiteral literal = readDoubleQuotedStringLiteral(stripped, 0);
+            return literal.closed() && literal.nextIndex() == stripped.length();
+        }
+        return false;
     }
 
     private GenericConversion convertDateSubInterval(String sql) {
@@ -7285,6 +7436,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record UpdateSetAssignment(String aliasKey, String columnKey, String text) {
+    }
+
+    private record AssignmentParts(String columnKey, boolean simpleLiteralValue) {
     }
 
     private record StatementSegment(String sql, String separator) {
