@@ -61,10 +61,10 @@ class DmAdapterCliTest {
         assertThat(Files.exists(tempDir.resolve(".dm-adapter/dm-adapter-report.md"))).isTrue();
         assertThat(Files.exists(sqlScriptReport)).isTrue();
         assertThat(Files.readString(sqlScriptReport))
-                .contains("SQL Script Migration Report")
+                .contains("达梦 SQL 脚本转换报告")
                 .contains("20260423_system.sql")
                 .contains("newsee-system")
-                .contains("Dry run; SQL script validation skipped.");
+                .contains("dry-run 模式；已跳过 SQL 脚本试执行。");
     }
 
     @Test

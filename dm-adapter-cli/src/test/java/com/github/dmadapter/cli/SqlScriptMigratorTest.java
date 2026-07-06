@@ -56,7 +56,8 @@ class SqlScriptMigratorTest {
                 .doesNotContain("DELIMITER")
                 .doesNotContain("DEFINER")
                 .contains("CREATE OR REPLACE PROCEDURE bill_proc() AS")
-                .contains("select 'ACTIVE' from dual;");
+                .contains("select 'ACTIVE' from dual;")
+                .contains("END;\n/");
         assertThat(Files.readString(sqlRootOut.resolve("nested/20260423_system.sql")))
                 .contains("select 'SYSTEM' from dual;");
         assertThat(validator.files)
@@ -67,6 +68,31 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.outputDisplay().replace('\\', '/'))
                         .endsWith("nested/20260423_system.sql"));
+    }
+
+    @Test
+    void parserKeepsSlashTerminatedDamengProcedureAsSingleStatement() {
+        String content = """
+                CREATE OR REPLACE PROCEDURE demo_proc() AS
+                BEGIN
+                    EXECUTE IMMEDIATE 'select 1';
+                END;
+                /
+                CALL demo_proc();
+                DROP PROCEDURE IF EXISTS demo_proc;
+                /
+                """;
+
+        List<String> statements = SqlScriptParser.statements(content);
+
+        assertThat(statements).hasSize(3);
+        assertThat(statements.get(0))
+                .contains("CREATE OR REPLACE PROCEDURE demo_proc() AS")
+                .contains("EXECUTE IMMEDIATE 'select 1'")
+                .contains("END");
+        assertThat(statements.get(1)).isEqualTo("CALL demo_proc()");
+        assertThat(statements.get(2)).isEqualTo("DROP PROCEDURE IF EXISTS demo_proc");
+        assertThat(statements).doesNotContain("/");
     }
 
     @Test
@@ -157,6 +183,93 @@ class SqlScriptMigratorTest {
         assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
                 .contains("PREPARE stmt FROM 'select 1'")
                 .contains("EXECUTE stmt");
+    }
+
+    @Test
+    void reportsSuspiciousLengthModifyWhenCheckOnlyComparesTargetLengthWithoutTypeGuard() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE modify_details()
+                BEGIN
+                    IF NOT EXISTS(
+                        SELECT CHARACTER_MAXIMUM_LENGTH
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = database()
+                          AND table_name = 'ns_payment_order_log'
+                          AND column_name = 'details'
+                          AND CHARACTER_MAXIMUM_LENGTH = 1000
+                    ) THEN
+                        alter table `ns_payment_order_log` MODIFY COLUMN `details` varchar(1000) DEFAULT NULL COMMENT '关于行为的描述';
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "newsee-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("可疑字段长度修改")
+                        .contains("varchar(1000)")
+                        .contains("DATA_TYPE/column_type")
+                        .contains("CHARACTER_MAXIMUM_LENGTH 小于目标长度"));
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("CREATE PROCEDURE modify_details()")
+                .contains("CHARACTER_MAXIMUM_LENGTH = 1000")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE modify_details() AS");
+    }
+
+    @Test
+    void keepsLengthExtensionWhenTypeAndLessThanGuardArePresent() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE modify_details()
+                BEGIN
+                    IF EXISTS(
+                        SELECT 1
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = database()
+                          AND table_name = 'ns_payment_order_log'
+                          AND column_name = 'details'
+                          AND LOWER(DATA_TYPE) IN ('char', 'varchar')
+                          AND CHARACTER_MAXIMUM_LENGTH < 1000
+                    ) THEN
+                        alter table `ns_payment_order_log` MODIFY COLUMN `details` varchar(1000) DEFAULT NULL COMMENT '关于行为的描述';
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "newsee-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("CREATE OR REPLACE PROCEDURE modify_details() AS")
+                .contains("LOWER(DATA_TYPE) IN ('char', 'varchar')")
+                .contains("CHAR_LENGTH < 1000")
+                .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` varchar(1000) DEFAULT NULL'");
     }
 
     @Test

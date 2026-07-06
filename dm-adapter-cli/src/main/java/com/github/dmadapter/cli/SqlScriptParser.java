@@ -17,11 +17,30 @@ final class SqlScriptParser {
         }
         List<String> statements = new ArrayList<>();
         String delimiter = ";";
+        boolean slashTerminatedBlock = false;
         StringBuilder buffer = new StringBuilder();
         for (String line : lines(content)) {
             Matcher delimiterMatcher = DELIMITER_DIRECTIVE.matcher(line.strip());
-            if (delimiterMatcher.matches() && isBlankSql(buffer.toString())) {
+            if (!slashTerminatedBlock && delimiterMatcher.matches() && isBlankSql(buffer.toString())) {
                 delimiter = delimiterMatcher.group(1);
+                continue;
+            }
+            if (slashTerminatedBlock) {
+                if (isSlashTerminator(line)) {
+                    addStatement(statements, buffer.toString());
+                    buffer.setLength(0);
+                    slashTerminatedBlock = false;
+                    continue;
+                }
+                buffer.append(line);
+                continue;
+            }
+            if (";".equals(delimiter) && isBlankSql(buffer.toString()) && startsSlashTerminatedBlock(line)) {
+                slashTerminatedBlock = true;
+                buffer.append(line);
+                continue;
+            }
+            if (isSlashTerminator(line) && isBlankSql(buffer.toString())) {
                 continue;
             }
             buffer.append(line);
@@ -53,6 +72,9 @@ final class SqlScriptParser {
             content.append(statement.stripTrailing());
             if (!endsWithSemicolon(statement)) {
                 content.append(";");
+            }
+            if (requiresSlashTerminator(statement)) {
+                content.append("\n/");
             }
         }
         if (!content.isEmpty()) {
@@ -182,5 +204,69 @@ final class SqlScriptParser {
     private static boolean endsWithSemicolon(String statement) {
         String stripped = statement == null ? "" : statement.stripTrailing();
         return stripped.endsWith(";");
+    }
+
+    private static boolean startsSlashTerminatedBlock(String line) {
+        return requiresSlashTerminator(stripLeadingCommentsAndWhitespace(line));
+    }
+
+    private static boolean requiresSlashTerminator(String statement) {
+        String sql = stripLeadingCommentsAndWhitespace(statement);
+        return Pattern.compile(
+                        "(?is)^CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|PACKAGE)\\b"
+                )
+                .matcher(sql)
+                .find();
+    }
+
+    private static boolean isSlashTerminator(String line) {
+        return line != null && line.strip().equals("/");
+    }
+
+    private static String stripLeadingCommentsAndWhitespace(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        int index = 0;
+        while (index < value.length()) {
+            while (index < value.length() && Character.isWhitespace(value.charAt(index))) {
+                index++;
+            }
+            if (startsWith(value, index, "--") || startsWith(value, index, "#")) {
+                index = skipLine(value, index);
+            } else if (startsWith(value, index, "/*")) {
+                index = skipBlockComment(value, index);
+            } else {
+                break;
+            }
+        }
+        return value.substring(Math.min(index, value.length()));
+    }
+
+    private static int skipLine(String value, int index) {
+        int cursor = index;
+        while (cursor < value.length() && value.charAt(cursor) != '\n' && value.charAt(cursor) != '\r') {
+            cursor++;
+        }
+        if (cursor < value.length() && value.charAt(cursor) == '\r') {
+            cursor++;
+            if (cursor < value.length() && value.charAt(cursor) == '\n') {
+                cursor++;
+            }
+        } else if (cursor < value.length() && value.charAt(cursor) == '\n') {
+            cursor++;
+        }
+        return cursor;
+    }
+
+    private static int skipBlockComment(String value, int index) {
+        int end = value.indexOf("*/", index + 2);
+        return end < 0 ? value.length() : end + 2;
+    }
+
+    private static boolean startsWith(String value, int index, String prefix) {
+        return index >= 0
+                && index + prefix.length() <= value.length()
+                && value.regionMatches(index, prefix, 0, prefix.length());
     }
 }
