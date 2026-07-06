@@ -190,7 +190,7 @@ class SqlRewriteConfigUpdaterTest {
 
                 validationIgnores:
                   missingSchemas:
-                    - "example-bill"
+                    - "sample-bill"
                 """);
         SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
@@ -209,13 +209,13 @@ class SqlRewriteConfigUpdaterTest {
         );
 
         assertThat(update.rewriteConfig().requiresIdentityInsert("ns_bill_openbill_interface_log_history")).isTrue();
-        assertThat(update.rewriteConfig().ignoredMissingSchemas()).contains("example-bill");
+        assertThat(update.rewriteConfig().ignoredMissingSchemas()).contains("sample-bill");
         assertThat(Files.readString(config))
                 .contains("identityInsertTables:")
                 .contains("- \"ns_bill_openbill_interface_log_history\"")
                 .contains("validationIgnores:")
                 .contains("missingSchemas:")
-                .contains("- \"example-bill\"")
+                .contains("- \"sample-bill\"")
                 .contains("\"role_perm\":");
     }
 

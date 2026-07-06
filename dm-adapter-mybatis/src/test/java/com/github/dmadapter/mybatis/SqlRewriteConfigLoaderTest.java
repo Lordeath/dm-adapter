@@ -30,31 +30,31 @@ class SqlRewriteConfigLoaderTest {
         SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
                 "identityInsertTables:",
                 "  - \"ns_equip_area_class\"",
-                "identityInsertTables: [\"EXAMPLE_OWNER.owner_house\"]",
+                "identityInsertTables: [\"SAMPLE_OWNER.owner_house\"]",
                 "validationIgnores:",
                 "  missingTables:",
                 "    - \"ns_core_resourcecolumn_temp\"",
                 "#    - \"commented_table\"",
-                "    - \"EXAMPLE_OWNER.owner_house\"",
+                "    - \"SAMPLE_OWNER.owner_house\"",
                 "  missingColumns: [\"organization_id\", \"D.fullPath\"]",
-                "  missingSchemas: [\"EXAMPLE-QUARTZ\"]",
+                "  missingSchemas: [\"SAMPLE-QUARTZ\"]",
                 "  missingTables: [\"b\"]",
                 "  missingColumns:",
                 "#    - \"commented_column\"",
                 "    - \"accountType\"",
                 "  missingSchemas:",
                 "#    - \"commented_schema\"",
-                "    - \"EXAMPLE-SCHEDULER\""
+                "    - \"SAMPLE-SCHEDULER\""
         ));
 
         assertThat(config.ignoredMissingTables())
-                .contains("ns_core_resourcecolumn_temp", "example_owner.owner_house", "b")
+                .contains("ns_core_resourcecolumn_temp", "sample_owner.owner_house", "b")
                 .doesNotContain("commented_table");
         assertThat(config.ignoredMissingColumns())
                 .contains("organization_id", "d.fullpath", "accounttype")
                 .doesNotContain("commented_column");
         assertThat(config.ignoredMissingSchemas())
-                .contains("example-quartz", "example-scheduler")
+                .contains("sample-quartz", "sample-scheduler")
                 .doesNotContain("commented_schema");
         assertThat(config.requiresIdentityInsert("ns_equip_area_class")).isTrue();
         assertThat(config.requiresIdentityInsert("owner_house")).isTrue();
