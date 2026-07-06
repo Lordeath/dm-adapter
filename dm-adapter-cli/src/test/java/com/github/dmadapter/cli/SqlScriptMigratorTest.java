@@ -195,6 +195,124 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void inlinesLiteralScriptVariablesAndIgnoresMysqlForeignKeyChecks() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                # 默认创建人和企业
+                set @enterpriseID=107;
+                set @adminUserName='超级管理员';
+                insert into demo_config(enterprise_id, user_name)
+                values (@enterpriseID, @adminUserName);
+                SET FOREIGN_KEY_CHECKS = 1;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260205.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("-- DM_ADAPTER: MySQL script variable @enterpriseID was inlined as 107")
+                .contains("-- DM_ADAPTER: MySQL script variable @adminUserName was inlined as '超级管理员'")
+                .contains("values (107, '超级管理员')")
+                .contains("-- DM_ADAPTER: ignored MySQL FOREIGN_KEY_CHECKS = 1")
+                .doesNotContain("values (@")
+                .doesNotContain("SET FOREIGN_KEY_CHECKS");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(
+                                SqlScriptMigrator.MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE,
+                                SqlScriptMigrator.MYSQL_FOREIGN_KEY_CHECKS_NOOP_RULE
+                        ));
+    }
+
+    @Test
+    void normalizesDropProcedureAndTemporaryTableSyntax() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205_system.sql"), "\uFEFF" + """
+                -- file starts with UTF-8 BOM
+                DROP PROCEDURE
+                IF
+                    EXISTS `already_safe_proc`;
+                DROP PROCEDURE `missing_proc`;
+                DROP PROCEDURE IF EXISTS IF EXISTS duplicated_proc;
+                create TEMPORARY table if not exists tmp_enterprise_orgid
+                SELECT enterprise_id, organization_id FROM ns_system_organization;
+                alter table tmp_enterprise_orgid add index idx_1(enterprise_id, organization_id);
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260205_system.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .doesNotContain("\uFEFF")
+                .doesNotContain("IF EXISTS IF")
+                .contains("DROP PROCEDURE IF EXISTS `already_safe_proc`")
+                .contains("DROP PROCEDURE IF EXISTS `missing_proc`")
+                .contains("DROP PROCEDURE IF EXISTS duplicated_proc")
+                .containsIgnoringCase("CREATE TABLE IF NOT EXISTS tmp_enterprise_orgid AS SELECT enterprise_id, organization_id FROM ns_system_organization")
+                .contains("-- DM_ADAPTER: ignored MySQL temporary table index DDL")
+                .doesNotContain("TEMPORARY")
+                .doesNotContain("add index");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.MYSQL_DROP_PROCEDURE_IF_EXISTS_RULE,
+                        SqlScriptMigrator.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        SqlScriptMigrator.MYSQL_TEMPORARY_INDEX_NOOP_RULE
+                ));
+    }
+
+    @Test
+    void keepsExistingDropProcedureIfExistsWhenSplitByCrLf() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                /* add parameter */
+                DROP PROCEDURE
+                IF
+                    EXISTS `pro_AddColumn`;
+                """
+                .replace("\n", "\r\n"));
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260205.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .doesNotContain("IF EXISTS \nIF")
+                .doesNotContain("IF EXISTS \r\nIF")
+                .contains("DROP PROCEDURE IF EXISTS `pro_AddColumn`");
+    }
+
+    @Test
     void keepsUnsafeProcedureSqlForManualReview() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -571,6 +689,12 @@ class SqlScriptMigratorTest {
                     ) THEN
                         CREATE INDEX idx_demo_title ON demo(title(20));
                     END IF;
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
+                        WHERE table_name = 'demo' AND table_schema = (SELECT DATABASE()) AND INDEX_NAME = 'amount'
+                    ) THEN
+                        ALTER TABLE demo ADD INDEX (amount);
+                    END IF;
                     IF EXISTS (
                         SELECT COLUMN_NAME FROM information_schema.COLUMNS
                         WHERE table_schema = (select database()) AND table_name = 'demo' AND column_name = 'code'
@@ -615,12 +739,18 @@ class SqlScriptMigratorTest {
                 .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
                 .contains("CHAR_LENGTH")
                 .contains("DATA_SCALE")
+                .contains("dm_adapter_exists INT;")
+                .contains("SELECT COUNT(*) INTO dm_adapter_exists FROM (")
+                .contains("IF dm_adapter_exists = 0 THEN")
+                .contains("IF dm_adapter_exists_5 > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'alter table demo add code varchar(128) null'")
                 .contains("COLUMN_NAME IN ('code')")
                 .contains("HAVING COUNT(DISTINCT COLUMN_NAME) = 1")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_code ON demo (code)'")
                 .contains("COLUMN_NAME IN ('title')")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title ON demo (title)'")
+                .contains("COLUMN_NAME IN ('amount')")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_amount ON demo (amount)'")
                 .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code varchar(256)'")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY tax decimal(14, 2) null';")
@@ -630,6 +760,8 @@ class SqlScriptMigratorTest {
                 .doesNotContain("INDEX_NAME = 'idx_demo_code'")
                 .doesNotContain("code(32)")
                 .doesNotContain("title(20)")
+                .doesNotContain("IF NOT EXISTS (")
+                .doesNotContain("IF EXISTS (")
                 .doesNotContain("character set utf8mb3")
                 .doesNotContain("collate utf8mb3_general_ci")
                 .doesNotContain("comment '编码'");
@@ -641,8 +773,161 @@ class SqlScriptMigratorTest {
                                 SqlScriptMigrator.MYSQL_SCRIPT_METADATA_TO_DM_RULE,
                                 SqlScriptMigrator.MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVAL_RULE,
                                 SqlScriptMigrator.MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE
                         ));
+    }
+
+    @Test
+    void convertsProcedureViewSchemaAndConstraintMetadataChecksToDamengSyntax() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE rebuild_view_and_constraints()
+                BEGIN
+                    IF EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_NAME = N'v_demo') THEN
+                        DROP VIEW v_demo;
+                    END IF;
+                    IF EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'sample-system') THEN
+                        CREATE VIEW v_demo AS SELECT id FROM demo;
+                    END IF;
+                    IF EXISTS(
+                        SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+                        WHERE CONSTRAINT_SCHEMA = DATABASE()
+                          AND TABLE_NAME = 'child'
+                          AND CONSTRAINT_NAME = 'FK_CHILD'
+                          AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+                    ) THEN
+                        ALTER TABLE child DROP FOREIGN KEY `FK_CHILD`;
+                    END IF;
+                    IF EXISTS(
+                        SELECT NULL FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                        WHERE TABLE_NAME = 'child'
+                          AND REFERENCED_TABLE_NAME = 'parent'
+                    ) THEN
+                        ALTER TABLE child DROP FOREIGN KEY `FK_CHILD_PARENT`;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE rebuild_view_and_constraints() AS")
+                .contains("FROM (SELECT OWNER, OWNER AS TABLE_SCHEMA, VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS)")
+                .contains("FROM (SELECT USERNAME AS SCHEMA_NAME FROM ALL_USERS)")
+                .contains("FROM (SELECT OWNER, OWNER AS CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME")
+                .contains("FROM ALL_CONSTRAINTS)")
+                .contains("FROM (SELECT C.OWNER, C.TABLE_NAME, C.CONSTRAINT_NAME, CC.COLUMN_NAME")
+                .contains("RC.TABLE_NAME AS REFERENCED_TABLE_NAME")
+                .contains("EXECUTE IMMEDIATE 'DROP VIEW v_demo'")
+                .contains("EXECUTE IMMEDIATE 'CREATE VIEW v_demo AS SELECT id FROM demo'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE child DROP CONSTRAINT FK_CHILD'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE child DROP CONSTRAINT FK_CHILD_PARENT'")
+                .doesNotContain("INFORMATION_SCHEMA")
+                .doesNotContain("information_schema")
+                .doesNotContain("DATABASE()")
+                .doesNotContain("database()")
+                .doesNotContain("DROP FOREIGN KEY");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(
+                                SqlScriptMigrator.MYSQL_SCRIPT_METADATA_TO_DM_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE
+                        ));
+    }
+
+    @Test
+    void normalizesProcedureDynamicDdlIdentifierTypeSpacing() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE fix_meter()
+                BEGIN
+                    IF EXISTS (
+                        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE table_schema = database() AND table_name = 'demo' AND column_name = 'unitPrice'
+                    ) THEN
+                        ALTER TABLE `demo` MODIFY `unitPrice`decimal(20,8) NULL;
+                        ALTER TABLE `demo` ADD COLUMN `useProperties`varchar(20) DEFAULT NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` MODIFY `unitPrice` decimal(20,8) NULL'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` ADD COLUMN `useProperties` varchar(20) DEFAULT NULL'")
+                .doesNotContain("`unitPrice`decimal")
+                .doesNotContain("`useProperties`varchar");
+    }
+
+    @Test
+    void mapsMysqlColumnDefaultMetadataToDamengDataDefault() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE clear_default()
+                BEGIN
+                    IF EXISTS (
+                        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE table_schema = database()
+                          AND table_name = 'demo'
+                          AND column_name = 'code'
+                          AND column_default IS NOT NULL
+                          AND numeric_precision = 20
+                    ) THEN
+                        ALTER TABLE demo ALTER COLUMN code SET DEFAULT NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("DATA_DEFAULT IS NOT NULL")
+                .contains("DATA_PRECISION = 20")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ALTER COLUMN code SET DEFAULT NULL'")
+                .doesNotContain("column_default")
+                .doesNotContain("numeric_precision");
     }
 
     @Test
