@@ -212,9 +212,14 @@ final class SqlScriptParser {
 
     private static boolean requiresSlashTerminator(String statement) {
         String sql = stripLeadingCommentsAndWhitespace(statement);
-        return Pattern.compile(
+        if (Pattern.compile(
                         "(?is)^CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|PACKAGE)\\b"
                 )
+                .matcher(sql)
+                .find()) {
+            return true;
+        }
+        return Pattern.compile("(?is)^(?:DECLARE|BEGIN)\\b")
                 .matcher(sql)
                 .find();
     }

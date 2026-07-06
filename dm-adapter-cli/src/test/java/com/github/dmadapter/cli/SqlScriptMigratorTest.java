@@ -71,7 +71,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void validatesOutputOnlySqlFilesFromOutputRootAfterGeneratedScripts() throws Exception {
+    void validatesOutputOnlySqlFilesFromOutputRootInRelativePathOrder() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("20260423.sql"), "select 1 from dual;\n");
@@ -94,7 +94,7 @@ class SqlScriptMigratorTest {
         assertThat(report.validationSuccessCount()).isEqualTo(3);
         assertThat(validator.files)
                 .extracting(file -> Path.of(file.outputDisplay()).getFileName().toString())
-                .containsExactly("20260423.sql", "00000000.sql", "00000000_system.sql");
+                .containsExactly("00000000.sql", "20260423.sql", "00000000_system.sql");
         assertThat(report.files())
                 .filteredOn(file -> file.sourceFile().contains("(output-only)"))
                 .hasSize(2)
@@ -135,6 +135,29 @@ class SqlScriptMigratorTest {
         assertThat(statements.get(1)).isEqualTo("CALL demo_proc()");
         assertThat(statements.get(2)).isEqualTo("DROP PROCEDURE IF EXISTS demo_proc");
         assertThat(statements).doesNotContain("/");
+    }
+
+    @Test
+    void parserKeepsSlashTerminatedAnonymousBlockAsSingleStatement() {
+        String content = """
+                DECLARE
+                    v CLOB;
+                BEGIN
+                    v := TO_CLOB('hello');
+                    CALL demo_proc(v);
+                END;
+                /
+                select 1 from dual;
+                """;
+
+        List<String> statements = SqlScriptParser.statements(content);
+
+        assertThat(statements).hasSize(2);
+        assertThat(statements.get(0))
+                .contains("DECLARE")
+                .contains("CALL demo_proc(v)")
+                .contains("END");
+        assertThat(statements.get(1)).isEqualTo("select 1 from dual");
     }
 
     @Test
@@ -545,6 +568,466 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsExactMysqlCursorNotFoundHandlerLoopToDamengLoop() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE add_hrParameter(IN p_key varchar(9999))
+                BEGIN
+                    DECLARE etrId BIGINT (20);
+                    DECLARE STOP INT DEFAULT 0;
+                    DECLARE ENTERPRISE CURSOR FOR SELECT DISTINCT ENTERPRISE_ID FROM `sample-system`.`ns_system_organization`;
+                    DECLARE CONTINUE HANDLER FOR SQLSTATE '02000'SET STOP=1;
+                    OPEN ENTERPRISE;
+                    FETCH ENTERPRISE INTO etrId;
+                    WHILE STOP<> 1 DO
+                        SELECT count(1) INTO @count FROM ns_hr_parameter_setting WHERE paramKey = p_key;
+                        IF @count < 1 THEN
+                            INSERT INTO ns_hr_parameter_setting(enterpriseId, paramKey) VALUES (etrId, p_key);
+                        END IF;
+                        FETCH ENTERPRISE INTO etrId;
+                    END WHILE;
+                    CLOSE ENTERPRISE;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-hr",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("etrId BIGINT;")
+                .contains("ENTERPRISE CURSOR FOR SELECT DISTINCT ENTERPRISE_ID FROM `sample-system`.`ns_system_organization`;")
+                .contains("""
+                            OPEN ENTERPRISE;
+                            LOOP
+                                FETCH ENTERPRISE INTO etrId;
+                                EXIT WHEN ENTERPRISE%NOTFOUND;
+                        """)
+                .contains("SELECT count(1) INTO dm_count FROM ns_hr_parameter_setting WHERE paramKey = p_key;")
+                .contains("IF dm_count < 1 THEN")
+                .contains("END LOOP;")
+                .contains("CLOSE ENTERPRISE;")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("WHILE STOP")
+                .doesNotContain("STOP INT")
+                .doesNotContain("@count");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP_RULE));
+    }
+
+    @Test
+    void leavesComplexMysqlHandlersForManualReview() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc()
+                BEGIN
+                    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET @failed = 1;
+                    INSERT INTO demo(id) VALUES (1);
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-hr",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("HANDLER"));
+    }
+
+    @Test
+    void removesLineCommentsInsideCallArgumentsOnly() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                -- keep this leading comment
+                call addOrUpdate_menu_leaf('menu-id', -- PPPP_jeCoreMenuId
+                    '菜单名称',
+                    '-- keep string literal',
+                    /* keep block comment */ 'icon-id');
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("-- keep this leading comment")
+                .contains("'-- keep string literal'")
+                .contains("/* keep block comment */ 'icon-id'")
+                .doesNotContain("PPPP_jeCoreMenuId");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_CALL_ARGUMENT_LINE_COMMENT_REMOVAL_RULE));
+    }
+
+    @Test
+    void convertsKnownLongClobCallArgumentsToAnonymousBlock() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String longJson = "{\"payload\":\"" + "A".repeat(3500) + "\",\"resourcecolumnValue\":\"\\\\\\\"1\\\\\\\"\"}";
+        write(sqlRoot.resolve("procedure.sql"), """
+                CALL addAll_ns_report_management_20240314(
+                    '报表', '', '8020', 'demo.ureport.xml', '0', 'menu-id', 5,
+                    '%s',
+                    'short content');
+                """.formatted(longJson));
+        RecordingValidator validator = new RecordingValidator();
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("DECLARE")
+                .contains("dm_adapter_clob_arg_8 CLOB;")
+                .contains("dm_adapter_clob_arg_8 := TO_CLOB('{\"payload\":\"")
+                .contains("dm_adapter_clob_arg_8 := dm_adapter_clob_arg_8 || TO_CLOB('")
+                .contains("\\\"1\\\"")
+                .doesNotContain("\\\\\\\"1\\\\\\\"")
+                .contains("CALL addAll_ns_report_management_20240314('报表', '', '8020', 'demo.ureport.xml', '0', 'menu-id', 5, dm_adapter_clob_arg_8, 'short content');")
+                .contains("END;\n/");
+        assertThat(validator.files)
+                .singleElement()
+                .satisfies(file -> assertThat(file.statements()).hasSize(1));
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE));
+    }
+
+    @Test
+    void doesNotConvertUnknownLongCallStringArgumentsToClobBlock() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String longJson = "[{\"id\":\"" + "A".repeat(3500) + "\"}]";
+        write(sqlRoot.resolve("procedure.sql"), """
+                CALL batch_insert_ns_core_resourcecolumn('%s');
+                """.formatted(longJson));
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(converted)
+                .doesNotContain("DECLARE")
+                .doesNotContain("TO_CLOB(")
+                .contains(longJson);
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE));
+    }
+
+    @Test
+    void convertsNestedMysqlBeginLabelsInsideProcedure() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE report_procedure(IN salaryMonth DATE)
+                BEGIN
+                  report_procedure: BEGIN
+                    IF salaryMonth IS NULL THEN
+                        LEAVE report_procedure;
+                    END IF;
+                  END report_procedure;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-hr",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE report_procedure(salaryMonth IN DATE) AS")
+                .contains("RETURN;")
+                .doesNotContain("report_procedure: BEGIN")
+                .doesNotContain("LEAVE report_procedure")
+                .doesNotContain("END report_procedure");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_LABEL_TO_RETURN_RULE));
+    }
+
+    @Test
+    void convertsClobEmptyStringChecksInsideProcedureToLobLengthChecks() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE update_report(IN payload LONGTEXT, IN title VARCHAR(100))
+                BEGIN
+                    DECLARE localContent TEXT DEFAULT '';
+                    IF payload <> '' THEN
+                        SET localContent = payload;
+                    END IF;
+                    IF localContent != '' THEN
+                        SET localContent = CONCAT(localContent, 'x');
+                    END IF;
+                    IF title <> '' THEN
+                        SET title = CONCAT(title, 'x');
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-hr",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("payload IS NOT NULL AND DBMS_LOB.GETLENGTH(payload) > 0")
+                .contains("localContent IS NOT NULL AND DBMS_LOB.GETLENGTH(localContent) > 0")
+                .contains("IF title <> '' THEN");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE));
+    }
+
+    @Test
+    void convertsMysqlProcedureAddUniqueIndexDdlToCreateUniqueIndex() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE add_unique_index()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT INDEX_NAME FROM information_schema.STATISTICS
+                        WHERE table_schema = database()
+                          AND table_name = 'sample_table'
+                          AND index_name = 'uk_user_date'
+                    ) THEN
+                        ALTER TABLE sample_table ADD UNIQUE INDEX uk_user_date (userId, workDate);
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-hr",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX sample_table_uk_user_date ON sample_table (userId, workDate)'")
+                .doesNotContain("ADD UNIQUE INDEX");
+    }
+
+    @Test
+    void renamesProcedureWhenProcedureNameConflictsWithTableReference() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                DROP PROCEDURE IF EXISTS sample_dictionary_item$$
+                CREATE PROCEDURE sample_dictionary_item()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sample_dictionary_item WHERE code = 'nation'
+                    ) THEN
+                        INSERT INTO sample_dictionary_item(code, name) VALUES ('nation', 'Nation');
+                    END IF;
+                END$$
+                CALL sample_dictionary_item()$$
+                DROP PROCEDURE IF EXISTS sample_dictionary_item$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("DROP PROCEDURE IF EXISTS dm_adapter_proc_sample_dictionary_item;")
+                .contains("CREATE OR REPLACE PROCEDURE dm_adapter_proc_sample_dictionary_item() AS")
+                .contains("CALL dm_adapter_proc_sample_dictionary_item();")
+                .contains("FROM sample_dictionary_item")
+                .contains("INSERT INTO sample_dictionary_item")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE sample_dictionary_item");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE));
+    }
+
+    @Test
+    void narrowsSystemMetadataScalarIdSubqueriesToDeterministicValue() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE ns_salary_query_UPDATE_SQL()
+                BEGIN
+                    INSERT INTO ns_core_form(resource_id, func_id)
+                    SELECT (SELECT id from ns_core_resourcetable where JE_CORE_RESOURCETABLE_ID='r'
+                                AND (enterprise_id, organization_id) in ((t.enterprise_id,t.organization_id))),
+                           (SELECT `id` from `ns_core_funcinfo` where JE_CORE_FUNCINFO_ID='f'
+                                AND (enterprise_id, organization_id) in ((t.enterprise_id,t.organization_id)))
+                    FROM tmp_enterprise_orgid t
+                    WHERE t.id IN (SELECT id from ns_core_funcinfo where enabled = 1);
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("(SELECT min(id) from ns_core_resourcetable where JE_CORE_RESOURCETABLE_ID='r'")
+                .contains("(SELECT min(id) from `ns_core_funcinfo` where JE_CORE_FUNCINFO_ID='f'")
+                .contains("IN (SELECT id from ns_core_funcinfo where enabled = 1)");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SYSTEM_METADATA_SCALAR_ID_TO_MIN_RULE));
+    }
+
+    @Test
+    void convertsMysqlDynamicPrepareSignalAndMysqlNumericDdlTypesInsideProcedure() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc(IN p_payload longtext, OUT p_result mediumtext)
+                BEGIN
+                    DECLARE current_length INT DEFAULT 0;
+                    DECLARE note TEXT;
+                    SET SESSION group_concat_max_len=102400;
+                    SET @sql = NULL;
+                    IF current_length IS NULL THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'missing column';
+                    END IF;
+                    SET @sql = CONCAT('select 1');
+                    PREPARE stmt FROM @sql;
+                    EXECUTE stmt;
+                    DEALLOCATE PREPARE stmt;
+                    ALTER TABLE ns_workclass_set MODIFY `day` double(18, 4) NULL DEFAULT NULL;
+                    SET p_result = p_payload;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-hr",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE demo_proc(p_payload IN CLOB, p_result OUT CLOB) AS")
+                .contains("current_length INT := 0;")
+                .contains("note CLOB;")
+                .contains("NULL;")
+                .contains("dm_sql VARCHAR(4000);")
+                .contains("SET dm_sql = NULL;")
+                .contains("RAISE_APPLICATION_ERROR(-20000, 'missing column');")
+                .contains("EXECUTE IMMEDIATE dm_sql;")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_workclass_set MODIFY `day` DECIMAL(18, 4) NULL DEFAULT NULL';")
+                .doesNotContain("group_concat_max_len")
+                .doesNotContain("PREPARE stmt")
+                .doesNotContain("SIGNAL SQLSTATE")
+                .doesNotContain("@sql");
+    }
+
+    @Test
     void convertsProcedureDdlWithLocalVariablesToDynamicSqlExpression() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -698,6 +1181,7 @@ class SqlScriptMigratorTest {
                     IF EXISTS (
                         SELECT COLUMN_NAME FROM information_schema.COLUMNS
                         WHERE table_schema = (select database()) AND table_name = 'demo' AND column_name = 'code'
+                          AND is_nullable = 'YES'
                     ) THEN
                         alter table demo modify column code varchar(256) character set utf8mb3 collate utf8mb3_general_ci;
                     END IF;
@@ -737,6 +1221,7 @@ class SqlScriptMigratorTest {
                 .contains("ALL_TABLES")
                 .contains("ALL_IND_COLUMNS")
                 .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("NULLABLE = 'YES'")
                 .contains("CHAR_LENGTH")
                 .contains("DATA_SCALE")
                 .contains("dm_adapter_exists INT;")
@@ -755,6 +1240,7 @@ class SqlScriptMigratorTest {
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY tax decimal(14, 2) null';")
                 .doesNotContain("information_schema")
+                .doesNotContain("IS_NULLABLE")
                 .doesNotContain("database()")
                 .doesNotContain("NUMERIC_SCALE")
                 .doesNotContain("INDEX_NAME = 'idx_demo_code'")
