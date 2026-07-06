@@ -655,6 +655,38 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesEarlierDuplicateUpdateSetLiteralAssignments() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE ns_core_resourcecolumn
+                SET RESOURCECOLUMN_FILTERXTYPE = "select",
+                    RESOURCECOLUMN_ISMULTIPLE = 2,
+                    RESOURCECOLUMN_SOURCE = 0,
+                    RESOURCECOLUMN_ISMULTIPLE = 99,
+                    SY_ORDERINDEX = 500
+                WHERE JE_CORE_RESOURCECOLUMN_ID = 'accountFromType'
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                UPDATE ns_core_resourcecolumn
+                SET RESOURCECOLUMN_FILTERXTYPE = 'select', RESOURCECOLUMN_SOURCE = 0, RESOURCECOLUMN_ISMULTIPLE = 99, SY_ORDERINDEX = 500 WHERE JE_CORE_RESOURCECOLUMN_ID = 'accountFromType'
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_DUPLICATE_UPDATE_SET_LITERAL_RULE
+                );
+    }
+
+    @Test
+    void keepsDuplicateUpdateSetAssignmentsWhenValueIsNotSimpleLiteral() {
+        SqlConversionResult result = converter.convert("UPDATE demo SET amount = amount + 1, amount = amount + 1 WHERE id = 1");
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
     void convertsMysqlConvertDecimalToCast() {
         SqlConversionResult result = converter.convert(
                 "SELECT CONVERT(NVL(SUM(charging_area),0), DECIMAL(16,6)) as chargingArea from owner_house_result"
