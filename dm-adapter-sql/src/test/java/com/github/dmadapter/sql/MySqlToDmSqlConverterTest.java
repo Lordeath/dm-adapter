@@ -42,6 +42,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void ignoresMysqlMetadataReferencesInsideCommentsAndStrings() {
+        SqlConversionResult result = converter.convert("""
+                select 1 as ok
+                /* old check: information_schema.columns where table_schema = database() */
+                where note = 'information_schema.tables database()'
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
     void convertsDoubleQuotedStringLiterals() {
         SqlConversionResult result = converter.convert(
                 "select * from user where status = \"ACTIVE\" and remark = \"Bob's \\\"note\\\"\""
@@ -360,6 +372,19 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void keepsSingleQuotedProcedureArgumentsAfterInlineComments() {
+        SqlConversionResult result = converter.convert("""
+                call addOrUpdate_button('buttonId', -- button id
+                '打印二维码', -- button name
+                'actionPrintQrCodeBtn'
+                )
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).contains("'打印二维码'").doesNotContain("AS \"打印二维码\"");
+    }
+
+    @Test
     void removesMysqlSelectModifiers() {
         SqlConversionResult result = converter.convert(
                 "select SQL_BIG_RESULT precinct_id, SUM(charging_area) from owner_house_result group by precinct_id"
@@ -392,6 +417,22 @@ class MySqlToDmSqlConverterTest {
                   /* block COLLATE utf8mb4_unicode_ci */
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE);
+    }
+
+    @Test
+    void removesQuotedMysqlCollateClauses() {
+        SqlConversionResult result = converter.convert("""
+                create table if not exists demo_table (
+                  id bigint,
+                  name varchar(100) COLLATE 'utf8_general_ci'
+                ) COLLATE "utf8mb4_unicode_ci"
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .doesNotContainIgnoringCase("COLLATE")
+                .contains("name varchar(100)");
+        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE);
     }
 
     @Test
@@ -484,6 +525,34 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesCreateTableIndexesAfterLeadingCommentsAndGeneratedColumnStoredKeyword() {
+        SqlConversionResult result = converter.convert("""
+                create table if not exists ns_gate_operation_log (
+                  id bigint NOT NULL AUTO_INCREMENT,
+                  path varchar(100),
+                  houseId bigint,
+                  fullPath varchar(200) GENERATED ALWAYS AS (concat(path, houseId, _utf8mb3'/')) STORED,
+                  PRIMARY KEY (id),
+                  -- supports request lookup
+                  INDEX idx_request_id (request_id),
+                  /* supports interface lookup */
+                  KEY idx_interface_time (interface_name, log_time)
+                )
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("GENERATED ALWAYS AS (concat(path, houseId, _utf8mb3'/'))")
+                .doesNotContain(" STORED")
+                .doesNotContain("INDEX idx_request_id")
+                .doesNotContain("KEY idx_interface_time");
+        assertThat(result.appliedRules()).contains(
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_GENERATED_COLUMN_STORED_REMOVAL_RULE
+        );
+    }
+
+    @Test
     void capsMysqlDecimalPrecisionAndRemovesCommentsInCreateTable() {
         SqlConversionResult result = converter.convert("""
                 create table tmp_should_amortize_detail (
@@ -541,6 +610,26 @@ class MySqlToDmSqlConverterTest {
                 .doesNotContainIgnoringCase("CHARACTER SET")
                 .contains(") ;");
         assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE);
+    }
+
+    @Test
+    void removesQuotedMysqlCharacterSetClausesForDameng() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE IF NOT EXISTS ns_quality_demo (
+                  id bigint NOT NULL AUTO_INCREMENT,
+                  name varchar(20) CHARACTER SET 'utf8mb4' DEFAULT NULL,
+                  PRIMARY KEY (id)
+                ) CHARACTER SET 'utf8mb4';
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("name varchar(80) DEFAULT NULL")
+                .doesNotContainIgnoringCase("CHARACTER SET");
+        assertThat(result.appliedRules()).contains(
+                MySqlToDmSqlConverter.MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE,
+                MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE
+        );
     }
 
     @Test
