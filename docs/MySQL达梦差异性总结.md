@@ -30,7 +30,9 @@
 | D24 | AES\_DECRYPT                                               | 可以用             | <br />                                                        | 不支持                                             |
 | d25 | force index                                                |                 | SELECT /\*+ USE\_INDEX(c idx\_actualAccountBook) \*/          | 需要修改                                            |
 | d26 | DATE_FORMAT('20260704','%Y%m%d') + interval 1 day          | 不准用             | <br />                                                        | <br />                                          |
+| D27 | 多表更新：`UPDATE a JOIN b ... SET a.xxx = ..., b.xxx = ...` | 不准用             | 拆成按同一关联条件分别更新 `a`、`b` 的多条 `UPDATE`，或改业务代码按事务分步更新            | 达梦不支持一次 `UPDATE JOIN` 同时更新多张表字段                       |
 
 ## 建议
 
-- 不应再默认转换：`CONCAT`、`LIMIT`、反引号、`FIND_IN_SET`、`DATE_FORMAT`、`STR_TO_DATE`、`UPDATE JOIN`、`DELETE JOIN`，now(),IFNULL,if因为本次环境验证均可执行。
+- 不应再默认转换：`CONCAT`、`LIMIT`、反引号、`FIND_IN_SET`、`DATE_FORMAT`、`STR_TO_DATE`、单目标 `UPDATE JOIN`、`DELETE JOIN`，now(),IFNULL,if因为本次环境验证均可执行。
+- `UPDATE JOIN` 可保留仅限更新单张目标表的场景；如果 `SET` 中同时更新 `a.xxx`、`b.xxx` 等多张表字段，需要拆成多条更新语句，并由业务代码保证事务和行数语义一致。
