@@ -555,6 +555,28 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void movesInlinePrimaryKeyFromIdentityColumnToTableConstraint() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE IF NOT EXISTS ns_core_role_del (
+                    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    enterpriseId BIGINT
+                )
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                CREATE TABLE IF NOT EXISTS ns_core_role_del (
+                    id BIGINT NOT NULL IDENTITY(1,1),
+                    enterpriseId BIGINT
+                , PRIMARY KEY (id))
+                """);
+        assertThat(result.appliedRules()).contains(
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
+                MySqlToDmSqlConverter.MYSQL_IDENTITY_INLINE_PRIMARY_KEY_RULE
+        );
+    }
+
+    @Test
     void removesCreateTableIndexesAfterLeadingCommentsAndGeneratedColumnStoredKeyword() {
         SqlConversionResult result = converter.convert("""
                 create table if not exists ns_gate_operation_log (
@@ -756,6 +778,25 @@ class MySqlToDmSqlConverterTest {
                 FROM charge_reminder_list "list"
                 left join charge_reminder_list_charge_relationship ship on ship.remind_list_id = "list".id
                 WHERE "list".house_id in (1)
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE);
+    }
+
+    @Test
+    void quotesDamengRefTableAlias() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE ns_core_module target
+                JOIN ns_core_module ref ON ref.enterprise_id = target.enterprise_id
+                SET target.module_group = ref.module_group
+                WHERE target.module_id = #{moduleId}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                UPDATE ns_core_module target
+                JOIN ns_core_module "ref" ON "ref".enterprise_id = target.enterprise_id
+                SET target.module_group = "ref".module_group
+                WHERE target.module_id = #{moduleId}
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE);
     }

@@ -847,15 +847,18 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .contains("payload IS NOT NULL AND DBMS_LOB.GETLENGTH(payload) > 0")
                 .contains("localContent IS NOT NULL AND DBMS_LOB.GETLENGTH(localContent) > 0")
-                .contains("IF title <> '' THEN")
+                .contains("dm_title VARCHAR(100);")
+                .contains("dm_title := title;")
+                .contains("IF dm_title <> '' THEN")
                 .contains("localContent := payload;")
                 .contains("localContent := CONCAT(localContent, 'x');")
-                .contains("title := CONCAT(title, 'x');");
+                .contains("dm_title := CONCAT(dm_title, 'x');");
         assertThat(report.files())
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(
                                 SqlScriptMigrator.DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_ASSIGNED_IN_PARAM_TO_LOCAL_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE
                         ));
     }
@@ -1572,12 +1575,136 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("insert-ignore.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
+                .contains("CREATE TABLE IF NOT EXISTS tmp_demo")
+                .contains("DELETE FROM tmp_demo;")
                 .contains("MERGE INTO tmp_demo t")
                 .contains("SELECT s.id AS id, s.name AS name")
                 .contains("ON (t.id = s.id)")
                 .contains("WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)")
                 .doesNotContain("INSERT IGNORE")
+                .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE tmp_demo")
                 .doesNotContain("KEY idx_tmp_demo_name");
+    }
+
+    @Test
+    void convertsDynamicTemporaryInsertIgnoreSqlStringToMerge() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("dynamic-insert-ignore.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_dynamic_insert_ignore()
+                BEGIN
+                    SET @sql_text = '';
+                    CREATE TEMPORARY TABLE tmp_demo_dynamic (
+                        id BIGINT NOT NULL PRIMARY KEY,
+                        name VARCHAR(100)
+                    );
+                    SET @sql_text = '
+                        INSERT IGNORE INTO tmp_demo_dynamic (id, name)
+                        SELECT s.id, s.name
+                        FROM source_table s';
+                    PREPARE stmt FROM @sql_text;
+                    EXECUTE stmt;
+                    DEALLOCATE PREPARE stmt;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("dynamic-insert-ignore.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("EXECUTE IMMEDIATE dm_sql_text;")
+                .contains("MERGE INTO tmp_demo_dynamic t")
+                .contains("ON (t.id = s.id)")
+                .doesNotContain("INSERT IGNORE")
+                .doesNotContain("PREPARE stmt");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_DYNAMIC_INSERT_IGNORE_TO_MERGE_RULE));
+    }
+
+    @Test
+    void convertsProcedureInsertIgnoreIntoBackupTableCreatedLikeSourceWhenIdIsAvailable() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("backup-insert-ignore.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_backup_insert_ignore()
+                BEGIN
+                    CREATE TABLE IF NOT EXISTS ns_demo_bak_20260521 LIKE ns_demo;
+                    INSERT IGNORE INTO ns_demo_bak_20260521 (ID, NAME)
+                    SELECT d.ID, d.NAME
+                    FROM ns_demo d;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("backup-insert-ignore.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE TABLE IF NOT EXISTS ns_demo_bak_20260521 LIKE ns_demo")
+                .contains("MERGE INTO ns_demo_bak_20260521 t")
+                .contains("ON (t.ID = s.ID)")
+                .doesNotContain("INSERT IGNORE");
+    }
+
+    @Test
+    void marksMalformedLengthComparisonForManualReview() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("length.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE bad_length_guard()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT CHARACTER_MAXIMUM_LENGTH
+                        FROM information_schema.columns
+                        WHERE table_schema = database()
+                          AND table_name = 'demo'
+                          AND column_name = 'name'
+                          AND CHARACTER_MAXIMUM_LENGTH>1=200
+                    ) THEN
+                        ALTER TABLE demo MODIFY COLUMN name varchar(200) NOT NULL DEFAULT '';
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("链式比较"));
     }
 
     @Test
