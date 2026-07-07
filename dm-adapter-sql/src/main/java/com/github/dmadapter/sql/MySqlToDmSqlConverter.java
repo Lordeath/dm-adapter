@@ -78,6 +78,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE =
             "MYSQL_UTF8_CHARACTER_TYPE_LENGTH_TO_DM_BYTES";
     public static final String MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE = "MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY";
+    public static final String MYSQL_IDENTITY_INLINE_PRIMARY_KEY_RULE =
+            "MYSQL_IDENTITY_INLINE_PRIMARY_KEY_TO_TABLE_CONSTRAINT";
     public static final String MYSQL_ALTER_AUTO_INCREMENT_RESET_RULE = "MYSQL_ALTER_AUTO_INCREMENT_RESET_TO_DM";
     public static final String MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE = "MYSQL_CREATE_TABLE_OPTIONS_REMOVED";
     public static final String MYSQL_USING_BTREE_REMOVAL_RULE = "MYSQL_USING_BTREE_REMOVED";
@@ -219,6 +221,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "OUTER",
             "PERCENT",
             "PRIOR",
+            "REF",
             "REVERSE",
             "RIGHT",
             "ROW",
@@ -409,6 +412,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (autoIncrementConversion.changed()) {
             converted = autoIncrementConversion.convertedSql();
             rules.add(MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE);
+        }
+
+        GenericConversion inlineIdentityPrimaryKeyConversion = normalizeIdentityInlinePrimaryKeys(converted);
+        if (inlineIdentityPrimaryKeyConversion.changed()) {
+            converted = inlineIdentityPrimaryKeyConversion.convertedSql();
+            rules.add(MYSQL_IDENTITY_INLINE_PRIMARY_KEY_RULE);
         }
 
         GenericConversion decimalPrecisionConversion = capMysqlDecimalPrecision(converted);
@@ -802,7 +811,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (containsKeywordOutsideIgnoredText(sql, "REGEXP")) {
             return "REGEXP requires manual confirmation because Dameng regular-expression syntax may differ from MySQL.";
         }
-        if (INSERT_IGNORE_PATTERN.matcher(sql).find()) {
+        if (containsPatternOutsideIgnoredText(sql, INSERT_IGNORE_PATTERN)) {
             return "INSERT IGNORE requires configured keyColumns for safe Dameng MERGE rewrite.";
         }
         if (containsMysqlUserVariable(sql)) {
@@ -1646,6 +1655,80 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion normalizeIdentityInlinePrimaryKeys(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<TopLevelArgument> definitions = splitTopLevelArguments(sql.substring(openParenIndex + 1, closeParenIndex));
+        List<String> convertedDefinitions = new ArrayList<>();
+        List<String> primaryKeyColumns = new ArrayList<>();
+        boolean changed = false;
+        for (TopLevelArgument definition : definitions) {
+            IdentityPrimaryKeyColumn column = identityInlinePrimaryKeyColumn(definition.text());
+            if (column == null) {
+                convertedDefinitions.add(definition.text());
+                continue;
+            }
+            convertedDefinitions.add(column.definitionWithoutInlinePrimaryKey());
+            primaryKeyColumns.add(column.columnName());
+            changed = true;
+        }
+        if (!changed || hasTablePrimaryKey(convertedDefinitions)) {
+            return GenericConversion.unchanged(sql);
+        }
+        convertedDefinitions.add(" PRIMARY KEY (" + String.join(", ", primaryKeyColumns) + ")");
+        return new GenericConversion(
+                sql.substring(0, openParenIndex + 1)
+                        + String.join(",", convertedDefinitions)
+                        + sql.substring(closeParenIndex),
+                true
+        );
+    }
+
+    private IdentityPrimaryKeyColumn identityInlinePrimaryKeyColumn(String definition) {
+        int cursor = skipWhitespace(definition, 0);
+        IdentifierToken column = readIdentifierToken(definition, cursor);
+        if (column == null) {
+            return null;
+        }
+        String attributes = definition.substring(column.endIndex());
+        if (!Pattern.compile("(?is)\\bIDENTITY\\s*\\(").matcher(attributes).find()
+                || !Pattern.compile("(?is)\\bPRIMARY\\s+KEY\\b").matcher(attributes).find()) {
+            return null;
+        }
+        String convertedAttributes = Pattern.compile("(?is)\\s+PRIMARY\\s+KEY\\b")
+                .matcher(attributes)
+                .replaceFirst("");
+        return new IdentityPrimaryKeyColumn(
+                column.text(),
+                definition.substring(0, column.endIndex()) + convertedAttributes
+        );
+    }
+
+    private boolean hasTablePrimaryKey(List<String> definitions) {
+        for (String definition : definitions) {
+            int cursor = skipWhitespace(definition, 0);
+            if (startsKeyword(definition, cursor, "PRIMARY")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private GenericConversion convertMysqlAlterTableAutoIncrementReset(String sql) {
@@ -7838,6 +7921,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record TopLevelArgument(String text, int startIndex, int endIndex) {
+    }
+
+    private record IdentityPrimaryKeyColumn(String columnName, String definitionWithoutInlinePrimaryKey) {
     }
 
     private record UserVariableInitialization(String name) {
