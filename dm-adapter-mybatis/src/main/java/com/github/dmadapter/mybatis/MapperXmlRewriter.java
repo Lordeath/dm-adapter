@@ -55,6 +55,8 @@ public class MapperXmlRewriter {
             "MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED";
     public static final String MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE =
             "MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
+    public static final String MYBATIS_DYNAMIC_HAVING_DYNAMIC_AGGREGATE_ALIAS_TO_EXPRESSION_RULE =
+            "MYBATIS_DYNAMIC_HAVING_DYNAMIC_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE =
             "MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION";
     public static final String MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION_RULE =
@@ -1983,20 +1985,38 @@ public class MapperXmlRewriter {
         if (scope.havingIndex() < 0 || scope.groupIndex() < 0) {
             return ScopeHavingConversion.unchanged(body);
         }
-        Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(
-                body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
-        );
-        Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(
-                body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
-        );
+        String selectList = body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex());
+        Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(selectList);
+        Map<String, DynamicAggregateAlias> dynamicAggregateAliases = dynamicAggregateSelectAliases(selectList);
+        Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(selectList);
         int havingStart = scope.havingIndex() + "HAVING".length();
         String havingContent = body.substring(havingStart, scope.havingEnd());
+        int groupStart = scope.groupIndex() + "GROUP BY".length();
+        String groupByContent = body.substring(groupStart, scope.havingIndex());
+        DynamicHavingAliasRewrite dynamicAliasRewrite = rewriteDynamicAggregateHavingAlias(
+                body,
+                scope,
+                havingContent,
+                aggregateAliases,
+                dynamicAggregateAliases
+        );
+        if (dynamicAliasRewrite.changed()) {
+            return new ScopeHavingConversion(
+                    body.substring(0, scope.havingIndex())
+                            + dynamicAliasRewrite.text()
+                            + body.substring(scope.havingEnd()),
+                    dynamicAliasRewrite.appliedRules(),
+                    true
+            );
+        }
         TextRewrite aggregateAliasRewrite = replaceAggregateAliases(havingContent, aggregateAliases);
         HavingRewrite havingRewrite = rewriteHavingContent(
                 havingContent,
                 aggregateAliasRewrite.text(),
                 aggregateAliases,
-                selectAliases
+                dynamicAggregateAliases.keySet(),
+                selectAliases,
+                simpleGroupByColumnReferences(groupByContent)
         );
         TextRewrite selectAliasRewrite = replaceSelectAliases(havingRewrite.remainingHaving(), selectAliases);
         boolean aggregateAliasChanged = aggregateAliasRewrite.changed();
@@ -2004,7 +2024,6 @@ public class MapperXmlRewriter {
         Map<String, SelectAlias> havingSelectAliases = selectAliasChanged
                 ? referencedAliases(havingRewrite.remainingHaving(), selectAliases, true)
                 : Map.of();
-        int groupStart = scope.groupIndex() + "GROUP BY".length();
         TextRewrite groupByAliasRewrite = selectAliasChanged
                 ? replaceSelectAliases(body.substring(groupStart, scope.havingIndex()), havingSelectAliases)
                 : new TextRewrite(body.substring(groupStart, scope.havingIndex()), false);
@@ -2090,7 +2109,9 @@ public class MapperXmlRewriter {
             String originalHavingContent,
             String rewrittenHavingContent,
             Map<String, SelectAlias> aggregateAliases,
-            Map<String, SelectAlias> selectAliases
+            Set<String> dynamicAggregateAliases,
+            Map<String, SelectAlias> selectAliases,
+            Set<String> simpleGroupByColumns
     ) {
         List<ConditionPart> rewrittenParts = splitTopLevelAndConditions(rewrittenHavingContent);
         if (rewrittenParts.isEmpty()) {
@@ -2103,7 +2124,13 @@ public class MapperXmlRewriter {
         for (int i = 0; i < rewrittenParts.size(); i++) {
             String rewrittenCondition = rewrittenParts.get(i).text();
             String conditionForMoveCheck = alignedParts ? originalParts.get(i).text() : rewrittenCondition;
-            if (isMovableSimpleHavingCondition(conditionForMoveCheck, aggregateAliases, selectAliases)) {
+            if (isMovableSimpleHavingCondition(
+                    conditionForMoveCheck,
+                    aggregateAliases,
+                    dynamicAggregateAliases,
+                    selectAliases,
+                    simpleGroupByColumns
+            )) {
                 moved.add(rewrittenCondition);
             } else {
                 kept.add(rewrittenCondition);
@@ -2172,7 +2199,9 @@ public class MapperXmlRewriter {
     private boolean isMovableSimpleHavingCondition(
             String condition,
             Map<String, SelectAlias> aggregateAliases,
-            Map<String, SelectAlias> selectAliases
+            Set<String> dynamicAggregateAliases,
+            Map<String, SelectAlias> selectAliases,
+            Set<String> simpleGroupByColumns
     ) {
         String normalized = stripXmlMarkup(condition);
         if (normalized.isBlank()) {
@@ -2180,12 +2209,18 @@ public class MapperXmlRewriter {
         }
         if (normalized.contains("${")
                 || containsAggregateFunction(normalized)
+                || containsSqlFunctionCall(normalized)
                 || containsKeyword(normalized, "OR")
                 || containsKeyword(normalized, "SELECT")
                 || containsKeyword(normalized, "EXISTS")) {
             return false;
         }
         for (String alias : aggregateAliases.keySet()) {
+            if (containsKeyword(normalized, alias)) {
+                return false;
+            }
+        }
+        for (String alias : dynamicAggregateAliases) {
             if (containsKeyword(normalized, alias)) {
                 return false;
             }
@@ -2198,7 +2233,131 @@ public class MapperXmlRewriter {
         if (containsExpandedSelectAliasExpression(normalized, selectAliases)) {
             return false;
         }
-        return containsComparisonOperator(normalized);
+        if (!containsComparisonOperator(normalized)) {
+            return false;
+        }
+        Set<String> conditionColumns = conditionColumnReferences(normalized);
+        return !conditionColumns.isEmpty() && simpleGroupByColumns.containsAll(conditionColumns);
+    }
+
+    private DynamicHavingAliasRewrite rewriteDynamicAggregateHavingAlias(
+            String body,
+            SelectScope scope,
+            String havingContent,
+            Map<String, SelectAlias> aggregateAliases,
+            Map<String, DynamicAggregateAlias> dynamicAggregateAliases
+    ) {
+        if (dynamicAggregateAliases.isEmpty()) {
+            return DynamicHavingAliasRewrite.unchanged();
+        }
+        Map<String, DynamicAggregateAlias> referenced = referencedDynamicAggregateAliases(
+                havingContent,
+                dynamicAggregateAliases
+        );
+        if (referenced.size() != 1) {
+            return DynamicHavingAliasRewrite.unchanged();
+        }
+        DynamicAggregateAlias dynamicAlias = referenced.values().iterator().next();
+        String staticRewrittenHaving = replaceAggregateAliases(havingContent, aggregateAliases).text();
+        String baseIndent = indentationOfLastLine(body.substring(0, scope.havingIndex()));
+        String branchIndent = baseIndent + "    ";
+        String conditionIndent = branchIndent + "    ";
+        String trailingWhitespace = trailingWhitespace(havingContent);
+        StringBuilder converted = new StringBuilder();
+        converted.append("<choose>");
+        for (DynamicAggregateAliasBranch branch : dynamicAlias.branches()) {
+            TextRewrite branchRewrite = replaceAliases(
+                    staticRewrittenHaving,
+                    Map.of(identifierKey(dynamicAlias.alias()), new SelectAlias(branch.expression(), dynamicAlias.alias())),
+                    false
+            );
+            if (!branchRewrite.changed()) {
+                return DynamicHavingAliasRewrite.unchanged();
+            }
+            converted.append("\n")
+                    .append(branchIndent)
+                    .append(branch.openingTag().strip());
+            converted.append("\n")
+                    .append(conditionIndent)
+                    .append(formatHavingCondition(branchRewrite.text(), conditionIndent));
+            converted.append("\n")
+                    .append(branchIndent)
+                    .append(branch.closingTag().strip());
+        }
+        converted.append("\n").append(baseIndent).append("</choose>").append(trailingWhitespace);
+        List<String> rules = new ArrayList<>();
+        if (!staticRewrittenHaving.equals(havingContent)) {
+            rules.add(MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        }
+        rules.add(MYBATIS_DYNAMIC_HAVING_DYNAMIC_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        return new DynamicHavingAliasRewrite(converted.toString(), rules, true);
+    }
+
+    private String trailingWhitespace(String value) {
+        int index = value.length();
+        while (index > 0 && Character.isWhitespace(value.charAt(index - 1))) {
+            index--;
+        }
+        return value.substring(index);
+    }
+
+    private String formatHavingCondition(String condition, String indent) {
+        String stripped = stripTrailingSqlTerminator(condition.strip());
+        if (stripped.isBlank()) {
+            return "HAVING";
+        }
+        String[] lines = stripped.split("\\R", -1);
+        StringBuilder formatted = new StringBuilder("HAVING ").append(lines[0].strip());
+        for (int i = 1; i < lines.length; i++) {
+            if (lines[i].isBlank()) {
+                continue;
+            }
+            formatted.append("\n")
+                    .append(indent)
+                    .append(lines[i].strip());
+        }
+        return formatted.toString();
+    }
+
+    private Map<String, DynamicAggregateAlias> referencedDynamicAggregateAliases(
+            String value,
+            Map<String, DynamicAggregateAlias> aliases
+    ) {
+        if (aliases.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, DynamicAggregateAlias> referenced = new LinkedHashMap<>();
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? value.length() : end + "-->".length();
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int end = value.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? value.length() : end + "]]>".length();
+            } else if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (isIdentifierStart(value.charAt(index))) {
+                IdentifierToken token = readIdentifierToken(value, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                DynamicAggregateAlias alias = aliases.get(identifierKey(token.text()));
+                if (alias != null) {
+                    referenced.putIfAbsent(identifierKey(token.text()), alias);
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return referenced;
     }
 
     private boolean containsExpandedSelectAliasExpression(String condition, Map<String, SelectAlias> selectAliases) {
@@ -2279,13 +2438,19 @@ public class MapperXmlRewriter {
         if (conditions.isEmpty()) {
             return "";
         }
+        List<String> normalizedConditions = conditions.stream()
+                .map(condition -> removeLeadingBooleanConnector(condition).strip())
+                .filter(condition -> !condition.isBlank())
+                .toList();
+        if (normalizedConditions.isEmpty()) {
+            return "";
+        }
+        if (firstHavingConditionStartsOnSameLine(originalHavingContent)) {
+            return " " + String.join(" AND ", normalizedConditions);
+        }
         String indent = indentationOfFirstContentLine(originalHavingContent);
         StringBuilder joined = new StringBuilder();
-        for (int i = 0; i < conditions.size(); i++) {
-            String condition = removeLeadingBooleanConnector(conditions.get(i)).strip();
-            if (condition.isBlank()) {
-                continue;
-            }
+        for (String condition : normalizedConditions) {
             if (joined.isEmpty()) {
                 joined.append("\n").append(indent).append(condition);
             } else {
@@ -2293,6 +2458,21 @@ public class MapperXmlRewriter {
             }
         }
         return joined.toString();
+    }
+
+    private boolean firstHavingConditionStartsOnSameLine(String value) {
+        int index = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\r' || current == '\n') {
+                return false;
+            }
+            if (!Character.isWhitespace(current)) {
+                return true;
+            }
+            index++;
+        }
+        return false;
     }
 
     private String joinMovedConditions(List<String> conditions, boolean prefixAnd) {
@@ -2630,6 +2810,118 @@ public class MapperXmlRewriter {
         return aliases;
     }
 
+    private Map<String, DynamicAggregateAlias> dynamicAggregateSelectAliases(String selectList) {
+        Map<String, DynamicAggregateAlias> aliases = new LinkedHashMap<>();
+        for (String item : splitTopLevelComma(selectList)) {
+            DynamicAggregateAlias alias = dynamicAggregateSelectAlias(item);
+            if (alias != null) {
+                aliases.putIfAbsent(identifierKey(alias.alias()), alias);
+            }
+        }
+        return aliases;
+    }
+
+    private DynamicAggregateAlias dynamicAggregateSelectAlias(String selectItem) {
+        String value = selectItem == null ? "" : selectItem;
+        int chooseStart = firstNonWhitespaceIndex(value);
+        if (chooseStart < 0 || chooseStart >= value.length() || value.charAt(chooseStart) != '<') {
+            return null;
+        }
+        XmlTag chooseTag = readXmlTag(value, chooseStart);
+        if (chooseTag == null || chooseTag.closing() || chooseTag.selfClosing()
+                || !"choose".equalsIgnoreCase(chooseTag.name())) {
+            return null;
+        }
+        int chooseClosingStart = findClosingTag(value, chooseTag.endIndex(), "choose", value.length());
+        if (chooseClosingStart < 0 || !value.substring(0, chooseStart).isBlank()
+                || !value.substring(closingTagEnd(value, chooseClosingStart)).isBlank()) {
+            return null;
+        }
+        List<DynamicAggregateAliasBranch> branches = new ArrayList<>();
+        String alias = "";
+        int index = chooseTag.endIndex();
+        while (index < chooseClosingStart) {
+            int nextTagStart = nextXmlTagStart(value, index, chooseClosingStart);
+            if (nextTagStart < 0) {
+                if (!value.substring(index, chooseClosingStart).isBlank()) {
+                    return null;
+                }
+                break;
+            }
+            if (!value.substring(index, nextTagStart).isBlank()) {
+                return null;
+            }
+            XmlTag branchTag = readXmlTag(value, nextTagStart);
+            if (branchTag == null || branchTag.closing() || branchTag.selfClosing()
+                    || (!"when".equalsIgnoreCase(branchTag.name())
+                    && !"otherwise".equalsIgnoreCase(branchTag.name()))) {
+                return null;
+            }
+            int branchClosingStart = findClosingTag(value, branchTag.endIndex(), branchTag.name(), chooseClosingStart);
+            if (branchClosingStart < 0) {
+                return null;
+            }
+            String branchBody = value.substring(branchTag.endIndex(), branchClosingStart);
+            SelectAlias branchAlias = selectAliasAllowingSqlFragments(branchBody);
+            if (branchAlias == null || !containsAggregateFunction(branchAlias.expression())) {
+                return null;
+            }
+            if (alias.isBlank()) {
+                alias = branchAlias.alias();
+            } else if (!identifierKey(alias).equals(identifierKey(branchAlias.alias()))) {
+                return null;
+            }
+            branches.add(new DynamicAggregateAliasBranch(
+                    value.substring(nextTagStart, branchTag.endIndex()),
+                    branchAlias.expression(),
+                    value.substring(branchClosingStart, closingTagEnd(value, branchClosingStart))
+            ));
+            index = closingTagEnd(value, branchClosingStart);
+        }
+        if (alias.isBlank() || branches.isEmpty()) {
+            return null;
+        }
+        return new DynamicAggregateAlias(alias, branches);
+    }
+
+    private int firstNonWhitespaceIndex(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (!Character.isWhitespace(value.charAt(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private int nextXmlTagStart(String value, int start, int end) {
+        int index = start;
+        while (index < end) {
+            int tagStart = value.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= end) {
+                return -1;
+            }
+            if (value.startsWith("<!--", tagStart)) {
+                int commentEnd = value.indexOf("-->", tagStart + "<!--".length());
+                if (commentEnd < 0 || commentEnd >= end) {
+                    return -1;
+                }
+                if (!value.substring(start, tagStart).isBlank()) {
+                    return tagStart;
+                }
+                start = commentEnd + "-->".length();
+                index = start;
+            } else {
+                return tagStart;
+            }
+        }
+        return -1;
+    }
+
+    private int closingTagEnd(String value, int closingStart) {
+        int tagEnd = findXmlTagEnd(value, closingStart);
+        return tagEnd < 0 ? closingStart : tagEnd + 1;
+    }
+
     private Map<String, SelectAlias> nonAggregateSelectAliases(String selectList) {
         Map<String, SelectAlias> aliases = new LinkedHashMap<>();
         for (String item : splitTopLevelComma(selectList)) {
@@ -2661,6 +2953,50 @@ public class MapperXmlRewriter {
         return new SelectAlias(expression, alias);
     }
 
+    private SelectAlias selectAliasAllowingSqlFragments(String selectItem) {
+        String trimmed = selectItem == null ? "" : selectItem.trim();
+        if (trimmed.isBlank() || containsUnsupportedAliasXmlTag(trimmed)) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?is)^(.+?)\\s+(?:AS\\s+)?(" + DM_IDENTIFIER + ")\\s*$")
+                .matcher(trimmed);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String expression = matcher.group(1).trim();
+        String alias = matcher.group(2).trim();
+        if (expression.isBlank()
+                || alias.isBlank()
+                || isSqlClauseKeyword(alias)) {
+            return null;
+        }
+        return new SelectAlias(expression, alias);
+    }
+
+    private boolean containsUnsupportedAliasXmlTag(String value) {
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? value.length() : end + "-->".length();
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int end = value.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? value.length() : end + "]]>".length();
+            } else if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                if (tag == null || !"include".equalsIgnoreCase(tag.name()) || !tag.selfClosing()) {
+                    return true;
+                }
+                index = tag.endIndex();
+            } else if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
     private boolean containsAggregateFunction(String value) {
         int index = 0;
         while (index < value.length()) {
@@ -2686,6 +3022,142 @@ public class MapperXmlRewriter {
             }
         }
         return false;
+    }
+
+    private boolean containsSqlFunctionCall(String value) {
+        int index = 0;
+        while (index < value.length()) {
+            if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (isIdentifierStart(value.charAt(index))) {
+                IdentifierToken token = readIdentifierToken(value, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                int afterToken = skipWhitespace(value, token.endIndex());
+                if (afterToken < value.length() && value.charAt(afterToken) == '(') {
+                    return true;
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private Set<String> simpleGroupByColumnReferences(String groupByContent) {
+        Set<String> references = new LinkedHashSet<>();
+        for (String item : splitTopLevelComma(groupByContent)) {
+            String reference = simpleColumnReference(stripXmlMarkup(item));
+            if (!reference.isBlank()) {
+                references.add(reference);
+            }
+        }
+        return references;
+    }
+
+    private String simpleColumnReference(String value) {
+        String normalized = stripTrailingSqlTerminator(value == null ? "" : value.strip());
+        if (normalized.isBlank()) {
+            return "";
+        }
+        int index = skipWhitespace(normalized, 0);
+        IdentifierToken first = readIdentifierToken(normalized, index);
+        if (first == null) {
+            return "";
+        }
+        List<String> parts = new ArrayList<>();
+        parts.add(identifierKey(first.text()));
+        index = skipWhitespace(normalized, first.endIndex());
+        while (index < normalized.length() && normalized.charAt(index) == '.') {
+            index = skipWhitespace(normalized, index + 1);
+            IdentifierToken part = readIdentifierToken(normalized, index);
+            if (part == null) {
+                return "";
+            }
+            parts.add(identifierKey(part.text()));
+            index = skipWhitespace(normalized, part.endIndex());
+        }
+        if (skipWhitespace(normalized, index) != normalized.length()) {
+            return "";
+        }
+        return String.join(".", parts);
+    }
+
+    private Set<String> conditionColumnReferences(String condition) {
+        Set<String> references = new LinkedHashSet<>();
+        int index = 0;
+        while (index < condition.length()) {
+            if (condition.startsWith("<!--", index)) {
+                int end = condition.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? condition.length() : end + "-->".length();
+            } else if (condition.startsWith("<![CDATA[", index)) {
+                int end = condition.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? condition.length() : end + "]]>".length();
+            } else if (condition.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(condition, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (condition.charAt(index) == '\'' || condition.charAt(index) == '"') {
+                index = skipQuoted(condition, index, condition.charAt(index));
+            } else if (startsMyBatisPlaceholder(condition, index)) {
+                index = skipMyBatisPlaceholder(condition, index);
+            } else if (isIdentifierStart(condition.charAt(index))) {
+                IdentifierToken token = readIdentifierToken(condition, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                if (isHavingReferenceKeyword(token.text())) {
+                    index = token.endIndex();
+                    continue;
+                }
+                int afterToken = skipWhitespace(condition, token.endIndex());
+                if (afterToken < condition.length() && condition.charAt(afterToken) == '(') {
+                    index = token.endIndex();
+                    continue;
+                }
+                List<String> parts = new ArrayList<>();
+                parts.add(identifierKey(token.text()));
+                index = afterToken;
+                while (index < condition.length() && condition.charAt(index) == '.') {
+                    index = skipWhitespace(condition, index + 1);
+                    IdentifierToken part = readIdentifierToken(condition, index);
+                    if (part == null) {
+                        break;
+                    }
+                    parts.add(identifierKey(part.text()));
+                    index = skipWhitespace(condition, part.endIndex());
+                }
+                references.add(String.join(".", parts));
+            } else {
+                index++;
+            }
+        }
+        return references;
+    }
+
+    private boolean isHavingReferenceKeyword(String value) {
+        return Set.of(
+                "AND",
+                "OR",
+                "NOT",
+                "NULL",
+                "IS",
+                "IN",
+                "LIKE",
+                "BETWEEN",
+                "TRUE",
+                "FALSE",
+                "CASE",
+                "WHEN",
+                "THEN",
+                "ELSE",
+                "END"
+        ).contains(unquoteIdentifier(value).toUpperCase());
     }
 
     private List<SelectScope> selectScopes(String view) {
@@ -6856,6 +7328,16 @@ public class MapperXmlRewriter {
     private record HavingRewrite(String remainingHaving, String movedConditions, boolean changed) {
     }
 
+    private record DynamicHavingAliasRewrite(String text, List<String> appliedRules, boolean changed) {
+        DynamicHavingAliasRewrite {
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+        }
+
+        private static DynamicHavingAliasRewrite unchanged() {
+            return new DynamicHavingAliasRewrite("", List.of(), false);
+        }
+    }
+
     private record ConditionPart(String text) {
     }
 
@@ -6878,6 +7360,15 @@ public class MapperXmlRewriter {
     }
 
     private record SelectAlias(String expression, String alias) {
+    }
+
+    private record DynamicAggregateAlias(String alias, List<DynamicAggregateAliasBranch> branches) {
+        DynamicAggregateAlias {
+            branches = List.copyOf(branches == null ? List.of() : branches);
+        }
+    }
+
+    private record DynamicAggregateAliasBranch(String openingTag, String expression, String closingTag) {
     }
 
     private record IdentifierToken(String text, int endIndex) {

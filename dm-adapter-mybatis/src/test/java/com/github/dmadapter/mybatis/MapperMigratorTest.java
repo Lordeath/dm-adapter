@@ -2901,6 +2901,70 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicSelectRewritesChooseAggregateAliasInHavingWithoutMovingToWhere() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeMapper">
+                    <sql id="lateFee_value_logic">cd.late_fee</sql>
+                    <select id="getMonthPaymentDetail">
+                        SELECT
+                        cd.HouseId,
+                        cd.OwnerId,
+                        <choose>
+                            <when test="payStatus == '待支付'">
+                                sum(cd.Arrears -<include refid="lateFee_value_logic"/>) chargePaid
+                            </when>
+                            <when test="payStatus == '已支付'">
+                                sum(cd.PaidChargeSum) chargePaid
+                            </when>
+                            <otherwise>
+                                sum(cd.ChargeSum) chargePaid
+                            </otherwise>
+                        </choose>
+                        FROM charge_customerchargedetail cd
+                        <where>
+                            cd.IsDelete = 0
+                        </where>
+                        GROUP BY cd.HouseId, cd.OwnerId
+                        HAVING chargePaid > 0
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ChargeMapper.xml"));
+        assertThat(rewritten)
+                .contains("GROUP BY cd.HouseId, cd.OwnerId\n        <choose>")
+                .contains("HAVING (sum(cd.Arrears -<include refid=\"lateFee_value_logic\"/>)) > 0")
+                .contains("HAVING (sum(cd.PaidChargeSum)) > 0")
+                .contains("HAVING (sum(cd.ChargeSum)) > 0")
+                .doesNotContain("and chargePaid > 0")
+                .doesNotContain("HAVING chargePaid > 0");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_DYNAMIC_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicSelectRemovesUnusedUserVariableInitializerAcrossXmlTags() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -3082,7 +3146,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicNestedHavingMovesSimpleConditionsToWhere() throws Exception {
+    void dynamicNestedHavingKeepsNonGroupBySimpleConditionsInHaving() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -3135,14 +3199,11 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BillUsedMapper.xml"));
         assertThat(rewritten)
-                .contains("WHERE")
-                .contains("b.IsDelete = 0")
+                .contains("HAVING\n                b.IsDelete = 0")
                 .contains("and a.PrecinctId = #{precinctId}")
-                .contains("HAVING\n                to_days(")
-                .doesNotContain("HAVING\n                b.IsDelete = 0");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+                .contains("AND to_days(")
+                .doesNotContain("\n                            and b.IsDelete = 0");
+        assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
@@ -3231,11 +3292,11 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
                 .contains("and status is not null")
-                .contains("and tenant_id is not null")
+                .contains("having tenant_id is not null")
                 .contains("group by status")
                 .doesNotContain("nullgroup")
                 .doesNotContain("nullGROUP")
-                .doesNotContain("having status is not null");
+                .doesNotContain("and tenant_id is not null");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
