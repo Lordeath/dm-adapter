@@ -11,7 +11,9 @@ import java.util.List;
 import java.util.Locale;
 
 class SqlScriptValidator implements SqlScriptMigrator.Validator {
-    private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 30;
+    private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 180;
+    private static final String STATEMENT_TIMEOUT_PROPERTY = "dm.adapter.sqlScriptStatementTimeoutSeconds";
+    private static final String STATEMENT_TIMEOUT_ENV = "DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS";
 
     private final ConnectionProvider connectionProvider;
 
@@ -108,6 +110,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 continue;
             }
             int statementIndex = i + 1;
+            if (file.manualReviewStatementIndexes().contains(statementIndex)) {
+                continue;
+            }
             try (Statement statement = connection.createStatement()) {
                 configureStatement(statement);
                 statement.execute(sql);
@@ -146,10 +151,22 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     }
 
     static int statementTimeoutSeconds() {
-        return Integer.getInteger(
-                "dm.adapter.sqlScriptStatementTimeoutSeconds",
-                DEFAULT_STATEMENT_TIMEOUT_SECONDS
-        );
+        Integer propertyValue = Integer.getInteger(STATEMENT_TIMEOUT_PROPERTY);
+        if (propertyValue != null && propertyValue > 0) {
+            return propertyValue;
+        }
+        String envValue = System.getenv(STATEMENT_TIMEOUT_ENV);
+        if (envValue != null && !envValue.isBlank()) {
+            try {
+                int parsed = Integer.parseInt(envValue.trim());
+                if (parsed > 0) {
+                    return parsed;
+                }
+            } catch (NumberFormatException ignored) {
+                // Invalid environment values fall back to the default.
+            }
+        }
+        return DEFAULT_STATEMENT_TIMEOUT_SECONDS;
     }
 
     static String quotedIdentifier(String identifier) {
