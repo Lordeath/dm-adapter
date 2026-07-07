@@ -289,8 +289,8 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .doesNotContain("\uFEFF")
                 .doesNotContain("IF EXISTS IF")
-                .contains("DROP PROCEDURE IF EXISTS `already_safe_proc`")
-                .contains("DROP PROCEDURE IF EXISTS `missing_proc`")
+                .contains("DROP PROCEDURE IF EXISTS already_safe_proc")
+                .contains("DROP PROCEDURE IF EXISTS missing_proc")
                 .contains("DROP PROCEDURE IF EXISTS duplicated_proc")
                 .containsIgnoringCase("CREATE TABLE IF NOT EXISTS tmp_enterprise_orgid AS SELECT enterprise_id, organization_id FROM ns_system_organization")
                 .contains("-- DM_ADAPTER: ignored MySQL temporary table index DDL")
@@ -332,7 +332,7 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .doesNotContain("IF EXISTS \nIF")
                 .doesNotContain("IF EXISTS \r\nIF")
-                .contains("DROP PROCEDURE IF EXISTS `pro_AddColumn`");
+                .contains("DROP PROCEDURE IF EXISTS pro_AddColumn");
     }
 
     @Test
@@ -1429,6 +1429,158 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsMysqlProcedureLoopSyntaxAndQuotedRoutineNamesForDameng() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("loop.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE `demo_loop`()
+                BEGIN
+                    DECLARE v_index INT DEFAULT 0;
+                    WHILE v_index < 2 DO
+                        IF v_index = 0 THEN
+                            SET v_index = v_index + 1;
+                        ELSEIF v_index = 1 THEN
+                            SET v_index = v_index + 1;
+                        END IF;
+                    END WHILE;
+                END$$
+                DELIMITER ;
+                CALL `demo_loop`();
+                DROP PROCEDURE IF EXISTS `demo_loop`;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("loop.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE demo_loop() AS")
+                .contains("WHILE v_index < 2 LOOP")
+                .contains("ELSIF v_index = 1 THEN")
+                .contains("END LOOP;")
+                .contains("CALL demo_loop()")
+                .contains("DROP PROCEDURE IF EXISTS demo_loop")
+                .doesNotContain(" DO")
+                .doesNotContain("END WHILE")
+                .doesNotContain("ELSEIF")
+                .doesNotContain("`demo_loop`");
+    }
+
+    @Test
+    void convertsProcedureUserVariablesAssignedWithColonEquals() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("variables.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_variables()
+                BEGIN
+                    SET @target_ver := 2;
+                    IF @target_ver > 1 THEN
+                        SELECT @target_ver;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("variables.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("dm_target_ver BIGINT;")
+                .contains("dm_target_ver := 2;")
+                .contains("IF dm_target_ver > 1 THEN")
+                .contains("SELECT dm_target_ver;")
+                .doesNotContain("@target_ver")
+                .doesNotContain("SET dm_target_ver :=");
+    }
+
+    @Test
+    void convertsTopLevelMysqlModifyColumnAfterClauseForDameng() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("alter.sql"), """
+                ALTER TABLE `demo` MODIFY COLUMN `body` mediumtext NULL AFTER `id`;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("alter.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("ALTER TABLE `demo` MODIFY `body` CLOB NULL")
+                .doesNotContainIgnoringCase("MODIFY COLUMN")
+                .doesNotContainIgnoringCase("AFTER");
+    }
+
+    @Test
+    void convertsTemporaryInsertIgnoreSelectToMergeWhenKeyColumnsAreKnown() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("insert-ignore.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_insert_ignore()
+                BEGIN
+                    CREATE TEMPORARY TABLE tmp_demo (
+                        id BIGINT NOT NULL,
+                        name VARCHAR(100),
+                        PRIMARY KEY (id),
+                        KEY idx_tmp_demo_name (name)
+                    );
+                    INSERT IGNORE INTO tmp_demo (id, name)
+                    SELECT s.id, s.name AS name
+                    FROM source_table s;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("insert-ignore.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("MERGE INTO tmp_demo t")
+                .contains("SELECT s.id AS id, s.name AS name")
+                .contains("ON (t.id = s.id)")
+                .contains("WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)")
+                .doesNotContain("INSERT IGNORE")
+                .doesNotContain("KEY idx_tmp_demo_name");
+    }
+
+    @Test
     void convertsCreateTableOptionsWhenStatementHasLeadingComments() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -1456,7 +1608,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .startsWith("-- business note")
-                .contains("`id` bigint NOT NULL AUTO_INCREMENT")
+                .contains("`id` bigint NOT NULL IDENTITY(1,1)")
                 .contains("`code` varchar(192) DEFAULT NULL")
                 .doesNotContain("KEY `idx_demo_code`")
                 .doesNotContainIgnoringCase("USING BTREE")
