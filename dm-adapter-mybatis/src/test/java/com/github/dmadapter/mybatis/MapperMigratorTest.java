@@ -2965,6 +2965,68 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicSelectRewritesChooseAggregateAliasWithBranchCommasInHaving() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeMapper">
+                    <select id="getReminderPayment">
+                        select
+                        <choose>
+                            <when test="filterLateFee == '1'">
+                                sum(greatest(Arrears - ifnull(late_fee, 0), 0)) arrearsSum,
+                            </when>
+                            <otherwise>
+                                sum(Arrears) as arrearsSum,
+                            </otherwise>
+                        </choose>
+                        count(1) as standrdId,
+                        HouseId,
+                        OwnerId
+                        from Charge_CustomerChargeDetail
+                        where IsDelete = 0
+                        <if test='groupType==null or groupType=="0"'>
+                            GROUP BY HouseId, OwnerId
+                        </if>
+                        <if test='groupType=="1"'>
+                            GROUP BY OwnerId
+                        </if>
+                        having arrearsSum > 0
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ChargeMapper.xml"));
+        assertThat(rewritten)
+                .contains("HAVING (sum(greatest(Arrears - ifnull(late_fee, 0), 0))) > 0")
+                .contains("HAVING (sum(Arrears)) > 0")
+                .contains("count(1) as standrdId")
+                .doesNotContain("having arrearsSum > 0");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_DYNAMIC_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+    }
+
+    @Test
     void dynamicSelectRemovesUnusedUserVariableInitializerAcrossXmlTags() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

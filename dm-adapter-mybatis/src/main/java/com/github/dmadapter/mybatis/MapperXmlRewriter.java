@@ -2818,7 +2818,37 @@ public class MapperXmlRewriter {
                 aliases.putIfAbsent(identifierKey(alias.alias()), alias);
             }
         }
+        addTopLevelDynamicAggregateChooseAliases(selectList, aliases);
         return aliases;
+    }
+
+    private void addTopLevelDynamicAggregateChooseAliases(
+            String selectList,
+            Map<String, DynamicAggregateAlias> aliases
+    ) {
+        int index = 0;
+        while (index < selectList.length()) {
+            int chooseStart = selectList.indexOf("<choose", index);
+            if (chooseStart < 0) {
+                return;
+            }
+            XmlTag chooseTag = readXmlTag(selectList, chooseStart);
+            if (chooseTag == null || chooseTag.closing() || chooseTag.selfClosing()
+                    || !"choose".equalsIgnoreCase(chooseTag.name())) {
+                index = chooseStart + "<choose".length();
+                continue;
+            }
+            int chooseClosingStart = findClosingTag(selectList, chooseTag.endIndex(), "choose", selectList.length());
+            if (chooseClosingStart < 0) {
+                return;
+            }
+            int chooseEnd = closingTagEnd(selectList, chooseClosingStart);
+            DynamicAggregateAlias alias = dynamicAggregateSelectAlias(selectList.substring(chooseStart, chooseEnd));
+            if (alias != null) {
+                aliases.putIfAbsent(identifierKey(alias.alias()), alias);
+            }
+            index = chooseEnd;
+        }
     }
 
     private DynamicAggregateAlias dynamicAggregateSelectAlias(String selectItem) {
@@ -2954,7 +2984,7 @@ public class MapperXmlRewriter {
     }
 
     private SelectAlias selectAliasAllowingSqlFragments(String selectItem) {
-        String trimmed = selectItem == null ? "" : selectItem.trim();
+        String trimmed = stripTrailingSelectItemComma(selectItem == null ? "" : selectItem.trim());
         if (trimmed.isBlank() || containsUnsupportedAliasXmlTag(trimmed)) {
             return null;
         }
@@ -2971,6 +3001,14 @@ public class MapperXmlRewriter {
             return null;
         }
         return new SelectAlias(expression, alias);
+    }
+
+    private String stripTrailingSelectItemComma(String value) {
+        String trimmed = value == null ? "" : value.stripTrailing();
+        if (trimmed.endsWith(",")) {
+            return trimmed.substring(0, trimmed.length() - 1).stripTrailing();
+        }
+        return trimmed;
     }
 
     private boolean containsUnsupportedAliasXmlTag(String value) {
@@ -5033,6 +5071,7 @@ public class MapperXmlRewriter {
         }
         List<String> parts = new ArrayList<>();
         int depth = 0;
+        int xmlDepth = 0;
         int start = 0;
         int index = 0;
         while (index < value.length()) {
@@ -5042,8 +5081,19 @@ public class MapperXmlRewriter {
             } else if (startsMyBatisPlaceholder(value, index)) {
                 index = skipMyBatisPlaceholder(value, index);
             } else if (current == '<') {
-                int tagEnd = findXmlTagEnd(value, index);
-                index = tagEnd < 0 ? value.length() : tagEnd + 1;
+                XmlTag tag = readXmlTag(value, index);
+                if (tag == null) {
+                    int tagEnd = findXmlTagEnd(value, index);
+                    index = tagEnd < 0 ? value.length() : tagEnd + 1;
+                } else {
+                    if (!tag.selfClosing() && !"include".equalsIgnoreCase(tag.name())) {
+                        xmlDepth += tag.closing() ? -1 : 1;
+                        if (xmlDepth < 0) {
+                            xmlDepth = 0;
+                        }
+                    }
+                    index = tag.endIndex();
+                }
             } else if (current == '(') {
                 depth++;
                 index++;
@@ -5052,7 +5102,7 @@ public class MapperXmlRewriter {
                     depth--;
                 }
                 index++;
-            } else if (current == ',' && depth == 0) {
+            } else if (current == ',' && depth == 0 && xmlDepth == 0) {
                 parts.add(value.substring(start, index));
                 index++;
                 start = index;
