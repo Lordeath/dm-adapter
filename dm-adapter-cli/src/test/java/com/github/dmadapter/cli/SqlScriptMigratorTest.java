@@ -470,6 +470,7 @@ class SqlScriptMigratorTest {
                     END IF;
                     DROP TEMPORARY TABLE IF EXISTS tmp_demo_a,tmp_demo_b;
                     CREATE TEMPORARY TABLE IF NOT EXISTS tmp_demo_a SELECT 1 AS id;
+                    CREATE TEMPORARY TABLE IF NOT EXISTS tmp_demo_b SELECT * FROM tmp_demo_a;
                     CREATE INDEX tmp_demo_idx ON tmp_demo_a(id);
                 END$$
                 DELIMITER ;
@@ -488,8 +489,10 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE TABLE IF NOT EXISTS tmp_demo_a (id BIGINT, enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
-                .contains("CREATE TABLE IF NOT EXISTS tmp_demo_b (enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
+                .contains("DROP TABLE IF EXISTS tmp_demo_a;")
+                .contains("CREATE TABLE tmp_demo_a (id BIGINT, enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
+                .contains("DROP TABLE IF EXISTS tmp_demo_b;")
+                .contains("CREATE TABLE tmp_demo_b (id BIGINT, enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
                 .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON, row_count OUT int) AS")
                 .contains("""
                             v_index INT := 0;
@@ -501,6 +504,7 @@ class SqlScriptMigratorTest {
                 .contains("DELETE FROM tmp_demo_a;")
                 .contains("DELETE FROM tmp_demo_b;")
                 .contains("INSERT INTO tmp_demo_a (id) SELECT 1 AS id;")
+                .contains("INSERT INTO tmp_demo_b (id, enterprise_id, organization_id, roleid, orderindex) SELECT * FROM tmp_demo_a;")
                 .contains("NULL;")
                 .doesNotContain("label_exit:BEGIN")
                 .doesNotContain("LEAVE label_exit")
@@ -898,6 +902,56 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .contains("EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX sample_table_uk_user_date ON sample_table (userId, workDate)'")
                 .doesNotContain("ADD UNIQUE INDEX");
+    }
+
+    @Test
+    void convertsMysqlProcedureDropAndAddUniqueIndexAlterToSeparateDamengIndexDdl() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE fix_unique_index()
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                          FROM information_schema.statistics s
+                         WHERE s.TABLE_SCHEMA = DATABASE()
+                           AND s.TABLE_NAME = 'sample_table'
+                           AND s.INDEX_NAME = 'uk_user_date'
+                           AND s.NON_UNIQUE = 0
+                         GROUP BY s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME
+                        HAVING GROUP_CONCAT(s.COLUMN_NAME ORDER BY s.SEQ_IN_INDEX SEPARATOR ',') = 'user_id'
+                    ) THEN
+                        ALTER TABLE sample_table
+                            DROP INDEX uk_user_date,
+                            ADD UNIQUE KEY uk_user_date (user_id, work_date);
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("FROM ALL_INDEXES I")
+                .contains("JOIN ALL_IND_COLUMNS C")
+                .contains("C.COLUMN_POSITION AS SEQ_IN_INDEX")
+                .contains("CASE WHEN I.UNIQUENESS = 'UNIQUE' THEN 0 ELSE 1 END AS NON_UNIQUE")
+                .contains("HAVING LISTAGG(s.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY s.SEQ_IN_INDEX) = 'user_id'")
+                .contains("EXECUTE IMMEDIATE 'DROP INDEX sample_table_uk_user_date';")
+                .contains("EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX sample_table_uk_user_date ON sample_table (user_id, work_date)'")
+                .doesNotContain("DROP INDEX uk_user_date,")
+                .doesNotContain("ADD UNIQUE KEY");
     }
 
     @Test
@@ -1575,7 +1629,8 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("insert-ignore.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE TABLE IF NOT EXISTS tmp_demo")
+                .contains("DROP TABLE IF EXISTS tmp_demo;")
+                .contains("CREATE TABLE tmp_demo (id BIGINT, name VARCHAR(200), enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
                 .contains("DELETE FROM tmp_demo;")
                 .contains("MERGE INTO tmp_demo t")
                 .contains("SELECT s.id AS id, s.name AS name")
