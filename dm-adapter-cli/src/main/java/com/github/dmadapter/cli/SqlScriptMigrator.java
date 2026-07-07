@@ -162,7 +162,15 @@ class SqlScriptMigrator {
             ),
             new TextReplacement(
                     Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*statistics\\b"),
-                    "ALL_INDEXES"
+                    "(SELECT I.OWNER, I.TABLE_NAME, I.INDEX_NAME, "
+                            + "CASE WHEN I.UNIQUENESS = 'UNIQUE' THEN 0 ELSE 1 END AS NON_UNIQUE, "
+                            + "C.COLUMN_NAME, C.COLUMN_POSITION AS SEQ_IN_INDEX "
+                            + "FROM ALL_INDEXES I "
+                            + "JOIN ALL_IND_COLUMNS C "
+                            + "ON C.INDEX_OWNER = I.OWNER "
+                            + "AND C.INDEX_NAME = I.INDEX_NAME "
+                            + "AND C.TABLE_OWNER = I.TABLE_OWNER "
+                            + "AND C.TABLE_NAME = I.TABLE_NAME)"
             ),
             new TextReplacement(
                     Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*tables\\b"),
@@ -820,10 +828,13 @@ class SqlScriptMigrator {
         if (tableColumns.isEmpty()) {
             return List.of();
         }
-        return tableColumns.entrySet().stream()
-                .map(entry -> "CREATE TABLE IF NOT EXISTS " + entry.getKey()
-                        + " (" + procedureTempTableColumnDefinitions(entry.getValue()) + ")")
-                .toList();
+        List<String> placeholders = new ArrayList<>(tableColumns.size() * 2);
+        for (Map.Entry<String, LinkedHashSet<String>> entry : tableColumns.entrySet()) {
+            placeholders.add("DROP TABLE IF EXISTS " + entry.getKey());
+            placeholders.add("CREATE TABLE " + entry.getKey()
+                    + " (" + procedureTempTableColumnDefinitions(entry.getValue()) + ")");
+        }
+        return placeholders;
     }
 
     private LinkedHashMap<String, LinkedHashSet<String>> temporaryProcedureTableDefinitions(String sql) {
@@ -836,14 +847,66 @@ class SqlScriptMigrator {
             }
             tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
         }
+        collectCreateTableDefinitionColumns(sql, tableColumns);
         collectCreateTableSelectColumns(sql, tableColumns);
         collectInsertSelectColumns(sql, tableColumns);
+        collectMergeInsertColumns(sql, tableColumns);
+        propagateCreateTableSelectStarColumns(sql, tableColumns);
         for (LinkedHashSet<String> columns : tableColumns.values()) {
             for (ProcedureTempTableColumn defaultColumn : PROCEDURE_TEMP_TABLE_DEFAULT_COLUMNS) {
                 columns.add(defaultColumn.name());
             }
         }
         return tableColumns;
+    }
+
+    private void collectCreateTableDefinitionColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bCREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\("
+        ).matcher(sql);
+        while (matcher.find()) {
+            String tableName = matcher.group("table").strip();
+            if (!isProcedureTemporaryTableName(tableName)) {
+                continue;
+            }
+            int openParen = matcher.end() - 1;
+            int closeParen = findMatchingParen(sql, openParen);
+            if (closeParen <= openParen) {
+                continue;
+            }
+            LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
+            for (String part : splitTopLevelComma(sql.substring(openParen + 1, closeParen))) {
+                String columnName = createTableColumnDefinitionName(part.strip());
+                if (!columnName.isBlank()) {
+                    targetColumns.add(columnName);
+                }
+            }
+        }
+    }
+
+    private String createTableColumnDefinitionName(String definition) {
+        int cursor = skipWhitespace(definition, 0);
+        if (cursor >= definition.length()
+                || startsKeyword(definition, cursor, "PRIMARY")
+                || startsKeyword(definition, cursor, "CONSTRAINT")
+                || startsKeyword(definition, cursor, "KEY")
+                || startsKeyword(definition, cursor, "INDEX")
+                || startsKeyword(definition, cursor, "UNIQUE")
+                || startsKeyword(definition, cursor, "FULLTEXT")
+                || startsKeyword(definition, cursor, "SPATIAL")
+                || startsKeyword(definition, cursor, "FOREIGN")
+                || startsKeyword(definition, cursor, "CHECK")) {
+            return "";
+        }
+        SqlIdentifierReference column = sqlIdentifierReferenceAt(definition, cursor);
+        if (column == null) {
+            return "";
+        }
+        return unquoteIdentifier(lastIdentifierPart(column.token()));
     }
 
     private void collectCreateTableSelectColumns(
@@ -872,12 +935,66 @@ class SqlScriptMigrator {
         }
     }
 
+    private void propagateCreateTableSelectStarColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bCREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                        + "(?<target>" + SQL_IDENTIFIER_TOKEN + ")\\s+(?:AS\\s+)?SELECT\\s+\\*\\s+FROM\\s+"
+                        + "(?<source>" + SQL_IDENTIFIER_TOKEN + ")\\b"
+        ).matcher(sql);
+        boolean changed;
+        do {
+            changed = false;
+            matcher.reset();
+            while (matcher.find()) {
+                if (!isProcedureTemporaryTableName(matcher.group("target"))
+                        || !isProcedureTemporaryTableName(matcher.group("source"))) {
+                    continue;
+                }
+                LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(
+                        matcher.group("target").strip(),
+                        ignored -> new LinkedHashSet<>()
+                );
+                LinkedHashSet<String> sourceColumns = temporaryTableColumns(tableColumns, matcher.group("source"));
+                if (sourceColumns != null && targetColumns.addAll(sourceColumns)) {
+                    changed = true;
+                }
+            }
+        } while (changed);
+    }
+
     private void collectInsertSelectColumns(
             String sql,
             LinkedHashMap<String, LinkedHashSet<String>> tableColumns
     ) {
         Matcher matcher = Pattern.compile(
                 "(?is)\\bINSERT\\s+INTO\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\((?<columns>[^)]*)\\)\\s*SELECT\\b"
+        ).matcher(sql);
+        while (matcher.find()) {
+            String tableName = matcher.group("table").strip();
+            if (!isProcedureTemporaryTableName(tableName)) {
+                continue;
+            }
+            LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
+            for (String column : splitTopLevelComma(matcher.group("columns"))) {
+                String columnName = unquoteIdentifier(lastIdentifierPart(column.strip()));
+                if (!columnName.isBlank()) {
+                    targetColumns.add(columnName);
+                }
+            }
+        }
+    }
+
+    private void collectMergeInsertColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bMERGE\\s+INTO\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\b"
+                        + "(?:(?!\\bWHEN\\s+NOT\\s+MATCHED\\s+THEN\\s+INSERT\\b).)*"
+                        + "\\bWHEN\\s+NOT\\s+MATCHED\\s+THEN\\s+INSERT\\s*\\((?<columns>[^)]*)\\)"
         ).matcher(sql);
         while (matcher.find()) {
             String tableName = matcher.group("table").strip();
@@ -3743,6 +3860,7 @@ class SqlScriptMigrator {
         }
 
         Map<String, String> variableNames = procedureVariableNamesByLowercase(sql);
+        LinkedHashMap<String, LinkedHashSet<String>> temporaryTableColumns = temporaryProcedureTableDefinitions(sql);
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -3770,7 +3888,8 @@ class SqlScriptMigrator {
                 index = end;
             } else if (startsProcedureDdl(sql, index)) {
                 int end = findStatementTerminator(sql, index);
-                List<ProcedureStatement> ddlStatements = convertProcedureDdlStatements(sql.substring(index, end).strip());
+                List<ProcedureStatement> ddlStatements =
+                        convertProcedureDdlStatements(sql.substring(index, end).strip(), temporaryTableColumns);
                 for (int i = 0; i < ddlStatements.size(); i++) {
                     if (i > 0) {
                         converted.append("\n");
@@ -3911,7 +4030,10 @@ class SqlScriptMigrator {
         return "'''' || IFNULL(REPLACE(CAST(" + variableName + " AS VARCHAR(4000)), '''', ''''''), '') || ''''";
     }
 
-    private List<ProcedureStatement> convertProcedureDdlStatements(String ddl) {
+    private List<ProcedureStatement> convertProcedureDdlStatements(
+            String ddl,
+            Map<String, LinkedHashSet<String>> temporaryTableColumns
+    ) {
         String converted = removeMysqlTemporaryKeyword(ddl);
         List<ProcedureStatement> temporaryDropTables = convertTemporaryDropTableToDml(converted);
         if (!temporaryDropTables.isEmpty()) {
@@ -3925,9 +4047,14 @@ class SqlScriptMigrator {
         if (temporaryCreateTableDefinition != null) {
             return List.of(temporaryCreateTableDefinition);
         }
-        ProcedureStatement temporaryCreateTableSelect = convertTemporaryCreateTableSelectToInsert(converted);
+        ProcedureStatement temporaryCreateTableSelect =
+                convertTemporaryCreateTableSelectToInsert(converted, temporaryTableColumns);
         if (temporaryCreateTableSelect != null) {
             return List.of(temporaryCreateTableSelect);
+        }
+        List<String> indexAlterStatements = splitMysqlAlterTableDropAndAddIndexes(converted);
+        if (!indexAlterStatements.isEmpty()) {
+            return indexAlterStatements.stream().map(ProcedureStatement::dynamicSql).toList();
         }
         List<String> dropTables = splitMysqlDropTables(converted);
         if (!dropTables.isEmpty()) {
@@ -4223,7 +4350,10 @@ class SqlScriptMigrator {
         return ProcedureStatement.directSql("DELETE FROM " + matcher.group("table").strip());
     }
 
-    private ProcedureStatement convertTemporaryCreateTableSelectToInsert(String ddl) {
+    private ProcedureStatement convertTemporaryCreateTableSelectToInsert(
+            String ddl,
+            Map<String, LinkedHashSet<String>> temporaryTableColumns
+    ) {
         Matcher matcher = Pattern.compile(
                 "(?is)^(\\s*CREATE\\s+TABLE\\s+)(?:IF\\s+NOT\\s+EXISTS\\s+)?(" + SQL_IDENTIFIER_TOKEN
                         + ")\\s+(?:AS\\s+)?SELECT\\b(.*)$"
@@ -4232,7 +4362,11 @@ class SqlScriptMigrator {
             return null;
         }
         String selectTail = matcher.group(3);
-        String columnList = insertColumnListForCreateTableSelect(selectTail);
+        String columnList = insertColumnListForCreateTableSelect(
+                matcher.group(2),
+                selectTail,
+                temporaryTableColumns
+        );
         return ProcedureStatement.directSql("INSERT INTO "
                 + matcher.group(2).strip()
                 + columnList
@@ -4240,14 +4374,67 @@ class SqlScriptMigrator {
                 + selectTail);
     }
 
-    private String insertColumnListForCreateTableSelect(String selectTail) {
+    private String insertColumnListForCreateTableSelect(
+            String targetTable,
+            String selectTail,
+            Map<String, LinkedHashSet<String>> temporaryTableColumns
+    ) {
         int fromIndex = topLevelKeywordIndex(selectTail, "FROM");
         String selectList = fromIndex < 0 ? selectTail : selectTail.substring(0, fromIndex);
         List<String> columns = selectListColumns(selectList);
+        if (columns.isEmpty() && selectList.strip().equals("*")) {
+            columns = temporarySelectStarColumns(targetTable, selectTail, temporaryTableColumns);
+        }
         if (columns.isEmpty()) {
             return "";
         }
         return " (" + String.join(", ", columns) + ")";
+    }
+
+    private List<String> temporarySelectStarColumns(
+            String targetTable,
+            String selectTail,
+            Map<String, LinkedHashSet<String>> temporaryTableColumns
+    ) {
+        String sourceTable = singleSelectStarSourceTable(selectTail);
+        if (sourceTable.isBlank()) {
+            return List.of();
+        }
+        LinkedHashSet<String> targetColumns = temporaryTableColumns(temporaryTableColumns, targetTable);
+        LinkedHashSet<String> sourceColumns = temporaryTableColumns(temporaryTableColumns, sourceTable);
+        if (targetColumns == null || sourceColumns == null) {
+            return List.of();
+        }
+        List<String> columns = new ArrayList<>();
+        for (String column : targetColumns) {
+            if (sourceColumns.contains(column)) {
+                columns.add(column);
+            }
+        }
+        return columns;
+    }
+
+    private LinkedHashSet<String> temporaryTableColumns(
+            Map<String, LinkedHashSet<String>> temporaryTableColumns,
+            String table
+    ) {
+        String normalized = normalizedTableKey(table);
+        for (Map.Entry<String, LinkedHashSet<String>> entry : temporaryTableColumns.entrySet()) {
+            if (normalizedTableKey(entry.getKey()).equals(normalized)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private String singleSelectStarSourceTable(String selectTail) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*\\*\\s+FROM\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*$"
+        ).matcher(selectTail);
+        if (!matcher.matches()) {
+            return "";
+        }
+        return matcher.group("table");
     }
 
     private ProcedureStatement convertTemporaryIndexDdlToNoop(String ddl) {
@@ -4302,6 +4489,58 @@ class SqlScriptMigrator {
                 .filter(table -> !table.isBlank())
                 .map(table -> "DROP TABLE IF EXISTS " + table)
                 .toList();
+    }
+
+    private List<String> splitMysqlAlterTableDropAndAddIndexes(String ddl) {
+        Matcher matcher = Pattern.compile("(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+(?<body>.+)$")
+                .matcher(ddl.strip());
+        if (!matcher.matches()) {
+            return List.of();
+        }
+        String table = matcher.group("table");
+        List<String> parts = splitTopLevelComma(matcher.group("body"));
+        if (parts.size() <= 1) {
+            return List.of();
+        }
+        List<String> statements = new ArrayList<>();
+        for (String part : parts) {
+            String converted = convertMysqlAlterTableIndexPart(table, part.strip());
+            if (converted.isBlank()) {
+                return List.of();
+            }
+            statements.add(converted);
+        }
+        return statements;
+    }
+
+    private String convertMysqlAlterTableIndexPart(String table, String part) {
+        Matcher dropIndex = Pattern.compile("(?is)^DROP\\s+INDEX\\s+(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s*$")
+                .matcher(part);
+        if (dropIndex.matches()) {
+            return "DROP INDEX " + dmSchemaScopedIndexName(table, dropIndex.group("index"));
+        }
+        Matcher addIndex = Pattern.compile(
+                "(?is)^ADD\\s+(?<unique>UNIQUE\\s+)?(?:INDEX|KEY)\\s+"
+                        + "(?:(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s*)?\\((?<columns>.*)\\)\\s*$"
+        ).matcher(part);
+        if (!addIndex.matches()) {
+            return "";
+        }
+        String index = addIndex.group("index");
+        if (index == null || index.isBlank()) {
+            List<String> columns = indexColumnNames(addIndex.group("columns"));
+            if (columns.isEmpty()) {
+                return "";
+            }
+            index = columns.get(0);
+        }
+        return (addIndex.group("unique") == null ? "CREATE INDEX " : "CREATE UNIQUE INDEX ")
+                + dmSchemaScopedIndexName(table, index)
+                + " ON "
+                + table
+                + " ("
+                + stripMysqlIndexPrefixLengths(addIndex.group("columns").strip())
+                + ")";
     }
 
     private List<String> splitMultiModifyAlterTable(String ddl) {
