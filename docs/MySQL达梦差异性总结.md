@@ -31,8 +31,10 @@
 | d25 | force index                                                |                 | SELECT /\*+ USE\_INDEX(c idx\_actualAccountBook) \*/          | 需要修改                                            |
 | d26 | DATE_FORMAT('20260704','%Y%m%d') + interval 1 day          | 不准用             | <br />                                                        | <br />                                          |
 | D27 | 多表更新：`UPDATE a JOIN b ... SET a.xxx = ..., b.xxx = ...` | 不准用             | 拆成按同一关联条件分别更新 `a`、`b` 的多条 `UPDATE`，或改业务代码按事务分步更新            | 达梦不支持一次 `UPDATE JOIN` 同时更新多张表字段                       |
+| D28 | 整数算术表达式：`SELECT 1 / 2 * 100`                         | 不准依赖隐式整数/小数转换   | 比例、百分比计算显式转小数，如 `CAST(1 AS DECIMAL(18,4)) / 2 * 100`，并按业务确认是否需要百分比放大 | 现场观察达梦结果为 `0`，MySQL 结果为 `0.5000`，可能因整数除法截断或精度提升规则不同导致特殊场景结果偏差 |
 
 ## 建议
 
 - 不应再默认转换：`CONCAT`、`LIMIT`、反引号、`FIND_IN_SET`、`DATE_FORMAT`、`STR_TO_DATE`、单目标 `UPDATE JOIN`、`DELETE JOIN`，now(),IFNULL,if因为本次环境验证均可执行。
 - `UPDATE JOIN` 可保留仅限更新单张目标表的场景；如果 `SET` 中同时更新 `a.xxx`、`b.xxx` 等多张表字段，需要拆成多条更新语句，并由业务代码保证事务和行数语义一致。
+- 比例、百分比、金额费率等计算不要写成纯整数字面量或整数字段直接相除，至少将一个操作数显式 `CAST` 为 `DECIMAL`，避免达梦与 MySQL 在整数除法、精度提升上的差异影响结果。
