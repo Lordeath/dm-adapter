@@ -11,6 +11,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -490,10 +491,8 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("DROP TABLE IF EXISTS tmp_demo_a;")
-                .contains("CREATE TABLE tmp_demo_a (id BIGINT, extra_name VARCHAR(200), enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
-                .contains("DROP TABLE IF EXISTS tmp_demo_b;")
-                .contains("CREATE TABLE tmp_demo_b (id BIGINT, extra_name VARCHAR(200), enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
+                .contains("CREATE TABLE IF NOT EXISTS tmp_demo_a (id BIGINT, extra_name VARCHAR(200));")
+                .contains("CREATE TABLE IF NOT EXISTS tmp_demo_b (id BIGINT, extra_name VARCHAR(200));")
                 .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON, row_count OUT int) AS")
                 .contains("""
                             v_index INT := 0;
@@ -505,8 +504,10 @@ class SqlScriptMigratorTest {
                 .contains("DELETE FROM tmp_demo_a;")
                 .contains("DELETE FROM tmp_demo_b;")
                 .contains("INSERT INTO tmp_demo_a (id) SELECT 1 AS id;")
-                .contains("INSERT INTO tmp_demo_b (id, extra_name, enterprise_id, organization_id, roleid, orderindex) SELECT * FROM tmp_demo_a;")
+                .contains("INSERT INTO tmp_demo_b (id, extra_name) SELECT id, extra_name FROM tmp_demo_a;")
                 .contains("NULL;")
+                .doesNotContain("DROP TABLE IF EXISTS tmp_demo_a;")
+                .doesNotContain("DROP TABLE IF EXISTS tmp_demo_b;")
                 .doesNotContain("label_exit:BEGIN")
                 .doesNotContain("LEAVE label_exit")
                 .doesNotContain("TEMPORARY TABLE")
@@ -517,6 +518,96 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE));
+    }
+
+    @Test
+    void qualifiesProcedureGroupByColumnsWhenJoinMakesNamesAmbiguous() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc()
+                BEGIN
+                    INSERT INTO tmp_enterprise_orgid_insert
+                    SELECT DISTINCT x2.enterprise_id, x2.organization_id
+                    FROM tmp_enterprise_orgid_2 x2
+                    LEFT JOIN ns_core_resourcefield b
+                      ON b.ENTERPRISE_ID = x2.enterprise_id
+                     AND b.ORGANIZATION_ID = x2.organization_id
+                    WHERE b.id IS NULL
+                    GROUP BY ENTERPRISE_ID,ORGANIZATION_ID;
+
+                    SELECT enterprise_id, organization_id
+                    FROM tmp_enterprise_orgid
+                    GROUP BY enterprise_id, organization_id;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(converted)
+                .contains("INSERT INTO tmp_enterprise_orgid_insert (enterprise_id, organization_id)")
+                .contains("GROUP BY x2.ENTERPRISE_ID,x2.ORGANIZATION_ID;")
+                .contains("GROUP BY enterprise_id, organization_id;");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_GROUP_BY_ALIAS_RULE));
+    }
+
+    @Test
+    void addsSysTimeToProcedureAuditInsertSelectWhenMissing() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc()
+                BEGIN
+                    INSERT INTO `ns_core_resourcefield` (`ID`,`NAME`,`SY_CREATETIME`)
+                    SELECT x.id, x.name, now()
+                    FROM tmp_form_field_insert x;
+
+                    INSERT INTO ns_core_resourcetable (ID, NAME, SY_CREATETIME)
+                    SELECT x.id, x.name, now()
+                    FROM tmp_resource_table x;
+
+                    INSERT INTO sample_already_done (ID, SY_CREATETIME, sys_time)
+                    SELECT x.id, now(), now()
+                    FROM tmp_done x;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(converted)
+                .contains("INSERT INTO `ns_core_resourcefield` (`ID`,`NAME`,`SY_CREATETIME`,`sys_time`)")
+                .contains(", now() FROM tmp_form_field_insert")
+                .contains("INSERT INTO ns_core_resourcetable (ID, NAME, SY_CREATETIME)\n    SELECT x.id, x.name, now()")
+                .contains("INSERT INTO sample_already_done (ID, SY_CREATETIME, sys_time)");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_MISSING_SYS_TIME_RULE));
     }
 
     @Test
@@ -574,6 +665,44 @@ class SqlScriptMigratorTest {
                                 SqlScriptMigrator.MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE
                         ));
+    }
+
+    @Test
+    void usesClobForDynamicDmlAccumulatorUserVariablesInsideProcedure() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert_demo(IN input_json JSON)
+                BEGIN
+                    SET @v_insert_sql = 'INSERT INTO tmp_demo(id, name) VALUES';
+                    SET @v_insert_sql = CONCAT(@v_insert_sql, '(''1'', ''demo'')');
+                    PREPARE stmt FROM @v_insert_sql;
+                    EXECUTE stmt;
+                    DEALLOCATE PREPARE stmt;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("dm_v_insert_sql CLOB;")
+                .contains("dm_v_insert_sql := 'INSERT INTO tmp_demo(id, name) VALUES';")
+                .contains("dm_v_insert_sql := CONCAT(dm_v_insert_sql, '(''1'', ''demo'')');")
+                .contains("EXECUTE IMMEDIATE dm_v_insert_sql;")
+                .doesNotContain("@v_insert_sql")
+                .doesNotContain("PREPARE stmt");
     }
 
     @Test
@@ -907,6 +1036,93 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsMysqlProcedureAddIndexUsingBtreeDdlToCreateIndex() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE add_card_id_index()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT INDEX_NAME FROM information_schema.STATISTICS
+                        WHERE table_schema = database()
+                          AND table_name = 'owner_car_month_card_info'
+                          AND index_name = 'idx_card_id'
+                    ) THEN
+                        ALTER TABLE `owner_car_month_card_info` ADD INDEX `idx_card_id` (`card_id`) USING BTREE;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-owner",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("FROM ALL_IND_COLUMNS")
+                .contains("HAVING COUNT(*) = 1")
+                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'card_id'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX owner_car_month_card_info_idx_card_id ON `owner_car_month_card_info` (`card_id`)'")
+                .doesNotContain("INDEX_NAME = 'owner_car_month_card_info_idx_card_id'")
+                .doesNotContain("ADD INDEX")
+                .doesNotContainIgnoringCase("USING BTREE");
+    }
+
+    @Test
+    void marksMysqlPrefixIndexAsManualReviewAndSkipsDependentCallValidation() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE add_prefix_index()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.statistics
+                        WHERE table_schema = database()
+                          AND table_name = 'sample_dictionaryitem'
+                          AND index_name = 'idx_item_code'
+                    ) THEN
+                        ALTER TABLE sample_dictionaryitem
+                            ADD INDEX idx_item_code (dictionary_id, item_code(254));
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL add_prefix_index();
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isEqualTo(2);
+        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(report.validationFailureCount()).isZero();
+        assertThat(converted)
+                .contains("ADD INDEX idx_item_code (dictionary_id, item_code(254))")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE");
+        assertThat(report.manualReviewItems())
+                .extracting(item -> item.reason())
+                .anySatisfy(reason -> assertThat(reason).contains("MySQL 前缀索引"))
+                .anySatisfy(reason -> assertThat(reason).contains("依赖需要人工确认的存储过程"));
+    }
+
+    @Test
     void convertsMysqlProcedureDropAndAddUniqueIndexAlterToSeparateDamengIndexDdl() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -1145,6 +1361,165 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void castsJsonTextAssignmentWhenLocalProcedureVariableNeedsNativeType() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("json-numeric-variable.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_json_numeric(IN payload JSON)
+                BEGIN
+                    DECLARE v_order int;
+                    DECLARE v_timestamp timestamp;
+                    DECLARE v_date date;
+                    DECLARE v_name varchar(255);
+                    SET v_order = JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].syOrderindex'));
+                    SET v_timestamp = JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].timestamp'));
+                    SET v_date = JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].date'));
+                    SET v_name = JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].name'));
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("json-numeric-variable.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("v_order int;")
+                .contains("v_order := TO_NUMBER(NULLIF(NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].syOrderindex'))), ''), 'null'));")
+                .contains("v_timestamp timestamp;")
+                .contains("v_timestamp := TO_TIMESTAMP(NULLIF(NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].timestamp'))), ''), 'null'));")
+                .contains("v_date date;")
+                .contains("v_date := TO_DATE(NULLIF(NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].date'))), ''), 'null'));")
+                .contains("v_name varchar(255);")
+                .contains("v_name := JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].name'));");
+    }
+
+    @Test
+    void formatsProcedureJsonSetTimestampValuesForDamengJsonSerialization() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("json-timestamp.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_json_timestamp()
+                BEGIN
+                    DECLARE dm_log_json varchar(4000);
+                    SET dm_log_json = JSON_SET(dm_log_json, '$.timestamp', CURRENT_TIMESTAMP(3));
+                    SET dm_log_json = JSON_SET(dm_log_json, '$.done', 1, '$.finishedAt', NOW());
+                    SET dm_log_json = 'JSON_SET(dm_log_json, ''$.timestamp'', CURRENT_TIMESTAMP(3))';
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("json-timestamp.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("dm_log_json := JSON_SET(dm_log_json, '$.timestamp', TO_CHAR(CURRENT_TIMESTAMP(3), 'YYYY-MM-DD HH24:MI:SS.FF3'));")
+                .contains("dm_log_json := JSON_SET(dm_log_json, '$.done', 1, '$.finishedAt', TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS.FF3'));")
+                .contains("dm_log_json := 'JSON_SET(dm_log_json, ''$.timestamp'', CURRENT_TIMESTAMP(3))';");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_JSON_TIMESTAMP_TO_CHAR_RULE));
+    }
+
+    @Test
+    void convertsMysqlQuoteCallsInsideProcedureToDmLiteralExpression() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("quote.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_quote()
+                BEGIN
+                    DECLARE v_name varchar(255);
+                    DECLARE v_order int;
+                    DECLARE dm_sql varchar(4000);
+                    SET v_name = 'a';
+                    SET v_order = 1;
+                    SET dm_sql = CONCAT('insert into t values (', QUOTE(v_name), ',', QUOTE(v_order), ')');
+                    SET dm_sql = 'QUOTE(v_name)';
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("quote.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CASE WHEN v_name IS NULL THEN 'NULL' ELSE '''' || REPLACE(CAST(v_name AS VARCHAR(4000)), '''', '''''') || '''' END")
+                .contains("CASE WHEN v_order IS NULL THEN 'NULL' ELSE '''' || REPLACE(CAST(v_order AS VARCHAR(4000)), '''', '''''') || '''' END")
+                .contains("dm_sql := 'QUOTE(v_name)';")
+                .doesNotContain("QUOTE(v_name),")
+                .doesNotContain("QUOTE(v_order)");
+    }
+
+    @Test
+    void convertsMysqlDateAndTimeFunctionsInsideProcedureForDameng() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("date-time.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE fix_card_end_date_to_235959()
+                BEGIN
+                    UPDATE owner_car_month_card_info
+                    SET card_end_date = CONCAT(DATE(card_end_date), ' 23:59:59')
+                    WHERE card_end_date IS NOT NULL
+                      AND TIME(card_end_date) != '23:59:59';
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-owner",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("date-time.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("card_end_date = TO_TIMESTAMP(TO_CHAR(card_end_date, 'YYYY-MM-DD') || ' 23:59:59', 'YYYY-MM-DD HH24:MI:SS')")
+                .contains("TO_CHAR(card_end_date, 'HH24:MI:SS') != '23:59:59'")
+                .doesNotContain("CONCAT(DATE(card_end_date)")
+                .doesNotContain("TIME(card_end_date)");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_DATE_TIME_TO_DM_RULE));
+    }
+
+    @Test
     void collapsesMysqlDoubledJsonQuoteEscapesInsideSqlStrings() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -1180,6 +1555,59 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_SQL_STRING_JSON_ESCAPE_TO_DM_RULE));
+    }
+
+    @Test
+    void convertsResourceColumnBatchMergeToInsertOnly() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert_ns_core_resourcecolumn(input_json JSON)
+                BEGIN
+                    MERGE INTO ns_core_resourcecolumn c
+                    USING (
+                        SELECT 1 AS ENTERPRISE_ID,
+                               2 AS ORGANIZATION_ID,
+                               'col-1' AS JE_CORE_RESOURCECOLUMN_ID,
+                               'demo' AS RESOURCECOLUMN_NAME
+                    ) s
+                    ON (c.ENTERPRISE_ID = s.ENTERPRISE_ID
+                        AND c.ORGANIZATION_ID = s.ORGANIZATION_ID
+                        AND c.JE_CORE_RESOURCECOLUMN_ID = s.JE_CORE_RESOURCECOLUMN_ID)
+                    WHEN MATCHED THEN UPDATE SET
+                        c.RESOURCECOLUMN_NAME = s.RESOURCECOLUMN_NAME,
+                        c.sys_time = CURRENT_TIMESTAMP
+                    WHEN NOT MATCHED THEN INSERT (
+                        ENTERPRISE_ID, ORGANIZATION_ID, JE_CORE_RESOURCECOLUMN_ID, RESOURCECOLUMN_NAME, sys_time
+                    ) VALUES (
+                        s.ENTERPRISE_ID, s.ORGANIZATION_ID, s.JE_CORE_RESOURCECOLUMN_ID, s.RESOURCECOLUMN_NAME, CURRENT_TIMESTAMP
+                    );
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("MERGE INTO ns_core_resourcecolumn c")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContain("WHEN MATCHED THEN UPDATE SET")
+                .doesNotContain("c.RESOURCECOLUMN_NAME = s.RESOURCECOLUMN_NAME");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_RESOURCECOLUMN_INSERT_ONLY_MERGE_RULE));
     }
 
     @Test
@@ -1300,12 +1728,12 @@ class SqlScriptMigratorTest {
                 .contains("IF dm_adapter_exists = 0 THEN")
                 .contains("IF dm_adapter_exists_5 > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'alter table demo add code varchar(128) null'")
-                .contains("COLUMN_NAME IN ('code')")
-                .contains("HAVING COUNT(DISTINCT COLUMN_NAME) = 1")
+                .contains("HAVING COUNT(*) = 1")
+                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'code'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_code ON demo (code)'")
-                .contains("COLUMN_NAME IN ('title')")
+                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'title'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title ON demo (title)'")
-                .contains("COLUMN_NAME IN ('amount')")
+                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'amount'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_amount ON demo (amount)'")
                 .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code varchar(256)'")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")
@@ -1631,16 +2059,65 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("insert-ignore.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("DROP TABLE IF EXISTS tmp_demo;")
-                .contains("CREATE TABLE tmp_demo (id BIGINT, name VARCHAR(200), enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
-                .contains("DELETE FROM tmp_demo;")
+                .contains("CREATE TABLE IF NOT EXISTS tmp_demo (id BIGINT, name VARCHAR(200));")
+                .contains("DELETE FROM tmp_demo /* DM_ADAPTER_TMP_COLUMN tmp_demo id */")
                 .contains("MERGE INTO tmp_demo t")
                 .contains("SELECT s.id AS id, s.name AS name")
                 .contains("ON (t.id = s.id)")
                 .contains("WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)")
                 .doesNotContain("INSERT IGNORE")
+                .doesNotContain("DROP TABLE IF EXISTS tmp_demo;")
                 .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE tmp_demo")
                 .doesNotContain("KEY idx_tmp_demo_name");
+    }
+
+    @Test
+    void preservesExplicitTemporaryTableColumnsForCompilePlaceholders() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("temporary-table.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_temp_table()
+                BEGIN
+                    CREATE TEMPORARY TABLE tmp_menu_copy (
+                        source_id BIGINT NOT NULL,
+                        enterprise_id BIGINT NOT NULL,
+                        organization_id BIGINT NOT NULL,
+                        target_ver INT NOT NULL,
+                        menu_id VARCHAR(100) NOT NULL,
+                        PRIMARY KEY (source_id)
+                    );
+                    INSERT IGNORE INTO tmp_menu_copy (
+                        source_id,
+                        enterprise_id,
+                        organization_id,
+                        target_ver,
+                        menu_id
+                    )
+                    SELECT src.id, src.enterprise_id, src.organization_id, 2, src.menu_id
+                    FROM source_menu src;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("temporary-table.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE TABLE IF NOT EXISTS tmp_menu_copy (source_id BIGINT, enterprise_id BIGINT, organization_id BIGINT, target_ver BIGINT, menu_id VARCHAR(200));")
+                .contains("DELETE FROM tmp_menu_copy /* DM_ADAPTER_TMP_COLUMN tmp_menu_copy source_id */")
+                .contains("MERGE INTO tmp_menu_copy t")
+                .contains("ON (t.source_id = s.source_id)")
+                .doesNotContain("roleid VARCHAR(200)");
     }
 
     @Test
@@ -1746,6 +2223,7 @@ class SqlScriptMigratorTest {
                     END IF;
                 END$$
                 DELIMITER ;
+                CALL bad_length_guard();
                 """);
 
         SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
@@ -1758,10 +2236,13 @@ class SqlScriptMigratorTest {
                 DmValidationEnvironment.from(Map.of())
         ));
 
-        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewSqlCount()).isEqualTo(2);
+        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(report.validationFailureCount()).isZero();
         assertThat(report.manualReviewItems())
-                .singleElement()
-                .satisfies(item -> assertThat(item.reason()).contains("链式比较"));
+                .extracting(item -> item.reason())
+                .anySatisfy(reason -> assertThat(reason).contains("链式比较"))
+                .anySatisfy(reason -> assertThat(reason).contains("依赖需要人工确认的存储过程"));
     }
 
     @Test
@@ -1822,6 +2303,7 @@ class SqlScriptMigratorTest {
                 1,
                 0,
                 0,
+                Set.of(),
                 List.of(),
                 List.of("select 1 from dual")
         )), environment);
@@ -1832,6 +2314,23 @@ class SqlScriptMigratorTest {
                 .doesNotContain("jdbc:dm://db-host:5236")
                 .doesNotContain("APP_USER")
                 .doesNotContain("APP_SECRET");
+    }
+
+    @Test
+    void sqlScriptValidationTimeoutCanBeOverriddenWithSystemProperty() {
+        String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "45");
+
+            assertThat(SqlScriptValidator.statementTimeoutSeconds()).isEqualTo(45);
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
     }
 
     private SqlScriptMigrator migrator(SqlScriptMigrator.Validator validator) {
@@ -1853,7 +2352,7 @@ class SqlScriptMigratorTest {
         ) {
             this.files.addAll(files);
             List<SqlScriptFileValidation> fileValidations = files.stream()
-                    .map(file -> new SqlScriptFileValidation(file.outputDisplay(), file.statements().size(), List.of()))
+                    .map(file -> new SqlScriptFileValidation(file.outputDisplay(), executableStatementCount(file), List.of()))
                     .toList();
             int successCount = fileValidations.stream().mapToInt(SqlScriptFileValidation::successCount).sum();
             return new SqlScriptValidationRun(
@@ -1865,6 +2364,20 @@ class SqlScriptMigratorTest {
                     List.of(),
                     List.of()
             );
+        }
+
+        private int executableStatementCount(SqlScriptMigrator.PlannedSqlScriptFile file) {
+            int count = 0;
+            for (int i = 0; i < file.statements().size(); i++) {
+                int statementIndex = i + 1;
+                if (file.manualReviewStatementIndexes().contains(statementIndex)) {
+                    continue;
+                }
+                if (SqlScriptParser.executable(file.statements().get(i))) {
+                    count++;
+                }
+            }
+            return count;
         }
     }
 
