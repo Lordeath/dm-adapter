@@ -553,8 +553,8 @@ class SqlScriptMigratorTest {
                 .contains("dm_has_menu_ver BIGINT;")
                 .contains("dm_new_form_data VARCHAR(4000);")
                 .contains("dm_roleId VARCHAR(4000);")
-                .contains("SET dm_has_menu_ver = (")
-                .contains("SET dm_new_form_data = '{\"name\":\"demo\"}';")
+                .contains("dm_has_menu_ver := (")
+                .contains("dm_new_form_data := '{\"name\":\"demo\"}';")
                 .contains("SELECT ROLEID INTO dm_roleId FROM ns_core_role ORDER BY id ASC LIMIT 1;")
                 .contains("IF dm_has_menu_ver > 0 AND dm_roleId IS NOT NULL THEN")
                 .contains("VALUES(dm_new_form_data, dm_roleId)")
@@ -564,7 +564,10 @@ class SqlScriptMigratorTest {
         assertThat(report.files())
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
-                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE));
+                        .contains(
+                                SqlScriptMigrator.MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE
+                        ));
     }
 
     @Test
@@ -844,11 +847,17 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .contains("payload IS NOT NULL AND DBMS_LOB.GETLENGTH(payload) > 0")
                 .contains("localContent IS NOT NULL AND DBMS_LOB.GETLENGTH(localContent) > 0")
-                .contains("IF title <> '' THEN");
+                .contains("IF title <> '' THEN")
+                .contains("localContent := payload;")
+                .contains("localContent := CONCAT(localContent, 'x');")
+                .contains("title := CONCAT(title, 'x');");
         assertThat(report.files())
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
-                        .contains(SqlScriptMigrator.DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE));
+                        .contains(
+                                SqlScriptMigrator.DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE
+                        ));
     }
 
     @Test
@@ -1017,9 +1026,11 @@ class SqlScriptMigratorTest {
                 .contains("note CLOB;")
                 .contains("NULL;")
                 .contains("dm_sql VARCHAR(4000);")
-                .contains("SET dm_sql = NULL;")
+                .contains("dm_sql := NULL;")
+                .contains("dm_sql := 'select 1';")
                 .contains("RAISE_APPLICATION_ERROR(-20000, 'missing column');")
                 .contains("EXECUTE IMMEDIATE dm_sql;")
+                .contains("p_result := p_payload;")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_workclass_set MODIFY `day` DECIMAL(18, 4) NULL DEFAULT NULL';")
                 .doesNotContain("group_concat_max_len")
                 .doesNotContain("PREPARE stmt")
@@ -1067,6 +1078,7 @@ class SqlScriptMigratorTest {
                 .doesNotContain("DECLARE enterprise_cursor CURSOR")
                 .doesNotContain("DECLARE CONTINUE HANDLER")
                 .contains("dm_resource_code VARCHAR(4000);")
+                .contains("dm_resource_code := p_code;")
                 .contains("INSERT INTO tmp_demo (id) SELECT id")
                 .contains("RESOURCEBUTTON_CODE = dm_resource_code")
                 .contains("RESOURCEBUTTON_FUNCINFO_ID = p_code")

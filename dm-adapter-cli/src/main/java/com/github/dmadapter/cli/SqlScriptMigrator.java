@@ -36,6 +36,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE =
             "MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL";
+    static final String MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE =
+            "MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT";
     static final String MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE =
             "MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT";
     static final String MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE =
@@ -1078,6 +1080,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_SIGNAL_TO_RAISE_APPLICATION_ERROR_RULE);
         }
 
+        String procedureLocalSetSql = convertMysqlProcedureLocalSetAssignments(converted);
+        if (!procedureLocalSetSql.equals(converted)) {
+            converted = procedureLocalSetSql;
+            rules.add(MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE);
+        }
+
         String jsonEscapeSql = normalizeMysqlJsonEscapesInSqlStringLiterals(converted);
         if (!jsonEscapeSql.equals(converted)) {
             converted = jsonEscapeSql;
@@ -1926,6 +1934,96 @@ class SqlScriptMigrator {
         return Pattern.compile("(?is)\\bSIGNAL\\s+SQLSTATE\\s+'45000'\\s*;")
                 .matcher(converted)
                 .replaceAll("RAISE_APPLICATION_ERROR(-20000, 'SQLSTATE 45000');");
+    }
+
+    private String convertMysqlProcedureLocalSetAssignments(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0) {
+            return sql;
+        }
+        Map<String, String> variableNames = procedureVariableNamesByLowercase(sql);
+        if (variableNames.isEmpty()) {
+            return sql;
+        }
+
+        StringBuilder converted = new StringBuilder(sql.length());
+        int cursor = 0;
+        int index = beginIndex + "BEGIN".length();
+        boolean changed = false;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "SET")) {
+                ProcedureSetAssignment assignment = procedureLocalSetAssignmentAt(sql, index, variableNames);
+                if (assignment == null) {
+                    index++;
+                } else {
+                    converted.append(sql, cursor, index);
+                    converted.append(sql, assignment.targetStart(), assignment.targetEnd())
+                            .append(" := ")
+                            .append(sql, assignment.expressionStart(), assignment.statementEnd());
+                    if (assignment.statementEnd() < sql.length() && sql.charAt(assignment.statementEnd()) == ';') {
+                        converted.append(';');
+                        cursor = assignment.statementEnd() + 1;
+                    } else {
+                        cursor = assignment.statementEnd();
+                    }
+                    index = cursor;
+                    changed = true;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return sql;
+        }
+        converted.append(sql.substring(cursor));
+        return converted.toString();
+    }
+
+    private ProcedureSetAssignment procedureLocalSetAssignmentAt(
+            String sql,
+            int setIndex,
+            Map<String, String> variableNames
+    ) {
+        int targetStart = skipWhitespace(sql, setIndex + "SET".length());
+        if (targetStart >= sql.length()
+                || sql.charAt(targetStart) == '@'
+                || startsKeyword(sql, targetStart, "SESSION")
+                || startsKeyword(sql, targetStart, "GLOBAL")) {
+            return null;
+        }
+        int targetEnd = simpleIdentifierEnd(sql, targetStart);
+        if (targetEnd <= targetStart) {
+            return null;
+        }
+        int operatorIndex = skipWhitespace(sql, targetEnd);
+        if (operatorIndex >= sql.length()
+                || sql.charAt(operatorIndex) != '='
+                || (operatorIndex + 1 < sql.length() && sql.charAt(operatorIndex + 1) == '=')
+                || !variableNames.containsKey(normalizedProcedureVariableName(sql.substring(targetStart, targetEnd)))) {
+            return null;
+        }
+        int expressionStart = skipWhitespace(sql, operatorIndex + 1);
+        int statementEnd = findStatementTerminator(sql, expressionStart);
+        String expression = sql.substring(expressionStart, statementEnd).strip();
+        if (expression.isBlank() || splitTopLevelComma(expression).size() > 1) {
+            return null;
+        }
+        return new ProcedureSetAssignment(targetStart, targetEnd, expressionStart, statementEnd);
     }
 
     private boolean containsKeywordOutsideIgnoredText(String sql, String keyword) {
@@ -4092,6 +4190,9 @@ class SqlScriptMigrator {
     }
 
     private record ProcedureReferenceRename(String sql, boolean changed) {
+    }
+
+    private record ProcedureSetAssignment(int targetStart, int targetEnd, int expressionStart, int statementEnd) {
     }
 
     private record LabelRemoval(String sql, boolean changed, Set<String> labels) {
