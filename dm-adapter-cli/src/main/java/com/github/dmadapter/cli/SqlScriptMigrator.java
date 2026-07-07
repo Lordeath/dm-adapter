@@ -74,6 +74,16 @@ class SqlScriptMigrator {
             "DM_LONG_CLOB_CALL_ARGUMENT_BLOCK";
     static final String DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE =
             "DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK";
+    static final String MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE =
+            "MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM";
+    static final String MYSQL_PROCEDURE_IDENTIFIER_TO_DM_RULE =
+            "MYSQL_PROCEDURE_IDENTIFIER_TO_DM";
+    static final String MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE =
+            "MYSQL_ALTER_MODIFY_COLUMN_TO_DM";
+    static final String MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE_RULE =
+            "MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE";
+    static final String MYSQL_CREATE_TABLE_INLINE_KEY_REMOVAL_RULE =
+            "MYSQL_CREATE_TABLE_INLINE_KEY_REMOVED";
 
     private static final String SUSPICIOUS_LENGTH_MODIFY_REASON =
             "可疑字段长度修改：当前 SQL 把字段改为 varchar(%s)，但前置判断没有使用“字符类型且长度小于 %s”的安全加长条件；"
@@ -920,6 +930,331 @@ class SqlScriptMigrator {
                 .matches();
     }
 
+    private String convertMysqlProcedureTemporaryInsertIgnore(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        Map<String, List<String>> keyColumnsByTable = temporaryTableKeyColumnsByLowercase(sql);
+        if (keyColumnsByTable.isEmpty()) {
+            return sql;
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        int cursor = 0;
+        int index = firstProcedureBegin(sql);
+        boolean changed = false;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "INSERT")) {
+                TemporaryInsertIgnoreSelect insert = readTemporaryInsertIgnoreSelect(sql, index, keyColumnsByTable);
+                if (insert == null) {
+                    index++;
+                } else {
+                    converted.append(sql, cursor, insert.start());
+                    converted.append(insert.mergeSql());
+                    cursor = insert.end();
+                    index = insert.end();
+                    changed = true;
+                }
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return sql;
+        }
+        converted.append(sql.substring(cursor));
+        return converted.toString();
+    }
+
+    private Map<String, List<String>> temporaryTableKeyColumnsByLowercase(String sql) {
+        LinkedHashMap<String, List<String>> keys = new LinkedHashMap<>();
+        int index = firstProcedureBegin(sql);
+        while (index >= 0 && index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "CREATE")) {
+                TemporaryTableKey tableKey = readTemporaryTableKey(sql, index);
+                if (tableKey == null) {
+                    index++;
+                } else {
+                    keys.putIfAbsent(tableKey.tableKey(), tableKey.keyColumns());
+                    index = tableKey.end();
+                }
+            } else {
+                index++;
+            }
+        }
+        return keys;
+    }
+
+    private TemporaryTableKey readTemporaryTableKey(String sql, int createIndex) {
+        int cursor = skipWhitespace(sql, createIndex + "CREATE".length());
+        if (startsKeyword(sql, cursor, "TEMPORARY")) {
+            cursor = skipWhitespace(sql, cursor + "TEMPORARY".length());
+        }
+        if (!startsKeyword(sql, cursor, "TABLE")) {
+            return null;
+        }
+        cursor = skipWhitespace(sql, cursor + "TABLE".length());
+        if (startsKeyword(sql, cursor, "IF")) {
+            cursor = skipWhitespace(sql, cursor + "IF".length());
+            if (!startsKeyword(sql, cursor, "NOT")) {
+                return null;
+            }
+            cursor = skipWhitespace(sql, cursor + "NOT".length());
+            if (!startsKeyword(sql, cursor, "EXISTS")) {
+                return null;
+            }
+            cursor = skipWhitespace(sql, cursor + "EXISTS".length());
+        }
+        SqlIdentifierReference table = sqlIdentifierReferenceAt(sql, cursor);
+        if (table == null || !isProcedureTemporaryTableName(table.token())) {
+            return null;
+        }
+        int openParen = skipWhitespace(sql, table.end());
+        if (openParen >= sql.length() || sql.charAt(openParen) != '(') {
+            return null;
+        }
+        int closeParen = findMatchingParen(sql, openParen);
+        if (closeParen <= openParen) {
+            return null;
+        }
+        List<String> keyColumns = temporaryTableKeyColumns(sql.substring(openParen + 1, closeParen));
+        if (keyColumns.isEmpty()) {
+            return null;
+        }
+        return new TemporaryTableKey(normalizedTableKey(table.token()), keyColumns, closeParen + 1);
+    }
+
+    private List<String> temporaryTableKeyColumns(String body) {
+        List<String> uniqueColumns = List.of();
+        for (String part : splitTopLevelComma(body)) {
+            String stripped = part.strip();
+            List<String> primaryKeyColumns = temporaryTablePrimaryKeyColumns(stripped);
+            if (!primaryKeyColumns.isEmpty()) {
+                return primaryKeyColumns;
+            }
+            if (uniqueColumns.isEmpty()) {
+                uniqueColumns = temporaryTableUniqueKeyColumns(stripped);
+            }
+        }
+        return uniqueColumns;
+    }
+
+    private List<String> temporaryTablePrimaryKeyColumns(String definition) {
+        int cursor = skipWhitespace(definition, 0);
+        if (startsKeyword(definition, cursor, "PRIMARY")) {
+            int openParen = findTopLevelChar(definition, '(', cursor + "PRIMARY".length());
+            return indexColumnNamesInParentheses(definition, openParen);
+        }
+        SqlIdentifierReference column = sqlIdentifierReferenceAt(definition, cursor);
+        if (column == null) {
+            return List.of();
+        }
+        String attributes = definition.substring(column.end());
+        return Pattern.compile("(?is)\\bPRIMARY\\s+KEY\\b").matcher(attributes).find()
+                ? List.of(unquoteIdentifier(lastIdentifierPart(column.token())))
+                : List.of();
+    }
+
+    private List<String> temporaryTableUniqueKeyColumns(String definition) {
+        int cursor = skipWhitespace(definition, 0);
+        if (!startsKeyword(definition, cursor, "UNIQUE")) {
+            return List.of();
+        }
+        int openParen = findTopLevelChar(definition, '(', cursor + "UNIQUE".length());
+        return indexColumnNamesInParentheses(definition, openParen);
+    }
+
+    private List<String> indexColumnNamesInParentheses(String definition, int openParen) {
+        if (openParen < 0) {
+            return List.of();
+        }
+        int closeParen = findMatchingParen(definition, openParen);
+        if (closeParen <= openParen) {
+            return List.of();
+        }
+        return indexColumnNames(definition.substring(openParen + 1, closeParen));
+    }
+
+    private TemporaryInsertIgnoreSelect readTemporaryInsertIgnoreSelect(
+            String sql,
+            int insertIndex,
+            Map<String, List<String>> keyColumnsByTable
+    ) {
+        int cursor = skipWhitespace(sql, insertIndex + "INSERT".length());
+        if (!startsKeyword(sql, cursor, "IGNORE")) {
+            return null;
+        }
+        cursor = skipWhitespace(sql, cursor + "IGNORE".length());
+        if (!startsKeyword(sql, cursor, "INTO")) {
+            return null;
+        }
+        cursor = skipWhitespace(sql, cursor + "INTO".length());
+        SqlIdentifierReference table = sqlIdentifierReferenceAt(sql, cursor);
+        if (table == null || !isProcedureTemporaryTableName(table.token())) {
+            return null;
+        }
+        List<String> keyColumns = keyColumnsByTable.get(normalizedTableKey(table.token()));
+        if (keyColumns == null || keyColumns.isEmpty()) {
+            return null;
+        }
+        int openParen = skipWhitespace(sql, table.end());
+        if (openParen >= sql.length() || sql.charAt(openParen) != '(') {
+            return null;
+        }
+        int closeParen = findMatchingParen(sql, openParen);
+        if (closeParen <= openParen) {
+            return null;
+        }
+        List<String> targetColumns = insertTargetColumns(sql.substring(openParen + 1, closeParen));
+        if (targetColumns.isEmpty()) {
+            return null;
+        }
+        cursor = skipWhitespace(sql, closeParen + 1);
+        if (!startsKeyword(sql, cursor, "SELECT")) {
+            return null;
+        }
+        int statementEnd = findStatementTerminator(sql, cursor);
+        String selectBody = sql.substring(cursor + "SELECT".length(), statementEnd);
+        int fromIndex = topLevelKeywordIndex(selectBody, "FROM");
+        if (fromIndex < 0) {
+            return null;
+        }
+        List<String> selectItems = splitTopLevelComma(selectBody.substring(0, fromIndex));
+        if (selectItems.size() != targetColumns.size()) {
+            return null;
+        }
+        String fromTail = selectBody.substring(fromIndex).strip();
+        String mergeSql = temporaryInsertIgnoreMergeSql(table.token(), targetColumns, selectItems, fromTail, keyColumns);
+        return mergeSql.isBlank() ? null : new TemporaryInsertIgnoreSelect(insertIndex, statementEnd, mergeSql);
+    }
+
+    private List<String> insertTargetColumns(String columns) {
+        List<String> targetColumns = new ArrayList<>();
+        for (String column : splitTopLevelComma(columns)) {
+            String columnName = unquoteIdentifier(lastIdentifierPart(column.strip()));
+            if (columnName.isBlank()) {
+                return List.of();
+            }
+            targetColumns.add(columnName);
+        }
+        return targetColumns;
+    }
+
+    private String temporaryInsertIgnoreMergeSql(
+            String tableToken,
+            List<String> targetColumns,
+            List<String> selectItems,
+            String fromTail,
+            List<String> keyColumns
+    ) {
+        List<String> normalizedTargetColumns = targetColumns.stream()
+                .map(this::normalizedIdentifierKey)
+                .toList();
+        for (String keyColumn : keyColumns) {
+            if (!normalizedTargetColumns.contains(normalizedIdentifierKey(keyColumn))) {
+                return "";
+            }
+        }
+        StringBuilder merge = new StringBuilder();
+        merge.append("MERGE INTO ")
+                .append(tableToken.strip())
+                .append(" t\n")
+                .append("USING (\n")
+                .append("    SELECT ");
+        for (int i = 0; i < targetColumns.size(); i++) {
+            if (i > 0) {
+                merge.append(", ");
+            }
+            merge.append(stripSelectItemAlias(selectItems.get(i).strip()))
+                    .append(" AS ")
+                    .append(dmSimpleIdentifier(targetColumns.get(i)));
+        }
+        merge.append("\n    ")
+                .append(fromTail)
+                .append("\n")
+                .append(") s\n")
+                .append("ON (");
+        for (int i = 0; i < keyColumns.size(); i++) {
+            if (i > 0) {
+                merge.append(" AND ");
+            }
+            String column = dmSimpleIdentifier(keyColumns.get(i));
+            merge.append("t.")
+                    .append(column)
+                    .append(" = s.")
+                    .append(column);
+        }
+        merge.append(")\nWHEN NOT MATCHED THEN INSERT (");
+        for (int i = 0; i < targetColumns.size(); i++) {
+            if (i > 0) {
+                merge.append(", ");
+            }
+            merge.append(dmSimpleIdentifier(targetColumns.get(i)));
+        }
+        merge.append(") VALUES (");
+        for (int i = 0; i < targetColumns.size(); i++) {
+            if (i > 0) {
+                merge.append(", ");
+            }
+            merge.append("s.").append(dmSimpleIdentifier(targetColumns.get(i)));
+        }
+        merge.append(")");
+        return merge.toString();
+    }
+
+    private String stripSelectItemAlias(String item) {
+        Matcher explicitAliasMatcher = Pattern.compile("(?is)^(.+?)\\s+AS\\s+(" + SQL_IDENTIFIER_TOKEN + ")\\s*$")
+                .matcher(item);
+        if (explicitAliasMatcher.matches()) {
+            return explicitAliasMatcher.group(1).strip();
+        }
+        Matcher implicitAliasMatcher = Pattern.compile(
+                "(?is)^(.+?)\\s+([A-Za-z_][A-Za-z0-9_$]*|`[^`]+`|\"[^\"]+\")\\s*$"
+        ).matcher(item);
+        if (implicitAliasMatcher.matches()
+                && !endsWithReservedSelectWord(implicitAliasMatcher.group(1))) {
+            return implicitAliasMatcher.group(1).strip();
+        }
+        return item;
+    }
+
+    private String dmSimpleIdentifier(String identifier) {
+        String unquoted = unquoteIdentifier(lastIdentifierPart(identifier.strip()));
+        if (Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*").matcher(unquoted).matches()) {
+            return unquoted;
+        }
+        return "\"" + unquoted.replace("\"", "\"\"") + "\"";
+    }
+
+    private String normalizedTableKey(String tableToken) {
+        return normalizedIdentifierKey(unquoteIdentifier(lastIdentifierPart(tableToken.strip())));
+    }
+
+    private String normalizedIdentifierKey(String identifier) {
+        return unquoteIdentifier(lastIdentifierPart(identifier.strip())).toLowerCase(Locale.ROOT);
+    }
+
     private String procedureTempTableColumnDefinitions(LinkedHashSet<String> columns) {
         List<String> definitions = new ArrayList<>();
         for (String column : columns) {
@@ -978,6 +1313,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_TEMPORARY_INDEX_NOOP_RULE);
         }
 
+        String alterModifySql = normalizeMysqlAlterModifySyntax(converted);
+        if (!alterModifySql.equals(converted)) {
+            converted = alterModifySql;
+            rules.add(MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE);
+        }
+
         String callArgumentCommentSql = removeMysqlCallArgumentLineComments(converted);
         if (!callArgumentCommentSql.equals(converted)) {
             converted = callArgumentCommentSql;
@@ -1002,6 +1343,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_CREATE_PROCEDURE_TO_DM_RULE);
         }
 
+        String procedureIdentifierSql = normalizeMysqlProcedureIdentifiers(converted);
+        if (!procedureIdentifierSql.equals(converted)) {
+            converted = procedureIdentifierSql;
+            rules.add(MYSQL_PROCEDURE_IDENTIFIER_TO_DM_RULE);
+        }
+
         String localLabelSql = convertMysqlProcedureBeginLabels(converted);
         if (!localLabelSql.equals(converted)) {
             converted = localLabelSql;
@@ -1012,6 +1359,12 @@ class SqlScriptMigrator {
         if (!cursorHandlerLoopSql.equals(converted)) {
             converted = cursorHandlerLoopSql;
             rules.add(MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP_RULE);
+        }
+
+        String controlFlowSql = convertMysqlProcedureControlFlowSyntax(converted);
+        if (!controlFlowSql.equals(converted)) {
+            converted = controlFlowSql;
+            rules.add(MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE);
         }
 
         String unusedCursorHandlerSql = removeUnusedMysqlCursorHandlers(converted);
@@ -1084,6 +1437,12 @@ class SqlScriptMigrator {
         if (!procedureLocalSetSql.equals(converted)) {
             converted = procedureLocalSetSql;
             rules.add(MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE);
+        }
+
+        String tempInsertIgnoreSql = convertMysqlProcedureTemporaryInsertIgnore(converted);
+        if (!tempInsertIgnoreSql.equals(converted)) {
+            converted = tempInsertIgnoreSql;
+            rules.add(MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE_RULE);
         }
 
         String jsonEscapeSql = normalizeMysqlJsonEscapesInSqlStringLiterals(converted);
@@ -1200,6 +1559,66 @@ class SqlScriptMigrator {
             return sql;
         }
         return matcher.group(1) + matcher.group(2).stripTrailing();
+    }
+
+    private String normalizeMysqlAlterModifySyntax(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        int start = skipWhitespace(sql, 0);
+        if (!startsKeyword(sql, start, "ALTER")) {
+            return sql;
+        }
+        int cursor = skipWhitespace(sql, start + "ALTER".length());
+        if (!startsKeyword(sql, cursor, "TABLE")) {
+            return sql;
+        }
+        if (!containsKeywordOutsideIgnoredText(sql, "MODIFY")) {
+            return sql;
+        }
+        String converted = replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile("(?is)\\bMODIFY\\s+COLUMN\\b"),
+                matcher -> "MODIFY"
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\s+AFTER\\s+(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?=\\s*(?:,|$))"),
+                matcher -> ""
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\s+FIRST(?=\\s*(?:,|$))"),
+                matcher -> ""
+        );
+        return normalizeMysqlDataTypes(converted);
+    }
+
+    private String normalizeMysqlProcedureIdentifiers(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        String converted = replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile("(?is)(\\b(?:CREATE\\s+(?:OR\\s+REPLACE\\s+)?|DROP\\s+)PROCEDURE\\s+"
+                        + "(?:IF\\s+EXISTS\\s+)?)(`([^`]+)`)"),
+                matcher -> matcher.group(1) + dmRoutineIdentifier(matcher.group(3), matcher.group(2))
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)(\\bCALL\\s+)(`([^`]+)`)(?=\\s*\\()"),
+                matcher -> matcher.group(1) + dmRoutineIdentifier(matcher.group(3), matcher.group(2))
+        );
+        return converted;
+    }
+
+    private String dmRoutineIdentifier(String identifier, String fallback) {
+        if (identifier == null || identifier.isBlank()) {
+            return fallback;
+        }
+        return Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*").matcher(identifier).matches()
+                ? identifier
+                : fallback;
     }
 
     private String removeMysqlCallArgumentLineComments(String sql) {
@@ -1561,6 +1980,27 @@ class SqlScriptMigrator {
                 + matcher.group(1).toUpperCase(Locale.ROOT)
                 + " "
                 + normalizeMysqlDataTypes(matcher.group(3).strip());
+    }
+
+    private String convertMysqlProcedureControlFlowSyntax(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        String converted = replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile("(?is)\\bELSEIF\\b"),
+                matcher -> "ELSIF"
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\bEND\\s+WHILE\\b"),
+                matcher -> "END LOOP"
+        );
+        return replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\bWHILE\\s+(.+?)\\s+DO\\b"),
+                matcher -> "WHILE " + matcher.group(1).strip() + " LOOP"
+        );
     }
 
     private String convertProcedureClobEmptyStringChecks(String sql) {
@@ -2012,12 +2452,21 @@ class SqlScriptMigrator {
         }
         int operatorIndex = skipWhitespace(sql, targetEnd);
         if (operatorIndex >= sql.length()
-                || sql.charAt(operatorIndex) != '='
-                || (operatorIndex + 1 < sql.length() && sql.charAt(operatorIndex + 1) == '=')
                 || !variableNames.containsKey(normalizedProcedureVariableName(sql.substring(targetStart, targetEnd)))) {
             return null;
         }
-        int expressionStart = skipWhitespace(sql, operatorIndex + 1);
+        int operatorEnd;
+        if (sql.charAt(operatorIndex) == ':'
+                && operatorIndex + 1 < sql.length()
+                && sql.charAt(operatorIndex + 1) == '=') {
+            operatorEnd = operatorIndex + 2;
+        } else if (sql.charAt(operatorIndex) == '='
+                && (operatorIndex + 1 >= sql.length() || sql.charAt(operatorIndex + 1) != '=')) {
+            operatorEnd = operatorIndex + 1;
+        } else {
+            return null;
+        }
+        int expressionStart = skipWhitespace(sql, operatorEnd);
         int statementEnd = findStatementTerminator(sql, expressionStart);
         String expression = sql.substring(expressionStart, statementEnd).strip();
         if (expression.isBlank() || splitTopLevelComma(expression).size() > 1) {
@@ -2366,11 +2815,27 @@ class SqlScriptMigrator {
             if (cursor + 1 < sql.length()
                     && sql.charAt(cursor) == ':'
                     && sql.charAt(cursor + 1) == '='
-                    && !statementStartsWithKeyword(sql, reference.start(), "SET")) {
+                    && !statementStartsWithKeyword(sql, reference.start(), "SET")
+                    && !previousWordIsKeyword(sql, reference.start(), "SET")) {
                 return true;
             }
         }
         return false;
+    }
+
+    private boolean previousWordIsKeyword(String sql, int beforeIndex, String keyword) {
+        int cursor = Math.min(beforeIndex, sql.length()) - 1;
+        while (cursor >= 0 && Character.isWhitespace(sql.charAt(cursor))) {
+            cursor--;
+        }
+        int end = cursor + 1;
+        while (cursor >= 0 && (Character.isLetterOrDigit(sql.charAt(cursor)) || sql.charAt(cursor) == '_')) {
+            cursor--;
+        }
+        if (end <= cursor + 1) {
+            return false;
+        }
+        return sql.substring(cursor + 1, end).equalsIgnoreCase(keyword);
     }
 
     private boolean statementStartsWithKeyword(String sql, int beforeIndex, String keyword) {
@@ -2693,6 +3158,39 @@ class SqlScriptMigrator {
             } else if (current == '`') {
                 index = skipBacktickIdentifier(value, index);
             } else if (current == '(') {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private int findTopLevelChar(String value, char target, int start) {
+        int index = Math.max(0, start);
+        int depth = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(value, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(value, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(value, index);
+            } else if (startsLineComment(value, index)) {
+                index = skipUntilLineEnd(value, index);
+            } else if (startsBlockComment(value, index)) {
+                index = skipUntilBlockCommentEnd(value, index);
+            } else if (current == '(') {
+                if (current == target && depth == 0) {
+                    return index;
+                }
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (current == target && depth == 0) {
                 return index;
             } else {
                 index++;
@@ -3068,7 +3566,11 @@ class SqlScriptMigrator {
         if (temporaryIndexDdl != null) {
             return List.of(temporaryIndexDdl);
         }
-        converted = Pattern.compile("(?is)\\bMODIFY\\s+COLUMN\\b").matcher(converted).replaceAll("MODIFY");
+        converted = normalizeMysqlAlterModifySyntax(converted);
+        String withoutInlineKeys = removeMysqlCreateTableInlineKeyDefinitions(converted);
+        if (!withoutInlineKeys.equals(converted)) {
+            converted = withoutInlineKeys;
+        }
         converted = replaceOutsideIgnoredText(converted, List.of(
                 new TextReplacement(
                         Pattern.compile("(?is)\\s+CHARACTER\\s+SET\\s*=\\s*[A-Za-z0-9_]+"),
@@ -3088,6 +3590,7 @@ class SqlScriptMigrator {
                 )
         ));
         converted = normalizeMysqlDataTypes(converted);
+        converted = convertProcedureCreateTableDdlSyntax(converted);
         converted = normalizeProcedureDynamicDdlSpacing(converted);
         converted = convertProcedureCreateViewDdlSyntax(converted);
         return splitMultiModifyAlterTable(converted).stream().map(ProcedureStatement::dynamicSql).toList();
@@ -3106,6 +3609,87 @@ class SqlScriptMigrator {
         return Pattern.compile("(?is)\\b(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)\\s*\\(\\s*\\d+\\s*\\)")
                 .matcher(converted)
                 .replaceAll("$1");
+    }
+
+    private String removeMysqlCreateTableInlineKeyDefinitions(String ddl) {
+        int start = skipWhitespace(ddl, 0);
+        if (!startsKeyword(ddl, start, "CREATE")) {
+            return ddl;
+        }
+        int cursor = skipWhitespace(ddl, start + "CREATE".length());
+        if (startsKeyword(ddl, cursor, "TEMPORARY")) {
+            cursor = skipWhitespace(ddl, cursor + "TEMPORARY".length());
+        }
+        if (!startsKeyword(ddl, cursor, "TABLE")) {
+            return ddl;
+        }
+        int openParen = findTopLevelChar(ddl, '(', cursor + "TABLE".length());
+        if (openParen < 0) {
+            return ddl;
+        }
+        int closeParen = findMatchingParen(ddl, openParen);
+        if (closeParen <= openParen) {
+            return ddl;
+        }
+        List<String> parts = splitTopLevelComma(ddl.substring(openParen + 1, closeParen));
+        List<String> convertedParts = new ArrayList<>(parts.size());
+        boolean changed = false;
+        for (String part : parts) {
+            String stripped = part.stripLeading();
+            if (isMysqlCreateTableInlineSecondaryKey(stripped)) {
+                changed = true;
+                continue;
+            }
+            String withoutUsingBtree = replaceOutsideIgnoredText(
+                    part,
+                    Pattern.compile("(?is)\\s+USING\\s+BTREE\\b"),
+                    matcher -> ""
+            );
+            if (!withoutUsingBtree.equals(part)) {
+                changed = true;
+            }
+            convertedParts.add(withoutUsingBtree);
+        }
+        if (!changed) {
+            return ddl;
+        }
+        return ddl.substring(0, openParen + 1)
+                + String.join(",", convertedParts)
+                + ddl.substring(closeParen);
+    }
+
+    private boolean isMysqlCreateTableInlineSecondaryKey(String part) {
+        int cursor = skipWhitespace(part, 0);
+        if (startsKeyword(part, cursor, "KEY") || startsKeyword(part, cursor, "INDEX")) {
+            return true;
+        }
+        if (startsKeyword(part, cursor, "UNIQUE")) {
+            cursor = skipWhitespace(part, cursor + "UNIQUE".length());
+            return startsKeyword(part, cursor, "KEY") || startsKeyword(part, cursor, "INDEX");
+        }
+        if (startsKeyword(part, cursor, "FULLTEXT") || startsKeyword(part, cursor, "SPATIAL")) {
+            cursor = skipWhitespace(part, cursor + (startsKeyword(part, cursor, "FULLTEXT")
+                    ? "FULLTEXT".length()
+                    : "SPATIAL".length()));
+            return startsKeyword(part, cursor, "KEY") || startsKeyword(part, cursor, "INDEX");
+        }
+        return false;
+    }
+
+    private String convertProcedureCreateTableDdlSyntax(String ddl) {
+        int start = skipWhitespace(ddl, 0);
+        if (!startsKeyword(ddl, start, "CREATE")) {
+            return ddl;
+        }
+        int cursor = skipWhitespace(ddl, start + "CREATE".length());
+        if (startsKeyword(ddl, cursor, "TEMPORARY")) {
+            cursor = skipWhitespace(ddl, cursor + "TEMPORARY".length());
+        }
+        if (!startsKeyword(ddl, cursor, "TABLE")) {
+            return ddl;
+        }
+        SqlConversionResult conversion = converter.convert(ddl);
+        return conversion.convertedSql();
     }
 
     private String convertProcedureCreateViewDdlSyntax(String ddl) {
@@ -4190,6 +4774,15 @@ class SqlScriptMigrator {
     }
 
     private record ProcedureReferenceRename(String sql, boolean changed) {
+    }
+
+    private record TemporaryTableKey(String tableKey, List<String> keyColumns, int end) {
+        private TemporaryTableKey {
+            keyColumns = List.copyOf(keyColumns == null ? List.of() : keyColumns);
+        }
+    }
+
+    private record TemporaryInsertIgnoreSelect(int start, int end, String mergeSql) {
     }
 
     private record ProcedureSetAssignment(int targetStart, int targetEnd, int expressionStart, int statementEnd) {

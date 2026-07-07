@@ -405,6 +405,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE);
         }
 
+        GenericConversion autoIncrementConversion = convertMysqlAutoIncrement(converted);
+        if (autoIncrementConversion.changed()) {
+            converted = autoIncrementConversion.convertedSql();
+            rules.add(MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE);
+        }
+
         GenericConversion decimalPrecisionConversion = capMysqlDecimalPrecision(converted);
         if (decimalPrecisionConversion.changed()) {
             converted = decimalPrecisionConversion.convertedSql();
@@ -1626,12 +1632,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             } else if (startsKeyword(sql, index, "AUTO_INCREMENT")) {
                 int afterKeyword = skipWhitespace(sql, index + "AUTO_INCREMENT".length());
                 if (afterKeyword < sql.length() && sql.charAt(afterKeyword) == '=') {
-                    index = skipMysqlTableOptionValue(sql, afterKeyword + 1);
+                    int optionEnd = skipMysqlTableOptionValue(sql, afterKeyword + 1);
+                    converted.append(sql, index, optionEnd);
+                    index = optionEnd;
                 } else {
                     converted.append("IDENTITY(1,1)");
+                    changed = true;
                     index += "AUTO_INCREMENT".length();
                 }
-                changed = true;
             } else {
                 converted.append(current);
                 index++;

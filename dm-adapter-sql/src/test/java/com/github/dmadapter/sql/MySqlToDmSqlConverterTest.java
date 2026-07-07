@@ -476,7 +476,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table if not exists tmp_budget_payment_receipt (
-                  `id` bigint NOT NULL AUTO_INCREMENT,
+                  `id` bigint NOT NULL IDENTITY(1,1),
                   `chargeItem` varchar(600) DEFAULT NULL,
                   PRIMARY KEY (`id`)
                 )
@@ -485,6 +485,7 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE,
                 MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
         );
     }
@@ -528,7 +529,7 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .contains("`id` bigint NOT NULL AUTO_INCREMENT")
+                .contains("`id` bigint NOT NULL IDENTITY(1,1)")
                 .contains("`type` int DEFAULT NULL")
                 .contains("`doneFlag` tinyint DEFAULT NULL")
                 .contains("PRIMARY KEY (`id`)")
@@ -545,6 +546,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.appliedRules()).contains(
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE,
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_USING_BTREE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE,
@@ -570,12 +572,15 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
+                .contains("id bigint NOT NULL IDENTITY(1,1)")
                 .contains("GENERATED ALWAYS AS (concat(path, houseId, _utf8mb3'/'))")
+                .doesNotContain("AUTO_INCREMENT")
                 .doesNotContain(" STORED")
                 .doesNotContain("INDEX idx_request_id")
                 .doesNotContain("KEY idx_interface_time");
         assertThat(result.appliedRules()).contains(
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
                 MySqlToDmSqlConverter.MYSQL_GENERATED_COLUMN_STORED_REMOVAL_RULE
         );
     }
@@ -615,12 +620,15 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 CREATE TABLE if not exists tmp_daily_property_rule (
-                    id bigint NOT NULL AUTO_INCREMENT,
+                    id bigint NOT NULL IDENTITY(1,1),
                     `dailyProperty` varchar(64) DEFAULT NULL,
                     PRIMARY KEY (id)
                 ) ;
                 """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE
+        );
         assertThat(result.convertedSql()).doesNotContainIgnoringCase("COMMENT");
     }
 
