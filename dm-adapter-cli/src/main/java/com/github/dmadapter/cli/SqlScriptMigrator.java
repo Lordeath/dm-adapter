@@ -845,16 +845,18 @@ class SqlScriptMigrator {
             if (Pattern.compile("(?i)_idx(?:_|$)").matcher(tableName).find()) {
                 continue;
             }
-            tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
+            temporaryTableColumnsFor(tableColumns, tableName);
         }
         collectCreateTableDefinitionColumns(sql, tableColumns);
         collectCreateTableSelectColumns(sql, tableColumns);
+        collectTemporaryAlterTableAddColumns(sql, tableColumns);
         collectInsertSelectColumns(sql, tableColumns);
         collectMergeInsertColumns(sql, tableColumns);
+        collectTemporaryColumnMarkers(sql, tableColumns);
         propagateCreateTableSelectStarColumns(sql, tableColumns);
         for (LinkedHashSet<String> columns : tableColumns.values()) {
             for (ProcedureTempTableColumn defaultColumn : PROCEDURE_TEMP_TABLE_DEFAULT_COLUMNS) {
-                columns.add(defaultColumn.name());
+                addColumnIfAbsentIgnoreCase(columns, defaultColumn.name());
             }
         }
         return tableColumns;
@@ -878,11 +880,11 @@ class SqlScriptMigrator {
             if (closeParen <= openParen) {
                 continue;
             }
-            LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
+            LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
             for (String part : splitTopLevelComma(sql.substring(openParen + 1, closeParen))) {
                 String columnName = createTableColumnDefinitionName(part.strip());
                 if (!columnName.isBlank()) {
-                    targetColumns.add(columnName);
+                    addColumnIfAbsentIgnoreCase(targetColumns, columnName);
                 }
             }
         }
@@ -930,8 +932,44 @@ class SqlScriptMigrator {
             if (columns.isEmpty()) {
                 continue;
             }
-            LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
-            targetColumns.addAll(columns);
+            LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
+            addColumnsIfAbsentIgnoreCase(targetColumns, columns);
+        }
+    }
+
+    private void collectTemporaryAlterTableAddColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+ADD\\s+"
+                        + "(?:COLUMN\\s+)?(?<definition>[^;]+)"
+        ).matcher(sql);
+        while (matcher.find()) {
+            String tableName = matcher.group("table").strip();
+            if (!isProcedureTemporaryTableName(tableName)) {
+                continue;
+            }
+            String columnName = createTableColumnDefinitionName(matcher.group("definition").strip());
+            if (!columnName.isBlank()) {
+                addColumnIfAbsentIgnoreCase(temporaryTableColumnsFor(tableColumns, tableName), columnName);
+            }
+        }
+    }
+
+    private void collectTemporaryColumnMarkers(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)/\\*\\s*DM_ADAPTER_TMP_COLUMN\\s+(?<table>[A-Za-z_][A-Za-z0-9_]*)\\s+"
+                        + "(?<column>[A-Za-z_][A-Za-z0-9_]*)\\s*\\*/"
+        ).matcher(sql);
+        while (matcher.find()) {
+            addColumnIfAbsentIgnoreCase(
+                    temporaryTableColumnsFor(tableColumns, matcher.group("table")),
+                    matcher.group("column")
+            );
         }
     }
 
@@ -953,12 +991,9 @@ class SqlScriptMigrator {
                         || !isProcedureTemporaryTableName(matcher.group("source"))) {
                     continue;
                 }
-                LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(
-                        matcher.group("target").strip(),
-                        ignored -> new LinkedHashSet<>()
-                );
+                LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, matcher.group("target"));
                 LinkedHashSet<String> sourceColumns = temporaryTableColumns(tableColumns, matcher.group("source"));
-                if (sourceColumns != null && targetColumns.addAll(sourceColumns)) {
+                if (sourceColumns != null && addColumnsIfAbsentIgnoreCase(targetColumns, sourceColumns)) {
                     changed = true;
                 }
             }
@@ -977,11 +1012,11 @@ class SqlScriptMigrator {
             if (!isProcedureTemporaryTableName(tableName)) {
                 continue;
             }
-            LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
+            LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
             for (String column : splitTopLevelComma(matcher.group("columns"))) {
                 String columnName = unquoteIdentifier(lastIdentifierPart(column.strip()));
                 if (!columnName.isBlank()) {
-                    targetColumns.add(columnName);
+                    addColumnIfAbsentIgnoreCase(targetColumns, columnName);
                 }
             }
         }
@@ -1001,11 +1036,11 @@ class SqlScriptMigrator {
             if (!isProcedureTemporaryTableName(tableName)) {
                 continue;
             }
-            LinkedHashSet<String> targetColumns = tableColumns.computeIfAbsent(tableName, ignored -> new LinkedHashSet<>());
+            LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
             for (String column : splitTopLevelComma(matcher.group("columns"))) {
                 String columnName = unquoteIdentifier(lastIdentifierPart(column.strip()));
                 if (!columnName.isBlank()) {
-                    targetColumns.add(columnName);
+                    addColumnIfAbsentIgnoreCase(targetColumns, columnName);
                 }
             }
         }
@@ -4052,6 +4087,10 @@ class SqlScriptMigrator {
         if (temporaryCreateTableSelect != null) {
             return List.of(temporaryCreateTableSelect);
         }
+        ProcedureStatement temporaryAddColumn = convertTemporaryAlterTableAddColumnToNoop(converted);
+        if (temporaryAddColumn != null) {
+            return List.of(temporaryAddColumn);
+        }
         List<String> indexAlterStatements = splitMysqlAlterTableDropAndAddIndexes(converted);
         if (!indexAlterStatements.isEmpty()) {
             return indexAlterStatements.stream().map(ProcedureStatement::dynamicSql).toList();
@@ -4350,6 +4389,24 @@ class SqlScriptMigrator {
         return ProcedureStatement.directSql("DELETE FROM " + matcher.group("table").strip());
     }
 
+    private ProcedureStatement convertTemporaryAlterTableAddColumnToNoop(String ddl) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+ADD\\s+"
+                        + "(?:COLUMN\\s+)?(?<definition>.+)$"
+        ).matcher(ddl.strip());
+        if (!matcher.matches() || !isProcedureTemporaryTableName(matcher.group("table"))) {
+            return null;
+        }
+        String columnName = createTableColumnDefinitionName(matcher.group("definition").strip());
+        if (columnName.isBlank()) {
+            return null;
+        }
+        String tableName = normalizeIdentifierSegment(unquoteIdentifier(lastIdentifierPart(matcher.group("table"))));
+        String normalizedColumn = normalizeIdentifierSegment(columnName);
+        return ProcedureStatement.directSql("NULL /* DM_ADAPTER_TMP_COLUMN "
+                + tableName + " " + normalizedColumn + " */");
+    }
+
     private ProcedureStatement convertTemporaryCreateTableSelectToInsert(
             String ddl,
             Map<String, LinkedHashSet<String>> temporaryTableColumns
@@ -4414,6 +4471,19 @@ class SqlScriptMigrator {
         return columns;
     }
 
+    private LinkedHashSet<String> temporaryTableColumnsFor(
+            LinkedHashMap<String, LinkedHashSet<String>> temporaryTableColumns,
+            String table
+    ) {
+        LinkedHashSet<String> existing = temporaryTableColumns(temporaryTableColumns, table);
+        if (existing != null) {
+            return existing;
+        }
+        LinkedHashSet<String> columns = new LinkedHashSet<>();
+        temporaryTableColumns.put(table.strip(), columns);
+        return columns;
+    }
+
     private LinkedHashSet<String> temporaryTableColumns(
             Map<String, LinkedHashSet<String>> temporaryTableColumns,
             String table
@@ -4425,6 +4495,26 @@ class SqlScriptMigrator {
             }
         }
         return null;
+    }
+
+    private boolean addColumnsIfAbsentIgnoreCase(LinkedHashSet<String> columns, Iterable<String> candidates) {
+        boolean changed = false;
+        for (String candidate : candidates) {
+            changed |= addColumnIfAbsentIgnoreCase(columns, candidate);
+        }
+        return changed;
+    }
+
+    private boolean addColumnIfAbsentIgnoreCase(LinkedHashSet<String> columns, String candidate) {
+        if (candidate == null || candidate.isBlank()) {
+            return false;
+        }
+        for (String existing : columns) {
+            if (existing.equalsIgnoreCase(candidate)) {
+                return false;
+            }
+        }
+        return columns.add(candidate);
     }
 
     private String singleSelectStarSourceTable(String selectTail) {

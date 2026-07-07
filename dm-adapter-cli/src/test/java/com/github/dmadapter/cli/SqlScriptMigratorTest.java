@@ -470,6 +470,7 @@ class SqlScriptMigratorTest {
                     END IF;
                     DROP TEMPORARY TABLE IF EXISTS tmp_demo_a,tmp_demo_b;
                     CREATE TEMPORARY TABLE IF NOT EXISTS tmp_demo_a SELECT 1 AS id;
+                    ALTER TABLE tmp_demo_a ADD COLUMN extra_name varchar(20);
                     CREATE TEMPORARY TABLE IF NOT EXISTS tmp_demo_b SELECT * FROM tmp_demo_a;
                     CREATE INDEX tmp_demo_idx ON tmp_demo_a(id);
                 END$$
@@ -490,9 +491,9 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("DROP TABLE IF EXISTS tmp_demo_a;")
-                .contains("CREATE TABLE tmp_demo_a (id BIGINT, enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
+                .contains("CREATE TABLE tmp_demo_a (id BIGINT, extra_name VARCHAR(200), enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
                 .contains("DROP TABLE IF EXISTS tmp_demo_b;")
-                .contains("CREATE TABLE tmp_demo_b (id BIGINT, enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
+                .contains("CREATE TABLE tmp_demo_b (id BIGINT, extra_name VARCHAR(200), enterprise_id BIGINT, organization_id BIGINT, roleid VARCHAR(200), orderindex BIGINT);")
                 .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON, row_count OUT int) AS")
                 .contains("""
                             v_index INT := 0;
@@ -504,11 +505,12 @@ class SqlScriptMigratorTest {
                 .contains("DELETE FROM tmp_demo_a;")
                 .contains("DELETE FROM tmp_demo_b;")
                 .contains("INSERT INTO tmp_demo_a (id) SELECT 1 AS id;")
-                .contains("INSERT INTO tmp_demo_b (id, enterprise_id, organization_id, roleid, orderindex) SELECT * FROM tmp_demo_a;")
+                .contains("INSERT INTO tmp_demo_b (id, extra_name, enterprise_id, organization_id, roleid, orderindex) SELECT * FROM tmp_demo_a;")
                 .contains("NULL;")
                 .doesNotContain("label_exit:BEGIN")
                 .doesNotContain("LEAVE label_exit")
                 .doesNotContain("TEMPORARY TABLE")
+                .doesNotContain("ADD COLUMN extra_name")
                 .doesNotContain("EXECUTE IMMEDIATE 'DROP TABLE IF EXISTS tmp_demo_a'")
                 .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE tmp_demo_a");
         assertThat(report.files())
