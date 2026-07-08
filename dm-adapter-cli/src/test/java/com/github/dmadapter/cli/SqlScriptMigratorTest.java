@@ -1123,6 +1123,59 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsMysqlPrefixIndexWhenColumnTypeGuardLimitsItToVarcharColumns() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE add_prefix_index()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.statistics
+                        WHERE table_schema = database()
+                          AND table_name = 'sample_dictionaryitem'
+                          AND index_name = 'idx_item_code'
+                    ) AND EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = database()
+                          AND table_name = 'sample_dictionaryitem'
+                          AND column_name = 'item_code'
+                          AND data_type IN ('char', 'varchar')
+                    ) THEN
+                        ALTER TABLE sample_dictionaryitem
+                            ADD INDEX idx_item_code (dictionary_id, item_code(254));
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL add_prefix_index();
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE add_prefix_index() AS")
+                .contains("dm_adapter_exists INT;")
+                .contains("dm_adapter_exists_2 INT;")
+                .contains("ALL_IND_COLUMNS")
+                .contains("ALL_TAB_COLUMNS")
+                .contains("UPPER(DATA_TYPE) IN ('CHAR', 'VARCHAR')")
+                .contains("IF dm_adapter_exists = 0 AND dm_adapter_exists_2 > 0 THEN")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX sample_dictionaryitem_idx_item_code ON sample_dictionaryitem (dictionary_id, item_code)'")
+                .doesNotContain("information_schema")
+                .doesNotContain("item_code(254)");
+    }
+
+    @Test
     void convertsMysqlProcedureDropAndAddUniqueIndexAlterToSeparateDamengIndexDdl() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
