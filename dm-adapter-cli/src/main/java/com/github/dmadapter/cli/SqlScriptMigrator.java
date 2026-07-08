@@ -29,6 +29,7 @@ import java.util.stream.Stream;
 class SqlScriptMigrator {
     static final String MYSQL_CREATE_DEFINER_REMOVAL_RULE = "MYSQL_CREATE_DEFINER_REMOVED";
     static final String MYSQL_CREATE_PROCEDURE_TO_DM_RULE = "MYSQL_CREATE_PROCEDURE_TO_DM";
+    static final String MYSQL_CREATE_FUNCTION_TO_DM_RULE = "MYSQL_CREATE_FUNCTION_TO_DM";
     static final String MYSQL_SCRIPT_METADATA_TO_DM_RULE = "MYSQL_SCRIPT_METADATA_TO_DM";
     static final String MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVAL_RULE = "MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVED";
     static final String MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE = "MYSQL_SCHEMA_SCOPED_INDEX_NAME";
@@ -102,6 +103,12 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_GROUP_BY_ALIAS";
     static final String MYSQL_PROCEDURE_MISSING_SYS_TIME_RULE =
             "MYSQL_PROCEDURE_MISSING_SYS_TIME";
+    static final String MYSQL_PROCEDURE_DELETE_ALIAS_STAR_RULE =
+            "MYSQL_PROCEDURE_DELETE_ALIAS_STAR_TO_DM";
+    static final String MYSQL_PROCEDURE_RESERVED_CURSOR_RENAME_RULE =
+            "MYSQL_PROCEDURE_RESERVED_CURSOR_RENAMED";
+    static final String MYSQL_INSERT_VALUES_COLUMN_LIST_RULE =
+            "MYSQL_INSERT_VALUES_COLUMN_LIST";
     static final String DM_RESOURCECOLUMN_INSERT_ONLY_MERGE_RULE =
             "DM_RESOURCECOLUMN_INSERT_ONLY_MERGE";
 
@@ -167,6 +174,8 @@ class SqlScriptMigrator {
                     + "如果目标字段是 TEXT/CLOB，达梦不能直接建普通索引；"
                     + "请按业务确认是否改字段类型、改为函数/虚拟列索引，或移除该索引。";
     private static final int MYSQL_LONG_PREFIX_INDEX_LENGTH_THRESHOLD = 128;
+    private static final String SQL_WS_OR_COMMENT_TOKEN =
+            "(?:(?:\\s+)|(?:--[^\\r\\n]*(?:\\r?\\n|\\r|$))|(?:#[^\\r\\n]*(?:\\r?\\n|\\r|$))|(?:/\\*.*?\\*/))*";
     private static final Pattern CLOB_EMPTY_STRING_COMPARISON_PATTERN = Pattern.compile(
             "(?is)(?<left>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*(?:<>|!=)\\s*''"
     );
@@ -466,6 +475,7 @@ class SqlScriptMigrator {
         List<String> originalStatements = SqlScriptParser.statements(originalContent);
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
+        LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns = new LinkedHashMap<>();
         LinkedHashMap<String, String> scriptProcedureRenames = procedureObjectNameConflictRenames(originalStatements);
         LinkedHashSet<String> manualReviewProcedureNames = new LinkedHashSet<>();
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
@@ -476,7 +486,8 @@ class SqlScriptMigrator {
         for (int i = 0; i < originalStatements.size(); i++) {
             String originalStatement = originalStatements.get(i);
             ScriptStatementConversion conversion =
-                    convertStatement(originalStatement, scriptUserVariables, scriptProcedureRenames);
+                    convertStatement(originalStatement, scriptUserVariables, scriptTableColumns, scriptProcedureRenames);
+            collectScriptCreateTableDefinitionColumns(originalStatement, scriptTableColumns);
             List<String> outputStatements = expandConvertedOutputStatements(conversion.outputSql());
             String calledProcedureName = procedureNameFromCall(originalStatement);
             boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
@@ -766,6 +777,7 @@ class SqlScriptMigrator {
     private ScriptStatementConversion convertStatement(
             String originalStatement,
             LinkedHashMap<String, String> scriptUserVariables,
+            Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptProcedureRenames
     ) {
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(originalStatement);
@@ -801,7 +813,7 @@ class SqlScriptMigrator {
             sqlBody = procedureReferenceRename.sql();
             rules.add(MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE);
         }
-        SafeRuleConversion safeRuleConversion = applyScriptSafeRules(sqlBody);
+        SafeRuleConversion safeRuleConversion = applyScriptSafeRules(sqlBody, scriptTableColumns);
         SqlConversionResult sqlConversion = isConvertedSimpleDateEndTrigger(safeRuleConversion.sql())
                 ? SqlConversionResult.unchanged(safeRuleConversion.sql())
                 : converter.convert(safeRuleConversion.sql());
@@ -963,6 +975,33 @@ class SqlScriptMigrator {
             }
         }
         return tableColumns;
+    }
+
+    private void collectScriptCreateTableDefinitionColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns
+    ) {
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        String body = leadingSqlPrefix.body();
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                        + "(?<table>(?:" + SQL_IDENTIFIER_TOKEN + "))\\s*\\("
+        ).matcher(body);
+        if (!matcher.find()) {
+            return;
+        }
+        int openParen = matcher.end() - 1;
+        int closeParen = findMatchingParen(body, openParen);
+        if (closeParen <= openParen) {
+            return;
+        }
+        LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, matcher.group("table").strip());
+        for (String part : splitTopLevelComma(body.substring(openParen + 1, closeParen))) {
+            String columnName = createTableColumnDefinitionName(part.strip());
+            if (!columnName.isBlank()) {
+                addColumnIfAbsentIgnoreCase(targetColumns, columnName);
+            }
+        }
     }
 
     private boolean shouldApplyDefaultTemporaryColumns(String tableName, LinkedHashSet<String> columns) {
@@ -1282,6 +1321,125 @@ class SqlScriptMigrator {
         return statement.substring(0, table.end())
                 + " (" + String.join(", ", columns) + ")"
                 + statement.substring(table.end());
+    }
+
+    private String addKnownInsertValuesColumnLists(
+            String sql,
+            Map<String, LinkedHashSet<String>> tableColumns
+    ) {
+        if (tableColumns == null || tableColumns.isEmpty()) {
+            return sql;
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                int end = skipSingleQuotedString(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '"') {
+                int end = skipDoubleQuotedText(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '`') {
+                int end = skipBacktickIdentifier(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                int end = skipUntilLineEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsBlockComment(sql, index)) {
+                int end = skipUntilBlockCommentEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsKeyword(sql, index, "INSERT")) {
+                int end = findStatementTerminator(sql, index);
+                String statement = sql.substring(index, end);
+                String rewritten = addKnownInsertValuesColumnList(statement, tableColumns);
+                converted.append(rewritten);
+                changed = changed || !rewritten.equals(statement);
+                index = end;
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return changed ? converted.toString() : sql;
+    }
+
+    private String addKnownInsertValuesColumnList(
+            String statement,
+            Map<String, LinkedHashSet<String>> tableColumns
+    ) {
+        int start = skipWhitespace(statement, 0);
+        if (!startsKeyword(statement, start, "INSERT")) {
+            return statement;
+        }
+        int cursor = skipWhitespace(statement, start + "INSERT".length());
+        if (!startsKeyword(statement, cursor, "INTO")) {
+            return statement;
+        }
+        cursor = skipWhitespace(statement, cursor + "INTO".length());
+        SqlIdentifierReference table = sqlIdentifierReferenceAt(statement, cursor);
+        if (table == null) {
+            return statement;
+        }
+        LinkedHashSet<String> columns = temporaryTableColumns(tableColumns, table.token());
+        if (columns == null || columns.isEmpty()) {
+            return statement;
+        }
+        cursor = skipWhitespace(statement, table.end());
+        if (cursor < statement.length() && statement.charAt(cursor) == '(') {
+            return statement;
+        }
+        boolean valueKeyword;
+        if (startsKeyword(statement, cursor, "VALUES")) {
+            cursor = skipWhitespace(statement, cursor + "VALUES".length());
+            valueKeyword = true;
+        } else if (startsKeyword(statement, cursor, "VALUE")) {
+            cursor = skipWhitespace(statement, cursor + "VALUE".length());
+            valueKeyword = true;
+        } else {
+            valueKeyword = false;
+        }
+        if (!valueKeyword) {
+            return statement;
+        }
+        Integer valueCount = insertValuesColumnCount(statement, cursor);
+        if (valueCount == null || valueCount != columns.size()) {
+            return statement;
+        }
+        return statement.substring(0, table.end())
+                + " (" + String.join(", ", columns) + ")"
+                + statement.substring(table.end());
+    }
+
+    private Integer insertValuesColumnCount(String statement, int valuesIndex) {
+        int cursor = skipWhitespace(statement, valuesIndex);
+        Integer columnCount = null;
+        boolean sawTuple = false;
+        while (cursor < statement.length() && statement.charAt(cursor) == '(') {
+            int closeParen = findMatchingParen(statement, cursor);
+            if (closeParen <= cursor) {
+                return null;
+            }
+            int currentCount = splitTopLevelComma(statement.substring(cursor + 1, closeParen)).size();
+            if (currentCount == 0 || (columnCount != null && columnCount != currentCount)) {
+                return null;
+            }
+            columnCount = currentCount;
+            sawTuple = true;
+            cursor = skipWhitespace(statement, closeParen + 1);
+            if (cursor < statement.length() && statement.charAt(cursor) == ',') {
+                cursor = skipWhitespace(statement, cursor + 1);
+            } else {
+                break;
+            }
+        }
+        return sawTuple ? columnCount : null;
     }
 
     private boolean endsWithReservedSelectWord(String value) {
@@ -1768,7 +1926,10 @@ class SqlScriptMigrator {
         return "VARCHAR(4000)";
     }
 
-    private SafeRuleConversion applyScriptSafeRules(String sql) {
+    private SafeRuleConversion applyScriptSafeRules(
+            String sql,
+            Map<String, LinkedHashSet<String>> scriptTableColumns
+    ) {
         if (sql == null || sql.isBlank()) {
             return new SafeRuleConversion(sql == null ? "" : sql, false, List.of());
         }
@@ -1805,6 +1966,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE);
         }
 
+        String alterChangeSql = normalizeMysqlAlterChangeSyntax(converted);
+        if (!alterChangeSql.equals(converted)) {
+            converted = alterChangeSql;
+            rules.add(MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE);
+        }
+
         String callArgumentCommentSql = removeMysqlCallArgumentLineComments(converted);
         if (!callArgumentCommentSql.equals(converted)) {
             converted = callArgumentCommentSql;
@@ -1835,10 +2002,22 @@ class SqlScriptMigrator {
             rules.add(MYSQL_CREATE_PROCEDURE_TO_DM_RULE);
         }
 
+        String functionSql = convertCreateFunctionHeader(converted);
+        if (!functionSql.equals(converted)) {
+            converted = functionSql;
+            rules.add(MYSQL_CREATE_FUNCTION_TO_DM_RULE);
+        }
+
         String procedureIdentifierSql = normalizeMysqlProcedureIdentifiers(converted);
         if (!procedureIdentifierSql.equals(converted)) {
             converted = procedureIdentifierSql;
             rules.add(MYSQL_PROCEDURE_IDENTIFIER_TO_DM_RULE);
+        }
+
+        String reservedCursorSql = renameReservedProcedureCursorNames(converted);
+        if (!reservedCursorSql.equals(converted)) {
+            converted = reservedCursorSql;
+            rules.add(MYSQL_PROCEDURE_RESERVED_CURSOR_RENAME_RULE);
         }
 
         String localLabelSql = convertMysqlProcedureBeginLabels(converted);
@@ -1967,6 +2146,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_DYNAMIC_INSERT_IGNORE_TO_MERGE_RULE);
         }
 
+        String deleteAliasStarSql = convertMysqlProcedureDeleteAliasStar(converted);
+        if (!deleteAliasStarSql.equals(converted)) {
+            converted = deleteAliasStarSql;
+            rules.add(MYSQL_PROCEDURE_DELETE_ALIAS_STAR_RULE);
+        }
+
         String jsonEscapeSql = normalizeMysqlJsonEscapesInSqlStringLiterals(converted);
         if (!jsonEscapeSql.equals(converted)) {
             converted = jsonEscapeSql;
@@ -1983,6 +2168,12 @@ class SqlScriptMigrator {
         if (!procedureDdlSql.equals(converted)) {
             converted = procedureDdlSql;
             rules.add(MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE);
+        }
+
+        String insertValuesColumnListSql = addKnownInsertValuesColumnLists(converted, scriptTableColumns);
+        if (!insertValuesColumnListSql.equals(converted)) {
+            converted = insertValuesColumnListSql;
+            rules.add(MYSQL_INSERT_VALUES_COLUMN_LIST_RULE);
         }
 
         String procedureSysTimeSql = addProcedureMissingSysTimeInsertValues(converted);
@@ -2481,13 +2672,31 @@ class SqlScriptMigrator {
         return normalizeMysqlDataTypes(converted);
     }
 
+    private String normalizeMysqlAlterChangeSyntax(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*ALTER\\s+TABLE\\s+(?<table>(?:" + SQL_IDENTIFIER_TOKEN + "))\\s+"
+                        + "CHANGE(?:\\s+COLUMN)?\\s+(?<old>(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))\\s+"
+                        + "(?<name>(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))\\s+(?<type>.+)$"
+        ).matcher(sql);
+        if (!matcher.matches() || !sameIdentifier(matcher.group("old"), matcher.group("name"))) {
+            return sql;
+        }
+        return normalizeMysqlDataTypes(
+                "ALTER TABLE " + matcher.group("table") + " MODIFY " + matcher.group("name") + " "
+                        + matcher.group("type").strip()
+        );
+    }
+
     private String normalizeMysqlProcedureIdentifiers(String sql) {
         if (sql == null || sql.isBlank()) {
             return sql == null ? "" : sql;
         }
         String converted = replaceOutsideIgnoredText(
                 sql,
-                Pattern.compile("(?is)(\\b(?:CREATE\\s+(?:OR\\s+REPLACE\\s+)?|DROP\\s+)PROCEDURE\\s+"
+                Pattern.compile("(?is)(\\b(?:CREATE\\s+(?:OR\\s+REPLACE\\s+)?|DROP\\s+)(?:PROCEDURE|FUNCTION)\\s+"
                         + "(?:IF\\s+EXISTS\\s+)?)(`([^`]+)`)"),
                 matcher -> matcher.group(1) + dmRoutineIdentifier(matcher.group(3), matcher.group(2))
         );
@@ -2758,6 +2967,85 @@ class SqlScriptMigrator {
         return converted;
     }
 
+    private String convertCreateFunctionHeader(String sql) {
+        int start = skipWhitespace(sql, 0);
+        if (!startsKeyword(sql, start, "CREATE")) {
+            return sql;
+        }
+        int cursor = skipWhitespace(sql, start + "CREATE".length());
+        if (startsKeyword(sql, cursor, "OR")) {
+            cursor = skipWhitespace(sql, cursor + "OR".length());
+            if (!startsKeyword(sql, cursor, "REPLACE")) {
+                return sql;
+            }
+            cursor = skipWhitespace(sql, cursor + "REPLACE".length());
+        }
+        if (!startsKeyword(sql, cursor, "FUNCTION")) {
+            return sql;
+        }
+        cursor = skipWhitespace(sql, cursor + "FUNCTION".length());
+        int functionNameStart = cursor;
+        SqlIdentifierReference functionName = sqlIdentifierReferenceAt(sql, cursor);
+        if (functionName == null) {
+            return sql;
+        }
+        int openParen = skipWhitespace(sql, functionName.end());
+        if (openParen >= sql.length() || sql.charAt(openParen) != '(') {
+            return sql;
+        }
+        int closeParen = findMatchingParen(sql, openParen);
+        if (closeParen <= openParen) {
+            return sql;
+        }
+        int returnsIndex = skipWhitespace(sql, closeParen + 1);
+        if (!startsKeyword(sql, returnsIndex, "RETURNS")) {
+            return sql;
+        }
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0 || beginIndex <= returnsIndex) {
+            return sql;
+        }
+        String returnTypeAndOptions = sql.substring(
+                skipWhitespace(sql, returnsIndex + "RETURNS".length()),
+                beginIndex
+        );
+        String returnType = mysqlFunctionReturnType(returnTypeAndOptions);
+        if (returnType.isBlank()) {
+            return sql;
+        }
+        String signature = sql.substring(functionNameStart, closeParen + 1).stripTrailing();
+        return sql.substring(0, start)
+                + "CREATE OR REPLACE FUNCTION "
+                + signature
+                + "\nRETURN "
+                + normalizeMysqlDataTypes(returnType)
+                + "\nAS\nBEGIN"
+                + sql.substring(beginIndex + "BEGIN".length());
+    }
+
+    private String mysqlFunctionReturnType(String returnTypeAndOptions) {
+        String stripped = returnTypeAndOptions.strip();
+        if (stripped.isBlank()) {
+            return "";
+        }
+        int characteristicIndex = -1;
+        for (String keyword : List.of(
+                "DETERMINISTIC",
+                "NOT DETERMINISTIC",
+                "READS SQL DATA",
+                "NO SQL",
+                "CONTAINS SQL",
+                "MODIFIES SQL DATA",
+                "SQL SECURITY"
+        )) {
+            int index = topLevelKeywordIndex(stripped, keyword);
+            if (index >= 0 && (characteristicIndex < 0 || index < characteristicIndex)) {
+                characteristicIndex = index;
+            }
+        }
+        return characteristicIndex < 0 ? stripped : stripped.substring(0, characteristicIndex).strip();
+    }
+
     private String convertMysqlProcedureBeginLabels(String sql) {
         if (!isCreateProcedureStatement(sql)) {
             return sql;
@@ -2827,6 +3115,38 @@ class SqlScriptMigrator {
         return new LabelRemoval(changed ? converted.toString() : sql, changed, labels);
     }
 
+    private String renameReservedProcedureCursorNames(String sql) {
+        if (!isCreateProcedureStatement(sql)
+                || !Pattern.compile("(?is)\\bDECLARE\\s+object\\s+CURSOR\\s+FOR\\b").matcher(sql).find()) {
+            return sql;
+        }
+        String converted = replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile("(?is)(\\bDECLARE\\s+)object(\\s+CURSOR\\s+FOR\\b)"),
+                matcher -> matcher.group(1) + "dm_object_cursor" + matcher.group(2)
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)(\\bOPEN\\s+)object(\\s*;)"),
+                matcher -> matcher.group(1) + "dm_object_cursor" + matcher.group(2)
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)(\\bFETCH\\s+)object(\\s+INTO\\b)"),
+                matcher -> matcher.group(1) + "dm_object_cursor" + matcher.group(2)
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)(\\bCLOSE\\s+)object(\\s*;)"),
+                matcher -> matcher.group(1) + "dm_object_cursor" + matcher.group(2)
+        );
+        return replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\bobject\\s*%\\s*NOTFOUND\\b"),
+                matcher -> "dm_object_cursor%NOTFOUND"
+        );
+    }
+
     private String convertMysqlProcedureSignature(String signature) {
         int openParen = firstTopLevelParen(signature);
         if (openParen < 0) {
@@ -2870,7 +3190,7 @@ class SqlScriptMigrator {
     }
 
     private String convertMysqlProcedureControlFlowSyntax(String sql) {
-        if (!isCreateProcedureStatement(sql)) {
+        if (!isCreateRoutineStatement(sql)) {
             return sql;
         }
         String converted = replaceOutsideIgnoredText(
@@ -2995,6 +3315,12 @@ class SqlScriptMigrator {
         if (nameFirstMatcher.matches()) {
             return new ProcedureParameterParts(nameFirstMatcher.group(1), nameFirstMatcher.group(3));
         }
+        Matcher implicitInMatcher = Pattern.compile(
+                "(?is)^(" + SQL_IDENTIFIER_TOKEN + ")\\s+(.+)$"
+        ).matcher(stripped);
+        if (implicitInMatcher.matches()) {
+            return new ProcedureParameterParts(implicitInMatcher.group(1), implicitInMatcher.group(2));
+        }
         return null;
     }
 
@@ -3056,7 +3382,9 @@ class SqlScriptMigrator {
         if (beginIndex < 0) {
             return sql;
         }
-        int cursor = skipWhitespace(sql, beginIndex + "BEGIN".length());
+        int bodyStart = beginIndex + "BEGIN".length();
+        int cursor = skipWhitespaceAndComments(sql, bodyStart);
+        String leadingTrivia = sql.substring(bodyStart, cursor);
         List<String> declarations = new ArrayList<>();
         int declarationsEnd = cursor;
         while (startsKeyword(sql, cursor, "DECLARE")) {
@@ -3070,10 +3398,10 @@ class SqlScriptMigrator {
             }
             declarations.add(declaration);
             declarationsEnd = terminator + 1;
-            cursor = skipWhitespace(sql, declarationsEnd);
+            cursor = skipWhitespaceAndComments(sql, declarationsEnd);
         }
         if (declarations.isEmpty()) {
-            return sql;
+            return moveMysqlNestedBlockDeclarations(sql, beginIndex + "BEGIN".length());
         }
         StringBuilder converted = new StringBuilder(sql.length());
         converted.append(sql, 0, beginIndex);
@@ -3081,8 +3409,79 @@ class SqlScriptMigrator {
             converted.append("    ").append(declaration).append(";\n");
         }
         converted.append("BEGIN");
+        converted.append(leadingTrivia);
         converted.append(sql.substring(declarationsEnd));
+        return moveMysqlNestedBlockDeclarations(converted.toString(), beginIndex + "BEGIN".length());
+    }
+
+    private String moveMysqlNestedBlockDeclarations(String sql, int scanStart) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        int cursor = 0;
+        int index = Math.max(0, scanStart);
+        boolean changed = false;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "BEGIN")) {
+                NestedBlockDeclarations declarations = mysqlNestedBlockDeclarationsAt(sql, index);
+                if (declarations == null) {
+                    index += "BEGIN".length();
+                    continue;
+                }
+                converted.append(sql, cursor, index);
+                String indent = lineIndentBefore(sql, index);
+                converted.append("DECLARE\n");
+                for (String declaration : declarations.declarations()) {
+                    converted.append(indent).append("    ").append(declaration).append(";\n");
+                }
+                converted.append(indent).append("BEGIN");
+                converted.append(declarations.leadingTrivia());
+                cursor = declarations.declarationsEnd();
+                index = declarations.declarationsEnd();
+                changed = true;
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return sql;
+        }
+        converted.append(sql.substring(cursor));
         return converted.toString();
+    }
+
+    private NestedBlockDeclarations mysqlNestedBlockDeclarationsAt(String sql, int beginIndex) {
+        int bodyStart = beginIndex + "BEGIN".length();
+        int cursor = skipWhitespaceAndComments(sql, bodyStart);
+        String leadingTrivia = sql.substring(bodyStart, cursor);
+        List<String> declarations = new ArrayList<>();
+        int declarationsEnd = cursor;
+        while (startsKeyword(sql, cursor, "DECLARE")) {
+            int terminator = findStatementTerminator(sql, cursor);
+            if (terminator >= sql.length()) {
+                return null;
+            }
+            String declaration = convertMysqlProcedureDeclaration(sql.substring(cursor, terminator).strip());
+            if (declaration == null) {
+                return null;
+            }
+            declarations.add(declaration);
+            declarationsEnd = terminator + 1;
+            cursor = skipWhitespaceAndComments(sql, declarationsEnd);
+        }
+        if (declarations.isEmpty()) {
+            return null;
+        }
+        return new NestedBlockDeclarations(declarations, declarationsEnd, leadingTrivia);
     }
 
     private String removeUnusedMysqlCursorHandlers(String sql) {
@@ -3112,56 +3511,107 @@ class SqlScriptMigrator {
 
     private String convertMysqlCursorHandlerLoops(String sql) {
         if (!isCreateProcedureStatement(sql)
-                || !Pattern.compile("(?is)\\bDECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+SQLSTATE\\s+'02000'")
+                || !Pattern.compile("(?is)\\bDECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+(?:SQLSTATE\\s+'02000'|NOT\\s+FOUND)")
                 .matcher(sql)
                 .find()) {
             return sql;
         }
+        LinkedHashSet<String> flags = mysqlCursorNotFoundHandlerFlags(sql);
+        if (flags.isEmpty()) {
+            return sql;
+        }
+
+        String converted = sql;
+        LinkedHashSet<String> convertedFlags = new LinkedHashSet<>();
+        boolean changed = false;
+        for (int i = 0; i < 20; i++) {
+            CursorLoopConversion loopConversion = convertMysqlCursorLoops(converted, flags);
+            if (!loopConversion.changed()) {
+                break;
+            }
+            converted = loopConversion.sql();
+            convertedFlags.addAll(loopConversion.convertedFlags());
+            changed = true;
+        }
+        if (!changed || convertedFlags.isEmpty()) {
+            return sql;
+        }
+        converted = Pattern.compile(
+                        "(?is)\\s*DECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+SQLSTATE\\s+'02000'\\s*SET\\s+("
+                                + SQL_SIMPLE_IDENTIFIER_TOKEN
+                                + ")\\s*=\\s*(?:1|TRUE)\\s*;"
+                )
+                .matcher(converted)
+                .replaceAll(matchResult -> convertedFlags
+                        .contains(unquoteIdentifier(matchResult.group(1)).toLowerCase(Locale.ROOT))
+                        ? ""
+                        : matchResult.group());
+        converted = Pattern.compile(
+                        "(?is)\\s*DECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+NOT\\s+FOUND\\s*SET\\s+("
+                                + SQL_SIMPLE_IDENTIFIER_TOKEN
+                                + ")\\s*=\\s*(?:1|TRUE)\\s*;"
+                )
+                .matcher(converted)
+                .replaceAll(matchResult -> convertedFlags
+                        .contains(unquoteIdentifier(matchResult.group(1)).toLowerCase(Locale.ROOT))
+                        ? ""
+                        : matchResult.group());
+        for (String flag : convertedFlags) {
+            converted = Pattern.compile(
+                            "(?is)\\s*DECLARE\\s+"
+                                    + identifierReferencePattern(flag)
+                                    + "\\s+(?:TINYINT(?:\\s*\\([^)]*\\))?|SMALLINT|INT(?:EGER)?(?:\\s*\\([^)]*\\))?|BIGINT(?:\\s*\\([^)]*\\))?|BOOLEAN|BOOL)"
+                                    + "\\s+DEFAULT\\s+(?:0|FALSE)\\s*;"
+                    )
+                    .matcher(converted)
+                    .replaceAll("");
+            converted = Pattern.compile(
+                            "(?is)\\s*(?:SET\\s+)?"
+                                    + identifierReferencePattern(flag)
+                                    + "\\s*(?:=|:=)\\s*(?:0|FALSE)\\s*;"
+                    )
+                    .matcher(converted)
+                    .replaceAll("");
+        }
+        for (String flag : convertedFlags) {
+            if (containsIdentifierReferenceOutsideIgnoredText(converted, flag)) {
+                return sql;
+            }
+        }
+        return converted;
+    }
+
+    private LinkedHashSet<String> mysqlCursorNotFoundHandlerFlags(String sql) {
         Matcher handlerMatcher = Pattern.compile(
-                "(?is)\\s*DECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+SQLSTATE\\s+'02000'\\s*SET\\s+("
-                        + SQL_IDENTIFIER_TOKEN
-                        + ")\\s*=\\s*1\\s*;"
+                "(?is)\\bDECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+"
+                        + "(?:SQLSTATE\\s+'02000'|NOT\\s+FOUND)\\s*SET\\s+("
+                        + SQL_SIMPLE_IDENTIFIER_TOKEN
+                        + ")\\s*=\\s*(?:1|TRUE)\\s*;"
         ).matcher(sql);
         LinkedHashSet<String> flags = new LinkedHashSet<>();
         while (handlerMatcher.find()) {
             flags.add(unquoteIdentifier(handlerMatcher.group(1)).toLowerCase(Locale.ROOT));
         }
-        if (flags.isEmpty()) {
-            return sql;
-        }
-
-        CursorLoopConversion loopConversion = convertMysqlCursorLoops(sql, flags);
-        if (!loopConversion.changed()) {
-            return sql;
-        }
-        String converted = loopConversion.sql();
-        converted = Pattern.compile(
-                        "(?is)\\s*DECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+SQLSTATE\\s+'02000'\\s*SET\\s+("
-                                + SQL_IDENTIFIER_TOKEN
-                                + ")\\s*=\\s*1\\s*;"
-                )
-                .matcher(converted)
-                .replaceAll(matchResult -> loopConversion.convertedFlags()
-                        .contains(unquoteIdentifier(matchResult.group(1)).toLowerCase(Locale.ROOT))
-                        ? ""
-                        : matchResult.group());
-        for (String flag : loopConversion.convertedFlags()) {
-            converted = Pattern.compile(
-                            "(?is)\\s*DECLARE\\s+"
-                                    + identifierReferencePattern(flag)
-                                    + "\\s+(?:INT|INTEGER|BIGINT)\\s+DEFAULT\\s+0\\s*;"
-                    )
-                    .matcher(converted)
-                    .replaceAll("");
-        }
-        return converted;
+        return flags;
     }
 
     private CursorLoopConversion convertMysqlCursorLoops(String sql, LinkedHashSet<String> handlerFlags) {
+        CursorLoopConversion whileLoops = convertMysqlCursorWhileLoops(sql, handlerFlags);
+        CursorLoopConversion labelLoops = convertMysqlCursorLabelLoops(whileLoops.sql(), handlerFlags);
+        if (!whileLoops.changed() && !labelLoops.changed()) {
+            return new CursorLoopConversion(sql, false, Set.of());
+        }
+        LinkedHashSet<String> convertedFlags = new LinkedHashSet<>();
+        convertedFlags.addAll(whileLoops.convertedFlags());
+        convertedFlags.addAll(labelLoops.convertedFlags());
+        return new CursorLoopConversion(labelLoops.sql(), true, convertedFlags);
+    }
+
+    private CursorLoopConversion convertMysqlCursorWhileLoops(String sql, LinkedHashSet<String> handlerFlags) {
         Matcher loopHeadMatcher = Pattern.compile(
-                "(?is)\\bOPEN\\s+(" + SQL_IDENTIFIER_TOKEN + ")\\s*;\\s*"
-                        + "FETCH\\s+(" + SQL_IDENTIFIER_TOKEN + ")\\s+INTO\\s+([^;]+?)\\s*;\\s*"
-                        + "WHILE\\s+(" + SQL_IDENTIFIER_TOKEN + ")\\s*(?:<>|!=)\\s*1\\s+DO\\b"
+                "(?is)\\bOPEN\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*;\\s*"
+                        + "FETCH\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+INTO\\s+([^;]+?)\\s*;\\s*"
+                        + "WHILE\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*(?:<>|!=)\\s*(?:1|TRUE)\\s+DO\\b"
         ).matcher(sql);
         StringBuilder converted = new StringBuilder(sql.length());
         LinkedHashSet<String> convertedFlags = new LinkedHashSet<>();
@@ -3182,7 +3632,9 @@ class SqlScriptMigrator {
             Matcher loopTailMatcher = Pattern.compile(
                     "(?is)\\bFETCH\\s+"
                             + identifierReferencePattern(unquoteIdentifier(cursorName))
-                            + "\\s+INTO\\s+(.+?)\\s*;\\s*END\\s+WHILE\\s*;\\s*CLOSE\\s+"
+                            + "\\s+INTO\\s+(.+?)\\s*;\\s*END\\s+WHILE\\s*;"
+                            + SQL_WS_OR_COMMENT_TOKEN
+                            + "CLOSE\\s+"
                             + identifierReferencePattern(unquoteIdentifier(cursorName))
                             + "\\s*;"
             ).matcher(sql);
@@ -3217,13 +3669,142 @@ class SqlScriptMigrator {
         return new CursorLoopConversion(converted.toString(), true, convertedFlags);
     }
 
+    private CursorLoopConversion convertMysqlCursorLabelLoops(String sql, LinkedHashSet<String> handlerFlags) {
+        Matcher loopHeadMatcher = Pattern.compile(
+                "(?is)\\bOPEN\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*;\\s*"
+                        + "(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*:\\s*LOOP"
+                        + SQL_WS_OR_COMMENT_TOKEN
+                        + "FETCH\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+INTO\\s+([^;]+?)\\s*;\\s*"
+                        + "IF\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*(?:=\\s*(?:1|TRUE))?\\s+THEN"
+        ).matcher(sql);
+        StringBuilder converted = new StringBuilder(sql.length());
+        LinkedHashSet<String> convertedFlags = new LinkedHashSet<>();
+        int cursor = 0;
+        boolean changed = false;
+        while (loopHeadMatcher.find(cursor)) {
+            String cursorName = loopHeadMatcher.group(1).strip();
+            String loopLabel = loopHeadMatcher.group(2).strip();
+            String fetchedCursorName = loopHeadMatcher.group(3).strip();
+            String flag = unquoteIdentifier(loopHeadMatcher.group(5).strip()).toLowerCase(Locale.ROOT);
+            if (!sameIdentifier(cursorName, fetchedCursorName)
+                    || !handlerFlags.contains(flag)) {
+                cursor = loopHeadMatcher.end();
+                continue;
+            }
+            CursorLeaveIfBlock leaveIfBlock = readCursorLeaveIfBlock(sql, loopHeadMatcher.end(), loopLabel);
+            if (leaveIfBlock == null) {
+                cursor = loopHeadMatcher.end();
+                continue;
+            }
+            Matcher loopTailMatcher = Pattern.compile(
+                    "(?is)\\bEND\\s+LOOP\\s*;"
+                            + SQL_WS_OR_COMMENT_TOKEN
+                            + "CLOSE\\s+"
+                            + identifierReferencePattern(unquoteIdentifier(cursorName))
+                            + "\\s*;"
+            ).matcher(sql);
+            loopTailMatcher.region(leaveIfBlock.endIfEnd(), sql.length());
+            if (!loopTailMatcher.find()) {
+                cursor = loopHeadMatcher.end();
+                continue;
+            }
+            converted.append(sql, cursor, loopHeadMatcher.start());
+            String fetchTargets = loopHeadMatcher.group(4).strip();
+            String body = leaveIfBlock.loopBody() + sql.substring(leaveIfBlock.endIfEnd(), loopTailMatcher.start());
+            String indent = lineIndentBefore(sql, loopHeadMatcher.start());
+            String innerIndent = indent + "    ";
+            converted.append("OPEN ").append(cursorName).append(";\n")
+                    .append(indent).append("LOOP\n")
+                    .append(innerIndent).append("FETCH ").append(cursorName).append(" INTO ").append(fetchTargets).append(";\n")
+                    .append(innerIndent).append("EXIT WHEN ").append(cursorName).append("%NOTFOUND;\n")
+                    .append(body.stripLeading());
+            if (!body.endsWith("\n") && !body.endsWith("\r")) {
+                converted.append("\n");
+            }
+            converted.append(indent).append("END LOOP;\n")
+                    .append(indent).append("CLOSE ").append(cursorName).append(";");
+            convertedFlags.add(flag);
+            cursor = loopTailMatcher.end();
+            changed = true;
+        }
+        if (!changed) {
+            return new CursorLoopConversion(sql, false, Set.of());
+        }
+        converted.append(sql.substring(cursor));
+        return new CursorLoopConversion(converted.toString(), true, convertedFlags);
+    }
+
+    private CursorLeaveIfBlock readCursorLeaveIfBlock(String sql, int afterThen, String expectedLabel) {
+        int leaveIndex = skipWhitespaceAndComments(sql, afterThen);
+        if (!startsKeyword(sql, leaveIndex, "LEAVE")) {
+            return null;
+        }
+        int labelStart = skipWhitespace(sql, leaveIndex + "LEAVE".length());
+        SqlIdentifierReference leaveLabel = sqlIdentifierReferenceAt(sql, labelStart);
+        if (leaveLabel == null || !sameIdentifier(leaveLabel.token(), expectedLabel)) {
+            return null;
+        }
+        int semicolon = skipWhitespace(sql, leaveLabel.end());
+        if (semicolon >= sql.length() || sql.charAt(semicolon) != ';') {
+            return null;
+        }
+        int index = skipWhitespace(sql, semicolon + 1);
+        int depth = 1;
+        int elseStart = -1;
+        int elseBodyStart = -1;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "END")) {
+                int ifIndex = skipWhitespace(sql, index + "END".length());
+                if (startsKeyword(sql, ifIndex, "IF")) {
+                    depth--;
+                    if (depth == 0) {
+                        int statementEnd = findStatementTerminator(sql, index);
+                        if (statementEnd >= sql.length()) {
+                            return null;
+                        }
+                        int endIfEnd = statementEnd;
+                        if (endIfEnd < sql.length() && sql.charAt(endIfEnd) == ';') {
+                            endIfEnd++;
+                        }
+                        String loopBody = elseStart < 0 ? "" : sql.substring(elseBodyStart, index);
+                        return new CursorLeaveIfBlock(endIfEnd, loopBody);
+                    }
+                    index = ifIndex + "IF".length();
+                } else {
+                    index++;
+                }
+            } else if (depth == 1 && startsKeyword(sql, index, "ELSE")) {
+                elseStart = index;
+                elseBodyStart = skipWhitespace(sql, index + "ELSE".length());
+                index = elseBodyStart;
+            } else if (startsKeyword(sql, index, "IF")) {
+                depth++;
+                index += "IF".length();
+            } else {
+                index++;
+            }
+        }
+        return null;
+    }
+
     private boolean sameIdentifier(String left, String right) {
         return unquoteIdentifier(left.strip()).equalsIgnoreCase(unquoteIdentifier(right.strip()));
     }
 
     private String identifierReferencePattern(String identifier) {
         String unquoted = Pattern.quote(unquoteIdentifier(identifier));
-        return "(?:`" + unquoted + "`|\"" + unquoted + "\"|" + unquoted + ")";
+        return "(?:`" + unquoted + "`|\"" + unquoted + "\"|(?<![A-Za-z0-9_$])" + unquoted + "(?![A-Za-z0-9_$]))";
     }
 
     private String convertMysqlProcedureSessionSetToNoop(String sql) {
@@ -3501,8 +4082,31 @@ class SqlScriptMigrator {
                 .replaceAll("RAISE_APPLICATION_ERROR(-20000, 'SQLSTATE 45000');");
     }
 
-    private String convertMysqlProcedureLocalSetAssignments(String sql) {
+    private String convertMysqlProcedureDeleteAliasStar(String sql) {
         if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        return replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile(
+                        "(?is)\\bDELETE\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*\\.\\s*\\*\\s+FROM\\s+"
+                                + "(" + SQL_IDENTIFIER_TOKEN + ")\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")"
+                                + "(?:\\s+(?:USE|FORCE|IGNORE)\\s+INDEX\\s*\\([^)]*\\))?"
+                ),
+                matcher -> {
+                    String deleteAlias = matcher.group(1);
+                    String table = matcher.group(2);
+                    String tableAlias = matcher.group(3);
+                    if (!sameIdentifier(deleteAlias, tableAlias)) {
+                        return matcher.group();
+                    }
+                    return "DELETE FROM " + table + " " + tableAlias;
+                }
+        );
+    }
+
+    private String convertMysqlProcedureLocalSetAssignments(String sql) {
+        if (!isCreateRoutineStatement(sql)) {
             return sql;
         }
         int beginIndex = firstProcedureBegin(sql);
@@ -3579,8 +4183,9 @@ class SqlScriptMigrator {
             return null;
         }
         int operatorIndex = skipWhitespace(sql, targetEnd);
+        String normalizedTarget = normalizedProcedureVariableName(sql.substring(targetStart, targetEnd));
         if (operatorIndex >= sql.length()
-                || !variableNames.containsKey(normalizedProcedureVariableName(sql.substring(targetStart, targetEnd)))) {
+                || (!variableNames.containsKey(normalizedTarget) && !normalizedTarget.startsWith("dm_"))) {
             return null;
         }
         int operatorEnd;
@@ -3981,6 +4586,42 @@ class SqlScriptMigrator {
         return false;
     }
 
+    private boolean containsIdentifierReferenceOutsideIgnoredText(String sql, String identifier) {
+        String normalized = unquoteIdentifier(identifier).toLowerCase(Locale.ROOT);
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                int end = skipBacktickIdentifier(sql, index);
+                String quotedIdentifier = sql.substring(index + 1, Math.max(index + 1, end - 1));
+                if (quotedIdentifier.equalsIgnoreCase(normalized)) {
+                    return true;
+                }
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (Character.isLetter(current) || current == '_') {
+                int end = index + 1;
+                while (end < sql.length() && isIdentifierPart(sql.charAt(end))) {
+                    end++;
+                }
+                if (sql.substring(index, end).equalsIgnoreCase(normalized)) {
+                    return true;
+                }
+                index = end;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
     private int firstProcedureBegin(String sql) {
         int index = 0;
         while (index < sql.length()) {
@@ -4065,7 +4706,7 @@ class SqlScriptMigrator {
     }
 
     private String convertMysqlProcedureUserVariables(String sql) {
-        if (!isCreateProcedureStatement(sql)) {
+        if (!isCreateRoutineStatement(sql)) {
             return sql;
         }
         int beginIndex = firstProcedureBegin(sql);
@@ -4099,9 +4740,21 @@ class SqlScriptMigrator {
                     .append(inferProcedureUserVariableType(sql, entry.getKey()))
                     .append(";\n");
         }
-        return replaced.substring(0, replacedBeginIndex)
+        int declarationInsertIndex = procedureUserVariableDeclarationInsertIndex(replaced, replacedBeginIndex);
+        return replaced.substring(0, declarationInsertIndex)
                 + declarations
-                + replaced.substring(replacedBeginIndex);
+                + replaced.substring(declarationInsertIndex);
+    }
+
+    private int procedureUserVariableDeclarationInsertIndex(String sql, int beginIndex) {
+        Matcher cursorMatcher = Pattern.compile(
+                "(?im)^\\s*(?:" + SQL_IDENTIFIER_TOKEN + ")\\s+CURSOR\\s+FOR\\b"
+        ).matcher(sql);
+        cursorMatcher.region(0, beginIndex);
+        if (cursorMatcher.find()) {
+            return cursorMatcher.start();
+        }
+        return beginIndex;
     }
 
     private String convertMysqlProcedureIfExistsConditions(String sql) {
@@ -4272,6 +4925,18 @@ class SqlScriptMigrator {
     }
 
     private boolean isCreateProcedureStatement(String sql) {
+        return isCreateRoutineStatement(sql, "PROCEDURE");
+    }
+
+    private boolean isCreateFunctionStatement(String sql) {
+        return isCreateRoutineStatement(sql, "FUNCTION");
+    }
+
+    private boolean isCreateRoutineStatement(String sql) {
+        return isCreateProcedureStatement(sql) || isCreateFunctionStatement(sql);
+    }
+
+    private boolean isCreateRoutineStatement(String sql, String routineKind) {
         int start = skipWhitespace(sql, 0);
         if (!startsKeyword(sql, start, "CREATE")) {
             return false;
@@ -4284,7 +4949,7 @@ class SqlScriptMigrator {
             }
             cursor = skipWhitespace(sql, cursor + "REPLACE".length());
         }
-        return startsKeyword(sql, cursor, "PROCEDURE");
+        return startsKeyword(sql, cursor, routineKind);
     }
 
     private List<UserVariableReference> mysqlUserVariableReferences(String sql) {
@@ -4394,15 +5059,15 @@ class SqlScriptMigrator {
     }
 
     private void collectProcedureParameterNames(String headerAndDeclarations, LinkedHashSet<String> names) {
-        int procedureIndex = keywordIndex(headerAndDeclarations, "PROCEDURE");
-        if (procedureIndex < 0) {
+        RoutineKeyword routine = routineKeyword(headerAndDeclarations);
+        if (routine == null) {
             return;
         }
-        int openParen = firstTopLevelParen(headerAndDeclarations.substring(procedureIndex + "PROCEDURE".length()));
+        int openParen = firstTopLevelParen(headerAndDeclarations.substring(routine.index() + routine.keyword().length()));
         if (openParen < 0) {
             return;
         }
-        openParen += procedureIndex + "PROCEDURE".length();
+        openParen += routine.index() + routine.keyword().length();
         int closeParen = findMatchingParen(headerAndDeclarations, openParen);
         if (closeParen <= openParen) {
             return;
@@ -4426,6 +5091,18 @@ class SqlScriptMigrator {
         return -1;
     }
 
+    private RoutineKeyword routineKeyword(String value) {
+        int procedureIndex = keywordIndex(value, "PROCEDURE");
+        int functionIndex = keywordIndex(value, "FUNCTION");
+        if (procedureIndex < 0 && functionIndex < 0) {
+            return null;
+        }
+        if (functionIndex < 0 || (procedureIndex >= 0 && procedureIndex < functionIndex)) {
+            return new RoutineKeyword(procedureIndex, "PROCEDURE");
+        }
+        return new RoutineKeyword(functionIndex, "FUNCTION");
+    }
+
     private String procedureParameterName(String parameter) {
         String stripped = parameter.strip();
         Matcher modeFirstMatcher = Pattern.compile("(?is)^(INOUT|IN|OUT)\\s+(" + SQL_IDENTIFIER_TOKEN + ")\\b.*$")
@@ -4437,6 +5114,11 @@ class SqlScriptMigrator {
                 .matcher(stripped);
         if (nameFirstMatcher.matches()) {
             return unquoteIdentifier(nameFirstMatcher.group(1));
+        }
+        Matcher implicitMatcher = Pattern.compile("(?is)^(" + SQL_IDENTIFIER_TOKEN + ")\\s+.+$")
+                .matcher(stripped);
+        if (implicitMatcher.matches()) {
+            return unquoteIdentifier(implicitMatcher.group(1));
         }
         return "";
     }
@@ -5026,15 +5708,15 @@ class SqlScriptMigrator {
     }
 
     private void collectProcedureParameterTypes(String headerAndDeclarations, LinkedHashMap<String, String> types) {
-        int procedureIndex = keywordIndex(headerAndDeclarations, "PROCEDURE");
-        if (procedureIndex < 0) {
+        RoutineKeyword routine = routineKeyword(headerAndDeclarations);
+        if (routine == null) {
             return;
         }
-        int openParen = firstTopLevelParen(headerAndDeclarations.substring(procedureIndex + "PROCEDURE".length()));
+        int openParen = firstTopLevelParen(headerAndDeclarations.substring(routine.index() + routine.keyword().length()));
         if (openParen < 0) {
             return;
         }
-        openParen += procedureIndex + "PROCEDURE".length();
+        openParen += routine.index() + routine.keyword().length();
         int closeParen = findMatchingParen(headerAndDeclarations, openParen);
         if (closeParen <= openParen) {
             return;
@@ -5051,15 +5733,15 @@ class SqlScriptMigrator {
     }
 
     private void collectProcedureParameterNames(String headerAndDeclarations, LinkedHashMap<String, String> names) {
-        int procedureIndex = keywordIndex(headerAndDeclarations, "PROCEDURE");
-        if (procedureIndex < 0) {
+        RoutineKeyword routine = routineKeyword(headerAndDeclarations);
+        if (routine == null) {
             return;
         }
-        int openParen = firstTopLevelParen(headerAndDeclarations.substring(procedureIndex + "PROCEDURE".length()));
+        int openParen = firstTopLevelParen(headerAndDeclarations.substring(routine.index() + routine.keyword().length()));
         if (openParen < 0) {
             return;
         }
-        openParen += procedureIndex + "PROCEDURE".length();
+        openParen += routine.index() + routine.keyword().length();
         int closeParen = findMatchingParen(headerAndDeclarations, openParen);
         if (closeParen <= openParen) {
             return;
@@ -5189,6 +5871,7 @@ class SqlScriptMigrator {
             return List.of(temporaryIndexDdl);
         }
         converted = normalizeMysqlAlterModifySyntax(converted);
+        converted = normalizeMysqlAlterChangeSyntax(converted);
         String withoutInlineKeys = removeMysqlCreateTableInlineKeyDefinitions(converted);
         if (!withoutInlineKeys.equals(converted)) {
             converted = withoutInlineKeys;
@@ -6301,6 +6984,27 @@ class SqlScriptMigrator {
         return cursor;
     }
 
+    private int skipWhitespaceAndComments(String value, int index) {
+        int cursor = Math.max(0, index);
+        boolean advanced;
+        do {
+            advanced = false;
+            int whitespaceEnd = skipWhitespace(value, cursor);
+            if (whitespaceEnd != cursor) {
+                cursor = whitespaceEnd;
+                advanced = true;
+            }
+            if (startsLineComment(value, cursor)) {
+                cursor = skipUntilLineEnd(value, cursor);
+                advanced = true;
+            } else if (startsBlockComment(value, cursor)) {
+                cursor = skipUntilBlockCommentEnd(value, cursor);
+                advanced = true;
+            }
+        } while (advanced);
+        return cursor;
+    }
+
     private boolean isSqlWhitespace(char value) {
         return Character.isWhitespace(value) || value == '\uFEFF';
     }
@@ -6644,6 +7348,9 @@ class SqlScriptMigrator {
     private record ProcedureAssignedParameter(ProcedureParameter parameter, String localName) {
     }
 
+    private record RoutineKeyword(int index, String keyword) {
+    }
+
     private record TextReplacement(Pattern pattern, String replacement) {
     }
 
@@ -6665,6 +7372,16 @@ class SqlScriptMigrator {
     private record CursorLoopConversion(String sql, boolean changed, Set<String> convertedFlags) {
         private CursorLoopConversion {
             convertedFlags = Set.copyOf(convertedFlags == null ? Set.of() : convertedFlags);
+        }
+    }
+
+    private record CursorLeaveIfBlock(int endIfEnd, String loopBody) {
+    }
+
+    private record NestedBlockDeclarations(List<String> declarations, int declarationsEnd, String leadingTrivia) {
+        private NestedBlockDeclarations {
+            declarations = List.copyOf(declarations == null ? List.of() : declarations);
+            leadingTrivia = leadingTrivia == null ? "" : leadingTrivia;
         }
     }
 
