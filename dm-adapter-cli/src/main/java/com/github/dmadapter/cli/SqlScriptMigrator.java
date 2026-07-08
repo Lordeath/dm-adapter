@@ -66,6 +66,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_SESSION_SET_NOOP";
     static final String MYSQL_CALL_ARGUMENT_LINE_COMMENT_REMOVAL_RULE =
             "MYSQL_CALL_ARGUMENT_LINE_COMMENT_REMOVED";
+    static final String MYSQL_SIMPLE_DATE_END_TRIGGER_TO_DM_RULE =
+            "MYSQL_SIMPLE_DATE_END_TRIGGER_TO_DM";
     static final String MYSQL_PROCEDURE_LOCAL_LABEL_TO_RETURN_RULE =
             "MYSQL_PROCEDURE_LOCAL_LABEL_TO_RETURN";
     static final String MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE =
@@ -800,7 +802,9 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE);
         }
         SafeRuleConversion safeRuleConversion = applyScriptSafeRules(sqlBody);
-        SqlConversionResult sqlConversion = converter.convert(safeRuleConversion.sql());
+        SqlConversionResult sqlConversion = isConvertedSimpleDateEndTrigger(safeRuleConversion.sql())
+                ? SqlConversionResult.unchanged(safeRuleConversion.sql())
+                : converter.convert(safeRuleConversion.sql());
         rules.addAll(safeRuleConversion.appliedRules());
         rules.addAll(sqlConversion.appliedRules());
         String convertedBody = sqlConversion.convertedSql();
@@ -1813,6 +1817,12 @@ class SqlScriptMigrator {
             rules.add(DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE);
         }
 
+        String simpleDateEndTriggerSql = convertMysqlSimpleDateEndTrigger(converted);
+        if (!simpleDateEndTriggerSql.equals(converted)) {
+            converted = simpleDateEndTriggerSql;
+            rules.add(MYSQL_SIMPLE_DATE_END_TRIGGER_TO_DM_RULE);
+        }
+
         String withoutDefiner = CREATE_DEFINER_PATTERN.matcher(converted).replaceFirst("CREATE ");
         if (!withoutDefiner.equals(converted)) {
             converted = withoutDefiner;
@@ -1994,6 +2004,67 @@ class SqlScriptMigrator {
         }
 
         return new SafeRuleConversion(converted, !rules.isEmpty(), rules);
+    }
+
+    private String convertMysqlSimpleDateEndTrigger(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+TRIGGER\\s+(?<name>" + SQL_IDENTIFIER_TOKEN + ")\\s+"
+                        + "BEFORE\\s+(?<event>INSERT|UPDATE)\\s+ON\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+"
+                        + "FOR\\s+EACH\\s+ROW\\s+BEGIN\\s+"
+                        + "IF\\s+NEW\\.(?<checkColumn>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+IS\\s+NOT\\s+NULL\\s+THEN\\s+"
+                        + "SET\\s+NEW\\.(?<targetColumn>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*=\\s*"
+                        + "CONCAT\\s*\\(\\s*DATE\\s*\\(\\s*NEW\\.(?<dateColumn>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*\\)\\s*,\\s*"
+                        + "'\\s*23:59:59'\\s*\\)\\s*;?\\s+"
+                        + "END\\s+IF\\s*;?\\s+END\\s*;?\\s*$"
+        ).matcher(sql);
+        if (!matcher.matches()) {
+            return sql;
+        }
+        String checkColumn = unquoteIdentifier(matcher.group("checkColumn"));
+        String targetColumn = unquoteIdentifier(matcher.group("targetColumn"));
+        String dateColumn = unquoteIdentifier(matcher.group("dateColumn"));
+        if (checkColumn.isBlank()
+                || !checkColumn.equalsIgnoreCase(targetColumn)
+                || !checkColumn.equalsIgnoreCase(dateColumn)) {
+            return sql;
+        }
+        String column = checkColumn;
+        return "CREATE OR REPLACE TRIGGER "
+                + matcher.group("name")
+                + "\n    BEFORE "
+                + matcher.group("event").toUpperCase(Locale.ROOT)
+                + " ON "
+                + matcher.group("table")
+                + "\n    FOR EACH ROW\n"
+                + "BEGIN\n"
+                + "    IF :NEW." + column + " IS NOT NULL THEN\n"
+                + "        :NEW." + column
+                + " := TO_TIMESTAMP(TO_CHAR(:NEW." + column
+                + ", 'YYYY-MM-DD') || ' 23:59:59', 'YYYY-MM-DD HH24:MI:SS');\n"
+                + "    END IF;\n"
+                + "END;";
+    }
+
+    private boolean isConvertedSimpleDateEndTrigger(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return false;
+        }
+        if (!Pattern.compile(
+                "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TRIGGER\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
+                        + "BEFORE\\s+(?:INSERT|UPDATE)\\s+ON\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
+                        + "FOR\\s+EACH\\s+ROW\\b"
+        ).matcher(sql).find()) {
+            return false;
+        }
+        String normalized = sql.toUpperCase(Locale.ROOT);
+        return normalized.contains(":NEW.")
+                && normalized.contains(":=")
+                && normalized.contains("TO_TIMESTAMP")
+                && normalized.contains("TO_CHAR")
+                && normalized.contains("23:59:59");
     }
 
     private String convertResourceColumnBatchMergeToInsertOnly(String sql) {
@@ -6365,6 +6436,9 @@ class SqlScriptMigrator {
     }
 
     private String manualReviewReason(String sql) {
+        if (isConvertedSimpleDateEndTrigger(sql)) {
+            return "";
+        }
         String suspiciousLengthModifyReason = suspiciousLengthModifyReason(sql);
         if (!suspiciousLengthModifyReason.isBlank()) {
             return suspiciousLengthModifyReason;
