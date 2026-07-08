@@ -1,6 +1,7 @@
 package com.github.dmadapter.cli;
 
 import com.github.dmadapter.core.SqlScriptMigrationReport;
+import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -260,6 +261,91 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsScriptDynamicColumnDdlToDamengAnonymousBlock() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260521.sql"), """
+                set @db_name = database();
+
+                set @ddl = (
+                    select if(count(*) = 0,
+                        'alter table ns_canal_config_item add column `targetDatabase` varchar(128) null comment ''跨库写入目标逻辑库，例如 DataCenter'' after `targetTableName`',
+                        'do 0')
+                    from information_schema.columns
+                    where table_schema = @db_name
+                      and table_name = 'ns_canal_config_item'
+                      and column_name = 'targetDatabase'
+                );
+                prepare stmt from @ddl;
+                execute stmt;
+                deallocate prepare stmt;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-report",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260521.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("FROM ALL_TAB_COLUMNS")
+                .contains("WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("AND TABLE_NAME = 'ns_canal_config_item'")
+                .contains("AND COLUMN_NAME = 'targetDatabase'")
+                .contains("EXECUTE IMMEDIATE 'alter table ns_canal_config_item ADD `targetDatabase` varchar(128) null'")
+                .contains("-- DM_ADAPTER: MySQL PREPARE stmt is handled by the previous EXECUTE IMMEDIATE block")
+                .contains("-- DM_ADAPTER: MySQL EXECUTE stmt is handled by the previous EXECUTE IMMEDIATE block")
+                .contains("-- DM_ADAPTER: MySQL DEALLOCATE PREPARE stmt is unnecessary after the previous EXECUTE IMMEDIATE block")
+                .doesNotContain("set @ddl")
+                .doesNotContain("prepare stmt")
+                .doesNotContain("execute stmt")
+                .doesNotContain("deallocate prepare stmt")
+                .doesNotContain("comment ''跨库写入目标逻辑库")
+                .doesNotContain(" after `targetTableName`");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE));
+    }
+
+    @Test
+    void convertsMysqlBackslashEscapedSingleQuotesInsideSqlStringLiterals() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260521.sql"), """
+                insert into ns_report_field_design(fieldExpression, canalFieldExpression)
+                values ('charge.IsCheck=\\'审核通过\\'', 'charge.IsCheck=\\'审核通过\\'');
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-report",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260521.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("values ('charge.IsCheck=''审核通过'''")
+                .contains("'charge.IsCheck=''审核通过''')")
+                .doesNotContain("\\'审核通过\\'");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SQL_STRING_JSON_ESCAPE_TO_DM_RULE));
+    }
+
+    @Test
     void normalizesDropProcedureAndTemporaryTableSyntax() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -367,6 +453,54 @@ class SqlScriptMigratorTest {
         assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
                 .contains("PREPARE stmt FROM 'select 1'")
                 .contains("EXECUTE stmt");
+    }
+
+    @Test
+    void reportsOriginalDanglingInsertValuesCommaForManualReviewAndSkipsDependentCall() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        RecordingValidator validator = new RecordingValidator();
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE insert_report_seed()
+                BEGIN
+                    IF 1 = 1 THEN
+                        INSERT INTO ns_report_rule_param(menu_id, param_code)
+                        VALUES ('report-demo', 'precinctId'),
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL insert_report_seed();
+                """);
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-report",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(2);
+        assertThat(report.manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::reason)
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("原始 SQL 语法缺陷")
+                        .contains("最后一个值元组后面仍然是逗号"))
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("依赖需要人工确认的存储过程 `insert_report_seed`"));
+        assertThat(validator.files)
+                .singleElement()
+                .satisfies(file -> {
+                    assertThat(file.manualReviewStatementIndexes()).containsExactlyInAnyOrder(1, 2);
+                    assertThat(file.statements()).hasSize(2);
+                });
+        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("VALUES ('report-demo', 'precinctId'),")
+                .contains("CALL insert_report_seed()");
     }
 
     @Test
