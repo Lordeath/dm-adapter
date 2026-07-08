@@ -51,6 +51,8 @@ class SqlScriptMigrator {
             "MYSQL_FOREIGN_KEY_CHECKS_NOOP";
     static final String MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE =
             "MYSQL_SCRIPT_USER_VARIABLE_LITERAL";
+    static final String MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE =
+            "MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_DROP_PROCEDURE_IF_EXISTS_RULE =
             "MYSQL_DROP_PROCEDURE_IF_EXISTS";
     static final String MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE =
@@ -111,6 +113,10 @@ class SqlScriptMigrator {
             "MYSQL_INSERT_VALUES_COLUMN_LIST";
     static final String DM_RESOURCECOLUMN_INSERT_ONLY_MERGE_RULE =
             "DM_RESOURCECOLUMN_INSERT_ONLY_MERGE";
+    static final String ORIGINAL_SQL_DANGLING_INSERT_VALUES_REASON =
+            "原始 SQL 语法缺陷：INSERT ... VALUES 的最后一个值元组后面仍然是逗号，后续直接进入 END/END IF；"
+                    + "这不是达梦语法转换问题。建议修原始脚本：把最后一个 values 元组后的逗号改成分号，"
+                    + "或补齐缺失的 values 元组。";
 
     private static final String SUSPICIOUS_LENGTH_MODIFY_REASON =
             "可疑字段长度修改：当前 SQL 把字段改为 varchar(%s)，但前置判断没有使用“字符类型且长度小于 %s”的安全加长条件；"
@@ -151,6 +157,7 @@ class SqlScriptMigrator {
     );
     private static final String SQL_SIMPLE_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
+    private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
     private static final Pattern MYSQL_PREFIX_INDEX_DDL_PATTERN = Pattern.compile(
             "(?is)\\b(?:"
                     + "CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:" + SQL_IDENTIFIER_TOKEN + ")\\s+ON\\s+"
@@ -475,6 +482,7 @@ class SqlScriptMigrator {
         List<String> originalStatements = SqlScriptParser.statements(originalContent);
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
+        ScriptDynamicDdlState scriptDynamicDdlState = new ScriptDynamicDdlState();
         LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns = new LinkedHashMap<>();
         LinkedHashMap<String, String> scriptProcedureRenames = procedureObjectNameConflictRenames(originalStatements);
         LinkedHashSet<String> manualReviewProcedureNames = new LinkedHashSet<>();
@@ -486,7 +494,13 @@ class SqlScriptMigrator {
         for (int i = 0; i < originalStatements.size(); i++) {
             String originalStatement = originalStatements.get(i);
             ScriptStatementConversion conversion =
-                    convertStatement(originalStatement, scriptUserVariables, scriptTableColumns, scriptProcedureRenames);
+                    convertStatement(
+                            originalStatement,
+                            scriptUserVariables,
+                            scriptDynamicDdlState,
+                            scriptTableColumns,
+                            scriptProcedureRenames
+                    );
             collectScriptCreateTableDefinitionColumns(originalStatement, scriptTableColumns);
             List<String> outputStatements = expandConvertedOutputStatements(conversion.outputSql());
             String calledProcedureName = procedureNameFromCall(originalStatement);
@@ -777,10 +791,26 @@ class SqlScriptMigrator {
     private ScriptStatementConversion convertStatement(
             String originalStatement,
             LinkedHashMap<String, String> scriptUserVariables,
+            ScriptDynamicDdlState scriptDynamicDdlState,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptProcedureRenames
     ) {
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(originalStatement);
+        ScriptStatementConversion currentSchemaVariableConversion =
+                convertScriptCurrentSchemaVariableAssignment(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
+        if (currentSchemaVariableConversion != null) {
+            return currentSchemaVariableConversion;
+        }
+        ScriptStatementConversion dynamicDdlAssignmentConversion =
+                convertScriptDynamicDdlAssignment(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
+        if (dynamicDdlAssignmentConversion != null) {
+            return dynamicDdlAssignmentConversion;
+        }
+        ScriptStatementConversion dynamicDdlPrepareConversion =
+                convertScriptDynamicDdlPrepareStatement(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
+        if (dynamicDdlPrepareConversion != null) {
+            return dynamicDdlPrepareConversion;
+        }
         ScriptUserVariableAssignment userVariableAssignment =
                 scriptUserVariableAssignment(leadingSqlPrefix.body());
         if (userVariableAssignment != null) {
@@ -827,7 +857,10 @@ class SqlScriptMigrator {
         }
         String convertedSql = leadingSqlPrefix.prefix() + convertedBody;
         boolean changed = !convertedSql.equals(originalStatement);
-        String manualReason = mysqlPrefixIndexManualReviewReason(sqlBody, convertedBody);
+        String manualReason = originalSqlSyntaxManualReviewReason(sqlBody);
+        if (manualReason.isBlank()) {
+            manualReason = mysqlPrefixIndexManualReviewReason(sqlBody, convertedBody);
+        }
         if (manualReason.isBlank()) {
             manualReason = manualReviewReason(convertedBody);
         }
@@ -885,6 +918,220 @@ class SqlScriptMigrator {
             return stripped;
         }
         return "";
+    }
+
+    private ScriptStatementConversion convertScriptCurrentSchemaVariableAssignment(
+            String originalStatement,
+            LeadingSqlPrefix leadingSqlPrefix,
+            ScriptDynamicDdlState scriptDynamicDdlState
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*"
+                        + "(?:DATABASE\\s*\\(\\s*\\)|\\(\\s*SELECT\\s+DATABASE\\s*\\(\\s*\\)\\s*\\))\\s*$"
+        ).matcher(leadingSqlPrefix.body().strip());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String variableName = matcher.group("name");
+        scriptDynamicDdlState.currentSchemaVariables.add(variableName.toLowerCase(Locale.ROOT));
+        String convertedSql = leadingSqlPrefix.prefix()
+                + "-- DM_ADAPTER: MySQL script variable @"
+                + variableName
+                + " uses SYS_CONTEXT('USERENV','CURRENT_SCHEMA') in converted metadata checks";
+        return new ScriptStatementConversion(
+                originalStatement,
+                convertedSql,
+                convertedSql,
+                true,
+                false,
+                "",
+                List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE)
+        );
+    }
+
+    private ScriptStatementConversion convertScriptDynamicDdlAssignment(
+            String originalStatement,
+            LeadingSqlPrefix leadingSqlPrefix,
+            ScriptDynamicDdlState scriptDynamicDdlState
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*\\(\\s*"
+                        + "SELECT\\s+IF\\s*\\(\\s*COUNT\\s*\\(\\s*(?:\\*|1)\\s*\\)\\s*=\\s*0\\s*,\\s*"
+                        + "(?<ddl>" + SQL_STRING_LITERAL_TOKEN + ")\\s*,\\s*"
+                        + "(?<noop>" + SQL_STRING_LITERAL_TOKEN + ")\\s*\\)\\s*"
+                        + "FROM\\s+information_schema\\s*\\.\\s*columns\\s+"
+                        + "WHERE\\s+(?<where>.*?)\\s*\\)\\s*$"
+        ).matcher(leadingSqlPrefix.body().strip());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String noopSql = singleQuotedSqlLiteralValue(matcher.group("noop"));
+        if (!noopSql.equalsIgnoreCase("do 0")) {
+            return null;
+        }
+        String tableName = metadataPredicateLiteral(matcher.group("where"), "table_name");
+        String columnName = metadataPredicateLiteral(matcher.group("where"), "column_name");
+        String schemaPredicate = metadataSchemaPredicate(matcher.group("where"), scriptDynamicDdlState);
+        if (tableName.isBlank() || columnName.isBlank() || schemaPredicate.isBlank()) {
+            return null;
+        }
+        String ddl = normalizeMysqlDynamicDdlForDameng(singleQuotedSqlLiteralValue(matcher.group("ddl")));
+        if (ddl.isBlank()) {
+            return null;
+        }
+        String variableName = matcher.group("name");
+        scriptDynamicDdlState.dynamicDdlVariables.add(variableName.toLowerCase(Locale.ROOT));
+        String convertedSql = leadingSqlPrefix.prefix()
+                + "DECLARE\n"
+                + "    dm_existing_count INT;\n"
+                + "BEGIN\n"
+                + "    SELECT COUNT(*) INTO dm_existing_count\n"
+                + "    FROM ALL_TAB_COLUMNS\n"
+                + "    WHERE " + schemaPredicate + "\n"
+                + "      AND TABLE_NAME = " + sqlStringLiteral(tableName) + "\n"
+                + "      AND COLUMN_NAME = " + sqlStringLiteral(columnName) + ";\n\n"
+                + "    IF dm_existing_count = 0 THEN\n"
+                + "        EXECUTE IMMEDIATE " + sqlStringLiteral(ddl) + ";\n"
+                + "    END IF;\n"
+                + "END";
+        return new ScriptStatementConversion(
+                originalStatement,
+                convertedSql,
+                convertedSql,
+                true,
+                false,
+                "",
+                List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE)
+        );
+    }
+
+    private ScriptStatementConversion convertScriptDynamicDdlPrepareStatement(
+            String originalStatement,
+            LeadingSqlPrefix leadingSqlPrefix,
+            ScriptDynamicDdlState scriptDynamicDdlState
+    ) {
+        String body = leadingSqlPrefix.body().strip();
+        Matcher prepare = Pattern.compile(
+                "(?is)^\\s*PREPARE\\s+(?<statement>[A-Za-z_][A-Za-z0-9_$]*)\\s+FROM\\s+@(?<variable>[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
+        ).matcher(body);
+        if (prepare.matches()) {
+            String variableName = prepare.group("variable").toLowerCase(Locale.ROOT);
+            if (!scriptDynamicDdlState.dynamicDdlVariables.contains(variableName)) {
+                return null;
+            }
+            String statementName = prepare.group("statement");
+            scriptDynamicDdlState.preparedDynamicDdlStatements.add(statementName.toLowerCase(Locale.ROOT));
+            return dynamicDdlNoopConversion(
+                    originalStatement,
+                    leadingSqlPrefix,
+                    "MySQL PREPARE " + statementName + " is handled by the previous EXECUTE IMMEDIATE block"
+            );
+        }
+        Matcher execute = Pattern.compile(
+                "(?is)^\\s*EXECUTE\\s+(?<statement>[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
+        ).matcher(body);
+        if (execute.matches()) {
+            String statementName = execute.group("statement");
+            if (!scriptDynamicDdlState.preparedDynamicDdlStatements.contains(statementName.toLowerCase(Locale.ROOT))) {
+                return null;
+            }
+            return dynamicDdlNoopConversion(
+                    originalStatement,
+                    leadingSqlPrefix,
+                    "MySQL EXECUTE " + statementName + " is handled by the previous EXECUTE IMMEDIATE block"
+            );
+        }
+        Matcher deallocate = Pattern.compile(
+                "(?is)^\\s*DEALLOCATE\\s+PREPARE\\s+(?<statement>[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
+        ).matcher(body);
+        if (!deallocate.matches()) {
+            return null;
+        }
+        String statementName = deallocate.group("statement");
+        if (!scriptDynamicDdlState.preparedDynamicDdlStatements.remove(statementName.toLowerCase(Locale.ROOT))) {
+            return null;
+        }
+        return dynamicDdlNoopConversion(
+                originalStatement,
+                leadingSqlPrefix,
+                "MySQL DEALLOCATE PREPARE " + statementName
+                        + " is unnecessary after the previous EXECUTE IMMEDIATE block"
+        );
+    }
+
+    private ScriptStatementConversion dynamicDdlNoopConversion(
+            String originalStatement,
+            LeadingSqlPrefix leadingSqlPrefix,
+            String message
+    ) {
+        String convertedSql = leadingSqlPrefix.prefix() + "-- DM_ADAPTER: " + message;
+        return new ScriptStatementConversion(
+                originalStatement,
+                convertedSql,
+                convertedSql,
+                true,
+                false,
+                "",
+                List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE)
+        );
+    }
+
+    private String metadataPredicateLiteral(String whereClause, String columnName) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b" + Pattern.quote(columnName) + "\\b\\s*=\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")"
+        ).matcher(whereClause);
+        if (!matcher.find()) {
+            return "";
+        }
+        return singleQuotedSqlLiteralValue(matcher.group("value"));
+    }
+
+    private String metadataSchemaPredicate(String whereClause, ScriptDynamicDdlState scriptDynamicDdlState) {
+        Matcher variableMatcher = Pattern.compile(
+                "(?is)\\btable_schema\\b\\s*=\\s*@(?<name>[A-Za-z_][A-Za-z0-9_$]*)"
+        ).matcher(whereClause);
+        if (variableMatcher.find()) {
+            String variableName = variableMatcher.group("name").toLowerCase(Locale.ROOT);
+            if (scriptDynamicDdlState.currentSchemaVariables.contains(variableName)) {
+                return "OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+            }
+            return "";
+        }
+        if (Pattern.compile("(?is)\\btable_schema\\b\\s*=\\s*DATABASE\\s*\\(").matcher(whereClause).find()) {
+            return "OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+        }
+        Matcher literalMatcher = Pattern.compile(
+                "(?is)\\btable_schema\\b\\s*=\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")"
+        ).matcher(whereClause);
+        if (!literalMatcher.find()) {
+            return "";
+        }
+        return "OWNER = " + sqlStringLiteral(singleQuotedSqlLiteralValue(literalMatcher.group("value")));
+    }
+
+    private String normalizeMysqlDynamicDdlForDameng(String ddl) {
+        if (ddl == null || ddl.isBlank()) {
+            return "";
+        }
+        String converted = ddl.strip();
+        converted = normalizeMysqlDataTypes(converted);
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\bADD\\s+COLUMN\\b"),
+                matcher -> "ADD"
+        );
+        converted = removeMysqlCommentClauses(converted);
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\s+AFTER\\s+(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?=\\s*(?:,|$))"),
+                matcher -> ""
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\s+FIRST(?=\\s*(?:,|$))"),
+                matcher -> ""
+        );
+        return converted.strip();
     }
 
     private ScriptUserVariableInline inlineScriptUserVariables(
@@ -5540,6 +5787,10 @@ class SqlScriptMigrator {
                 if (!decoded.equals(raw) && isJsonText(decoded)) {
                     return new SingleQuotedStringRewrite(sqlStringLiteral(decoded), end, true);
                 }
+                String normalizedSingleQuotes = normalizeMysqlBackslashEscapedSingleQuotes(raw);
+                if (!normalizedSingleQuotes.equals(raw)) {
+                    return new SingleQuotedStringRewrite(sqlStringLiteral(normalizedSingleQuotes), end, true);
+                }
                 return new SingleQuotedStringRewrite(sql.substring(start, end), end, false);
             } else {
                 rawContent.append(current);
@@ -5572,6 +5823,24 @@ class SqlScriptMigrator {
             index += 2;
         }
         return decoded.toString();
+    }
+
+    private String normalizeMysqlBackslashEscapedSingleQuotes(String value) {
+        StringBuilder normalized = new StringBuilder(value.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\\' && index + 1 < value.length() && value.charAt(index + 1) == '\'') {
+                normalized.append('\'');
+                index += 2;
+                changed = true;
+            } else {
+                normalized.append(current);
+                index++;
+            }
+        }
+        return changed ? normalized.toString() : value;
     }
 
     private boolean isJsonText(String value) {
@@ -7155,6 +7424,24 @@ class SqlScriptMigrator {
         return "";
     }
 
+    private String originalSqlSyntaxManualReviewReason(String sql) {
+        if (hasDanglingInsertValuesCommaBeforeBlockEnd(sql)) {
+            return ORIGINAL_SQL_DANGLING_INSERT_VALUES_REASON;
+        }
+        return "";
+    }
+
+    private boolean hasDanglingInsertValuesCommaBeforeBlockEnd(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return false;
+        }
+        return Pattern.compile(
+                        "(?is)\\bINSERT\\s+INTO\\b[^;]*\\bVALUES\\b[^;]*\\)\\s*,\\s*(?:END\\s+IF|END)\\b"
+                )
+                .matcher(sql)
+                .find();
+    }
+
     private String mysqlPrefixIndexManualReviewReason(String originalSql, String convertedSql) {
         if (originalSql == null || convertedSql == null) {
             return "";
@@ -7361,6 +7648,12 @@ class SqlScriptMigrator {
     }
 
     private record ScriptUserVariableInline(String sql, boolean changed) {
+    }
+
+    private static final class ScriptDynamicDdlState {
+        private final LinkedHashSet<String> currentSchemaVariables = new LinkedHashSet<>();
+        private final LinkedHashSet<String> dynamicDdlVariables = new LinkedHashSet<>();
+        private final LinkedHashSet<String> preparedDynamicDdlStatements = new LinkedHashSet<>();
     }
 
     private record ProcedureExistsCondition(int start, int end, List<String> variableNames, String replacement) {
