@@ -155,6 +155,11 @@ class SqlScriptMigrator {
             "(?is)\\bCREATE\\s+(?:UNIQUE\\s+)?INDEX\\b"
                     + "|\\bALTER\\s+TABLE\\b(?:(?!;).)*?\\bADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b"
     );
+    private static final Pattern MYSQL_PREFIX_INDEX_VARCHAR_GUARD_PATTERN = Pattern.compile(
+            "(?is)\\b(?:UPPER\\s*\\(\\s*)?DATA_TYPE\\s*\\)?\\s+IN\\s*\\(\\s*'CHAR'\\s*,\\s*'VARCHAR'\\s*\\)"
+                    + "|\\bDATA_TYPE\\s+IN\\s*\\(\\s*'char'\\s*,\\s*'varchar'\\s*\\)"
+                    + "|\\bDATA_TYPE\\s+IN\\s*\\(\\s*'varchar'\\s*,\\s*'char'\\s*\\)"
+    );
     private static final String MYSQL_PREFIX_INDEX_MANUAL_REVIEW_REASON =
             "MySQL 前缀索引长度较大（如 column(254)）时，无法可靠自动转换为达梦索引。"
                     + "如果目标字段是 TEXT/CLOB，达梦不能直接建普通索引；"
@@ -249,6 +254,15 @@ class SqlScriptMigrator {
             new TextReplacement(Pattern.compile("(?is)\\btable_schema\\b"), "OWNER"),
             new TextReplacement(Pattern.compile("(?is)\\btable_name\\b"), "TABLE_NAME"),
             new TextReplacement(Pattern.compile("(?is)\\bcolumn_name\\b"), "COLUMN_NAME"),
+            new TextReplacement(
+                    Pattern.compile("(?is)\\bdata_type\\s+IN\\s*\\(\\s*'char'\\s*,\\s*'varchar'\\s*\\)"),
+                    "UPPER(DATA_TYPE) IN ('CHAR', 'VARCHAR')"
+            ),
+            new TextReplacement(
+                    Pattern.compile("(?is)\\bdata_type\\s+IN\\s*\\(\\s*'varchar'\\s*,\\s*'char'\\s*\\)"),
+                    "UPPER(DATA_TYPE) IN ('VARCHAR', 'CHAR')"
+            ),
+            new TextReplacement(Pattern.compile("(?is)\\bdata_type\\b"), "DATA_TYPE"),
             new TextReplacement(Pattern.compile("(?is)\\bcolumn_type\\b"), "DATA_TYPE"),
             new TextReplacement(Pattern.compile("(?is)\\bcolumn_default\\b"), "DATA_DEFAULT"),
             new TextReplacement(Pattern.compile("(?is)\\bis_nullable\\b"), "NULLABLE"),
@@ -4069,7 +4083,9 @@ class SqlScriptMigrator {
         }
         StringBuilder declarations = new StringBuilder();
         for (ProcedureExistsCondition condition : conditions) {
-            declarations.append("    ").append(condition.variableName()).append(" INT;\n");
+            for (String variableName : condition.variableNames()) {
+                declarations.append("    ").append(variableName).append(" INT;\n");
+            }
         }
         return converted.substring(0, convertedBeginIndex)
                 + declarations
@@ -4098,27 +4114,64 @@ class SqlScriptMigrator {
         if (closeParen <= cursor) {
             return null;
         }
-        String existsSelect = sql.substring(cursor + 1, closeParen).strip();
-        if (!startsKeyword(existsSelect, skipWhitespace(existsSelect, 0), "SELECT")) {
-            return null;
+        List<ProcedureExistsTerm> terms = new ArrayList<>();
+        while (true) {
+            String existsSelect = sql.substring(cursor + 1, closeParen).strip();
+            if (!startsKeyword(existsSelect, skipWhitespace(existsSelect, 0), "SELECT")) {
+                return null;
+            }
+            String variableName = uniqueProcedureLocalName("dm_adapter_exists", existingNames);
+            terms.add(new ProcedureExistsTerm(existsSelect, negated, variableName));
+            int nextIndex = skipWhitespace(sql, closeParen + 1);
+            if (!startsKeyword(sql, nextIndex, "AND")) {
+                cursor = nextIndex;
+                break;
+            }
+            cursor = skipWhitespace(sql, nextIndex + "AND".length());
+            negated = false;
+            if (startsKeyword(sql, cursor, "NOT")) {
+                negated = true;
+                cursor = skipWhitespace(sql, cursor + "NOT".length());
+            }
+            if (!startsKeyword(sql, cursor, "EXISTS")) {
+                return null;
+            }
+            cursor = skipWhitespace(sql, cursor + "EXISTS".length());
+            if (cursor >= sql.length() || sql.charAt(cursor) != '(') {
+                return null;
+            }
+            closeParen = findMatchingParen(sql, cursor);
+            if (closeParen <= cursor) {
+                return null;
+            }
         }
-        int thenIndex = skipWhitespace(sql, closeParen + 1);
+        int thenIndex = skipWhitespace(sql, cursor);
         if (!startsKeyword(sql, thenIndex, "THEN")) {
             return null;
         }
-        String variableName = uniqueProcedureLocalName("dm_adapter_exists", existingNames);
         String indent = lineIndentBefore(sql, ifIndex);
-        String replacement = "SELECT COUNT(*) INTO "
-                + variableName
-                + " FROM (\n"
-                + existsSelect
-                + "\n) dm_adapter_exists_check;\n"
-                + indent
-                + "IF "
-                + variableName
-                + (negated ? " = 0" : " > 0")
-                + " THEN";
-        return new ProcedureExistsCondition(ifIndex, thenIndex + "THEN".length(), variableName, replacement);
+        StringBuilder replacement = new StringBuilder();
+        List<String> checks = new ArrayList<>();
+        List<String> variableNames = new ArrayList<>();
+        for (ProcedureExistsTerm term : terms) {
+            replacement.append("SELECT COUNT(*) INTO ")
+                    .append(term.variableName())
+                    .append(" FROM (\n")
+                    .append(term.existsSelect())
+                    .append("\n) dm_adapter_exists_check;\n")
+                    .append(indent);
+            checks.add(term.variableName() + (term.negated() ? " = 0" : " > 0"));
+            variableNames.add(term.variableName());
+        }
+        replacement.append("IF ")
+                .append(String.join(" AND ", checks))
+                .append(" THEN");
+        return new ProcedureExistsCondition(
+                ifIndex,
+                thenIndex + "THEN".length(),
+                variableNames,
+                replacement.toString()
+        );
     }
 
     private String uniqueProcedureLocalName(String base, LinkedHashSet<String> existingNames) {
@@ -6343,6 +6396,10 @@ class SqlScriptMigrator {
         if (!longPrefixIndex) {
             return "";
         }
+        if (MYSQL_PREFIX_INDEX_VARCHAR_GUARD_PATTERN.matcher(originalSql).find()
+                && !MYSQL_PREFIX_INDEX_DDL_PATTERN.matcher(convertedSql).find()) {
+            return "";
+        }
         if (!INDEX_DDL_AFTER_CONVERSION_PATTERN.matcher(convertedSql).find()) {
             return "";
         }
@@ -6525,7 +6582,10 @@ class SqlScriptMigrator {
     private record ScriptUserVariableInline(String sql, boolean changed) {
     }
 
-    private record ProcedureExistsCondition(int start, int end, String variableName, String replacement) {
+    private record ProcedureExistsCondition(int start, int end, List<String> variableNames, String replacement) {
+    }
+
+    private record ProcedureExistsTerm(String existsSelect, boolean negated, String variableName) {
     }
 
     private record CursorLoopConversion(String sql, boolean changed, Set<String> convertedFlags) {
