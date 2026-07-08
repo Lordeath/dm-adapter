@@ -1176,6 +1176,62 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsSimpleMysqlDateEndTriggersToDamengSyntax() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("trigger.sql"), """
+                DROP TRIGGER IF EXISTS trg_card_end_date_insert;
+                DELIMITER //
+                CREATE TRIGGER trg_card_end_date_insert
+                    BEFORE INSERT ON owner_car_month_card_info
+                    FOR EACH ROW
+                BEGIN
+                    IF NEW.card_end_date IS NOT NULL THEN
+                        SET NEW.card_end_date = CONCAT(DATE(NEW.card_end_date), ' 23:59:59');
+                    END IF;
+                END //
+                DELIMITER ;
+
+                DROP TRIGGER IF EXISTS trg_card_end_date_update;
+                DELIMITER //
+                CREATE TRIGGER trg_card_end_date_update
+                    BEFORE UPDATE ON owner_car_month_card_info
+                    FOR EACH ROW
+                BEGIN
+                    IF NEW.card_end_date IS NOT NULL THEN
+                        SET NEW.card_end_date = CONCAT(DATE(NEW.card_end_date), ' 23:59:59');
+                    END IF;
+                END //
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-owner",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("trigger.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE TRIGGER trg_card_end_date_insert")
+                .contains("CREATE OR REPLACE TRIGGER trg_card_end_date_update")
+                .contains("IF :NEW.card_end_date IS NOT NULL THEN")
+                .contains(":NEW.card_end_date := TO_TIMESTAMP(TO_CHAR(:NEW.card_end_date, 'YYYY-MM-DD') || ' 23:59:59', 'YYYY-MM-DD HH24:MI:SS');")
+                .contains("\n/")
+                .doesNotContain("SET NEW.card_end_date")
+                .doesNotContain("CONCAT(DATE(NEW.card_end_date)");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SIMPLE_DATE_END_TRIGGER_TO_DM_RULE));
+    }
+
+    @Test
     void convertsMysqlProcedureDropAndAddUniqueIndexAlterToSeparateDamengIndexDdl() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
