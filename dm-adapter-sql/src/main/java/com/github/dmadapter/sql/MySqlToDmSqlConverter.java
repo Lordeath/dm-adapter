@@ -12,7 +12,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MySqlToDmSqlConverter implements SqlConverter {
-    public static final String MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE = "MYSQL_AES_BASE64_TO_DM_AES128_ECB";
     public static final String MYSQL_BACKTICK_IDENTIFIER_RULE = "MYSQL_BACKTICK_IDENTIFIER_TO_DM";
     public static final String UPDATE_SET_TABLE_ORDER_RULE = "UPDATE_SET_TABLE_ORDER_TO_STANDARD_UPDATE";
     public static final String MYSQL_DATE_SUB_INTERVAL_RULE = "MYSQL_DATE_SUB_INTERVAL_TO_DATEADD";
@@ -103,13 +102,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_HOUR_SECOND_INTERVAL_RULE =
             "MYSQL_HOUR_SECOND_INTERVAL_TO_DATEADD_SECOND";
 
-    private static final int DM_AES128_ECB_ALGORITHM_ID = 513;
-    private static final String AES_ENCRYPT = "AES_ENCRYPT";
-    private static final String AES_DECRYPT = "AES_DECRYPT";
-    private static final String FROM_BASE64 = "FROM_BASE64";
-    private static final String TO_BASE64 = "TO_BASE64";
-    private static final String AES_MANUAL_REVIEW_REASON =
-            "AES_ENCRYPT/AES_DECRYPT is present but only Base64-wrapped AES password SQL is supported for automatic Dameng rewrite.";
     private static final String DM_CURRENT_SCHEMA_EXPRESSION = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')";
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
@@ -326,19 +318,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
         }
 
-        AesBase64Conversion aesBase64Conversion = convertBase64Aes(converted);
-        if (aesBase64Conversion.changed()) {
-            converted = aesBase64Conversion.convertedSql();
-            rules.add(MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE);
-        }
-
         String reason = "";
-        if (containsAesFunction(converted)) {
-            AesBase64Conversion remainingAesConversion = convertBase64Aes(converted);
-            if (!remainingAesConversion.changed() || containsAesFunction(remainingAesConversion.convertedSql())) {
-                reason = AES_MANUAL_REVIEW_REASON;
-            }
-        }
         if (!converted.equals(original) && !reason.isBlank()) {
             return SqlConversionResult.changedWithManualReview(original, converted, rules, reason);
         }
@@ -624,12 +604,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_UPDATE_JOIN_RULE);
         }
 
-        AesBase64Conversion aesBase64Conversion = convertBase64Aes(converted);
-        if (aesBase64Conversion.changed()) {
-            converted = aesBase64Conversion.convertedSql();
-            rules.add(MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE);
-        }
-
         DamengReservedColumnRenamer.RenameResult renameResult =
                 DamengReservedColumnRenamer.renameBareIdentifiers(converted);
         if (renameResult.changed()) {
@@ -822,12 +796,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         if (containsMysqlUserVariable(sql)) {
             return "MySQL user variables such as @var require ROW_NUMBER, explicit variables, or procedure-level rewrite for Dameng.";
-        }
-        if (containsAesFunction(sql)) {
-            AesBase64Conversion aesBase64Conversion = convertBase64Aes(sql);
-            if (!aesBase64Conversion.changed() || containsAesFunction(aesBase64Conversion.convertedSql())) {
-                return AES_MANUAL_REVIEW_REASON;
-            }
         }
         String mysqlFunction = firstMySqlFunctionRequiringReview(sql);
         if (!mysqlFunction.isBlank()) {
@@ -6881,114 +6849,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new UpdateSetTableOrderConversion(converted, true);
     }
 
-    private boolean containsAesFunction(String sql) {
-        return containsFunction(sql, AES_ENCRYPT) || containsFunction(sql, AES_DECRYPT);
-    }
-
-    private AesBase64Conversion convertBase64Aes(String sql) {
-        StringBuilder converted = new StringBuilder(sql.length());
-        boolean changed = false;
-        int index = 0;
-        while (index < sql.length()) {
-            char current = sql.charAt(index);
-            if (current == '\'') {
-                index = appendSingleQuotedString(sql, index, converted);
-            } else if (current == '"') {
-                index = appendDoubleQuotedText(sql, index, converted);
-            } else if (startsMyBatisPlaceholder(sql, index)) {
-                index = appendMyBatisPlaceholder(sql, index, converted);
-            } else if (startsLineComment(sql, index)) {
-                index = appendUntilLineEnd(sql, index, converted);
-            } else if (startsBlockComment(sql, index)) {
-                index = appendUntilBlockCommentEnd(sql, index, converted);
-            } else if (startsFunction(sql, index, TO_BASE64)) {
-                FunctionCall functionCall = readFunctionCall(sql, index, TO_BASE64);
-                String replacement = functionCall == null ? null : rewriteToBase64AesEncrypt(functionCall);
-                if (replacement == null) {
-                    converted.append(current);
-                    index++;
-                } else {
-                    converted.append(replacement);
-                    index = functionCall.endIndex();
-                    changed = true;
-                }
-            } else if (startsFunction(sql, index, AES_DECRYPT)) {
-                FunctionCall functionCall = readFunctionCall(sql, index, AES_DECRYPT);
-                String replacement = functionCall == null ? null : rewriteAesDecrypt(functionCall);
-                if (replacement == null) {
-                    converted.append(current);
-                    index++;
-                } else {
-                    converted.append(replacement);
-                    index = functionCall.endIndex();
-                    changed = true;
-                }
-            } else {
-                converted.append(current);
-                index++;
-            }
-        }
-        return new AesBase64Conversion(changed ? converted.toString() : sql, changed);
-    }
-
-    private String rewriteToBase64AesEncrypt(FunctionCall toBase64Call) {
-        List<TopLevelArgument> toBase64Arguments = splitTopLevelArguments(toBase64Call.body());
-        if (toBase64Arguments.size() != 1) {
-            return null;
-        }
-
-        FunctionCall aesEncryptCall = readOnlyFunctionCall(toBase64Arguments.get(0).text(), AES_ENCRYPT);
-        if (aesEncryptCall == null) {
-            return null;
-        }
-        List<TopLevelArgument> aesEncryptArguments = splitTopLevelArguments(aesEncryptCall.body());
-        if (aesEncryptArguments.size() != 2) {
-            return null;
-        }
-
-        String plainText = aesEncryptArguments.get(0).text().trim();
-        String key = normalizedStringLiteral(aesEncryptArguments.get(1).text());
-        if (plainText.isBlank() || key == null) {
-            return null;
-        }
-        return "TO_BASE64(SF_ENCRYPT_CHAR("
-                + plainText
-                + ", "
-                + DM_AES128_ECB_ALGORITHM_ID
-                + ", "
-                + key
-                + ", NULL))";
-    }
-
-    private String rewriteAesDecrypt(FunctionCall aesDecryptCall) {
-        List<TopLevelArgument> aesDecryptArguments = splitTopLevelArguments(aesDecryptCall.body());
-        if (aesDecryptArguments.size() != 2) {
-            return null;
-        }
-
-        FunctionCall fromBase64Call = readOnlyFunctionCall(aesDecryptArguments.get(0).text(), FROM_BASE64);
-        if (fromBase64Call == null) {
-            return null;
-        }
-        List<TopLevelArgument> fromBase64Arguments = splitTopLevelArguments(fromBase64Call.body());
-        if (fromBase64Arguments.size() != 1) {
-            return null;
-        }
-
-        String cipherText = fromBase64Arguments.get(0).text().trim();
-        String key = normalizedStringLiteral(aesDecryptArguments.get(1).text());
-        if (cipherText.isBlank() || key == null) {
-            return null;
-        }
-        return "SF_DECRYPT_TO_CHAR(FROM_BASE64("
-                + cipherText
-                + "), "
-                + DM_AES128_ECB_ALGORITHM_ID
-                + ", "
-                + key
-                + ", NULL)";
-    }
-
     private FunctionCall readOnlyFunctionCall(String expression, String functionName) {
         int leadingWhitespace = leadingWhitespaceLength(expression);
         FunctionCall functionCall = readFunctionCall(expression, leadingWhitespace, functionName);
@@ -7909,9 +7769,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record BacktickIdentifier(String value, int nextIndex, boolean closed) {
-    }
-
-    private record AesBase64Conversion(String convertedSql, boolean changed) {
     }
 
     private record FunctionCall(int startIndex, int openParenIndex, int closeParenIndex, int endIndex, String body) {

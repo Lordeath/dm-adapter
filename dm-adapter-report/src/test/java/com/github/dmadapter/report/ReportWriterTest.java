@@ -76,8 +76,8 @@ class ReportWriterTest {
                 "mapper/UserMapper.xml",
                 "updatePassword",
                 "user_password = TO_BASE64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR}, 'REAL_SECRET'))",
-                "user_password = TO_BASE64(SF_ENCRYPT_CHAR(#{userPassword, jdbcType=VARCHAR}, 513, 'REAL_SECRET', NULL))",
-                List.of("MYSQL_AES_BASE64_TO_DM_AES128_ECB"),
+                "user_password = TO_BASE64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR}, 'REAL_SECRET'))",
+                List.of("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING"),
                 false,
                 ""
         );

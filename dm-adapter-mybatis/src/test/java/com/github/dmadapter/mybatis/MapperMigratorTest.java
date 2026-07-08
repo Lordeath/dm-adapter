@@ -1556,7 +1556,7 @@ class MapperMigratorTest {
                         INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id
                         SET nu.AD_account = c.`AD_account`,
                             nu.sentry_id = case c.`sentry_id` when "0" then nu.sentry_id else c.`sentry_id` end,
-                            nu.user_password = to_base64(AES_ENCRYPT(c.`password`, "WJ19938888")),
+                            nu.user_password = to_base64(AES_ENCRYPT(c.`password`, "sample-key")),
                             nu.update_time = now()
                         <if test="isFromV8 != null and (isFromV8 == '1' or isFromV8 == 1)">
                             ,nu.v8_user_id = c.sso_user_id
@@ -1590,17 +1590,14 @@ class MapperMigratorTest {
                 .contains("INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id")
                 .contains("SET nu.AD_account = c.`AD_account`")
                 .contains("nu.sentry_id = case c.`sentry_id` when '0' then nu.sentry_id else c.`sentry_id` end")
-                .contains("nu.user_password = TO_BASE64(SF_ENCRYPT_CHAR(c.`password`, 513, 'WJ19938888', NULL))")
+                .contains("nu.user_password = to_base64(AES_ENCRYPT(c.`password`, 'sample-key'))")
                 .contains("nu.update_time = now()")
                 .contains(",nu.v8_user_id = c.sso_user_id")
                 .contains("WHERE\n            nu.enterprise_id = #{enterpriseId}");
         assertThat(result.automaticConversions())
                 .singleElement()
                 .satisfies(change -> assertThat(change.appliedRules())
-                        .containsExactly(
-                                "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
-                                MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
-                        ));
+                        .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING"));
     }
 
     @Test
@@ -1686,14 +1683,11 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
                 .contains("<if test=\"userPassword != null\">")
-                .contains("TO_BASE64(SF_ENCRYPT_CHAR(#{userPassword, jdbcType=VARCHAR }, 513, 'XXXXXXXX', NULL))")
+                .contains("to_base64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,'XXXXXXXX'))")
                 .doesNotContain(",\"XXXXXXXX\"");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(
-                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
-                        MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
-                );
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
