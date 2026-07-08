@@ -216,7 +216,7 @@ class DmAdapterCliTest {
     }
 
     @Test
-    void migrateRewritesAesPasswordSqlAndRedactsReports() throws Exception {
+    void migrateKeepsAesPasswordSqlAndDoesNotReportSecrets() throws Exception {
         writeDemoProject();
         Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -239,17 +239,17 @@ class DmAdapterCliTest {
         assertThat(exitCode).isZero();
         String migratedMapper = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(migratedMapper)
-                .contains("SF_DECRYPT_TO_CHAR(FROM_BASE64(user_password), 513, 'REAL_SECRET', NULL)")
-                .contains("TO_BASE64(SF_ENCRYPT_CHAR(#{userPassword, jdbcType=VARCHAR}, 513, 'REAL_SECRET', NULL))");
+                .contains("AES_DECRYPT(FROM_BASE64(user_password), 'REAL_SECRET')")
+                .contains("TO_BASE64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR}, 'REAL_SECRET'))")
+                .doesNotContain("SF_DECRYPT_TO_CHAR")
+                .doesNotContain("SF_ENCRYPT_CHAR");
         String markdown = Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md"));
         String json = Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.json"));
         assertThat(markdown)
-                .contains("AES128_ECB")
-                .contains("RESET_REQUIRED")
-                .contains("'******'")
+                .doesNotContain("AES128_ECB")
+                .doesNotContain("RESET_REQUIRED")
                 .doesNotContain("REAL_SECRET");
         assertThat(json)
-                .contains("'******'")
                 .doesNotContain("REAL_SECRET");
     }
 

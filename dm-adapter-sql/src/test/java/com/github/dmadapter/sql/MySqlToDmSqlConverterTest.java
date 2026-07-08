@@ -128,19 +128,16 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void convertsDoubleQuotedStringLiteralInAesEncryptExpression() {
+    void keepsAesEncryptExpressionAndConvertsDoubleQuotedStringLiteral() {
         SqlConversionResult result = converter.convert(
                 "user_password = to_base64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,\"XXXXXXXX\")) ,"
         );
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("user_password = TO_BASE64(SF_ENCRYPT_CHAR(#{userPassword, jdbcType=VARCHAR }, 513, 'XXXXXXXX', NULL)) ,");
+                .isEqualTo("user_password = to_base64(AES_ENCRYPT(#{userPassword, jdbcType=VARCHAR } \t,'XXXXXXXX')) ,");
         assertThat(result.appliedRules())
-                .containsExactly(
-                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
-                        MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
-                );
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
     }
 
     @Test
@@ -148,37 +145,34 @@ class MySqlToDmSqlConverterTest {
         SqlConversionResult result = converter.convertDynamicTextSegmentSafeRules(
                 "UPDATE ns_system_user nu INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id "
                         + "SET nu.sentry_id = case c.`sentry_id` when \"0\" then nu.sentry_id else c.`sentry_id` end, "
-                        + "nu.user_password = to_base64(AES_ENCRYPT(c.`password`, \"WJ19938888\"))"
+                        + "nu.user_password = to_base64(AES_ENCRYPT(c.`password`, \"sample-key\"))"
         );
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
                 .contains("UPDATE ns_system_user nu INNER JOIN ys_user c ON nu.ys_user_id = c.sso_user_id SET")
                 .contains("when '0' then")
-                .contains("TO_BASE64(SF_ENCRYPT_CHAR(c.`password`, 513, 'WJ19938888', NULL))")
+                .contains("to_base64(AES_ENCRYPT(c.`password`, 'sample-key'))")
                 .doesNotContain(" from ");
         assertThat(result.appliedRules())
-                .containsExactly(
-                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
-                        MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE
-                );
+                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
     }
 
     @Test
-    void convertsBase64WrappedAesDecryptToDamengAes128Ecb() {
+    void keepsBase64WrappedAesDecryptForCompatibilityFunction() {
         SqlConversionResult result = converter.convert(
                 "select AES_DECRYPT(FROM_BASE64(user_password), 'XXXXXXXX') from user"
         );
 
-        assertThat(result.changed()).isTrue();
+        assertThat(result.changed()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("select SF_DECRYPT_TO_CHAR(FROM_BASE64(user_password), 513, 'XXXXXXXX', NULL) from user");
+                .isEqualTo("select AES_DECRYPT(FROM_BASE64(user_password), 'XXXXXXXX') from user");
         assertThat(result.appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_AES_BASE64_TO_DM_AES128_ECB_RULE);
+                .isEmpty();
     }
 
     @Test
-    void marksUnsupportedAesFormsForManualReview() {
+    void keepsAesFunctionsForCompatibilityFunctions() {
         List<String> sqlItems = List.of(
                 "select AES_ENCRYPT(name, 'XXXXXXXX') from user",
                 "select TO_BASE64(AES_ENCRYPT(name, #{aesKey})) from user",
@@ -188,10 +182,9 @@ class MySqlToDmSqlConverterTest {
         for (String sql : sqlItems) {
             SqlConversionResult result = converter.convert(sql);
 
-            assertThat(result.manualReviewRequired()).isTrue();
+            assertThat(result.manualReviewRequired()).isFalse();
             assertThat(result.changed()).isFalse();
             assertThat(result.convertedSql()).isEqualTo(result.originalSql());
-            assertThat(result.reason()).contains("Base64-wrapped AES password SQL");
         }
     }
 
