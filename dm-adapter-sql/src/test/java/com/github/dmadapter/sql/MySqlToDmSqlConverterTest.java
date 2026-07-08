@@ -1032,6 +1032,23 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlDeleteAliasStarAfterRemovingIndexHint() {
+        SqlConversionResult result = converter.convert("""
+                delete x.* from ns_core_role_perm x USE index(ns_core_role_perm_idx)
+                where x.perid = #{perid}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                delete from ns_core_role_perm x where x.perid = #{perid}
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_DELETE_ALIAS_STAR_RULE,
+                MySqlToDmSqlConverter.MYSQL_INDEX_HINT_REMOVAL_RULE
+        );
+    }
+
+    @Test
     void keepsDeleteAliasStarWhenAliasDoesNotMatchTargetAlias() {
         SqlConversionResult result = converter.convert("delete t.* from sample_user u where u.id = #{id}");
 

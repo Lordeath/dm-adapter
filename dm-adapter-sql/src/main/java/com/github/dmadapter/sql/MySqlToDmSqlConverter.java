@@ -606,6 +606,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_INDEX_HINT_REMOVAL_RULE);
         }
 
+        GenericConversion deleteAliasStarAfterIndexHintConversion = convertMysqlDeleteAliasStar(converted);
+        if (deleteAliasStarAfterIndexHintConversion.changed()) {
+            converted = deleteAliasStarAfterIndexHintConversion.convertedSql();
+            rules.add(MYSQL_DELETE_ALIAS_STAR_RULE);
+        }
+
         UpdateSetTableOrderConversion updateSetTableOrderConversion = convertUpdateSetTableOrder(converted);
         if (updateSetTableOrderConversion.changed()) {
             converted = updateSetTableOrderConversion.convertedSql();

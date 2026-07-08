@@ -767,6 +767,541 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void movesMysqlProcedureDeclarationsAfterLeadingComments() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE initializeInspectItemNum()
+                BEGIN
+                    -- keep comment before declarations
+                    DECLARE itemId3 bigint;
+                    DECLARE STOP3 INT DEFAULT 0;
+                    DECLARE ITEM3 CURSOR FOR SELECT id FROM ns_equip_inspect_item;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET STOP3=1;
+                    OPEN ITEM3;
+                    FETCH ITEM3 INTO itemId3;
+                    WHILE STOP3<> 1 DO
+                        INSERT INTO ns_equip_inspect_item_num(itemId) VALUES(itemId3);
+                        FETCH ITEM3 INTO itemId3;
+                    END WHILE;
+                    CLOSE ITEM3;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-equip",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("""
+                        CREATE OR REPLACE PROCEDURE initializeInspectItemNum() AS
+                            itemId3 bigint;
+                            ITEM3 CURSOR FOR SELECT id FROM ns_equip_inspect_item;
+                        BEGIN
+                            -- keep comment before declarations
+                        """)
+                .contains("EXIT WHEN ITEM3%NOTFOUND;")
+                .doesNotContain("BEGIN\n    -- keep comment before declarations\n    DECLARE")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("STOP3");
+    }
+
+    @Test
+    void convertsMysqlAlterChangeWithSameColumnNameInsideProcedureDdl() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE updatePrecinctColumns()
+                BEGIN
+                    IF EXISTS (
+                        SELECT NULL FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE table_name = 'ns_equip_inspect_template'
+                          AND table_schema = 'sample-equip'
+                          AND column_name = 'precinctID'
+                    ) THEN
+                        alter table ns_equip_inspect_template change precinctID precinctID text NOT NULL COMMENT '项目id集合';
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-equip",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_equip_inspect_template MODIFY precinctID CLOB NOT NULL'")
+                .doesNotContain(" change precinctID precinctID ")
+                .doesNotContain(" COMMENT ");
+    }
+
+    @Test
+    void renamesReservedObjectCursorInsideProcedure() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE insertVirtualRoom()
+                BEGIN
+                    DECLARE house_id1 BIGINT (32);
+                    DECLARE STOP INT DEFAULT 0;
+                    DECLARE object CURSOR FOR SELECT house_id FROM owner_house_precinct_info;
+                    DECLARE CONTINUE HANDLER FOR SQLSTATE '02000'SET STOP=1;
+                    OPEN object;
+                    FETCH object INTO house_id1;
+                    WHILE STOP<> 1 DO
+                        INSERT INTO ns_equip_room(precinctid) VALUES (house_id1);
+                        FETCH object INTO house_id1;
+                    END WHILE;
+                    CLOSE object;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-equip",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("dm_object_cursor CURSOR FOR SELECT house_id FROM owner_house_precinct_info;")
+                .contains("OPEN dm_object_cursor;")
+                .contains("FETCH dm_object_cursor INTO house_id1;")
+                .contains("EXIT WHEN dm_object_cursor%NOTFOUND;")
+                .contains("CLOSE dm_object_cursor;")
+                .doesNotContain(" object CURSOR")
+                .doesNotContain("OPEN object")
+                .doesNotContain("FETCH object")
+                .doesNotContain("CLOSE object");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_RESERVED_CURSOR_RENAME_RULE));
+    }
+
+    @Test
+    void addsColumnListForInsertValuesWhenTableDefinitionIsKnown() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                CREATE TABLE IF NOT EXISTS `ns_equip_help_topic` (
+                    `help_topic_id` int(10) UNSIGNED NOT NULL,
+                    PRIMARY KEY (`help_topic_id`) USING BTREE
+                ) ENGINE = InnoDB;
+
+                DELIMITER $$
+                CREATE PROCEDURE `insert_Init_ns_equip_help_topic` ()
+                BEGIN
+                    SET @i:=0;
+                    WHILE @i<2000 DO
+                        insert into `ns_equip_help_topic` VALUES(@i);
+                        SET @i:=@i+1;
+                    END WHILE;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-equip",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("insert into `ns_equip_help_topic` (help_topic_id) VALUES(dm_i);")
+                .doesNotContain("insert into `ns_equip_help_topic` VALUES(dm_i);");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void placesProcedureUserVariableDeclarationsBeforeCursorDeclarations() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE updateQualityData()
+                BEGIN
+                    DECLARE etrId BIGINT (20);
+                    DECLARE STOP INT DEFAULT 0;
+                    DECLARE ENTERPRISE CURSOR FOR SELECT DISTINCT enterpriseID FROM ns_quality_param_value union SELECT @enterpriseID;
+                    DECLARE CONTINUE HANDLER FOR SQLSTATE '02000'SET STOP=1;
+                    OPEN ENTERPRISE;
+                    FETCH ENTERPRISE INTO etrId;
+                    WHILE STOP<> 1 DO
+                        INSERT INTO ns_quality_param_value(enterpriseID, createUserID) VALUES(etrId, @adminUserID);
+                        FETCH ENTERPRISE INTO etrId;
+                    END WHILE;
+                    CLOSE ENTERPRISE;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-quality",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .containsSubsequence(
+                        "dm_enterpriseID VARCHAR(4000);",
+                        "dm_adminUserID VARCHAR(4000);",
+                        "ENTERPRISE CURSOR FOR SELECT DISTINCT enterpriseID FROM ns_quality_param_value union SELECT dm_enterpriseID;"
+                )
+                .contains("EXIT WHEN ENTERPRISE%NOTFOUND;")
+                .doesNotContain("DECLARE CONTINUE HANDLER");
+    }
+
+    @Test
+    void convertsMysqlNotFoundHandlerLabelLoopsToDamengCursorLoops() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE init_equip_records()
+                BEGIN
+                    DECLARE etrId_outer BIGINT;
+                    DECLARE recId_inner BIGINT;
+                    DECLARE done INT DEFAULT FALSE;
+                    DECLARE edone INT DEFAULT FALSE;
+                    DECLARE _outerForEach CURSOR FOR SELECT DISTINCT ENTERPRISE_ID FROM `sample-system`.ns_system_organization;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+                    OPEN _outerForEach;
+                    read_loop:
+                    LOOP
+                        FETCH _outerForEach INTO etrId_outer;
+                        IF done = TRUE THEN
+                            LEAVE read_loop;
+                        END IF;
+                        BEGIN
+                            DECLARE _innerForEach CURSOR FOR SELECT id FROM ns_equip_custom_record WHERE enterprise_id = etrId_outer;
+                            DECLARE CONTINUE HANDLER FOR NOT FOUND SET edone = TRUE;
+                            OPEN _innerForEach;
+                            inner_loop:
+                            LOOP
+                                FETCH _innerForEach INTO recId_inner;
+                                IF edone=1 THEN
+                                    LEAVE inner_loop;
+                                END IF;
+                                UPDATE ns_equip_custom_record SET enterprise_id = etrId_outer WHERE id = recId_inner;
+                            END LOOP;
+                            CLOSE _innerForEach;
+                            SET edone = FALSE;
+                        END;
+                    END LOOP;
+                    CLOSE _outerForEach;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-equip",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE init_equip_records() AS")
+                .contains("_outerForEach CURSOR FOR SELECT DISTINCT ENTERPRISE_ID FROM `sample-system`.ns_system_organization;")
+                .contains("EXIT WHEN _outerForEach%NOTFOUND;")
+                .contains("DECLARE\n")
+                .contains("_innerForEach CURSOR FOR SELECT id FROM ns_equip_custom_record WHERE enterprise_id = etrId_outer;")
+                .contains("BEGIN")
+                .contains("OPEN _innerForEach;")
+                .contains("EXIT WHEN _innerForEach%NOTFOUND;")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("done INT")
+                .doesNotContain("edone INT")
+                .doesNotContain("LEAVE read_loop")
+                .doesNotContain("LEAVE inner_loop")
+                .doesNotContain("SET edone");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP_RULE));
+    }
+
+    @Test
+    void convertsMysqlNotFoundHandlerLabelLoopWithElseBodyToDamengCursorLoop() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE updateCustomRecordAllData()
+                BEGIN
+                    DECLARE etrId_outer BIGINT (20);
+                    DECLARE recId_inner BIGINT (20);
+                    DECLARE done INT DEFAULT FALSE;
+                    DECLARE edone INT DEFAULT FALSE;
+                    DECLARE _outerForEach CURSOR FOR SELECT DISTINCT ENTERPRISE_ID FROM `sample-system`.ns_system_organization;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+                    OPEN _outerForEach;
+                    read_loop:
+                    LOOP
+                        FETCH _outerForEach INTO etrId_outer;
+                        IF done THEN
+                            LEAVE read_loop;
+                        END IF;
+                        BEGIN
+                            DECLARE _innerForEach CURSOR FOR SELECT id FROM ns_equip_custom_record WHERE enterpriseID = 0;
+                            DECLARE CONTINUE HANDLER FOR NOT FOUND SET edone = 1;
+                            OPEN _innerForEach;
+                            inner_loop:
+                            LOOP
+                                FETCH _innerForEach INTO recId_inner;
+                                IF edone THEN
+                                    LEAVE inner_loop;
+                                ELSE
+                                    SELECT customerTypeid INTO @typeId FROM ns_equip_custom_record WHERE id = recId_inner;
+                                    SELECT customerCode INTO @typeCode FROM ns_equip_custom_record WHERE id = recId_inner;
+                                    IF NOT EXISTS (
+                                        SELECT 1 FROM ns_equip_custom_record
+                                        WHERE customerTypeid = @typeId AND customerCode = @typeCode and enterpriseID = etrId_outer
+                                    ) THEN
+                                        INSERT INTO ns_equip_custom_record(enterpriseID, customerTypeid, customerCode)
+                                        SELECT etrId_outer, customerTypeid, customerCode
+                                        FROM ns_equip_custom_record
+                                        WHERE customerTypeid = @typeId AND customerCode = @typeCode AND enterpriseID = 0 LIMIT 1;
+                                    END IF;
+                                END IF;
+                            END LOOP;
+                            CLOSE _innerForEach;
+                            SET edone = FALSE;
+                        END;
+                    END LOOP;
+                    CLOSE _outerForEach;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-equip",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE updateCustomRecordAllData() AS")
+                .contains("dm_typeId VARCHAR(4000);")
+                .contains("dm_typeCode VARCHAR(4000);")
+                .contains("EXIT WHEN _outerForEach%NOTFOUND;")
+                .contains("EXIT WHEN _innerForEach%NOTFOUND;")
+                .contains("SELECT customerTypeid INTO dm_typeId")
+                .contains("SELECT customerCode INTO dm_typeCode")
+                .contains("WHERE customerTypeid = dm_typeId AND customerCode = dm_typeCode")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("IF done THEN")
+                .doesNotContain("IF edone THEN")
+                .doesNotContain("LEAVE read_loop")
+                .doesNotContain("LEAVE inner_loop")
+                .doesNotContain("SET edone")
+                .doesNotContain("@typeId")
+                .doesNotContain("@typeCode");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(
+                                SqlScriptMigrator.MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE
+                        ));
+    }
+
+    @Test
+    void leavesCursorHandlerForManualReviewWhenFlagHasBusinessUse() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE unsafe_cursor_flag()
+                BEGIN
+                    DECLARE recId BIGINT;
+                    DECLARE done INT DEFAULT FALSE;
+                    DECLARE c1 CURSOR FOR SELECT id FROM ns_demo;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+                    OPEN c1;
+                    read_loop:
+                    LOOP
+                        FETCH c1 INTO recId;
+                        IF done THEN
+                            LEAVE read_loop;
+                        END IF;
+                        INSERT INTO ns_demo_log(id) VALUES (recId);
+                    END LOOP;
+                    CLOSE c1;
+                    IF done THEN
+                        INSERT INTO ns_demo_log(id) VALUES (-1);
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-equip",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("HANDLER"));
+    }
+
+    @Test
+    void convertsMysqlDeleteAliasStarInsideProcedure() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE cleanup_role_perm()
+                BEGIN
+                    delete x.* from ns_core_role_perm x USE index(ns_core_role_perm_idx)
+                    where x.perid in (select perid from ns_core_permission where funcid = 'demo');
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("DELETE FROM ns_core_role_perm x")
+                .contains("where x.perid in")
+                .doesNotContain("delete x.* from")
+                .doesNotContain("USE index");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_DELETE_ALIAS_STAR_RULE));
+    }
+
+    @Test
+    void convertsSimpleMysqlFunctionUserVariablesToDamengLocals() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("function.sql"), """
+                DELIMITER $$
+                CREATE FUNCTION get_number (param varchar(50))
+                RETURNS varchar(30)
+                READS SQL DATA
+                BEGIN
+                    SET @temp_length=0;
+                    SET @temp_str='';
+                    SET @temp_length=CHAR_LENGTH(param);
+                    WHILE @temp_length > 0 DO
+                        IF (ASCII(mid(param,@temp_length,1))>47 and ASCII(mid(param,@temp_length,1))<58 )THEN
+                            SET @temp_str = concat(@temp_str,mid(param,@temp_length,1));
+                        END IF;
+                        SET @temp_length = @temp_length - 1;
+                    END WHILE;
+                    RETURN REVERSE(@temp_str);
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-warehouse",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("function.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE FUNCTION get_number (param varchar(50))")
+                .contains("RETURN varchar(30)")
+                .contains("dm_temp_length BIGINT;")
+                .contains("dm_temp_str VARCHAR(4000);")
+                .contains("dm_temp_length := 0;")
+                .contains("dm_temp_str := '';")
+                .contains("WHILE dm_temp_length > 0 LOOP")
+                .contains("END LOOP;")
+                .contains("RETURN REVERSE(dm_temp_str);")
+                .doesNotContain("RETURNS")
+                .doesNotContain("READS SQL DATA")
+                .doesNotContain("@temp");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(
+                                SqlScriptMigrator.MYSQL_CREATE_FUNCTION_TO_DM_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE
+                        ));
+    }
+
+    @Test
     void leavesComplexMysqlHandlersForManualReview() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
