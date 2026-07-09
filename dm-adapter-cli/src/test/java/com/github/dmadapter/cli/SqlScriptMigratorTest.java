@@ -269,11 +269,11 @@ class SqlScriptMigratorTest {
 
                 set @ddl = (
                     select if(count(*) = 0,
-                        'alter table ns_canal_config_item add column `targetDatabase` varchar(128) null comment ''跨库写入目标逻辑库，例如 DataCenter'' after `targetTableName`',
+                        'alter table sample_canal_config_item add column `targetDatabase` varchar(128) null comment ''跨库写入目标逻辑库，例如 DataCenter'' after `targetTableName`',
                         'do 0')
                     from information_schema.columns
                     where table_schema = @db_name
-                      and table_name = 'ns_canal_config_item'
+                      and table_name = 'sample_canal_config_item'
                       and column_name = 'targetDatabase'
                 );
                 prepare stmt from @ddl;
@@ -296,9 +296,9 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .contains("FROM ALL_TAB_COLUMNS")
                 .contains("WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
-                .contains("AND TABLE_NAME = 'ns_canal_config_item'")
+                .contains("AND TABLE_NAME = 'sample_canal_config_item'")
                 .contains("AND COLUMN_NAME = 'targetDatabase'")
-                .contains("EXECUTE IMMEDIATE 'alter table ns_canal_config_item ADD `targetDatabase` varchar(128) null'")
+                .contains("EXECUTE IMMEDIATE 'alter table sample_canal_config_item ADD `targetDatabase` varchar(128) null'")
                 .contains("-- DM_ADAPTER: MySQL PREPARE stmt is handled by the previous EXECUTE IMMEDIATE block")
                 .contains("-- DM_ADAPTER: MySQL EXECUTE stmt is handled by the previous EXECUTE IMMEDIATE block")
                 .contains("-- DM_ADAPTER: MySQL DEALLOCATE PREPARE stmt is unnecessary after the previous EXECUTE IMMEDIATE block")
@@ -1115,6 +1115,119 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_INSERT_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void omitsNullAutoIncrementColumnForInsertValuesWhenTableDefinitionIsKnown() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE IF NOT EXISTS `sample_canal_config_item` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `sourceTableName` VARCHAR(255) NOT NULL,
+                    `sourceDatabase` VARCHAR(255) NOT NULL,
+                    PRIMARY KEY (`id`)
+                ) ENGINE = InnoDB;
+
+                DELIMITER $$
+                CREATE PROCEDURE addAll_sample_canal_config_item()
+                BEGIN
+                    INSERT INTO `sample_canal_config_item` VALUES (NULL, 'sample_table', 'Sample');
+                    SET @configId = LAST_INSERT_ID();
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("INSERT INTO `sample_canal_config_item` (sourceTableName, sourceDatabase) VALUES ('sample_table', 'Sample');")
+                .doesNotContain("INSERT INTO `sample_canal_config_item` (id, sourceTableName, sourceDatabase)");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void omitsDefaultIdentityColumnForMultiRowInsertValues() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_identity (
+                    id BIGINT IDENTITY(1,1),
+                    code VARCHAR(32),
+                    name VARCHAR(64)
+                );
+
+                INSERT INTO sample_identity VALUES (DEFAULT, 'A', 'Alpha'), (default, 'B', 'Beta');
+                """);
+
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_identity (code, name) VALUES ('A', 'Alpha'), ('B', 'Beta');")
+                .doesNotContain("id, code, name");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void keepsExplicitIdentityValuesUnchanged() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_identity (
+                    id BIGINT IDENTITY(1,1),
+                    code VARCHAR(32)
+                );
+
+                INSERT INTO sample_identity VALUES (7, 'A');
+                """);
+
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_identity VALUES (7, 'A');")
+                .doesNotContain("sample_identity (code) VALUES")
+                .doesNotContain("sample_identity (id, code) VALUES");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE)
+                        .doesNotContain(SqlScriptMigrator.MYSQL_INSERT_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void keepsNullFirstValueWhenFirstColumnIsNotIdentity() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_plain (
+                    id BIGINT NOT NULL,
+                    code VARCHAR(32)
+                );
+
+                INSERT INTO sample_plain VALUES (NULL, 'A');
+                """);
+
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_plain (id, code) VALUES (NULL, 'A');");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_VALUES_COLUMN_LIST_RULE)
+                        .doesNotContain(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void keepsExistingInsertColumnListForIdentityTable() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_identity (
+                    id BIGINT IDENTITY(1,1),
+                    code VARCHAR(32)
+                );
+
+                INSERT INTO sample_identity (code) VALUES ('A');
+                """);
+
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_identity (code) VALUES ('A');")
+                .doesNotContain("sample_identity (id, code)");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE)
+                        .doesNotContain(SqlScriptMigrator.MYSQL_INSERT_VALUES_COLUMN_LIST_RULE));
     }
 
     @Test
@@ -3150,9 +3263,28 @@ class SqlScriptMigratorTest {
         return new SqlScriptMigrator(new MySqlToDmSqlConverter(), validator);
     }
 
+    private ConvertedScript migrateSingleScript(String content) throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), content);
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+        return new ConvertedScript(report, Files.readString(sqlRootOut.resolve("procedure.sql")));
+    }
+
     private void write(Path path, String content) throws Exception {
         Files.createDirectories(path.getParent());
         Files.writeString(path, content);
+    }
+
+    private record ConvertedScript(SqlScriptMigrationReport report, String sql) {
     }
 
     private static final class RecordingValidator implements SqlScriptMigrator.Validator {
