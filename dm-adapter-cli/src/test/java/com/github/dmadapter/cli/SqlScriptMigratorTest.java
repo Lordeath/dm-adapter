@@ -1204,7 +1204,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void keepsExplicitIdentityValuesUnchanged() throws Exception {
+    void wrapsExplicitIdentityValuesWithIdentityInsert() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE TABLE sample_identity (
                     id BIGINT IDENTITY(1,1),
@@ -1215,14 +1215,53 @@ class SqlScriptMigratorTest {
                 """);
 
         assertThat(converted.sql())
-                .contains("INSERT INTO sample_identity VALUES (7, 'A');")
-                .doesNotContain("sample_identity (code) VALUES")
-                .doesNotContain("sample_identity (id, code) VALUES");
+                .contains("""
+                        SET IDENTITY_INSERT sample_identity ON;
+                        INSERT INTO sample_identity (id, code) VALUES (7, 'A');
+                        SET IDENTITY_INSERT sample_identity OFF;
+                        """)
+                .doesNotContain("INSERT INTO sample_identity VALUES (7, 'A');")
+                .doesNotContain("sample_identity (code) VALUES");
         assertThat(converted.report().files())
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE)
                         .doesNotContain(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE)
                         .doesNotContain(SqlScriptMigrator.MYSQL_INSERT_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void wrapsExplicitAutoIncrementInsertAfterScriptAlterTableAddColumn() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_seed_item (
+                    id INT NOT NULL AUTO_INCREMENT,
+                    code VARCHAR(32) NOT NULL,
+                    name VARCHAR(64) NOT NULL,
+                    PRIMARY KEY (id)
+                );
+
+                ALTER TABLE sample_seed_item ADD COLUMN deleteFlag TINYINT DEFAULT 0;
+
+                DELIMITER $$
+                CREATE PROCEDURE add_sample_seed_item()
+                BEGIN
+                    INSERT INTO sample_seed_item VALUES (2, 'A', 'Alpha');
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.sql())
+                .contains("""
+                        SET IDENTITY_INSERT sample_seed_item ON;
+                        INSERT INTO sample_seed_item (id, code, name) VALUES (2, 'A', 'Alpha');
+                        SET IDENTITY_INSERT sample_seed_item OFF;
+                        """)
+                .doesNotContain("INSERT INTO sample_seed_item VALUES (2, 'A', 'Alpha');")
+                .doesNotContain("deleteFlag) VALUES");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE));
     }
 
     @Test
