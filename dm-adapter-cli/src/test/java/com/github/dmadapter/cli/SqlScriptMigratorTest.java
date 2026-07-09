@@ -456,6 +456,41 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void marksUnsafeIntegerArithmeticScriptSqlForManualReviewAndSkipsValidation() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        RecordingValidator validator = new RecordingValidator();
+        write(sqlRoot.resolve("arithmetic.sql"), """
+                select '10'/4 from dual;
+                """);
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> {
+                    assertThat(item.reason()).contains("整数算术表达式风险");
+                    assertThat(item.originalSql()).contains("'10'/4");
+                    assertThat(item.convertedSql()).contains("'10'/4");
+                });
+        assertThat(Files.readString(sqlRootOut.resolve("arithmetic.sql")))
+                .contains("select '10'/4 from dual;");
+        assertThat(validator.files)
+                .singleElement()
+                .satisfies(file -> assertThat(file.manualReviewStatementIndexes()).containsExactly(1));
+    }
+
+    @Test
     void reportsOriginalDanglingInsertValuesCommaForManualReviewAndSkipsDependentCall() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");

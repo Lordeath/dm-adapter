@@ -295,6 +295,9 @@ public class ReportWriter {
         if (reason.startsWith("可疑字段长度修改")) {
             return reason;
         }
+        if (reason.startsWith("整数算术表达式风险")) {
+            return reason;
+        }
         if (reason.equals("MySQL user variables such as @var require ROW_NUMBER, explicit variables, or procedure-level rewrite for Dameng.")) {
             return "MySQL 用户变量（如 @var）不能直接迁移到达梦；建议改为 ROW_NUMBER()、显式变量，或按存储过程语义人工重写。";
         }

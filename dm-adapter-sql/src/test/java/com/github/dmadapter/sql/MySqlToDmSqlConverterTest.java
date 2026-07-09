@@ -172,6 +172,92 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsSimpleIntegerDivisionToDecimalArithmetic() {
+        SqlConversionResult result = converter.convert("select 1/2*100 as pct, 100*(1/3) as pct2 from dual");
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select CAST(1 AS DECIMAL(38,10)) / NULLIF(CAST(2 AS DECIMAL(38,10)), 0)*100 as pct, "
+                        + "100*(CAST(1 AS DECIMAL(38,10)) / NULLIF(CAST(3 AS DECIMAL(38,10)), 0)) as pct2 from dual"
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE);
+    }
+
+    @Test
+    void convertsAggregateAndIdentifierDivisionToDecimalArithmetic() {
+        SqlConversionResult result = converter.convert(
+                "select SUM(receivable)/SUM(total), amount / count from bill_detail"
+        );
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select CAST(SUM(receivable) AS DECIMAL(38,10)) / "
+                        + "NULLIF(CAST(SUM(total) AS DECIMAL(38,10)), 0), "
+                        + "CAST(amount AS DECIMAL(38,10)) / NULLIF(CAST(count AS DECIMAL(38,10)), 0) "
+                        + "from bill_detail"
+        );
+    }
+
+    @Test
+    void convertsMysqlDivOperatorToTruncDecimalArithmetic() {
+        SqlConversionResult result = converter.convert("select 5 DIV 2, -5 DIV #{count} from dual");
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select TRUNC(CAST(5 AS DECIMAL(38,10)) / NULLIF(CAST(2 AS DECIMAL(38,10)), 0), 0), "
+                        + "TRUNC(CAST(-5 AS DECIMAL(38,10)) / NULLIF(CAST(#{count} AS DECIMAL(38,10)), 0), 0) "
+                        + "from dual"
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL_RULE);
+    }
+
+    @Test
+    void keepsDecimalDivisionAndAddsDecimalCastBeforeExistingNullifDenominator() {
+        SqlConversionResult result = converter.convert(
+                "select 1.0/2, CAST(a AS DECIMAL(18,6))/b, a/NULLIF(b,0) from dual"
+        );
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select 1.0/2, CAST(a AS DECIMAL(18,6))/b, "
+                        + "CAST(a AS DECIMAL(38,10)) / NULLIF(b,0) from dual"
+        );
+    }
+
+    @Test
+    void marksUnsafeArithmeticDivisionForManualReview() {
+        List<String> sqlItems = List.of(
+                "select '10'/4 from dual",
+                "select ${expr}/4 from dual",
+                "select 1e0/2 from dual",
+                "select TIMESTAMPDIFF(SECOND, start_time, end_time)/60 from task"
+        );
+
+        for (String sql : sqlItems) {
+            SqlConversionResult result = converter.convert(sql);
+
+            assertThat(result.changed()).isFalse();
+            assertThat(result.manualReviewRequired()).isTrue();
+            assertThat(result.reason()).contains("整数算术表达式风险");
+        }
+    }
+
+    @Test
+    void ignoresArithmeticOperatorsInsideStringsAndComments() {
+        SqlConversionResult result = converter.convert("""
+                select '1/2' as raw, note from demo
+                -- 1/2
+                where id = 1
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
     void keepsAesFunctionsForCompatibilityFunctions() {
         List<String> sqlItems = List.of(
                 "select AES_ENCRYPT(name, 'XXXXXXXX') from user",
@@ -2858,15 +2944,20 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesMysqlIfFunctionNative() {
+    void convertsMysqlIfFunctionDivisionToDecimalArithmetic() {
         SqlConversionResult result = converter.convert("""
                 select sum(amount) / if(count(DISTINCT log.id) = 0, 1, count(DISTINCT log.id)) as avgAmount
                 from payment_log log
                 """);
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql()).isEqualTo("""
+                select CAST(sum(amount) AS DECIMAL(38,10)) / NULLIF(CAST(if(count(DISTINCT log.id) = 0, 1, count(DISTINCT log.id)) AS DECIMAL(38,10)), 0) as avgAmount
+                from payment_log log
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE);
     }
 
     @Test
