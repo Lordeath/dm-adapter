@@ -101,8 +101,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYSQL_HOUR_SECOND_INTERVAL_RULE =
             "MYSQL_HOUR_SECOND_INTERVAL_TO_DATEADD_SECOND";
+    public static final String MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE =
+            "MYSQL_INTEGER_DIVISION_TO_DECIMAL";
+    public static final String MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL_RULE =
+            "MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL";
 
     private static final String DM_CURRENT_SCHEMA_EXPRESSION = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')";
+    private static final String DECIMAL_ARITHMETIC_TYPE = "DECIMAL(38,10)";
+    private static final String INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON =
+            "整数算术表达式风险：MySQL `/` 会产生小数，达梦整数/整数可能截断；"
+                    + "请确认是否需要在除法前 CAST 为 DECIMAL(38,10)，并用 NULLIF 处理分母 0。";
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOW_PATTERN = Pattern.compile("\\bNOW\\s*\\(\\s*\\)", Pattern.CASE_INSENSITIVE);
@@ -171,6 +179,23 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MAKEDATE",
             "PERIOD_DIFF",
             "YEARWEEK"
+    );
+    private static final Set<String> SIMPLE_ARITHMETIC_FUNCTION_OPERANDS = Set.of(
+            "ABS",
+            "AVG",
+            "CEIL",
+            "CEILING",
+            "COALESCE",
+            "COUNT",
+            "FLOOR",
+            "IF",
+            "IFNULL",
+            "MAX",
+            "MIN",
+            "NULLIF",
+            "NVL",
+            "ROUND",
+            "SUM"
     );
     private static final Set<String> DAMENG_KEYWORDS_REQUIRING_QUOTES = Set.of(
             "ADD",
@@ -740,6 +765,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
         }
 
+        ArithmeticConversion arithmeticConversion = convertIntegerArithmeticExpressions(converted);
+        if (arithmeticConversion.changed()) {
+            converted = arithmeticConversion.convertedSql();
+            rules.addAll(arithmeticConversion.appliedRules());
+        }
+        if (!arithmeticConversion.manualReviewReason().isBlank()) {
+            return manualReviewResult(original, converted, rules, arithmeticConversion.manualReviewReason());
+        }
+
         GenericConversion trailingSemicolonConversion = removeTrailingStatementSemicolons(converted);
         if (trailingSemicolonConversion.changed()) {
             converted = trailingSemicolonConversion.convertedSql();
@@ -767,6 +801,533 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return SqlConversionResult.changedWithManualReview(original, converted, rules, reason);
         }
         return SqlConversionResult.manualReview(original, reason);
+    }
+
+    private ArithmeticConversion convertIntegerArithmeticExpressions(String sql) {
+        ArithmeticConversion divConversion = convertMysqlDivOperators(sql);
+        if (!divConversion.manualReviewReason().isBlank()) {
+            return divConversion;
+        }
+        ArithmeticConversion slashConversion = convertSlashDivisionOperators(divConversion.convertedSql());
+        List<String> appliedRules = new ArrayList<>(divConversion.appliedRules());
+        for (String rule : slashConversion.appliedRules()) {
+            if (!appliedRules.contains(rule)) {
+                appliedRules.add(rule);
+            }
+        }
+        return new ArithmeticConversion(
+                slashConversion.convertedSql(),
+                divConversion.changed() || slashConversion.changed(),
+                slashConversion.manualReviewReason(),
+                appliedRules
+        );
+    }
+
+    private ArithmeticConversion convertMysqlDivOperators(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int protectedEnd = -1;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsMyBatisXmlTag(sql, index)) {
+                index = skipMyBatisXmlTag(sql, index);
+            } else if (startsKeyword(sql, index, "DIV")) {
+                ArithmeticOperand left = readArithmeticLeftOperand(sql, index);
+                ArithmeticOperand right = readArithmeticRightOperand(sql, index + "DIV".length());
+                if (!isConvertibleArithmeticOperation(left, right) || left.startIndex() < protectedEnd) {
+                    return ArithmeticConversion.manual(sql);
+                }
+                replacements.add(new TextReplacement(
+                        left.startIndex(),
+                        right.endIndex(),
+                        "TRUNC(" + decimalArithmeticOperand(left.text()) + " / "
+                                + nullSafeArithmeticDenominator(right.text()) + ", 0)"
+                ));
+                protectedEnd = right.endIndex();
+                index = right.endIndex();
+            } else {
+                index++;
+            }
+        }
+        GenericConversion conversion = applyTextReplacements(sql, replacements);
+        return new ArithmeticConversion(
+                conversion.convertedSql(),
+                conversion.changed(),
+                "",
+                conversion.changed() ? List.of(MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL_RULE) : List.of()
+        );
+    }
+
+    private ArithmeticConversion convertSlashDivisionOperators(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int protectedEnd = -1;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsMyBatisXmlTag(sql, index)) {
+                index = skipMyBatisXmlTag(sql, index);
+            } else if (current == '/') {
+                ArithmeticOperand left = readArithmeticLeftOperand(sql, index);
+                ArithmeticOperand right = readArithmeticRightOperand(sql, index + 1);
+                if (!isConvertibleArithmeticOperation(left, right) || left.startIndex() < protectedEnd) {
+                    return ArithmeticConversion.manual(sql);
+                }
+                if (isDecimalArithmeticExpression(left.text()) || isDecimalArithmeticExpression(right.text())) {
+                    index++;
+                    continue;
+                }
+                replacements.add(new TextReplacement(
+                        left.startIndex(),
+                        right.endIndex(),
+                        decimalArithmeticOperand(left.text()) + " / " + nullSafeArithmeticDenominator(right.text())
+                ));
+                protectedEnd = right.endIndex();
+                index = right.endIndex();
+            } else {
+                index++;
+            }
+        }
+        GenericConversion conversion = applyTextReplacements(sql, replacements);
+        return new ArithmeticConversion(
+                conversion.convertedSql(),
+                conversion.changed(),
+                "",
+                conversion.changed() ? List.of(MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE) : List.of()
+        );
+    }
+
+    private boolean isConvertibleArithmeticOperation(ArithmeticOperand left, ArithmeticOperand right) {
+        return left != null
+                && right != null
+                && isSimpleArithmeticOperand(left.text())
+                && isSimpleArithmeticOperand(right.text());
+    }
+
+    private ArithmeticOperand readArithmeticLeftOperand(String sql, int operatorIndex) {
+        int end = skipWhitespaceBackward(sql, operatorIndex);
+        if (end <= 0) {
+            return null;
+        }
+        int start = arithmeticOperandStart(sql, end);
+        if (start < 0) {
+            return null;
+        }
+        start = includeUnarySign(sql, start);
+        return new ArithmeticOperand(start, end, sql.substring(start, end));
+    }
+
+    private ArithmeticOperand readArithmeticRightOperand(String sql, int afterOperatorIndex) {
+        int start = skipWhitespace(sql, afterOperatorIndex);
+        if (start >= sql.length()) {
+            return null;
+        }
+        int end = arithmeticOperandEnd(sql, start);
+        if (end < 0) {
+            return null;
+        }
+        return new ArithmeticOperand(start, end, sql.substring(start, end));
+    }
+
+    private int arithmeticOperandStart(String sql, int endExclusive) {
+        int end = skipWhitespaceBackward(sql, endExclusive);
+        if (end <= 0) {
+            return -1;
+        }
+        char previous = sql.charAt(end - 1);
+        if (previous == ')') {
+            int openParenIndex = findMatchingOpenParenBackward(sql, end - 1);
+            if (openParenIndex < 0) {
+                return -1;
+            }
+            return readExpressionNameStartBeforeParen(sql, openParenIndex);
+        }
+        if (previous == '}') {
+            return readHashMyBatisPlaceholderStartBackward(sql, end);
+        }
+        if (previous == '`') {
+            int start = readBacktickIdentifierStartBackward(sql, end);
+            return start < 0 ? -1 : extendQualifiedIdentifierStartBackward(sql, start);
+        }
+        if (isArithmeticIdentifierPart(previous) || previous == '.') {
+            int start = end - 1;
+            while (start > 0 && isArithmeticIdentifierPart(sql.charAt(start - 1))) {
+                start--;
+            }
+            return start;
+        }
+        return -1;
+    }
+
+    private int arithmeticOperandEnd(String sql, int startInclusive) {
+        int start = skipWhitespace(sql, startInclusive);
+        if (start >= sql.length()) {
+            return -1;
+        }
+        if ((sql.charAt(start) == '+' || sql.charAt(start) == '-')
+                && start + 1 < sql.length()
+                && startsArithmeticOperandWithoutSign(sql, start + 1)) {
+            int signedEnd = arithmeticOperandEnd(sql, start + 1);
+            return signedEnd > start + 1 ? signedEnd : -1;
+        }
+        if (sql.charAt(start) == '(') {
+            int closeParenIndex = findMatchingParen(sql, start);
+            return closeParenIndex < 0 ? -1 : closeParenIndex + 1;
+        }
+        if (startsHashMyBatisPlaceholder(sql, start)) {
+            return skipMyBatisPlaceholder(sql, start);
+        }
+        if (sql.charAt(start) == '`') {
+            BacktickIdentifier identifier = readBacktickIdentifier(sql, start);
+            if (!identifier.closed()) {
+                return -1;
+            }
+            return extendQualifiedIdentifierEnd(sql, identifier.nextIndex());
+        }
+        if (isIdentifierStart(sql.charAt(start))) {
+            IdentifierToken token = readIdentifierToken(sql, start);
+            if (token == null) {
+                return -1;
+            }
+            int cursor = skipWhitespace(sql, token.endIndex());
+            if (cursor < sql.length() && sql.charAt(cursor) == '(') {
+                int closeParenIndex = findMatchingParen(sql, cursor);
+                return closeParenIndex < 0 ? -1 : closeParenIndex + 1;
+            }
+            return extendQualifiedIdentifierEnd(sql, token.endIndex());
+        }
+        if (Character.isDigit(sql.charAt(start)) || sql.charAt(start) == '.') {
+            return readNumericTokenEnd(sql, start);
+        }
+        return -1;
+    }
+
+    private boolean startsArithmeticOperandWithoutSign(String sql, int index) {
+        if (index >= sql.length()) {
+            return false;
+        }
+        char value = sql.charAt(index);
+        return value == '('
+                || value == '`'
+                || value == '.'
+                || Character.isDigit(value)
+                || isIdentifierStart(value)
+                || startsHashMyBatisPlaceholder(sql, index);
+    }
+
+    private int includeUnarySign(String sql, int operandStart) {
+        int signIndex = skipWhitespaceBackward(sql, operandStart);
+        if (signIndex <= 0) {
+            return operandStart;
+        }
+        char sign = sql.charAt(signIndex - 1);
+        if (sign != '+' && sign != '-') {
+            return operandStart;
+        }
+        int beforeSign = skipWhitespaceBackward(sql, signIndex - 1);
+        if (beforeSign == 0 || isUnarySignBoundary(sql.charAt(beforeSign - 1))) {
+            return signIndex - 1;
+        }
+        return operandStart;
+    }
+
+    private boolean isUnarySignBoundary(char value) {
+        return value == '('
+                || value == ','
+                || value == '='
+                || value == '+'
+                || value == '-'
+                || value == '*'
+                || value == '/'
+                || value == '%'
+                || value == '<'
+                || value == '>';
+    }
+
+    private int readHashMyBatisPlaceholderStartBackward(String sql, int endExclusive) {
+        int start = readMyBatisPlaceholderStartBackward(sql, endExclusive);
+        if (start < 0 || sql.charAt(start) != '#') {
+            return -1;
+        }
+        return start;
+    }
+
+    private boolean startsHashMyBatisPlaceholder(String sql, int index) {
+        return index + 1 < sql.length() && sql.charAt(index) == '#' && sql.charAt(index + 1) == '{';
+    }
+
+    private int readBacktickIdentifierStartBackward(String sql, int endExclusive) {
+        int start = endExclusive - 2;
+        while (start >= 0) {
+            if (sql.charAt(start) == '`') {
+                return start;
+            }
+            start--;
+        }
+        return -1;
+    }
+
+    private int extendQualifiedIdentifierStartBackward(String sql, int start) {
+        int cursor = skipWhitespaceBackward(sql, start);
+        if (cursor <= 0 || sql.charAt(cursor - 1) != '.') {
+            return start;
+        }
+        int qualifierEnd = skipWhitespaceBackward(sql, cursor - 1);
+        if (qualifierEnd <= 0) {
+            return start;
+        }
+        int qualifierStart;
+        if (sql.charAt(qualifierEnd - 1) == '`') {
+            qualifierStart = readBacktickIdentifierStartBackward(sql, qualifierEnd);
+        } else {
+            qualifierStart = qualifierEnd - 1;
+            while (qualifierStart > 0 && isArithmeticIdentifierPart(sql.charAt(qualifierStart - 1))) {
+                qualifierStart--;
+            }
+        }
+        return qualifierStart < 0 ? start : extendQualifiedIdentifierStartBackward(sql, qualifierStart);
+    }
+
+    private int extendQualifiedIdentifierEnd(String sql, int end) {
+        int cursor = skipWhitespace(sql, end);
+        if (cursor >= sql.length() || sql.charAt(cursor) != '.') {
+            return end;
+        }
+        int nextStart = skipWhitespace(sql, cursor + 1);
+        if (nextStart >= sql.length()) {
+            return end;
+        }
+        if (sql.charAt(nextStart) == '`') {
+            BacktickIdentifier identifier = readBacktickIdentifier(sql, nextStart);
+            return identifier.closed() ? extendQualifiedIdentifierEnd(sql, identifier.nextIndex()) : end;
+        }
+        IdentifierToken token = readIdentifierToken(sql, nextStart);
+        return token == null ? end : extendQualifiedIdentifierEnd(sql, token.endIndex());
+    }
+
+    private int readNumericTokenEnd(String sql, int start) {
+        int index = start;
+        boolean seenDot = false;
+        while (index < sql.length()) {
+            char value = sql.charAt(index);
+            if (Character.isDigit(value)) {
+                index++;
+            } else if (value == '.' && !seenDot) {
+                seenDot = true;
+                index++;
+            } else if (value == 'e' || value == 'E') {
+                index++;
+                if (index < sql.length() && (sql.charAt(index) == '+' || sql.charAt(index) == '-')) {
+                    index++;
+                }
+                while (index < sql.length() && Character.isDigit(sql.charAt(index))) {
+                    index++;
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+        return index;
+    }
+
+    private boolean isSimpleArithmeticOperand(String expression) {
+        String trimmed = expression.trim();
+        if (trimmed.isEmpty()) {
+            return false;
+        }
+        if (trimmed.startsWith("${") || trimmed.startsWith("'") || trimmed.startsWith("\"")) {
+            return false;
+        }
+        if (trimmed.matches("(?is)[+-]?\\d+(?:\\.\\d+)?e[+-]?\\d+")) {
+            return false;
+        }
+        if (trimmed.matches("[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)")) {
+            return true;
+        }
+        if (trimmed.startsWith("#{") && trimmed.endsWith("}")) {
+            return true;
+        }
+        if (trimmed.startsWith("(") && matchingFinalParen(trimmed)) {
+            String body = trimmed.substring(1, trimmed.length() - 1);
+            return !containsKeywordOutsideIgnoredText(body, "SELECT")
+                    && !containsKeywordOutsideIgnoredText(body, "FROM")
+                    && !containsKeywordOutsideIgnoredText(body, "JOIN");
+        }
+        FunctionCall functionCall = readArithmeticOnlyFunctionCall(trimmed);
+        if (functionCall != null) {
+            String functionName = trimmed.substring(0, functionCall.openParenIndex()).trim().toUpperCase(Locale.ROOT);
+            return SIMPLE_ARITHMETIC_FUNCTION_OPERANDS.contains(functionName)
+                    || isDecimalCastFunction(trimmed, functionCall);
+        }
+        return isSimpleQualifiedIdentifier(trimmed);
+    }
+
+    private FunctionCall readArithmeticOnlyFunctionCall(String expression) {
+        int leadingWhitespace = leadingWhitespaceLength(expression);
+        IdentifierToken token = readIdentifierToken(expression, leadingWhitespace);
+        if (token == null) {
+            return null;
+        }
+        int openParenIndex = skipWhitespace(expression, token.endIndex());
+        if (openParenIndex >= expression.length() || expression.charAt(openParenIndex) != '(') {
+            return null;
+        }
+        int closeParenIndex = findMatchingParen(expression, openParenIndex);
+        if (closeParenIndex < 0 || !expression.substring(closeParenIndex + 1).isBlank()) {
+            return null;
+        }
+        return new FunctionCall(leadingWhitespace, openParenIndex, closeParenIndex, closeParenIndex + 1,
+                expression.substring(openParenIndex + 1, closeParenIndex));
+    }
+
+    private boolean isDecimalCastFunction(String expression, FunctionCall functionCall) {
+        String functionName = expression.substring(0, functionCall.openParenIndex()).trim();
+        if (!functionName.equalsIgnoreCase("CAST")) {
+            return false;
+        }
+        return Pattern.compile("(?is)\\s+AS\\s+(?:DECIMAL|NUMERIC|NUMBER|DOUBLE|FLOAT|REAL)\\b")
+                .matcher(functionCall.body())
+                .find();
+    }
+
+    private boolean matchingFinalParen(String expression) {
+        int close = findMatchingParen(expression, 0);
+        return close == expression.length() - 1;
+    }
+
+    private boolean isSimpleQualifiedIdentifier(String expression) {
+        int index = 0;
+        boolean readToken = false;
+        while (index < expression.length()) {
+            if (expression.charAt(index) == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(expression, index);
+                if (!identifier.closed()) {
+                    return false;
+                }
+                index = identifier.nextIndex();
+                readToken = true;
+            } else {
+                IdentifierToken token = readIdentifierToken(expression, index);
+                if (token == null) {
+                    return false;
+                }
+                index = token.endIndex();
+                readToken = true;
+            }
+            if (index == expression.length()) {
+                return readToken;
+            }
+            if (expression.charAt(index) != '.') {
+                return false;
+            }
+            index++;
+            if (index == expression.length()) {
+                return false;
+            }
+        }
+        return readToken;
+    }
+
+    private String decimalArithmeticOperand(String expression) {
+        String trimmed = expression.trim();
+        if (isDecimalArithmeticExpression(trimmed)) {
+            return trimmed;
+        }
+        return "CAST(" + trimmed + " AS " + DECIMAL_ARITHMETIC_TYPE + ")";
+    }
+
+    private String nullSafeArithmeticDenominator(String expression) {
+        String trimmed = expression.trim();
+        if (isNullifExpression(trimmed)) {
+            return trimmed;
+        }
+        if (isDecimalArithmeticExpression(trimmed)) {
+            return "NULLIF(" + trimmed + ", 0)";
+        }
+        return "NULLIF(CAST(" + trimmed + " AS " + DECIMAL_ARITHMETIC_TYPE + "), 0)";
+    }
+
+    private boolean isDecimalArithmeticExpression(String expression) {
+        String trimmed = expression.trim();
+        if (trimmed.matches("[+-]?(?:\\d+\\.\\d*|\\.\\d+)")) {
+            return true;
+        }
+        FunctionCall functionCall = readArithmeticOnlyFunctionCall(trimmed);
+        return functionCall != null && isDecimalCastFunction(trimmed, functionCall);
+    }
+
+    private boolean isNullifExpression(String expression) {
+        return readOnlyFunctionCall(expression.trim(), "NULLIF") != null;
+    }
+
+    private boolean isArithmeticIdentifierPart(char value) {
+        return Character.isLetterOrDigit(value) || value == '_' || value == '$' || value == '.';
+    }
+
+    private boolean startsMyBatisXmlTag(String sql, int index) {
+        if (index >= sql.length() || sql.charAt(index) != '<') {
+            return false;
+        }
+        int cursor = index + 1;
+        if (cursor < sql.length() && sql.charAt(cursor) == '/') {
+            cursor++;
+        }
+        if (cursor >= sql.length() || !Character.isLetter(sql.charAt(cursor))) {
+            return false;
+        }
+        int nameStart = cursor;
+        while (cursor < sql.length() && Character.isLetter(sql.charAt(cursor))) {
+            cursor++;
+        }
+        String tagName = sql.substring(nameStart, cursor).toLowerCase(Locale.ROOT);
+        if (!Set.of(
+                "bind",
+                "choose",
+                "foreach",
+                "if",
+                "include",
+                "otherwise",
+                "selectkey",
+                "set",
+                "sql",
+                "trim",
+                "when",
+                "where"
+        ).contains(tagName)) {
+            return false;
+        }
+        return sql.indexOf('>', cursor) >= 0;
+    }
+
+    private int skipMyBatisXmlTag(String sql, int index) {
+        int end = sql.indexOf('>', index + 1);
+        return end < 0 ? index + 1 : end + 1;
     }
 
     private String unsupportedReason(String sql) {
@@ -7667,6 +8228,24 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         private static GenericConversion unchanged(String sql) {
             return new GenericConversion(sql, false);
         }
+    }
+
+    private record ArithmeticConversion(
+            String convertedSql,
+            boolean changed,
+            String manualReviewReason,
+            List<String> appliedRules
+    ) {
+        private ArithmeticConversion {
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+        }
+
+        private static ArithmeticConversion manual(String sql) {
+            return new ArithmeticConversion(sql, false, INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON, List.of());
+        }
+    }
+
+    private record ArithmeticOperand(int startIndex, int endIndex, String text) {
     }
 
     private record IdentifierToken(String text, int endIndex) {

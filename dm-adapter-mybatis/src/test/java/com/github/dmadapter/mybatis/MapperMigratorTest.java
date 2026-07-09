@@ -155,6 +155,35 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationReportsUnsafeIntegerArithmeticForManualReview() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", "select '10'/4 from dual");
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> {
+                    assertThat(item.statementId()).isEqualTo("com.example.UserMapper.selectUsers");
+                    assertThat(item.reason()).contains("整数算术表达式风险");
+                    assertThat(item.originalSql()).contains("'10'/4");
+                });
+    }
+
+    @Test
     void migrationRewritesStaticOnDuplicateKeyUpdateToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

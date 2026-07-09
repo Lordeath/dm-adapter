@@ -114,7 +114,7 @@ class ReportWriterTest {
                 false,
                 1,
                 1,
-                2,
+                3,
                 true,
                 "Dameng SQL script validation completed with failed SQL statements.",
                 3,
@@ -147,6 +147,13 @@ class ReportWriterTest {
                         "MySQL user variables such as @var require ROW_NUMBER, explicit variables, or procedure-level rewrite for Dameng.",
                         "select @rownum := @rownum + 1",
                         "select @rownum := @rownum + 1"
+                ), new SqlScriptManualReviewItem(
+                        "20260206.sql",
+                        tempDir.resolve("sql/v2-dm/20260206.sql").toString(),
+                        1,
+                        "整数算术表达式风险：MySQL `/` 会产生小数，达梦整数/整数可能截断；请确认是否需要在除法前 CAST 为 DECIMAL(38,10)，并用 NULLIF 处理分母 0。",
+                        "select '10'/4 from dual",
+                        "select '10'/4 from dual"
                 )),
                 List.of(new SqlScriptValidationFailure(
                         "20260205.sql",
@@ -172,6 +179,7 @@ class ReportWriterTest {
                 .contains("## 需人工确认的 SQL")
                 .contains("原因：可疑字段长度修改")
                 .contains("MySQL 用户变量（如 @var）不能直接迁移到达梦")
+                .contains("整数算术表达式风险")
                 .contains("原始 SQL")
                 .contains("转换后 SQL")
                 .contains("## 达梦试执行失败")
