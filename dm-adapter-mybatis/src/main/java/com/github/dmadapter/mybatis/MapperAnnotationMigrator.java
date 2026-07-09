@@ -44,6 +44,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -76,13 +77,26 @@ public class MapperAnnotationMigrator {
     }
 
     private final MapperXmlRewriter mapperXmlRewriter;
+    private final Consumer<String> progressLogger;
 
     public MapperAnnotationMigrator() {
-        this(new MapperXmlRewriter());
+        this(new MapperXmlRewriter(), message -> {
+        });
+    }
+
+    public MapperAnnotationMigrator(Consumer<String> progressLogger) {
+        this(new MapperXmlRewriter(), progressLogger);
     }
 
     MapperAnnotationMigrator(MapperXmlRewriter mapperXmlRewriter) {
+        this(mapperXmlRewriter, message -> {
+        });
+    }
+
+    MapperAnnotationMigrator(MapperXmlRewriter mapperXmlRewriter, Consumer<String> progressLogger) {
         this.mapperXmlRewriter = mapperXmlRewriter;
+        this.progressLogger = progressLogger == null ? message -> {
+        } : progressLogger;
     }
 
     public MapperMigrationResult migrate(
@@ -91,8 +105,11 @@ public class MapperAnnotationMigrator {
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig
     ) {
+        progress("Scanning MyBatis annotation SQL under " + context.projectRoot() + "...");
         List<AnnotationStatement> annotationStatements = scanAnnotationStatements(context.projectRoot());
+        progress("MyBatis annotation SQL statements discovered: " + annotationStatements.size());
         if (annotationStatements.isEmpty()) {
+            progress("Annotation SQL migration skipped: no annotation SQL statements found.");
             return new MapperMigrationResult(List.of(), List.of(), List.of(), List.of());
         }
 
@@ -129,20 +146,34 @@ public class MapperAnnotationMigrator {
             }
             statementsByTarget.computeIfAbsent(target, ignored -> new ArrayList<>()).add(statement);
         }
+        progress("Annotation SQL migration planning completed. Source mapper files: " + statementsBySource.size()
+                + ", existing source mapper files: " + existingStatementsBySource.size()
+                + ", target mapper-dm files: " + statementsByTarget.size());
         if (statementsBySource.isEmpty() && existingStatementsBySource.isEmpty() && statementsByTarget.isEmpty()) {
+            progress("Annotation SQL migration skipped: no mapper updates required.");
             return new MapperMigrationResult(List.of(), List.of(), List.of(), List.of());
         }
 
+        MapperMigrationResult result;
         if (context.dryRun()) {
-            return combine(
+            result = combine(
                     dryRunSourceMigration(statementsBySource, existingStatementsBySource),
                     dryRunMigration(statementsByTarget, sqlConverter, rewriteConfig)
             );
+        } else {
+            result = combine(
+                    applySourceMigration(statementsBySource, existingStatementsBySource),
+                    applyMigration(statementsByTarget, sqlConverter, rewriteConfig)
+            );
         }
-        return combine(
-                applySourceMigration(statementsBySource, existingStatementsBySource),
-                applyMigration(statementsByTarget, sqlConverter, rewriteConfig)
-        );
+        progress("Annotation SQL migration finished. File changes: " + result.fileChanges().size()
+                + ", automatic conversions: " + result.automaticConversions().size()
+                + ", manual review: " + result.manualReviewItems().size());
+        return result;
+    }
+
+    private void progress(String message) {
+        progressLogger.accept(message);
     }
 
     private MapperMigrationResult combine(MapperMigrationResult left, MapperMigrationResult right) {
@@ -194,6 +225,7 @@ public class MapperAnnotationMigrator {
         Map<Path, List<AnnotationStatement>> statementsToClean = new LinkedHashMap<>(existingStatementsBySource);
         for (Map.Entry<Path, List<AnnotationStatement>> entry : existingStatementsBySource.entrySet()) {
             Path source = entry.getKey();
+            progress("Repairing extracted annotation SQL in mapper XML: " + source);
             try {
                 if (repairExistingAnnotationSql(source, entry.getValue())) {
                     fileChanges.add(FileChange.applied(
@@ -208,6 +240,8 @@ public class MapperAnnotationMigrator {
         }
         for (Map.Entry<Path, List<AnnotationStatement>> entry : statementsBySource.entrySet()) {
             Path source = entry.getKey();
+            progress("Extracting annotation SQL to source mapper XML: " + source
+                    + " (" + entry.getValue().size() + " statements)");
             boolean existed = Files.exists(source);
             try {
                 writeAnnotationStatements(source, entry.getValue());
@@ -339,6 +373,8 @@ public class MapperAnnotationMigrator {
         for (Map.Entry<Path, List<AnnotationStatement>> entry : statementsByTarget.entrySet()) {
             Path target = entry.getKey();
             List<AnnotationStatement> statements = entry.getValue();
+            progress("Extracting annotation SQL to mapper-dm XML: " + target
+                    + " (" + statements.size() + " statements)");
             boolean existed = Files.exists(target);
             try {
                 writeAnnotationStatements(target, statements);
@@ -379,6 +415,7 @@ public class MapperAnnotationMigrator {
         List<FileChange> fileChanges = new ArrayList<>();
         for (Map.Entry<Path, List<AnnotationStatement>> entry : statementsByJavaFile.entrySet()) {
             Path javaFile = entry.getKey();
+            progress("Removing extracted annotation SQL from Java mapper: " + javaFile);
             if (!Files.isRegularFile(javaFile)) {
                 continue;
             }

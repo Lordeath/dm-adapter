@@ -88,8 +88,12 @@ public class MigrateCommand implements Callable<Integer> {
     private final ProjectScanner projectScanner = new ProjectScanner();
     private final PomModifier pomModifier = new PomModifier();
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
-    private final MapperMigrator mapperMigrator = new MapperMigrator();
-    private final MapperAnnotationMigrator mapperAnnotationMigrator = new MapperAnnotationMigrator();
+    private final MapperMigrator mapperMigrator = new MapperMigrator(
+            message -> CliLogger.info("[mapper] " + message)
+    );
+    private final MapperAnnotationMigrator mapperAnnotationMigrator = new MapperAnnotationMigrator(
+            message -> CliLogger.info("[annotation] " + message)
+    );
     private final MapperJavaParamFixer mapperJavaParamFixer = new MapperJavaParamFixer();
     private final SqlRewriteConfigLoader sqlRewriteConfigLoader = new SqlRewriteConfigLoader();
     private final SqlRewriteConfigUpdater sqlRewriteConfigUpdater = new SqlRewriteConfigUpdater();
@@ -109,15 +113,20 @@ public class MigrateCommand implements Callable<Integer> {
     public Integer call() {
         try {
             AdapterContext context = buildContext();
+            CliLogger.info("Migration started. Project: " + context.projectRoot());
             validateSupportedDatabases(context);
             validateValidationTestGeneration(context);
             validateSqlScriptMigrationOptions();
+            CliLogger.info("Scanning project...");
             ProjectScanResult scanResult = projectScanner.scan(context);
+            CliLogger.info("Project scan completed. Maven project: " + scanResult.mavenProject()
+                    + ", mapper XML files: " + scanResult.mapperXmlFiles().size());
 
             List<FileChange> fileChanges = new ArrayList<>();
             List<String> warnings = new ArrayList<>(scanResult.warnings());
             if (!scanResult.mavenProject()) {
                 warnings.add("Migration was not applied because the project root does not contain pom.xml.");
+                CliLogger.info("Writing migration report...");
                 writeReport(context, scanResult, fileChanges, List.of(), List.of(), warnings);
                 return 2;
             }
@@ -129,12 +138,16 @@ public class MigrateCommand implements Callable<Integer> {
                 warnings.add("MyBatis XML mapper usage was not fully detected; mapper migration may be incomplete.");
             }
 
+            CliLogger.info("Selecting Maven POM targets...");
             PomTargetSelection pomTargetSelection = pomTargetSelector.select(context.projectRoot(), scanResult.mapperXmlFiles());
+            CliLogger.info("Maven POM target selection completed. Target pom.xml files: "
+                    + pomTargetSelection.pomPaths().size());
             warnings.addAll(pomTargetSelection.warnings());
             if (pomTargetSelection.pomPaths().isEmpty()) {
                 warnings.add("No pom.xml target was found for adding Dameng JDBC driver dependency.");
             }
             for (Path pomPath : pomTargetSelection.pomPaths()) {
+                CliLogger.info("Ensuring Dameng JDBC dependency in " + pomPath + "...");
                 Optional<FileChange> pomChange = pomModifier.ensureDependency(
                         pomPath,
                         context.dmDriverCoordinate(),
@@ -144,17 +157,29 @@ public class MigrateCommand implements Callable<Integer> {
             }
 
             Path rewriteConfigPath = rewriteConfigPath(context);
+            CliLogger.info("Loading SQL rewrite config: " + rewriteConfigPath);
             SqlRewriteConfig loadedRewriteConfig = sqlRewriteConfigLoader.load(rewriteConfigPath);
             MySqlToDmSqlConverter sqlConverter = new MySqlToDmSqlConverter();
+            CliLogger.info("Previewing mapper XML migration for rewrite candidates...");
             MapperMigrationResult previewMigrationResult = mapperMigrator.migrate(
                     scanResult,
                     previewContext(context),
                     sqlConverter,
                     loadedRewriteConfig
             );
+            CliLogger.info("Preview mapper XML migration completed. " + migrationResultSummary(previewMigrationResult));
             List<RewriteConfigCandidate> rewriteConfigCandidates = rewriteConfigCandidates(previewMigrationResult);
+            CliLogger.info("Rewrite config metadata candidates: " + rewriteConfigCandidates.size());
+            if (!rewriteConfigCandidates.isEmpty()) {
+                CliLogger.info("Resolving metadata for rewrite config candidates...");
+            }
             MetadataLookupResult metadataLookupResult = metadataForRewriteCandidates(context, rewriteConfigCandidates);
+            if (!rewriteConfigCandidates.isEmpty()) {
+                CliLogger.info("Metadata resolution completed. Available: " + metadataLookupResult.available()
+                        + ", tables: " + metadataLookupResult.metadataByTable().size());
+            }
             warnings.addAll(metadataLookupResult.warnings());
+            CliLogger.info("Updating SQL rewrite config...");
             SqlRewriteConfigUpdate rewriteConfigUpdate = sqlRewriteConfigUpdater.update(
                     context,
                     rewriteConfigPath,
@@ -166,32 +191,45 @@ public class MigrateCommand implements Callable<Integer> {
             rewriteConfigUpdate.fileChange().ifPresent(fileChanges::add);
             warnings.addAll(rewriteConfigUpdate.warnings());
 
+            CliLogger.info("Migrating mapper XML files...");
             MapperMigrationResult mapperMigrationResult = mapperMigrator.migrate(
                     scanResult,
                     context,
                     sqlConverter,
                     rewriteConfigUpdate.rewriteConfig()
             );
+            CliLogger.info("Mapper XML migration completed. " + migrationResultSummary(mapperMigrationResult));
             fileChanges.addAll(mapperMigrationResult.fileChanges());
             warnings.addAll(mapperMigrationResult.warnings());
             if (shouldPrepareAnnotationClassScan(context)) {
+                CliLogger.info("Preparing annotation SQL class scan with Maven compile...");
                 warnings.addAll(mavenCompilePreparer.prepare(context.projectRoot(), appModule));
+                CliLogger.info("Maven compile preparation completed.");
             }
+            CliLogger.info("Migrating annotation SQL...");
             MapperMigrationResult annotationMigrationResult = mapperAnnotationMigrator.migrate(
                     scanResult,
                     context,
                     sqlConverter,
                     rewriteConfigUpdate.rewriteConfig()
             );
+            CliLogger.info("Annotation SQL migration completed. " + migrationResultSummary(annotationMigrationResult));
             fileChanges.addAll(annotationMigrationResult.fileChanges());
             warnings.addAll(annotationMigrationResult.warnings());
             MapperMigrationResult combinedMigrationResult = combine(mapperMigrationResult, annotationMigrationResult);
+            CliLogger.info("Fixing mapper Java parameter names...");
             MapperJavaParamFixResult javaParamFixResult = mapperJavaParamFixer.fix(scanResult, context);
+            CliLogger.info("Mapper Java parameter name fix completed. File changes: "
+                    + javaParamFixResult.fileChanges().size());
             fileChanges.addAll(javaParamFixResult.fileChanges());
             warnings.addAll(javaParamFixResult.warnings());
+            CliLogger.info("Aligning mapper jdbcType declarations...");
             MapperJdbcTypeAlignmentResult jdbcTypeAlignmentResult = alignMapperJdbcTypes(context, scanResult);
+            CliLogger.info("Mapper jdbcType alignment completed. File changes: "
+                    + jdbcTypeAlignmentResult.fileChanges().size());
             fileChanges.addAll(jdbcTypeAlignmentResult.fileChanges());
             warnings.addAll(jdbcTypeAlignmentResult.warnings());
+            CliLogger.info("Writing migration report...");
             ReportPaths reportPaths = writeReport(
                     context,
                     scanResult,
@@ -200,10 +238,21 @@ public class MigrateCommand implements Callable<Integer> {
                     combinedMigrationResult.manualReviewItems(),
                     warnings
             );
+            CliLogger.info("Migration report written: " + reportPaths.markdownPath());
+            if (sqlScriptMigrationRequested()) {
+                CliLogger.info("Migrating SQL scripts...");
+            } else {
+                CliLogger.info("SQL script migration skipped: --sql-root not provided.");
+            }
             SqlScriptReportResult sqlScriptReportResult = migrateSqlScripts(context);
+            if (sqlScriptReportResult != null) {
+                CliLogger.info("SQL script migration report written: "
+                        + sqlScriptReportResult.reportPaths().markdownPath());
+            }
             printMigrationSummary(context, scanResult, combinedMigrationResult, fileChanges, warnings, reportPaths);
             printSqlScriptSummary(sqlScriptReportResult);
             if (validationTestGenerationRequested()) {
+                CliLogger.info("Generating Dameng SQL validation test...");
                 ValidationTestGenerationResult validationResult = validationTestGenerator.generate(
                         context.projectRoot(),
                         appModule,
@@ -212,6 +261,7 @@ public class MigrateCommand implements Callable<Integer> {
                         schema
                 );
                 GenerateValidationTestCommand.printResult(validationResult);
+                CliLogger.info("Running Dameng SQL validation test if configured...");
                 GenerateValidationTestCommand.printValidationRunResult(
                         validationTestRunner.runIfConfigured(validationResult, DmValidationEnvironment.fromSystem())
                 );
@@ -331,6 +381,13 @@ public class MigrateCommand implements Callable<Integer> {
         List<String> warnings = new ArrayList<>(first.warnings());
         warnings.addAll(second.warnings());
         return new MapperMigrationResult(fileChanges, automaticConversions, manualReviewItems, warnings);
+    }
+
+    private String migrationResultSummary(MapperMigrationResult result) {
+        return "file changes: " + result.fileChanges().size()
+                + ", automatic conversions: " + result.automaticConversions().size()
+                + ", manual review: " + result.manualReviewItems().size()
+                + ", warnings: " + result.warnings().size();
     }
 
     private MetadataLookupResult metadataForRewriteCandidates(

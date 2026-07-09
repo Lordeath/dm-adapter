@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -126,6 +127,35 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).convertedSql()).contains("'ACTIVE'");
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isFalse();
+    }
+
+    @Test
+    void reportsProgressDuringMapperMigration() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", "select NOW() from dual");
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+        List<String> progressMessages = new ArrayList<>();
+
+        new MapperMigrator(progressMessages::add).migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(true).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(progressMessages)
+                .anySatisfy(message -> assertThat(message)
+                        .contains("Mapper XML migration [1/1]")
+                        .contains("mapper/UserMapper.xml"))
+                .anySatisfy(message -> assertThat(message)
+                        .contains("Mapper XML migration finished")
+                        .contains("Files: 1"));
     }
 
     @Test

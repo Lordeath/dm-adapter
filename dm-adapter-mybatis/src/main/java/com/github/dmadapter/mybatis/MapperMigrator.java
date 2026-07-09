@@ -15,16 +15,30 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 
 public class MapperMigrator {
     private final MapperXmlRewriter mapperXmlRewriter;
+    private final Consumer<String> progressLogger;
 
     public MapperMigrator() {
-        this(new MapperXmlRewriter());
+        this(new MapperXmlRewriter(), message -> {
+        });
+    }
+
+    public MapperMigrator(Consumer<String> progressLogger) {
+        this(new MapperXmlRewriter(), progressLogger);
     }
 
     public MapperMigrator(MapperXmlRewriter mapperXmlRewriter) {
+        this(mapperXmlRewriter, message -> {
+        });
+    }
+
+    public MapperMigrator(MapperXmlRewriter mapperXmlRewriter, Consumer<String> progressLogger) {
         this.mapperXmlRewriter = mapperXmlRewriter;
+        this.progressLogger = progressLogger == null ? message -> {
+        } : progressLogger;
     }
 
     public MapperMigrationResult migrate(ProjectScanResult scanResult, AdapterContext context, SqlConverter sqlConverter) {
@@ -42,7 +56,11 @@ public class MapperMigrator {
         List<SqlChange> manualReviewItems = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
 
-        for (MapperXmlFile mapperXmlFile : scanResult.mapperXmlFiles()) {
+        List<MapperXmlFile> mapperXmlFiles = scanResult.mapperXmlFiles();
+        int total = mapperXmlFiles.size();
+        for (int i = 0; i < total; i++) {
+            MapperXmlFile mapperXmlFile = mapperXmlFiles.get(i);
+            progress("Mapper XML migration [" + (i + 1) + "/" + total + "]: " + displayPath(mapperXmlFile));
             Path source = Paths.get(mapperXmlFile.path());
             Path target = mapperTargetDir(context, mapperXmlFile).resolve(toMapperDmRelativePath(mapperXmlFile.resourcesRelativePath()));
             fileChanges.add(context.dryRun()
@@ -61,8 +79,24 @@ public class MapperMigrator {
             manualReviewItems.addAll(rewriteResult.manualReviewItems());
             warnings.addAll(rewriteResult.warnings());
         }
+        if (total > 0) {
+            progress("Mapper XML migration finished. Files: " + total
+                    + ", automatic conversions: " + automaticConversions.size()
+                    + ", manual review: " + manualReviewItems.size());
+        }
 
         return new MapperMigrationResult(fileChanges, automaticConversions, manualReviewItems, warnings);
+    }
+
+    private void progress(String message) {
+        progressLogger.accept(message);
+    }
+
+    private String displayPath(MapperXmlFile mapperXmlFile) {
+        if (!mapperXmlFile.resourcesRelativePath().isBlank()) {
+            return mapperXmlFile.resourcesRelativePath();
+        }
+        return mapperXmlFile.path();
     }
 
     private Path mapperTargetDir(AdapterContext context, MapperXmlFile mapperXmlFile) {
