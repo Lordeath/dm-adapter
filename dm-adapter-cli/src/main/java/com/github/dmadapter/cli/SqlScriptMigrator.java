@@ -113,6 +113,8 @@ class SqlScriptMigrator {
             "MYSQL_INSERT_VALUES_COLUMN_LIST";
     static final String MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE =
             "MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST";
+    static final String MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE =
+            "MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST";
     static final String DM_RESOURCECOLUMN_INSERT_ONLY_MERGE_RULE =
             "DM_RESOURCECOLUMN_INSERT_ONLY_MERGE";
     static final String ORIGINAL_SQL_DANGLING_INSERT_VALUES_REASON =
@@ -1717,18 +1719,43 @@ class SqlScriptMigrator {
         }
         List<InsertValuesTuple> tuples = insertValuesTuples(statement, cursor);
         Integer valueCount = insertValuesColumnCount(tuples);
-        if (valueCount == null || valueCount != columns.size()) {
+        if (valueCount == null) {
             return InsertValuesColumnListRewrite.unchanged(statement);
         }
         List<String> columnList = new ArrayList<>(columns);
         String identityFirstColumn = identityFirstColumn(identityFirstColumns, table.token());
         if (identityFirstColumn != null && identifiersEqual(columnList.get(0), identityFirstColumn)) {
-            if (columnList.size() > 1 && allTuplesStartWithGeneratedIdentityPlaceholder(tuples)) {
+            if (valueCount > columnList.size()) {
+                return InsertValuesColumnListRewrite.unchanged(statement);
+            }
+            if (valueCount > 1 && allTuplesStartWithGeneratedIdentityPlaceholder(tuples)) {
                 return new InsertValuesColumnListRewrite(
-                        rewriteInsertValuesWithoutFirstColumn(statement, table.end(), columnList, tuples),
+                        rewriteInsertValuesWithColumnList(
+                                statement,
+                                table.end(),
+                                columnList.subList(1, valueCount),
+                                tuples,
+                                1
+                        ),
                         List.of(MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE)
                 );
             }
+            if (allTuplesStartWithExplicitIdentityValue(tuples)) {
+                String rewritten = rewriteInsertValuesWithColumnList(
+                        statement,
+                        table.end(),
+                        columnList.subList(0, valueCount),
+                        tuples,
+                        0
+                );
+                return new InsertValuesColumnListRewrite(
+                        wrapExplicitIdentityInsert(table.token(), rewritten),
+                        List.of(MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE)
+                );
+            }
+            return InsertValuesColumnListRewrite.unchanged(statement);
+        }
+        if (valueCount != columns.size()) {
             return InsertValuesColumnListRewrite.unchanged(statement);
         }
         String rewritten = statement.substring(0, table.end())
@@ -1760,31 +1787,44 @@ class SqlScriptMigrator {
         return true;
     }
 
+    private boolean allTuplesStartWithExplicitIdentityValue(List<InsertValuesTuple> tuples) {
+        if (tuples.isEmpty()) {
+            return false;
+        }
+        for (InsertValuesTuple tuple : tuples) {
+            if (tuple.values().isEmpty() || isGeneratedIdentityPlaceholder(tuple.values().get(0))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private boolean isGeneratedIdentityPlaceholder(String value) {
         return Pattern.compile("(?is)^\\s*(?:NULL|DEFAULT)\\s*$")
                 .matcher(value)
                 .matches();
     }
 
-    private String rewriteInsertValuesWithoutFirstColumn(
+    private String rewriteInsertValuesWithColumnList(
             String statement,
             int tableEnd,
             List<String> columns,
-            List<InsertValuesTuple> tuples
+            List<InsertValuesTuple> tuples,
+            int valueOffset
     ) {
-        if (columns.size() <= 1 || tuples.isEmpty()) {
+        if (columns.isEmpty() || tuples.isEmpty()) {
             return statement;
         }
         StringBuilder rewritten = new StringBuilder(statement.length());
         rewritten.append(statement, 0, tableEnd)
                 .append(" (")
-                .append(String.join(", ", columns.subList(1, columns.size())))
+                .append(String.join(", ", columns))
                 .append(")");
         int cursor = tableEnd;
         for (InsertValuesTuple tuple : tuples) {
             rewritten.append(statement, cursor, tuple.openParen());
             rewritten.append("(")
-                    .append(String.join(", ", tuple.values().subList(1, tuple.values().size()).stream()
+                    .append(String.join(", ", tuple.values().subList(valueOffset, tuple.values().size()).stream()
                             .map(String::strip)
                             .toList()))
                     .append(")");
@@ -1792,6 +1832,12 @@ class SqlScriptMigrator {
         }
         rewritten.append(statement, cursor, statement.length());
         return rewritten.toString();
+    }
+
+    private String wrapExplicitIdentityInsert(String tableToken, String statement) {
+        return "SET IDENTITY_INSERT " + tableToken + " ON;\n"
+                + statement + ";\n"
+                + "SET IDENTITY_INSERT " + tableToken + " OFF";
     }
 
     private Integer insertValuesColumnCount(String statement, int valuesIndex) {
