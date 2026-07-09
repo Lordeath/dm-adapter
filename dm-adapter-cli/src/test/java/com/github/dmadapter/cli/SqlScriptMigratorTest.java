@@ -1147,6 +1147,42 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void omitsNullAutoIncrementColumnAfterScriptAlterTableAddColumn() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_canal_config_field (
+                    id INT NOT NULL AUTO_INCREMENT,
+                    configId INT NOT NULL,
+                    fieldName VARCHAR(255) NOT NULL,
+                    PRIMARY KEY (id)
+                );
+
+                DELIMITER $$
+                CREATE PROCEDURE add_sample_canal_config_field_column()
+                BEGIN
+                    ALTER TABLE sample_canal_config_field ADD COLUMN deleteFlag TINYINT DEFAULT 0;
+                END$$
+                DELIMITER ;
+
+                DELIMITER $$
+                CREATE PROCEDURE add_sample_canal_config_field()
+                BEGIN
+                    INSERT INTO sample_canal_config_field VALUES (NULL, 100, 'sampleName', 0);
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_canal_config_field (configId, fieldName, deleteFlag) VALUES (100, 'sampleName', 0);")
+                .doesNotContain("sample_canal_config_field (id, configId, fieldName, deleteFlag)")
+                .doesNotContain("INSERT INTO sample_canal_config_field VALUES (NULL");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
     void omitsDefaultIdentityColumnForMultiRowInsertValues() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE TABLE sample_identity (

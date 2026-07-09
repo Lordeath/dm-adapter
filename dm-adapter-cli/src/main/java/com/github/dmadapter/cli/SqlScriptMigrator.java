@@ -510,6 +510,7 @@ class SqlScriptMigrator {
                     scriptTableColumns,
                     scriptIdentityFirstColumns
             );
+            collectScriptAlterTableAddColumns(originalStatement, scriptTableColumns);
             List<String> outputStatements = expandConvertedOutputStatements(conversion.outputSql());
             String calledProcedureName = procedureNameFromCall(originalStatement);
             boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
@@ -1269,6 +1270,31 @@ class SqlScriptMigrator {
                         identityFirstColumns.put(normalizedTableKey(tableName), columnName);
                     }
                 }
+                addColumnIfAbsentIgnoreCase(targetColumns, columnName);
+            }
+        }
+    }
+
+    private void collectScriptAlterTableAddColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns
+    ) {
+        if (tableColumns.isEmpty()) {
+            return;
+        }
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+ADD\\s+"
+                        + "(?:COLUMN\\s+)?(?<definition>[^;]+)"
+        ).matcher(leadingSqlPrefix.body());
+        while (matcher.find()) {
+            String tableName = matcher.group("table").strip();
+            LinkedHashSet<String> targetColumns = temporaryTableColumns(tableColumns, tableName);
+            if (targetColumns == null) {
+                continue;
+            }
+            String columnName = createTableColumnDefinitionName(matcher.group("definition").strip());
+            if (!columnName.isBlank()) {
                 addColumnIfAbsentIgnoreCase(targetColumns, columnName);
             }
         }
