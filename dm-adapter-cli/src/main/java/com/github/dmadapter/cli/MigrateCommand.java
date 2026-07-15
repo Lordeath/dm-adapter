@@ -106,7 +106,8 @@ public class MigrateCommand implements Callable<Integer> {
     private final ValidationTestRunner validationTestRunner = new ValidationTestRunner();
     private final SqlScriptMigrator sqlScriptMigrator = new SqlScriptMigrator(
             new MySqlToDmSqlConverter(),
-            new SqlScriptValidator()
+            SqlScriptValidator.withProgress(message -> CliLogger.info("[sql-script] " + message)),
+            message -> CliLogger.info("[sql-script] " + message)
     );
     private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
     private final LegacyWorkspaceMigrator legacyWorkspaceMigrator = new LegacyWorkspaceMigrator();
