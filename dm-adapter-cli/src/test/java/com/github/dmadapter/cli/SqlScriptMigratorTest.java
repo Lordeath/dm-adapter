@@ -3391,6 +3391,72 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void rejectsLargeProcedureBeforeRunningConvertedTriggerRegex() {
+        String largeProcedure = "CREATE OR REPLACE PROCEDURE demo AS BEGIN\n"
+                + "    select 1 from dual;\n".repeat(40_000)
+                + "END;";
+
+        assertTimeout(
+                Duration.ofSeconds(1),
+                () -> assertThat(migrator(new RecordingValidator())
+                        .isConvertedSimpleDateEndTrigger(largeProcedure))
+                        .isFalse()
+        );
+    }
+
+    @Test
+    void parallelLargeProcedureConversionMatchesSequentialOutput() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        String filler = "    -- parallel conversion filler 012345678901234567890123456789\n".repeat(1_000);
+        write(sqlRoot.resolve("procedures.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE first_proc()
+                BEGIN
+                %s
+                    SELECT IFNULL(1, 0);
+                END$$
+                CREATE PROCEDURE second_proc()
+                BEGIN
+                %s
+                    SELECT DATE_ADD(NOW(), INTERVAL 1 DAY);
+                END$$
+                CREATE PROCEDURE third_proc()
+                BEGIN
+                %s
+                    SELECT 3;
+                END$$
+                DELIMITER ;
+                """.formatted(filler, filler, filler));
+        String property = "dm.adapter.sqlScriptConversionThreads";
+        String previous = System.getProperty(property);
+        try {
+            System.setProperty(property, "1");
+            SqlScriptMigrationReport sequentialReport = migrateScriptRoot(
+                    sqlRoot,
+                    tempDir.resolve("sql/sequential")
+            );
+            System.setProperty(property, "3");
+            SqlScriptMigrationReport parallelReport = migrateScriptRoot(
+                    sqlRoot,
+                    tempDir.resolve("sql/parallel")
+            );
+
+            assertThat(Files.readString(tempDir.resolve("sql/parallel/procedures.sql")))
+                    .isEqualTo(Files.readString(tempDir.resolve("sql/sequential/procedures.sql")));
+            assertThat(parallelReport.files().get(0).convertedStatementCount())
+                    .isEqualTo(sequentialReport.files().get(0).convertedStatementCount());
+            assertThat(parallelReport.files().get(0).manualReviewStatementCount())
+                    .isEqualTo(sequentialReport.files().get(0).manualReviewStatementCount());
+        } finally {
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    @Test
     void reportsSlowValidationStatementWithoutLoggingSqlText() {
         String property = "dm.adapter.sqlScriptSlowOperationLogMillis";
         String previous = System.getProperty(property);
@@ -3474,6 +3540,18 @@ class SqlScriptMigratorTest {
                 DmValidationEnvironment.from(Map.of())
         ));
         return new ConvertedScript(report, Files.readString(sqlRootOut.resolve("procedure.sql")));
+    }
+
+    private SqlScriptMigrationReport migrateScriptRoot(Path sqlRoot, Path sqlRootOut) throws Exception {
+        return migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
     }
 
     private void write(Path path, String content) throws Exception {

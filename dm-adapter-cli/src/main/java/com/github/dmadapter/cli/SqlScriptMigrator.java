@@ -21,6 +21,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Matcher;
@@ -28,6 +31,8 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 class SqlScriptMigrator {
+    private static final int PARALLEL_PROCEDURE_MIN_CHARS = 50_000;
+    private static final String CONVERSION_THREADS_PROPERTY = "dm.adapter.sqlScriptConversionThreads";
     static final String MYSQL_CREATE_DEFINER_REMOVAL_RULE = "MYSQL_CREATE_DEFINER_REMOVED";
     static final String MYSQL_CREATE_PROCEDURE_TO_DM_RULE = "MYSQL_CREATE_PROCEDURE_TO_DM";
     static final String MYSQL_CREATE_FUNCTION_TO_DM_RULE = "MYSQL_CREATE_FUNCTION_TO_DM";
@@ -163,6 +168,11 @@ class SqlScriptMigrator {
     private static final String SQL_SIMPLE_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
+    private static final Pattern CONVERTED_SIMPLE_DATE_END_TRIGGER_PATTERN = Pattern.compile(
+            "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TRIGGER\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
+                    + "BEFORE\\s+(?:INSERT|UPDATE)\\s+ON\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
+                    + "FOR\\s+EACH\\s+ROW\\b"
+    );
     private static final Pattern MYSQL_PREFIX_INDEX_DDL_PATTERN = Pattern.compile(
             "(?is)\\b(?:"
                     + "CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?:" + SQL_IDENTIFIER_TOKEN + ")\\s+ON\\s+"
@@ -463,7 +473,114 @@ class SqlScriptMigrator {
         return Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);
     }
 
-    private void progress(String message) {
+    private String sqlType(String sql) {
+        String body = splitLeadingSqlPrefix(sql).body().stripLeading();
+        int end = 0;
+        while (end < body.length() && Character.isLetter(body.charAt(end))) {
+            end++;
+        }
+        return end == 0 ? "UNKNOWN" : body.substring(0, end).toUpperCase(Locale.ROOT);
+    }
+
+    private ScriptStatementConversion convertStatementWithProgress(
+            Path relative,
+            int statementIndex,
+            int statementCount,
+            String originalStatement,
+            LinkedHashMap<String, String> scriptUserVariables,
+            ScriptDynamicDdlState scriptDynamicDdlState,
+            Map<String, LinkedHashSet<String>> scriptTableColumns,
+            Map<String, String> scriptIdentityFirstColumns,
+            Map<String, String> scriptProcedureRenames
+    ) {
+        long startedAt = System.nanoTime();
+        boolean largeStatement = originalStatement.length() >= 100_000;
+        if (largeStatement) {
+            progress("Converting large SQL script statement: file=" + relative
+                    + ", statement=" + statementIndex + "/" + statementCount
+                    + ", sqlType=" + sqlType(originalStatement)
+                    + ", chars=" + originalStatement.length());
+        }
+        ConversionTimings timings = new ConversionTimings();
+        ScriptStatementConversion conversion = convertStatement(
+                originalStatement,
+                scriptUserVariables,
+                scriptDynamicDdlState,
+                scriptTableColumns,
+                scriptIdentityFirstColumns,
+                scriptProcedureRenames,
+                timings
+        );
+        long elapsedMillis = elapsedMillis(startedAt);
+        if (largeStatement || elapsedMillis >= 1_000L) {
+            progress("Converted slow SQL script statement: file=" + relative
+                    + ", statement=" + statementIndex + "/" + statementCount
+                    + ", sqlType=" + sqlType(originalStatement)
+                    + ", chars=" + originalStatement.length()
+                    + ", elapsedMs=" + elapsedMillis
+                    + ", prepareMs=" + nanosToMillis(timings.preparationNanos)
+                    + ", safeRulesMs=" + nanosToMillis(timings.safeRulesNanos)
+                    + ", genericConverterMs=" + nanosToMillis(timings.genericConverterNanos)
+                    + ", postProcessMs=" + nanosToMillis(timings.postProcessNanos)
+                    + ", originalSyntaxReviewMs=" + nanosToMillis(timings.originalSyntaxReviewNanos)
+                    + ", prefixIndexReviewMs=" + nanosToMillis(timings.prefixIndexReviewNanos)
+                    + ", generalManualReviewMs=" + nanosToMillis(timings.generalManualReviewNanos));
+        }
+        return conversion;
+    }
+
+    private boolean parallelSafeProcedureStatement(String statement) {
+        return statement != null
+                && statement.length() >= PARALLEL_PROCEDURE_MIN_CHARS
+                && !procedureNameFromCreateProcedure(statement).isBlank();
+    }
+
+    private ExecutorService conversionExecutor(long statementCount) {
+        if (statementCount <= 0) {
+            return null;
+        }
+        int threadCount = conversionThreadCount(statementCount);
+        if (threadCount <= 1) {
+            return null;
+        }
+        return Executors.newFixedThreadPool(threadCount, runnable -> {
+            Thread thread = new Thread(runnable, "dm-sql-script-converter");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    private int conversionThreadCount(long statementCount) {
+        int availableProcessors = Runtime.getRuntime().availableProcessors();
+        int defaultThreadCount = Math.max(1, Math.min(2, availableProcessors - 1));
+        Integer configured = Integer.getInteger(CONVERSION_THREADS_PROPERTY);
+        int requested = configured != null && configured > 0 ? configured : defaultThreadCount;
+        return Math.max(1, Math.min(requested, Math.toIntExact(Math.min(statementCount, Integer.MAX_VALUE))));
+    }
+
+    private ScriptDynamicDdlState copyScriptDynamicDdlState(ScriptDynamicDdlState source) {
+        ScriptDynamicDdlState copy = new ScriptDynamicDdlState();
+        copy.currentSchemaVariables.addAll(source.currentSchemaVariables);
+        copy.dynamicDdlVariables.addAll(source.dynamicDdlVariables);
+        copy.preparedDynamicDdlStatements.addAll(source.preparedDynamicDdlStatements);
+        return copy;
+    }
+
+    private LinkedHashMap<String, LinkedHashSet<String>> copyScriptTableColumns(
+            Map<String, LinkedHashSet<String>> source
+    ) {
+        LinkedHashMap<String, LinkedHashSet<String>> copy = new LinkedHashMap<>();
+        for (Map.Entry<String, LinkedHashSet<String>> entry : source.entrySet()) {
+            copy.put(entry.getKey(), new LinkedHashSet<>(entry.getValue()));
+        }
+        return copy;
+    }
+
+    private long nanosToMillis(long nanos) {
+        return Math.max(0L, nanos / 1_000_000L);
+    }
+
+    private synchronized void progress(String message) {
         try {
             progressConsumer.accept(message);
         } catch (RuntimeException ignored) {
@@ -572,64 +689,113 @@ class SqlScriptMigrator {
         LinkedHashSet<Integer> manualReviewStatementIndexes = new LinkedHashSet<>();
 
         long conversionStartedAt = System.nanoTime();
-        for (int i = 0; i < originalStatements.size(); i++) {
-            String originalStatement = originalStatements.get(i);
-            ScriptStatementConversion conversion =
-                    convertStatement(
+        long parallelStatementCount = originalStatements.stream()
+                .filter(this::parallelSafeProcedureStatement)
+                .count();
+        ExecutorService conversionExecutor = conversionExecutor(parallelStatementCount);
+        if (conversionExecutor != null) {
+            progress("Parallel SQL procedure conversion enabled: file=" + relative
+                    + ", threads=" + conversionThreadCount(parallelStatementCount)
+                    + ", statements=" + parallelStatementCount);
+        }
+        List<StatementConversionPlan> conversionPlans = new ArrayList<>(originalStatements.size());
+        try {
+            for (int i = 0; i < originalStatements.size(); i++) {
+                String originalStatement = originalStatements.get(i);
+                int statementIndex = i + 1;
+                CompletableFuture<ScriptStatementConversion> conversion;
+                if (conversionExecutor != null && parallelSafeProcedureStatement(originalStatement)) {
+                    LinkedHashMap<String, String> userVariablesSnapshot = new LinkedHashMap<>(scriptUserVariables);
+                    ScriptDynamicDdlState dynamicDdlStateSnapshot = copyScriptDynamicDdlState(scriptDynamicDdlState);
+                    LinkedHashMap<String, LinkedHashSet<String>> tableColumnsSnapshot =
+                            copyScriptTableColumns(scriptTableColumns);
+                    LinkedHashMap<String, String> identityFirstColumnsSnapshot =
+                            new LinkedHashMap<>(scriptIdentityFirstColumns);
+                    conversion = CompletableFuture.supplyAsync(
+                            () -> convertStatementWithProgress(
+                                    relative,
+                                    statementIndex,
+                                    originalStatements.size(),
+                                    originalStatement,
+                                    userVariablesSnapshot,
+                                    dynamicDdlStateSnapshot,
+                                    tableColumnsSnapshot,
+                                    identityFirstColumnsSnapshot,
+                                    scriptProcedureRenames
+                            ),
+                            conversionExecutor
+                    );
+                } else {
+                    conversion = CompletableFuture.completedFuture(convertStatementWithProgress(
+                            relative,
+                            statementIndex,
+                            originalStatements.size(),
                             originalStatement,
                             scriptUserVariables,
                             scriptDynamicDdlState,
                             scriptTableColumns,
                             scriptIdentityFirstColumns,
                             scriptProcedureRenames
-                    );
-            collectScriptCreateTableDefinitionColumns(
-                    originalStatement,
-                    scriptTableColumns,
-                    scriptIdentityFirstColumns
-            );
-            collectScriptAlterTableAddColumns(originalStatement, scriptTableColumns);
-            List<String> outputStatements = expandConvertedOutputStatements(conversion.outputSql());
-            String calledProcedureName = procedureNameFromCall(originalStatement);
-            boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
-                    && manualReviewProcedureNames.contains(calledProcedureName.toLowerCase(Locale.ROOT));
-            boolean manualReviewRequired = conversion.manualReviewRequired() || dependencyManualReviewRequired;
-            if (conversion.manualReviewRequired()) {
-                String procedureName = procedureNameFromCreateProcedure(originalStatement);
-                if (!procedureName.isBlank()) {
-                    manualReviewProcedureNames.add(procedureName.toLowerCase(Locale.ROOT));
+                    ));
                 }
-            }
-            if (manualReviewRequired) {
-                manualReviewStatementCount++;
-                int firstOutputStatementIndex = convertedStatements.size() + 1;
-                for (int offset = 0; offset < outputStatements.size(); offset++) {
-                    manualReviewStatementIndexes.add(firstOutputStatementIndex + offset);
-                }
-                String reason = conversion.manualReviewRequired()
-                        ? conversion.reason()
-                        : "依赖需要人工确认的存储过程 `" + calledProcedureName + "`；请先修正该存储过程后再执行这个 CALL。";
-                manualReviewItems.add(new SqlScriptManualReviewItem(
-                        relative.toString(),
-                        outputFile.toString(),
-                        i + 1,
-                        reason,
+                conversionPlans.add(new StatementConversionPlan(statementIndex, originalStatement, conversion));
+                collectScriptCreateTableDefinitionColumns(
                         originalStatement,
-                        conversion.convertedSql()
-                ));
+                        scriptTableColumns,
+                        scriptIdentityFirstColumns
+                );
+                collectScriptAlterTableAddColumns(originalStatement, scriptTableColumns);
             }
-            if (conversion.changed() && !manualReviewRequired) {
-                convertedStatementCount++;
-                appliedRules.addAll(conversion.appliedRules());
+
+            for (StatementConversionPlan plan : conversionPlans) {
+                String originalStatement = plan.originalStatement();
+                ScriptStatementConversion conversion = plan.conversion().join();
+                List<String> outputStatements = expandConvertedOutputStatements(conversion.outputSql());
+                String calledProcedureName = procedureNameFromCall(originalStatement);
+                boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
+                        && manualReviewProcedureNames.contains(calledProcedureName.toLowerCase(Locale.ROOT));
+                boolean manualReviewRequired = conversion.manualReviewRequired() || dependencyManualReviewRequired;
+                if (conversion.manualReviewRequired()) {
+                    String procedureName = procedureNameFromCreateProcedure(originalStatement);
+                    if (!procedureName.isBlank()) {
+                        manualReviewProcedureNames.add(procedureName.toLowerCase(Locale.ROOT));
+                    }
+                }
+                if (manualReviewRequired) {
+                    manualReviewStatementCount++;
+                    int firstOutputStatementIndex = convertedStatements.size() + 1;
+                    for (int offset = 0; offset < outputStatements.size(); offset++) {
+                        manualReviewStatementIndexes.add(firstOutputStatementIndex + offset);
+                    }
+                    String reason = conversion.manualReviewRequired()
+                            ? conversion.reason()
+                            : "依赖需要人工确认的存储过程 `" + calledProcedureName + "`；请先修正该存储过程后再执行这个 CALL。";
+                    manualReviewItems.add(new SqlScriptManualReviewItem(
+                            relative.toString(),
+                            outputFile.toString(),
+                            plan.statementIndex(),
+                            reason,
+                            originalStatement,
+                            conversion.convertedSql()
+                    ));
+                }
+                if (conversion.changed() && !manualReviewRequired) {
+                    convertedStatementCount++;
+                    appliedRules.addAll(conversion.appliedRules());
+                }
+                if (outputStatements.size() > 1 && !manualReviewRequired) {
+                    appliedRules.add(MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE);
+                }
+                convertedStatements.addAll(outputStatements);
+                if (plan.statementIndex() % 1_000 == 0) {
+                    progress("SQL script conversion progress: file=" + relative
+                            + ", statements=" + plan.statementIndex() + "/" + originalStatements.size()
+                            + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
+                }
             }
-            if (outputStatements.size() > 1 && !manualReviewRequired) {
-                appliedRules.add(MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE);
-            }
-            convertedStatements.addAll(outputStatements);
-            if ((i + 1) % 1_000 == 0) {
-                progress("SQL script conversion progress: file=" + relative
-                        + ", statements=" + (i + 1) + "/" + originalStatements.size()
-                        + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
+        } finally {
+            if (conversionExecutor != null) {
+                conversionExecutor.shutdownNow();
             }
         }
         progress("Converted SQL script statements: " + relative
@@ -890,8 +1056,10 @@ class SqlScriptMigrator {
             ScriptDynamicDdlState scriptDynamicDdlState,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptIdentityFirstColumns,
-            Map<String, String> scriptProcedureRenames
+            Map<String, String> scriptProcedureRenames,
+            ConversionTimings timings
     ) {
+        long preparationStartedAt = System.nanoTime();
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(originalStatement);
         ScriptStatementConversion currentSchemaVariableConversion =
                 convertScriptCurrentSchemaVariableAssignment(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
@@ -940,14 +1108,20 @@ class SqlScriptMigrator {
             sqlBody = procedureReferenceRename.sql();
             rules.add(MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE);
         }
+        timings.preparationNanos += System.nanoTime() - preparationStartedAt;
+        long safeRulesStartedAt = System.nanoTime();
         SafeRuleConversion safeRuleConversion = applyScriptSafeRules(
                 sqlBody,
                 scriptTableColumns,
                 scriptIdentityFirstColumns
         );
+        timings.safeRulesNanos += System.nanoTime() - safeRulesStartedAt;
+        long genericConverterStartedAt = System.nanoTime();
         SqlConversionResult sqlConversion = isConvertedSimpleDateEndTrigger(safeRuleConversion.sql())
                 ? SqlConversionResult.unchanged(safeRuleConversion.sql())
                 : converter.convert(safeRuleConversion.sql());
+        timings.genericConverterNanos += System.nanoTime() - genericConverterStartedAt;
+        long postProcessStartedAt = System.nanoTime();
         rules.addAll(safeRuleConversion.appliedRules());
         rules.addAll(sqlConversion.appliedRules());
         String convertedBody = sqlConversion.convertedSql();
@@ -958,17 +1132,26 @@ class SqlScriptMigrator {
         }
         String convertedSql = leadingSqlPrefix.prefix() + convertedBody;
         boolean changed = !convertedSql.equals(originalStatement);
-        String manualReason = originalSqlSyntaxManualReviewReason(sqlBody);
-        if (manualReason.isBlank()) {
-            manualReason = mysqlPrefixIndexManualReviewReason(sqlBody, convertedBody);
-        }
-        if (manualReason.isBlank()) {
-            manualReason = manualReviewReason(convertedBody);
-        }
+        String manualReason;
         if (sqlConversion.manualReviewRequired()) {
             manualReason = sqlConversion.reason();
+        } else {
+            long manualCheckStartedAt = System.nanoTime();
+            manualReason = originalSqlSyntaxManualReviewReason(sqlBody);
+            timings.originalSyntaxReviewNanos += System.nanoTime() - manualCheckStartedAt;
+            if (manualReason.isBlank()) {
+                manualCheckStartedAt = System.nanoTime();
+                manualReason = mysqlPrefixIndexManualReviewReason(sqlBody, convertedBody);
+                timings.prefixIndexReviewNanos += System.nanoTime() - manualCheckStartedAt;
+            }
+            if (manualReason.isBlank()) {
+                manualCheckStartedAt = System.nanoTime();
+                manualReason = manualReviewReason(convertedBody);
+                timings.generalManualReviewNanos += System.nanoTime() - manualCheckStartedAt;
+            }
         }
         if (!manualReason.isBlank()) {
+            timings.postProcessNanos += System.nanoTime() - postProcessStartedAt;
             return new ScriptStatementConversion(
                     originalStatement,
                     convertedSql,
@@ -979,6 +1162,7 @@ class SqlScriptMigrator {
                     rules
             );
         }
+        timings.postProcessNanos += System.nanoTime() - postProcessStartedAt;
         return new ScriptStatementConversion(
                 originalStatement,
                 convertedSql,
@@ -2772,15 +2956,12 @@ class SqlScriptMigrator {
                 + "END;";
     }
 
-    private boolean isConvertedSimpleDateEndTrigger(String sql) {
+    boolean isConvertedSimpleDateEndTrigger(String sql) {
         if (sql == null || sql.isBlank()) {
             return false;
         }
-        if (!Pattern.compile(
-                "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TRIGGER\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
-                        + "BEFORE\\s+(?:INSERT|UPDATE)\\s+ON\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
-                        + "FOR\\s+EACH\\s+ROW\\b"
-        ).matcher(sql).find()) {
+        if (!startsWithKeywords(sql, "CREATE", "OR", "REPLACE", "TRIGGER")
+                || !CONVERTED_SIMPLE_DATE_END_TRIGGER_PATTERN.matcher(sql).find()) {
             return false;
         }
         String normalized = sql.toUpperCase(Locale.ROOT);
@@ -2789,6 +2970,17 @@ class SqlScriptMigrator {
                 && normalized.contains("TO_TIMESTAMP")
                 && normalized.contains("TO_CHAR")
                 && normalized.contains("23:59:59");
+    }
+
+    private boolean startsWithKeywords(String sql, String... keywords) {
+        int cursor = skipWhitespace(sql, 0);
+        for (String keyword : keywords) {
+            if (!startsKeyword(sql, cursor, keyword)) {
+                return false;
+            }
+            cursor = skipWhitespace(sql, cursor + keyword.length());
+        }
+        return true;
     }
 
     private String convertResourceColumnBatchMergeToInsertOnly(String sql) {
@@ -7950,6 +8142,23 @@ class SqlScriptMigrator {
     }
 
     private record ScriptUserVariableInline(String sql, boolean changed) {
+    }
+
+    private record StatementConversionPlan(
+            int statementIndex,
+            String originalStatement,
+            CompletableFuture<ScriptStatementConversion> conversion
+    ) {
+    }
+
+    private static final class ConversionTimings {
+        private long preparationNanos;
+        private long safeRulesNanos;
+        private long genericConverterNanos;
+        private long postProcessNanos;
+        private long originalSyntaxReviewNanos;
+        private long prefixIndexReviewNanos;
+        private long generalManualReviewNanos;
     }
 
     private static final class ScriptDynamicDdlState {
