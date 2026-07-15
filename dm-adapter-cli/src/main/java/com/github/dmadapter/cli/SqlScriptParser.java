@@ -7,6 +7,11 @@ import java.util.regex.Pattern;
 
 final class SqlScriptParser {
     private static final Pattern DELIMITER_DIRECTIVE = Pattern.compile("(?i)^\\s*DELIMITER\\s+(\\S+)\\s*$");
+    private static final Pattern SCRIPT_LINE = Pattern.compile(".*(?:\\R|$)");
+    private static final Pattern SLASH_TERMINATED_CREATE = Pattern.compile(
+            "(?is)^CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|PACKAGE)\\b"
+    );
+    private static final Pattern SLASH_TERMINATED_BLOCK = Pattern.compile("(?is)^(?:DECLARE|BEGIN)\\b");
 
     private SqlScriptParser() {
     }
@@ -18,42 +23,35 @@ final class SqlScriptParser {
         List<String> statements = new ArrayList<>();
         String delimiter = ";";
         boolean slashTerminatedBlock = false;
-        StringBuilder buffer = new StringBuilder();
+        StringBuilder buffer = new StringBuilder(content.length());
+        ScriptScanState scanState = new ScriptScanState();
         for (String line : lines(content)) {
             Matcher delimiterMatcher = DELIMITER_DIRECTIVE.matcher(line.strip());
-            if (!slashTerminatedBlock && delimiterMatcher.matches() && isBlankSql(buffer.toString())) {
+            if (!slashTerminatedBlock && delimiterMatcher.matches() && !scanState.pendingExecutable()) {
                 delimiter = delimiterMatcher.group(1);
                 continue;
             }
             if (slashTerminatedBlock) {
                 if (isSlashTerminator(line)) {
-                    addStatement(statements, buffer.toString());
-                    buffer.setLength(0);
+                    scanState.completeSlashTerminatedStatement(buffer, statements);
                     slashTerminatedBlock = false;
                     continue;
                 }
                 buffer.append(line);
                 continue;
             }
-            if (";".equals(delimiter) && isBlankSql(buffer.toString()) && startsSlashTerminatedBlock(line)) {
+            if (";".equals(delimiter) && !scanState.pendingExecutable() && startsSlashTerminatedBlock(line)) {
                 slashTerminatedBlock = true;
                 buffer.append(line);
                 continue;
             }
-            if (isSlashTerminator(line) && isBlankSql(buffer.toString())) {
+            if (isSlashTerminator(line) && !scanState.pendingExecutable()) {
                 continue;
             }
             buffer.append(line);
-            while (true) {
-                int delimiterIndex = delimiterIndex(buffer, delimiter);
-                if (delimiterIndex < 0) {
-                    break;
-                }
-                addStatement(statements, buffer.substring(0, delimiterIndex));
-                buffer.delete(0, delimiterIndex + delimiter.length());
-            }
+            scanState.scanAppendedText(buffer, delimiter, statements);
         }
-        addStatement(statements, buffer.toString());
+        scanState.completeTrailingStatement(buffer, statements);
         return List.copyOf(statements);
     }
 
@@ -96,7 +94,7 @@ final class SqlScriptParser {
 
     private static List<String> lines(String content) {
         List<String> lines = new ArrayList<>();
-        Matcher matcher = Pattern.compile(".*(?:\\R|$)").matcher(content);
+        Matcher matcher = SCRIPT_LINE.matcher(content);
         while (matcher.find()) {
             String line = matcher.group();
             if (!line.isEmpty()) {
@@ -104,78 +102,6 @@ final class SqlScriptParser {
             }
         }
         return lines;
-    }
-
-    private static int delimiterIndex(CharSequence sql, String delimiter) {
-        if (delimiter == null || delimiter.isEmpty()) {
-            return -1;
-        }
-        boolean singleQuoted = false;
-        boolean doubleQuoted = false;
-        boolean backtickQuoted = false;
-        boolean lineComment = false;
-        boolean blockComment = false;
-        for (int i = 0; i < sql.length(); i++) {
-            char current = sql.charAt(i);
-            char next = i + 1 < sql.length() ? sql.charAt(i + 1) : '\0';
-            if (lineComment) {
-                if (current == '\n' || current == '\r') {
-                    lineComment = false;
-                }
-                continue;
-            }
-            if (blockComment) {
-                if (current == '*' && next == '/') {
-                    blockComment = false;
-                    i++;
-                }
-                continue;
-            }
-            if (singleQuoted) {
-                if (current == '\\' && next != '\0') {
-                    i++;
-                } else if (current == '\'' && next == '\'') {
-                    i++;
-                } else if (current == '\'') {
-                    singleQuoted = false;
-                }
-                continue;
-            }
-            if (doubleQuoted) {
-                if (current == '\\' && next != '\0') {
-                    i++;
-                } else if (current == '"' && next == '"') {
-                    i++;
-                } else if (current == '"') {
-                    doubleQuoted = false;
-                }
-                continue;
-            }
-            if (backtickQuoted) {
-                if (current == '`') {
-                    backtickQuoted = false;
-                }
-                continue;
-            }
-            if (current == '-' && next == '-') {
-                lineComment = true;
-                i++;
-            } else if (current == '#') {
-                lineComment = true;
-            } else if (current == '/' && next == '*') {
-                blockComment = true;
-                i++;
-            } else if (current == '\'') {
-                singleQuoted = true;
-            } else if (current == '"') {
-                doubleQuoted = true;
-            } else if (current == '`') {
-                backtickQuoted = true;
-            } else if (matchesAt(sql, delimiter, i)) {
-                return i;
-            }
-        }
-        return -1;
     }
 
     private static boolean matchesAt(CharSequence text, String value, int index) {
@@ -212,16 +138,10 @@ final class SqlScriptParser {
 
     private static boolean requiresSlashTerminator(String statement) {
         String sql = stripLeadingCommentsAndWhitespace(statement);
-        if (Pattern.compile(
-                        "(?is)^CREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|PACKAGE)\\b"
-                )
-                .matcher(sql)
-                .find()) {
+        if (SLASH_TERMINATED_CREATE.matcher(sql).find()) {
             return true;
         }
-        return Pattern.compile("(?is)^(?:DECLARE|BEGIN)\\b")
-                .matcher(sql)
-                .find();
+        return SLASH_TERMINATED_BLOCK.matcher(sql).find();
     }
 
     private static boolean isSlashTerminator(String line) {
@@ -273,5 +193,138 @@ final class SqlScriptParser {
         return index >= 0
                 && index + prefix.length() <= value.length()
                 && value.regionMatches(index, prefix, 0, prefix.length());
+    }
+
+    private static final class ScriptScanState {
+        private int scanIndex;
+        private int statementStart;
+        private boolean pendingExecutable;
+        private boolean singleQuoted;
+        private boolean doubleQuoted;
+        private boolean backtickQuoted;
+        private boolean lineComment;
+        private boolean blockComment;
+
+        boolean pendingExecutable() {
+            return pendingExecutable;
+        }
+
+        void scanAppendedText(StringBuilder sql, String delimiter, List<String> statements) {
+            if (delimiter == null || delimiter.isEmpty()) {
+                scanIndex = sql.length();
+                return;
+            }
+            int index = scanIndex;
+            while (index < sql.length()) {
+                char current = sql.charAt(index);
+                char next = index + 1 < sql.length() ? sql.charAt(index + 1) : '\0';
+                if (lineComment) {
+                    if (current == '\n' || current == '\r') {
+                        lineComment = false;
+                    }
+                    index++;
+                    continue;
+                }
+                if (blockComment) {
+                    if (current == '*' && next == '/') {
+                        blockComment = false;
+                        index += 2;
+                    } else {
+                        index++;
+                    }
+                    continue;
+                }
+                if (singleQuoted) {
+                    if (current == '\\' && next != '\0') {
+                        index += 2;
+                    } else if (current == '\'' && next == '\'') {
+                        index += 2;
+                    } else {
+                        if (current == '\'') {
+                            singleQuoted = false;
+                        }
+                        index++;
+                    }
+                    continue;
+                }
+                if (doubleQuoted) {
+                    if (current == '\\' && next != '\0') {
+                        index += 2;
+                    } else if (current == '"' && next == '"') {
+                        index += 2;
+                    } else {
+                        if (current == '"') {
+                            doubleQuoted = false;
+                        }
+                        index++;
+                    }
+                    continue;
+                }
+                if (backtickQuoted) {
+                    if (current == '`') {
+                        backtickQuoted = false;
+                    }
+                    index++;
+                    continue;
+                }
+                if (current == '-' && next == '-') {
+                    lineComment = true;
+                    index += 2;
+                } else if (current == '#') {
+                    lineComment = true;
+                    index++;
+                } else if (current == '/' && next == '*') {
+                    blockComment = true;
+                    index += 2;
+                } else if (current == '\'') {
+                    pendingExecutable = true;
+                    singleQuoted = true;
+                    index++;
+                } else if (current == '"') {
+                    pendingExecutable = true;
+                    doubleQuoted = true;
+                    index++;
+                } else if (current == '`') {
+                    pendingExecutable = true;
+                    backtickQuoted = true;
+                    index++;
+                } else if (matchesAt(sql, delimiter, index)) {
+                    if (pendingExecutable) {
+                        addStatement(statements, sql.substring(statementStart, index));
+                    }
+                    index += delimiter.length();
+                    statementStart = index;
+                    resetStatementState();
+                } else {
+                    if (!Character.isWhitespace(current)) {
+                        pendingExecutable = true;
+                    }
+                    index++;
+                }
+            }
+            scanIndex = index;
+        }
+
+        void completeSlashTerminatedStatement(StringBuilder sql, List<String> statements) {
+            addStatement(statements, sql.substring(statementStart));
+            statementStart = sql.length();
+            scanIndex = sql.length();
+            resetStatementState();
+        }
+
+        void completeTrailingStatement(StringBuilder sql, List<String> statements) {
+            if (pendingExecutable || scanIndex < sql.length()) {
+                addStatement(statements, sql.substring(statementStart));
+            }
+        }
+
+        private void resetStatementState() {
+            pendingExecutable = false;
+            singleQuoted = false;
+            doubleQuoted = false;
+            backtickQuoted = false;
+            lineComment = false;
+            blockComment = false;
+        }
     }
 }

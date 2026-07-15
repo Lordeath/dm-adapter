@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Proxy;
+import java.time.Duration;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -19,6 +20,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
 
 class SqlScriptMigratorTest {
     @TempDir
@@ -3365,6 +3367,27 @@ class SqlScriptMigratorTest {
                 .anySatisfy(message -> assertThat(message).contains("Planned SQL script [1/1]").contains("elapsedMs="))
                 .anySatisfy(message -> assertThat(message).contains("Starting SQL script database validation"))
                 .anySatisfy(message -> assertThat(message).contains("SQL script migration completed").contains("elapsedMs="));
+    }
+
+    @Test
+    void parsesLargeMultilineStatementInLinearTime() {
+        StringBuilder sql = new StringBuilder("insert into demo(id, content) values\n");
+        int rowCount = 20_000;
+        for (int i = 0; i < rowCount; i++) {
+            sql.append('(')
+                    .append(i)
+                    .append(", 'abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789')")
+                    .append(i + 1 == rowCount ? ";\n" : ",\n");
+        }
+
+        List<String> statements = assertTimeout(
+                Duration.ofSeconds(5),
+                () -> SqlScriptParser.statements(sql.toString())
+        );
+
+        assertThat(statements).singleElement().asString()
+                .startsWith("insert into demo")
+                .contains("(19999,");
     }
 
     @Test

@@ -550,19 +550,28 @@ class SqlScriptMigrator {
         }
 
         String originalContent = readSqlScriptContent(sqlFile);
+        long parseStartedAt = System.nanoTime();
         List<String> originalStatements = SqlScriptParser.statements(originalContent);
+        progress("Parsed SQL script: " + relative
+                + ", statements=" + originalStatements.size()
+                + ", elapsedMs=" + elapsedMillis(parseStartedAt));
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
         ScriptDynamicDdlState scriptDynamicDdlState = new ScriptDynamicDdlState();
         LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns = new LinkedHashMap<>();
         LinkedHashMap<String, String> scriptIdentityFirstColumns = new LinkedHashMap<>();
+        long preparationStartedAt = System.nanoTime();
         LinkedHashMap<String, String> scriptProcedureRenames = procedureObjectNameConflictRenames(originalStatements);
+        progress("Prepared SQL script conversion context: " + relative
+                + ", procedureRenames=" + scriptProcedureRenames.size()
+                + ", elapsedMs=" + elapsedMillis(preparationStartedAt));
         LinkedHashSet<String> manualReviewProcedureNames = new LinkedHashSet<>();
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
         int convertedStatementCount = 0;
         int manualReviewStatementCount = 0;
         LinkedHashSet<Integer> manualReviewStatementIndexes = new LinkedHashSet<>();
 
+        long conversionStartedAt = System.nanoTime();
         for (int i = 0; i < originalStatements.size(); i++) {
             String originalStatement = originalStatements.get(i);
             ScriptStatementConversion conversion =
@@ -617,7 +626,16 @@ class SqlScriptMigrator {
                 appliedRules.add(MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE);
             }
             convertedStatements.addAll(outputStatements);
+            if ((i + 1) % 1_000 == 0) {
+                progress("SQL script conversion progress: file=" + relative
+                        + ", statements=" + (i + 1) + "/" + originalStatements.size()
+                        + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
+            }
         }
+        progress("Converted SQL script statements: " + relative
+                + ", statements=" + originalStatements.size()
+                + ", outputStatements=" + convertedStatements.size()
+                + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
 
         String convertedContent = originalStatements.isEmpty()
                 ? originalContent
