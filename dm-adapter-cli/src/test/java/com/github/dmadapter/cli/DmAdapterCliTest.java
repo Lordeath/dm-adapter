@@ -8,6 +8,8 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -15,12 +17,21 @@ class DmAdapterCliTest {
     @TempDir
     Path tempDir;
 
+    private int execute(String... args) {
+        List<String> actualArgs = new ArrayList<>(List.of(args));
+        if (!actualArgs.contains("--report-dir")) {
+            actualArgs.add("--report-dir");
+            actualArgs.add(tempDir.resolve(".dm-adapter").toString());
+        }
+        return new CommandLine(new DmAdapterCli()).execute(actualArgs.toArray(String[]::new));
+    }
+
     @Test
     void migrateDryRunWritesReportWithoutChangingProjectFiles() throws Exception {
         writeDemoProject();
         String pomBefore = Files.readString(tempDir.resolve("pom.xml"));
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString(), "--dry-run");
+        int exitCode = execute("migrate", "--project", tempDir.toString(), "--dry-run");
 
         assertThat(exitCode).isZero();
         assertThat(Files.readString(tempDir.resolve("pom.xml"))).isEqualTo(pomBefore);
@@ -30,7 +41,7 @@ class DmAdapterCliTest {
                 .contains("Automatic SQL Conversions")
                 .contains("Manual Review SQL Items");
 
-        int reportExitCode = new CommandLine(new DmAdapterCli()).execute("report", "--project", tempDir.toString());
+        int reportExitCode = execute("report", "--project", tempDir.toString());
 
         assertThat(reportExitCode).isZero();
     }
@@ -40,7 +51,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeFile("sql/v2/20260423_system.sql", "select \"SYSTEM\" from dual;\n");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "migrate",
                 "--project",
                 tempDir.toString(),
@@ -71,17 +82,35 @@ class DmAdapterCliTest {
     void scanWritesScanReport() throws Exception {
         writeDemoProject();
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("scan", "--project", tempDir.toString());
+        int exitCode = execute("scan", "--project", tempDir.toString());
 
         assertThat(exitCode).isZero();
         assertThat(Files.exists(tempDir.resolve(".dm-adapter/dm-adapter-scan-report.json"))).isTrue();
     }
 
     @Test
+    void scanWritesOnlyToExplicitExternalWorkspace() throws Exception {
+        writeDemoProject();
+        Path workspace = tempDir.resolve("tool-work/newsee-hr-rest");
+
+        int exitCode = execute(
+                "scan",
+                "--project",
+                tempDir.toString(),
+                "--report-dir",
+                workspace.toString()
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(workspace.resolve("dm-adapter-scan-report.json")).exists();
+        assertThat(tempDir.resolve(".dm-adapter")).doesNotExist();
+    }
+
+    @Test
     void migrateAddsDmDriverToRootPomWithoutGeneratingApplicationDmConfig() throws Exception {
         writeDemoProject();
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        int exitCode = execute("migrate", "--project", tempDir.toString());
 
         assertThat(exitCode).isZero();
         assertThat(Files.readString(tempDir.resolve("pom.xml")))
@@ -104,7 +133,7 @@ class DmAdapterCliTest {
                 }
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        int exitCode = execute("migrate", "--project", tempDir.toString());
 
         String mapperDm = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AnnotationMapper.xml"));
         assertThat(exitCode).isZero();
@@ -138,7 +167,7 @@ class DmAdapterCliTest {
         int exitCode;
         try (PrintStream capturedOut = new PrintStream(stdout, true, StandardCharsets.UTF_8)) {
             System.setOut(capturedOut);
-            exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+            exitCode = execute("migrate", "--project", tempDir.toString());
         } finally {
             System.setOut(originalOut);
         }
@@ -159,7 +188,7 @@ class DmAdapterCliTest {
         writeMultiModuleProjectWithIndependentRootPom();
         String rootPomBefore = Files.readString(tempDir.resolve("pom.xml"));
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        int exitCode = execute("migrate", "--project", tempDir.toString());
 
         assertThat(exitCode).isZero();
         assertThat(Files.readString(tempDir.resolve("pom.xml"))).isEqualTo(rootPomBefore);
@@ -176,7 +205,7 @@ class DmAdapterCliTest {
     void migrateGeneratesValidationTestWhenValidationOptionsArePresent() throws Exception {
         writeMultiModuleProjectWithIndependentRootPom();
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "migrate",
                 "--project",
                 tempDir.toString(),
@@ -202,7 +231,7 @@ class DmAdapterCliTest {
     void migrateDryRunRejectsValidationTestGeneration() throws Exception {
         writeDemoProject();
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "migrate",
                 "--project",
                 tempDir.toString(),
@@ -234,7 +263,7 @@ class DmAdapterCliTest {
                 </mapper>
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        int exitCode = execute("migrate", "--project", tempDir.toString());
 
         assertThat(exitCode).isZero();
         String migratedMapper = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
@@ -273,7 +302,7 @@ class DmAdapterCliTest {
                 </mapper>
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        int exitCode = execute("migrate", "--project", tempDir.toString());
 
         Path rewriteConfig = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         assertThat(exitCode).isZero();
@@ -319,7 +348,7 @@ class DmAdapterCliTest {
                 ) ENGINE=InnoDB;
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
+        int exitCode = execute("migrate", "--project", tempDir.toString());
 
         assertThat(exitCode).isZero();
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-rewrite.yml")))
@@ -356,7 +385,7 @@ class DmAdapterCliTest {
                   methods:
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "migrate",
                 "--project",
                 tempDir.toString(),
@@ -378,7 +407,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString(),
@@ -876,7 +905,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -901,7 +930,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -930,7 +959,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -997,7 +1026,7 @@ class DmAdapterCliTest {
                 .contains("private ValidationRecord skipExistingDdlObject(ValidationRecord record)")
                 .contains("\"existing-ddl-object\"")
                 .contains("\"dynamic-identifier-parameter\"")
-                .contains("configure a real identifier in .dm-adapter/sql-rewrite.yml validationArgs")
+                .contains("configure a real identifier in sql-rewrite.yml validationArgs")
                 .contains("private boolean hasRegexpOperatorIssue(String message)")
                 .contains("lower.contains(\"regexp_like\")")
                 .contains("lower.contains(\"正则表达式\")");
@@ -1035,7 +1064,7 @@ class DmAdapterCliTest {
                   - "com.example.LegacyMapper.*"
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -1061,7 +1090,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -1253,7 +1282,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -1284,7 +1313,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -1314,7 +1343,7 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString(),
@@ -1345,7 +1374,7 @@ class DmAdapterCliTest {
         Files.writeString(config, "schema: \"custom\"\n");
         Files.writeString(test, "stale generated test");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString(),
@@ -1374,7 +1403,7 @@ class DmAdapterCliTest {
         int exitCode;
         try (PrintStream capturedOut = new PrintStream(stdout, true, StandardCharsets.UTF_8)) {
             System.setOut(capturedOut);
-            exitCode = new CommandLine(new DmAdapterCli()).execute(
+            exitCode = execute(
                     "generate-validation-test",
                     "--project",
                     tempDir.toString()
@@ -1396,8 +1425,8 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
-        int migrateExitCode = new CommandLine(new DmAdapterCli()).execute("migrate", "--project", tempDir.toString());
-        int generateExitCode = new CommandLine(new DmAdapterCli()).execute(
+        int migrateExitCode = execute("migrate", "--project", tempDir.toString());
+        int generateExitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -1415,7 +1444,7 @@ class DmAdapterCliTest {
         writeMultiModuleProjectWithIndependentRootPom();
         writeAdditionalAppModule("another-rest", "AnotherApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString()
@@ -1430,7 +1459,7 @@ class DmAdapterCliTest {
         writeMultiModuleProjectWithIndependentRootPom();
         writeAdditionalAppModule("another-rest", "AnotherApplication");
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString(),
@@ -1448,7 +1477,7 @@ class DmAdapterCliTest {
     void generateValidationTestUsesRootPomWhenAppModuleMatchesArtifactId() throws Exception {
         writeDemoProject();
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString(),
@@ -1458,6 +1487,10 @@ class DmAdapterCliTest {
 
         assertThat(exitCode).isZero();
         assertThat(Files.exists(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"))).isTrue();
+        assertThat(Files.readString(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java")))
+                .contains("dm.adapter.dir")
+                .contains("DM_ADAPTER_DIR")
+                .doesNotContain(".dm-adapter/sql-validation-report.md");
     }
 
     @Test
@@ -1505,7 +1538,7 @@ class DmAdapterCliTest {
                 </mapper>
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString(),
@@ -1540,7 +1573,7 @@ class DmAdapterCliTest {
         int exitCode;
         try (PrintStream capturedErr = new PrintStream(stderr, true, StandardCharsets.UTF_8)) {
             System.setErr(capturedErr);
-            exitCode = new CommandLine(new DmAdapterCli()).execute(
+            exitCode = execute(
                     "generate-validation-test",
                     "--project",
                     tempDir.toString(),
@@ -1609,7 +1642,7 @@ class DmAdapterCliTest {
                 </mapper>
                 """);
 
-        int exitCode = new CommandLine(new DmAdapterCli()).execute(
+        int exitCode = execute(
                 "generate-validation-test",
                 "--project",
                 tempDir.toString(),

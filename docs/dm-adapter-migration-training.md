@@ -58,8 +58,8 @@
 4. 按失败类型处理：
    - 原始业务 SQL 有问题：修改原 mapper XML 或 Java 注解 SQL。
    - 达梦测试库缺表、缺视图、缺函数、缺字段：优先补齐测试库对象。
-   - 确认只是测试环境缺对象且本轮无需验证：在 `.dm-adapter/sql-rewrite.yml` 的 `validationIgnores` 中解注或加入需要跳过的表、字段、schema。
-   - 动态表名、动态字段、排序片段、where 片段缺少真实入参：在 `.dm-adapter/sql-rewrite.yml` 中补充验证参数或安全枚举。
+   - 确认只是测试环境缺对象且本轮无需验证：在 `<应用工作目录>/sql-rewrite.yml` 的 `validationIgnores` 中解注或加入需要跳过的表、字段、schema。
+   - 动态表名、动态字段、排序片段、where 片段缺少真实入参：在 `<应用工作目录>/sql-rewrite.yml` 中补充验证参数或安全枚举。
 5. 重新执行 `migrate`。
 6. 重复查看报告、修正、重跑，直到剩余项都能明确归类。
 
@@ -75,9 +75,11 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
   --schema sample-system
 ```
 
+本文中的 `<应用工作目录>` 默认指启动 CLI 的当前目录下 `.dm-adapter/<应用 artifactId>/`。例如从 dm-adapter 工具目录执行并传入 `--app-module demo-rest` 时，默认目录是 `dm-adapter/.dm-adapter/demo-rest/`；也可用 `--report-dir` 指定完整最终目录。该目录保存配置、报告和验证临时文件，不再默认创建在业务项目中。
+
 说明：
 
-- `migrate` 会生成 `.dm-adapter/dm-adapter-report.md` 和 JSON 报告。
+- `migrate` 会生成 `<应用工作目录>/dm-adapter-report.md` 和 JSON 报告。
 - 传入 `--app-module`、`--schema` 或 `--config` 时，会触发达梦 SQL 验证测试生成。
 - 配置达梦连接环境变量后，工具会尝试执行生成的验证测试。
 - `--dry-run` 可作为预览手段，但不作为本培训推荐主流程。
@@ -100,20 +102,20 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
 
 ## 报告
 
-- `.dm-adapter/dm-adapter-report.md`
-- `.dm-adapter/dm-adapter-report.json`
+- `<应用工作目录>/dm-adapter-report.md`
+- `<应用工作目录>/dm-adapter-report.json`
 - 记录文件变化、自动转换 SQL、人工确认项和风险提示。
 
 ## 配置
 
-- `.dm-adapter/sql-rewrite.yml`
+- `<应用工作目录>/sql-rewrite.yml`
 - 用于配置 upsert 的 `keyColumns`。
 - 用于配置验证入参、动态 SQL 回放、`validationIgnores` 等迁移验证辅助信息。
 
 ## 验证测试
 
 - 生成 JUnit/MyBatis/JDBC 验证测试。
-- 生成或维护 `.dm-adapter/sql-validation.yml`。
+- 生成或维护 `<应用工作目录>/sql-validation.yml`。
 - 普通 `mvn test` 默认不连接达梦库。
 
 ---
@@ -205,8 +207,8 @@ status = 'ACTIVE'
 
 处理方式：
 
-- 能确认唯一键时，在 `.dm-adapter/sql-rewrite.yml` 中补 `keyColumns`。
-- 能确认动态入参时，在 `.dm-adapter/sql-rewrite.yml` 中补验证参数或安全枚举。
+- 能确认唯一键时，在 `<应用工作目录>/sql-rewrite.yml` 中补 `keyColumns`。
+- 能确认动态入参时，在 `<应用工作目录>/sql-rewrite.yml` 中补验证参数或安全枚举。
 - 不能确认时保留人工确认项，不强行转换。
 
 ---
@@ -220,7 +222,8 @@ DM_SQL_VALIDATION=true \
 DM_JDBC_URL=jdbc:dm://host:5236 \
 DM_DB_USERNAME=user \
 DM_DB_PASSWORD=password \
-mvn -Dtest=DmSqlValidationTest -DskipTests=false -Dmaven.test.skip=false test
+DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
+mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest -DskipTests=false -Dmaven.test.skip=false test
 ```
 
 ## 验证特点
@@ -232,8 +235,8 @@ mvn -Dtest=DmSqlValidationTest -DskipTests=false -Dmaven.test.skip=false test
 
 ## 报告输出
 
-- `.dm-adapter/sql-validation-report.md`
-- `.dm-adapter/sql-validation-report.json`
+- `<应用工作目录>/sql-validation-report.md`
+- `<应用工作目录>/sql-validation-report.json`
 
 报告会按以下维度帮助归类：
 
@@ -278,7 +281,7 @@ mvn -Dtest=DmSqlValidationTest -DskipTests=false -Dmaven.test.skip=false test
 处理方式：
 
 - 优先补齐达梦测试库对象。
-- 如果确认该对象不属于本轮验证范围，可在 `.dm-adapter/sql-rewrite.yml` 中解注或加入跳过配置：
+- 如果确认该对象不属于本轮验证范围，可在 `<应用工作目录>/sql-rewrite.yml` 中解注或加入跳过配置：
 
 ```yaml
 validationIgnores:
@@ -300,7 +303,7 @@ validationIgnores:
 处理方式：
 
 - 动态表名、字段名、SQL 片段必须给真实业务值或白名单枚举。
-- 在 `.dm-adapter/sql-rewrite.yml` 中补验证参数。
+- 在 `<应用工作目录>/sql-rewrite.yml` 中补验证参数。
 - 无法自动化确认时保留人工确认。
 
 ## 重跑工具

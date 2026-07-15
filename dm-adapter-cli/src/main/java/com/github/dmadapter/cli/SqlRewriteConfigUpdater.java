@@ -196,7 +196,7 @@ class SqlRewriteConfigUpdater {
             AdapterContext context,
             List<String> warnings
     ) {
-        Path report = context.projectRoot().resolve(".dm-adapter/sql-validation-report.json");
+        Path report = context.reportDir().resolve("sql-validation-report.json");
         if (!Files.isRegularFile(report)) {
             return List.of();
         }
@@ -239,7 +239,7 @@ class SqlRewriteConfigUpdater {
             AdapterContext context,
             List<String> warnings
     ) {
-        Path report = context.projectRoot().resolve(".dm-adapter/sql-validation-report.json");
+        Path report = context.reportDir().resolve("sql-validation-report.json");
         if (!Files.isRegularFile(report)) {
             return List.of();
         }

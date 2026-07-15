@@ -72,7 +72,7 @@
 
 ## 验证和分类流程
 
-1. 运行 Windows 环境 CLI `migrate`，读取目标项目 `.dm-adapter/sql-validation-report.md` 和 `.json`。
+1. 运行 Windows 环境 CLI `migrate`，读取工具侧应用工作目录（默认 `<启动目录>/.dm-adapter/<应用 artifactId>/`）中的 `sql-validation-report.md` 和 `.json`。
 2. 先排除数据库连接失败；连接失败不能作为 SQL 迁移结果。
 3. 对失败项按以下顺序处理：
    - dm-adapter 可通用转换：补转换规则和单元测试。

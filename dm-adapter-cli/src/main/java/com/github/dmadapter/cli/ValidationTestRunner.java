@@ -25,6 +25,10 @@ import java.util.function.Consumer;
 class ValidationTestRunner {
     private static final int MAX_PATH_CANDIDATES = 20;
     private static final int REPORT_SECTION_ROW_LIMIT = 8;
+    private static final String ADAPTER_DIR_PROPERTY = "dm.adapter.dir";
+    private static final String PROJECT_ROOT_PROPERTY = "dm.adapter.projectRoot";
+    private static final String CONFIG_PROPERTY = "dm.adapter.config";
+    private static final String REWRITE_CONFIG_PROPERTY = "dm.adapter.rewriteConfig";
 
     private final Map<String, String> processEnvironment;
     private final String osName;
@@ -121,9 +125,9 @@ class ValidationTestRunner {
 
         List<String> command = mavenCommand(generationResult);
         Path workingDirectory = workingDirectory(generationResult);
-        Path markdownReport = validationMarkdownReport(generationResult.projectRoot());
+        Path markdownReport = validationMarkdownReport(generationResult.workspaceDir());
         try {
-            deleteStaleValidationReports(generationResult.projectRoot());
+            deleteStaleValidationReports(generationResult.workspaceDir());
         } catch (IOException e) {
             return new ValidationTestRunResult(
                     true,
@@ -147,7 +151,7 @@ class ValidationTestRunner {
             ProcessExecutionResult effectiveExecution = mavenExecution;
             if (mavenExecution.exitCode() == 0 && mavenTestsWereSkipped(mavenExecution.output())) {
                 publishMavenOutput("Maven reported tests are skipped; running generated validation main directly.");
-                Files.createDirectories(generationResult.projectRoot().resolve(".dm-adapter"));
+                Files.createDirectories(generationResult.workspaceDir());
                 currentCommand = mavenClasspathCommand(generationResult);
                 currentWorkingDirectory = workingDirectory;
                 ProcessExecutionResult classpathExecution = executeProcess(
@@ -177,7 +181,7 @@ class ValidationTestRunner {
                     true,
                     exitCode,
                     existingReportPath(markdownReport),
-                    runDiagnostics(executions, combinedOutput, environment, generationResult.projectRoot()),
+                    runDiagnostics(executions, combinedOutput, environment, generationResult.workspaceDir()),
                     exitCode == 0
                             ? "Dameng SQL validation test passed."
                             : "Dameng SQL validation test exited with code " + exitCode + "."
@@ -189,7 +193,7 @@ class ValidationTestRunner {
                             executions,
                             combinedOutput(executions) + e.getClass().getSimpleName() + ": " + e.getMessage(),
                             environment,
-                            generationResult.projectRoot()
+                            generationResult.workspaceDir()
                     );
             String message = executions.isEmpty()
                     ? "Failed to start Maven validation test: " + e.getMessage()
@@ -207,7 +211,7 @@ class ValidationTestRunner {
                     true,
                     1,
                     existingReportPath(markdownReport),
-                    runDiagnostics(executions, combinedOutput(executions) + readFailure, environment, generationResult.projectRoot()),
+                    runDiagnostics(executions, combinedOutput(executions) + readFailure, environment, generationResult.workspaceDir()),
                     "Failed to read Maven validation output: " + readFailure
             );
         } catch (InterruptedException e) {
@@ -216,7 +220,7 @@ class ValidationTestRunner {
                     true,
                     1,
                     existingReportPath(markdownReport),
-                    runDiagnostics(executions, combinedOutput(executions), environment, generationResult.projectRoot()),
+                    runDiagnostics(executions, combinedOutput(executions), environment, generationResult.workspaceDir()),
                     "Maven validation test was interrupted."
             );
         }
@@ -254,23 +258,23 @@ class ValidationTestRunner {
         }
     }
 
-    private void deleteStaleValidationReports(Path projectRoot) throws IOException {
-        Files.deleteIfExists(validationMarkdownReport(projectRoot));
-        Files.deleteIfExists(projectRoot.resolve(".dm-adapter/sql-validation-report.json"));
-        Files.deleteIfExists(validationClasspathFile(projectRoot));
-        Files.deleteIfExists(validationJavaArgsFile(projectRoot));
+    private void deleteStaleValidationReports(Path workspaceDir) throws IOException {
+        Files.deleteIfExists(validationMarkdownReport(workspaceDir));
+        Files.deleteIfExists(workspaceDir.resolve("sql-validation-report.json"));
+        Files.deleteIfExists(validationClasspathFile(workspaceDir));
+        Files.deleteIfExists(validationJavaArgsFile(workspaceDir));
     }
 
-    private Path validationMarkdownReport(Path projectRoot) {
-        return projectRoot.resolve(".dm-adapter/sql-validation-report.md");
+    private Path validationMarkdownReport(Path workspaceDir) {
+        return workspaceDir.resolve("sql-validation-report.md");
     }
 
-    private Path validationClasspathFile(Path projectRoot) {
-        return projectRoot.resolve(".dm-adapter/sql-validation-classpath.txt");
+    private Path validationClasspathFile(Path workspaceDir) {
+        return workspaceDir.resolve("sql-validation-classpath.txt");
     }
 
-    private Path validationJavaArgsFile(Path projectRoot) {
-        return projectRoot.resolve(".dm-adapter/sql-validation-java.args");
+    private Path validationJavaArgsFile(Path workspaceDir) {
+        return workspaceDir.resolve("sql-validation-java.args");
     }
 
     private Path existingReportPath(Path reportPath) {
@@ -287,6 +291,7 @@ class ValidationTestRunner {
             command.add(projectRoot.relativize(moduleRoot).toString().replace('\\', '/'));
             command.add("-am");
         }
+        addValidationSystemProperties(command, generationResult);
         command.add("-Dtest=" + validationMainClass(generationResult));
         command.add("-DskipTests=false");
         command.add("-Dmaven.test.skip=false");
@@ -310,8 +315,22 @@ class ValidationTestRunner {
         command.add("test-compile");
         command.add("dependency:build-classpath");
         command.add("-Dmdep.includeScope=test");
-        command.add("-Dmdep.outputFile=" + validationClasspathFile(projectRoot));
+        command.add("-Dmdep.outputFile=" + validationClasspathFile(generationResult.workspaceDir()));
         return command;
+    }
+
+    private void addValidationSystemProperties(
+            List<String> command,
+            ValidationTestGenerationResult generationResult
+    ) {
+        command.add(systemPropertyArgument(ADAPTER_DIR_PROPERTY, generationResult.workspaceDir()));
+        command.add(systemPropertyArgument(PROJECT_ROOT_PROPERTY, generationResult.projectRoot()));
+        command.add(systemPropertyArgument(CONFIG_PROPERTY, generationResult.configPath()));
+        command.add(systemPropertyArgument(REWRITE_CONFIG_PROPERTY, generationResult.rewriteConfigPath()));
+    }
+
+    private String systemPropertyArgument(String name, Path value) {
+        return "-D" + name + "=" + value.toAbsolutePath().normalize();
     }
 
     List<String> javaValidationCommand(ValidationTestGenerationResult generationResult) throws IOException {
@@ -322,9 +341,13 @@ class ValidationTestRunner {
     }
 
     private Path writeValidationJavaArgsFile(ValidationTestGenerationResult generationResult) throws IOException {
-        Path argsFile = validationJavaArgsFile(generationResult.projectRoot());
+        Path argsFile = validationJavaArgsFile(generationResult.workspaceDir());
         Files.createDirectories(argsFile.getParent());
         List<String> args = List.of(
+                systemPropertyArgument(ADAPTER_DIR_PROPERTY, generationResult.workspaceDir()),
+                systemPropertyArgument(PROJECT_ROOT_PROPERTY, generationResult.projectRoot()),
+                systemPropertyArgument(CONFIG_PROPERTY, generationResult.configPath()),
+                systemPropertyArgument(REWRITE_CONFIG_PROPERTY, generationResult.rewriteConfigPath()),
                 "-cp",
                 validationRuntimeClasspath(generationResult),
                 validationMainClass(generationResult)
@@ -388,7 +411,7 @@ class ValidationTestRunner {
         Path moduleRoot = generationResult.appModuleRoot();
         elements.add(moduleRoot.resolve("target/test-classes").toString());
         elements.add(moduleRoot.resolve("target/classes").toString());
-        Path classpathFile = validationClasspathFile(generationResult.projectRoot());
+        Path classpathFile = validationClasspathFile(generationResult.workspaceDir());
         if (Files.isRegularFile(classpathFile)) {
             String classpath = Files.readString(classpathFile, StandardCharsets.UTF_8).trim();
             if (!classpath.isBlank()) {
@@ -522,7 +545,7 @@ class ValidationTestRunner {
             List<ProcessExecutionResult> executions,
             String output,
             DmValidationEnvironment environment,
-            Path projectRoot
+            Path workspaceDir
     ) {
         List<String> diagnostics = new ArrayList<>();
         if (executions.isEmpty()) {
@@ -533,7 +556,7 @@ class ValidationTestRunner {
             diagnostics.add(commandLabel(i, execution.command()) + ": " + execution.command());
             diagnostics.add("Working directory: " + execution.workingDirectory());
         }
-        diagnostics.addAll(validationReportSummary(projectRoot));
+        diagnostics.addAll(validationReportSummary(workspaceDir));
         diagnostics.addAll(tail(redact(output, environment), 40));
         return diagnostics;
     }
@@ -548,8 +571,8 @@ class ValidationTestRunner {
         return "Maven fallback command";
     }
 
-    private List<String> validationReportSummary(Path projectRoot) {
-        Path report = validationMarkdownReport(projectRoot);
+    private List<String> validationReportSummary(Path workspaceDir) {
+        Path report = validationMarkdownReport(workspaceDir);
         if (!Files.isRegularFile(report)) {
             return List.of();
         }
@@ -715,6 +738,8 @@ class ValidationTestRunner {
         diagnostics.add("Working directory: " + workingDirectory + " (exists=" + Files.isDirectory(workingDirectory) + ")");
         diagnostics.add("Project root: " + projectRoot + " (exists=" + Files.isDirectory(projectRoot) + ")");
         diagnostics.add("Application module root: " + appModuleRoot + " (exists=" + Files.isDirectory(appModuleRoot) + ")");
+        diagnostics.add("dm-adapter workspace: " + generationResult.workspaceDir()
+                + " (exists=" + Files.isDirectory(generationResult.workspaceDir()) + ")");
         diagnostics.add("Root pom.xml exists: " + Files.isRegularFile(projectRoot.resolve("pom.xml")));
         diagnostics.add("OS: " + osName + " " + System.getProperty("os.version", "") + " " + System.getProperty("os.arch", ""));
         diagnostics.add("java.home: " + System.getProperty("java.home", ""));

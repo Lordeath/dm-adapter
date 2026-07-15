@@ -5,6 +5,7 @@ import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.Callable;
 
 @Command(
@@ -21,19 +22,41 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
     @Option(names = "--mapper-dir", description = "Mapper XML directory used for configuration template discovery.")
     private Path mapperDir;
 
-    @Option(names = "--config", description = "Validation config path. Defaults to <project>/.dm-adapter/sql-validation.yml.")
+    @Option(names = "--config", description = "Validation config path. Defaults to <workspace>/sql-validation.yml.")
     private Path config;
+
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
+    private Path reportDir;
 
     @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods. Supports comma-separated fallback schemas.")
     private String schema;
 
     private final DmSqlValidationTestGenerator generator = new DmSqlValidationTestGenerator();
     private final ValidationTestRunner validationTestRunner = new ValidationTestRunner();
+    private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
+    private final LegacyWorkspaceMigrator legacyWorkspaceMigrator = new LegacyWorkspaceMigrator();
 
     @Override
     public Integer call() {
         try {
-            ValidationTestGenerationResult result = generator.generate(project, appModule, mapperDir, config, schema);
+            Path workspaceDir = workspaceResolver.resolve(project, appModule, reportDir);
+            List<String> workspaceWarnings = legacyWorkspaceMigrator.migrateDefaults(
+                    project,
+                    workspaceDir,
+                    true,
+                    config == null
+            );
+            CliLogger.info("dm-adapter workspace: " + workspaceDir);
+            ValidationTestGenerationResult result = generator.generate(
+                    project,
+                    appModule,
+                    mapperDir,
+                    config,
+                    schema,
+                    workspaceDir,
+                    workspaceDir.resolve(LegacyWorkspaceMigrator.REWRITE_CONFIG),
+                    workspaceWarnings
+            );
             printResult(result);
             printValidationRunResult(validationTestRunner.runIfConfigured(result, DmValidationEnvironment.fromSystem()));
             return 0;

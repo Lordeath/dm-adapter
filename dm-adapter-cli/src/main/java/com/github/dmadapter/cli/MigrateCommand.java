@@ -55,13 +55,13 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--dm-driver", description = "Dameng JDBC dependency coordinate: groupId:artifactId:version.")
     private String dmDriver;
 
-    @Option(names = "--report-dir", description = "Report output directory. Defaults to <project>/.dm-adapter.")
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
     private Path reportDir;
 
     @Option(names = "--mapper-dir", description = "Target mapper directory. Defaults to src/main/resources/mapper-dm.")
     private Path mapperDir;
 
-    @Option(names = "--rewrite-config", description = "SQL rewrite config path. Defaults to <project>/.dm-adapter/sql-rewrite.yml.")
+    @Option(names = "--rewrite-config", description = "SQL rewrite config path. Defaults to <workspace>/sql-rewrite.yml.")
     private Path rewriteConfig;
 
     @Option(names = "--generate-validation-test", description = "Generate the Dameng SQL validation test after migration.")
@@ -70,7 +70,7 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--app-module", description = "Application module path or Maven artifactId used for generated validation test placement; implies --generate-validation-test.")
     private Path appModule;
 
-    @Option(names = "--config", description = "Validation config path; implies --generate-validation-test. Defaults to <project>/.dm-adapter/sql-validation.yml.")
+    @Option(names = "--config", description = "Validation config path; implies --generate-validation-test. Defaults to <workspace>/sql-validation.yml.")
     private Path config;
 
     @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods in the generated validation test; supports comma-separated fallback schemas; implies --generate-validation-test.")
@@ -108,15 +108,24 @@ public class MigrateCommand implements Callable<Integer> {
             new MySqlToDmSqlConverter(),
             new SqlScriptValidator()
     );
+    private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
+    private final LegacyWorkspaceMigrator legacyWorkspaceMigrator = new LegacyWorkspaceMigrator();
 
     @Override
     public Integer call() {
         try {
             AdapterContext context = buildContext();
             CliLogger.info("Migration started. Project: " + context.projectRoot());
+            CliLogger.info("dm-adapter workspace: " + context.reportDir());
             validateSupportedDatabases(context);
             validateValidationTestGeneration(context);
             validateSqlScriptMigrationOptions();
+            List<String> workspaceWarnings = legacyWorkspaceMigrator.migrateDefaults(
+                    context.projectRoot(),
+                    context.reportDir(),
+                    rewriteConfig == null,
+                    config == null
+            );
             CliLogger.info("Scanning project...");
             ProjectScanResult scanResult = projectScanner.scan(context);
             CliLogger.info("Project scan completed. Maven project: " + scanResult.mavenProject()
@@ -124,6 +133,7 @@ public class MigrateCommand implements Callable<Integer> {
 
             List<FileChange> fileChanges = new ArrayList<>();
             List<String> warnings = new ArrayList<>(scanResult.warnings());
+            warnings.addAll(workspaceWarnings);
             if (!scanResult.mavenProject()) {
                 warnings.add("Migration was not applied because the project root does not contain pom.xml.");
                 CliLogger.info("Writing migration report...");
@@ -258,7 +268,10 @@ public class MigrateCommand implements Callable<Integer> {
                         appModule,
                         mapperDir,
                         config,
-                        schema
+                        schema,
+                        context.reportDir(),
+                        rewriteConfigPath(context),
+                        List.of()
                 );
                 GenerateValidationTestCommand.printResult(validationResult);
                 CliLogger.info("Running Dameng SQL validation test if configured...");
@@ -274,12 +287,13 @@ public class MigrateCommand implements Callable<Integer> {
     }
 
     private AdapterContext buildContext() {
+        Path workspaceDir = workspaceResolver.resolve(project, appModule, reportDir);
         return AdapterContext.builder(project)
                 .sourceDb(sourceDb)
                 .targetDb(targetDb)
                 .dryRun(dryRun)
                 .dmDriverCoordinate(DependencyCoordinate.parse(dmDriver))
-                .reportDir(reportDir)
+                .reportDir(workspaceDir)
                 .mapperTargetDir(mapperDir)
                 .build();
     }
@@ -324,7 +338,7 @@ public class MigrateCommand implements Callable<Integer> {
 
     private Path rewriteConfigPath(AdapterContext context) {
         return rewriteConfig == null
-                ? context.projectRoot().resolve(".dm-adapter/sql-rewrite.yml")
+                ? context.reportDir().resolve(LegacyWorkspaceMigrator.REWRITE_CONFIG)
                 : (rewriteConfig.isAbsolute()
                         ? rewriteConfig.toAbsolutePath().normalize()
                         : context.projectRoot().resolve(rewriteConfig).toAbsolutePath().normalize());
@@ -566,7 +580,10 @@ public class MigrateCommand implements Callable<Integer> {
         if (schema != null && !schema.isBlank()) {
             return Optional.of(schema.trim());
         }
-        return DmValidationConfigReader.schema(context.projectRoot(), config);
+        Path configPath = config == null
+                ? context.reportDir().resolve(LegacyWorkspaceMigrator.VALIDATION_CONFIG)
+                : config;
+        return DmValidationConfigReader.schema(context.projectRoot(), configPath);
     }
 
     private String redact(String message, DmValidationEnvironment environment) {

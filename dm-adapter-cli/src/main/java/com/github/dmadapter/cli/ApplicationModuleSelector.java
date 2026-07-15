@@ -1,13 +1,8 @@
 package com.github.dmadapter.cli;
 
 import com.github.dmadapter.core.DmAdapterException;
-import org.w3c.dom.Document;
-import org.w3c.dom.Element;
-import org.w3c.dom.Node;
-import org.w3c.dom.NodeList;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -19,8 +14,6 @@ import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
-import javax.xml.XMLConstants;
-import javax.xml.parsers.DocumentBuilderFactory;
 
 class ApplicationModuleSelector {
     private static final Pattern PACKAGE_PATTERN = Pattern.compile("(?m)^\\s*package\\s+([A-Za-z0-9_.]+)\\s*;");
@@ -59,7 +52,7 @@ class ApplicationModuleSelector {
 
     private ApplicationModule selectExplicitModuleByArtifactId(Path projectRoot, String artifactId, Path failedModuleRoot) {
         List<Path> matches = pomFiles(projectRoot).stream()
-                .filter(pomPath -> artifactId.equals(readArtifactId(pomPath).orElse("")))
+                .filter(pomPath -> artifactId.equals(PomArtifactIdReader.read(pomPath).orElse("")))
                 .toList();
         if (matches.size() == 1) {
             Path pomPath = matches.get(0);
@@ -84,30 +77,6 @@ class ApplicationModuleSelector {
                     .toList();
         } catch (IOException e) {
             throw new DmAdapterException("Failed to scan pom.xml files under " + projectRoot, e);
-        }
-    }
-
-    private Optional<String> readArtifactId(Path pomPath) {
-        try (InputStream inputStream = Files.newInputStream(pomPath)) {
-            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-            factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-            Document document = factory.newDocumentBuilder().parse(inputStream);
-            Element root = document.getDocumentElement();
-            if (root == null) {
-                return Optional.empty();
-            }
-            NodeList children = root.getChildNodes();
-            for (int i = 0; i < children.getLength(); i++) {
-                Node node = children.item(i);
-                if (node instanceof Element element && "artifactId".equals(element.getTagName())) {
-                    String value = element.getTextContent();
-                    return value == null || value.isBlank() ? Optional.empty() : Optional.of(value.trim());
-                }
-            }
-            return Optional.empty();
-        } catch (Exception e) {
-            return Optional.empty();
         }
     }
 

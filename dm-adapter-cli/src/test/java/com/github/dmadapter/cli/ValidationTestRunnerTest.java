@@ -69,6 +69,8 @@ class ValidationTestRunnerTest {
     void allowsReactorModulesWithoutGeneratedValidationTest() {
         assertThat(new ValidationTestRunner().mavenCommand(generationResult()))
                 .contains(
+                        "-Ddm.adapter.dir=" + tempDir.resolve(".dm-adapter"),
+                        "-Ddm.adapter.projectRoot=" + tempDir,
                         "-DskipTests=false",
                         "-Dmaven.test.skip=false",
                         "-Dsurefire.failIfNoSpecifiedTests=false"
@@ -171,6 +173,8 @@ class ValidationTestRunnerTest {
         assertThat(commands.get(2))
                 .noneSatisfy(argument -> assertThat(argument).contains("dependency with space.jar"));
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation-java.args")))
+                .contains("-Ddm.adapter.dir=" + tempDir.resolve(".dm-adapter"))
+                .contains("-Ddm.adapter.projectRoot=" + tempDir)
                 .contains("-cp")
                 .contains("dependency with space.jar")
                 .contains("DmSqlValidationTest");
@@ -502,7 +506,9 @@ class ValidationTestRunnerTest {
         return new ValidationTestGenerationResult(
                 tempDir,
                 tempDir,
+                tempDir.resolve(".dm-adapter"),
                 tempDir.resolve(".dm-adapter/sql-validation.yml"),
+                tempDir.resolve(".dm-adapter/sql-rewrite.yml"),
                 testPath,
                 List.of(),
                 List.of()
