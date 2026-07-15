@@ -320,6 +320,7 @@ class DmSqlValidationTestGenerator {
                   # - com.example.mybatis.typehandler
 
                 # Skip mapper methods that are not referenced by project target/classes bytecode.
+                # Actual parameter subtype inference scans production src/main/java sources only.
                 usageFilterEnabled: true
                 usageClassDirectories:
                   # - sample-system-base/target/classes
@@ -686,8 +687,11 @@ class DmSqlValidationTestGenerator {
             import java.math.BigInteger;
             import java.nio.charset.Charset;
             import java.nio.charset.StandardCharsets;
+            import java.nio.file.FileVisitResult;
             import java.nio.file.Files;
             import java.nio.file.Path;
+            import java.nio.file.SimpleFileVisitor;
+            import java.nio.file.attribute.BasicFileAttributes;
             import java.sql.Connection;
             import java.sql.DatabaseMetaData;
             import java.sql.PreparedStatement;
@@ -856,10 +860,17 @@ class DmSqlValidationTestGenerator {
                                             "No mapped statements were found in mapper XML files."));
                                     log("FAILED discovery: No mapped statements were found in mapper XML files.");
                                 }
+                                long usageFilterStartedAt = System.nanoTime();
                                 UsageFilter usageFilter = MapperUsageIndex.build(projectRoot, config, mapperMethods);
                                 usageFilterReport = usageFilter.report();
-                                log("Usage filter: " + usageFilterReport.summary());
-                                actualParameterTypeIndex = ActualParameterTypeIndex.build(projectRoot, mapperMethods);
+                                log("Usage filter: " + usageFilterReport.summary()
+                                        + ", elapsedMs=" + elapsedMillis(usageFilterStartedAt));
+                                List<MapperMethod> inferenceCandidates = actualParameterTypeInferenceCandidates(
+                                        mapperMethods,
+                                        usageFilter,
+                                        config
+                                );
+                                actualParameterTypeIndex = ActualParameterTypeIndex.build(projectRoot, inferenceCandidates);
                                 log("Actual parameter type inference: " + actualParameterTypeIndex.summary());
                                 int index = 0;
                                 int total = mapperMethods.size();
@@ -2824,6 +2835,28 @@ class DmSqlValidationTestGenerator {
 
                 """,
             """
+                private List<MapperMethod> actualParameterTypeInferenceCandidates(
+                        List<MapperMethod> mapperMethods,
+                        UsageFilter usageFilter,
+                        ValidationConfig config
+                ) {
+                    List<MapperMethod> candidates = new ArrayList<>();
+                    for (MapperMethod mapperMethod : mapperMethods) {
+                        if (mapperMethod == null
+                                || mapperMethod.method == null
+                                || mapperMethod.method.getParameterCount() == 0
+                                || config.excludes(mapperMethod.key())
+                                || usageFilter.unused(mapperMethod, config)
+                                || config.methodArguments(mapperMethod.key()) != null
+                                || skipUnsupportedReturnType(mapperMethod) != null
+                                || javaMapperSignatureIssue(mapperMethod) != null) {
+                            continue;
+                        }
+                        candidates.add(mapperMethod);
+                    }
+                    return candidates;
+                }
+
                 private List<ParameterResolution> resolveParameterVariants(MapperMethod mapperMethod, ValidationConfig config) {
                     MethodArgumentConfig configuredArgs = config.methodArguments(mapperMethod.key());
                     if (mapperMethod.isUnmapped()) {
@@ -9657,6 +9690,10 @@ class DmSqlValidationTestGenerator {
                     return path.toString().replace('\\\\', '/');
                 }
 
+                private long elapsedMillis(long startedAtNanos) {
+                    return Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);
+                }
+
                 private void logProgress(int index, int total, ValidationRecord record, long elapsedMillis) {
                     String elapsed = elapsedMillis <= 0 ? "" : " (" + elapsedMillis + " ms)";
                     String message = record.message == null || isBlank(record.message)
@@ -9701,17 +9738,59 @@ class DmSqlValidationTestGenerator {
                 """,
             """
                 private static final class ActualParameterTypeIndex {
+                    private static final long INFERENCE_TIMEOUT_NANOS = 5_000_000_000L;
+                    private static final long MAX_SOURCE_FILE_BYTES = 262_144L;
+                    private static final Set<String> SKIPPED_PROJECT_DIRECTORIES = new LinkedHashSet<>(Arrays.asList(
+                            ".git",
+                            ".dm-adapter",
+                            "target",
+                            "build",
+                            "out",
+                            "node_modules"
+                    ));
+                    private static final Pattern JAVA_VARIABLE_DECLARATION_PATTERN = Pattern.compile(
+                            "(^|[^A-Za-z0-9_$])"
+                                    + "([A-Za-z_$][A-Za-z0-9_$.]*(?:\\\\s*<[^;(){}=]*>)?)"
+                                    + "\\\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\\\s*(?:[;=,){])"
+                    );
+                    private static final Pattern MAPPER_CALL_PATTERN = Pattern.compile(
+                            "(^|[^A-Za-z0-9_$])"
+                                    + "([A-Za-z_$][A-Za-z0-9_$]*)"
+                                    + "\\\\s*\\\\.\\\\s*"
+                                    + "([A-Za-z_$][A-Za-z0-9_$]*)"
+                                    + "\\\\s*\\\\("
+                    );
+                    private static final Pattern SIMPLE_IDENTIFIER_PATTERN =
+                            Pattern.compile("[A-Za-z_$][A-Za-z0-9_$]*");
                     private final Map<String, Map<Integer, Class<?>>> actualTypes;
+                    private final int candidateMethodCount;
+                    private final int sourceRootCount;
+                    private final int sourceFileCount;
+                    private final boolean timedOut;
+                    private final long elapsedMillis;
 
-                    private ActualParameterTypeIndex(Map<String, Map<Integer, Class<?>>> actualTypes) {
+                    private ActualParameterTypeIndex(
+                            Map<String, Map<Integer, Class<?>>> actualTypes,
+                            int candidateMethodCount,
+                            int sourceRootCount,
+                            int sourceFileCount,
+                            boolean timedOut,
+                            long elapsedMillis
+                    ) {
                         this.actualTypes = actualTypes;
+                        this.candidateMethodCount = candidateMethodCount;
+                        this.sourceRootCount = sourceRootCount;
+                        this.sourceFileCount = sourceFileCount;
+                        this.timedOut = timedOut;
+                        this.elapsedMillis = elapsedMillis;
                     }
 
                     private static ActualParameterTypeIndex empty() {
-                        return new ActualParameterTypeIndex(emptyMap());
+                        return new ActualParameterTypeIndex(emptyMap(), 0, 0, 0, false, 0L);
                     }
 
                     private static ActualParameterTypeIndex build(Path projectRoot, List<MapperMethod> mapperMethods) {
+                        long startedAt = System.nanoTime();
                         Map<String, List<MapperMethod>> mapperMethodsBySimpleName = new LinkedHashMap<>();
                         for (MapperMethod mapperMethod : mapperMethods) {
                             if (mapperMethod.mapperInterface == null || mapperMethod.method == null) {
@@ -9722,18 +9801,31 @@ class DmSqlValidationTestGenerator {
                                     .add(mapperMethod);
                         }
                         if (mapperMethodsBySimpleName.isEmpty()) {
-                            return empty();
+                            return new ActualParameterTypeIndex(
+                                    emptyMap(),
+                                    mapperMethods.size(),
+                                    0,
+                                    0,
+                                    false,
+                                    elapsedMillisSince(startedAt)
+                            );
                         }
                         Map<String, Map<String, List<MapperMethod>>> mapperMethodsBySimpleAndMethod = new LinkedHashMap<>();
                         for (Map.Entry<String, List<MapperMethod>> entry : mapperMethodsBySimpleName.entrySet()) {
                             mapperMethodsBySimpleAndMethod.put(entry.getKey(), mapperMethodsByMethodName(entry.getValue()));
                         }
                         Map<String, Map<Integer, Class<?>>> actualTypes = new LinkedHashMap<>();
-                        long deadlineNanos = System.nanoTime() + 5_000_000_000L;
-                        for (Path sourceFile : javaSourceFiles(projectRoot)) {
-                            if (System.nanoTime() > deadlineNanos) {
+                        long deadlineNanos = startedAt + INFERENCE_TIMEOUT_NANOS;
+                        SourceScanState scanState = new SourceScanState();
+                        List<Path> sourceRoots = javaSourceRoots(projectRoot, deadlineNanos, scanState);
+                        List<Path> sourceFiles = javaSourceFiles(sourceRoots, deadlineNanos, scanState);
+                        int scannedSourceFiles = 0;
+                        for (Path sourceFile : sourceFiles) {
+                            if (deadlineExceeded(deadlineNanos)) {
+                                scanState.timedOut = true;
                                 break;
                             }
+                            scannedSourceFiles++;
                             try {
                                 scanSourceFile(
                                         sourceFile,
@@ -9744,7 +9836,14 @@ class DmSqlValidationTestGenerator {
                             } catch (Exception ignored) {
                             }
                         }
-                        return actualTypes.isEmpty() ? empty() : new ActualParameterTypeIndex(actualTypes);
+                        return new ActualParameterTypeIndex(
+                                actualTypes.isEmpty() ? emptyMap() : actualTypes,
+                                mapperMethods.size(),
+                                sourceRoots.size(),
+                                scannedSourceFiles,
+                                scanState.timedOut,
+                                elapsedMillisSince(startedAt)
+                        );
                     }
 
                     private static Map<String, List<MapperMethod>> mapperMethodsByMethodName(List<MapperMethod> mapperMethods) {
@@ -9775,35 +9874,113 @@ class DmSqlValidationTestGenerator {
                         for (Map<Integer, Class<?>> byIndex : actualTypes.values()) {
                             count += byIndex.size();
                         }
-                        return count + " mapper parameter type(s) inferred from Java call sites.";
+                        return count + " mapper parameter type(s) inferred from Java call sites; candidates="
+                                + candidateMethodCount
+                                + ", sourceRoots=" + sourceRootCount
+                                + ", sourceFiles=" + sourceFileCount
+                                + ", timedOut=" + timedOut
+                                + ", elapsedMs=" + elapsedMillis + ".";
                     }
 
-                    private static List<Path> javaSourceFiles(Path projectRoot) {
-                        try (Stream<Path> paths = Files.walk(projectRoot)) {
-                            return paths.filter(Files::isRegularFile)
-                                    .filter(path -> path.getFileName().toString().endsWith(".java"))
-                                    .filter(ActualParameterTypeIndex::isJavaSourcePath)
-                                    .filter(ActualParameterTypeIndex::isReasonableJavaSourceFile)
-                                    .filter(path -> !path.toString().contains("/target/"))
-                                    .filter(path -> !path.toString().contains("\\\\target\\\\"))
-                                    .sorted()
-                                    .collect(Collectors.toList());
-                        } catch (IOException e) {
-                            return listOf();
-                        }
-                    }
-
-                    private static boolean isJavaSourcePath(Path path) {
-                        String value = path.toString().replace('\\\\', '/');
-                        return value.contains("/src/main/java/") || value.contains("/src/test/java/");
-                    }
-
-                    private static boolean isReasonableJavaSourceFile(Path path) {
+                    private static List<Path> javaSourceRoots(
+                            Path projectRoot,
+                            long deadlineNanos,
+                            SourceScanState scanState
+                    ) {
+                        List<Path> sourceRoots = new ArrayList<>();
                         try {
-                            return Files.size(path) <= 262_144L;
+                            Files.walkFileTree(projectRoot, new SimpleFileVisitor<Path>() {
+                                @Override
+                                public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) {
+                                    if (deadlineExceeded(deadlineNanos)) {
+                                        scanState.timedOut = true;
+                                        return FileVisitResult.TERMINATE;
+                                    }
+                                    if (!directory.equals(projectRoot) && skippedProjectDirectory(directory)) {
+                                        return FileVisitResult.SKIP_SUBTREE;
+                                    }
+                                    if (isMainJavaSourceRoot(directory)) {
+                                        sourceRoots.add(directory.toAbsolutePath().normalize());
+                                        return FileVisitResult.SKIP_SUBTREE;
+                                    }
+                                    return FileVisitResult.CONTINUE;
+                                }
+                            });
                         } catch (IOException e) {
-                            return false;
+                            return sourceRoots;
                         }
+                        Collections.sort(sourceRoots);
+                        return sourceRoots;
+                    }
+
+                    private static boolean skippedProjectDirectory(Path directory) {
+                        Path fileName = directory.getFileName();
+                        return fileName != null && SKIPPED_PROJECT_DIRECTORIES.contains(fileName.toString());
+                    }
+
+                    private static boolean isMainJavaSourceRoot(Path directory) {
+                        Path java = directory.getFileName();
+                        Path mainDirectory = directory.getParent();
+                        Path main = mainDirectory == null ? null : mainDirectory.getFileName();
+                        Path sourceDirectory = mainDirectory == null ? null : mainDirectory.getParent();
+                        Path source = sourceDirectory == null ? null : sourceDirectory.getFileName();
+                        return java != null
+                                && main != null
+                                && source != null
+                                && "java".equals(java.toString())
+                                && "main".equals(main.toString())
+                                && "src".equals(source.toString());
+                    }
+
+                    private static List<Path> javaSourceFiles(
+                            List<Path> sourceRoots,
+                            long deadlineNanos,
+                            SourceScanState scanState
+                    ) {
+                        List<Path> sourceFiles = new ArrayList<>();
+                        for (Path sourceRoot : sourceRoots) {
+                            if (deadlineExceeded(deadlineNanos)) {
+                                scanState.timedOut = true;
+                                break;
+                            }
+                            try {
+                                Files.walkFileTree(sourceRoot, new SimpleFileVisitor<Path>() {
+                                    @Override
+                                    public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) {
+                                        if (deadlineExceeded(deadlineNanos)) {
+                                            scanState.timedOut = true;
+                                            return FileVisitResult.TERMINATE;
+                                        }
+                                        return FileVisitResult.CONTINUE;
+                                    }
+
+                                    @Override
+                                    public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) {
+                                        if (deadlineExceeded(deadlineNanos)) {
+                                            scanState.timedOut = true;
+                                            return FileVisitResult.TERMINATE;
+                                        }
+                                        if (attributes.isRegularFile()
+                                                && attributes.size() <= MAX_SOURCE_FILE_BYTES
+                                                && file.getFileName().toString().endsWith(".java")) {
+                                            sourceFiles.add(file.toAbsolutePath().normalize());
+                                        }
+                                        return FileVisitResult.CONTINUE;
+                                    }
+                                });
+                            } catch (IOException ignored) {
+                            }
+                        }
+                        Collections.sort(sourceFiles);
+                        return sourceFiles;
+                    }
+
+                    private static boolean deadlineExceeded(long deadlineNanos) {
+                        return System.nanoTime() > deadlineNanos;
+                    }
+
+                    private static long elapsedMillisSince(long startedAtNanos) {
+                        return Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);
                     }
 
                     private static void scanSourceFile(
@@ -9818,43 +9995,41 @@ class DmSqlValidationTestGenerator {
                         }
                         String packageName = packageName(source);
                         ImportIndex imports = ImportIndex.parse(source);
-                        Map<String, Set<String>> mapperVariablesBySimpleName = mapperVariablesBySimpleName(source, mapperSimpleNames);
-                        for (Map.Entry<String, Set<String>> entry : mapperVariablesBySimpleName.entrySet()) {
-                            Map<String, List<MapperMethod>> mapperMethodsByName = mapperMethodsBySimpleAndMethod.get(entry.getKey());
-                            if (mapperMethodsByName == null) {
-                                continue;
-                            }
-                            for (String mapperVariableName : entry.getValue()) {
-                                scanMapperMethodCalls(
-                                        source,
-                                        packageName,
-                                        imports,
-                                        mapperVariableName,
-                                        mapperMethodsByName,
-                                        actualTypes
-                                );
-                            }
-                        }
+                        Map<String, List<SourceVariableDeclaration>> declarations = sourceVariableDeclarations(source);
+                        scanMapperMethodCalls(
+                                source,
+                                packageName,
+                                imports,
+                                declarations,
+                                mapperSimpleNames,
+                                mapperMethodsBySimpleAndMethod,
+                                actualTypes
+                        );
                     }
 
                     private static void scanMapperMethodCalls(
                             String source,
                             String packageName,
                             ImportIndex imports,
-                            String mapperVariableName,
-                            Map<String, List<MapperMethod>> mapperMethodsByName,
+                            Map<String, List<SourceVariableDeclaration>> declarations,
+                            Set<String> mapperSimpleNames,
+                            Map<String, Map<String, List<MapperMethod>>> mapperMethodsBySimpleAndMethod,
                             Map<String, Map<Integer, Class<?>>> actualTypes
                     ) {
-                        Pattern callPattern = Pattern.compile(
-                                "(^|[^A-Za-z0-9_$])"
-                                        + Pattern.quote(mapperVariableName)
-                                        + "\\\\s*\\\\.\\\\s*"
-                                        + "([A-Za-z_$][A-Za-z0-9_$]*)"
-                                        + "\\\\s*\\\\("
-                        );
-                        Matcher matcher = callPattern.matcher(source);
+                        Matcher matcher = MAPPER_CALL_PATTERN.matcher(source);
                         while (matcher.find()) {
-                            List<MapperMethod> mapperMethods = mapperMethodsByName.get(matcher.group(2));
+                            String mapperVariableName = matcher.group(2);
+                            String mapperType = declarationTypeBefore(declarations, mapperVariableName, matcher.start(2));
+                            String mapperSimpleName = simpleTypeName(mapperType);
+                            if (!mapperSimpleNames.contains(mapperSimpleName)) {
+                                continue;
+                            }
+                            Map<String, List<MapperMethod>> mapperMethodsByName =
+                                    mapperMethodsBySimpleAndMethod.get(mapperSimpleName);
+                            if (mapperMethodsByName == null) {
+                                continue;
+                            }
+                            List<MapperMethod> mapperMethods = mapperMethodsByName.get(matcher.group(3));
                             if (mapperMethods == null) {
                                 continue;
                             }
@@ -9867,7 +10042,11 @@ class DmSqlValidationTestGenerator {
                                     if (argumentName == null) {
                                         continue;
                                     }
-                                    String typeName = variableTypeBefore(source, matcher.start(), argumentName);
+                                    String typeName = declarationTypeBefore(
+                                                declarations,
+                                                argumentName,
+                                                matcher.start(2)
+                                    );
                                     Class<?> actualType = loadActualType(typeName, packageName, imports, declaredTypes[i]);
                                     if (actualType != null) {
                                         actualTypes.computeIfAbsent(mapperMethod.key(), key -> new LinkedHashMap<>())
@@ -9878,24 +10057,39 @@ class DmSqlValidationTestGenerator {
                         }
                     }
 
-                    private static Map<String, Set<String>> mapperVariablesBySimpleName(String source, Set<String> mapperSimpleNames) {
-                        Pattern pattern = Pattern.compile(
-                                "(^|[^A-Za-z0-9_$])"
-                                        + "([A-Za-z_$][A-Za-z0-9_$.]*)"
-                                        + "\\\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\\\s*(?:[;=,)])"
-                        );
-                        Matcher matcher = pattern.matcher(source);
-                        Map<String, Set<String>> variablesBySimpleName = new LinkedHashMap<>();
+                    private static Map<String, List<SourceVariableDeclaration>> sourceVariableDeclarations(String source) {
+                        Matcher matcher = JAVA_VARIABLE_DECLARATION_PATTERN.matcher(source);
+                        Map<String, List<SourceVariableDeclaration>> declarations = new LinkedHashMap<>();
                         while (matcher.find()) {
-                            String mapperSimpleName = simpleTypeName(cleanTypeName(matcher.group(2)));
-                            if (!mapperSimpleNames.contains(mapperSimpleName)) {
-                                continue;
-                            }
-                            variablesBySimpleName
-                                    .computeIfAbsent(mapperSimpleName, key -> new LinkedHashSet<>())
-                                    .add(matcher.group(3));
+                            declarations.computeIfAbsent(matcher.group(3), key -> new ArrayList<>())
+                                    .add(new SourceVariableDeclaration(matcher.start(3), cleanTypeName(matcher.group(2))));
                         }
-                        return variablesBySimpleName;
+                        return declarations;
+                    }
+
+                    private static String declarationTypeBefore(
+                            Map<String, List<SourceVariableDeclaration>> declarations,
+                            String variableName,
+                            int beforeIndex
+                    ) {
+                        List<SourceVariableDeclaration> matchingDeclarations = declarations.get(variableName);
+                        if (matchingDeclarations == null || matchingDeclarations.isEmpty()) {
+                            return null;
+                        }
+                        int low = 0;
+                        int high = matchingDeclarations.size() - 1;
+                        SourceVariableDeclaration result = null;
+                        while (low <= high) {
+                            int middle = (low + high) >>> 1;
+                            SourceVariableDeclaration candidate = matchingDeclarations.get(middle);
+                            if (candidate.position < beforeIndex) {
+                                result = candidate;
+                                low = middle + 1;
+                            } else {
+                                high = middle - 1;
+                            }
+                        }
+                        return result == null ? null : result.typeName;
                     }
 
                     private static String simpleTypeName(String typeName) {
@@ -9933,21 +10127,7 @@ class DmSqlValidationTestGenerator {
 
                     private static String simpleIdentifier(String expression) {
                         String value = expression == null ? "" : expression.trim();
-                        return value.matches("[A-Za-z_$][A-Za-z0-9_$]*") ? value : null;
-                    }
-
-                    private static String variableTypeBefore(String source, int beforeIndex, String variableName) {
-                        Pattern pattern = Pattern.compile(
-                                "([A-Za-z_$][A-Za-z0-9_$.]*(?:\\\\s*<[^;(){}=]*>)?)\\\\s+"
-                                        + Pattern.quote(variableName)
-                                        + "\\\\s*(?:[,)=;{])"
-                        );
-                        Matcher matcher = pattern.matcher(source.substring(0, beforeIndex));
-                        String typeName = null;
-                        while (matcher.find()) {
-                            typeName = matcher.group(1);
-                        }
-                        return cleanTypeName(typeName);
+                        return SIMPLE_IDENTIFIER_PATTERN.matcher(value).matches() ? value : null;
                     }
 
                     private static String cleanTypeName(String typeName) {
@@ -10063,6 +10243,20 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         return result.toString();
+                    }
+
+                    private static final class SourceScanState {
+                        private boolean timedOut;
+                    }
+
+                    private static final class SourceVariableDeclaration {
+                        private final int position;
+                        private final String typeName;
+
+                        private SourceVariableDeclaration(int position, String typeName) {
+                            this.position = position;
+                            this.typeName = typeName;
+                        }
                     }
 
                     private static final class ImportIndex {
@@ -10199,17 +10393,27 @@ class DmSqlValidationTestGenerator {
                             }
                             return directories;
                         }
-                        try (Stream<Path> paths = Files.walk(projectRoot)) {
-                            return paths.filter(Files::isDirectory)
-                                    .filter(path -> path.getFileName() != null)
-                                    .filter(path -> "classes".equals(path.getFileName().toString()))
-                                    .filter(path -> path.getParent() != null
-                                            && path.getParent().getFileName() != null
-                                            && "target".equals(path.getParent().getFileName().toString()))
-                                    .filter(path -> !path.toString().contains("test-classes"))
-                                    .sorted()
-                                    .collect(Collectors.toList());
-                        }
+                        List<Path> directories = new ArrayList<>();
+                        Files.walkFileTree(projectRoot, new SimpleFileVisitor<Path>() {
+                            @Override
+                            public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) {
+                                Path fileName = directory.getFileName();
+                                if (fileName != null && "target".equals(fileName.toString())) {
+                                    Path classes = directory.resolve("classes");
+                                    if (Files.isDirectory(classes)) {
+                                        directories.add(classes.toAbsolutePath().normalize());
+                                    }
+                                    return FileVisitResult.SKIP_SUBTREE;
+                                }
+                                if (!directory.equals(projectRoot)
+                                        && ActualParameterTypeIndex.skippedProjectDirectory(directory)) {
+                                    return FileVisitResult.SKIP_SUBTREE;
+                                }
+                                return FileVisitResult.CONTINUE;
+                            }
+                        });
+                        Collections.sort(directories);
+                        return directories;
                     }
 
                     private static List<Path> classFiles(List<Path> classDirectories) throws IOException {

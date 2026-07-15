@@ -1,8 +1,11 @@
 package com.github.dmadapter.cli;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import javax.tools.JavaCompiler;
+import javax.tools.ToolProvider;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -853,13 +856,22 @@ class DmAdapterCliTest {
                 .contains("defaultProxyReturnValue")
                 .contains("set schema")
                 .contains("quotedIdentifier(schema)")
-                .contains("ActualParameterTypeIndex.build(projectRoot, mapperMethods)")
+                .contains("actualParameterTypeInferenceCandidates(")
+                .contains("ActualParameterTypeIndex.build(projectRoot, inferenceCandidates)")
+                .contains("usageFilter.unused(mapperMethod, config)")
+                .contains("config.methodArguments(mapperMethod.key()) != null")
                 .contains("actualParameterTypeIndex.actualType(")
-                .contains("mapperVariablesBySimpleName(source, mapperSimpleNames)")
-                .contains("mapperMethodsByMethodName(entry.getValue())")
-                .contains("isJavaSourcePath")
-                .contains("isReasonableJavaSourceFile")
-                .contains("deadlineNanos")
+                .contains("JAVA_VARIABLE_DECLARATION_PATTERN")
+                .contains("MAPPER_CALL_PATTERN")
+                .contains("sourceVariableDeclarations(source)")
+                .contains("declarationTypeBefore(")
+                .contains("javaSourceRoots(projectRoot, deadlineNanos, scanState)")
+                .contains("FileVisitResult.SKIP_SUBTREE")
+                .contains("sourceFiles=")
+                .contains("elapsedMs=")
+                .doesNotContain("mapperVariablesBySimpleName(")
+                .doesNotContain("variableTypeBefore(")
+                .doesNotContain("/src/test/java/")
                 .contains("auto:actual-type")
                 .contains("\"now\".equals(normalizedName)")
                 .contains("normalizedName.endsWith(\"datestr\")")
@@ -898,6 +910,7 @@ class DmAdapterCliTest {
                 .doesNotContain("singleValue(collectionElementColumnReferences)")
                 .doesNotContainPattern("case\\s+[^:\\n]+->")
                 .doesNotContainPattern("case\\s+[^:\\n]+,\\s+[^:\\n]+:");
+        assertGeneratedTestCompilesForJava8(test);
     }
 
     @Test
@@ -1654,6 +1667,26 @@ class DmAdapterCliTest {
         Path generatedTest = tempDir.resolve("sample-system-rest/src/test/java/com/example/hr/DmSqlValidationTest.java");
         assertThat(Files.exists(generatedTest)).isTrue();
         assertThat(Files.readString(generatedTest)).contains("package com.example.hr;");
+    }
+
+    private void assertGeneratedTestCompilesForJava8(Path sourceFile) throws Exception {
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        assertThat(compiler).as("JDK compiler").isNotNull();
+        Path outputDirectory = tempDir.resolve("generated-test-classes");
+        Files.createDirectories(outputDirectory);
+        int exitCode = compiler.run(
+                null,
+                null,
+                null,
+                "--release",
+                "8",
+                "-classpath",
+                System.getProperty("java.class.path"),
+                "-d",
+                outputDirectory.toString(),
+                sourceFile.toString()
+        );
+        assertThat(exitCode).as("generated Java 8 validation test compilation").isZero();
     }
 
     private void writeDemoProject() throws Exception {
