@@ -8,7 +8,9 @@ import java.util.List;
 record ValidationTestGenerationResult(
         Path projectRoot,
         Path appModuleRoot,
+        Path workspaceDir,
         Path configPath,
+        Path rewriteConfigPath,
         Path testPath,
         List<FileChange> fileChanges,
         List<String> warnings

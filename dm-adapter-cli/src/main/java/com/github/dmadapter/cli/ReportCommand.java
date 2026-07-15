@@ -14,15 +14,19 @@ public class ReportCommand implements Callable<Integer> {
     @Option(names = "--project", required = true, description = "Project root path.")
     private Path project;
 
-    @Option(names = "--report-dir", description = "Report directory. Defaults to <project>/.dm-adapter.")
+    @Option(names = "--app-module", description = "Application module path or Maven artifactId used for the default workspace name.")
+    private Path appModule;
+
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
     private Path reportDir;
+
+    private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
 
     @Override
     public Integer call() {
         try {
-            Path actualReportDir = reportDir == null
-                    ? project.toAbsolutePath().normalize().resolve(".dm-adapter")
-                    : reportDir.toAbsolutePath().normalize();
+            Path actualReportDir = workspaceResolver.resolve(project, appModule, reportDir);
+            CliLogger.info("dm-adapter workspace: " + actualReportDir);
             if (!Files.exists(actualReportDir.resolve("dm-adapter-report.json"))) {
                 CliLogger.error("Migration report not found: " + actualReportDir.resolve("dm-adapter-report.json"));
                 return 2;

@@ -19,20 +19,26 @@ public class ScanCommand implements Callable<Integer> {
     @Option(names = "--dm-driver", description = "Dameng JDBC dependency coordinate: groupId:artifactId:version.")
     private String dmDriver;
 
-    @Option(names = "--report-dir", description = "Report output directory. Defaults to <project>/.dm-adapter.")
+    @Option(names = "--app-module", description = "Application module path or Maven artifactId used for the default workspace name.")
+    private Path appModule;
+
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
     private Path reportDir;
 
     private final ProjectScanner projectScanner = new ProjectScanner();
     private final ReportWriter reportWriter = new ReportWriter();
+    private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
 
     @Override
     public Integer call() {
         try {
+            Path workspaceDir = workspaceResolver.resolve(project, appModule, reportDir);
             AdapterContext context = AdapterContext.builder(project)
                     .dmDriverCoordinate(DependencyCoordinate.parse(dmDriver))
-                    .reportDir(reportDir)
+                    .reportDir(workspaceDir)
                     .dryRun(true)
                     .build();
+            CliLogger.info("dm-adapter workspace: " + context.reportDir());
             ProjectScanResult scanResult = projectScanner.scan(context);
             ReportPaths reportPaths = reportWriter.writeScanReport(scanResult, context.reportDir());
             CliLogger.info("Scan completed.");

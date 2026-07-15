@@ -11,7 +11,12 @@ final class DmValidationConfigReader {
     }
 
     static Optional<String> schema(Path projectRoot, Path configuredPath) {
-        Path path = resolveProjectPath(projectRoot, configuredPath, DmSqlValidationTestGenerator.DEFAULT_CONFIG_PATH);
+        if (configuredPath == null) {
+            return Optional.empty();
+        }
+        Path path = configuredPath.isAbsolute()
+                ? configuredPath.toAbsolutePath().normalize()
+                : projectRoot.toAbsolutePath().normalize().resolve(configuredPath).normalize();
         if (!Files.isRegularFile(path)) {
             return Optional.empty();
         }
