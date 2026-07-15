@@ -21,6 +21,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -308,13 +309,26 @@ class SqlScriptMigrator {
 
     private final SqlConverter converter;
     private final Validator validator;
+    private final Consumer<String> progressConsumer;
 
     SqlScriptMigrator(SqlConverter converter, Validator validator) {
+        this(converter, validator, message -> {
+        });
+    }
+
+    SqlScriptMigrator(
+            SqlConverter converter,
+            Validator validator,
+            Consumer<String> progressConsumer
+    ) {
         this.converter = converter;
         this.validator = validator;
+        this.progressConsumer = progressConsumer == null ? message -> {
+        } : progressConsumer;
     }
 
     SqlScriptMigrationReport migrate(SqlScriptMigrationRequest request) throws IOException {
+        long migrationStartedAt = System.nanoTime();
         Path projectRoot = request.projectRoot().toAbsolutePath().normalize();
         Path sqlRoot = resolvePath(projectRoot, request.sqlRoot());
         Path sqlRootOut = resolvePath(projectRoot, request.sqlRootOut());
@@ -326,6 +340,14 @@ class SqlScriptMigrator {
         }
 
         List<Path> sqlFiles = sqlFiles(sqlRoot);
+        long totalInputBytes = 0L;
+        for (Path sqlFile : sqlFiles) {
+            totalInputBytes += safeFileSize(sqlFile);
+        }
+        progress("Discovered SQL script files: " + sqlFiles.size()
+                + ", totalBytes=" + totalInputBytes
+                + ", input=" + sqlRoot
+                + ", output=" + sqlRootOut);
         List<String> warnings = new ArrayList<>();
         String schema = primarySchema(request.schema(), "--schema", warnings);
         String systemSchema = primarySchema(request.systemSchema(), "--system-schema", warnings);
@@ -333,7 +355,12 @@ class SqlScriptMigrator {
         List<PlannedSqlScriptFile> plannedFiles = new ArrayList<>();
         int convertedFileCount = 0;
 
-        for (Path sqlFile : sqlFiles) {
+        for (int fileIndex = 0; fileIndex < sqlFiles.size(); fileIndex++) {
+            Path sqlFile = sqlFiles.get(fileIndex);
+            long fileStartedAt = System.nanoTime();
+            Path relative = sqlRoot.relativize(sqlFile);
+            progress("Planning SQL script [" + (fileIndex + 1) + "/" + sqlFiles.size() + "]: "
+                    + relative + ", bytes=" + safeFileSize(sqlFile));
             PlannedSqlScriptFile plannedFile = planFile(
                     sqlRoot,
                     sqlRootOut,
@@ -348,17 +375,33 @@ class SqlScriptMigrator {
             if (plannedFile.converted()) {
                 convertedFileCount++;
             }
+            progress("Planned SQL script [" + (fileIndex + 1) + "/" + sqlFiles.size() + "]: "
+                    + relative
+                    + ", statements=" + plannedFile.originalStatementCount()
+                    + ", outputStatements=" + plannedFile.statements().size()
+                    + ", convertedStatements=" + plannedFile.convertedStatementCount()
+                    + ", manualReview=" + plannedFile.manualReviewStatementCount()
+                    + ", elapsedMs=" + elapsedMillis(fileStartedAt));
         }
         if (!request.dryRun()) {
+            long outputOnlyStartedAt = System.nanoTime();
             plannedFiles.addAll(outputOnlyPlannedFiles(sqlRootOut, plannedFiles, schema, systemSchema, warnings));
+            progress("Output-only SQL script discovery completed: totalPlannedFiles=" + plannedFiles.size()
+                    + ", elapsedMs=" + elapsedMillis(outputOnlyStartedAt));
         }
         plannedFiles = plannedFiles.stream()
                 .sorted(Comparator.comparing(file -> plannedFileSortKey(sqlRootOut, file)))
                 .toList();
 
+        long validationStartedAt = System.nanoTime();
+        progress("Starting SQL script database validation: files=" + plannedFiles.size());
         SqlScriptValidationRun validationRun = request.dryRun()
                 ? SqlScriptValidationRun.notAttempted("Dry run; SQL script validation skipped.", List.of())
                 : validator.validate(plannedFiles, request.validationEnvironment());
+        progress("SQL script database validation completed: attempted=" + validationRun.attempted()
+                + ", succeeded=" + validationRun.successCount()
+                + ", failed=" + validationRun.failureCount()
+                + ", elapsedMs=" + elapsedMillis(validationStartedAt));
         warnings.addAll(validationRun.warnings());
 
         Function<String, SqlScriptFileValidation> validationByOutput = output -> validationRun.fileValidations().stream()
@@ -385,7 +428,7 @@ class SqlScriptMigrator {
                 })
                 .toList();
 
-        return new SqlScriptMigrationReport(
+        SqlScriptMigrationReport report = new SqlScriptMigrationReport(
                 projectRoot.toString(),
                 sqlRoot.toString(),
                 sqlRootOut.toString(),
@@ -402,6 +445,30 @@ class SqlScriptMigrator {
                 validationRun.failures(),
                 warnings
         );
+        progress("SQL script migration completed: files=" + sqlFiles.size()
+                + ", convertedFiles=" + convertedFileCount
+                + ", elapsedMs=" + elapsedMillis(migrationStartedAt));
+        return report;
+    }
+
+    private long safeFileSize(Path path) {
+        try {
+            return Files.size(path);
+        } catch (IOException ignored) {
+            return -1L;
+        }
+    }
+
+    private long elapsedMillis(long startedAtNanos) {
+        return Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);
+    }
+
+    private void progress(String message) {
+        try {
+            progressConsumer.accept(message);
+        } catch (RuntimeException ignored) {
+            // Progress logging must never stop SQL script migration.
+        }
     }
 
     private String plannedFileSortKey(Path sqlRootOut, PlannedSqlScriptFile file) {
