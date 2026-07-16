@@ -611,29 +611,15 @@ class MapperJdbcTypeAligner {
             return placeholder;
         }
         if (stringParameter && (isNumericColumnType(columnType) || isTemporalColumnType(columnType))) {
-            return "CAST(" + replaceOrAddJdbcType(placeholder, "VARCHAR") + " AS " + targetJdbcType + ")";
+            return "CAST(" + replaceJdbcTypeIfPresent(placeholder, "VARCHAR") + " AS " + targetJdbcType + ")";
         }
-        return replaceOrAddJdbcType(placeholder, targetJdbcType);
+        return replaceJdbcTypeIfPresent(placeholder, targetJdbcType);
     }
 
-    private String replaceOrAddJdbcType(String placeholder, String targetJdbcType) {
+    private String replaceJdbcTypeIfPresent(String placeholder, String targetJdbcType) {
         Matcher matcher = JDBC_TYPE_PATTERN.matcher(placeholder);
         if (!matcher.find()) {
-            int close = placeholder.lastIndexOf('}');
-            if (close < 0) {
-                return placeholder;
-            }
-            int insertAt = close;
-            while (insertAt > 0 && Character.isWhitespace(placeholder.charAt(insertAt - 1))) {
-                insertAt--;
-            }
-            if (insertAt > 0 && placeholder.charAt(insertAt - 1) == ',') {
-                return placeholder.substring(0, insertAt)
-                        + "jdbcType=" + targetJdbcType
-                        + placeholder.substring(insertAt, close)
-                        + placeholder.substring(close);
-            }
-            return placeholder.substring(0, close) + ",jdbcType=" + targetJdbcType + placeholder.substring(close);
+            return placeholder;
         }
         String current = matcher.group(2);
         if (targetJdbcType.equalsIgnoreCase(current)) {

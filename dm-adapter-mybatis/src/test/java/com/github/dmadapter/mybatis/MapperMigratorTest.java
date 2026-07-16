@@ -314,7 +314,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void migrationWrapsConfiguredIdentityInsertTableWithDynamicColumnList() throws Exception {
+    void migrationDoesNotWrapConfiguredIdentityInsertTableWithDynamicColumnList() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -360,39 +360,30 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AreaClassMapper.xml"));
         assertThat(rewritten)
-                .contains("BEGIN")
-                .contains("SET IDENTITY_INSERT ns_equip_area_class ON;")
                 .contains("insert into ns_equip_area_class")
                 .contains("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">")
                 .contains("<foreach collection=\"list\" item=\"item\" separator=\",\">")
-                .contains("SET IDENTITY_INSERT ns_equip_area_class OFF;")
-                .contains("END;");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.DAMENG_IDENTITY_INSERT_RULE);
+                .doesNotContain("SET IDENTITY_INSERT")
+                .doesNotContain("BEGIN");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
-    void migrationWrapsConfiguredIdentityInsertTableWithTrimValuesPrefix() throws Exception {
+    void migrationDoesNotWrapGeneratedKeyInsertForConfiguredIdentityInsertTable() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
                         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
                 <mapper namespace="com.example.BankAccountMapper">
-                    <insert id="insertSelective" parameterType="com.example.BankAccount">
+                    <insert id="insertSelective" parameterType="com.example.BankAccount"
+                            useGeneratedKeys="true" keyProperty="ownerBankAccountId">
                         insert into owner_customer_bank_account
                         <trim prefix="(" suffix=")" suffixOverrides=",">
-                            <if test="ownerBankAccountId != null">
-                                owner_bank_account_id,
-                            </if>
                             <if test="ownerId != null">
                                 owner_id,
                             </if>
                         </trim>
                         <trim prefix="values (" suffix=")" suffixOverrides=",">
-                            <if test="ownerBankAccountId != null">
-                                #{ownerBankAccountId,jdbcType=BIGINT},
-                            </if>
                             <if test="ownerId != null">
                                 #{ownerId,jdbcType=BIGINT},
                             </if>
@@ -427,32 +418,24 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BankAccountMapper.xml"));
         assertThat(rewritten)
-                .contains("SET IDENTITY_INSERT owner_customer_bank_account ON;")
                 .contains("<trim prefix=\"values (\" suffix=\")\" suffixOverrides=\",\">")
-                .contains("SET IDENTITY_INSERT owner_customer_bank_account OFF;");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.DAMENG_IDENTITY_INSERT_RULE);
+                .contains("useGeneratedKeys=\"true\" keyProperty=\"ownerBankAccountId\"")
+                .doesNotContain("owner_bank_account_id")
+                .doesNotContain("SET IDENTITY_INSERT")
+                .doesNotContain("BEGIN");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test
-    void migrationWrapsConfiguredIdentityInsertTableWhenMysqlOmitsIntoKeyword() throws Exception {
+    void migrationDoesNotWrapStaticInsertForConfiguredIdentityInsertTable() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
                         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
                 <mapper namespace="com.example.ThirdAddHouseInfoMapper">
-                    <insert id="insertThirdHouseEntity" parameterType="list">
-                        insert zj_add_house_info
-                        <trim prefix="(" suffix=")" suffixOverrides=",">
-                            id,
-                            enterprise_id,
-                            roomName
-                        </trim>
-                        values
-                        <foreach collection="list" item="item" separator=",">
-                            (#{item.id}, #{item.enterpriseId}, #{item.roomName})
-                        </foreach>
+                    <insert id="insertThirdHouseEntity" parameterType="com.example.ThirdHouseInfo">
+                        insert zj_add_house_info (id, enterprise_id, roomName)
+                        values (#{id}, #{enterpriseId}, #{roomName})
                     </insert>
                 </mapper>
                 """;
@@ -483,12 +466,10 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ThirdAddHouseInfoMapper.xml"));
         assertThat(rewritten)
-                .contains("SET IDENTITY_INSERT zj_add_house_info ON;")
-                .contains("insert zj_add_house_info")
-                .contains("SET IDENTITY_INSERT zj_add_house_info OFF;");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.DAMENG_IDENTITY_INSERT_RULE);
+                .contains("insert zj_add_house_info (id, enterprise_id, roomName)")
+                .doesNotContain("SET IDENTITY_INSERT")
+                .doesNotContain("BEGIN");
+        assertThat(result.automaticConversions()).isEmpty();
     }
 
     @Test

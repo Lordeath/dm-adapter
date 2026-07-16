@@ -32,19 +32,12 @@ class SqlRewriteConfigUpdater {
             boolean metadataAvailable
     ) {
         List<String> warnings = new ArrayList<>();
-        List<String> learnedIdentityInsertTables = identityInsertTablesFromPreviousValidationReport(context, warnings);
         List<String> learnedTypeMismatchMethods = typeMismatchMethodsFromPreviousValidationReport(context, warnings);
-        if (candidates.isEmpty() && learnedIdentityInsertTables.isEmpty() && learnedTypeMismatchMethods.isEmpty()) {
+        if (candidates.isEmpty() && learnedTypeMismatchMethods.isEmpty()) {
             return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), List.of());
         }
 
         RewriteConfigModel model = RewriteConfigModel.load(rewriteConfigPath);
-        for (String table : learnedIdentityInsertTables) {
-            if (model.ensureIdentityInsertTable(table)) {
-                warnings.add("Learned identityInsertTables entry " + table
-                        + " from previous Dameng SQL validation report.");
-            }
-        }
         for (String method : learnedTypeMismatchMethods) {
             if (model.ensureTypeMismatchMethod(method)) {
                 warnings.add("Learned validationIgnores.typeMismatchMethods entry " + method
@@ -192,49 +185,6 @@ class SqlRewriteConfigUpdater {
         return normalized;
     }
 
-    private List<String> identityInsertTablesFromPreviousValidationReport(
-            AdapterContext context,
-            List<String> warnings
-    ) {
-        Path report = context.reportDir().resolve("sql-validation-report.json");
-        if (!Files.isRegularFile(report)) {
-            return List.of();
-        }
-        try {
-            JsonNode records = objectMapper.readTree(report.toFile()).path("records");
-            if (!records.isArray()) {
-                return List.of();
-            }
-            Set<String> tables = new LinkedHashSet<>();
-            for (JsonNode record : records) {
-                if (!"FAILED".equalsIgnoreCase(record.path("status").asText())) {
-                    continue;
-                }
-                String text = record.path("summary").asText("")
-                        + "\n"
-                        + record.path("message").asText("");
-                if (!isIdentityInsertFailure(text)) {
-                    continue;
-                }
-                String table = InsertColumnExtractor.tableName(text);
-                if (!table.isBlank()) {
-                    tables.add(table);
-                }
-            }
-            return List.copyOf(tables);
-        } catch (IOException e) {
-            warnings.add("Could not inspect previous SQL validation report for identityInsertTables hints: "
-                    + e.getMessage());
-            return List.of();
-        }
-    }
-
-    private boolean isIdentityInsertFailure(String text) {
-        String lower = text == null ? "" : text.toLowerCase(Locale.ROOT);
-        return lower.contains("set identity_insert")
-                && (text.contains("自增列") || lower.contains("identity"));
-    }
-
     private List<String> typeMismatchMethodsFromPreviousValidationReport(
             AdapterContext context,
             List<String> warnings
@@ -352,22 +302,6 @@ class SqlRewriteConfigUpdater {
             return Set.copyOf(identityInsertTables);
         }
 
-        boolean ensureIdentityInsertTable(String table) {
-            if (table == null || table.isBlank()) {
-                return false;
-            }
-            String normalized = normalizeTableName(table);
-            boolean exists = identityInsertTables.stream()
-                    .map(this::normalizeTableName)
-                    .anyMatch(normalized::equals);
-            if (exists) {
-                return false;
-            }
-            identityInsertTables.add(table.trim());
-            rebuildIdentityInsertLines();
-            return true;
-        }
-
         boolean ensureTypeMismatchMethod(String method) {
             if (method == null || method.isBlank()) {
                 return false;
@@ -478,12 +412,6 @@ class SqlRewriteConfigUpdater {
                     }
                 }
             }
-        }
-
-        private void rebuildIdentityInsertLines() {
-            identityInsertLines.clear();
-            identityInsertLines.add("identityInsertTables:");
-            identityInsertTables.forEach(table -> identityInsertLines.add("  - " + quoteValue(table)));
         }
 
         private void addValidationIgnoreListValue(String header, String value) {

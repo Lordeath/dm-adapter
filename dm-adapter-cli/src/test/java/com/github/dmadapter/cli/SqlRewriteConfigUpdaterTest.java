@@ -220,7 +220,7 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
-    void learnsIdentityInsertTablesFromPreviousValidationReport() throws Exception {
+    void doesNotLearnIdentityInsertTablesFromPreviousValidationReport() throws Exception {
         Path adapterDir = tempDir.resolve(".dm-adapter");
         Files.createDirectories(adapterDir);
         Files.writeString(adapterDir.resolve("sql-validation-report.json"), """
@@ -245,12 +245,10 @@ class SqlRewriteConfigUpdaterTest {
                 false
         );
 
-        assertThat(update.warnings())
-                .contains("Learned identityInsertTables entry ns_bill_openbill_interface_log_history from previous Dameng SQL validation report.");
-        assertThat(update.rewriteConfig().requiresIdentityInsert("ns_bill_openbill_interface_log_history")).isTrue();
-        assertThat(Files.readString(config))
-                .contains("identityInsertTables:")
-                .contains("- \"ns_bill_openbill_interface_log_history\"");
+        assertThat(update.warnings()).isEmpty();
+        assertThat(update.fileChange()).isEmpty();
+        assertThat(update.rewriteConfig().requiresIdentityInsert("ns_bill_openbill_interface_log_history")).isFalse();
+        assertThat(config).doesNotExist();
     }
 
     @Test

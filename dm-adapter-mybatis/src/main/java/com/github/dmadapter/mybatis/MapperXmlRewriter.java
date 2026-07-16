@@ -71,7 +71,6 @@ public class MapperXmlRewriter {
             "DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED";
     public static final String DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED_RULE =
             "DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED";
-    public static final String DAMENG_IDENTITY_INSERT_RULE = "DAMENG_IDENTITY_INSERT";
     private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
             "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
 
@@ -377,12 +376,6 @@ public class MapperXmlRewriter {
                                 rewriteConfig,
                                 resultMapColumnByProperty
                         );
-                dynamicBodyConversion = wrapDynamicIdentityInsertIfConfigured(
-                        tagName,
-                        statementBody.rawBody(),
-                        dynamicBodyConversion,
-                        rewriteConfig
-                );
                 manualReviewItems.add(new SqlChange(
                         reportPath,
                         statementKey,
@@ -424,11 +417,6 @@ public class MapperXmlRewriter {
                     ? conversionResult.convertedSql()
                     : commentSafeSql;
             addAppliedRules(staticRules, conversionResult.appliedRules());
-            String identityInsertTable = identityInsertTableName(tagName, originalSql, rewriteConfig);
-            if (!identityInsertTable.isBlank() && !containsIdentityInsert(convertedSql)) {
-                convertedSql = wrapIdentityInsertSql(convertedSql, identityInsertTable);
-                staticRules.add(DAMENG_IDENTITY_INSERT_RULE);
-            }
             TextRewrite duplicateBlockSemicolon = removeDuplicateDamengBlockSemicolons(convertedSql);
             if (duplicateBlockSemicolon.changed()) {
                 convertedSql = duplicateBlockSemicolon.text();
@@ -533,86 +521,6 @@ public class MapperXmlRewriter {
             return "";
         }
         return sql.substring(index, tableEnd).trim();
-    }
-
-    private String identityInsertTableName(String tagName, String sql, SqlRewriteConfig rewriteConfig) {
-        if (!"insert".equals(tagName) || rewriteConfig == null || sql == null || sql.isBlank()) {
-            return "";
-        }
-        String tableName = extractInsertTableNameLenient(sql);
-        if (tableName.isBlank()
-                || !rewriteConfig.requiresIdentityInsert(tableName)
-                || !hasExplicitInsertColumnList(sql, tableName)) {
-            return "";
-        }
-        return tableName;
-    }
-
-    private boolean hasExplicitInsertColumnList(String sql, String tableName) {
-        Matcher matcher = Pattern.compile(
-                "(?is)\\binsert\\s+(?:ignore\\s+)?(?:into\\s+)?"
-                        + Pattern.quote(tableName)
-        ).matcher(sql);
-        if (!matcher.find()) {
-            return false;
-        }
-        int index = skipWhitespaceAndXmlComments(sql, matcher.end(), sql.length());
-        if (index >= sql.length() || isKeywordAt(sql, index, "VALUES")) {
-            return false;
-        }
-        if (sql.charAt(index) == '(') {
-            return true;
-        }
-        return Pattern.compile("(?is)<trim\\b(?=[^>]*\\bprefix\\s*=\\s*([\"'])\\s*\\()[^>]*>")
-                .matcher(sql)
-                .region(index, sql.length())
-                .lookingAt();
-    }
-
-    private DynamicBodyConversion wrapDynamicIdentityInsertIfConfigured(
-            String tagName,
-            String originalSql,
-            DynamicBodyConversion conversion,
-            SqlRewriteConfig rewriteConfig
-    ) {
-        String tableName = identityInsertTableName(tagName, originalSql, rewriteConfig);
-        if (tableName.isBlank() || containsIdentityInsert(conversion.convertedBody())) {
-            return conversion;
-        }
-        List<String> appliedRules = new ArrayList<>(conversion.appliedRules());
-        appliedRules.add(DAMENG_IDENTITY_INSERT_RULE);
-        return new DynamicBodyConversion(
-                conversion.originalBody(),
-                wrapIdentityInsertSql(conversion.convertedBody(), tableName),
-                appliedRules,
-                conversion.manualReviewReasons(),
-                true
-        );
-    }
-
-    private boolean containsIdentityInsert(String sql) {
-        return sql != null && Pattern.compile("(?is)\\bSET\\s+IDENTITY_INSERT\\b").matcher(sql).find();
-    }
-
-    private String wrapIdentityInsertSql(String sql, String tableName) {
-        int leadingLength = leadingWhitespaceLength(sql);
-        int trailingStart = sql.length();
-        while (trailingStart > leadingLength && Character.isWhitespace(sql.charAt(trailingStart - 1))) {
-            trailingStart--;
-        }
-        String leading = sql.substring(0, leadingLength);
-        String core = sql.substring(leadingLength, trailingStart);
-        String trailing = sql.substring(trailingStart);
-        String indent = indentationOfLastLine(leading);
-        String semicolon = core.stripTrailing().endsWith(";") ? "\n" : ";\n";
-        return leading
-                + "BEGIN\n"
-                + indent + "SET IDENTITY_INSERT " + tableName + " ON;\n"
-                + indent + core
-                + semicolon
-                + indent + "SET IDENTITY_INSERT " + tableName + " OFF;\n"
-                + indent + "END;"
-                + trailing;
     }
 
     private String readXml(Path path) {

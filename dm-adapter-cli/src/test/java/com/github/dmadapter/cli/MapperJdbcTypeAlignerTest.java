@@ -163,7 +163,7 @@ class MapperJdbcTypeAlignerTest {
     }
 
     @Test
-    void addsMissingJdbcTypeForBatchInsertFromDamengColumnMetadata() throws Exception {
+    void doesNotAddMissingJdbcTypeForBatchInsertFromDamengColumnMetadata() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/NsContractRoomMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <mapper namespace="com.example.NsContractRoomMapper">
@@ -189,14 +189,15 @@ class MapperJdbcTypeAlignerTest {
         );
 
         String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/NsContractRoomMapper.xml"));
-        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.fileChanges()).isEmpty();
         assertThat(rewritten)
-                .contains("#{item.contractId,jdbcType=BIGINT}")
-                .contains("#{item.temporaryBillingArea,jdbcType=DECIMAL}");
+                .contains("#{item.contractId}")
+                .contains("#{item.temporaryBillingArea}")
+                .doesNotContain("jdbcType=");
     }
 
     @Test
-    void replacesDanglingCommaWhenAddingMissingJdbcType() throws Exception {
+    void keepsOtherPlaceholderAttributesWithoutAddingMissingJdbcType() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/NsSystemUserMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <mapper namespace="com.example.NsSystemUserMapper">
@@ -204,7 +205,7 @@ class MapperJdbcTypeAlignerTest {
                         insert into ns_system_user (create_user_name)
                         values
                         <foreach collection="list" item="item" separator=",">
-                            (#{item.createUserName,})
+                            (#{item.createUserName,javaType=String})
                         </foreach>
                     </insert>
                 </mapper>
@@ -217,14 +218,14 @@ class MapperJdbcTypeAlignerTest {
         );
 
         String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/NsSystemUserMapper.xml"));
-        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.fileChanges()).isEmpty();
         assertThat(rewritten)
-                .contains("#{item.createUserName,jdbcType=VARCHAR}")
-                .doesNotContain(",,jdbcType");
+                .contains("#{item.createUserName,javaType=String}")
+                .doesNotContain("jdbcType=");
     }
 
     @Test
-    void alignsSelectComparisonJdbcTypesWithoutForcingJavaType() throws Exception {
+    void doesNotAddMissingJdbcTypesToSelectComparisons() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/BpmMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <mapper namespace="com.example.BpmMapper">
@@ -249,11 +250,43 @@ class MapperJdbcTypeAlignerTest {
         );
 
         String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/BpmMapper.xml"));
-        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.fileChanges()).isEmpty();
         assertThat(rewritten)
-                .contains("cp.auditor_ = #{userId,jdbcType=VARCHAR}")
-                .contains("task_id_ = #{taskId,jdbcType=VARCHAR}")
+                .contains("cp.auditor_ = #{userId}")
+                .contains("task_id_ = #{taskId}")
+                .doesNotContain("jdbcType=")
                 .doesNotContain("javaType=String");
+    }
+
+    @Test
+    void doesNotAddMissingJdbcTypesToDynamicUpdate() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/NsBankFlowMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NsBankFlowMapper">
+                    <update id="updateById" parameterType="com.example.BankFlow">
+                        update ns_bill_bank_flow
+                        <set>
+                            <if test="precinctName != null">
+                                precinct_name = #{precinctName},
+                            </if>
+                        </set>
+                        where id = #{id}
+                    </update>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("ns_bill_bank_flow", Map.of("precinct_name", "VARCHAR", "id", "BIGINT"))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/NsBankFlowMapper.xml"));
+        assertThat(result.fileChanges()).isEmpty();
+        assertThat(rewritten)
+                .contains("precinct_name = #{precinctName},")
+                .contains("where id = #{id}")
+                .doesNotContain("jdbcType=");
     }
 
     @Test
@@ -481,8 +514,8 @@ class MapperJdbcTypeAlignerTest {
         assertThat(result.warnings()).isEmpty();
         assertThat(rewritten)
                 .contains("#{item.enterpriseId,jdbcType=BIGINT}")
-                .contains("CAST(#{item.precinctIdModified,jdbcType=VARCHAR} AS TINYINT)")
-                .doesNotContain("#{item.precinctIdModified}");
+                .contains("CAST(#{item.precinctIdModified} AS TINYINT)")
+                .doesNotContain("#{item.precinctIdModified,jdbcType=");
     }
 
     @Test
@@ -546,10 +579,10 @@ class MapperJdbcTypeAlignerTest {
         assertThat(result.warnings()).isEmpty();
         assertThat(rewritten)
                 .contains("#{item.enterpriseId,jdbcType=BIGINT}")
-                .contains("CAST(#{item.vacantStage,jdbcType=VARCHAR} AS TINYINT)")
+                .contains("CAST(#{item.vacantStage} AS TINYINT)")
                 .contains("SYSDATE")
                 .contains("REPLACE(UUID(),'-','')")
-                .doesNotContain("#{item.vacantStage},");
+                .doesNotContain("#{item.vacantStage,jdbcType=");
     }
 
     @Test
