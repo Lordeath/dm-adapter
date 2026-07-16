@@ -51,11 +51,20 @@ DM_SQL_VALIDATION=true \
 DM_JDBC_URL=jdbc:dm://host:5236 \
 DM_DB_USERNAME=user \
 DM_DB_PASSWORD=password \
+DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS=7200 \
 DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
 mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest test
 ```
 
-测试直接用应用工作目录中 `sql-validation.yml` 的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。CLI 自动传递工作目录；手工 Maven 运行时需通过 `-Ddm.adapter.dir=...` 或 `DM_ADAPTER_DIR` 指定，并可通过 `dm.adapter.projectRoot` 指定业务项目根目录。配置 `--schema` 后，测试会在每次 DAO 调用前执行 `set schema "<schema>"`。执行结果写入同一工作目录的 `sql-validation-report.md` 和 `sql-validation-report.json`。
+测试直接用应用工作目录中 `sql-validation.yml` 的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。CLI 自动传递工作目录；手工 Maven 运行时需通过 `-Ddm.adapter.dir=...` 或 `DM_ADAPTER_DIR` 指定，并可通过 `dm.adapter.projectRoot` 指定业务项目根目录。配置 `--schema` 后，测试会先对全部 schema 做项目级前置检查；任一 schema 无效时只报告一次根因，不执行 Mapper SQL。前置检查通过后，仍会在每次 DAO 调用前执行 `set schema "<schema>"`。执行结果写入同一工作目录的 `sql-validation-report.md` 和 `sql-validation-report.json`。
+
+> **数据库写入警告：** `DM_SQL_VALIDATION=true` 是数据库验证的唯一开关。使用 `migrate --sql-root ... --sql-root-out ...` 时，工具会按文件顺序完整执行转换后的 SQL 脚本，连接保持自动提交，不自动回滚、不缓存，也不会跳过已执行文件。这会真实修改共享测试库；业务脚本必须自行保证幂等，并且只能连接可接受变更的测试环境。
+
+数据库验证的总时限由 `DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS` 控制，默认 `7200` 秒（2 小时），SQL 脚本验证和 Mapper 验证共享同一时限。Mapper 验证每累计 50 条记录会原子更新报告；超时或进程中断后可读取已完成部分。新一轮运行开始前，上一轮报告会保留为 `sql-validation-report.previous.md/json`。
+
+每次 `migrate` 还会在应用工作目录生成 `dm-adapter-summary.md` 和 `dm-adapter-summary.json`，汇总迁移、SQL 脚本验证、Mapper 验证三阶段状态、根因/级联阻塞数、人工确认降噪统计和详细报告链接。`report` 命令优先读取该摘要，旧工作目录则回退到原迁移报告。
+
+CLI 退出码约定：`0` 表示请求的迁移/验证成功或未请求数据库验证，`1` 表示工具内部错误，`2` 表示项目路径无效或不是 Maven 项目，`3` 表示数据库验证存在 SQL 根因失败，`4` 表示连接、schema 前置检查、验证环境或总时限问题。
 
 同一组环境变量也会被 `migrate` 用于只读读取达梦元数据：优先使用 CLI `--schema` / 应用工作目录 `sql-validation.yml` 中的 `schema`，其次使用 JDBC URL 的 `schema` 参数、连接默认 schema 或用户名。自动推断只写入表名、方法名和 `keyColumns`，不会把连接串、用户名或密码写入仓库文件。
 

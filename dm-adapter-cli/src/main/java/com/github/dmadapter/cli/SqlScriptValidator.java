@@ -7,13 +7,23 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 class SqlScriptValidator implements SqlScriptMigrator.Validator {
     private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 180;
@@ -23,6 +33,10 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     private static final String STATEMENT_TIMEOUT_PROPERTY = "dm.adapter.sqlScriptStatementTimeoutSeconds";
     private static final String STATEMENT_TIMEOUT_ENV = "DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS";
     private static final String SLOW_OPERATION_LOG_PROPERTY = "dm.adapter.sqlScriptSlowOperationLogMillis";
+    private static final Pattern CREATE_ROUTINE_PATTERN = Pattern.compile(
+            "(?is)\\bCREATE(?:\\s+OR\\s+REPLACE)?\\s+(?:PROCEDURE|FUNCTION|TRIGGER|VIEW)\\s+([`\"\\w.$-]+)"
+    );
+    private static final Pattern CALL_PATTERN = Pattern.compile("(?is)\\bCALL\\s+([`\"\\w.$-]+)");
 
     private final ConnectionProvider connectionProvider;
     private final Consumer<String> progressConsumer;
@@ -76,6 +90,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                     List.of()
             );
         }
+        if (environment.deadline().expired()) {
+            return SqlScriptValidationRun.timedOut(List.of(), List.of());
+        }
 
         int timeoutSeconds = statementTimeoutSeconds();
         progress("SQL script validation initialized: files=" + files.size()
@@ -84,6 +101,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         ScheduledExecutorService diagnostics = diagnosticsExecutor();
         List<SqlScriptValidationFailure> failures = new ArrayList<>();
         List<SqlScriptFileValidation> fileValidations = new ArrayList<>();
+        Map<String, Integer> failedCreatedObjects = new LinkedHashMap<>();
         int successCount = 0;
         long connectionStartedAt = System.nanoTime();
         ScheduledFuture<?> connectionWarning = scheduleSlowOperation(
@@ -91,7 +109,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 "Opening Dameng validation connection",
                 connectionStartedAt
         );
-        try (Connection connection = connectionProvider.open(environment)) {
+        try (Connection connection = openConnection(environment)) {
             cancel(connectionWarning);
             progress("Dameng validation connection opened: elapsedMs=" + elapsedMillis(connectionStartedAt));
             try {
@@ -99,20 +117,48 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             } catch (SQLException ignored) {
                 // DDL validation can still proceed on drivers that do not allow changing auto-commit.
             }
+            SqlScriptValidationFailure schemaFailure = preflightSchemas(connection, files, environment, diagnostics);
+            if (schemaFailure != null) {
+                failures.add(schemaFailure);
+                return new SqlScriptValidationRun(
+                        true,
+                        "VALIDATION_TIMEOUT".equals(schemaFailure.category())
+                                ? "Dameng SQL script validation timed out."
+                                : "Dameng SQL script validation failed during schema preflight.",
+                        0,
+                        1,
+                        List.of(),
+                        failures,
+                        List.of("No SQL script statements were executed because schema preflight failed.")
+                );
+            }
             for (int fileIndex = 0; fileIndex < files.size(); fileIndex++) {
+                if (environment.deadline().expired()) {
+                    failures.add(timeoutFailure(files.get(fileIndex), environment));
+                    break;
+                }
                 SqlScriptMigrator.PlannedSqlScriptFile file = files.get(fileIndex);
                 SqlScriptFileValidation fileValidation = validateFile(
                         connection,
                         file,
                         environment,
                         diagnostics,
+                        failedCreatedObjects,
                         fileIndex + 1,
                         files.size()
                 );
                 fileValidations.add(fileValidation);
                 successCount += fileValidation.successCount();
                 failures.addAll(fileValidation.failures());
+                if (fileValidation.failures().stream()
+                        .anyMatch(failure -> "VALIDATION_TIMEOUT".equals(failure.category()))) {
+                    break;
+                }
             }
+        } catch (ValidationConnectionTimeoutException e) {
+            cancel(connectionWarning);
+            progress("Dameng SQL script validation connection timed out.");
+            return SqlScriptValidationRun.timedOut(fileValidations, failures);
         } catch (Exception e) {
             cancel(connectionWarning);
             progress("Dameng SQL script validation stopped: elapsedMs=" + elapsedMillis(connectionStartedAt)
@@ -127,10 +173,39 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             }
         }
 
-        String status = failures.isEmpty()
+        String status = failures.stream().anyMatch(failure -> "VALIDATION_TIMEOUT".equals(failure.category()))
+                ? "Dameng SQL script validation timed out."
+                : failures.isEmpty()
                 ? "Dameng SQL script validation passed."
                 : "Dameng SQL script validation completed with failed SQL statements.";
         return new SqlScriptValidationRun(true, status, successCount, failures.size(), fileValidations, failures, List.of());
+    }
+
+    private Connection openConnection(DmValidationEnvironment environment) throws Exception {
+        long remainingSeconds = environment.deadline().remainingSeconds();
+        if (remainingSeconds <= 0L) {
+            throw new ValidationConnectionTimeoutException();
+        }
+        ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "dm-sql-validation-connection");
+            thread.setDaemon(true);
+            return thread;
+        });
+        Future<Connection> connection = executor.submit(() -> connectionProvider.open(environment));
+        try {
+            return connection.get(remainingSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            connection.cancel(true);
+            throw new ValidationConnectionTimeoutException();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            throw new IllegalStateException(cause);
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     private SqlScriptFileValidation validateFile(
@@ -138,6 +213,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             SqlScriptMigrator.PlannedSqlScriptFile file,
             DmValidationEnvironment environment,
             ScheduledExecutorService diagnostics,
+            Map<String, Integer> failedCreatedObjects,
             int fileIndex,
             int fileCount
     ) {
@@ -152,24 +228,19 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 + ", executable=" + executableCount
                 + ", manualReview=" + file.manualReviewStatementIndexes().size());
         try {
-            applySchema(connection, file.schema(), diagnostics, file.sourceDisplay());
+            applySchema(connection, file.schema(), environment, diagnostics, file.sourceDisplay());
         } catch (Exception e) {
             failures.add(new SqlScriptValidationFailure(
                     file.sourceDisplay(),
                     file.outputDisplay(),
                     file.schema(),
                     0,
-                    classify(e),
-                    compact(redact(safeMessage(e), environment)),
+                    "INVALID_SCHEMA",
+                    compact(redact("Invalid Dameng schema " + file.schema() + ": " + safeMessage(e), environment)),
                     ""
             ));
-            progress("SQL script schema selection failed [" + fileIndex + "/" + fileCount + "]: "
-                    + file.sourceDisplay()
-                    + ", elapsedMs=" + elapsedMillis(fileStartedAt)
-                    + ", errorType=" + e.getClass().getSimpleName());
             return new SqlScriptFileValidation(file.outputDisplay(), 0, failures);
         }
-
         int attemptedCount = 0;
         for (int i = 0; i < file.statements().size(); i++) {
             String sql = file.statements().get(i);
@@ -180,6 +251,10 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             if (file.manualReviewStatementIndexes().contains(statementIndex)) {
                 continue;
             }
+            if (environment.deadline().expired()) {
+                failures.add(timeoutFailure(file, environment));
+                break;
+            }
             attemptedCount++;
             long statementStartedAt = System.nanoTime();
             String statementDescription = "Slow SQL script statement still running: file="
@@ -187,26 +262,41 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                     + ", statement=" + statementIndex + "/" + file.statements().size()
                     + ", sqlType=" + sqlType(sql)
                     + ", chars=" + sql.length()
-                    + ", timeoutSeconds=" + statementTimeoutSeconds();
+                    + ", timeoutSeconds=" + effectiveStatementTimeoutSeconds(environment);
             ScheduledFuture<?> slowWarning = scheduleSlowOperation(
                     diagnostics,
                     statementDescription,
                     statementStartedAt
             );
+            String createdObject = createdObject(sql);
             try (Statement statement = connection.createStatement()) {
-                configureStatement(statement);
+                configureStatement(statement, environment);
                 statement.execute(sql);
+                if (!createdObject.isBlank()) {
+                    failedCreatedObjects.remove(createdObject);
+                }
                 successCount++;
             } catch (Exception e) {
+                String blockedObject = blockedObject(sql, failedCreatedObjects.keySet());
+                String category = blockedObject.isBlank() ? classify(e) : "BLOCKED_BY_PRIOR_FAILURE";
+                String errorSummary = compact(redact(safeMessage(e), environment));
+                if (!blockedObject.isBlank()) {
+                    errorSummary = compact("Blocked by failed statement "
+                            + failedCreatedObjects.get(blockedObject)
+                            + " for object " + blockedObject + ": " + errorSummary);
+                }
                 failures.add(new SqlScriptValidationFailure(
                         file.sourceDisplay(),
                         file.outputDisplay(),
                         file.schema(),
                         statementIndex,
-                        classify(e),
-                        compact(redact(safeMessage(e), environment)),
+                        category,
+                        errorSummary,
                         compact(sql)
                 ));
+                if (!createdObject.isBlank()) {
+                    failedCreatedObjects.putIfAbsent(createdObject, statementIndex);
+                }
                 progress("SQL script statement failed: file=" + file.sourceDisplay()
                         + ", statement=" + statementIndex + "/" + file.statements().size()
                         + ", sqlType=" + sqlType(sql)
@@ -233,9 +323,62 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         return new SqlScriptFileValidation(file.outputDisplay(), successCount, failures);
     }
 
+    private SqlScriptValidationFailure preflightSchemas(
+            Connection connection,
+            List<SqlScriptMigrator.PlannedSqlScriptFile> files,
+            DmValidationEnvironment environment,
+            ScheduledExecutorService diagnostics
+    ) {
+        Set<String> schemas = new LinkedHashSet<>();
+        for (SqlScriptMigrator.PlannedSqlScriptFile file : files) {
+            if (file.schema() != null && !file.schema().isBlank()) {
+                schemas.add(file.schema());
+            }
+        }
+        for (String schema : schemas) {
+            if (environment.deadline().expired()) {
+                return new SqlScriptValidationFailure(
+                        "(schema-preflight)", "", schema, 0, "VALIDATION_TIMEOUT",
+                        "Dameng SQL validation exceeded the configured total timeout.", ""
+                );
+            }
+            try {
+                applySchema(connection, schema, environment, diagnostics, "(schema-preflight)");
+            } catch (Exception e) {
+                return new SqlScriptValidationFailure(
+                        "(schema-preflight)",
+                        "",
+                        schema,
+                        0,
+                        "INVALID_SCHEMA",
+                        compact(redact("Invalid Dameng schema " + schema + ": " + safeMessage(e), environment)),
+                        ""
+                );
+            }
+        }
+        return null;
+    }
+
+    private SqlScriptValidationFailure timeoutFailure(
+            SqlScriptMigrator.PlannedSqlScriptFile file,
+            DmValidationEnvironment environment
+    ) {
+        return new SqlScriptValidationFailure(
+                file.sourceDisplay(),
+                file.outputDisplay(),
+                file.schema(),
+                0,
+                "VALIDATION_TIMEOUT",
+                "Dameng SQL validation exceeded the configured total timeout of "
+                        + environment.totalTimeoutSeconds() + " seconds.",
+                ""
+        );
+    }
+
     private void applySchema(
             Connection connection,
             String schema,
+            DmValidationEnvironment environment,
             ScheduledExecutorService diagnostics,
             String sourceDisplay
     ) throws SQLException {
@@ -249,19 +392,51 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 startedAt
         );
         try (Statement statement = connection.createStatement()) {
-            configureStatement(statement);
+            configureStatement(statement, environment);
             statement.execute("set schema " + quotedIdentifier(schema));
         } finally {
             cancel(slowWarning);
         }
     }
 
-    private void configureStatement(Statement statement) {
+    private void configureStatement(Statement statement, DmValidationEnvironment environment) {
         try {
-            statement.setQueryTimeout(statementTimeoutSeconds());
+            statement.setQueryTimeout(effectiveStatementTimeoutSeconds(environment));
         } catch (SQLException ignored) {
             // Statement timeouts are best-effort for driver compatibility.
         }
+    }
+
+    private int effectiveStatementTimeoutSeconds(DmValidationEnvironment environment) {
+        long remaining = environment == null ? statementTimeoutSeconds() : environment.deadline().remainingSeconds();
+        return (int) Math.max(1L, Math.min(statementTimeoutSeconds(), Math.min(Integer.MAX_VALUE, remaining)));
+    }
+
+    private String createdObject(String sql) {
+        Matcher matcher = CREATE_ROUTINE_PATTERN.matcher(sql == null ? "" : sql);
+        return matcher.find() ? normalizedObject(matcher.group(1)) : "";
+    }
+
+    private String blockedObject(String sql, Set<String> failedObjects) {
+        Matcher matcher = CALL_PATTERN.matcher(sql == null ? "" : sql);
+        if (!matcher.find()) {
+            return "";
+        }
+        String calledObject = normalizedObject(matcher.group(1));
+        if (failedObjects.contains(calledObject)) {
+            return calledObject;
+        }
+        int separator = calledObject.lastIndexOf('.');
+        String simpleName = separator < 0 ? calledObject : calledObject.substring(separator + 1);
+        return failedObjects.stream()
+                .filter(object -> object.equals(simpleName) || object.endsWith("." + simpleName))
+                .findFirst()
+                .orElse("");
+    }
+
+    private String normalizedObject(String value) {
+        return value == null ? "" : value.replace("`", "").replace("\"", "")
+                .toUpperCase(Locale.ROOT);
     }
 
     static int statementTimeoutSeconds() {
@@ -441,6 +616,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     interface ConnectionProvider {
         Connection open(DmValidationEnvironment environment) throws Exception;
     }
+
+    private static final class ValidationConnectionTimeoutException extends Exception {
+    }
 }
 
 record SqlScriptValidationRun(
@@ -460,6 +638,24 @@ record SqlScriptValidationRun(
 
     static SqlScriptValidationRun notAttempted(String status, List<String> warnings) {
         return new SqlScriptValidationRun(false, status, 0, 0, List.of(), List.of(), warnings);
+    }
+
+    static SqlScriptValidationRun timedOut(
+            List<SqlScriptFileValidation> fileValidations,
+            List<SqlScriptValidationFailure> existingFailures
+    ) {
+        List<SqlScriptValidationFailure> failures = new ArrayList<>(existingFailures == null ? List.of() : existingFailures);
+        failures.add(new SqlScriptValidationFailure(
+                "(validation)", "", "", 0, "VALIDATION_TIMEOUT",
+                "Dameng SQL validation exceeded the configured total timeout.", ""
+        ));
+        int successes = (fileValidations == null ? List.<SqlScriptFileValidation>of() : fileValidations).stream()
+                .mapToInt(SqlScriptFileValidation::successCount)
+                .sum();
+        return new SqlScriptValidationRun(
+                true, "Dameng SQL script validation timed out.", successes, failures.size(),
+                fileValidations, failures, List.of()
+        );
     }
 }
 

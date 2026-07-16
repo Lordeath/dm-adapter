@@ -114,8 +114,17 @@ public class MigrateCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        ProjectSummaryTracker summaryTracker = null;
         try {
             AdapterContext context = buildContext();
+            DmValidationEnvironment validationEnvironment = DmValidationEnvironment.fromSystem();
+            summaryTracker = new ProjectSummaryTracker(
+                    context,
+                    reportWriter,
+                    sqlScriptMigrationRequested(),
+                    validationTestGenerationRequested(),
+                    validationEnvironment
+            );
             CliLogger.info("Migration started. Project: " + context.projectRoot());
             CliLogger.info("dm-adapter workspace: " + context.reportDir());
             validateSupportedDatabases(context);
@@ -138,7 +147,11 @@ public class MigrateCommand implements Callable<Integer> {
             if (!scanResult.mavenProject()) {
                 warnings.add("Migration was not applied because the project root does not contain pom.xml.");
                 CliLogger.info("Writing migration report...");
-                writeReport(context, scanResult, fileChanges, List.of(), List.of(), warnings);
+                MigrationReportResult reportResult = writeReport(
+                        context, scanResult, fileChanges, List.of(), List.of(), warnings
+                );
+                summaryTracker.invalidProject(reportResult.report(), reportResult.reportPaths());
+                summaryTracker.finish(2);
                 return 2;
             }
 
@@ -241,7 +254,7 @@ public class MigrateCommand implements Callable<Integer> {
             fileChanges.addAll(jdbcTypeAlignmentResult.fileChanges());
             warnings.addAll(jdbcTypeAlignmentResult.warnings());
             CliLogger.info("Writing migration report...");
-            ReportPaths reportPaths = writeReport(
+            MigrationReportResult migrationReportResult = writeReport(
                     context,
                     scanResult,
                     fileChanges,
@@ -249,19 +262,36 @@ public class MigrateCommand implements Callable<Integer> {
                     combinedMigrationResult.manualReviewItems(),
                     warnings
             );
+            ReportPaths reportPaths = migrationReportResult.reportPaths();
             CliLogger.info("Migration report written: " + reportPaths.markdownPath());
+            summaryTracker.migrationCompleted(migrationReportResult.report(), reportPaths);
             if (sqlScriptMigrationRequested()) {
                 CliLogger.info("Migrating SQL scripts...");
             } else {
                 CliLogger.info("SQL script migration skipped: --sql-root not provided.");
             }
-            SqlScriptReportResult sqlScriptReportResult = migrateSqlScripts(context);
+            summaryTracker.startSqlScriptValidation(sqlScriptMigrationRequested());
+            SqlScriptReportResult sqlScriptReportResult = migrateSqlScripts(context, validationEnvironment);
             if (sqlScriptReportResult != null) {
                 CliLogger.info("SQL script migration report written: "
                         + sqlScriptReportResult.reportPaths().markdownPath());
+                summaryTracker.sqlScriptCompleted(
+                        sqlScriptReportResult.report(),
+                        sqlScriptReportResult.reportPaths()
+                );
             }
             printMigrationSummary(context, scanResult, combinedMigrationResult, fileChanges, warnings, reportPaths);
             printSqlScriptSummary(sqlScriptReportResult);
+            ValidationTestRunResult validationRunResult = null;
+            MapperValidationAssessment mapperAssessment = null;
+            boolean mapperValidationBlocked = mapperValidationBlockedByScript(sqlScriptReportResult);
+            if (mapperValidationBlocked) {
+                summaryTracker.skipMapperValidation(
+                        "SQL 脚本验证的 schema 前置检查失败或总时限已耗尽，未执行 Mapper 数据库验证。"
+                );
+            } else {
+                summaryTracker.startMapperValidation(validationTestGenerationRequested());
+            }
             if (validationTestGenerationRequested()) {
                 CliLogger.info("Generating Dameng SQL validation test...");
                 ValidationTestGenerationResult validationResult = validationTestGenerator.generate(
@@ -275,13 +305,29 @@ public class MigrateCommand implements Callable<Integer> {
                         List.of()
                 );
                 GenerateValidationTestCommand.printResult(validationResult);
-                CliLogger.info("Running Dameng SQL validation test if configured...");
-                GenerateValidationTestCommand.printValidationRunResult(
-                        validationTestRunner.runIfConfigured(validationResult, DmValidationEnvironment.fromSystem())
-                );
+                if (mapperValidationBlocked) {
+                    CliLogger.info("Mapper database validation skipped because SQL script validation preflight failed or timed out.");
+                } else {
+                    CliLogger.info("Running Dameng SQL validation test if configured...");
+                    validationRunResult = validationTestRunner.runIfConfigured(validationResult, validationEnvironment);
+                    GenerateValidationTestCommand.printValidationRunResult(validationRunResult);
+                    mapperAssessment = summaryTracker.mapperCompleted(validationRunResult);
+                }
             }
-            return 0;
+            int exitCode = validationExitCode(
+                    context,
+                    validationEnvironment,
+                    sqlScriptReportResult,
+                    validationRunResult,
+                    mapperAssessment
+            );
+            summaryTracker.finish(exitCode);
+            CliLogger.info("Project summary: " + context.reportDir().resolve(ReportWriter.SUMMARY_MARKDOWN));
+            return exitCode;
         } catch (Exception e) {
+            if (summaryTracker != null) {
+                summaryTracker.fail(e);
+            }
             CliLogger.error("Migration failed: " + e.getMessage());
             return 1;
         }
@@ -602,7 +648,7 @@ public class MigrateCommand implements Callable<Integer> {
         return message.replace(value, "******");
     }
 
-    private ReportPaths writeReport(
+    private MigrationReportResult writeReport(
             AdapterContext context,
             ProjectScanResult scanResult,
             List<FileChange> fileChanges,
@@ -621,14 +667,17 @@ public class MigrateCommand implements Callable<Integer> {
                 manualReviewItems,
                 warnings
         );
-        return reportWriter.writeMigrationReport(report, context.reportDir());
+        return new MigrationReportResult(report, reportWriter.writeMigrationReport(report, context.reportDir()));
     }
 
     private boolean sqlScriptMigrationRequested() {
         return sqlRoot != null;
     }
 
-    private SqlScriptReportResult migrateSqlScripts(AdapterContext context) throws Exception {
+    private SqlScriptReportResult migrateSqlScripts(
+            AdapterContext context,
+            DmValidationEnvironment validationEnvironment
+    ) throws Exception {
         if (!sqlScriptMigrationRequested()) {
             return null;
         }
@@ -639,7 +688,7 @@ public class MigrateCommand implements Callable<Integer> {
                 context.dryRun(),
                 configuredSchema(context).orElse(""),
                 systemSchema,
-                DmValidationEnvironment.fromSystem()
+                validationEnvironment
         ));
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
         return new SqlScriptReportResult(report, reportPaths);
@@ -684,6 +733,60 @@ public class MigrateCommand implements Callable<Integer> {
         }
     }
 
+    private int validationExitCode(
+            AdapterContext context,
+            DmValidationEnvironment environment,
+            SqlScriptReportResult sqlScriptResult,
+            ValidationTestRunResult mapperResult,
+            MapperValidationAssessment mapperAssessment
+    ) {
+        boolean scriptValidationRequested = sqlScriptMigrationRequested() && !context.dryRun()
+                && environment.validationEnabled();
+        boolean mapperValidationRequested = validationTestGenerationRequested()
+                && environment.validationEnabled();
+        if ((scriptValidationRequested || mapperValidationRequested) && !environment.ready()) {
+            return 4;
+        }
+        if (sqlScriptResult != null && scriptValidationRequested) {
+            SqlScriptMigrationReport report = sqlScriptResult.report();
+            boolean timeoutOrPreflight = report.validationFailures().stream().anyMatch(failure ->
+                    "VALIDATION_TIMEOUT".equals(failure.category())
+                            || "INVALID_SCHEMA".equals(failure.category()));
+            boolean connectionFailure = !report.validationAttempted()
+                    && report.validationStatus().toLowerCase(java.util.Locale.ROOT).contains("connection failed");
+            if (timeoutOrPreflight || connectionFailure) {
+                return 4;
+            }
+            boolean rootFailure = report.validationFailures().stream().anyMatch(failure ->
+                    !"BLOCKED_BY_PRIOR_FAILURE".equals(failure.category()));
+            if (rootFailure) {
+                return 3;
+            }
+        }
+        if (mapperResult != null && mapperValidationRequested) {
+            if (mapperAssessment != null && mapperAssessment.internalFailure()) {
+                return 1;
+            }
+            if (mapperAssessment == null || mapperAssessment.timedOut()
+                    || mapperAssessment.infrastructureFailure()) {
+                return 4;
+            }
+            if (mapperAssessment.validationFailure() || mapperResult.exitCode() != 0) {
+                return 3;
+            }
+        }
+        return 0;
+    }
+
+    private boolean mapperValidationBlockedByScript(SqlScriptReportResult result) {
+        if (result == null) {
+            return false;
+        }
+        return result.report().validationFailures().stream().anyMatch(failure ->
+                "INVALID_SCHEMA".equals(failure.category())
+                        || "VALIDATION_TIMEOUT".equals(failure.category()));
+    }
+
     private record MetadataLookupResult(
             Map<String, TableKeyMetadata> metadataByTable,
             boolean available,
@@ -696,5 +799,8 @@ public class MigrateCommand implements Callable<Integer> {
     }
 
     private record SqlScriptReportResult(SqlScriptMigrationReport report, ReportPaths reportPaths) {
+    }
+
+    private record MigrationReportResult(MigrationReport report, ReportPaths reportPaths) {
     }
 }

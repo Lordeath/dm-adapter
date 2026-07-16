@@ -1,7 +1,9 @@
 package com.github.dmadapter.cli;
 
 import com.github.dmadapter.core.MigrationReport;
+import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.report.ReportReader;
+import com.github.dmadapter.report.ReportWriter;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
@@ -27,6 +29,24 @@ public class ReportCommand implements Callable<Integer> {
         try {
             Path actualReportDir = workspaceResolver.resolve(project, appModule, reportDir);
             CliLogger.info("dm-adapter workspace: " + actualReportDir);
+            if (Files.exists(actualReportDir.resolve(ReportWriter.SUMMARY_JSON))) {
+                DmAdapterSummary summary = new ReportReader().readSummary(actualReportDir);
+                CliLogger.info("Project: " + summary.projectRoot());
+                CliLogger.info("Overall status: " + summary.overallStatus());
+                CliLogger.info("Dry run: " + summary.dryRun());
+                CliLogger.info("Database execution mode: " + summary.executionMode());
+                summary.stages().forEach((key, stage) -> CliLogger.info(
+                        "Stage " + key + ": " + stage.status()
+                                + (stage.message().isBlank() ? "" : " - " + stage.message())
+                ));
+                CliLogger.info("Top issues: " + summary.topIssues().size());
+                summary.topIssues().stream().limit(10).forEach(issue -> CliLogger.info(
+                        "- " + issue.severity() + " " + issue.category() + "/" + issue.pattern()
+                                + ": root=" + issue.rootCount() + ", blocked=" + issue.blockedCount()
+                ));
+                CliLogger.info("Summary: " + actualReportDir.resolve(ReportWriter.SUMMARY_MARKDOWN));
+                return 0;
+            }
             if (!Files.exists(actualReportDir.resolve("dm-adapter-report.json"))) {
                 CliLogger.error("Migration report not found: " + actualReportDir.resolve("dm-adapter-report.json"));
                 return 2;

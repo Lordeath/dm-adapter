@@ -1,24 +1,71 @@
 package com.github.dmadapter.report;
 
+import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.MigrationReport;
+import com.github.dmadapter.core.OverallStatus;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlChange;
 import com.github.dmadapter.core.SqlScriptFileResult;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
+import com.github.dmadapter.core.StageStatus;
+import com.github.dmadapter.core.SummaryIssue;
+import com.github.dmadapter.core.SummaryStage;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ReportWriterTest {
     @TempDir
     Path tempDir;
+
+    @Test
+    void writesReadableProjectSummaryAtomically() throws Exception {
+        DmAdapterSummary summary = new DmAdapterSummary(
+                1,
+                "2026-07-16T12:00:00Z",
+                tempDir.toString(),
+                false,
+                "FULL_MUTATING_SHARED_DATABASE",
+                OverallStatus.COMPLETED_WITH_ISSUES,
+                Map.of("sqlScriptValidation", new SummaryStage(
+                        "SQL 脚本数据库验证",
+                        StageStatus.FAILED,
+                        true,
+                        true,
+                        "2026-07-16T11:00:00Z",
+                        "2026-07-16T12:00:00Z",
+                        3_600_000L,
+                        Map.of("rootFailures", 1L, "blockedCalls", 3L),
+                        "存在根因失败。",
+                        "dm-adapter-sql-script-report.md"
+                )),
+                Map.of("rawItems", 5L, "uniqueStatements", 2L),
+                List.of(new SummaryIssue(
+                        "ERROR", "SQL_SCRIPT_VALIDATION", "SQL_EXECUTION", 1, 1, 0,
+                        "查看详细报告。"
+                )),
+                Map.of("sqlScriptMarkdown", "dm-adapter-sql-script-report.md"),
+                List.of("先修复根因。")
+        );
+
+        ReportPaths paths = new ReportWriter().writeSummary(summary, tempDir);
+
+        assertThat(new ReportReader().readSummary(tempDir)).isEqualTo(summary);
+        assertThat(Files.readString(paths.markdownPath()))
+                .contains("FULL_MUTATING_SHARED_DATABASE")
+                .contains("SQL_EXECUTION")
+                .contains("级联阻塞");
+        assertThat(tempDir.resolve(ReportWriter.SUMMARY_MARKDOWN + ".tmp")).doesNotExist();
+        assertThat(tempDir.resolve(ReportWriter.SUMMARY_JSON + ".tmp")).doesNotExist();
+    }
 
     @Test
     void migrationReportIncludesManualReviewReason() throws Exception {

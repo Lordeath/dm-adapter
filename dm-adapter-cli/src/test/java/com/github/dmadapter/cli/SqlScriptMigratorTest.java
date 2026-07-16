@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
@@ -3324,6 +3325,77 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void schemaPreflightStopsAllSqlStatementsAndReportsOneRootFailure() {
+        AtomicInteger businessStatementCount = new AtomicInteger();
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                if (sql.startsWith("set schema")) {
+                    throw new SQLException("无效的模式名");
+                }
+                businessStatementCount.incrementAndGet();
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "schema.sql",
+                        "missing-schema",
+                        List.of("select 1 from dual", "select 2 from dual")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.attempted()).isTrue();
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("INVALID_SCHEMA");
+            assertThat(failure.statementIndex()).isZero();
+        });
+        assertThat(businessStatementCount).hasValue(0);
+    }
+
+    @Test
+    void classifiesCallsToFailedRoutineAsBlockedFailures() {
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                if (!sql.startsWith("set schema")) {
+                    throw new SQLException("routine validation failed");
+                }
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "routine.sql",
+                        "sample-bill",
+                        List.of(
+                                "CREATE OR REPLACE PROCEDURE demo_proc AS BEGIN NULL; END;",
+                                "CALL demo_proc()"
+                        )
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures())
+                .extracting(com.github.dmadapter.core.SqlScriptValidationFailure::category)
+                .containsExactly("SQL_EXECUTION", "BLOCKED_BY_PRIOR_FAILURE");
+        assertThat(result.failures().get(1).errorSummary())
+                .contains("Blocked by failed statement 1")
+                .contains("DEMO_PROC");
+    }
+
+    @Test
     void sqlScriptValidationTimeoutCanBeOverriddenWithSystemProperty() {
         String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
         String previous = System.getProperty(property);
@@ -3524,6 +3596,36 @@ class SqlScriptMigratorTest {
 
     private SqlScriptMigrator migrator(SqlScriptMigrator.Validator validator) {
         return new SqlScriptMigrator(new MySqlToDmSqlConverter(), validator);
+    }
+
+    private SqlScriptMigrator.PlannedSqlScriptFile plannedValidationFile(
+            String file,
+            String schema,
+            List<String> statements
+    ) {
+        return new SqlScriptMigrator.PlannedSqlScriptFile(
+                file,
+                file,
+                schema,
+                false,
+                true,
+                false,
+                statements.size(),
+                0,
+                0,
+                Set.of(),
+                List.of(),
+                statements
+        );
+    }
+
+    private DmValidationEnvironment validationEnvironment() {
+        return DmValidationEnvironment.from(Map.of(
+                "DM_SQL_VALIDATION", "true",
+                "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                "DM_DB_USERNAME", "SYSDBA",
+                "DM_DB_PASSWORD", "SYSDBA"
+        ));
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {

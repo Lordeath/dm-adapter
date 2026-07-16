@@ -1,6 +1,9 @@
 package com.github.dmadapter.cli;
 
 import com.github.dmadapter.core.FileChange;
+import com.github.dmadapter.core.StageStatus;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
@@ -58,8 +61,10 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
                     workspaceWarnings
             );
             printResult(result);
-            printValidationRunResult(validationTestRunner.runIfConfigured(result, DmValidationEnvironment.fromSystem()));
-            return 0;
+            DmValidationEnvironment environment = DmValidationEnvironment.fromSystem();
+            ValidationTestRunResult runResult = validationTestRunner.runIfConfigured(result, environment);
+            printValidationRunResult(runResult);
+            return validationExitCode(runResult, environment);
         } catch (Exception e) {
             CliLogger.error("Validation test generation failed: " + e.getMessage());
             return 1;
@@ -93,6 +98,37 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
             for (String line : result.outputTail()) {
                 CliLogger.info(line);
             }
+        }
+    }
+
+    private int validationExitCode(
+            ValidationTestRunResult result,
+            DmValidationEnvironment environment
+    ) {
+        if (!environment.validationEnabled()) {
+            return 0;
+        }
+        if (!environment.ready() || result.status() == StageStatus.TIMEOUT) {
+            return 4;
+        }
+        if (result.exitCode() == 0) {
+            return 0;
+        }
+        if (result.reportPath() == null) {
+            return 1;
+        }
+        Path jsonPath = result.reportPath().resolveSibling("sql-validation-report.json");
+        try {
+            JsonNode root = new ObjectMapper().readTree(jsonPath.toFile());
+            for (JsonNode pattern : root.path("failurePatterns")) {
+                String name = pattern.path("name").asText();
+                if ("INVALID_SCHEMA".equals(name) || "DATABASE_CONNECTION".equals(name)) {
+                    return 4;
+                }
+            }
+            return root.path("summary").path("failed").asLong() > 0L ? 3 : 1;
+        } catch (Exception ignored) {
+            return 1;
         }
     }
 }
