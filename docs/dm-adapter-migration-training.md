@@ -222,6 +222,7 @@ DM_SQL_VALIDATION=true \
 DM_JDBC_URL=jdbc:dm://host:5236 \
 DM_DB_USERNAME=user \
 DM_DB_PASSWORD=password \
+DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS=7200 \
 DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
 mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest -DskipTests=false -Dmaven.test.skip=false test
 ```
@@ -230,13 +231,20 @@ mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest -DskipTest
 
 - 直接创建 MyBatis `SqlSessionFactory`。
 - 不启动 Spring Boot、Web、MQ、ShardingSphere 等业务 Bean。
-- 设置 `--schema` 后，测试会在 DAO 调用前执行 schema 切换。
+- 设置 `--schema` 后，先统一检查全部 schema；任一无效时只报告一次根因且不执行 Mapper SQL，检查通过后再在 DAO 调用前切换 schema。
 - 控制台输出 `[dm-sql-validation]` 进度日志。
+- SQL 脚本验证与 Mapper 验证共享总时限，默认 2 小时。
+
+> SQL 脚本数据库验证会按顺序完整执行转换后的文件，保持自动提交、不自动回滚、不缓存、不跳过。这是真实写入共享测试库的模式，只能连接允许变更的测试环境，脚本必须自行保证幂等。
 
 ## 报告输出
 
 - `<应用工作目录>/sql-validation-report.md`
 - `<应用工作目录>/sql-validation-report.json`
+- `<应用工作目录>/dm-adapter-summary.md`
+- `<应用工作目录>/dm-adapter-summary.json`
+
+Mapper 验证每 50 条记录原子更新一次详细报告。新一轮执行会将旧详细报告轮换为 `sql-validation-report.previous.md/json`，因此超时后仍可查看本轮已完成部分和上一轮结果。
 
 报告会按以下维度帮助归类：
 

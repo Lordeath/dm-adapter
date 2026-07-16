@@ -40,6 +40,15 @@ class DmAdapterCliTest {
         assertThat(Files.readString(tempDir.resolve("pom.xml"))).isEqualTo(pomBefore);
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"))).isFalse();
         assertThat(Files.exists(tempDir.resolve(".dm-adapter/dm-adapter-report.json"))).isTrue();
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-summary.json")))
+                .contains("\"schemaVersion\" : 1")
+                .contains("\"migration\"")
+                .contains("\"sqlScriptValidation\"")
+                .contains("\"mapperValidation\"")
+                .contains("\"overallStatus\"");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-summary.md")))
+                .contains("dm-adapter 项目摘要")
+                .contains("人工确认降噪");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
                 .contains("Automatic SQL Conversions")
                 .contains("Manual Review SQL Items");
@@ -459,6 +468,13 @@ class DmAdapterCliTest {
                 .contains("Mapper statement timeout: ")
                 .contains("Database connection attempt ")
                 .contains("sleepBeforeConnectionRetry")
+                .contains("validationSchemaFailure(sqlSessionFactory, config)")
+                .contains("Invalid Dameng schema(s)")
+                .contains("No mapper statements were executed")
+                .contains("writeReports(adapterDir, records, usageFilterReport, \"PARTIAL\")")
+                .contains("checkpointReports(adapterDir, records, usageFilterReport)")
+                .contains("StandardCopyOption.ATOMIC_MOVE")
+                .contains("runStatus")
                 .contains("[dm-sql-validation]")
                 .contains("LOG_TIMESTAMP_FORMATTER")
                 .contains("logProgress(index, total, record")

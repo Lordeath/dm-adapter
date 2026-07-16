@@ -691,6 +691,7 @@ class DmSqlValidationTestGenerator {
             import java.nio.file.Files;
             import java.nio.file.Path;
             import java.nio.file.SimpleFileVisitor;
+            import java.nio.file.StandardCopyOption;
             import java.nio.file.attribute.BasicFileAttributes;
             import java.sql.Connection;
             import java.sql.DatabaseMetaData;
@@ -807,11 +808,31 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private static void writeString(Path path, String content) throws IOException {
-                    Files.write(path, content.getBytes(StandardCharsets.UTF_8));
+                    writeString(path, content, StandardCharsets.UTF_8);
                 }
 
                 private static void writeString(Path path, String content, Charset charset) throws IOException {
-                    Files.write(path, content.getBytes(charset));
+                    Files.createDirectories(path.toAbsolutePath().normalize().getParent());
+                    Path temporary = Files.createTempFile(
+                            path.toAbsolutePath().normalize().getParent(),
+                            path.getFileName().toString() + ".",
+                            ".tmp"
+                    );
+                    try {
+                        Files.write(temporary, content.getBytes(charset));
+                        try {
+                            Files.move(
+                                    temporary,
+                                    path,
+                                    StandardCopyOption.ATOMIC_MOVE,
+                                    StandardCopyOption.REPLACE_EXISTING
+                            );
+                        } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+                            Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
+                        }
+                    } finally {
+                        Files.deleteIfExists(temporary);
+                    }
                 }
 
                 public static void main(String[] args) throws Exception {
@@ -836,6 +857,7 @@ class DmSqlValidationTestGenerator {
                     currentConfig = config;
                     List<ValidationRecord> records = new ArrayList<>();
                     UsageFilterReport usageFilterReport = UsageFilterReport.disabled();
+                    writeReports(adapterDir, records, usageFilterReport, "PARTIAL");
 
                     try {
                         log("Resolving mapper XML locations...");
@@ -852,6 +874,11 @@ class DmSqlValidationTestGenerator {
                                 records.add(connectionFailure);
                                 log("FAILED database connection: " + connectionFailure.message);
                             } else {
+                                ValidationRecord schemaFailure = validationSchemaFailure(sqlSessionFactory, config);
+                                if (schemaFailure != null) {
+                                    records.add(schemaFailure);
+                                    log("FAILED schema preflight: " + schemaFailure.message);
+                                } else {
                                 List<MapperMethod> mapperMethods = mapperMethods(sqlSessionFactory.getConfiguration(), mapperXmlFiles, config);
                                 log("Discovered mapper statements: " + mapperMethods.size());
                                 dbColumnMetadata = loadColumnMetadata(sqlSessionFactory, config, mapperMethods);
@@ -884,6 +911,7 @@ class DmSqlValidationTestGenerator {
                                         );
                                         records.add(record);
                                         logProgress(index, total, record, 0L);
+                                        checkpointReports(adapterDir, records, usageFilterReport);
                                         continue;
                                     }
                                     if (usageFilter.unused(mapperMethod, config)) {
@@ -895,18 +923,21 @@ class DmSqlValidationTestGenerator {
                                         );
                                         records.add(record);
                                         logProgress(index, total, record, 0L);
+                                        checkpointReports(adapterDir, records, usageFilterReport);
                                         continue;
                                     }
                                     ValidationRecord unsupportedReturnType = skipUnsupportedReturnType(mapperMethod);
                                     if (unsupportedReturnType != null) {
                                         records.add(unsupportedReturnType);
                                         logProgress(index, total, unsupportedReturnType, 0L);
+                                        checkpointReports(adapterDir, records, usageFilterReport);
                                         continue;
                                     }
                                     ValidationRecord signatureIssue = javaMapperSignatureIssue(mapperMethod);
                                     if (signatureIssue != null) {
                                         records.add(signatureIssue);
                                         logProgress(index, total, signatureIssue, 0L);
+                                        checkpointReports(adapterDir, records, usageFilterReport);
                                         continue;
                                     }
                                     List<ParameterResolution> parameterVariants = resolveParameterVariants(mapperMethod, config);
@@ -921,6 +952,7 @@ class DmSqlValidationTestGenerator {
                                             );
                                             records.add(record);
                                             logProgress(index, total, record, 0L);
+                                            checkpointReports(adapterDir, records, usageFilterReport);
                                             continue;
                                         }
                                         log("RUN [" + index + "/" + total + "] " + recordKey
@@ -939,7 +971,9 @@ class DmSqlValidationTestGenerator {
                                         record = skipIgnoredNotNullColumn(record, config);
                                         records.add(record);
                                         logProgress(index, total, record, System.currentTimeMillis() - startedAt);
+                                        checkpointReports(adapterDir, records, usageFilterReport);
                                     }
+                                }
                                 }
                             }
                         }
@@ -950,7 +984,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     log("Writing reports...");
-                    writeReports(adapterDir, records, usageFilterReport);
+                    writeReports(adapterDir, records, usageFilterReport, "COMPLETE");
                     log("Finished. Passed: " + count(records, "PASSED")
                             + ", Failed: " + count(records, "FAILED")
                             + ", Skipped: " + count(records, "SKIPPED"));
@@ -1050,6 +1084,34 @@ class DmSqlValidationTestGenerator {
                                     + DATABASE_CONNECTION_ATTEMPTS + " attempt(s). "
                                     + "Check DM_JDBC_URL, DM_DB_USERNAME, DM_DB_PASSWORD and database availability.\\n"
                                     + throwableSummary(lastFailure)
+                    );
+                }
+
+                private ValidationRecord validationSchemaFailure(
+                        SqlSessionFactory sqlSessionFactory,
+                        ValidationConfig config
+                ) {
+                    List<String> invalidSchemas = new ArrayList<>();
+                    for (String schema : validationSchemas(config)) {
+                        if (isBlank(schema)) {
+                            continue;
+                        }
+                        try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
+                            applySchema(sqlSession.getConnection(), schema);
+                            sqlSession.rollback(true);
+                        } catch (Throwable e) {
+                            invalidSchemas.add(schema + ": " + throwableSummary(e));
+                        }
+                    }
+                    if (invalidSchemas.isEmpty()) {
+                        log("Schema preflight passed.");
+                        return null;
+                    }
+                    return ValidationRecord.failed(
+                            "(schema-preflight)",
+                            "configuration",
+                            "Invalid Dameng schema(s): " + String.join(" | ", invalidSchemas)
+                                    + "\\nNo mapper statements were executed."
                     );
                 }
 
@@ -7363,11 +7425,22 @@ class DmSqlValidationTestGenerator {
                 private void writeReports(
                         Path adapterDir,
                         List<ValidationRecord> records,
-                        UsageFilterReport usageFilterReport
+                        UsageFilterReport usageFilterReport,
+                        String runStatus
                 ) throws IOException {
                     Files.createDirectories(adapterDir);
                     writeString(adapterDir.resolve(MARKDOWN_REPORT), markdown(records, usageFilterReport), StandardCharsets.UTF_8);
-                    writeString(adapterDir.resolve(JSON_REPORT), json(records, usageFilterReport), StandardCharsets.UTF_8);
+                    writeString(adapterDir.resolve(JSON_REPORT), json(records, usageFilterReport, runStatus), StandardCharsets.UTF_8);
+                }
+
+                private void checkpointReports(
+                        Path adapterDir,
+                        List<ValidationRecord> records,
+                        UsageFilterReport usageFilterReport
+                ) throws IOException {
+                    if (!records.isEmpty() && records.size() % 50 == 0) {
+                        writeReports(adapterDir, records, usageFilterReport, "PARTIAL");
+                    }
                 }
 
                 """,
@@ -8577,9 +8650,14 @@ class DmSqlValidationTestGenerator {
                     return label == null || isBlank(label) ? code : label + " (" + code + ")";
                 }
 
-                private String json(List<ValidationRecord> records, UsageFilterReport usageFilterReport) {
+                private String json(
+                        List<ValidationRecord> records,
+                        UsageFilterReport usageFilterReport,
+                        String runStatus
+                ) {
                     StringBuilder json = new StringBuilder();
                     json.append("{\\n");
+                    json.append("  \\"runStatus\\": \\"").append(escapeJson(runStatus)).append("\\",\\n");
                     json.append("  \\"summary\\": {")
                             .append("\\"passed\\": ").append(count(records, "PASSED")).append(", ")
                             .append("\\"failed\\": ").append(count(records, "FAILED")).append(", ")
@@ -8704,6 +8782,10 @@ class DmSqlValidationTestGenerator {
                     }
                     String message = normalizeMessage(record.message);
                     String lower = message.toLowerCase(Locale.ROOT);
+                    if (lower.contains("invalid dameng schema(s)")
+                            || lower.contains("failed to set dameng schema")) {
+                        return "INVALID_SCHEMA";
+                    }
                     if (isDatabaseConnectionFailure(message)) {
                         return "DATABASE_CONNECTION";
                     }
@@ -9247,6 +9329,8 @@ class DmSqlValidationTestGenerator {
                             "No mapped statements were found",
                             "Could not find",
                             "Failed to parse mapper XML",
+                            "Invalid Dameng schema(s)",
+                            "Failed to set Dameng schema",
                             "Failed to open Dameng validation connection",
                             "Error getting a new connection",
                             "Mapped statement was not registered",

@@ -2,6 +2,7 @@ package com.github.dmadapter.report;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dmadapter.core.FileChange;
+import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlChange;
@@ -14,6 +15,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -24,6 +26,8 @@ public class ReportWriter {
     public static final String MIGRATION_REPORT_JSON = "dm-adapter-report.json";
     public static final String SQL_SCRIPT_REPORT_MARKDOWN = "dm-adapter-sql-script-report.md";
     public static final String SQL_SCRIPT_REPORT_JSON = "dm-adapter-sql-script-report.json";
+    public static final String SUMMARY_MARKDOWN = "dm-adapter-summary.md";
+    public static final String SUMMARY_JSON = "dm-adapter-summary.json";
 
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
@@ -54,6 +58,90 @@ public class ReportWriter {
         Files.writeString(markdownPath, sqlScriptMarkdown(redactedReport), StandardCharsets.UTF_8);
         objectMapper.writerWithDefaultPrettyPrinter().writeValue(jsonPath.toFile(), redactedReport);
         return new ReportPaths(markdownPath, jsonPath);
+    }
+
+    public ReportPaths writeSummary(DmAdapterSummary summary, Path reportDir) throws IOException {
+        Files.createDirectories(reportDir);
+        Path markdownPath = reportDir.resolve(SUMMARY_MARKDOWN);
+        Path jsonPath = reportDir.resolve(SUMMARY_JSON);
+        writeStringAtomically(markdownPath, summaryMarkdown(summary));
+        writeJsonAtomically(jsonPath, summary);
+        return new ReportPaths(markdownPath, jsonPath);
+    }
+
+    private void writeStringAtomically(Path path, String content) throws IOException {
+        Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
+        Files.writeString(temporary, content, StandardCharsets.UTF_8);
+        moveAtomically(temporary, path);
+    }
+
+    private void writeJsonAtomically(Path path, Object value) throws IOException {
+        Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
+        objectMapper.writerWithDefaultPrettyPrinter().writeValue(temporary.toFile(), value);
+        moveAtomically(temporary, path);
+    }
+
+    private void moveAtomically(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private String summaryMarkdown(DmAdapterSummary summary) {
+        StringBuilder markdown = new StringBuilder();
+        markdown.append("# dm-adapter 项目摘要\n\n");
+        markdown.append("- 项目：`").append(summary.projectRoot()).append("`\n");
+        markdown.append("- 生成时间：`").append(summary.generatedAt()).append("`\n");
+        markdown.append("- 总体状态：`").append(summary.overallStatus()).append("`\n");
+        markdown.append("- dry-run：`").append(summary.dryRun()).append("`\n");
+        markdown.append("- 数据库执行模式：`").append(summary.executionMode()).append("`\n\n");
+
+        markdown.append("## 阶段状态\n\n");
+        markdown.append("| 阶段 | 状态 | 已尝试 | 耗时(ms) | 结果 | 详细报告 |\n");
+        markdown.append("| --- | --- | --- | ---: | --- | --- |\n");
+        summary.stages().values().forEach(stage -> markdown.append("| ")
+                .append(stage.name()).append(" | `").append(stage.status()).append("` | ")
+                .append(stage.attempted()).append(" | ").append(stage.durationMillis()).append(" | ")
+                .append(escapeTable(stage.message())).append(" | ")
+                .append(stage.report().isBlank()
+                        ? ""
+                        : "[" + stage.report() + "](" + stage.report() + ")")
+                .append(" |\n"));
+        markdown.append("\n");
+
+        if (!summary.manualReview().isEmpty()) {
+            markdown.append("## 人工确认降噪\n\n");
+            summary.manualReview().forEach((key, value) -> markdown.append("- ")
+                    .append(key).append("：`").append(value).append("`\n"));
+            markdown.append("\n");
+        }
+
+        markdown.append("## 主要问题\n\n");
+        if (summary.topIssues().isEmpty()) {
+            markdown.append("没有发现需要处理的根因。\n\n");
+        } else {
+            markdown.append("| 级别 | 类别 | 模式 | 总数 | 根因 | 级联阻塞 | 建议 |\n");
+            markdown.append("| --- | --- | --- | ---: | ---: | ---: | --- |\n");
+            summary.topIssues().forEach(issue -> markdown.append("| ")
+                    .append(issue.severity()).append(" | ").append(issue.category()).append(" | ")
+                    .append(issue.pattern()).append(" | ").append(issue.count()).append(" | ")
+                    .append(issue.rootCount()).append(" | ").append(issue.blockedCount()).append(" | ")
+                    .append(escapeTable(issue.action())).append(" |\n"));
+            markdown.append("\n");
+        }
+
+        if (!summary.nextActions().isEmpty()) {
+            markdown.append("## 建议动作\n\n");
+            summary.nextActions().forEach(action -> markdown.append("- ").append(action).append("\n"));
+            markdown.append("\n");
+        }
+        return markdown.toString();
+    }
+
+    private String escapeTable(String value) {
+        return value == null ? "" : value.replace("|", "\\|").replaceAll("[\\r\\n]+", " ");
     }
 
     private String scanMarkdown(ProjectScanResult scanResult) {

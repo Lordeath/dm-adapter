@@ -377,7 +377,7 @@ class ValidationTestRunnerTest {
     }
 
     @Test
-    void removesStaleValidationReportBeforeRunningMaven() throws IOException {
+    void rotatesStaleValidationReportBeforeRunningMaven() throws IOException {
         Files.createDirectories(tempDir.resolve(".dm-adapter"));
         Path staleReport = tempDir.resolve(".dm-adapter/sql-validation-report.md");
         Files.writeString(staleReport, """
@@ -405,11 +405,44 @@ class ValidationTestRunnerTest {
         );
 
         assertThat(Files.exists(staleReport)).isFalse();
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation-report.previous.md")))
+                .contains("Passed: `1`")
+                .contains("Failed: `2`");
         assertThat(result.reportPath()).isNull();
         assertThat(result.outputTail())
                 .noneSatisfy(line -> assertThat(line).contains("Validation report summary"))
                 .noneSatisfy(line -> assertThat(line).contains("验证报告摘要"))
                 .anySatisfy(line -> assertThat(line).contains("pom failure"));
+    }
+
+    @Test
+    void appliesConfiguredTotalValidationTimeoutAndPreservesTimeoutStatus() {
+        BlockingProcess process = new BlockingProcess();
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> process,
+                new RecordingShutdownHookRegistry()
+        );
+        DmValidationEnvironment environment = DmValidationEnvironment.from(Map.of(
+                "DM_SQL_VALIDATION", "true",
+                "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                "DM_DB_USERNAME", "SYSDBA",
+                "DM_DB_PASSWORD", "SYSDBA",
+                "DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS", "1"
+        ));
+
+        ValidationTestRunResult result = runner.runIfConfigured(generationResult(), environment);
+
+        assertThat(environment.totalTimeoutSeconds()).isEqualTo(1L);
+        assertThat(result.status()).isEqualTo(com.github.dmadapter.core.StageStatus.TIMEOUT);
+        assertThat(result.exitCode()).isEqualTo(4);
+        assertThat(process.destroyed).isTrue();
+    }
+
+    @Test
+    void defaultsTotalValidationTimeoutToTwoHours() {
+        assertThat(DmValidationEnvironment.from(Map.of()).totalTimeoutSeconds()).isEqualTo(7_200L);
     }
 
     @Test
@@ -680,6 +713,65 @@ class ValidationTestRunnerTest {
         public Process destroyForcibly() {
             destroyForciblyCount++;
             alive = false;
+            return this;
+        }
+
+        @Override
+        public boolean isAlive() {
+            return alive;
+        }
+
+        @Override
+        public ProcessHandle toHandle() {
+            throw new UnsupportedOperationException("test process has no handle");
+        }
+    }
+
+    private static class BlockingProcess extends Process {
+        private boolean alive = true;
+        private boolean destroyed;
+
+        @Override
+        public OutputStream getOutputStream() {
+            return OutputStream.nullOutputStream();
+        }
+
+        @Override
+        public InputStream getInputStream() {
+            return InputStream.nullInputStream();
+        }
+
+        @Override
+        public InputStream getErrorStream() {
+            return InputStream.nullInputStream();
+        }
+
+        @Override
+        public synchronized int waitFor() throws InterruptedException {
+            while (alive) {
+                wait();
+            }
+            return 143;
+        }
+
+        @Override
+        public int exitValue() {
+            if (alive) {
+                throw new IllegalThreadStateException();
+            }
+            return 143;
+        }
+
+        @Override
+        public synchronized void destroy() {
+            destroyForcibly();
+        }
+
+        @Override
+        public synchronized Process destroyForcibly() {
+            destroyed = true;
+            alive = false;
+            notifyAll();
             return this;
         }
 

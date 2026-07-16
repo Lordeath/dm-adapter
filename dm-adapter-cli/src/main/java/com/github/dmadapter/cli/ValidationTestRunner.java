@@ -18,8 +18,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 class ValidationTestRunner {
@@ -29,6 +33,8 @@ class ValidationTestRunner {
     private static final String PROJECT_ROOT_PROPERTY = "dm.adapter.projectRoot";
     private static final String CONFIG_PROPERTY = "dm.adapter.config";
     private static final String REWRITE_CONFIG_PROPERTY = "dm.adapter.rewriteConfig";
+    private static final String PREVIOUS_MARKDOWN_REPORT = "sql-validation-report.previous.md";
+    private static final String PREVIOUS_JSON_REPORT = "sql-validation-report.previous.json";
 
     private final Map<String, String> processEnvironment;
     private final String osName;
@@ -205,6 +211,15 @@ class ValidationTestRunner {
                     diagnostics,
                     message
             );
+        } catch (ValidationProcessTimeoutException e) {
+            return new ValidationTestRunResult(
+                    true,
+                    4,
+                    existingReportPath(markdownReport),
+                    runDiagnostics(executions, combinedOutput(executions), environment, generationResult.workspaceDir()),
+                    "Dameng SQL validation timed out after " + environment.totalTimeoutSeconds() + " seconds.",
+                    com.github.dmadapter.core.StageStatus.TIMEOUT
+            );
         } catch (ExecutionException | TimeoutException e) {
             String readFailure = mavenOutputReadFailure(e);
             return new ValidationTestRunResult(
@@ -246,7 +261,30 @@ class ValidationTestRunner {
             CompletableFuture<String> output = CompletableFuture.supplyAsync(
                     () -> readMavenOutput(runningProcess.getInputStream(), environment)
             );
-            int exitCode = process.waitFor();
+            long remainingSeconds = environment.deadline().remainingSeconds();
+            if (remainingSeconds <= 0L) {
+                throw new ValidationProcessTimeoutException();
+            }
+            AtomicBoolean timedOut = new AtomicBoolean(false);
+            ScheduledExecutorService timeoutExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "dm-validation-timeout");
+                thread.setDaemon(true);
+                return thread;
+            });
+            ScheduledFuture<?> timeoutTask = timeoutExecutor.schedule(() -> {
+                timedOut.set(true);
+                destroyProcessTree(runningProcess);
+            }, remainingSeconds, TimeUnit.SECONDS);
+            int exitCode;
+            try {
+                exitCode = process.waitFor();
+            } finally {
+                timeoutTask.cancel(false);
+                timeoutExecutor.shutdownNow();
+            }
+            if (timedOut.get()) {
+                throw new ValidationProcessTimeoutException();
+            }
             String processOutput = output.get(5, TimeUnit.SECONDS);
             completed = true;
             return new ProcessExecutionResult(command, workingDirectory, exitCode, processOutput);
@@ -259,10 +297,23 @@ class ValidationTestRunner {
     }
 
     private void deleteStaleValidationReports(Path workspaceDir) throws IOException {
-        Files.deleteIfExists(validationMarkdownReport(workspaceDir));
-        Files.deleteIfExists(workspaceDir.resolve("sql-validation-report.json"));
+        rotateIfExists(
+                validationMarkdownReport(workspaceDir),
+                workspaceDir.resolve(PREVIOUS_MARKDOWN_REPORT)
+        );
+        rotateIfExists(
+                workspaceDir.resolve("sql-validation-report.json"),
+                workspaceDir.resolve(PREVIOUS_JSON_REPORT)
+        );
         Files.deleteIfExists(validationClasspathFile(workspaceDir));
         Files.deleteIfExists(validationJavaArgsFile(workspaceDir));
+    }
+
+    private void rotateIfExists(Path current, Path previous) throws IOException {
+        if (!Files.isRegularFile(current)) {
+            return;
+        }
+        Files.move(current, previous, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
 
     private Path validationMarkdownReport(Path workspaceDir) {
@@ -279,6 +330,9 @@ class ValidationTestRunner {
 
     private Path existingReportPath(Path reportPath) {
         return Files.isRegularFile(reportPath) ? reportPath : null;
+    }
+
+    private static final class ValidationProcessTimeoutException extends TimeoutException {
     }
 
     List<String> mavenCommand(ValidationTestGenerationResult generationResult) {
