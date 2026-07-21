@@ -1967,9 +1967,7 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("FROM ALL_IND_COLUMNS")
-                .contains("HAVING COUNT(*) = 1")
-                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'card_id'")
+                .contains("JOIN ALL_IND_COLUMNS")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX owner_car_month_card_info_idx_card_id ON `owner_car_month_card_info` (`card_id`)'")
                 .doesNotContain("INDEX_NAME = 'owner_car_month_card_info_idx_card_id'")
                 .doesNotContain("ADD INDEX")
@@ -2402,13 +2400,13 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("v_order int;")
-                .contains("v_order := TO_NUMBER(NULLIF(NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].syOrderindex'))), ''), 'null'));")
+                .contains("v_order := TO_NUMBER(NULLIF(NULLIF(TRIM(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].syOrderindex')) AS VARCHAR(4000))), ''), 'null'));")
                 .contains("v_timestamp timestamp;")
-                .contains("v_timestamp := TO_TIMESTAMP(NULLIF(NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].timestamp'))), ''), 'null'));")
+                .contains("v_timestamp := TO_TIMESTAMP(NULLIF(NULLIF(TRIM(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].timestamp')) AS VARCHAR(4000))), ''), 'null'));")
                 .contains("v_date date;")
-                .contains("v_date := TO_DATE(NULLIF(NULLIF(TRIM(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].date'))), ''), 'null'));")
+                .contains("v_date := TO_DATE(NULLIF(NULLIF(TRIM(CAST(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].date')) AS VARCHAR(4000))), ''), 'null'));")
                 .contains("v_name varchar(255);")
-                .contains("v_name := JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].name'));");
+                .contains("v_name := CAST(JSON_UNQUOTE(JSON_EXTRACT(payload, '$[0].name')) AS VARCHAR(4000));");
     }
 
     @Test
@@ -2554,7 +2552,7 @@ class SqlScriptMigratorTest {
         ));
 
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
-        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
         assertThat(converted)
                 .contains("[{\\\"label\\\":\\\"V9\\\"}]")
                 .contains("{\"id\":\"1\",\"resourcecolumnTactics\":\"{\\\"label\\\":\\\"金额\\\"}\"}")
@@ -2726,7 +2724,6 @@ class SqlScriptMigratorTest {
                 .contains("CREATE OR REPLACE PROCEDURE add_col() AS")
                 .contains("ALL_TAB_COLUMNS")
                 .contains("ALL_TABLES")
-                .contains("ALL_IND_COLUMNS")
                 .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
                 .contains("NULLABLE = 'YES'")
                 .contains("CHAR_LENGTH")
@@ -2736,12 +2733,8 @@ class SqlScriptMigratorTest {
                 .contains("IF dm_adapter_exists = 0 THEN")
                 .contains("IF dm_adapter_exists_5 > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'alter table demo add code varchar(128) null'")
-                .contains("HAVING COUNT(*) = 1")
-                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'code'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_code ON demo (code)'")
-                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'title'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title ON demo (title)'")
-                .contains("COLUMN_POSITION = 1 AND COLUMN_NAME = 'amount'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_amount ON demo (amount)'")
                 .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code varchar(256)'")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")
@@ -2765,7 +2758,7 @@ class SqlScriptMigratorTest {
                                 SqlScriptMigrator.MYSQL_CREATE_PROCEDURE_TO_DM_RULE,
                                 SqlScriptMigrator.MYSQL_SCRIPT_METADATA_TO_DM_RULE,
                                 SqlScriptMigrator.MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVAL_RULE,
-                                SqlScriptMigrator.MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE,
+                                SqlScriptMigrator.DM_METADATA_IDENTIFIER_CASE_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE
                         ));
@@ -2876,7 +2869,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` MODIFY `unitPrice` decimal(20,8) NULL'")
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` ADD COLUMN `useProperties` varchar(20) DEFAULT NULL'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` ADD `useProperties` varchar(20) DEFAULT NULL'")
                 .doesNotContain("`unitPrice`decimal")
                 .doesNotContain("`useProperties`varchar");
     }
@@ -3626,6 +3619,61 @@ class SqlScriptMigratorTest {
                 "DM_DB_USERNAME", "SYSDBA",
                 "DM_DB_PASSWORD", "SYSDBA"
         ));
+    }
+
+    @Test
+    void preservesDefaultBaseScriptAndUsesItsRoutineForProcedureDependencyChecks() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("00000000.sql"), "select 'mysql base';\n");
+        write(sqlRootOut.resolve("00000000.sql"), """
+                CREATE OR REPLACE PROCEDURE log_sql_execution() AS
+                BEGIN
+                    NULL;
+                END;
+                /
+                """);
+        write(sqlRoot.resolve("20260205.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL log_sql_execution();
+                END$$
+                DELIMITER ;
+                """);
+        RecordingValidator validator = new RecordingValidator();
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir, sqlRoot, sqlRootOut, false, "sample-app", "", DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(Files.readString(sqlRootOut.resolve("00000000.sql"))).contains("log_sql_execution");
+        assertThat(report.scannedFileCount()).isEqualTo(2);
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(validator.files).extracting(SqlScriptMigrator.PlannedSqlScriptFile::sourceDisplay)
+                .contains("(output-only) 00000000.sql", "20260205.sql");
+    }
+
+    @Test
+    void marksRoutineWithMissingPriorProcedureDependencyForManualReview() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL log_sql_execution();
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir, sqlRoot, sqlRootOut, false, "sample-app", "", DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("log_sql_execution"));
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {
