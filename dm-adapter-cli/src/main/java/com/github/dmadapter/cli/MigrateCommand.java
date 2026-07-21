@@ -82,6 +82,12 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--sql-root-out", description = "Output directory for converted Dameng SQL scripts.")
     private Path sqlRootOut;
 
+    @Option(names = "--preserve-sql", description = "Relative SQL path to preserve in --sql-root-out instead of converting; repeat for multiple files. Top-level 00000000.sql is always preserved.")
+    private List<Path> preservedSqlPaths = new ArrayList<>();
+
+    @Option(names = "--sql-scripts-only", description = "Only migrate SQL scripts; do not scan or modify Maven, mapper, or application files.")
+    private boolean sqlScriptsOnly;
+
     @Option(names = {"--system-schema", "--system_schema"}, description = "Dameng schema for validating *_system.sql scripts.")
     private String systemSchema;
 
@@ -130,6 +136,15 @@ public class MigrateCommand implements Callable<Integer> {
             validateSupportedDatabases(context);
             validateValidationTestGeneration(context);
             validateSqlScriptMigrationOptions();
+            if (sqlScriptsOnly) {
+                if (!sqlScriptMigrationRequested()) {
+                    throw new DmAdapterException("--sql-scripts-only requires --sql-root and --sql-root-out.");
+                }
+                SqlScriptReportResult sqlScriptResult = migrateSqlScripts(context, validationEnvironment);
+                CliLogger.info("SQL script migration report written: " + sqlScriptResult.reportPaths().markdownPath());
+                printSqlScriptSummary(sqlScriptResult);
+                return sqlScriptOnlyExitCode(context, validationEnvironment, sqlScriptResult);
+            }
             List<String> workspaceWarnings = legacyWorkspaceMigrator.migrateDefaults(
                     context.projectRoot(),
                     context.reportDir(),
@@ -688,6 +703,7 @@ public class MigrateCommand implements Callable<Integer> {
                 context.dryRun(),
                 configuredSchema(context).orElse(""),
                 systemSchema,
+                preservedSqlPaths,
                 validationEnvironment
         ));
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
@@ -740,6 +756,9 @@ public class MigrateCommand implements Callable<Integer> {
             ValidationTestRunResult mapperResult,
             MapperValidationAssessment mapperAssessment
     ) {
+        if (sqlScriptResult != null && sqlScriptResult.report().manualReviewSqlCount() > 0) {
+            return 3;
+        }
         boolean scriptValidationRequested = sqlScriptMigrationRequested() && !context.dryRun()
                 && environment.validationEnabled();
         boolean mapperValidationRequested = validationTestGenerationRequested()
@@ -776,6 +795,14 @@ public class MigrateCommand implements Callable<Integer> {
             }
         }
         return 0;
+    }
+
+    private int sqlScriptOnlyExitCode(
+            AdapterContext context,
+            DmValidationEnvironment environment,
+            SqlScriptReportResult sqlScriptResult
+    ) {
+        return validationExitCode(context, environment, sqlScriptResult, null, null);
     }
 
     private boolean mapperValidationBlockedByScript(SqlScriptReportResult result) {

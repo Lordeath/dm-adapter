@@ -31,6 +31,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 class SqlScriptMigrator {
+    private static final Path DEFAULT_PRESERVED_SQL_PATH = Path.of("00000000.sql");
     private static final int PARALLEL_PROCEDURE_MIN_CHARS = 50_000;
     private static final String CONVERSION_THREADS_PROPERTY = "dm.adapter.sqlScriptConversionThreads";
     static final String MYSQL_CREATE_DEFINER_REMOVAL_RULE = "MYSQL_CREATE_DEFINER_REMOVED";
@@ -47,6 +48,9 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL";
     static final String MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE =
             "MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT";
+    static final String MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE =
+            "MYSQL_PROCEDURE_JSON_TEXT_TYPE";
+    static final String DM_METADATA_IDENTIFIER_CASE_RULE = "DM_METADATA_IDENTIFIER_CASE";
     static final String MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE =
             "MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT";
     static final String MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE =
@@ -349,16 +353,29 @@ class SqlScriptMigrator {
             throw new IllegalStateException("--sql-root-out must be different from --sql-root.");
         }
 
-        List<Path> sqlFiles = sqlFiles(sqlRoot);
+        List<String> warnings = new ArrayList<>();
+        Set<Path> preservedPaths = preservedSqlPaths(request);
+        List<Path> discoveredSqlFiles = sqlFiles(sqlRoot);
+        List<Path> sqlFiles = discoveredSqlFiles.stream()
+                .filter(file -> !preservedPaths.contains(sqlRoot.relativize(file).normalize()))
+                .toList();
+        for (Path preservedPath : preservedPaths) {
+            Path sourceFile = sqlRoot.resolve(preservedPath);
+            Path outputFile = sqlRootOut.resolve(preservedPath);
+            if (Files.isRegularFile(sourceFile) && !Files.isRegularFile(outputFile)) {
+                warnings.add("Preserved SQL source was not converted because no manual Dameng output exists: "
+                        + preservedPath);
+            }
+        }
         long totalInputBytes = 0L;
         for (Path sqlFile : sqlFiles) {
             totalInputBytes += safeFileSize(sqlFile);
         }
-        progress("Discovered SQL script files: " + sqlFiles.size()
+        progress("Discovered SQL script files: " + discoveredSqlFiles.size()
+                + ", convertedFiles=" + sqlFiles.size()
                 + ", totalBytes=" + totalInputBytes
                 + ", input=" + sqlRoot
                 + ", output=" + sqlRootOut);
-        List<String> warnings = new ArrayList<>();
         String schema = primarySchema(request.schema(), "--schema", warnings);
         String systemSchema = primarySchema(request.systemSchema(), "--system-schema", warnings);
         List<SqlScriptManualReviewItem> manualReviewItems = new ArrayList<>();
@@ -402,6 +419,7 @@ class SqlScriptMigrator {
         plannedFiles = plannedFiles.stream()
                 .sorted(Comparator.comparing(file -> plannedFileSortKey(sqlRootOut, file)))
                 .toList();
+        plannedFiles = markMissingProcedureDependencies(plannedFiles, manualReviewItems);
 
         long validationStartedAt = System.nanoTime();
         progress("Starting SQL script database validation: files=" + plannedFiles.size());
@@ -443,7 +461,7 @@ class SqlScriptMigrator {
                 sqlRoot.toString(),
                 sqlRootOut.toString(),
                 request.dryRun(),
-                sqlFiles.size(),
+                discoveredSqlFiles.size(),
                 convertedFileCount,
                 manualReviewItems.size(),
                 validationRun.attempted(),
@@ -455,10 +473,27 @@ class SqlScriptMigrator {
                 validationRun.failures(),
                 warnings
         );
-        progress("SQL script migration completed: files=" + sqlFiles.size()
+        progress("SQL script migration completed: files=" + discoveredSqlFiles.size()
                 + ", convertedFiles=" + convertedFileCount
                 + ", elapsedMs=" + elapsedMillis(migrationStartedAt));
         return report;
+    }
+
+    private Set<Path> preservedSqlPaths(SqlScriptMigrationRequest request) {
+        LinkedHashSet<Path> paths = new LinkedHashSet<>();
+        paths.add(DEFAULT_PRESERVED_SQL_PATH);
+        for (Path configuredPath : request.preservedSqlPaths()) {
+            if (configuredPath == null || configuredPath.isAbsolute()) {
+                throw new IllegalArgumentException("--preserve-sql must be a relative path inside --sql-root: "
+                        + configuredPath);
+            }
+            Path normalized = configuredPath.normalize();
+            if (normalized.startsWith("..") || normalized.toString().isBlank()) {
+                throw new IllegalArgumentException("--preserve-sql must stay inside --sql-root: " + configuredPath);
+            }
+            paths.add(normalized);
+        }
+        return Set.copyOf(paths);
     }
 
     private long safeFileSize(Path path) {
@@ -467,6 +502,71 @@ class SqlScriptMigrator {
         } catch (IOException ignored) {
             return -1L;
         }
+    }
+
+    private List<PlannedSqlScriptFile> markMissingProcedureDependencies(
+            List<PlannedSqlScriptFile> plannedFiles,
+            List<SqlScriptManualReviewItem> manualReviewItems
+    ) {
+        LinkedHashSet<String> availableProcedures = new LinkedHashSet<>();
+        List<PlannedSqlScriptFile> result = new ArrayList<>(plannedFiles.size());
+        for (PlannedSqlScriptFile file : plannedFiles) {
+            LinkedHashSet<Integer> manualIndexes = new LinkedHashSet<>(file.manualReviewStatementIndexes());
+            boolean fileAlreadyManual = !manualIndexes.isEmpty();
+            for (int index = 0; index < file.statements().size(); index++) {
+                String statement = file.statements().get(index);
+                String createdProcedure = procedureNameFromCreateProcedure(statement);
+                if (!createdProcedure.isBlank() && !fileAlreadyManual) {
+                    for (String calledProcedure : calledProceduresInRoutine(statement)) {
+                        if (calledProcedure.equalsIgnoreCase(createdProcedure)
+                                || availableProcedures.contains(calledProcedure.toLowerCase(Locale.ROOT))) {
+                            continue;
+                        }
+                        int statementIndex = index + 1;
+                        if (manualIndexes.add(statementIndex)) {
+                            manualReviewItems.add(new SqlScriptManualReviewItem(
+                                    file.sourceDisplay(),
+                                    file.outputDisplay(),
+                                    statementIndex,
+                                    "缺少已在此前脚本中创建的存储过程依赖 `" + calledProcedure
+                                            + "`；请在保留的达梦基础脚本中提供该过程后再验证。",
+                                    statement,
+                                    statement
+                            ));
+                        }
+                    }
+                    availableProcedures.add(createdProcedure.toLowerCase(Locale.ROOT));
+                }
+            }
+            result.add(new PlannedSqlScriptFile(
+                    file.sourceDisplay(),
+                    file.outputDisplay(),
+                    file.schema(),
+                    file.systemScript(),
+                    file.written(),
+                    file.converted(),
+                    file.originalStatementCount(),
+                    file.convertedStatementCount(),
+                    manualIndexes.size(),
+                    manualIndexes,
+                    file.appliedRules(),
+                    file.statements()
+            ));
+        }
+        return List.copyOf(result);
+    }
+
+    private List<String> calledProceduresInRoutine(String sql) {
+        if (procedureNameFromCreateProcedure(sql).isBlank()) {
+            return List.of();
+        }
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        Matcher matcher = Pattern.compile("(?is)\\bCALL\\s+(?<name>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\(")
+                .matcher(sql);
+        while (matcher.find()) {
+            names.add(unquoteIdentifier(lastIdentifierPart(matcher.group("name"))).toLowerCase(Locale.ROOT));
+        }
+        return List.copyOf(names);
     }
 
     private long elapsedMillis(long startedAtNanos) {
@@ -1417,6 +1517,20 @@ class SqlScriptMigrator {
                 matcher -> ""
         );
         return converted.strip();
+    }
+
+    private String normalizeDamengMetadataIdentifierComparisons(String sql) {
+        if (sql == null || sql.isBlank()
+                || !Pattern.compile("(?is)\\bALL_(?:TAB_COLUMNS|INDEXES|IND_COLUMNS)\\b").matcher(sql).find()) {
+            return sql == null ? "" : sql;
+        }
+        return replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile(
+                        "(?is)\\b(TABLE_NAME|COLUMN_NAME|INDEX_NAME|INDEX_OWNER)\\b\\s*=\\s*(" + SQL_STRING_LITERAL_TOKEN + ")"
+                ),
+                matcher -> "UPPER(" + matcher.group(1) + ") = UPPER(" + matcher.group(2) + ")"
+        );
     }
 
     private ScriptUserVariableInline inlineScriptUserVariables(
@@ -2793,6 +2907,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_SCRIPT_METADATA_TO_DM_RULE);
         }
 
+        String metadataIdentifierCaseSql = normalizeDamengMetadataIdentifierComparisons(converted);
+        if (!metadataIdentifierCaseSql.equals(converted)) {
+            converted = metadataIdentifierCaseSql;
+            rules.add(DM_METADATA_IDENTIFIER_CASE_RULE);
+        }
+
         String systemMetadataScalarIdSql = convertSystemMetadataScalarIdSubqueries(converted);
         if (!systemMetadataScalarIdSql.equals(converted)) {
             converted = systemMetadataScalarIdSql;
@@ -2827,6 +2947,9 @@ class SqlScriptMigrator {
         if (!procedureLocalSetSql.equals(converted)) {
             converted = procedureLocalSetSql;
             rules.add(MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE);
+            if (procedureLocalSetSql.contains("CAST(JSON_UNQUOTE(JSON_EXTRACT")) {
+                rules.add(MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE);
+            }
         }
 
         String procedureQuoteSql = convertMysqlQuoteCallsInProcedure(converted);
@@ -4939,21 +5062,63 @@ class SqlScriptMigrator {
             Map<String, String> variableTypes
     ) {
         String variableType = variableTypes.get(normalizedProcedureVariableName(target));
-        if (!isJsonTextExtractionExpression(expression)) {
+        String textExpression = castJsonTextExtractions(expression);
+        if (textExpression.equals(expression) && !isJsonTextExtractionExpression(expression)) {
             return expression;
         }
-        String stripped = expression.strip();
+        String stripped = textExpression.strip();
         String normalizedText = "NULLIF(NULLIF(TRIM(" + stripped + "), ''), 'null')";
         if (isNumericProcedureType(variableType)) {
-            return "TO_NUMBER(" + normalizedText + ")";
+            return "TO_NUMBER(" + (isJsonTextExtractionExpression(expression) ? normalizedText : stripped) + ")";
         }
         if (isTimestampProcedureType(variableType)) {
-            return "TO_TIMESTAMP(" + normalizedText + ")";
+            return "TO_TIMESTAMP(" + (isJsonTextExtractionExpression(expression) ? normalizedText : stripped) + ")";
         }
         if (isDateProcedureType(variableType)) {
-            return "TO_DATE(" + normalizedText + ")";
+            return "TO_DATE(" + (isJsonTextExtractionExpression(expression) ? normalizedText : stripped) + ")";
         }
-        return expression;
+        return textExpression;
+    }
+
+    private String castJsonTextExtractions(String expression) {
+        StringBuilder converted = new StringBuilder(expression.length() + 32);
+        int cursor = 0;
+        int index = 0;
+        boolean changed = false;
+        while (index < expression.length()) {
+            char current = expression.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(expression, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(expression, index);
+            } else if (startsKeyword(expression, index, "JSON_UNQUOTE")) {
+                int openParen = skipWhitespace(expression, index + "JSON_UNQUOTE".length());
+                if (openParen < expression.length() && expression.charAt(openParen) == '(') {
+                    int closeParen = findMatchingParen(expression, openParen);
+                    String body = closeParen > openParen
+                            ? expression.substring(openParen + 1, closeParen).strip()
+                            : "";
+                    if (closeParen > openParen && startsKeyword(body, 0, "JSON_EXTRACT")) {
+                        converted.append(expression, cursor, index)
+                                .append("CAST(")
+                                .append(expression, index, closeParen + 1)
+                                .append(" AS VARCHAR(4000))");
+                        cursor = closeParen + 1;
+                        index = cursor;
+                        changed = true;
+                        continue;
+                    }
+                }
+                index++;
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return expression;
+        }
+        converted.append(expression.substring(cursor));
+        return converted.toString();
     }
 
     private boolean isJsonTextExtractionExpression(String expression) {
@@ -6642,6 +6807,7 @@ class SqlScriptMigrator {
                 )
         ));
         converted = normalizeMysqlDataTypes(converted);
+        converted = normalizeMysqlDynamicDdlForDameng(converted);
         converted = convertProcedureCreateTableDdlSyntax(converted);
         converted = normalizeProcedureDynamicDdlSpacing(converted);
         converted = convertProcedureCreateViewDdlSyntax(converted);
