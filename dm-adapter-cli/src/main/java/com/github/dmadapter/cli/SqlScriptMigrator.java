@@ -51,7 +51,7 @@ class SqlScriptMigrator {
     static final String MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE =
             "MYSQL_PROCEDURE_JSON_TEXT_TYPE";
     static final String DM_METADATA_IDENTIFIER_CASE_RULE = "DM_METADATA_IDENTIFIER_CASE";
-    static final String DM_METADATA_OWNER_TARGET_SCHEMA_RULE = "DM_METADATA_OWNER_TARGET_SCHEMA";
+    static final String DM_METADATA_SCHEMA_CALL_ARGUMENT_RULE = "DM_METADATA_SCHEMA_CALL_ARGUMENT";
     static final String MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE =
             "MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT";
     static final String MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE =
@@ -904,15 +904,14 @@ class SqlScriptMigrator {
                 + ", outputStatements=" + convertedStatements.size()
                 + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
 
+        MetadataSchemaBinding metadataSchemaBinding = bindMetadataSchemaAtProcedureCalls(convertedStatements);
+        if (metadataSchemaBinding.changed()) {
+            convertedStatements = new ArrayList<>(metadataSchemaBinding.statements());
+            appliedRules.add(DM_METADATA_SCHEMA_CALL_ARGUMENT_RULE);
+        }
         String convertedContent = originalStatements.isEmpty()
                 ? originalContent
                 : SqlScriptParser.scriptContent(convertedStatements);
-        String schemaBoundContent = bindMetadataOwnerToTargetSchema(convertedContent, targetSchema);
-        if (!schemaBoundContent.equals(convertedContent)) {
-            convertedContent = schemaBoundContent;
-            appliedRules.add(DM_METADATA_OWNER_TARGET_SCHEMA_RULE);
-            convertedStatements = new ArrayList<>(SqlScriptParser.statements(convertedContent));
-        }
         convertedContent = stripLeadingBom(convertedContent);
         boolean converted = !convertedContent.equals(originalContent);
         boolean written = false;
@@ -942,19 +941,6 @@ class SqlScriptMigrator {
         return stripLeadingBom(Files.readString(sqlFile, StandardCharsets.UTF_8));
     }
 
-    private String bindMetadataOwnerToTargetSchema(String sql, String targetSchema) {
-        if (sql == null || sql.isBlank() || targetSchema == null || targetSchema.isBlank()) {
-            return sql == null ? "" : sql;
-        }
-        String owner = sqlStringLiteral(targetSchema.trim());
-        return Pattern.compile(
-                        "(?is)\\b(?:[A-Za-z_][A-Za-z0-9_$]*\\.)?OWNER\\s*=\\s*"
-                                + "SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
-                )
-                .matcher(sql)
-                .replaceAll("OWNER = " + Matcher.quoteReplacement(owner));
-    }
-
     private String stripLeadingBom(String content) {
         String stripped = content == null ? "" : content;
         while (stripped.startsWith("\uFEFF")) {
@@ -964,6 +950,97 @@ class SqlScriptMigrator {
             stripped = stripped.substring(3);
         }
         return stripped;
+    }
+
+    private MetadataSchemaBinding bindMetadataSchemaAtProcedureCalls(List<String> statements) {
+        LinkedHashSet<String> procedures = new LinkedHashSet<>();
+        for (String statement : statements) {
+            String procedureName = procedureNameFromCreateProcedure(statement);
+            if (!procedureName.isBlank() && containsCurrentSchemaContext(statement)) {
+                procedures.add(procedureName.toLowerCase(Locale.ROOT));
+            }
+        }
+        if (procedures.isEmpty()) {
+            return new MetadataSchemaBinding(statements, false);
+        }
+        List<String> converted = new ArrayList<>(statements.size());
+        boolean changed = false;
+        for (String statement : statements) {
+            String procedureName = procedureNameFromCreateProcedure(statement);
+            String rewritten = statement;
+            if (!procedureName.isBlank()
+                    && procedures.contains(procedureName.toLowerCase(Locale.ROOT))) {
+                rewritten = addMetadataSchemaProcedureParameter(rewritten);
+            } else {
+                String calledProcedure = procedureNameFromCall(statement);
+                if (!calledProcedure.isBlank()
+                        && procedures.contains(calledProcedure.toLowerCase(Locale.ROOT))) {
+                    rewritten = addMetadataSchemaCallArgument(rewritten);
+                }
+            }
+            converted.add(rewritten);
+            changed |= !rewritten.equals(statement);
+        }
+        return new MetadataSchemaBinding(List.copyOf(converted), changed);
+    }
+
+    private boolean containsCurrentSchemaContext(String sql) {
+        return Pattern.compile(
+                        "(?is)SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
+                )
+                .matcher(sql)
+                .find();
+    }
+
+    private String addMetadataSchemaProcedureParameter(String sql) {
+        String schemaBoundSql = replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile(
+                        "(?is)SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
+                ),
+                matcher -> "dm_adapter_schema"
+        );
+        Matcher header = Pattern.compile(
+                        "(?is)\\bCREATE\\s+OR\\s+REPLACE\\s+PROCEDURE\\s+" + SQL_IDENTIFIER_TOKEN + "\\s*\\("
+                )
+                .matcher(schemaBoundSql);
+        if (!header.find()) {
+            return sql;
+        }
+        int openParen = header.end() - 1;
+        int closeParen = findMatchingParen(schemaBoundSql, openParen);
+        if (closeParen <= openParen) {
+            return sql;
+        }
+        String parameters = schemaBoundSql.substring(openParen + 1, closeParen).strip();
+        String schemaParameter = "dm_adapter_schema IN VARCHAR "
+                + "DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+        if (!parameters.isBlank()) {
+            schemaParameter = parameters + ", " + schemaParameter;
+        }
+        return schemaBoundSql.substring(0, openParen + 1)
+                + schemaParameter
+                + schemaBoundSql.substring(closeParen);
+    }
+
+    private String addMetadataSchemaCallArgument(String sql) {
+        Matcher call = Pattern.compile("(?is)\\bCALL\\s+" + SQL_IDENTIFIER_TOKEN + "\\s*\\(").matcher(sql);
+        if (!call.find()) {
+            return sql;
+        }
+        int openParen = call.end() - 1;
+        int closeParen = findMatchingParen(sql, openParen);
+        if (closeParen <= openParen) {
+            return sql;
+        }
+        String arguments = sql.substring(openParen + 1, closeParen).strip();
+        String schemaArgument = "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+        String boundArguments = arguments.isBlank()
+                ? schemaArgument
+                : arguments + ", " + schemaArgument;
+        return sql.substring(0, openParen + 1)
+                + boundArguments
+                + sql.substring(closeParen);
     }
 
     private LinkedHashMap<String, String> procedureObjectNameConflictRenames(List<String> statements) {
@@ -1547,9 +1624,14 @@ class SqlScriptMigrator {
         return replaceOutsideIgnoredText(
                 sql,
                 Pattern.compile(
-                        "(?is)\\b(TABLE_NAME|COLUMN_NAME|INDEX_NAME|INDEX_OWNER)\\b\\s*=\\s*(" + SQL_STRING_LITERAL_TOKEN + ")"
+                        "(?is)\\b(?:(?<qualifier>[A-Za-z_][A-Za-z0-9_$]*)\\s*\\.\\s*)?"
+                                + "(?<column>TABLE_NAME|COLUMN_NAME|INDEX_NAME|INDEX_OWNER)\\b\\s*=\\s*"
+                                + "(?<value>" + SQL_STRING_LITERAL_TOKEN + ")"
                 ),
-                matcher -> "UPPER(" + matcher.group(1) + ") = UPPER(" + matcher.group(2) + ")"
+                matcher -> "UPPER("
+                        + (matcher.group("qualifier") == null ? "" : matcher.group("qualifier") + ".")
+                        + matcher.group("column")
+                        + ") = UPPER(" + matcher.group("value") + ")"
         );
     }
 
@@ -1603,17 +1685,34 @@ class SqlScriptMigrator {
         if (!isCreateProcedureStatement(leadingSqlPrefix.body())) {
             return List.of();
         }
+        LinkedHashSet<String> placeholders = new LinkedHashSet<>();
         LinkedHashMap<String, LinkedHashSet<String>> tableColumns =
                 temporaryProcedureTableDefinitions(leadingSqlPrefix.body());
-        if (tableColumns.isEmpty()) {
-            return List.of();
-        }
-        List<String> placeholders = new ArrayList<>(tableColumns.size());
         for (Map.Entry<String, LinkedHashSet<String>> entry : tableColumns.entrySet()) {
             placeholders.add("CREATE TABLE IF NOT EXISTS " + entry.getKey()
                     + " (" + procedureTempTableColumnDefinitions(entry.getValue()) + ")");
         }
-        return placeholders;
+        placeholders.addAll(procedureCreateTableLikeCompilePlaceholders(leadingSqlPrefix.body()));
+        return List.copyOf(placeholders);
+    }
+
+    private List<String> procedureCreateTableLikeCompilePlaceholders(String sql) {
+        LinkedHashSet<String> placeholders = new LinkedHashSet<>();
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bEXECUTE\\s+IMMEDIATE\\s+(?<ddl>'(?:''|[^'])*')"
+        ).matcher(sql);
+        Pattern createTableLike = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+"
+                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+LIKE\\s+"
+                        + "(?<source>" + SQL_IDENTIFIER_TOKEN + ")\\s*$"
+        );
+        while (matcher.find()) {
+            String ddl = decodeMysqlSingleQuotedLiteral(matcher.group("ddl"));
+            if (createTableLike.matcher(ddl).matches()) {
+                placeholders.add(ddl);
+            }
+        }
+        return List.copyOf(placeholders);
     }
 
     private LinkedHashMap<String, LinkedHashSet<String>> temporaryProcedureTableDefinitions(String sql) {
@@ -7618,11 +7717,20 @@ class SqlScriptMigrator {
         String tableName = Pattern.quote(rename.tableName());
         String oldIndexName = Pattern.quote(rename.oldIndexName());
         String newIndexName = Pattern.quote(rename.newIndexName());
-        boolean tableMatches = Pattern.compile("(?is)\\bTABLE_NAME\\s*=\\s*'" + tableName + "'")
+        boolean tableMatches = Pattern.compile(
+                        "(?is)(?:\\bTABLE_NAME\\s*=\\s*'" + tableName + "'"
+                                + "|UPPER\\s*\\(\\s*TABLE_NAME\\s*\\)\\s*=\\s*"
+                                + "UPPER\\s*\\(\\s*'" + tableName + "'\\s*\\))"
+                )
                 .matcher(check)
                 .find();
-        boolean indexMatches = Pattern.compile("(?is)\\bINDEX_NAME\\s*=\\s*'(?:"
-                        + oldIndexName + "|" + newIndexName + ")'")
+        boolean indexMatches = Pattern.compile(
+                        "(?is)(?:\\bINDEX_NAME\\s*=\\s*'(?:"
+                                + oldIndexName + "|" + newIndexName + ")'"
+                                + "|UPPER\\s*\\(\\s*INDEX_NAME\\s*\\)\\s*=\\s*"
+                                + "UPPER\\s*\\(\\s*'(?:"
+                                + oldIndexName + "|" + newIndexName + ")'\\s*\\))"
+                )
                 .matcher(check)
                 .find();
         return tableMatches && indexMatches;
@@ -7635,9 +7743,9 @@ class SqlScriptMigrator {
             columnPositionChecks.append("\n")
                     .append("               AND MAX(CASE WHEN COLUMN_POSITION = ")
                     .append(i + 1)
-                    .append(" AND COLUMN_NAME = '")
-                    .append(columnNames.get(i).replace("'", "''"))
-                    .append("' THEN 1 ELSE 0 END) = 1");
+                        .append(" AND UPPER(COLUMN_NAME) = UPPER('")
+                        .append(columnNames.get(i).replace("'", "''"))
+                        .append("') THEN 1 ELSE 0 END) = 1");
         }
         return "IF NOT EXISTS (\n"
                 + "        SELECT 1\n"
@@ -7645,7 +7753,8 @@ class SqlScriptMigrator {
                 + "            SELECT INDEX_NAME\n"
                 + "            FROM ALL_IND_COLUMNS\n"
                 + "            WHERE INDEX_OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
-                + "              AND TABLE_NAME = '" + rename.tableName().replace("'", "''") + "'\n"
+                + "              AND UPPER(TABLE_NAME) = UPPER('"
+                + rename.tableName().replace("'", "''") + "')\n"
                 + "            GROUP BY INDEX_NAME\n"
                 + "            HAVING COUNT(*) = " + columnNames.size() + columnPositionChecks + "\n"
                 + "        )\n"
@@ -8306,6 +8415,12 @@ class SqlScriptMigrator {
     private record SafeRuleConversion(String sql, boolean changed, List<String> appliedRules) {
         private SafeRuleConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+        }
+    }
+
+    private record MetadataSchemaBinding(List<String> statements, boolean changed) {
+        private MetadataSchemaBinding {
+            statements = List.copyOf(statements == null ? List.of() : statements);
         }
     }
 

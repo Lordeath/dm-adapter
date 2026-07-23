@@ -302,7 +302,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("FROM ALL_TAB_COLUMNS")
-                .contains("WHERE OWNER = 'sample-report'")
+                .contains("WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
                 .contains("AND TABLE_NAME = 'sample_canal_config_item'")
                 .contains("AND COLUMN_NAME = 'targetDatabase'")
                 .contains("EXECUTE IMMEDIATE 'alter table sample_canal_config_item ADD `targetDatabase` varchar(128) null'")
@@ -626,7 +626,7 @@ class SqlScriptMigratorTest {
 
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
-                .contains("CREATE OR REPLACE PROCEDURE modify_details() AS")
+                .contains("CREATE OR REPLACE PROCEDURE modify_details(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
                 .contains("LOWER(DATA_TYPE) IN ('char', 'varchar')")
                 .contains("CHAR_LENGTH < 1000")
                 .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` varchar(1000) DEFAULT NULL'");
@@ -822,7 +822,7 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON) AS")
+                .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON, dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
                 .contains("dm_has_menu_ver BIGINT;")
                 .contains("dm_new_form_data VARCHAR(4000);")
                 .contains("dm_roleId VARCHAR(4000);")
@@ -1967,7 +1967,9 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("JOIN ALL_IND_COLUMNS")
+                .contains("FROM ALL_IND_COLUMNS")
+                .contains("GROUP BY INDEX_NAME")
+                .contains("UPPER(COLUMN_NAME) = UPPER('card_id')")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX owner_car_month_card_info_idx_card_id ON `owner_car_month_card_info` (`card_id`)'")
                 .doesNotContain("INDEX_NAME = 'owner_car_month_card_info_idx_card_id'")
                 .doesNotContain("ADD INDEX")
@@ -2060,7 +2062,7 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE OR REPLACE PROCEDURE add_prefix_index() AS")
+                .contains("CREATE OR REPLACE PROCEDURE add_prefix_index(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
                 .contains("dm_adapter_exists INT;")
                 .contains("dm_adapter_exists_2 INT;")
                 .contains("ALL_IND_COLUMNS")
@@ -2721,10 +2723,15 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE OR REPLACE PROCEDURE add_col() AS")
                 .contains("ALL_TAB_COLUMNS")
                 .contains("ALL_TABLES")
-                .contains("OWNER = 'sample-bill'")
+                .contains("FROM ALL_IND_COLUMNS")
+                .contains("CREATE OR REPLACE PROCEDURE add_col(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
+                .contains("INDEX_OWNER = dm_adapter_schema")
+                .contains("OWNER = dm_adapter_schema")
+                .contains("CALL add_col(SYS_CONTEXT('USERENV','CURRENT_SCHEMA'))")
+                .contains("HAVING COUNT(*) = 1")
+                .contains("UPPER(COLUMN_NAME) = UPPER('code')")
                 .contains("NULLABLE = 'YES'")
                 .contains("CHAR_LENGTH")
                 .contains("DATA_SCALE")
@@ -2811,7 +2818,7 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE OR REPLACE PROCEDURE rebuild_view_and_constraints() AS")
+                .contains("CREATE OR REPLACE PROCEDURE rebuild_view_and_constraints(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
                 .contains("FROM (SELECT OWNER, OWNER AS TABLE_SCHEMA, VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS)")
                 .contains("FROM (SELECT USERNAME AS SCHEMA_NAME FROM ALL_USERS)")
                 .contains("FROM (SELECT OWNER, OWNER AS CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME")
@@ -3202,6 +3209,10 @@ class SqlScriptMigratorTest {
                 .contains("MERGE INTO ns_demo_bak_20260521 t")
                 .contains("ON (t.ID = s.ID)")
                 .doesNotContain("INSERT IGNORE");
+        assertThat(converted.indexOf("CREATE TABLE IF NOT EXISTS ns_demo_bak_20260521 LIKE ns_demo"))
+                .isLessThan(converted.indexOf("CREATE OR REPLACE PROCEDURE demo_backup_insert_ignore"));
+        assertThat(converted)
+                .contains("EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ns_demo_bak_20260521 LIKE ns_demo'");
     }
 
     @Test
