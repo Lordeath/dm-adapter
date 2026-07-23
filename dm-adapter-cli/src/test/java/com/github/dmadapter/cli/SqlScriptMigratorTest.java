@@ -11,7 +11,10 @@ import java.time.Duration;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
@@ -3129,6 +3132,55 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void infersTemporaryTableColumnsAfterMultilineDistinctWithoutAliases() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("temporary-table-distinct.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_temp_table_distinct()
+                BEGIN
+                    DROP TEMPORARY TABLE IF EXISTS tmp_module_copy_top_menu;
+                    DROP TEMPORARY TABLE IF EXISTS tmp_module_copy_all_menu;
+
+                    CREATE TEMPORARY TABLE tmp_module_copy_top_menu AS
+                    SELECT DISTINCT
+                        mm.enterprise_id,
+                        mm.menu_id
+                    FROM ns_core_module_menu mm;
+
+                    CREATE TEMPORARY TABLE tmp_module_copy_all_menu AS
+                    SELECT DISTINCT
+                        mm.enterprise_id,
+                        mm.menu_id
+                    FROM ns_core_module_menu mm;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("temporary-table-distinct.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE TABLE IF NOT EXISTS tmp_module_copy_top_menu"
+                        + " (enterprise_id BIGINT, menu_id VARCHAR(200));")
+                .contains("CREATE TABLE IF NOT EXISTS tmp_module_copy_all_menu"
+                        + " (enterprise_id BIGINT, menu_id VARCHAR(200));")
+                .contains("INSERT INTO tmp_module_copy_top_menu (enterprise_id, menu_id) SELECT DISTINCT")
+                .contains("INSERT INTO tmp_module_copy_all_menu (enterprise_id, menu_id) SELECT DISTINCT")
+                .doesNotContain("organization_id BIGINT")
+                .doesNotContain("roleid VARCHAR(200)");
+    }
+
+    @Test
     void convertsDynamicTemporaryInsertIgnoreSqlStringToMerge() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -3397,6 +3449,107 @@ class SqlScriptMigratorTest {
         assertThat(result.failures().get(1).errorSummary())
                 .contains("Blocked by failed statement 1")
                 .contains("DEMO_PROC");
+    }
+
+    @Test
+    void failsValidationWhenCreatedRoutineIsInvalidWithoutJdbcException() {
+        AtomicInteger resultSetNextCount = new AtomicInteger();
+        ResultSet resultSet = proxy(ResultSet.class, (ignored, method, args) -> switch (method.getName()) {
+            case "next" -> resultSetNextCount.getAndIncrement() == 0;
+            case "getString" -> "INVALID";
+            default -> defaultValue(method.getReturnType());
+        });
+        List<String> statusQueries = new ArrayList<>();
+        PreparedStatement preparedStatement = proxy(PreparedStatement.class, (ignored, method, args) -> {
+            if (method.getName().equals("executeQuery")) {
+                return resultSet;
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                if (sql.startsWith("CALL")) {
+                    throw new SQLException("对象处于无效状态");
+                }
+                return false;
+            }
+            if (method.getName().equals("getWarnings")) {
+                return new SQLWarning("创建的对象带有编译错误");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) -> {
+            if (method.getName().equals("createStatement")) {
+                return statement;
+            }
+            if (method.getName().equals("prepareStatement")) {
+                statusQueries.add((String) args[0]);
+                return preparedStatement;
+            }
+            return defaultValue(method.getReturnType());
+        });
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "routine-invalid.sql",
+                        "sample-system",
+                        List.of(
+                                "CREATE OR REPLACE PROCEDURE demo_proc AS BEGIN NULL; END;",
+                                "CALL demo_proc()"
+                        )
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.successCount()).isZero();
+        assertThat(result.failures())
+                .extracting(com.github.dmadapter.core.SqlScriptValidationFailure::category)
+                .containsExactly("INVALID_DATABASE_OBJECT", "BLOCKED_BY_PRIOR_FAILURE");
+        assertThat(result.failures().get(0).errorSummary())
+                .contains("PROCEDURE demo_proc is INVALID")
+                .contains("创建的对象带有编译错误");
+        assertThat(statusQueries).singleElement().satisfies(query -> assertThat(query)
+                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .doesNotContain("sample-system"));
+    }
+
+    @Test
+    void failsClosedWhenCreatedObjectStatusCannotBeQueried() {
+        PreparedStatement preparedStatement = proxy(PreparedStatement.class, (ignored, method, args) -> {
+            if (method.getName().equals("executeQuery")) {
+                throw new SQLException("无权限查询 ALL_OBJECTS");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Statement statement = proxy(Statement.class, (ignored, method, args) ->
+                defaultValue(method.getReturnType()));
+        Connection connection = proxy(Connection.class, (ignored, method, args) -> {
+            if (method.getName().equals("createStatement")) {
+                return statement;
+            }
+            if (method.getName().equals("prepareStatement")) {
+                return preparedStatement;
+            }
+            return defaultValue(method.getReturnType());
+        });
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "routine-status.sql",
+                        "sample-system",
+                        List.of("CREATE OR REPLACE FUNCTION demo_func RETURN INT AS BEGIN RETURN 1; END;")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.successCount()).isZero();
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("OBJECT_STATUS_VALIDATION_FAILED");
+            assertThat(failure.errorSummary())
+                    .contains("FUNCTION demo_func")
+                    .contains("ALL_OBJECTS");
+        });
     }
 
     @Test

@@ -457,6 +457,9 @@ final class ProjectSummaryTracker {
         if (issues.stream().anyMatch(issue -> "VALIDATION_TIMEOUT".equals(issue.pattern()))) {
             nextActions.add("检查慢 SQL 或按需增大 DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS 后重新运行。");
         }
+        if (issues.stream().anyMatch(issue -> "OBJECT_STATUS_VALIDATION_FAILED".equals(issue.pattern()))) {
+            nextActions.add("确认达梦验证账号可查询当前 schema 的 ALL_OBJECTS 后重新运行。");
+        }
         if (issues.stream().anyMatch(issue -> issue.rootCount() > 0L)) {
             nextActions.add("按主要问题中的根因优先级处理详细报告，再重新执行完整数据库验证。");
         }
@@ -480,7 +483,8 @@ final class ProjectSummaryTracker {
 
     private String severity(String pattern) {
         return switch (pattern) {
-            case "INVALID_SCHEMA", "DATABASE_CONNECTION", "VALIDATION_TIMEOUT" -> "CRITICAL";
+            case "INVALID_SCHEMA", "DATABASE_CONNECTION", "VALIDATION_TIMEOUT",
+                    "OBJECT_STATUS_VALIDATION_FAILED" -> "CRITICAL";
             case "BLOCKED_BY_PRIOR_FAILURE" -> "INFO";
             default -> "ERROR";
         };
@@ -491,6 +495,8 @@ final class ProjectSummaryTracker {
             case "INVALID_SCHEMA" -> "修正 schema 配置或创建缺失 schema；前置检查通过前不会执行 SQL。";
             case "DATABASE_CONNECTION" -> "检查达梦连接参数、账号权限和数据库可用性。";
             case "VALIDATION_TIMEOUT" -> "检查慢 SQL，必要时调整总验证时限。";
+            case "INVALID_DATABASE_OBJECT" -> "修复新建对象的编译错误，确保对象状态为 VALID。";
+            case "OBJECT_STATUS_VALIDATION_FAILED" -> "授予验证账号查询当前 schema 对象状态的权限后重新运行。";
             case "TEST_SCHEMA_OBJECT", "TEST_SCHEMA_FUNCTION" -> "先补齐测试库对象，再判断是否属于业务 SQL 问题。";
             default -> "查看详细报告中的首个失败样例并按迁移分类处理。";
         };

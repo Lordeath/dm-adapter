@@ -42,6 +42,58 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlNullSafeEqualityWithoutChangingNotSemantics() {
+        SqlConversionResult result = converter.convert("""
+                SELECT *
+                FROM ns_core_module target
+                WHERE NOT (
+                    target.module_group <=> NULLIF(TRIM(#{moduleGroup}), '')
+                    AND target.order_id <=> CASE
+                        WHEN #{mode} = 'BEFORE' THEN ref.order_id - 1
+                        ELSE IFNULL(ref.order_id, 0) + 1
+                    END
+                )
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("(CASE WHEN (target.module_group) = (NULLIF(TRIM(#{moduleGroup}), ''))"
+                        + " OR ((target.module_group) IS NULL"
+                        + " AND (NULLIF(TRIM(#{moduleGroup}), '')) IS NULL)"
+                        + " THEN 1 ELSE 0 END = 1)")
+                .contains("(CASE WHEN (target.order_id) = (CASE")
+                .contains("ELSE IFNULL(ref.order_id, 0) + 1")
+                .contains("END) IS NULL) THEN 1 ELSE 0 END = 1)")
+                .doesNotContain("<=>");
+        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_NULL_SAFE_EQUAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlNullSafeEqualityWithArithmeticRightOperand() {
+        SqlConversionResult result = converter.convert(
+                "SELECT 1 FROM dual WHERE mm.menu_order_index <=> IFNULL(target_last.menu_order_index, 0) + 1"
+        );
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("(mm.menu_order_index) = (IFNULL(target_last.menu_order_index, 0) + 1)")
+                .doesNotContain("<=>");
+    }
+
+    @Test
+    void ignoresMysqlNullSafeEqualityInsideStringsAndComments() {
+        SqlConversionResult result = converter.convert("""
+                SELECT '<=>' AS operator_text
+                FROM dual
+                -- legacy predicate: a <=> b
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
     void convertsStrToDateHourSecondIntervalToDateaddSecond() {
         SqlConversionResult result = converter.convert("""
                 select str_to_date(( date_format( a.`workDate`, '%Y-%m-%d' ) + INTERVAL '23:59:59' HOUR_SECOND ), '%Y-%m-%d %H:%i:%s' )

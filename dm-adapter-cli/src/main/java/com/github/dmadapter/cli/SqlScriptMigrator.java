@@ -2015,8 +2015,11 @@ class SqlScriptMigrator {
     }
 
     private String selectItemColumnName(String item) {
-        if (item.regionMatches(true, 0, "DISTINCT ", 0, "DISTINCT ".length())) {
-            item = item.substring("DISTINCT ".length()).stripLeading();
+        if (startsKeyword(item, 0, "DISTINCT")) {
+            int expressionStart = skipWhitespace(item, "DISTINCT".length());
+            if (expressionStart > "DISTINCT".length()) {
+                item = item.substring(expressionStart);
+            }
         }
         if (item.isBlank() || "*".equals(item) || item.endsWith(".*")) {
             return "";

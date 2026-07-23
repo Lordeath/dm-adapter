@@ -18,6 +18,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_DATE_SUB_NOW_DAY_RULE = MYSQL_DATE_SUB_INTERVAL_RULE;
     public static final String MYSQL_CURRENT_SCHEMA_FUNCTION_RULE = "MYSQL_CURRENT_SCHEMA_FUNCTION_TO_DM";
     public static final String MYSQL_REGEXP_OPERATOR_RULE = "MYSQL_REGEXP_OPERATOR_TO_REGEXP_LIKE";
+    public static final String MYSQL_NULL_SAFE_EQUAL_RULE = "MYSQL_NULL_SAFE_EQUAL_TO_DM";
     public static final String MYSQL_CAST_UNSIGNED_RULE = "MYSQL_CAST_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_CAST_SIGNED_RULE = "MYSQL_CAST_SIGNED_TO_BIGINT";
     public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
@@ -579,6 +580,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (regexpConversion.changed()) {
             converted = regexpConversion.convertedSql();
             rules.add(MYSQL_REGEXP_OPERATOR_RULE);
+        }
+
+        GenericConversion nullSafeEqualConversion = convertMysqlNullSafeEquals(converted);
+        if (nullSafeEqualConversion.changed()) {
+            converted = nullSafeEqualConversion.convertedSql();
+            rules.add(MYSQL_NULL_SAFE_EQUAL_RULE);
         }
 
         GenericConversion tableAliasAsConversion = removeAsFromTableAliases(converted);
@@ -1331,6 +1338,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private String unsupportedReason(String sql) {
+        if (containsPatternOutsideIgnoredText(sql, Pattern.compile("<=>"))) {
+            return "MySQL null-safe equality <=> could not be parsed safely for automatic Dameng rewrite.";
+        }
         if (containsPatternOutsideIgnoredText(
                 sql,
                 Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
@@ -4720,6 +4730,173 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql, lastCopiedIndex, sql.length());
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertMysqlNullSafeEquals(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int protectedEnd = -1;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsMyBatisXmlTag(sql, index)) {
+                index = skipMyBatisXmlTag(sql, index);
+            } else if (sql.startsWith("<=>", index)) {
+                Operand left = readNullSafeLeftOperand(sql, index);
+                Operand right = readNullSafeRightOperand(sql, index + 3);
+                if (left == null || right == null || left.startIndex() < protectedEnd) {
+                    index += 3;
+                    continue;
+                }
+                replacements.add(new TextReplacement(
+                        left.startIndex(),
+                        right.endIndex(),
+                        nullSafeEqualityPredicate(left.text().trim(), right.text().trim())
+                ));
+                protectedEnd = right.endIndex();
+                index = right.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(sql, replacements);
+    }
+
+    private Operand readNullSafeLeftOperand(String sql, int operatorIndex) {
+        int end = skipWhitespaceBackward(sql, operatorIndex);
+        if (end <= 0) {
+            return null;
+        }
+        int start;
+        char previous = sql.charAt(end - 1);
+        if (previous == ')') {
+            int openParen = findMatchingOpenParenBackward(sql, end - 1);
+            if (openParen < 0) {
+                return null;
+            }
+            start = readExpressionNameStartBeforeParen(sql, openParen);
+        } else if (previous == '\'') {
+            start = findSingleQuotedStringStartEndingAt(sql, end);
+        } else if (previous == '}') {
+            start = readMyBatisPlaceholderStartBackward(sql, end);
+        } else if (previous == '`') {
+            start = readBacktickIdentifierStartBackward(sql, end);
+            if (start >= 0) {
+                start = extendQualifiedIdentifierStartBackward(sql, start);
+            }
+        } else if (previous == '"') {
+            start = readDoubleQuotedIdentifierStartBackward(sql, end);
+            if (start >= 0) {
+                start = extendQualifiedIdentifierStartBackward(sql, start);
+            }
+        } else if (isArithmeticIdentifierPart(previous) || previous == '.') {
+            start = end - 1;
+            while (start > 0 && isOperandIdentifierChar(sql.charAt(start - 1))) {
+                start--;
+            }
+        } else if (Character.isDigit(previous)) {
+            start = end - 1;
+            while (start > 0 && (Character.isDigit(sql.charAt(start - 1)) || sql.charAt(start - 1) == '.')) {
+                start--;
+            }
+        } else {
+            return null;
+        }
+        if (start < 0 || start >= end) {
+            return null;
+        }
+        String text = sql.substring(start, end);
+        return text.isBlank() ? null : new Operand(start, end, text);
+    }
+
+    private Operand readNullSafeRightOperand(String sql, int afterOperatorIndex) {
+        int start = skipWhitespace(sql, afterOperatorIndex);
+        if (start >= sql.length()) {
+            return null;
+        }
+        int index = start;
+        int parenthesisDepth = 0;
+        int caseDepth = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                break;
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsMyBatisXmlTag(sql, index)) {
+                break;
+            } else if (current == '(') {
+                parenthesisDepth++;
+                index++;
+            } else if (current == ')') {
+                if (parenthesisDepth == 0 && caseDepth == 0) {
+                    break;
+                }
+                parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+                index++;
+            } else if (parenthesisDepth == 0 && startsKeyword(sql, index, "CASE")) {
+                caseDepth++;
+                index += "CASE".length();
+            } else if (parenthesisDepth == 0 && caseDepth > 0 && startsKeyword(sql, index, "END")) {
+                caseDepth--;
+                index += "END".length();
+            } else if (parenthesisDepth == 0 && caseDepth == 0
+                    && (current == ',' || current == ';'
+                    || startsKeyword(sql, index, "AND")
+                    || startsKeyword(sql, index, "OR"))) {
+                break;
+            } else {
+                index++;
+            }
+        }
+        int end = skipWhitespaceBackward(sql, index);
+        if (end <= start) {
+            return null;
+        }
+        String text = sql.substring(start, end);
+        return text.isBlank() ? null : new Operand(start, end, text);
+    }
+
+    private int readDoubleQuotedIdentifierStartBackward(String sql, int endExclusive) {
+        int index = endExclusive - 2;
+        while (index >= 0) {
+            if (sql.charAt(index) == '"') {
+                if (index > 0 && sql.charAt(index - 1) == '"') {
+                    index -= 2;
+                    continue;
+                }
+                return index;
+            }
+            index--;
+        }
+        return -1;
+    }
+
+    private String nullSafeEqualityPredicate(String left, String right) {
+        return "(CASE WHEN (" + left + ") = (" + right + ")"
+                + " OR ((" + left + ") IS NULL AND (" + right + ") IS NULL)"
+                + " THEN 1 ELSE 0 END = 1)";
     }
 
     private RegexpExpression readRegexpExpression(String sql, int regexpIndex) {

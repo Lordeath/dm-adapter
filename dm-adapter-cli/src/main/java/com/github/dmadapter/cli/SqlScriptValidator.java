@@ -4,7 +4,10 @@ import com.github.dmadapter.core.SqlScriptValidationFailure;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -34,7 +37,8 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     private static final String STATEMENT_TIMEOUT_ENV = "DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS";
     private static final String SLOW_OPERATION_LOG_PROPERTY = "dm.adapter.sqlScriptSlowOperationLogMillis";
     private static final Pattern CREATE_ROUTINE_PATTERN = Pattern.compile(
-            "(?is)\\bCREATE(?:\\s+OR\\s+REPLACE)?\\s+(?:PROCEDURE|FUNCTION|TRIGGER|VIEW)\\s+([`\"\\w.$-]+)"
+            "(?is)\\bCREATE(?:\\s+OR\\s+REPLACE)?\\s+"
+                    + "(PROCEDURE|FUNCTION|TRIGGER|VIEW)\\s+([`\"\\w.$-]+)"
     );
     private static final Pattern CALL_PATTERN = Pattern.compile("(?is)\\bCALL\\s+([`\"\\w.$-]+)");
 
@@ -281,12 +285,37 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                     statementDescription,
                     statementStartedAt
             );
-            String createdObject = createdObject(sql);
+            CreatedObject createdObject = createdObject(sql);
             try (Statement statement = connection.createStatement()) {
                 configureStatement(statement, environment);
                 statement.execute(sql);
-                if (!createdObject.isBlank()) {
-                    failedCreatedObjects.remove(createdObject);
+                if (createdObject != null) {
+                    String warningSummary = warningSummary(statement);
+                    CreatedObjectStatus objectStatus;
+                    try {
+                        objectStatus = createdObjectStatus(connection, createdObject, environment);
+                    } catch (SQLException e) {
+                        throw new ObjectStatusValidationException(
+                                "Unable to validate " + createdObject.displayName()
+                                        + " in the active schema: " + safeMessage(e),
+                                e
+                        );
+                    }
+                    if (objectStatus == null) {
+                        throw new ObjectStatusValidationException(
+                                "Created object status was not found for " + createdObject.displayName()
+                                        + " in the active schema."
+                        );
+                    }
+                    if (!"VALID".equalsIgnoreCase(objectStatus.status())) {
+                        String message = "Created object " + createdObject.displayName()
+                                + " is " + objectStatus.status() + ".";
+                        if (!warningSummary.isBlank()) {
+                            message += " JDBC warning: " + warningSummary;
+                        }
+                        throw new InvalidCreatedObjectException(message);
+                    }
+                    failedCreatedObjects.remove(createdObject.key());
                 }
                 successCount++;
             } catch (Exception e) {
@@ -307,8 +336,8 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         errorSummary,
                         compact(sql)
                 ));
-                if (!createdObject.isBlank()) {
-                    failedCreatedObjects.putIfAbsent(createdObject, statementIndex);
+                if (createdObject != null) {
+                    failedCreatedObjects.putIfAbsent(createdObject.key(), statementIndex);
                 }
                 progress("SQL script statement failed: file=" + file.sourceDisplay()
                         + ", statement=" + statementIndex + "/" + file.statements().size()
@@ -425,9 +454,59 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         return (int) Math.max(1L, Math.min(statementTimeoutSeconds(), Math.min(Integer.MAX_VALUE, remaining)));
     }
 
-    private String createdObject(String sql) {
+    private CreatedObject createdObject(String sql) {
         Matcher matcher = CREATE_ROUTINE_PATTERN.matcher(sql == null ? "" : sql);
-        return matcher.find() ? normalizedObject(matcher.group(1)) : "";
+        if (!matcher.find()) {
+            return null;
+        }
+        String type = matcher.group(1).toUpperCase(Locale.ROOT);
+        String reference = matcher.group(2).replace("`", "").replace("\"", "");
+        int separator = reference.lastIndexOf('.');
+        String owner = separator < 0 ? "" : reference.substring(0, separator);
+        String name = separator < 0 ? reference : reference.substring(separator + 1);
+        return name.isBlank() ? null : new CreatedObject(type, owner, name);
+    }
+
+    private CreatedObjectStatus createdObjectStatus(
+            Connection connection,
+            CreatedObject object,
+            DmValidationEnvironment environment
+    ) throws SQLException {
+        String ownerPredicate = object.owner().isBlank()
+                ? "OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                : "UPPER(OWNER) = UPPER(?)";
+        String sql = "SELECT STATUS FROM ALL_OBJECTS WHERE "
+                + ownerPredicate
+                + " AND UPPER(OBJECT_NAME) = UPPER(?)"
+                + " AND OBJECT_TYPE = ?";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            configureStatement(statement, environment);
+            int parameterIndex = 1;
+            if (!object.owner().isBlank()) {
+                statement.setString(parameterIndex++, object.owner());
+            }
+            statement.setString(parameterIndex++, object.name());
+            statement.setString(parameterIndex, object.type());
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return null;
+                }
+                return new CreatedObjectStatus(resultSet.getString(1));
+            }
+        }
+    }
+
+    private String warningSummary(Statement statement) throws SQLException {
+        List<String> warnings = new ArrayList<>();
+        SQLWarning warning = statement.getWarnings();
+        while (warning != null && warnings.size() < 10) {
+            String message = warning.getMessage();
+            if (message != null && !message.isBlank()) {
+                warnings.add(compact(message));
+            }
+            warning = warning.getNextWarning();
+        }
+        return String.join(" | ", warnings);
     }
 
     private String blockedObject(String sql, Set<String> failedObjects) {
@@ -575,6 +654,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     }
 
     private String classify(Exception e) {
+        if (e instanceof InvalidCreatedObjectException) {
+            return "INVALID_DATABASE_OBJECT";
+        }
+        if (e instanceof ObjectStatusValidationException) {
+            return "OBJECT_STATUS_VALIDATION_FAILED";
+        }
         String message = safeMessage(e).toLowerCase(Locale.ROOT);
         if (message.contains("无效的表") || message.contains("无效的视图")
                 || message.contains("无效的列") || message.contains("无效的模式")) {
@@ -624,6 +709,40 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             return compact;
         }
         return compact.substring(0, 237) + "...";
+    }
+
+    private record CreatedObject(String type, String owner, String name) {
+        String key() {
+            String normalizedName = name.replace("`", "").replace("\"", "").toUpperCase(Locale.ROOT);
+            if (owner == null || owner.isBlank()) {
+                return normalizedName;
+            }
+            return owner.replace("`", "").replace("\"", "").toUpperCase(Locale.ROOT)
+                    + "." + normalizedName;
+        }
+
+        String displayName() {
+            return type + " " + (owner == null || owner.isBlank() ? "" : owner + ".") + name;
+        }
+    }
+
+    private record CreatedObjectStatus(String status) {
+    }
+
+    private static final class InvalidCreatedObjectException extends SQLException {
+        private InvalidCreatedObjectException(String message) {
+            super(message);
+        }
+    }
+
+    private static final class ObjectStatusValidationException extends SQLException {
+        private ObjectStatusValidationException(String message) {
+            super(message);
+        }
+
+        private ObjectStatusValidationException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     interface ConnectionProvider {
