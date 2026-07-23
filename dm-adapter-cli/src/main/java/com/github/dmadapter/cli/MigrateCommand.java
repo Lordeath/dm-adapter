@@ -770,7 +770,8 @@ public class MigrateCommand implements Callable<Integer> {
             SqlScriptMigrationReport report = sqlScriptResult.report();
             boolean timeoutOrPreflight = report.validationFailures().stream().anyMatch(failure ->
                     "VALIDATION_TIMEOUT".equals(failure.category())
-                            || "INVALID_SCHEMA".equals(failure.category()));
+                            || "INVALID_SCHEMA".equals(failure.category())
+                            || "OBJECT_STATUS_VALIDATION_FAILED".equals(failure.category()));
             boolean connectionFailure = !report.validationAttempted()
                     && report.validationStatus().toLowerCase(java.util.Locale.ROOT).contains("connection failed");
             if (timeoutOrPreflight || connectionFailure) {
@@ -811,7 +812,8 @@ public class MigrateCommand implements Callable<Integer> {
         }
         return result.report().validationFailures().stream().anyMatch(failure ->
                 "INVALID_SCHEMA".equals(failure.category())
-                        || "VALIDATION_TIMEOUT".equals(failure.category()));
+                        || "VALIDATION_TIMEOUT".equals(failure.category())
+                        || "OBJECT_STATUS_VALIDATION_FAILED".equals(failure.category()));
     }
 
     private record MetadataLookupResult(
