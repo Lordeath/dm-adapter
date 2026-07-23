@@ -302,7 +302,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("FROM ALL_TAB_COLUMNS")
-                .contains("WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("WHERE OWNER = 'sample-report'")
                 .contains("AND TABLE_NAME = 'sample_canal_config_item'")
                 .contains("AND COLUMN_NAME = 'targetDatabase'")
                 .contains("EXECUTE IMMEDIATE 'alter table sample_canal_config_item ADD `targetDatabase` varchar(128) null'")
@@ -2724,7 +2724,7 @@ class SqlScriptMigratorTest {
                 .contains("CREATE OR REPLACE PROCEDURE add_col() AS")
                 .contains("ALL_TAB_COLUMNS")
                 .contains("ALL_TABLES")
-                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("OWNER = 'sample-bill'")
                 .contains("NULLABLE = 'YES'")
                 .contains("CHAR_LENGTH")
                 .contains("DATA_SCALE")

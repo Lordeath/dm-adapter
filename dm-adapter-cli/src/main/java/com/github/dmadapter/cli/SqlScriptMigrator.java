@@ -51,6 +51,7 @@ class SqlScriptMigrator {
     static final String MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE =
             "MYSQL_PROCEDURE_JSON_TEXT_TYPE";
     static final String DM_METADATA_IDENTIFIER_CASE_RULE = "DM_METADATA_IDENTIFIER_CASE";
+    static final String DM_METADATA_OWNER_TARGET_SCHEMA_RULE = "DM_METADATA_OWNER_TARGET_SCHEMA";
     static final String MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE =
             "MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT";
     static final String MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE =
@@ -906,6 +907,12 @@ class SqlScriptMigrator {
         String convertedContent = originalStatements.isEmpty()
                 ? originalContent
                 : SqlScriptParser.scriptContent(convertedStatements);
+        String schemaBoundContent = bindMetadataOwnerToTargetSchema(convertedContent, targetSchema);
+        if (!schemaBoundContent.equals(convertedContent)) {
+            convertedContent = schemaBoundContent;
+            appliedRules.add(DM_METADATA_OWNER_TARGET_SCHEMA_RULE);
+            convertedStatements = new ArrayList<>(SqlScriptParser.statements(convertedContent));
+        }
         convertedContent = stripLeadingBom(convertedContent);
         boolean converted = !convertedContent.equals(originalContent);
         boolean written = false;
@@ -933,6 +940,19 @@ class SqlScriptMigrator {
 
     private String readSqlScriptContent(Path sqlFile) throws IOException {
         return stripLeadingBom(Files.readString(sqlFile, StandardCharsets.UTF_8));
+    }
+
+    private String bindMetadataOwnerToTargetSchema(String sql, String targetSchema) {
+        if (sql == null || sql.isBlank() || targetSchema == null || targetSchema.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        String owner = sqlStringLiteral(targetSchema.trim());
+        return Pattern.compile(
+                        "(?is)\\b(?:[A-Za-z_][A-Za-z0-9_$]*\\.)?OWNER\\s*=\\s*"
+                                + "SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
+                )
+                .matcher(sql)
+                .replaceAll("OWNER = " + Matcher.quoteReplacement(owner));
     }
 
     private String stripLeadingBom(String content) {
@@ -2935,6 +2955,12 @@ class SqlScriptMigrator {
         if (!procedureIfExistsSql.equals(converted)) {
             converted = procedureIfExistsSql;
             rules.add(MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE);
+        }
+
+        String countGuardIndexSql = synchronizeSchemaScopedIndexNames(converted);
+        if (!countGuardIndexSql.equals(converted)) {
+            converted = countGuardIndexSql;
+            rules.add(MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE);
         }
 
         String signalSql = convertMysqlProcedureSignal(converted);
@@ -7534,6 +7560,22 @@ class SqlScriptMigrator {
         converted = Pattern.compile(
                         "(?is)(INDEX_NAME\\s*=\\s*)'" + oldIndexName
                                 + "'((?:(?!\\bTHEN\\b).)*?TABLE_NAME\\s*=\\s*'" + tableName + "')"
+                )
+                .matcher(converted)
+                .replaceAll("$1'" + Matcher.quoteReplacement(newIndexName) + "'$2");
+        converted = Pattern.compile(
+                        "(?is)(UPPER\\s*\\(\\s*TABLE_NAME\\s*\\)\\s*=\\s*UPPER\\s*\\(\\s*'"
+                                + tableName + "'\\s*\\)(?:(?!\\bTHEN\\b).)*?"
+                                + "UPPER\\s*\\(\\s*INDEX_NAME\\s*\\)\\s*=\\s*UPPER\\s*\\(\\s*)'"
+                                + oldIndexName + "'"
+                )
+                .matcher(converted)
+                .replaceAll("$1'" + Matcher.quoteReplacement(newIndexName) + "'");
+        converted = Pattern.compile(
+                        "(?is)(UPPER\\s*\\(\\s*INDEX_NAME\\s*\\)\\s*=\\s*UPPER\\s*\\(\\s*)'"
+                                + oldIndexName + "'((?:(?!\\bTHEN\\b).)*?"
+                                + "UPPER\\s*\\(\\s*TABLE_NAME\\s*\\)\\s*=\\s*UPPER\\s*\\(\\s*'"
+                                + tableName + "'\\s*\\))"
                 )
                 .matcher(converted)
                 .replaceAll("$1'" + Matcher.quoteReplacement(newIndexName) + "'$2");
