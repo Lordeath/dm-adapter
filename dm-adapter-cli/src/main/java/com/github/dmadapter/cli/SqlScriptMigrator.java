@@ -416,11 +416,28 @@ class SqlScriptMigrator {
             plannedFiles.addAll(outputOnlyPlannedFiles(sqlRootOut, plannedFiles, schema, systemSchema, warnings));
             progress("Output-only SQL script discovery completed: totalPlannedFiles=" + plannedFiles.size()
                     + ", elapsedMs=" + elapsedMillis(outputOnlyStartedAt));
+        } else {
+            long preservedOutputStartedAt = System.nanoTime();
+            plannedFiles.addAll(preservedOutputPlannedFiles(
+                    sqlRootOut,
+                    preservedPaths,
+                    schema,
+                    systemSchema,
+                    warnings
+            ));
+            progress("Preserved Dameng SQL dependency discovery completed: totalPlannedFiles="
+                    + plannedFiles.size()
+                    + ", elapsedMs="
+                    + elapsedMillis(preservedOutputStartedAt));
         }
         plannedFiles = plannedFiles.stream()
                 .sorted(Comparator.comparing(file -> plannedFileSortKey(sqlRootOut, file)))
                 .toList();
-        plannedFiles = markMissingProcedureDependencies(plannedFiles, manualReviewItems);
+        ProcedureDependencyAnalysis dependencyAnalysis = analyzeProcedureDependencies(
+                plannedFiles,
+                manualReviewItems
+        );
+        plannedFiles = dependencyAnalysis.files();
 
         long validationStartedAt = System.nanoTime();
         progress("Starting SQL script database validation: files=" + plannedFiles.size());
@@ -432,6 +449,9 @@ class SqlScriptMigrator {
                 + ", failed=" + validationRun.failureCount()
                 + ", elapsedMs=" + elapsedMillis(validationStartedAt));
         warnings.addAll(validationRun.warnings());
+        if (externalProcedureDependenciesUnverified(validationRun)) {
+            warnings.addAll(externalProcedureDependencyWarnings(dependencyAnalysis.externalDependencies()));
+        }
 
         Function<String, SqlScriptFileValidation> validationByOutput = output -> validationRun.fileValidations().stream()
                 .filter(validation -> validation.outputFile().equals(output))
@@ -505,38 +525,103 @@ class SqlScriptMigrator {
         }
     }
 
-    private List<PlannedSqlScriptFile> markMissingProcedureDependencies(
+    private ProcedureDependencyAnalysis analyzeProcedureDependencies(
             List<PlannedSqlScriptFile> plannedFiles,
             List<SqlScriptManualReviewItem> manualReviewItems
     ) {
-        LinkedHashSet<String> availableProcedures = new LinkedHashSet<>();
+        LinkedHashSet<ProcedureKey> declaredProcedures = new LinkedHashSet<>();
+        for (PlannedSqlScriptFile file : plannedFiles) {
+            for (String statement : file.statements()) {
+                ProcedureReference createdProcedure = procedureReferenceFromCreateProcedure(statement, file.schema());
+                if (createdProcedure != null) {
+                    declaredProcedures.add(createdProcedure.key());
+                }
+            }
+        }
+
+        LinkedHashSet<ProcedureKey> availableProcedures = new LinkedHashSet<>();
+        LinkedHashSet<ProcedureKey> manualReviewProcedures = new LinkedHashSet<>();
+        LinkedHashMap<String, LinkedHashSet<String>> externalDependencies = new LinkedHashMap<>();
         List<PlannedSqlScriptFile> result = new ArrayList<>(plannedFiles.size());
         for (PlannedSqlScriptFile file : plannedFiles) {
             LinkedHashSet<Integer> manualIndexes = new LinkedHashSet<>(file.manualReviewStatementIndexes());
-            boolean fileAlreadyManual = !manualIndexes.isEmpty();
             for (int index = 0; index < file.statements().size(); index++) {
                 String statement = file.statements().get(index);
-                String createdProcedure = procedureNameFromCreateProcedure(statement);
-                if (!createdProcedure.isBlank() && !fileAlreadyManual) {
-                    for (String calledProcedure : calledProceduresInRoutine(statement)) {
-                        if (calledProcedure.equalsIgnoreCase(createdProcedure)
-                                || availableProcedures.contains(calledProcedure.toLowerCase(Locale.ROOT))) {
-                            continue;
+                int statementIndex = index + 1;
+                ProcedureReference createdProcedure = procedureReferenceFromCreateProcedure(
+                        statement,
+                        file.schema()
+                );
+                if (createdProcedure != null) {
+                    if (!manualIndexes.contains(statementIndex)) {
+                        String dependencyReason = "";
+                        for (ProcedureReference calledProcedure
+                                : calledProceduresInRoutine(statement, file.schema())) {
+                            if (calledProcedure.key().equals(createdProcedure.key())
+                                    || availableProcedures.contains(calledProcedure.key())) {
+                                continue;
+                            }
+                            if (manualReviewProcedures.contains(calledProcedure.key())) {
+                                dependencyReason = "依赖当前迁移队列中需要人工确认的存储过程 `"
+                                        + calledProcedure.displayName()
+                                        + "`；请先修正该存储过程后再验证。";
+                                break;
+                            }
+                            if (declaredProcedures.contains(calledProcedure.key())) {
+                                dependencyReason = "存储过程依赖顺序错误：`"
+                                        + calledProcedure.displayName()
+                                        + "` 在当前迁移队列中尚未创建；请调整脚本顺序后再验证。";
+                                break;
+                            }
+                            addExternalProcedureDependency(externalDependencies, calledProcedure);
                         }
-                        int statementIndex = index + 1;
-                        if (manualIndexes.add(statementIndex)) {
+                        if (!dependencyReason.isBlank() && manualIndexes.add(statementIndex)) {
                             manualReviewItems.add(new SqlScriptManualReviewItem(
                                     file.sourceDisplay(),
                                     file.outputDisplay(),
                                     statementIndex,
-                                    "缺少已在此前脚本中创建的存储过程依赖 `" + calledProcedure
-                                            + "`；请在保留的达梦基础脚本中提供该过程后再验证。",
+                                    dependencyReason,
                                     statement,
                                     statement
                             ));
                         }
                     }
-                    availableProcedures.add(createdProcedure.toLowerCase(Locale.ROOT));
+                    if (manualIndexes.contains(statementIndex)) {
+                        availableProcedures.remove(createdProcedure.key());
+                        manualReviewProcedures.add(createdProcedure.key());
+                    } else {
+                        manualReviewProcedures.remove(createdProcedure.key());
+                        availableProcedures.add(createdProcedure.key());
+                    }
+                    continue;
+                }
+
+                ProcedureReference calledProcedure = procedureReferenceFromCall(statement, file.schema());
+                if (calledProcedure == null || manualIndexes.contains(statementIndex)) {
+                    continue;
+                }
+                String dependencyReason = "";
+                if (manualReviewProcedures.contains(calledProcedure.key())) {
+                    dependencyReason = "依赖需要人工确认的存储过程 `"
+                            + calledProcedure.displayName()
+                            + "`；请先修正该存储过程后再执行这个 CALL。";
+                } else if (declaredProcedures.contains(calledProcedure.key())
+                        && !availableProcedures.contains(calledProcedure.key())) {
+                    dependencyReason = "存储过程调用顺序错误：`"
+                            + calledProcedure.displayName()
+                            + "` 在当前迁移队列中尚未创建；请调整脚本顺序后再验证。";
+                } else if (!declaredProcedures.contains(calledProcedure.key())) {
+                    addExternalProcedureDependency(externalDependencies, calledProcedure);
+                }
+                if (!dependencyReason.isBlank() && manualIndexes.add(statementIndex)) {
+                    manualReviewItems.add(new SqlScriptManualReviewItem(
+                            file.sourceDisplay(),
+                            file.outputDisplay(),
+                            statementIndex,
+                            dependencyReason,
+                            statement,
+                            statement
+                    ));
                 }
             }
             result.add(new PlannedSqlScriptFile(
@@ -554,20 +639,202 @@ class SqlScriptMigrator {
                     file.statements()
             ));
         }
-        return List.copyOf(result);
+        LinkedHashMap<String, Set<String>> immutableExternalDependencies = new LinkedHashMap<>();
+        externalDependencies.forEach((schema, procedures) ->
+                immutableExternalDependencies.put(schema, Set.copyOf(procedures)));
+        return new ProcedureDependencyAnalysis(
+                List.copyOf(result),
+                Map.copyOf(immutableExternalDependencies)
+        );
     }
 
-    private List<String> calledProceduresInRoutine(String sql) {
+    private void addExternalProcedureDependency(
+            Map<String, LinkedHashSet<String>> externalDependencies,
+            ProcedureReference procedure
+    ) {
+        externalDependencies.computeIfAbsent(
+                        procedure.schemaDisplay(),
+                        ignored -> new LinkedHashSet<>()
+                )
+                .add(procedure.nameDisplay());
+    }
+
+    private boolean externalProcedureDependenciesUnverified(SqlScriptValidationRun validationRun) {
+        if (validationRun == null || !validationRun.attempted()) {
+            return true;
+        }
+        return validationRun.failures().stream().anyMatch(failure ->
+                "INVALID_SCHEMA".equals(failure.category())
+                        || "VALIDATION_TIMEOUT".equals(failure.category())
+                        || "OBJECT_STATUS_VALIDATION_FAILED".equals(failure.category()));
+    }
+
+    private List<String> externalProcedureDependencyWarnings(Map<String, Set<String>> externalDependencies) {
+        if (externalDependencies == null || externalDependencies.isEmpty()) {
+            return List.of();
+        }
+        return externalDependencies.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(String.CASE_INSENSITIVE_ORDER))
+                .map(entry -> {
+                    List<String> procedures = entry.getValue().stream()
+                            .sorted(String.CASE_INSENSITIVE_ORDER)
+                            .toList();
+                    return "外部存储过程依赖尚未完成达梦验证：schema="
+                            + entry.getKey()
+                            + ", procedures="
+                            + procedures;
+                })
+                .toList();
+    }
+
+    private List<ProcedureReference> calledProceduresInRoutine(String sql, String defaultSchema) {
         if (procedureNameFromCreateProcedure(sql).isBlank()) {
             return List.of();
         }
-        LinkedHashSet<String> names = new LinkedHashSet<>();
-        Matcher matcher = Pattern.compile("(?is)\\bCALL\\s+(?<name>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\(")
-                .matcher(sql);
-        while (matcher.find()) {
-            names.add(unquoteIdentifier(lastIdentifierPart(matcher.group("name"))).toLowerCase(Locale.ROOT));
+        LinkedHashMap<ProcedureKey, ProcedureReference> procedures = new LinkedHashMap<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "CALL")) {
+                int procedureStart = skipWhitespace(sql, index + "CALL".length());
+                SqlIdentifierReference identifier = sqlIdentifierReferenceAt(sql, procedureStart);
+                if (identifier == null) {
+                    index++;
+                    continue;
+                }
+                int openParen = skipWhitespace(sql, identifier.end());
+                if (openParen >= sql.length() || sql.charAt(openParen) != '(') {
+                    index++;
+                    continue;
+                }
+                ProcedureReference procedure = procedureReference(identifier.token(), defaultSchema);
+                if (procedure != null) {
+                    procedures.putIfAbsent(procedure.key(), procedure);
+                }
+                index = identifier.end();
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else {
+                index++;
+            }
         }
-        return List.copyOf(names);
+        return List.copyOf(procedures.values());
+    }
+
+    private ProcedureReference procedureReferenceFromCreateProcedure(String sql, String defaultSchema) {
+        if (sql == null || sql.isBlank()) {
+            return null;
+        }
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        String body = CREATE_DEFINER_PATTERN.matcher(leadingSqlPrefix.body()).replaceFirst("CREATE ");
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?PROCEDURE\\s+(?<name>"
+                        + SQL_IDENTIFIER_TOKEN
+                        + ")"
+        ).matcher(body);
+        if (!matcher.find()) {
+            return null;
+        }
+        return procedureReference(matcher.group("name").strip(), defaultSchema);
+    }
+
+    private ProcedureReference procedureReferenceFromCall(String sql, String defaultSchema) {
+        if (sql == null || sql.isBlank()) {
+            return null;
+        }
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        String body = leadingSqlPrefix.body();
+        int start = skipWhitespace(body, 0);
+        if (!startsKeyword(body, start, "CALL")) {
+            return null;
+        }
+        int procedureStart = skipWhitespace(body, start + "CALL".length());
+        SqlIdentifierReference procedure = sqlIdentifierReferenceAt(body, procedureStart);
+        if (procedure == null) {
+            return null;
+        }
+        int openParen = skipWhitespace(body, procedure.end());
+        if (openParen >= body.length() || body.charAt(openParen) != '(') {
+            return null;
+        }
+        return procedureReference(procedure.token(), defaultSchema);
+    }
+
+    private ProcedureReference procedureReference(String token, String defaultSchema) {
+        if (token == null || token.isBlank()) {
+            return null;
+        }
+        int separator = lastIdentifierSeparator(token);
+        String nameToken = separator < 0 ? token : token.substring(separator + 1);
+        String schemaToken = separator < 0 ? defaultSchema : token.substring(0, separator);
+        String name = unquoteIdentifier(nameToken.strip());
+        String schema = schemaToken == null || schemaToken.isBlank()
+                ? "<current-schema>"
+                : unquoteIdentifier(lastIdentifierPart(schemaToken.strip()));
+        if (name.isBlank()) {
+            return null;
+        }
+        return new ProcedureReference(
+                new ProcedureKey(
+                        schema.toLowerCase(Locale.ROOT),
+                        name.toLowerCase(Locale.ROOT)
+                ),
+                schema,
+                name
+        );
+    }
+
+    private int lastIdentifierSeparator(String token) {
+        char quote = 0;
+        int separator = -1;
+        for (int index = 0; index < token.length(); index++) {
+            char current = token.charAt(index);
+            if (quote == 0 && (current == '"' || current == '`' || current == '[')) {
+                quote = current == '[' ? ']' : current;
+            } else if (quote != 0 && current == quote) {
+                if (index + 1 < token.length() && token.charAt(index + 1) == quote) {
+                    index++;
+                } else {
+                    quote = 0;
+                }
+            } else if (quote == 0 && current == '.') {
+                separator = index;
+            }
+        }
+        return separator;
+    }
+
+    private record ProcedureKey(String schema, String name) {
+    }
+
+    private record ProcedureReference(
+            ProcedureKey key,
+            String schemaDisplay,
+            String nameDisplay
+    ) {
+        String displayName() {
+            return "<current-schema>".equals(schemaDisplay)
+                    ? nameDisplay
+                    : schemaDisplay + "." + nameDisplay;
+        }
+    }
+
+    private record ProcedureDependencyAnalysis(
+            List<PlannedSqlScriptFile> files,
+            Map<String, Set<String>> externalDependencies
+    ) {
+        private ProcedureDependencyAnalysis {
+            files = List.copyOf(files == null ? List.of() : files);
+            externalDependencies = Map.copyOf(externalDependencies == null ? Map.of() : externalDependencies);
+        }
     }
 
     private long elapsedMillis(long startedAtNanos) {
@@ -723,30 +990,76 @@ class SqlScriptMigrator {
                 continue;
             }
             Path relative = sqlRootOut.relativize(outputFile);
-            boolean systemScript = isSystemScript(outputFile);
-            String targetSchema = systemScript ? systemSchema : schema;
-            if (systemScript && targetSchema.isBlank()) {
-                warnings.add("Output-only system SQL script has no --system-schema and will use the current connection schema: "
-                        + relative);
-            }
-            String content = readSqlScriptContent(outputFile);
-            List<String> statements = SqlScriptParser.statements(content);
-            outputOnlyFiles.add(new PlannedSqlScriptFile(
-                    "(output-only) " + relative,
-                    outputFile.toString(),
-                    targetSchema,
-                    systemScript,
-                    false,
-                    false,
-                    statements.size(),
-                    0,
-                    0,
-                    Set.of(),
-                    List.of(),
-                    statements
+            outputOnlyFiles.add(plannedOutputFile(
+                    outputFile,
+                    relative,
+                    "(output-only) ",
+                    schema,
+                    systemSchema,
+                    warnings
             ));
         }
         return outputOnlyFiles;
+    }
+
+    private List<PlannedSqlScriptFile> preservedOutputPlannedFiles(
+            Path sqlRootOut,
+            Set<Path> preservedPaths,
+            String schema,
+            String systemSchema,
+            List<String> warnings
+    ) throws IOException {
+        if (preservedPaths == null || preservedPaths.isEmpty()) {
+            return List.of();
+        }
+        List<PlannedSqlScriptFile> files = new ArrayList<>();
+        for (Path relative : preservedPaths.stream().sorted().toList()) {
+            Path outputFile = sqlRootOut.resolve(relative).normalize();
+            if (!outputFile.startsWith(sqlRootOut) || !Files.isRegularFile(outputFile)) {
+                continue;
+            }
+            files.add(plannedOutputFile(
+                    outputFile,
+                    relative,
+                    "(preserved output) ",
+                    schema,
+                    systemSchema,
+                    warnings
+            ));
+        }
+        return List.copyOf(files);
+    }
+
+    private PlannedSqlScriptFile plannedOutputFile(
+            Path outputFile,
+            Path relative,
+            String sourcePrefix,
+            String schema,
+            String systemSchema,
+            List<String> warnings
+    ) throws IOException {
+        boolean systemScript = isSystemScript(outputFile);
+        String targetSchema = systemScript ? systemSchema : schema;
+        if (systemScript && targetSchema.isBlank()) {
+            warnings.add("Output-only system SQL script has no --system-schema and will use the current connection schema: "
+                    + relative);
+        }
+        String content = readSqlScriptContent(outputFile);
+        List<String> statements = SqlScriptParser.statements(content);
+        return new PlannedSqlScriptFile(
+                sourcePrefix + relative,
+                outputFile.toString(),
+                targetSchema,
+                systemScript,
+                false,
+                false,
+                statements.size(),
+                0,
+                0,
+                Set.of(),
+                List.of(),
+                statements
+        );
     }
 
     private PlannedSqlScriptFile planFile(
