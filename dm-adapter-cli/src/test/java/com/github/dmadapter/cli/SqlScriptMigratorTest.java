@@ -2557,7 +2557,7 @@ class SqlScriptMigratorTest {
         ));
 
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
-        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("[{\\\"label\\\":\\\"V9\\\"}]")
                 .contains("{\"id\":\"1\",\"resourcecolumnTactics\":\"{\\\"label\\\":\\\"金额\\\"}\"}")
@@ -3452,6 +3452,49 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void skipsOnlyManualReviewStatementsAndValidatesRemainingStatements() {
+        List<String> executedSql = new ArrayList<>();
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                if (!sql.startsWith("set schema")) {
+                    executedSql.add(sql);
+                }
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+        SqlScriptMigrator.PlannedSqlScriptFile file = new SqlScriptMigrator.PlannedSqlScriptFile(
+                "partial-manual.sql",
+                "partial-manual.sql",
+                "sample-bill",
+                false,
+                true,
+                false,
+                2,
+                0,
+                1,
+                Set.of(1),
+                List.of(),
+                List.of("select 'manual' from dual", "select 'validated' from dual")
+        );
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(file),
+                validationEnvironment()
+        );
+
+        assertThat(result.successCount()).isEqualTo(1);
+        assertThat(result.failureCount()).isZero();
+        assertThat(result.failures()).noneSatisfy(failure ->
+                assertThat(failure.category()).isEqualTo("MANUAL_REVIEW_REQUIRED"));
+        assertThat(executedSql).containsExactly("select 'validated' from dual");
+    }
+
+    @Test
     void failsValidationWhenCreatedRoutineIsInvalidWithoutJdbcException() {
         AtomicInteger resultSetNextCount = new AtomicInteger();
         ResultSet resultSet = proxy(ResultSet.class, (ignored, method, args) -> switch (method.getName()) {
@@ -3819,7 +3862,53 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void marksRoutineWithMissingPriorProcedureDependencyForManualReview() throws Exception {
+    void usesPreservedDamengBaseScriptForDependencyChecksDuringDryRun() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("00000000.sql"), "select 'mysql base';\n");
+        write(sqlRootOut.resolve("00000000.sql"), """
+                CREATE OR REPLACE PROCEDURE batch_insert_ns_core_resourcecolumn(input_json IN JSON) AS
+                BEGIN
+                    NULL;
+                END;
+                /
+                """);
+        write(sqlRoot.resolve("20260205.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE seed_resourcecolumn()
+                BEGIN
+                    CALL batch_insert_ns_core_resourcecolumn('[]');
+                END$$
+                DELIMITER ;
+                """);
+        write(sqlRoot.resolve("20260507.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert_ns_core_resourcecolumn(IN input_json JSON)
+                BEGIN
+                    SELECT 1 FROM dual;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new FailingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                true,
+                "sample-system",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.warnings()).noneSatisfy(warning ->
+                assertThat(warning).contains("batch_insert_ns_core_resourcecolumn"));
+        assertThat(report.files()).extracting(com.github.dmadapter.core.SqlScriptFileResult::sourceFile)
+                .contains("(preserved output) 00000000.sql");
+    }
+
+    @Test
+    void treatsRoutineDependencyOutsideCurrentQueueAsExternalDependency() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("20260205.sql"), """
@@ -3830,14 +3919,204 @@ class SqlScriptMigratorTest {
                 END$$
                 DELIMITER ;
                 """);
+        RecordingValidator validator = new RecordingValidator();
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir, sqlRoot, sqlRootOut, false, "sample-app", "", DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.warnings()).noneSatisfy(warning ->
+                assertThat(warning).contains("log_sql_execution"));
+        assertThat(validator.files).singleElement().satisfies(file ->
+                assertThat(file.manualReviewStatementIndexes()).isEmpty());
+    }
+
+    @Test
+    void warnsAboutExternalProcedureDependenciesWhenDatabaseValidationIsSkipped() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205_system.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL log_sql_execution();
+                    CALL addorupdate_dictionary();
+                    CALL log_sql_execution();
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new FailingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                true,
+                "sample-app",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.warnings()).anySatisfy(warning -> assertThat(warning)
+                .contains("schema=sample-system")
+                .contains("addorupdate_dictionary")
+                .contains("log_sql_execution"));
+    }
+
+    @Test
+    void warnsAboutExternalProcedureDependenciesWhenValidationConnectionFails() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205_system.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL log_sql_execution();
+                END$$
+                DELIMITER ;
+                """);
+        SqlScriptMigrator.Validator unavailableValidator = (files, environment) ->
+                SqlScriptValidationRun.notAttempted(
+                        "Dameng SQL script validation connection failed.",
+                        List.of("connection unavailable")
+                );
+
+        SqlScriptMigrationReport report = migrator(unavailableValidator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.warnings()).anySatisfy(warning -> assertThat(warning)
+                .contains("schema=sample-system")
+                .contains("log_sql_execution"));
+    }
+
+    @Test
+    void marksProcedureDeclaredLaterInSameSchemaAsOrderingProblem() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE caller_proc()
+                BEGIN
+                    CALL later_proc();
+                END$$
+                CREATE PROCEDURE later_proc()
+                BEGIN
+                    SELECT 1 FROM dual;
+                END$$
+                DELIMITER ;
+                """);
 
         SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
                 tempDir, sqlRoot, sqlRootOut, false, "sample-app", "", DmValidationEnvironment.from(Map.of())
         ));
 
         assertThat(report.manualReviewSqlCount()).isEqualTo(1);
-        assertThat(report.manualReviewItems()).singleElement()
-                .satisfies(item -> assertThat(item.reason()).contains("log_sql_execution"));
+        assertThat(report.manualReviewItems()).singleElement().satisfies(item -> assertThat(item.reason())
+                .contains("依赖顺序错误")
+                .contains("sample-app.later_proc"));
+    }
+
+    @Test
+    void doesNotUseProcedureDeclaredInAnotherSchemaToSatisfyDependency() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE shared_proc()
+                BEGIN
+                    SELECT 1 FROM dual;
+                END$$
+                DELIMITER ;
+                """);
+        write(sqlRoot.resolve("20260205_system.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE system_caller()
+                BEGIN
+                    CALL shared_proc();
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new FailingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                true,
+                "sample-app",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.warnings()).anySatisfy(warning -> assertThat(warning)
+                .contains("schema=sample-system")
+                .contains("shared_proc"));
+    }
+
+    @Test
+    void respectsSchemaQualifiedProcedureDependencyOrdering() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260204.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE app_caller()
+                BEGIN
+                    CALL `sample-system`.`shared_proc`();
+                END$$
+                DELIMITER ;
+                """);
+        write(sqlRoot.resolve("20260205_system.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE shared_proc()
+                BEGIN
+                    SELECT 1 FROM dual;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems()).singleElement().satisfies(item -> assertThat(item.reason())
+                .contains("依赖顺序错误")
+                .contains("sample-system.shared_proc"));
+    }
+
+    @Test
+    void allowsRecursiveProcedureCalls() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE recursive_proc()
+                BEGIN
+                    CALL recursive_proc();
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir, sqlRoot, sqlRootOut, false, "sample-app", "", DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {

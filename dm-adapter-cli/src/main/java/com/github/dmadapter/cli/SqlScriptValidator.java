@@ -231,19 +231,6 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 + ", statements=" + file.statements().size()
                 + ", executable=" + executableCount
                 + ", manualReview=" + file.manualReviewStatementIndexes().size());
-        if (!file.manualReviewStatementIndexes().isEmpty()) {
-            failures.add(new SqlScriptValidationFailure(
-                    file.sourceDisplay(),
-                    file.outputDisplay(),
-                    file.schema(),
-                    file.manualReviewStatementIndexes().stream().min(Integer::compareTo).orElse(0),
-                    "MANUAL_REVIEW_REQUIRED",
-                    "SQL script validation was skipped because this file contains statements requiring manual review.",
-                    ""
-            ));
-            progress("Skipped SQL script validation because manual review is required: " + file.sourceDisplay());
-            return new SqlScriptFileValidation(file.outputDisplay(), 0, failures);
-        }
         try {
             applySchema(connection, file.schema(), environment, diagnostics, file.sourceDisplay());
         } catch (Exception e) {
