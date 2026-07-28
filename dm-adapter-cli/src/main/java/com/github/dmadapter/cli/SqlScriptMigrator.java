@@ -30,6 +30,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 class SqlScriptMigrator {
@@ -9122,14 +9123,11 @@ class SqlScriptMigrator {
 
     private Map<String, Set<String>> sourceTableCharsets(List<String> statements) {
         LinkedHashMap<String, Set<String>> charsets = new LinkedHashMap<>();
-        if (statements == null) {
-            return Map.of();
-        }
         Pattern createTable = Pattern.compile(
                 "(?is)\\bCREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?<table>"
                         + SQL_IDENTIFIER_TOKEN + ")"
         );
-        for (String statement : statements) {
+        for (String statement : statements == null ? List.<String>of() : statements) {
             Matcher tableMatcher = createTable.matcher(statement == null ? "" : statement);
             if (!tableMatcher.find()) {
                 continue;
@@ -9164,33 +9162,23 @@ class SqlScriptMigrator {
         if (semantics == TargetLengthSemantics.CHAR) {
             return conversion;
         }
-        CharsetResolution charsetResolution = resolveLengthDdlCharsets(sql, sourceTableCharsets);
-        if (charsetResolution.unresolved() || charsetResolution.charsets().size() != 1) {
+        Set<String> sourceCharsets = lengthDdlSourceCharsets(
+                conversion.originalSql(),
+                sourceTableCharsets
+        );
+        Set<String> unsupportedCharsets = sourceCharsets.stream()
+                .filter(charset -> !"utf8".equals(charset)
+                        && !"utf8mb3".equals(charset)
+                        && !"utf8mb4".equals(charset))
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (!unsupportedCharsets.isEmpty()) {
             return lengthManualReview(
                     conversion,
-                    charsetResolution.charsets().size() > 1
-                            ? "目标库使用 BYTE 长度语义，但同一 SQL 含有不同源字符集；"
-                            + "无法用单一安全倍数换算 VARCHAR/CHAR 长度，请人工确认各字段。"
-                            : "目标库使用 BYTE 长度语义，但无法从字段或 CREATE TABLE 定义确认源字符集；"
-                            + "仅 utf8/utf8mb3/utf8mb4 可安全自动换算。"
+                    "目标库使用 BYTE 长度语义，但 SQL 明确声明了非 UTF-8 源字符集 "
+                            + unsupportedCharsets + "；请人工确认目标字段长度语义。"
             );
         }
-        String charset = charsetResolution.charsets().iterator().next();
-        int multiplier = sourceCharsetMultiplier(charset);
-        if (multiplier == 0) {
-            return lengthManualReview(
-                    conversion,
-                    "目标库使用 BYTE 长度语义，但无法从字段或 CREATE TABLE 定义确认源字符集；"
-                            + "仅 utf8/utf8mb3/utf8mb4 可安全自动换算。"
-            );
-        }
-        LengthRewrite rewrite = rewriteDdlVarcharLengths(sql, multiplier);
-        if (rewrite.overflow()) {
-            return lengthManualReview(
-                    conversion,
-                    "VARCHAR/CHAR 按源字符集换算为达梦字节长度时溢出或超过保守容量 32767；请人工确认目标字段类型。"
-            );
-        }
+        LengthRewrite rewrite = rewriteDdlVarcharLengths(sql);
         if (!rewrite.changed()) {
             return conversion;
         }
@@ -9205,6 +9193,24 @@ class SqlScriptMigrator {
                 conversion.reason(),
                 rules
         );
+    }
+
+    private Set<String> lengthDdlSourceCharsets(
+            String sql,
+            Map<String, Set<String>> sourceTableCharsets
+    ) {
+        LinkedHashSet<String> charsets = new LinkedHashSet<>(explicitSourceCharsets(sql));
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b(?:CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+)"
+                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")"
+        ).matcher(sql == null ? "" : sql);
+        while (matcher.find()) {
+            charsets.addAll(sourceTableCharsets.getOrDefault(
+                    normalizedTableKey(matcher.group("table")),
+                    Set.of()
+            ));
+        }
+        return Set.copyOf(charsets);
     }
 
     private ScriptStatementConversion lengthManualReview(
@@ -9227,71 +9233,18 @@ class SqlScriptMigrator {
 
     private boolean containsLengthSensitiveDdl(String sql) {
         if (sql == null || sql.isBlank()
-                || !Pattern.compile("(?is)\\b(?:VAR)?CHAR\\s*\\(\\s*\\d+\\s*\\)").matcher(sql).find()) {
+                || !Pattern.compile(
+                        "(?is)\\b(?:VAR)?CHAR\\s*\\(\\s*\\d+(?:\\s+CHAR)?\\s*\\)"
+                ).matcher(sql).find()) {
             return false;
         }
         return Pattern.compile("(?is)\\b(?:CREATE|ALTER)\\s+TABLE\\b").matcher(sql).find();
     }
 
-    private String ddlTableName(String sql) {
-        Matcher matcher = Pattern.compile(
-                "(?is)\\b(?:CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+)"
-                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")"
-        ).matcher(sql == null ? "" : sql);
-        return matcher.find() ? matcher.group("table") : "";
-    }
-
-    private CharsetResolution resolveLengthDdlCharsets(
-            String sql,
-            Map<String, Set<String>> sourceTableCharsets
-    ) {
-        LinkedHashSet<String> charsets = new LinkedHashSet<>();
-        boolean unresolved = false;
-        if (!procedureNameFromCreateProcedure(sql).isBlank()) {
-            int index = 0;
-            boolean foundLengthDdl = false;
-            while (index < sql.length()) {
-                if (sql.charAt(index) != '\'') {
-                    index++;
-                    continue;
-                }
-                int end = skipSingleQuotedString(sql, index);
-                String literal = singleQuotedSqlLiteralValue(sql.substring(index, end));
-                if (containsLengthSensitiveDdl(literal)) {
-                    foundLengthDdl = true;
-                    CharsetResolution literalResolution =
-                            resolvePlainLengthDdlCharsets(literal, sourceTableCharsets);
-                    charsets.addAll(literalResolution.charsets());
-                    unresolved |= literalResolution.unresolved();
-                }
-                index = end;
-            }
-            return new CharsetResolution(Set.copyOf(charsets), unresolved || !foundLengthDdl);
-        }
-        return resolvePlainLengthDdlCharsets(sql, sourceTableCharsets);
-    }
-
-    private CharsetResolution resolvePlainLengthDdlCharsets(
-            String sql,
-            Map<String, Set<String>> sourceTableCharsets
-    ) {
-        Set<String> explicitCharsets = explicitSourceCharsets(sql);
-        if (!explicitCharsets.isEmpty()) {
-            return new CharsetResolution(explicitCharsets, false);
-        }
-        String table = ddlTableName(sql);
-        Set<String> inheritedCharsets = table.isBlank()
-                ? Set.of()
-                : sourceTableCharsets.getOrDefault(normalizedTableKey(table), Set.of());
-        return inheritedCharsets.isEmpty()
-                ? new CharsetResolution(Set.of(), true)
-                : new CharsetResolution(inheritedCharsets, false);
-    }
-
     private Set<String> explicitSourceCharsets(String sql) {
         Matcher matcher = Pattern.compile(
                 "(?is)\\b(?:DEFAULT\\s+)?(?:CHARACTER\\s+SET|CHARSET)\\s*(?:=\\s*)?"
-                        + "(?<charset>[A-Za-z0-9_]+)"
+                        + "(?<charsetQuote>['\"]?)(?<charset>[A-Za-z0-9_]+)\\k<charsetQuote>"
         ).matcher(sql == null ? "" : sql);
         LinkedHashSet<String> charsets = new LinkedHashSet<>();
         while (matcher.find()) {
@@ -9300,25 +9253,14 @@ class SqlScriptMigrator {
         return Set.copyOf(charsets);
     }
 
-    private int sourceCharsetMultiplier(String charset) {
-        if (charset == null) {
-            return 0;
-        }
-        return switch (charset.toLowerCase(Locale.ROOT)) {
-            case "utf8", "utf8mb3" -> 3;
-            case "utf8mb4" -> 4;
-            default -> 0;
-        };
-    }
-
-    private LengthRewrite rewriteDdlVarcharLengths(String sql, int multiplier) {
+    private LengthRewrite rewriteDdlVarcharLengths(String sql) {
         if (!procedureNameFromCreateProcedure(sql).isBlank()) {
-            return rewriteProcedureDdlVarcharLengths(sql, multiplier);
+            return rewriteProcedureDdlVarcharLengths(sql);
         }
-        return rewritePlainDdlVarcharLengths(sql, multiplier);
+        return rewritePlainDdlVarcharLengths(sql);
     }
 
-    private LengthRewrite rewriteProcedureDdlVarcharLengths(String sql, int multiplier) {
+    private LengthRewrite rewriteProcedureDdlVarcharLengths(String sql) {
         StringBuilder rewritten = new StringBuilder(sql.length());
         int index = 0;
         boolean changed = false;
@@ -9331,11 +9273,10 @@ class SqlScriptMigrator {
             String literalExpression = sql.substring(index, end);
             String literal = singleQuotedSqlLiteralValue(literalExpression);
             if (Pattern.compile("(?is)^\\s*(?:ALTER|CREATE)\\s+TABLE\\b").matcher(literal).find()
-                    && Pattern.compile("(?is)\\b(?:VAR)?CHAR\\s*\\(\\s*\\d+\\s*\\)").matcher(literal).find()) {
-                LengthRewrite literalRewrite = rewritePlainDdlVarcharLengths(literal, multiplier);
-                if (literalRewrite.overflow()) {
-                    return new LengthRewrite(sql, false, true);
-                }
+                    && Pattern.compile(
+                            "(?is)\\b(?:VAR)?CHAR\\s*\\(\\s*\\d+(?:\\s+CHAR)?\\s*\\)"
+                    ).matcher(literal).find()) {
+                LengthRewrite literalRewrite = rewritePlainDdlVarcharLengths(literal);
                 rewritten.append(sqlStringLiteral(literalRewrite.sql()));
                 changed |= literalRewrite.changed();
             } else {
@@ -9343,14 +9284,13 @@ class SqlScriptMigrator {
             }
             index = end;
         }
-        String result = rewriteMetadataGuardLengths(rewritten.toString(), multiplier);
-        changed |= !result.equals(rewritten.toString());
-        return new LengthRewrite(result, changed, false);
+        return new LengthRewrite(rewritten.toString(), changed);
     }
 
-    private LengthRewrite rewritePlainDdlVarcharLengths(String sql, int multiplier) {
+    private LengthRewrite rewritePlainDdlVarcharLengths(String sql) {
         Pattern typePattern = Pattern.compile(
-                "(?is)\\b(?<type>VARCHAR|CHAR)\\s*\\(\\s*(?<length>[0-9]+)\\s*\\)"
+                "(?is)\\b(?<type>VARCHAR|CHAR)\\s*\\(\\s*(?<length>[0-9]+)"
+                        + "(?<charSemantics>\\s+CHAR)?\\s*\\)"
         );
         StringBuilder rewritten = new StringBuilder(sql.length());
         int index = 0;
@@ -9378,66 +9318,22 @@ class SqlScriptMigrator {
                 rewritten.append(sql.charAt(index++));
                 continue;
             }
-            int targetLength;
-            try {
-                targetLength = Math.multiplyExact(
-                        Integer.parseInt(matcher.group("length")),
-                        multiplier
-                );
-            } catch (ArithmeticException | NumberFormatException e) {
-                return new LengthRewrite(sql, false, true);
-            }
-            if (targetLength > 32_767) {
-                return new LengthRewrite(sql, false, true);
+            if (matcher.group("charSemantics") != null) {
+                rewritten.append(matcher.group());
+                index = matcher.end();
+                continue;
             }
             rewritten.append(matcher.group("type").toUpperCase(Locale.ROOT))
                     .append('(')
-                    .append(targetLength)
-                    .append(')');
+                    .append(matcher.group("length"))
+                    .append(" CHAR)");
             index = matcher.end();
             changed = true;
         }
         if (!changed) {
-            return new LengthRewrite(sql, false, false);
+            return new LengthRewrite(sql, false);
         }
-        String result = rewritten.toString();
-        result = replaceOutsideIgnoredText(
-                result,
-                Pattern.compile("(?is)\\bCHAR_LENGTH\\b"),
-                ignored -> "DATA_LENGTH"
-        );
-        return new LengthRewrite(result, true, false);
-    }
-
-    private String rewriteMetadataGuardLengths(String sql, int multiplier) {
-        Pattern pattern = Pattern.compile(
-                "(?is)\\b(?<column>CHAR_LENGTH|DATA_LENGTH)\\b"
-                        + "(?<operator>\\s*(?:=|<=|>=|<|>)\\s*)"
-                        + "(?<quote>'?)(?<length>[0-9]+)\\k<quote>"
-        );
-        Matcher matcher = pattern.matcher(sql);
-        StringBuilder rewritten = new StringBuilder(sql.length());
-        int previous = 0;
-        boolean changed = false;
-        while (matcher.find()) {
-            int target;
-            try {
-                target = Math.multiplyExact(Integer.parseInt(matcher.group("length")), multiplier);
-            } catch (ArithmeticException | NumberFormatException e) {
-                return sql;
-            }
-            rewritten.append(sql, previous, matcher.start())
-                    .append("DATA_LENGTH")
-                    .append(matcher.group("operator"))
-                    .append(target);
-            previous = matcher.end();
-            changed = true;
-        }
-        if (!changed) {
-            return sql;
-        }
-        rewritten.append(sql, previous, sql.length());
-        return rewritten.toString();
+        return new LengthRewrite(rewritten.toString(), true);
     }
 
     private Path resolvePath(Path projectRoot, Path path) {
@@ -9590,13 +9486,7 @@ class SqlScriptMigrator {
     private record ScriptUserVariableInline(String sql, boolean changed) {
     }
 
-    private record LengthRewrite(String sql, boolean changed, boolean overflow) {
-    }
-
-    private record CharsetResolution(Set<String> charsets, boolean unresolved) {
-        private CharsetResolution {
-            charsets = Set.copyOf(charsets == null ? Set.of() : charsets);
-        }
+    private record LengthRewrite(String sql, boolean changed) {
     }
 
     private record StatementConversionPlan(

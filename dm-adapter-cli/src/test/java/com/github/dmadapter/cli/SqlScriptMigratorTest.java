@@ -3345,7 +3345,7 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .startsWith("-- business note")
                 .contains("`id` bigint NOT NULL IDENTITY(1,1)")
-                .contains("`code` varchar(192) DEFAULT NULL")
+                .contains("`code` varchar(64) DEFAULT NULL")
                 .doesNotContain("KEY `idx_demo_code`")
                 .doesNotContainIgnoringCase("USING BTREE")
                 .doesNotContainIgnoringCase("ENGINE")
@@ -4247,7 +4247,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void expandsUtf8mb4VarcharForByteLengthTargets() throws Exception {
+    void usesExplicitCharacterSemanticsForUtf8mb4VarcharOnByteLengthTargets() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("table.sql"), """
@@ -4274,7 +4274,8 @@ class SqlScriptMigratorTest {
 
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
-                .contains("VARCHAR(400)");
+                .contains("VARCHAR(100 CHAR)")
+                .doesNotContain("VARCHAR(400)");
     }
 
     @Test
@@ -4304,13 +4305,13 @@ class SqlScriptMigratorTest {
 
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
-                .contains("VARCHAR(400)")
+                .contains("VARCHAR(100 CHAR)")
                 .contains("'source VARCHAR(255)'")
-                .doesNotContain("'source VARCHAR(1020)'");
+                .doesNotContain("'source VARCHAR(255 CHAR)'");
     }
 
     @Test
-    void expandsUtf8VarcharByThreeForByteLengthTargets() throws Exception {
+    void usesExplicitCharacterSemanticsForUtf8VarcharOnByteLengthTargets() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("table.sql"), """
@@ -4335,11 +4336,13 @@ class SqlScriptMigratorTest {
         );
 
         assertThat(report.manualReviewSqlCount()).isZero();
-        assertThat(Files.readString(sqlRootOut.resolve("table.sql"))).contains("VARCHAR(300)");
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("VARCHAR(100 CHAR)")
+                .doesNotContain("VARCHAR(300)");
     }
 
     @Test
-    void keepsByteLengthDdlForManualReviewWhenSourceCharsetIsUnknown() throws Exception {
+    void usesExplicitCharacterSemanticsWhenSourceCharsetIsUnknown() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("table.sql"), "CREATE TABLE demo (display_name VARCHAR(100));");
@@ -4359,13 +4362,13 @@ class SqlScriptMigratorTest {
                 )
         );
 
-        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
-        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
-                assertThat(item.reason()).contains("无法从字段或 CREATE TABLE 定义确认源字符集"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("VARCHAR(100 CHAR)");
     }
 
     @Test
-    void keepsMixedSourceCharsetDdlForManualReviewOnByteLengthTarget() throws Exception {
+    void usesExplicitCharacterSemanticsForMixedUtf8CharsetsOnByteLengthTarget() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         String original = """
@@ -4391,10 +4394,122 @@ class SqlScriptMigratorTest {
                 )
         );
 
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("legacy_name VARCHAR(100 CHAR)")
+                .contains("display_name VARCHAR(100 CHAR)");
+    }
+
+    @Test
+    void keepsExplicitNonUtf8CharsetDdlForManualReviewOnByteLengthTarget() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String original = """
+                CREATE TABLE demo (
+                    legacy_name VARCHAR(100) CHARACTER SET 'latin1'
+                ) DEFAULT CHARSET='latin1';
+                """;
+        write(sqlRoot.resolve("table.sql"), original);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
         assertThat(report.manualReviewSqlCount()).isEqualTo(1);
         assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
-                assertThat(item.reason()).contains("不同源字符集"));
+                assertThat(item.reason()).contains("非 UTF-8 源字符集").contains("latin1"));
         assertThat(Files.readString(sqlRootOut.resolve("table.sql"))).contains(original.strip());
+    }
+
+    @Test
+    void addsCharacterSemanticsToCharAndDoesNotDuplicateExistingSemantics() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("table.sql"), """
+                CREATE TABLE demo (
+                    code CHAR(10),
+                    display_name VARCHAR(100 CHAR)
+                );
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("CHAR(10 CHAR)")
+                .contains("VARCHAR(100 CHAR)")
+                .doesNotContain("CHAR(10 CHAR CHAR)")
+                .doesNotContain("VARCHAR(100 CHAR CHAR)");
+    }
+
+    @Test
+    void usesCharacterLengthGuardForDynamicDdlOnByteLengthTarget() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                CREATE OR REPLACE PROCEDURE change_demo() AS
+                    dm_adapter_exists INT;
+                BEGIN
+                    SELECT COUNT(*) INTO dm_adapter_exists FROM (
+                        SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS
+                        WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                          AND TABLE_NAME = 'demo'
+                          AND COLUMN_NAME = 'display_name'
+                          AND CHAR_LENGTH = '100'
+                    ) dm_adapter_exists_check;
+                    IF dm_adapter_exists = 0 THEN
+                        EXECUTE IMMEDIATE
+                            'ALTER TABLE demo MODIFY display_name VARCHAR(100) DEFAULT NULL';
+                    END IF;
+                END;
+                /
+                CALL change_demo();
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("CHAR_LENGTH < 100")
+                .contains("VARCHAR(100 CHAR)")
+                .doesNotContain("DATA_LENGTH = 400");
     }
 
     @Test

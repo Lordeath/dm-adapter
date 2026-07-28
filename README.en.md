@@ -36,6 +36,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --proje
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 
 # Declare the target length semantics when SQL scripts are converted offline.
+# BYTE targets use explicit VARCHAR(n CHAR)/CHAR(n CHAR) definitions.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
   --project ./demo --sql-scripts-only \
   --sql-root ./sql/v2 --sql-root-out ./sql/v2-dm \

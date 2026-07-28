@@ -35,7 +35,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 
-# 离线转换 SQL 脚本时显式声明目标库字符长度语义；BYTE 会按可识别的 utf8/utf8mb4 源字符集换算。
+# 离线转换 SQL 脚本时显式声明目标库字符长度语义；BYTE 会生成 VARCHAR(n CHAR)/CHAR(n CHAR)。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
   --project ./demo --sql-scripts-only \
   --sql-root ./sql/v2 --sql-root-out ./sql/v2-dm \

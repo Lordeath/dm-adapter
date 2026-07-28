@@ -4,7 +4,7 @@
 
 - 达梦官方文档：MySQL 到 DM，https://eco.dameng.com/document/dm/zh-cn/start/mysql_dm
 - 达梦官方 FAQ：MySQL 迁移 DM8，https://eco.dameng.com/document/dm/zh-cn/faq/faq-mysql-dm8-migrate.html
-- 最后核对日期：2026-07-01
+- 最后核对日期：2026-07-28
 
 本文用于指导 dm-adapter 后续处理 Spring Boot + MyBatis 项目从 MySQL 迁移到达梦 8。修改代码前先按本文区分：应由 dm-adapter 自动转换的问题、业务 SQL 本身需要修正的问题、测试库缺对象的问题、必须人工提供参数或 `sql-rewrite.yml` 配置的问题。
 
@@ -13,7 +13,7 @@
 - 新建达梦实例时应按 MySQL 兼容场景确认实例参数，尤其是 `COMPATIBLE_MODE=4`、`CASE_SENSITIVE`、`LENGTH_IN_CHAR`、`BLANK_PAD_MODE`。实例参数不匹配时，SQL 转换正确也可能因为大小写、字符长度、空格比较等行为差异失败。
 - `COMPATIBLE_MODE=4` 只是 MySQL 兼容模式，不代表所有 MySQL 语法都能直接执行。官方 FAQ 明确要求迁移前修改兼容参数并重启数据库服务使其生效；兼容模式下仍可能需要手工重写表、视图、游标、系统包、函数、存储过程和非法数据。
 - `CASE_SENSITIVE` 是实例级参数，确定后不可随意修改。MySQL 可细到字段级大小写规则，达梦实例级大小写会同时影响对象名和数据比较；如果迁移时保留小写对象名，MyBatis SQL 往往需要双引号，若取消 DTS 的“保持对象名大小写”则对象名会转大写。
-- `LENGTH_IN_CHAR` 和 DTS 类型映射会影响 `VARCHAR`/`CHAR` 长度语义。MySQL 常按字符理解长度，达梦若按字节或自动放大长度，可能出现字段内容截断、乱码或长度变为原来的 3 倍。
+- `LENGTH_IN_CHAR` 和 DTS 类型映射会影响 `VARCHAR`/`CHAR` 长度语义。MySQL 的 `VARCHAR(n)`/`CHAR(n)` 中 `n` 是字符数；达梦 BYTE 实例若直接使用 `VARCHAR(n)`/`CHAR(n)`，中文或 emoji 可能在未达到 `n` 个字符时就超长。
 - `BLANK_PAD_MODE` 会影响 `CHAR` 尾部空格补齐和比较行为。遇到字符列比较、唯一约束、迁移后数据尾部空格异常时，先确认实例参数和字段类型。
 - MySQL 兼容容错参数会影响数据超长、字符串转数值、除 0 等行为。验证失败如果是“字符串转数值失败”“除数为 0”“超出列长度”，不能只从 mapper SQL 判断，需要同时看实例容错策略和测试数据。
 - MySQL 的 `database` 通常迁移为达梦的 `schema`。验证 SQL 时不能默认所有对象都在当前 schema，跨库 SQL 要么映射到多个 schema，要么明确跳过缺失库表。
@@ -21,7 +21,7 @@
 
 ## 类型和对象差异
 
-- MySQL `VARCHAR(n)`/`CHAR(n)` 按字符语义使用时，应确保达梦侧采用字符长度语义，或在 DDL 转换时按 `utf8` 3 字节、`utf8mb4` 4 字节放大长度；否则 `'审核通过'` 等中文默认值和查询写入临时表时可能报列长度超出定义。
+- MySQL `VARCHAR(n)`/`CHAR(n)` 迁移到 `LENGTH_IN_CHAR=0` 的达梦实例时，应定义为 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`，保持原字符数上限。不要按 `utf8` 3 倍或 `utf8mb4` 4 倍修改 `n`：倍数扩长只能增加字节容量，还会允许写入超过 MySQL 上限的较短字节字符。达梦 DTS 的 MySQL 类型映射同样使用 `VARCHAR(n char)`/`CHAR(n char)`。
 - MySQL `TEXT`、`LONGTEXT`、`JSON` 等类型迁移到达梦时通常需要映射到大字段或字符串类型，并检查业务是否依赖 MySQL JSON 函数。
 - 自增列迁移后要特别处理。MySQL `AUTO_INCREMENT` 可对应达梦 `IDENTITY(start, increment)` 或迁移工具提供的 `auto_increment` 兼容方案；`IDENTITY` 自增列类型只能使用 `INT` 或 `BIGINT`。脚本里无列清单的 `INSERT INTO t VALUES(NULL, ...)` / `VALUES(DEFAULT, ...)` 如果首列明确是自增列，可省略该列和值，让达梦继续自动生成主键；显式插入具体 id 且列清单可从同脚本表定义确定时，可补列清单并用 `SET IDENTITY_INSERT ... ON/OFF` 保留种子 id。验证中出现“仅当指定列列表，且 SET IDENTITY_INSERT 为 ON 时，才能对自增列赋值”时，通常不是 SQL 语法转换问题，而是测试数据、表结构或业务插入策略问题。
 - 触发器、函数、存储过程、视图、事件、外键、索引等对象不能只靠 mapper SQL 验证判断完整性。缺对象导致的 `无效的表或视图名`、`无效的列名`、`无法解析成员访问表达式`，优先归类为测试库对象缺失或原始 SQL 引用错误。

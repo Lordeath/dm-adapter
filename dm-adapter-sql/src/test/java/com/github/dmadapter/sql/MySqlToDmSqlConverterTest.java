@@ -608,13 +608,12 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).isEqualTo("""
                 create table if not exists tmp_budget_payment_receipt (
                   `id` bigint NOT NULL IDENTITY(1,1),
-                  `chargeItem` varchar(600) DEFAULT NULL,
+                  `chargeItem` varchar(200) DEFAULT NULL,
                   PRIMARY KEY (`id`)
                 )
                 """);
         assertThat(result.appliedRules()).containsExactly(
                 MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE,
-                MySqlToDmSqlConverter.MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE,
                 MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
@@ -622,7 +621,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void expandsMysqlUtf8CharacterColumnLengthsForDamengBytes() {
+    void preservesMysqlCharacterColumnLengthsWhenRemovingCharacterSets() {
         SqlConversionResult result = converter.convert("""
                 create table tmp_charge_precinct (
                   `IsCheck` varchar(10) CHARACTER SET utf8 DEFAULT '审核通过',
@@ -634,13 +633,12 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table tmp_charge_precinct (
-                  `IsCheck` varchar(30) DEFAULT '审核通过',
-                  `EmojiName` varchar(40) DEFAULT NULL,
-                  `Flag` char(8) DEFAULT NULL
+                  `IsCheck` varchar(10) DEFAULT '审核通过',
+                  `EmojiName` varchar(10) DEFAULT NULL,
+                  `Flag` char(2) DEFAULT NULL
                 )
                 """);
         assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE,
                 MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE
         );
     }
@@ -813,12 +811,9 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .contains("name varchar(80) DEFAULT NULL")
+                .contains("name varchar(20) DEFAULT NULL")
                 .doesNotContainIgnoringCase("CHARACTER SET");
-        assertThat(result.appliedRules()).contains(
-                MySqlToDmSqlConverter.MYSQL_UTF8_CHARACTER_TYPE_LENGTH_RULE,
-                MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE
-        );
+        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE);
     }
 
     @Test
