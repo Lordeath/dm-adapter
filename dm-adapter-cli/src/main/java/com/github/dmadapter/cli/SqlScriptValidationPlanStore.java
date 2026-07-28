@@ -44,13 +44,23 @@ final class SqlScriptValidationPlanStore {
                         "Cannot create a strict SQL validation plan because an output file is missing: " + output
                 );
             }
+            byte[] outputBytes = Files.readAllBytes(output);
+            List<String> writtenStatements = SqlScriptParser.statements(
+                    new String(outputBytes, StandardCharsets.UTF_8)
+            );
+            if (writtenStatements.size() != file.statements().size()) {
+                throw new IllegalArgumentException(
+                        "Cannot create a strict SQL validation plan because the written statement count "
+                                + "does not match the migration result: " + output
+                );
+            }
             List<ValidationPlanStatement> statements = new ArrayList<>();
-            for (int index = 0; index < file.statements().size(); index++) {
+            for (int index = 0; index < writtenStatements.size(); index++) {
                 int statementIndex = index + 1;
                 boolean manual = file.manualReviewStatementIndexes().contains(statementIndex);
                 statements.add(new ValidationPlanStatement(
                         statementIndex,
-                        sha256(file.statements().get(index).getBytes(StandardCharsets.UTF_8)),
+                        sha256(writtenStatements.get(index).getBytes(StandardCharsets.UTF_8)),
                         manual ? "MANUAL_REVIEW" : "EXECUTE",
                         manual
                                 ? manualReasons.getOrDefault(
@@ -65,7 +75,7 @@ final class SqlScriptValidationPlanStore {
                     output.toString(),
                     file.schema(),
                     file.systemScript(),
-                    sha256(Files.readAllBytes(output)),
+                    sha256(outputBytes),
                     file.appliedRules(),
                     statements
             ));

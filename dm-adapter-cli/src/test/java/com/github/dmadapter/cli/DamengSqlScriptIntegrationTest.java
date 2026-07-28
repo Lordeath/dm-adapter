@@ -16,10 +16,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 @EnabledIfEnvironmentVariable(named = "DM_ADAPTER_RUN_INTEGRATION_TESTS", matches = "(?i)true")
 class DamengSqlScriptIntegrationTest {
     @Test
-    void createsCallsAndCleansIsolatedCurrentSchemaProcedure() throws Exception {
+    void createsCallsAndCleansIsolatedTargetSchemaProcedure() throws Exception {
         String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
         String username = requiredEnvironment("DM_DB_USERNAME");
         String password = requiredEnvironment("DM_DB_PASSWORD");
+        String schema = "newsee-system";
         String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
         String table = "DM_ADAPTER_IT_T_" + suffix;
         String procedure = "DM_ADAPTER_IT_P_" + suffix;
@@ -27,13 +28,13 @@ class DamengSqlScriptIntegrationTest {
         Class.forName("dm.jdbc.driver.DmDriver");
         try (Connection connection = DriverManager.getConnection(jdbcUrl, username, password);
              Statement statement = connection.createStatement()) {
-            statement.execute("SET SCHEMA \"newsee-system\"");
+            statement.execute("SET SCHEMA \"" + schema + "\"");
             try {
                 statement.execute("CREATE TABLE " + table + " (ID INT)");
                 statement.execute("""
                         CREATE OR REPLACE PROCEDURE %s() AS
                             dm_adapter_schema VARCHAR(128)
-                                := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');
+                                := '%s';
                             dm_adapter_exists INT;
                         BEGIN
                             SELECT COUNT(*) INTO dm_adapter_exists
@@ -46,7 +47,7 @@ class DamengSqlScriptIntegrationTest {
                                     'ALTER TABLE %s ADD `paramName` VARCHAR(255) DEFAULT NULL';
                             END IF;
                         END
-                        """.formatted(procedure, table, table));
+                        """.formatted(procedure, schema, table, table));
                 statement.execute("CALL " + procedure + "()");
                 try (PreparedStatement metadata = connection.prepareStatement("""
                         SELECT COLUMN_NAME

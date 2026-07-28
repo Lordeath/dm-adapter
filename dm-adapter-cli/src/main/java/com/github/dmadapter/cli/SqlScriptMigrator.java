@@ -1546,7 +1546,10 @@ class SqlScriptMigrator {
                 + ", outputStatements=" + convertedStatements.size()
                 + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
 
-        MetadataSchemaBinding metadataSchemaBinding = bindMetadataSchemaAtProcedureCalls(convertedStatements);
+        MetadataSchemaBinding metadataSchemaBinding = bindMetadataSchemaAtProcedureCalls(
+                convertedStatements,
+                targetSchema
+        );
         if (metadataSchemaBinding.changed()) {
             convertedStatements = new ArrayList<>(metadataSchemaBinding.statements());
             appliedRules.add(DM_METADATA_SCHEMA_LOCAL_VARIABLE_RULE);
@@ -1594,7 +1597,10 @@ class SqlScriptMigrator {
         return stripped;
     }
 
-    private MetadataSchemaBinding bindMetadataSchemaAtProcedureCalls(List<String> statements) {
+    private MetadataSchemaBinding bindMetadataSchemaAtProcedureCalls(
+            List<String> statements,
+            String targetSchema
+    ) {
         LinkedHashSet<String> procedures = new LinkedHashSet<>();
         for (String statement : statements) {
             String procedureName = procedureNameFromCreateProcedure(statement);
@@ -1612,7 +1618,7 @@ class SqlScriptMigrator {
             String rewritten = statement;
             if (!procedureName.isBlank()
                     && procedures.contains(procedureName.toLowerCase(Locale.ROOT))) {
-                rewritten = addMetadataSchemaLocalVariable(rewritten);
+                rewritten = addMetadataSchemaLocalVariable(rewritten, targetSchema);
             } else if (!procedureNameFromCall(statement).isBlank()) {
                 rewritten = removeLegacyMetadataSchemaCallArgument(rewritten, procedures);
             }
@@ -1630,7 +1636,7 @@ class SqlScriptMigrator {
                 .find();
     }
 
-    private String addMetadataSchemaLocalVariable(String sql) {
+    private String addMetadataSchemaLocalVariable(String sql, String targetSchema) {
         String schemaBoundSql = replaceOutsideIgnoredText(
                 sql,
                 Pattern.compile(
@@ -1665,9 +1671,13 @@ class SqlScriptMigrator {
             return sql;
         }
         int insertionPoint = declarationStart.end();
+        String schemaInitializer = targetSchema == null || targetSchema.isBlank()
+                ? "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                : sqlStringLiteral(targetSchema);
         return schemaBoundSql.substring(0, insertionPoint)
                 + "\n    dm_adapter_schema VARCHAR(128) := "
-                + "SYS_CONTEXT('USERENV','CURRENT_SCHEMA');"
+                + schemaInitializer
+                + ";"
                 + schemaBoundSql.substring(insertionPoint);
     }
 
