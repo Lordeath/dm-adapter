@@ -12,6 +12,7 @@ import java.sql.Statement;
 import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @EnabledIfEnvironmentVariable(named = "DM_ADAPTER_RUN_INTEGRATION_TESTS", matches = "(?i)true")
 class DamengSqlScriptIntegrationTest {
@@ -20,7 +21,7 @@ class DamengSqlScriptIntegrationTest {
         String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
         String username = requiredEnvironment("DM_DB_USERNAME");
         String password = requiredEnvironment("DM_DB_PASSWORD");
-        String schema = "newsee-system";
+        String schema = optionalEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA", "newsee-system");
         String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
         String table = "DM_ADAPTER_IT_T_" + suffix;
         String procedure = "DM_ADAPTER_IT_P_" + suffix;
@@ -44,13 +45,13 @@ class DamengSqlScriptIntegrationTest {
                               AND UPPER(COLUMN_NAME) = UPPER('paramName');
                             IF dm_adapter_exists = 0 THEN
                                 EXECUTE IMMEDIATE
-                                    'ALTER TABLE %s ADD `paramName` VARCHAR(255) DEFAULT NULL';
+                                    'ALTER TABLE %s ADD `paramName` VARCHAR(10 CHAR) DEFAULT NULL';
                             END IF;
                         END
                         """.formatted(procedure, schema, table, table));
                 statement.execute("CALL " + procedure + "()");
                 try (PreparedStatement metadata = connection.prepareStatement("""
-                        SELECT COLUMN_NAME
+                        SELECT COLUMN_NAME, CHAR_LENGTH, CHAR_USED
                         FROM ALL_TAB_COLUMNS
                         WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
                           AND UPPER(TABLE_NAME) = UPPER(?)
@@ -60,7 +61,24 @@ class DamengSqlScriptIntegrationTest {
                     try (ResultSet resultSet = metadata.executeQuery()) {
                         assertThat(resultSet.next()).isTrue();
                         assertThat(resultSet.getString(1)).isEqualTo("paramName");
+                        assertThat(resultSet.getInt(2)).isEqualTo(10);
+                        assertThat(resultSet.getString(3)).isEqualTo("C");
                     }
+                }
+                try (PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO " + table + " (ID, `paramName`) VALUES (?, ?)"
+                )) {
+                    insert.setInt(1, 1);
+                    insert.setString(2, "审核通过审核通过审核");
+                    assertThat(insert.executeUpdate()).isEqualTo(1);
+
+                    insert.setInt(1, 2);
+                    insert.setString(2, "😀😀😀😀😀😀😀😀😀😀");
+                    assertThat(insert.executeUpdate()).isEqualTo(1);
+
+                    insert.setInt(1, 3);
+                    insert.setString(2, "😀😀😀😀😀😀😀😀😀😀😀");
+                    assertThatThrownBy(insert::executeUpdate).isInstanceOf(Exception.class);
                 }
             } finally {
                 dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + procedure);
@@ -73,6 +91,11 @@ class DamengSqlScriptIntegrationTest {
         String value = System.getenv(name);
         Assumptions.assumeTrue(value != null && !value.isBlank(), name + " is required");
         return value;
+    }
+
+    private String optionalEnvironment(String name, String defaultValue) {
+        String value = System.getenv(name);
+        return value == null || value.isBlank() ? defaultValue : value;
     }
 
     private void dropQuietly(Statement statement, String sql) {
