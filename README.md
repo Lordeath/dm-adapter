@@ -12,7 +12,7 @@
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
 - 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页、`DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`、`CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`、`FROM/JOIN ... AS 别名` -> `FROM/JOIN ... 别名`，并将 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦特殊列名重命名为追加下划线形式。
 - 支持通过应用工作目录中的 `sql-rewrite.yml` 配置 `keyColumns`，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；配置达梦验证环境变量后，`migrate` 会优先从测试库主键/唯一键元数据自动推断并维护该配置，无法确认时保留原 SQL 并写入报告。
-- 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore、反引号标识符等标记为人工确认。
+- 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore 等标记为人工确认；达梦 MySQL 兼容模式可执行的反引号标识符默认保留。
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类，在工具侧应用工作目录生成 `sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean；若 `DM_SQL_VALIDATION=true` 且连接环境变量齐全，生成后会自动执行一次验证测试并输出报告路径。
 - 默认将配置、Markdown/JSON 报告和验证临时文件输出到 `<当前命令目录>/.dm-adapter/<应用 artifactId>/`，不在业务项目中创建 `.dm-adapter`。
 
@@ -35,6 +35,12 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 
+# 离线转换 SQL 脚本时显式声明目标库字符长度语义；BYTE 会按可识别的 utf8/utf8mb4 源字符集换算。
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
+  --project ./demo --sql-scripts-only \
+  --sql-root ./sql/v2 --sql-root-out ./sql/v2-dm \
+  --schema sample-system --target-length-semantics BYTE
+
 # 需要自定义完整应用工作目录时，--report-dir 的值就是最终目录，不会再追加 artifactId。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --report-dir /data/dm-work/demo-rest
 
@@ -42,7 +48,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 
-以上命令从 `dm-adapter` 目录执行时，默认应用工作目录为 `dm-adapter/.dm-adapter/demo-rest/`。目录名优先取 `--app-module` 定位到的 Maven `artifactId`；未传时自动发现唯一 Spring Boot 应用模块，无法唯一发现时回退到根 POM `artifactId` 和 `--project` 目录名。`scan`、`migrate`、`report`、`generate-validation-test` 使用同一规则。升级前业务项目中已有的 `sql-rewrite.yml`、`sql-validation.yml` 会在新目录缺文件时首次复制，旧文件不会删除或覆盖新文件。
+以上命令从 `dm-adapter` 目录执行时，默认应用工作目录为 `dm-adapter/.dm-adapter/demo-rest/`。目录名优先取 `--app-module` 定位到的 Maven `artifactId`；未传时自动发现唯一 Spring Boot 应用模块，无法唯一发现时回退到根 POM `artifactId` 和 `--project` 目录名。`scan`、`migrate`、`validate-sql`、`report`、`generate-validation-test` 使用同一规则。升级前业务项目中已有的 `sql-rewrite.yml`、`sql-validation.yml` 会在新目录缺文件时首次复制，旧文件不会删除或覆盖新文件。
 
 生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。配置以下环境变量后，`generate-validation-test` 会在生成后自动运行一次；也可以在达梦测试环境中手动运行：
 
@@ -56,15 +62,36 @@ DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
 mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest test
 ```
 
+SQL 脚本迁移的非 dry-run 会在应用工作目录生成
+`sql-script-validation-plan.json`。清单固化输出文件、目标 schema、数据库能力快照、人工确认项以及文件/语句 SHA-256。需要稍后单独执行时，使用：
+
+```bash
+DM_SQL_VALIDATION=true \
+DM_JDBC_URL=jdbc:dm://host:5236 \
+DM_DB_USERNAME=user \
+DM_DB_PASSWORD=password \
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar validate-sql \
+  --project /path/to/demo
+```
+
+`validate-sql` 只接受该迁移清单，不提供执行任意 SQL 目录的旁路。文件内容、语句切分、项目目录、schema、`LENGTH_IN_CHAR` 或 `COMPATIBLE_MODE` 与清单不一致时，会在执行任何 SQL 前失败。清单中的人工确认项只跳过对应语句；其他互不依赖语句继续验证。结果写入 `sql-script-validation-report.md/json`。
+
 测试直接用应用工作目录中 `sql-validation.yml` 的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。CLI 自动传递工作目录；手工 Maven 运行时需通过 `-Ddm.adapter.dir=...` 或 `DM_ADAPTER_DIR` 指定，并可通过 `dm.adapter.projectRoot` 指定业务项目根目录。配置 `--schema` 后，测试会先对全部 schema 做项目级前置检查；任一 schema 无效时只报告一次根因，不执行 Mapper SQL。前置检查通过后，仍会在每次 DAO 调用前执行 `set schema "<schema>"`。执行结果写入同一工作目录的 `sql-validation-report.md` 和 `sql-validation-report.json`。
 
-> **数据库写入警告：** `DM_SQL_VALIDATION=true` 是数据库验证的唯一开关。使用 `migrate --sql-root ... --sql-root-out ...` 时，工具会按文件顺序完整执行转换后的 SQL 脚本，连接保持自动提交，不自动回滚、不缓存，也不会跳过已执行文件。这会真实修改共享测试库；业务脚本必须自行保证幂等，并且只能连接可接受变更的测试环境。
+> **数据库写入警告：** `DM_SQL_VALIDATION=true` 是数据库验证的唯一开关。使用 `migrate --sql-root ... --sql-root-out ...` 或 `validate-sql` 时，工具会按清单顺序执行未标记人工确认的 SQL，连接保持自动提交且不自动回滚。这会真实修改共享测试库；业务脚本必须自行保证幂等，并且只能连接可接受变更的测试环境。连接信息只能通过当前会话环境变量提供，不会写入仓库、清单或报告。
+
+### DBeaver 执行生成脚本
+
+生成脚本保留 `DROP PROCEDURE IF EXISTS`、`CREATE OR REPLACE PROCEDURE`、`CALL`、再次 `DROP` 的生命周期，并使用单独一行 `/` 结束过程块。在 DBeaver 中应使用“执行 SQL 脚本”（Windows/Linux 默认 `Alt+X`），不要选中整段后使用“执行 SQL 语句”（默认 `Ctrl+Enter`），否则多个语句可能被一次发送并在第二个 `PROCEDURE` 附近报语法错误。连接的 SQL Processing 设置中需保留 `;` 语句分隔符，并将 `/` 配置为脚本/过程块分隔符。
+
+临时过程不再接收 schema 参数；过程内部通过
+`SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` 初始化一次局部变量，调用统一为 `CALL procedure_name()`。反引号字段名用于保留源字段大小写，因此包含反引号的脚本要求目标达梦实例 `COMPATIBLE_MODE=4`。
 
 数据库验证的总时限由 `DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS` 控制，默认 `7200` 秒（2 小时），SQL 脚本验证和 Mapper 验证共享同一时限。Mapper 验证每累计 50 条记录会原子更新报告；超时或进程中断后可读取已完成部分。新一轮运行开始前，上一轮报告会保留为 `sql-validation-report.previous.md/json`。
 
 每次 `migrate` 还会在应用工作目录生成 `dm-adapter-summary.md` 和 `dm-adapter-summary.json`，汇总迁移、SQL 脚本验证、Mapper 验证三阶段状态、根因/级联阻塞数、人工确认降噪统计和详细报告链接。`report` 命令优先读取该摘要，旧工作目录则回退到原迁移报告。
 
-CLI 退出码约定：`0` 表示请求的迁移/验证成功或未请求数据库验证，`1` 表示工具内部错误，`2` 表示项目路径无效或不是 Maven 项目，`3` 表示数据库验证存在 SQL 根因失败，`4` 表示连接、schema 前置检查、验证环境或总时限问题。
+CLI 退出码约定：`0` 表示请求的迁移/验证成功或未请求数据库验证，`1` 表示工具内部错误，`2` 表示项目路径无效或不是 Maven 项目，`3` 表示数据库验证存在 SQL 根因失败或仍有人工确认项，`4` 表示清单、连接、schema、数据库能力前置检查、验证环境或总时限问题。
 
 同一组环境变量也会被 `migrate` 用于只读读取达梦元数据：优先使用 CLI `--schema` / 应用工作目录 `sql-validation.yml` 中的 `schema`，其次使用 JDBC URL 的 `schema` 参数、连接默认 schema 或用户名。自动推断只写入表名、方法名和 `keyColumns`，不会把连接串、用户名或密码写入仓库文件。
 

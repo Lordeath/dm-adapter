@@ -1,5 +1,7 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.core.DamengTargetCapabilities;
+
 import java.nio.file.Path;
 import java.util.List;
 
@@ -11,10 +13,15 @@ record SqlScriptMigrationRequest(
         String schema,
         String systemSchema,
         List<Path> preservedSqlPaths,
-        DmValidationEnvironment validationEnvironment
+        DmValidationEnvironment validationEnvironment,
+        DamengTargetCapabilities targetCapabilities,
+        Path validationPlan
 ) {
     SqlScriptMigrationRequest {
         preservedSqlPaths = List.copyOf(preservedSqlPaths == null ? List.of() : preservedSqlPaths);
+        targetCapabilities = targetCapabilities == null
+                ? DamengTargetCapabilities.unknown()
+                : targetCapabilities;
     }
 
     SqlScriptMigrationRequest(
@@ -26,6 +33,41 @@ record SqlScriptMigrationRequest(
             String systemSchema,
             DmValidationEnvironment validationEnvironment
     ) {
-        this(projectRoot, sqlRoot, sqlRootOut, dryRun, schema, systemSchema, List.of(), validationEnvironment);
+        this(
+                projectRoot,
+                sqlRoot,
+                sqlRootOut,
+                dryRun,
+                schema,
+                systemSchema,
+                List.of(),
+                validationEnvironment,
+                DamengTargetCapabilities.offline(com.github.dmadapter.core.TargetLengthSemantics.CHAR),
+                null
+        );
+    }
+
+    SqlScriptMigrationRequest(
+            Path projectRoot,
+            Path sqlRoot,
+            Path sqlRootOut,
+            boolean dryRun,
+            String schema,
+            String systemSchema,
+            List<Path> preservedSqlPaths,
+            DmValidationEnvironment validationEnvironment
+    ) {
+        this(
+                projectRoot,
+                sqlRoot,
+                sqlRootOut,
+                dryRun,
+                schema,
+                systemSchema,
+                preservedSqlPaths,
+                validationEnvironment,
+                DamengTargetCapabilities.offline(com.github.dmadapter.core.TargetLengthSemantics.CHAR),
+                null
+        );
     }
 }

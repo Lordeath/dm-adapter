@@ -8,6 +8,8 @@ import com.github.dmadapter.core.MapperMigrationResult;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
+import com.github.dmadapter.core.DamengTargetCapabilities;
+import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.maven.PomModifier;
 import com.github.dmadapter.maven.PomTargetSelection;
 import com.github.dmadapter.maven.PomTargetSelector;
@@ -91,6 +93,12 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = {"--system-schema", "--system_schema"}, description = "Dameng schema for validating *_system.sql scripts.")
     private String systemSchema;
 
+    @Option(
+            names = "--target-length-semantics",
+            description = "Dameng character length semantics for offline SQL migration: ${COMPLETION-CANDIDATES}."
+    )
+    private TargetLengthSemantics targetLengthSemantics;
+
     private final ProjectScanner projectScanner = new ProjectScanner();
     private final PomModifier pomModifier = new PomModifier();
     private final PomTargetSelector pomTargetSelector = new PomTargetSelector();
@@ -117,6 +125,7 @@ public class MigrateCommand implements Callable<Integer> {
     );
     private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
     private final LegacyWorkspaceMigrator legacyWorkspaceMigrator = new LegacyWorkspaceMigrator();
+    private final DamengTargetCapabilitiesReader targetCapabilitiesReader = new DamengTargetCapabilitiesReader();
 
     @Override
     public Integer call() {
@@ -696,6 +705,7 @@ public class MigrateCommand implements Callable<Integer> {
         if (!sqlScriptMigrationRequested()) {
             return null;
         }
+        DamengTargetCapabilities targetCapabilities = resolveTargetCapabilities(validationEnvironment);
         SqlScriptMigrationReport report = sqlScriptMigrator.migrate(new SqlScriptMigrationRequest(
                 context.projectRoot(),
                 sqlRoot,
@@ -704,10 +714,48 @@ public class MigrateCommand implements Callable<Integer> {
                 configuredSchema(context).orElse(""),
                 systemSchema,
                 preservedSqlPaths,
-                validationEnvironment
+                validationEnvironment,
+                targetCapabilities,
+                context.reportDir().resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME)
         ));
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
         return new SqlScriptReportResult(report, reportPaths);
+    }
+
+    private DamengTargetCapabilities resolveTargetCapabilities(DmValidationEnvironment environment) {
+        DamengTargetCapabilities detected = DamengTargetCapabilities.unknown();
+        if (environment != null && environment.ready()) {
+            try {
+                detected = runWithMetadataTimeout(
+                        () -> targetCapabilitiesReader.read(environment),
+                        DEFAULT_METADATA_READ_TIMEOUT_SECONDS,
+                        TimeUnit.SECONDS,
+                        "Dameng target capability lookup"
+                );
+            } catch (Exception e) {
+                throw new DmAdapterException(
+                        "Dameng target capability preflight failed before SQL execution. "
+                                + "Verify the validation connection and V$DM_INI read permission.",
+                        e
+                );
+            }
+        }
+        if (detected.lengthSemantics() != null
+                && targetLengthSemantics != null
+                && detected.lengthSemantics() != targetLengthSemantics) {
+            throw new DmAdapterException(
+                    "--target-length-semantics=" + targetLengthSemantics
+                            + " conflicts with target database LENGTH_IN_CHAR="
+                            + (detected.lengthSemantics() == TargetLengthSemantics.CHAR ? "1" : "0")
+            );
+        }
+        if (detected.lengthSemantics() != null) {
+            return detected;
+        }
+        if (targetLengthSemantics != null) {
+            return DamengTargetCapabilities.offline(targetLengthSemantics);
+        }
+        return detected;
     }
 
     private void printMigrationSummary(

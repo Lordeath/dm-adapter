@@ -106,6 +106,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         List<SqlScriptValidationFailure> failures = new ArrayList<>();
         List<SqlScriptFileValidation> fileValidations = new ArrayList<>();
         Map<String, Integer> failedCreatedObjects = new LinkedHashMap<>();
+        Map<String, DdlLocation> recentObjectDdl = new LinkedHashMap<>();
         int successCount = 0;
         long connectionStartedAt = System.nanoTime();
         ScheduledFuture<?> connectionWarning = scheduleSlowOperation(
@@ -148,6 +149,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         environment,
                         diagnostics,
                         failedCreatedObjects,
+                        recentObjectDdl,
                         fileIndex + 1,
                         files.size()
                 );
@@ -218,6 +220,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             DmValidationEnvironment environment,
             ScheduledExecutorService diagnostics,
             Map<String, Integer> failedCreatedObjects,
+            Map<String, DdlLocation> recentObjectDdl,
             int fileIndex,
             int fileCount
     ) {
@@ -273,6 +276,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                     statementStartedAt
             );
             CreatedObject createdObject = createdObject(sql);
+            String alteredObject = alteredObject(sql);
             try (Statement statement = connection.createStatement()) {
                 configureStatement(statement, environment);
                 statement.execute(sql);
@@ -304,11 +308,20 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                     }
                     failedCreatedObjects.remove(createdObject.key());
                 }
+                if (!alteredObject.isBlank()) {
+                    recentObjectDdl.put(
+                            alteredObject,
+                            new DdlLocation(file.sourceDisplay(), statementIndex, compact(sql))
+                    );
+                }
                 successCount++;
             } catch (Exception e) {
                 String blockedObject = blockedObject(sql, failedCreatedObjects.keySet());
                 String category = blockedObject.isBlank() ? classify(e) : "BLOCKED_BY_PRIOR_FAILURE";
                 String errorSummary = compact(redact(safeMessage(e), environment));
+                if ("OBJECT_DEFINITION_CHANGED".equals(category)) {
+                    errorSummary = objectDefinitionChangedSummary(errorSummary, e, recentObjectDdl);
+                }
                 if (!blockedObject.isBlank()) {
                     errorSummary = compact("Blocked by failed statement "
                             + failedCreatedObjects.get(blockedObject)
@@ -518,6 +531,47 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 .toUpperCase(Locale.ROOT);
     }
 
+    private String alteredObject(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b(?:ALTER|CREATE|DROP|TRUNCATE)\\s+TABLE\\s+(?:IF\\s+(?:NOT\\s+)?EXISTS\\s+)?"
+                        + "([`\"\\w.$-]+)"
+        ).matcher(sql == null ? "" : sql);
+        return matcher.find() ? normalizedObject(matcher.group(1)) : "";
+    }
+
+    private String objectDefinitionChangedSummary(
+            String summary,
+            Exception exception,
+            Map<String, DdlLocation> recentObjectDdl
+    ) {
+        String message = safeMessage(exception);
+        Matcher object = Pattern.compile("(?is)(?:对象定义|object definition)\\s*\\[([^]]+)]").matcher(message);
+        String objectName = object.find() ? normalizedObject(object.group(1)) : "";
+        DdlLocation location = recentObjectDdl.get(objectName);
+        if (location == null && !objectName.isBlank()) {
+            location = recentObjectDdl.entrySet().stream()
+                    .filter(entry -> entry.getKey().endsWith("." + objectName)
+                            || objectName.endsWith("." + entry.getKey()))
+                    .map(Map.Entry::getValue)
+                    .findFirst()
+                    .orElse(null);
+        }
+        String advice = "达梦错误 -7184：过程执行计划引用的对象定义已变化；"
+                + "请检查过程创建后、调用前的 DDL，并重新编译过程。工具不会修改 PL_SQL_STRIP 或自动重试。";
+        if (location == null) {
+            return compact(summary + " | " + advice);
+        }
+        return compact(summary
+                + " | 最近相关 DDL："
+                + location.sourceFile()
+                + " 第 "
+                + location.statementIndex()
+                + " 条 SQL："
+                + location.sqlSummary()
+                + " | "
+                + advice);
+    }
+
     static int statementTimeoutSeconds() {
         Integer propertyValue = Integer.getInteger(STATEMENT_TIMEOUT_PROPERTY);
         if (propertyValue != null && propertyValue > 0) {
@@ -648,6 +702,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             return "OBJECT_STATUS_VALIDATION_FAILED";
         }
         String message = safeMessage(e).toLowerCase(Locale.ROOT);
+        if (damengErrorCode(e) == -7184
+                || damengErrorCode(e) == 7184
+                || message.contains("-7184")
+                || message.contains("对象定义") && message.contains("版本")) {
+            return "OBJECT_DEFINITION_CHANGED";
+        }
         if (message.contains("无效的表") || message.contains("无效的视图")
                 || message.contains("无效的列") || message.contains("无效的模式")) {
             return "TEST_SCHEMA_OBJECT";
@@ -659,6 +719,17 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             return "SQL_SYNTAX";
         }
         return "SQL_EXECUTION";
+    }
+
+    private int damengErrorCode(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof SQLException sqlException && sqlException.getErrorCode() != 0) {
+                return sqlException.getErrorCode();
+            }
+            current = current.getCause();
+        }
+        return 0;
     }
 
     private String safeMessage(Exception e) {
@@ -714,6 +785,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     }
 
     private record CreatedObjectStatus(String status) {
+    }
+
+    private record DdlLocation(String sourceFile, int statementIndex, String sqlSummary) {
     }
 
     private static final class InvalidCreatedObjectException extends SQLException {

@@ -1,7 +1,9 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
+import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -629,7 +631,8 @@ class SqlScriptMigratorTest {
 
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
-                .contains("CREATE OR REPLACE PROCEDURE modify_details(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
+                .contains("CREATE OR REPLACE PROCEDURE modify_details() AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');")
                 .contains("LOWER(DATA_TYPE) IN ('char', 'varchar')")
                 .contains("CHAR_LENGTH < 1000")
                 .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` varchar(1000) DEFAULT NULL'");
@@ -825,7 +828,8 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON, dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
+                .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON) AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');")
                 .contains("dm_has_menu_ver BIGINT;")
                 .contains("dm_new_form_data VARCHAR(4000);")
                 .contains("dm_roleId VARCHAR(4000);")
@@ -2065,7 +2069,8 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE OR REPLACE PROCEDURE add_prefix_index(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
+                .contains("CREATE OR REPLACE PROCEDURE add_prefix_index() AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');")
                 .contains("dm_adapter_exists INT;")
                 .contains("dm_adapter_exists_2 INT;")
                 .contains("ALL_IND_COLUMNS")
@@ -2729,10 +2734,11 @@ class SqlScriptMigratorTest {
                 .contains("ALL_TAB_COLUMNS")
                 .contains("ALL_TABLES")
                 .contains("FROM ALL_IND_COLUMNS")
-                .contains("CREATE OR REPLACE PROCEDURE add_col(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
+                .contains("CREATE OR REPLACE PROCEDURE add_col() AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');")
                 .contains("INDEX_OWNER = dm_adapter_schema")
                 .contains("OWNER = dm_adapter_schema")
-                .contains("CALL add_col(SYS_CONTEXT('USERENV','CURRENT_SCHEMA'))")
+                .contains("CALL add_col()")
                 .contains("HAVING COUNT(*) = 1")
                 .contains("UPPER(COLUMN_NAME) = UPPER('code')")
                 .contains("NULLABLE = 'YES'")
@@ -2821,7 +2827,8 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE OR REPLACE PROCEDURE rebuild_view_and_constraints(dm_adapter_schema IN VARCHAR DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')) AS")
+                .contains("CREATE OR REPLACE PROCEDURE rebuild_view_and_constraints() AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');")
                 .contains("FROM (SELECT OWNER, OWNER AS TABLE_SCHEMA, VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS)")
                 .contains("FROM (SELECT USERNAME AS SCHEMA_NAME FROM ALL_USERS)")
                 .contains("FROM (SELECT OWNER, OWNER AS CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME")
@@ -3378,6 +3385,47 @@ class SqlScriptMigratorTest {
                 .doesNotContain("jdbc:dm://db-host:5236")
                 .doesNotContain("APP_USER")
                 .doesNotContain("APP_SECRET");
+    }
+
+    @Test
+    void classifiesObjectDefinitionVersionFailuresAndReportsRecentDdl() {
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                if (sql.startsWith("CALL")) {
+                    throw new SQLException(
+                            "对象定义[demo]被修改，版本检查失败 -7184: refresh_demo line 8",
+                            "42000",
+                            -7184
+                    );
+                }
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "version.sql",
+                        "",
+                        List.of(
+                                "ALTER TABLE demo ADD status INT",
+                                "CALL refresh_demo()"
+                        )
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("OBJECT_DEFINITION_CHANGED");
+            assertThat(failure.errorSummary())
+                    .contains("-7184")
+                    .contains("最近相关 DDL")
+                    .contains("第 1 条 SQL");
+        });
     }
 
     @Test
@@ -4117,6 +4165,379 @@ class SqlScriptMigratorTest {
         ));
 
         assertThat(report.manualReviewSqlCount()).isZero();
+    }
+
+    @Test
+    void rewritesQuotedLengthEqualityToSafeExpansionAndKeepsSchemaLocal() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS change_col_ns_contract_bpm_bpmurl;
+
+                CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl() AS
+                    dm_adapter_exists INT;
+                BEGIN
+                    SELECT COUNT(*) INTO dm_adapter_exists FROM (
+                        SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS
+                        WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                          AND TABLE_NAME = 'ns_contract_bpm'
+                          AND COLUMN_NAME = 'bpmUrl'
+                          AND CHAR_LENGTH = '300'
+                    ) dm_adapter_exists_check;
+                    IF dm_adapter_exists = 0 THEN
+                        EXECUTE IMMEDIATE 'ALTER TABLE ns_contract_bpm MODIFY bpmUrl varchar(300) DEFAULT NULL';
+                    END IF;
+                END;
+                /
+
+                CALL change_col_ns_contract_bpm_bpmurl();
+                DROP PROCEDURE IF EXISTS change_col_ns_contract_bpm_bpmurl;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl() AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');")
+                .contains("OWNER = dm_adapter_schema")
+                .contains("UPPER(TABLE_NAME) = UPPER('ns_contract_bpm')")
+                .contains("UPPER(COLUMN_NAME) = UPPER('bpmUrl')")
+                .contains("UPPER(DATA_TYPE) IN ('CHAR', 'VARCHAR', 'VARCHAR2') AND CHAR_LENGTH < 300")
+                .contains("IF dm_adapter_exists > 0 THEN")
+                .contains("CALL change_col_ns_contract_bpm_bpmurl()")
+                .doesNotContain("dm_adapter_schema IN VARCHAR")
+                .doesNotContain("CALL change_col_ns_contract_bpm_bpmurl(SYS_CONTEXT");
+    }
+
+    @Test
+    void removesLegacyCurrentSchemaParameterFromLowCodeProcedure() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS change_col_ns_contract_bpm_bpmurl;
+
+                CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl (
+                    dm_adapter_schema IN VARCHAR
+                        DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                ) AS
+                    dm_adapter_exists INT;
+                BEGIN
+                    SELECT COUNT(*) INTO dm_adapter_exists FROM (
+                        SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS
+                        WHERE OWNER = dm_adapter_schema
+                          AND UPPER(TABLE_NAME) = UPPER('ns_contract_bpm')
+                          AND UPPER(COLUMN_NAME) = UPPER('bpmUrl')
+                          AND CHAR_LENGTH = '300'
+                    ) dm_adapter_exists_check;
+                    IF dm_adapter_exists = 0 THEN
+                        EXECUTE IMMEDIATE
+                            'ALTER TABLE ns_contract_bpm MODIFY bpmUrl varchar(300) DEFAULT NULL';
+                    END IF;
+                END;
+                /
+
+                CALL change_col_ns_contract_bpm_bpmurl (
+                    SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                );
+                DROP PROCEDURE IF EXISTS change_col_ns_contract_bpm_bpmurl;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl () AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SYS_CONTEXT('USERENV','CURRENT_SCHEMA');")
+                .contains("CALL change_col_ns_contract_bpm_bpmurl ()")
+                .doesNotContain("dm_adapter_schema IN VARCHAR")
+                .doesNotContain("CALL change_col_ns_contract_bpm_bpmurl (\n    SYS_CONTEXT");
+    }
+
+    @Test
+    void expandsUtf8mb4VarcharForByteLengthTargets() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("table.sql"), """
+                CREATE TABLE demo (
+                    id BIGINT,
+                    display_name VARCHAR(100)
+                ) DEFAULT CHARSET=utf8mb4;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("VARCHAR(400)");
+    }
+
+    @Test
+    void byteLengthRewriteDoesNotChangeTypeTextInsideStringLiterals() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("table.sql"), """
+                CREATE TABLE demo (
+                    display_name VARCHAR(100) DEFAULT 'source VARCHAR(255)'
+                ) DEFAULT CHARSET=utf8mb4;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("VARCHAR(400)")
+                .contains("'source VARCHAR(255)'")
+                .doesNotContain("'source VARCHAR(1020)'");
+    }
+
+    @Test
+    void expandsUtf8VarcharByThreeForByteLengthTargets() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("table.sql"), """
+                CREATE TABLE demo (
+                    display_name VARCHAR(100)
+                ) DEFAULT CHARSET=utf8;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql"))).contains("VARCHAR(300)");
+    }
+
+    @Test
+    void keepsByteLengthDdlForManualReviewWhenSourceCharsetIsUnknown() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("table.sql"), "CREATE TABLE demo (display_name VARCHAR(100));");
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("无法从字段或 CREATE TABLE 定义确认源字符集"));
+    }
+
+    @Test
+    void keepsMixedSourceCharsetDdlForManualReviewOnByteLengthTarget() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String original = """
+                CREATE TABLE demo (
+                    legacy_name VARCHAR(100) CHARACTER SET utf8,
+                    display_name VARCHAR(100) CHARACTER SET utf8mb4
+                ) DEFAULT CHARSET=utf8;
+                """;
+        write(sqlRoot.resolve("table.sql"), original);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("不同源字符集"));
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql"))).contains(original.strip());
+    }
+
+    @Test
+    void preservesSourceCaseForBacktickAddedColumn() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS add_clo_ns_wms_parameter_setting_paramName;
+                CREATE PROCEDURE add_clo_ns_wms_parameter_setting_paramName()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = database()
+                          AND table_name = 'ns_wms_parameter_setting'
+                          AND column_name = 'paramName'
+                    ) THEN
+                        ALTER TABLE ns_wms_parameter_setting
+                            ADD COLUMN `paramName` varchar(255) DEFAULT NULL;
+                    END IF;
+                END;
+                /
+                CALL add_clo_ns_wms_parameter_setting_paramName();
+                DROP PROCEDURE IF EXISTS add_clo_ns_wms_parameter_setting_paramName;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("UPPER(COLUMN_NAME) = UPPER('paramName')")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_wms_parameter_setting")
+                .contains("ADD `paramName` varchar(255) DEFAULT NULL'")
+                .contains("CALL add_clo_ns_wms_parameter_setting_paramName()")
+                .doesNotContain("dm_adapter_schema IN VARCHAR");
+    }
+
+    @Test
+    void keepsLengthSensitiveDdlForManualReviewWhenTargetSemanticsAreUnknown() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String original = "CREATE TABLE demo (display_name VARCHAR(100)) DEFAULT CHARSET=utf8mb4;";
+        write(sqlRoot.resolve("table.sql"), original);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.unknown(),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("LENGTH_IN_CHAR 未知"));
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql"))).contains(original);
+    }
+
+    @Test
+    void recompilesLocalProcedureWhenDependencyChangedBeforeCall() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE refresh_demo()
+                BEGIN
+                    SELECT COUNT(*) FROM demo;
+                END;
+                /
+                ALTER TABLE demo ADD status INT;
+                CALL refresh_demo();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("ALTER TABLE demo ADD status INT")
+                .contains("ALTER PROCEDURE refresh_demo COMPILE")
+                .contains("CALL refresh_demo()");
+        assertThat(converted.sql().indexOf("ALTER PROCEDURE refresh_demo COMPILE"))
+                .isLessThan(converted.sql().indexOf("CALL refresh_demo()"));
+    }
+
+    @Test
+    void marksRoutineThatMutatesItsStaticDependencyForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE unsafe_demo()
+                BEGIN
+                    SELECT COUNT(*) FROM demo;
+                    ALTER TABLE demo ADD status INT;
+                END;
+                /
+                CALL unsafe_demo();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
+        assertThat(converted.report().manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::reason)
+                .anySatisfy(reason -> assertThat(reason).contains("-7184"));
+    }
+
+    @Test
+    void recompilesReaderAfterCallingRoutineThatChangesItsDependency() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE read_demo()
+                BEGIN
+                    SELECT COUNT(*) FROM demo;
+                END;
+                /
+                CREATE PROCEDURE change_demo()
+                BEGIN
+                    EXECUTE IMMEDIATE 'ALTER TABLE demo ADD status INT';
+                END;
+                /
+                CALL change_demo();
+                CALL read_demo();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CALL change_demo()")
+                .contains("ALTER PROCEDURE read_demo COMPILE")
+                .contains("CALL read_demo()");
+        assertThat(converted.sql().indexOf("CALL change_demo()"))
+                .isLessThan(converted.sql().indexOf("ALTER PROCEDURE read_demo COMPILE"));
+        assertThat(converted.sql().indexOf("ALTER PROCEDURE read_demo COMPILE"))
+                .isLessThan(converted.sql().indexOf("CALL read_demo()"));
+    }
+
+    @Test
+    void marksUnresolvedDynamicDdlRoutineForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE change_unknown(table_name VARCHAR)
+                BEGIN
+                    EXECUTE IMMEDIATE 'ALTER TABLE ' || table_name || ' ADD status INT';
+                END;
+                /
+                CALL change_unknown('demo');
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
+        assertThat(converted.report().manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::reason)
+                .anySatisfy(reason -> assertThat(reason).contains("动态 DDL 对象名无法静态解析"));
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {

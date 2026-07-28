@@ -5,6 +5,8 @@ import com.github.dmadapter.core.SqlScriptFileResult;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
+import com.github.dmadapter.core.DamengTargetCapabilities;
+import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.sql.SqlConverter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -51,7 +53,7 @@ class SqlScriptMigrator {
     static final String MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE =
             "MYSQL_PROCEDURE_JSON_TEXT_TYPE";
     static final String DM_METADATA_IDENTIFIER_CASE_RULE = "DM_METADATA_IDENTIFIER_CASE";
-    static final String DM_METADATA_SCHEMA_CALL_ARGUMENT_RULE = "DM_METADATA_SCHEMA_CALL_ARGUMENT";
+    static final String DM_METADATA_SCHEMA_LOCAL_VARIABLE_RULE = "DM_METADATA_SCHEMA_LOCAL_VARIABLE";
     static final String MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE =
             "MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT";
     static final String MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE =
@@ -98,6 +100,10 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_IDENTIFIER_TO_DM";
     static final String MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE =
             "MYSQL_ALTER_MODIFY_COLUMN_TO_DM";
+    static final String MYSQL_VARCHAR_LENGTH_SEMANTICS_RULE =
+            "MYSQL_VARCHAR_LENGTH_SEMANTICS_TO_DM";
+    static final String DM_PROCEDURE_RECOMPILE_AFTER_DDL_RULE =
+            "DM_PROCEDURE_RECOMPILE_AFTER_DDL";
     static final String MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE_RULE =
             "MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE";
     static final String MYSQL_CREATE_TABLE_INLINE_KEY_REMOVAL_RULE =
@@ -148,13 +154,13 @@ class SqlScriptMigrator {
                     + "(?:\\s+([A-Za-z_][A-Za-z0-9_$]*)\\s*:\\s*)?BEGIN\\b"
     );
     private static final Pattern LENGTH_EQUALITY_PATTERN = Pattern.compile(
-            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*=\\s*(\\d+)\\b"
+            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*=\\s*'?([0-9]+)'?(?![\\w'])"
     );
     private static final Pattern LENGTH_RANGE_PATTERN = Pattern.compile(
-            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*(<=|>=|<|>)\\s*(\\d+)\\b"
+            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*(<=|>=|<|>)\\s*'?([0-9]+)'?(?![\\w'])"
     );
     private static final Pattern MALFORMED_LENGTH_COMPARISON_PATTERN = Pattern.compile(
-            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*(?:<=|>=|<|>)\\s*\\d+\\s*=\\s*\\d+\\b"
+            "(?is)\\b(?:CHARACTER_MAXIMUM_LENGTH|CHAR_LENGTH)\\s*(?:<=|>=|<|>)\\s*'?\\d+'?\\s*=\\s*'?\\d+'?(?![\\w'])"
     );
     private static final Pattern COLUMN_TYPE_GUARD_PATTERN = Pattern.compile(
             "(?is)\\b(?:DATA_TYPE|COLUMN_TYPE)\\b"
@@ -171,6 +177,8 @@ class SqlScriptMigrator {
                     + "(?=\\s|\\)|;)"
     );
     private static final String SQL_SIMPLE_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*";
+    private static final String SQL_OBJECT_IDENTIFIER_TOKEN =
+            "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?:\\s*\\.\\s*(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
     private static final Pattern CONVERTED_SIMPLE_DATE_END_TRIGGER_PATTERN = Pattern.compile(
@@ -325,6 +333,7 @@ class SqlScriptMigrator {
     private final SqlConverter converter;
     private final Validator validator;
     private final Consumer<String> progressConsumer;
+    private final SqlScriptValidationPlanStore validationPlanStore = new SqlScriptValidationPlanStore();
 
     SqlScriptMigrator(SqlConverter converter, Validator validator) {
         this(converter, validator, message -> {
@@ -396,6 +405,7 @@ class SqlScriptMigrator {
                     schema,
                     systemSchema,
                     request.dryRun(),
+                    request.targetCapabilities(),
                     manualReviewItems,
                     warnings
             );
@@ -437,13 +447,49 @@ class SqlScriptMigrator {
                 plannedFiles,
                 manualReviewItems
         );
-        plannedFiles = dependencyAnalysis.files();
+        plannedFiles = addSafeProcedureRecompiles(dependencyAnalysis.files(), manualReviewItems);
+        if (!request.dryRun()) {
+            rewriteChangedPlannedFiles(plannedFiles);
+        }
+        boolean containsBackticks = plannedFiles.stream()
+                .flatMap(file -> file.statements().stream())
+                .anyMatch(statement -> statement.indexOf('`') >= 0);
+        if (containsBackticks
+                && !request.targetCapabilities().compatibleMode().isBlank()
+                && !"4".equals(request.targetCapabilities().compatibleMode())) {
+            throw new IllegalStateException(
+                    "Converted SQL contains backtick identifiers but target COMPATIBLE_MODE is "
+                            + request.targetCapabilities().compatibleMode() + ", expected 4."
+            );
+        }
+        String validationPlan = "";
+        List<PlannedSqlScriptFile> validationFiles = plannedFiles;
+        if (!request.dryRun() && request.validationPlan() != null) {
+            Path writtenPlan = validationPlanStore.write(
+                    request.validationPlan(),
+                    projectRoot,
+                    sqlRootOut,
+                    request.targetCapabilities(),
+                    plannedFiles,
+                    manualReviewItems
+            );
+            SqlScriptValidationPlanStore.LoadedValidationPlan loadedPlan =
+                    validationPlanStore.load(writtenPlan);
+            validationPlan = writtenPlan.toString();
+            validationFiles = loadedPlan.files();
+            progress("SQL script validation plan written: " + writtenPlan);
+        }
+        if (request.targetCapabilities().lengthSemantics() == null
+                && manualReviewItems.stream().anyMatch(item -> item.reason().contains("LENGTH_IN_CHAR 未知"))) {
+            warnings.add("Target LENGTH_IN_CHAR was not available. Length-sensitive DDL without an explicit "
+                    + "--target-length-semantics value was retained for manual review.");
+        }
 
         long validationStartedAt = System.nanoTime();
-        progress("Starting SQL script database validation: files=" + plannedFiles.size());
+        progress("Starting SQL script database validation: files=" + validationFiles.size());
         SqlScriptValidationRun validationRun = request.dryRun()
                 ? SqlScriptValidationRun.notAttempted("Dry run; SQL script validation skipped.", List.of())
-                : validator.validate(plannedFiles, request.validationEnvironment());
+                : validator.validate(validationFiles, request.validationEnvironment());
         progress("SQL script database validation completed: attempted=" + validationRun.attempted()
                 + ", succeeded=" + validationRun.successCount()
                 + ", failed=" + validationRun.failureCount()
@@ -492,7 +538,8 @@ class SqlScriptMigrator {
                 fileResults,
                 manualReviewItems,
                 validationRun.failures(),
-                warnings
+                warnings,
+                validationPlan
         );
         progress("SQL script migration completed: files=" + discoveredSqlFiles.size()
                 + ", convertedFiles=" + convertedFileCount
@@ -648,6 +695,280 @@ class SqlScriptMigrator {
         );
     }
 
+    private List<PlannedSqlScriptFile> addSafeProcedureRecompiles(
+            List<PlannedSqlScriptFile> plannedFiles,
+            List<SqlScriptManualReviewItem> manualReviewItems
+    ) {
+        LinkedHashMap<ProcedureKey, ProcedureVersionState> procedures = new LinkedHashMap<>();
+        LinkedHashSet<TableKey> knownExistingTables = new LinkedHashSet<>();
+        List<PlannedSqlScriptFile> result = new ArrayList<>(plannedFiles.size());
+        for (PlannedSqlScriptFile file : plannedFiles) {
+            List<String> statements = new ArrayList<>();
+            LinkedHashSet<Integer> manualIndexes = new LinkedHashSet<>();
+            LinkedHashSet<String> rules = new LinkedHashSet<>(file.appliedRules());
+            int insertedRecompileCount = 0;
+            for (int oldIndex = 0; oldIndex < file.statements().size(); oldIndex++) {
+                String statement = file.statements().get(oldIndex);
+                int oldStatementIndex = oldIndex + 1;
+                ProcedureReference created = procedureReferenceFromCreateProcedure(statement, file.schema());
+                if (created != null) {
+                    Set<TableKey> staticDependencies = staticRoutineTableDependencies(statement, file.schema());
+                    DynamicDdlDependencies dynamicDependencies =
+                            dynamicRoutineDdlDependencies(statement, file.schema());
+                    Set<TableKey> unsafeDynamicTables = new LinkedHashSet<>(
+                            intersection(staticDependencies, dynamicDependencies.tables())
+                    );
+                    unsafeDynamicTables.removeAll(
+                            intersection(dynamicDependencies.conditionalCreates(), knownExistingTables)
+                    );
+                    boolean unsafe = dynamicDependencies.unresolved()
+                            || !unsafeDynamicTables.isEmpty();
+                    int newIndex = statements.size() + 1;
+                    statements.add(statement);
+                    boolean alreadyManual = file.manualReviewStatementIndexes().contains(oldStatementIndex);
+                    if (alreadyManual || unsafe) {
+                        manualIndexes.add(newIndex);
+                    }
+                    if (unsafe && !alreadyManual) {
+                        manualReviewItems.add(new SqlScriptManualReviewItem(
+                                file.sourceDisplay(),
+                                file.outputDisplay(),
+                                newIndex,
+                                "存储过程同时静态访问并动态修改同一对象，或动态 DDL 对象名无法静态解析；"
+                                        + "为避免达梦 -7184 对象版本变化，不自动改写，请人工拆分 DDL/DML 或改为可审计的动态 SQL。",
+                                statement,
+                                statement
+                        ));
+                    }
+                    procedures.put(
+                            created.key(),
+                            new ProcedureVersionState(
+                                    created,
+                                    staticDependencies,
+                                    dynamicDependencies.tables(),
+                                    unsafe || alreadyManual,
+                                    false
+                            )
+                    );
+                    continue;
+                }
+
+                TableKey alteredTable = alteredTable(statement, file.schema());
+                if (alteredTable != null) {
+                    procedures.replaceAll((key, state) -> state.dependencies().contains(alteredTable)
+                            ? state.withDirty(true)
+                            : state);
+                }
+                boolean manualStatement = file.manualReviewStatementIndexes().contains(oldStatementIndex);
+                TableKey createdTable = tableForDdlVerb(statement, file.schema(), "CREATE");
+                if (!manualStatement && createdTable != null) {
+                    knownExistingTables.add(createdTable);
+                }
+                TableKey droppedTable = tableForDdlVerb(statement, file.schema(), "DROP");
+                if (!manualStatement && droppedTable != null) {
+                    knownExistingTables.remove(droppedTable);
+                }
+
+                ProcedureReference called = procedureReferenceFromCall(statement, file.schema());
+                ProcedureVersionState state = called == null ? null : procedures.get(called.key());
+                if (state != null
+                        && !state.manualReview()
+                        && state.dirty()
+                        && !file.manualReviewStatementIndexes().contains(oldStatementIndex)) {
+                    statements.add("ALTER PROCEDURE " + state.reference().sqlDisplay() + " COMPILE");
+                    insertedRecompileCount++;
+                    rules.add(DM_PROCEDURE_RECOMPILE_AFTER_DDL_RULE);
+                    procedures.put(called.key(), state.withDirty(false));
+                }
+
+                int newIndex = statements.size() + 1;
+                statements.add(statement);
+                if (file.manualReviewStatementIndexes().contains(oldStatementIndex)) {
+                    manualIndexes.add(newIndex);
+                } else if (state != null && state.manualReview()) {
+                    manualIndexes.add(newIndex);
+                    manualReviewItems.add(new SqlScriptManualReviewItem(
+                            file.sourceDisplay(),
+                            file.outputDisplay(),
+                            newIndex,
+                            "调用的存储过程存在无法安全自动处理的对象版本依赖；请先人工修正过程后再执行 CALL。",
+                            statement,
+                            statement
+                    ));
+                }
+                if (state != null && !state.manualReview() && !state.dynamicDdlTables().isEmpty()) {
+                    procedures.replaceAll((key, candidate) ->
+                            !key.equals(state.reference().key())
+                                    && !intersection(
+                                            candidate.dependencies(),
+                                            state.dynamicDdlTables()
+                                    ).isEmpty()
+                                    ? candidate.withDirty(true)
+                                    : candidate);
+                }
+
+                ProcedureReference dropped = procedureReferenceFromDropProcedure(statement, file.schema());
+                if (dropped != null) {
+                    procedures.remove(dropped.key());
+                }
+            }
+            result.add(new PlannedSqlScriptFile(
+                    file.sourceDisplay(),
+                    file.outputDisplay(),
+                    file.schema(),
+                    file.systemScript(),
+                    file.written(),
+                    file.converted() || insertedRecompileCount > 0,
+                    file.originalStatementCount(),
+                    file.convertedStatementCount() + insertedRecompileCount,
+                    manualIndexes.size(),
+                    manualIndexes,
+                    List.copyOf(rules),
+                    statements
+            ));
+        }
+        return List.copyOf(result);
+    }
+
+    private void rewriteChangedPlannedFiles(List<PlannedSqlScriptFile> files) throws IOException {
+        for (PlannedSqlScriptFile file : files) {
+            if (!file.written()) {
+                continue;
+            }
+            Path output = Path.of(file.outputDisplay()).toAbsolutePath().normalize();
+            Files.createDirectories(output.getParent());
+            Files.writeString(
+                    output,
+                    SqlScriptParser.scriptContent(file.statements()),
+                    StandardCharsets.UTF_8
+            );
+        }
+    }
+
+    private ProcedureReference procedureReferenceFromDropProcedure(String sql, String defaultSchema) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*DROP\\s+PROCEDURE\\s+(?:IF\\s+EXISTS\\s+)?(?<name>" + SQL_IDENTIFIER_TOKEN + ")"
+        ).matcher(splitLeadingSqlPrefix(sql == null ? "" : sql).body());
+        return matcher.find() ? procedureReference(matcher.group("name"), defaultSchema) : null;
+    }
+
+    private Set<TableKey> staticRoutineTableDependencies(String sql, String defaultSchema) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b(?:FROM|JOIN|UPDATE|INTO|DELETE\\s+FROM)\\s+(?<table>"
+                        + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
+        ).matcher(searchable);
+        LinkedHashSet<TableKey> tables = new LinkedHashSet<>();
+        while (matcher.find()) {
+            TableKey table = tableKey(matcher.group("table"), defaultSchema);
+            if (table != null && !table.name().startsWith("all_") && !table.name().startsWith("v$")) {
+                tables.add(table);
+            }
+        }
+        return Set.copyOf(tables);
+    }
+
+    private DynamicDdlDependencies dynamicRoutineDdlDependencies(String sql, String defaultSchema) {
+        LinkedHashSet<TableKey> tables = new LinkedHashSet<>();
+        LinkedHashSet<TableKey> conditionalCreates = new LinkedHashSet<>();
+        boolean unresolved = false;
+        Matcher execute = Pattern.compile("(?is)\\bEXECUTE\\s+IMMEDIATE\\b").matcher(sql == null ? "" : sql);
+        while (execute.find()) {
+            int literalStart = skipWhitespace(sql, execute.end());
+            if (literalStart >= sql.length() || sql.charAt(literalStart) != '\'') {
+                continue;
+            }
+            SingleQuotedStringContent literal = readSingleQuotedStringContent(sql, literalStart);
+            String dynamicSql = decodeMysqlBackslashEscapedString(literal.rawContent());
+            TableKey table = alteredTable(dynamicSql, defaultSchema);
+            if (table != null) {
+                tables.add(table);
+                if (Pattern.compile("(?is)^\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\b")
+                        .matcher(dynamicSql)
+                        .find()) {
+                    conditionalCreates.add(table);
+                }
+            } else if (Pattern.compile(
+                    "(?is)\\b(?:ALTER|CREATE(?:\\s+GLOBAL)?(?:\\s+TEMPORARY)?|DROP|TRUNCATE)\\s+TABLE\\b"
+            ).matcher(dynamicSql).find()) {
+                unresolved = true;
+            }
+        }
+        return new DynamicDdlDependencies(
+                Set.copyOf(tables),
+                Set.copyOf(conditionalCreates),
+                unresolved
+        );
+    }
+
+    private TableKey alteredTable(String sql, String defaultSchema) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b(?:ALTER|CREATE(?:\\s+GLOBAL)?(?:\\s+TEMPORARY)?|DROP|TRUNCATE)\\s+TABLE\\s+"
+                        + "(?:IF\\s+(?:NOT\\s+)?EXISTS\\s+)?"
+                        + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
+        ).matcher(searchable);
+        return matcher.find() ? tableKey(matcher.group("table"), defaultSchema) : null;
+    }
+
+    private TableKey tableForDdlVerb(String sql, String defaultSchema, String verb) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b" + Pattern.quote(verb)
+                        + "(?:\\s+GLOBAL)?(?:\\s+TEMPORARY)?\\s+TABLE\\s+"
+                        + "(?:IF\\s+(?:NOT\\s+)?EXISTS\\s+)?"
+                        + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
+        ).matcher(searchable);
+        return matcher.find() ? tableKey(matcher.group("table"), defaultSchema) : null;
+    }
+
+    private TableKey tableKey(String token, String defaultSchema) {
+        if (token == null || token.isBlank()) {
+            return null;
+        }
+        int separator = lastIdentifierSeparator(token);
+        String nameToken = separator < 0 ? token : token.substring(separator + 1);
+        String schemaToken = separator < 0 ? defaultSchema : token.substring(0, separator);
+        String name = unquoteIdentifier(lastIdentifierPart(nameToken)).toLowerCase(Locale.ROOT);
+        String schema = schemaToken == null || schemaToken.isBlank()
+                ? "<current-schema>"
+                : unquoteIdentifier(lastIdentifierPart(schemaToken)).toLowerCase(Locale.ROOT);
+        return name.isBlank() ? null : new TableKey(schema, name);
+    }
+
+    private String replaceIgnoredSqlWithSpaces(String sql) {
+        if (sql == null || sql.isEmpty()) {
+            return "";
+        }
+        char[] chars = sql.toCharArray();
+        int index = 0;
+        while (index < chars.length) {
+            int end = index;
+            if (chars[index] == '\'') {
+                end = skipSingleQuotedString(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                end = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                end = skipUntilBlockCommentEnd(sql, index);
+            }
+            if (end > index) {
+                for (int cursor = index; cursor < Math.min(end, chars.length); cursor++) {
+                    chars[cursor] = ' ';
+                }
+                index = end;
+            } else {
+                index++;
+            }
+        }
+        return new String(chars);
+    }
+
+    private Set<TableKey> intersection(Set<TableKey> left, Set<TableKey> right) {
+        LinkedHashSet<TableKey> result = new LinkedHashSet<>(left);
+        result.retainAll(right);
+        return result;
+    }
+
     private void addExternalProcedureDependency(
             Map<String, LinkedHashSet<String>> externalDependencies,
             ProcedureReference procedure
@@ -788,7 +1109,8 @@ class SqlScriptMigrator {
                         name.toLowerCase(Locale.ROOT)
                 ),
                 schema,
-                name
+                name,
+                token.strip()
         );
     }
 
@@ -818,7 +1140,8 @@ class SqlScriptMigrator {
     private record ProcedureReference(
             ProcedureKey key,
             String schemaDisplay,
-            String nameDisplay
+            String nameDisplay,
+            String sqlDisplay
     ) {
         String displayName() {
             return "<current-schema>".equals(schemaDisplay)
@@ -1069,6 +1392,7 @@ class SqlScriptMigrator {
             String schema,
             String systemSchema,
             boolean dryRun,
+            DamengTargetCapabilities targetCapabilities,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -1091,6 +1415,7 @@ class SqlScriptMigrator {
         ScriptDynamicDdlState scriptDynamicDdlState = new ScriptDynamicDdlState();
         LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns = new LinkedHashMap<>();
         LinkedHashMap<String, String> scriptIdentityFirstColumns = new LinkedHashMap<>();
+        Map<String, Set<String>> sourceTableCharsets = sourceTableCharsets(originalStatements);
         long preparationStartedAt = System.nanoTime();
         LinkedHashMap<String, String> scriptProcedureRenames = procedureObjectNameConflictRenames(originalStatements);
         progress("Prepared SQL script conversion context: " + relative
@@ -1163,7 +1488,11 @@ class SqlScriptMigrator {
 
             for (StatementConversionPlan plan : conversionPlans) {
                 String originalStatement = plan.originalStatement();
-                ScriptStatementConversion conversion = plan.conversion().join();
+                ScriptStatementConversion conversion = applyTargetLengthSemantics(
+                        plan.conversion().join(),
+                        sourceTableCharsets,
+                        targetCapabilities
+                );
                 List<String> outputStatements = expandConvertedOutputStatements(conversion.outputSql());
                 String calledProcedureName = procedureNameFromCall(originalStatement);
                 boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
@@ -1220,7 +1549,7 @@ class SqlScriptMigrator {
         MetadataSchemaBinding metadataSchemaBinding = bindMetadataSchemaAtProcedureCalls(convertedStatements);
         if (metadataSchemaBinding.changed()) {
             convertedStatements = new ArrayList<>(metadataSchemaBinding.statements());
-            appliedRules.add(DM_METADATA_SCHEMA_CALL_ARGUMENT_RULE);
+            appliedRules.add(DM_METADATA_SCHEMA_LOCAL_VARIABLE_RULE);
         }
         String convertedContent = originalStatements.isEmpty()
                 ? originalContent
@@ -1283,13 +1612,9 @@ class SqlScriptMigrator {
             String rewritten = statement;
             if (!procedureName.isBlank()
                     && procedures.contains(procedureName.toLowerCase(Locale.ROOT))) {
-                rewritten = addMetadataSchemaProcedureParameter(rewritten);
-            } else {
-                String calledProcedure = procedureNameFromCall(statement);
-                if (!calledProcedure.isBlank()
-                        && procedures.contains(calledProcedure.toLowerCase(Locale.ROOT))) {
-                    rewritten = addMetadataSchemaCallArgument(rewritten);
-                }
+                rewritten = addMetadataSchemaLocalVariable(rewritten);
+            } else if (!procedureNameFromCall(statement).isBlank()) {
+                rewritten = removeLegacyMetadataSchemaCallArgument(rewritten, procedures);
             }
             converted.add(rewritten);
             changed |= !rewritten.equals(statement);
@@ -1305,7 +1630,7 @@ class SqlScriptMigrator {
                 .find();
     }
 
-    private String addMetadataSchemaProcedureParameter(String sql) {
+    private String addMetadataSchemaLocalVariable(String sql) {
         String schemaBoundSql = replaceOutsideIgnoredText(
                 sql,
                 Pattern.compile(
@@ -1313,6 +1638,10 @@ class SqlScriptMigrator {
                 ),
                 matcher -> "dm_adapter_schema"
         );
+        schemaBoundSql = removeLegacyMetadataSchemaProcedureParameter(schemaBoundSql);
+        if (Pattern.compile("(?is)\\bdm_adapter_schema\\s+VARCHAR\\s*\\(").matcher(schemaBoundSql).find()) {
+            return schemaBoundSql;
+        }
         Matcher header = Pattern.compile(
                         "(?is)\\bCREATE\\s+OR\\s+REPLACE\\s+PROCEDURE\\s+" + SQL_IDENTIFIER_TOKEN + "\\s*\\("
                 )
@@ -1325,18 +1654,57 @@ class SqlScriptMigrator {
         if (closeParen <= openParen) {
             return sql;
         }
-        String parameters = schemaBoundSql.substring(openParen + 1, closeParen).strip();
-        String schemaParameter = "dm_adapter_schema IN VARCHAR "
-                + "DEFAULT SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
-        if (!parameters.isBlank()) {
-            schemaParameter = parameters + ", " + schemaParameter;
+        int beginIndex = firstProcedureBegin(schemaBoundSql);
+        if (beginIndex <= closeParen) {
+            return sql;
         }
-        return schemaBoundSql.substring(0, openParen + 1)
-                + schemaParameter
-                + schemaBoundSql.substring(closeParen);
+        Matcher declarationStart = Pattern.compile("(?is)\\b(?:AS|IS)\\b")
+                .matcher(schemaBoundSql)
+                .region(closeParen + 1, beginIndex);
+        if (!declarationStart.find()) {
+            return sql;
+        }
+        int insertionPoint = declarationStart.end();
+        return schemaBoundSql.substring(0, insertionPoint)
+                + "\n    dm_adapter_schema VARCHAR(128) := "
+                + "SYS_CONTEXT('USERENV','CURRENT_SCHEMA');"
+                + schemaBoundSql.substring(insertionPoint);
     }
 
-    private String addMetadataSchemaCallArgument(String sql) {
+    private String removeLegacyMetadataSchemaProcedureParameter(String sql) {
+        Matcher header = Pattern.compile(
+                        "(?is)\\bCREATE\\s+OR\\s+REPLACE\\s+PROCEDURE\\s+" + SQL_IDENTIFIER_TOKEN + "\\s*\\("
+                )
+                .matcher(sql);
+        if (!header.find()) {
+            return sql;
+        }
+        int openParen = header.end() - 1;
+        int closeParen = findMatchingParen(sql, openParen);
+        if (closeParen <= openParen) {
+            return sql;
+        }
+        String parameters = sql.substring(openParen + 1, closeParen);
+        String cleaned = parameters.replaceFirst(
+                "(?is)(?:,\\s*)?dm_adapter_schema\\s+IN\\s+VARCHAR(?:\\s*\\(\\s*\\d+\\s*\\))?"
+                        + "\\s+DEFAULT\\s+dm_adapter_schema\\s*$",
+                ""
+        ).replaceFirst(
+                "(?is)^\\s*dm_adapter_schema\\s+IN\\s+VARCHAR(?:\\s*\\(\\s*\\d+\\s*\\))?"
+                        + "\\s+DEFAULT\\s+dm_adapter_schema\\s*,?\\s*",
+                ""
+        );
+        if (cleaned.equals(parameters)) {
+            return sql;
+        }
+        return sql.substring(0, openParen + 1) + cleaned.strip() + sql.substring(closeParen);
+    }
+
+    private String removeLegacyMetadataSchemaCallArgument(String sql, Set<String> procedures) {
+        String calledProcedure = procedureNameFromCall(sql);
+        if (calledProcedure.isBlank() || !procedures.contains(calledProcedure.toLowerCase(Locale.ROOT))) {
+            return sql;
+        }
         Matcher call = Pattern.compile("(?is)\\bCALL\\s+" + SQL_IDENTIFIER_TOKEN + "\\s*\\(").matcher(sql);
         if (!call.find()) {
             return sql;
@@ -1347,10 +1715,13 @@ class SqlScriptMigrator {
             return sql;
         }
         String arguments = sql.substring(openParen + 1, closeParen).strip();
-        String schemaArgument = "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
-        String boundArguments = arguments.isBlank()
-                ? schemaArgument
-                : arguments + ", " + schemaArgument;
+        String boundArguments = arguments.replaceFirst(
+                "(?is)(?:,\\s*)?SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)\\s*$",
+                ""
+        ).strip();
+        if (boundArguments.equals(arguments)) {
+            return sql;
+        }
         return sql.substring(0, openParen + 1)
                 + boundArguments
                 + sql.substring(closeParen);
@@ -1946,6 +2317,67 @@ class SqlScriptMigrator {
                         + matcher.group("column")
                         + ") = UPPER(" + matcher.group("value") + ")"
         );
+    }
+
+    private String normalizeDamengMetadataNumericLengths(String sql) {
+        if (sql == null || sql.isBlank()
+                || !Pattern.compile("(?is)\\bALL_TAB_COLUMNS\\b").matcher(sql).find()) {
+            return sql == null ? "" : sql;
+        }
+        return replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile(
+                        "(?is)\\b(?<column>CHAR_LENGTH|DATA_LENGTH)\\b"
+                                + "(?<operator>\\s*(?:=|<=|>=|<|>)\\s*)"
+                                + "'(?<length>[0-9]+)'"
+                ),
+                matcher -> matcher.group("column")
+                        + matcher.group("operator")
+                        + matcher.group("length")
+        );
+    }
+
+    private String normalizeSafeVarcharModifyGuards(String sql) {
+        if (sql == null || sql.isBlank()
+                || !Pattern.compile("(?is)\\bEXECUTE\\s+IMMEDIATE\\s+'ALTER\\s+TABLE\\b").matcher(sql).find()) {
+            return sql == null ? "" : sql;
+        }
+        Pattern pattern = Pattern.compile(
+                "(?is)(?<guard>\\b(?:CHAR_LENGTH|DATA_LENGTH)\\s*=\\s*'?(?<length>[0-9]+)'?)"
+                        + "(?<middle>(?:(?!\\b(?:CHAR_LENGTH|DATA_LENGTH)\\b).){0,5000}?)"
+                        + "\\bIF\\s+(?<variable>dm_adapter_exists(?:_[0-9]+)?)\\s*=\\s*0\\s+THEN"
+                        + "(?<spacing>\\s*)"
+                        + "(?<execute>EXECUTE\\s+IMMEDIATE\\s+'ALTER\\s+TABLE\\b"
+                        + "(?:''|[^'])*?\\bMODIFY\\b(?:''|[^'])*?"
+                        + "\\b(?:VAR)?CHAR\\s*\\(\\s*\\k<length>\\s*\\)(?:''|[^'])*')"
+        );
+        Matcher matcher = pattern.matcher(sql);
+        StringBuffer converted = new StringBuffer(sql.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            String lengthColumn = matcher.group("guard")
+                    .toUpperCase(Locale.ROOT)
+                    .contains("DATA_LENGTH")
+                    ? "DATA_LENGTH"
+                    : "CHAR_LENGTH";
+            String replacement = "UPPER(DATA_TYPE) IN ('CHAR', 'VARCHAR', 'VARCHAR2') AND "
+                    + lengthColumn
+                    + " < "
+                    + matcher.group("length")
+                    + matcher.group("middle")
+                    + "IF "
+                    + matcher.group("variable")
+                    + " > 0 THEN"
+                    + matcher.group("spacing")
+                    + matcher.group("execute");
+            matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
+            changed = true;
+        }
+        if (!changed) {
+            return sql;
+        }
+        matcher.appendTail(converted);
+        return converted.toString();
     }
 
     private ScriptUserVariableInline inlineScriptUserVariables(
@@ -3346,6 +3778,18 @@ class SqlScriptMigrator {
         if (!metadataIdentifierCaseSql.equals(converted)) {
             converted = metadataIdentifierCaseSql;
             rules.add(DM_METADATA_IDENTIFIER_CASE_RULE);
+        }
+
+        String metadataLengthSql = normalizeDamengMetadataNumericLengths(converted);
+        if (!metadataLengthSql.equals(converted)) {
+            converted = metadataLengthSql;
+            rules.add(MYSQL_SCRIPT_METADATA_TO_DM_RULE);
+        }
+
+        String safeVarcharModifySql = normalizeSafeVarcharModifyGuards(converted);
+        if (!safeVarcharModifySql.equals(converted)) {
+            converted = safeVarcharModifySql;
+            rules.add(MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE);
         }
 
         String systemMetadataScalarIdSql = convertSystemMetadataScalarIdSubqueries(converted);
@@ -8666,6 +9110,326 @@ class SqlScriptMigrator {
         return false;
     }
 
+    private Map<String, Set<String>> sourceTableCharsets(List<String> statements) {
+        LinkedHashMap<String, Set<String>> charsets = new LinkedHashMap<>();
+        if (statements == null) {
+            return Map.of();
+        }
+        Pattern createTable = Pattern.compile(
+                "(?is)\\bCREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?<table>"
+                        + SQL_IDENTIFIER_TOKEN + ")"
+        );
+        for (String statement : statements) {
+            Matcher tableMatcher = createTable.matcher(statement == null ? "" : statement);
+            if (!tableMatcher.find()) {
+                continue;
+            }
+            Set<String> explicitCharsets = explicitSourceCharsets(statement);
+            if (!explicitCharsets.isEmpty()) {
+                charsets.put(normalizedTableKey(tableMatcher.group("table")), explicitCharsets);
+            }
+        }
+        return Map.copyOf(charsets);
+    }
+
+    private ScriptStatementConversion applyTargetLengthSemantics(
+            ScriptStatementConversion conversion,
+            Map<String, Set<String>> sourceTableCharsets,
+            DamengTargetCapabilities targetCapabilities
+    ) {
+        String sql = conversion.convertedSql();
+        if (!containsLengthSensitiveDdl(sql)) {
+            return conversion;
+        }
+        TargetLengthSemantics semantics = targetCapabilities == null
+                ? null
+                : targetCapabilities.lengthSemantics();
+        if (semantics == null) {
+            return lengthManualReview(
+                    conversion,
+                    "目标库 LENGTH_IN_CHAR 未知；涉及 VARCHAR/CHAR 长度的 DDL 已保留原文。"
+                            + "联网探测目标库，或离线迁移时显式传入 --target-length-semantics=CHAR|BYTE。"
+            );
+        }
+        if (semantics == TargetLengthSemantics.CHAR) {
+            return conversion;
+        }
+        CharsetResolution charsetResolution = resolveLengthDdlCharsets(sql, sourceTableCharsets);
+        if (charsetResolution.unresolved() || charsetResolution.charsets().size() != 1) {
+            return lengthManualReview(
+                    conversion,
+                    charsetResolution.charsets().size() > 1
+                            ? "目标库使用 BYTE 长度语义，但同一 SQL 含有不同源字符集；"
+                            + "无法用单一安全倍数换算 VARCHAR/CHAR 长度，请人工确认各字段。"
+                            : "目标库使用 BYTE 长度语义，但无法从字段或 CREATE TABLE 定义确认源字符集；"
+                            + "仅 utf8/utf8mb3/utf8mb4 可安全自动换算。"
+            );
+        }
+        String charset = charsetResolution.charsets().iterator().next();
+        int multiplier = sourceCharsetMultiplier(charset);
+        if (multiplier == 0) {
+            return lengthManualReview(
+                    conversion,
+                    "目标库使用 BYTE 长度语义，但无法从字段或 CREATE TABLE 定义确认源字符集；"
+                            + "仅 utf8/utf8mb3/utf8mb4 可安全自动换算。"
+            );
+        }
+        LengthRewrite rewrite = rewriteDdlVarcharLengths(sql, multiplier);
+        if (rewrite.overflow()) {
+            return lengthManualReview(
+                    conversion,
+                    "VARCHAR/CHAR 按源字符集换算为达梦字节长度时溢出或超过保守容量 32767；请人工确认目标字段类型。"
+            );
+        }
+        if (!rewrite.changed()) {
+            return conversion;
+        }
+        List<String> rules = new ArrayList<>(conversion.appliedRules());
+        rules.add(MYSQL_VARCHAR_LENGTH_SEMANTICS_RULE);
+        return new ScriptStatementConversion(
+                conversion.originalSql(),
+                rewrite.sql(),
+                rewrite.sql(),
+                true,
+                conversion.manualReviewRequired(),
+                conversion.reason(),
+                rules
+        );
+    }
+
+    private ScriptStatementConversion lengthManualReview(
+            ScriptStatementConversion conversion,
+            String reason
+    ) {
+        if (conversion.manualReviewRequired()) {
+            return conversion;
+        }
+        return new ScriptStatementConversion(
+                conversion.originalSql(),
+                conversion.convertedSql(),
+                conversion.originalSql(),
+                conversion.changed(),
+                true,
+                reason,
+                conversion.appliedRules()
+        );
+    }
+
+    private boolean containsLengthSensitiveDdl(String sql) {
+        if (sql == null || sql.isBlank()
+                || !Pattern.compile("(?is)\\b(?:VAR)?CHAR\\s*\\(\\s*\\d+\\s*\\)").matcher(sql).find()) {
+            return false;
+        }
+        return Pattern.compile("(?is)\\b(?:CREATE|ALTER)\\s+TABLE\\b").matcher(sql).find();
+    }
+
+    private String ddlTableName(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b(?:CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+)"
+                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")"
+        ).matcher(sql == null ? "" : sql);
+        return matcher.find() ? matcher.group("table") : "";
+    }
+
+    private CharsetResolution resolveLengthDdlCharsets(
+            String sql,
+            Map<String, Set<String>> sourceTableCharsets
+    ) {
+        LinkedHashSet<String> charsets = new LinkedHashSet<>();
+        boolean unresolved = false;
+        if (!procedureNameFromCreateProcedure(sql).isBlank()) {
+            int index = 0;
+            boolean foundLengthDdl = false;
+            while (index < sql.length()) {
+                if (sql.charAt(index) != '\'') {
+                    index++;
+                    continue;
+                }
+                int end = skipSingleQuotedString(sql, index);
+                String literal = singleQuotedSqlLiteralValue(sql.substring(index, end));
+                if (containsLengthSensitiveDdl(literal)) {
+                    foundLengthDdl = true;
+                    CharsetResolution literalResolution =
+                            resolvePlainLengthDdlCharsets(literal, sourceTableCharsets);
+                    charsets.addAll(literalResolution.charsets());
+                    unresolved |= literalResolution.unresolved();
+                }
+                index = end;
+            }
+            return new CharsetResolution(Set.copyOf(charsets), unresolved || !foundLengthDdl);
+        }
+        return resolvePlainLengthDdlCharsets(sql, sourceTableCharsets);
+    }
+
+    private CharsetResolution resolvePlainLengthDdlCharsets(
+            String sql,
+            Map<String, Set<String>> sourceTableCharsets
+    ) {
+        Set<String> explicitCharsets = explicitSourceCharsets(sql);
+        if (!explicitCharsets.isEmpty()) {
+            return new CharsetResolution(explicitCharsets, false);
+        }
+        String table = ddlTableName(sql);
+        Set<String> inheritedCharsets = table.isBlank()
+                ? Set.of()
+                : sourceTableCharsets.getOrDefault(normalizedTableKey(table), Set.of());
+        return inheritedCharsets.isEmpty()
+                ? new CharsetResolution(Set.of(), true)
+                : new CharsetResolution(inheritedCharsets, false);
+    }
+
+    private Set<String> explicitSourceCharsets(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b(?:DEFAULT\\s+)?(?:CHARACTER\\s+SET|CHARSET)\\s*(?:=\\s*)?"
+                        + "(?<charset>[A-Za-z0-9_]+)"
+        ).matcher(sql == null ? "" : sql);
+        LinkedHashSet<String> charsets = new LinkedHashSet<>();
+        while (matcher.find()) {
+            charsets.add(matcher.group("charset").toLowerCase(Locale.ROOT));
+        }
+        return Set.copyOf(charsets);
+    }
+
+    private int sourceCharsetMultiplier(String charset) {
+        if (charset == null) {
+            return 0;
+        }
+        return switch (charset.toLowerCase(Locale.ROOT)) {
+            case "utf8", "utf8mb3" -> 3;
+            case "utf8mb4" -> 4;
+            default -> 0;
+        };
+    }
+
+    private LengthRewrite rewriteDdlVarcharLengths(String sql, int multiplier) {
+        if (!procedureNameFromCreateProcedure(sql).isBlank()) {
+            return rewriteProcedureDdlVarcharLengths(sql, multiplier);
+        }
+        return rewritePlainDdlVarcharLengths(sql, multiplier);
+    }
+
+    private LengthRewrite rewriteProcedureDdlVarcharLengths(String sql, int multiplier) {
+        StringBuilder rewritten = new StringBuilder(sql.length());
+        int index = 0;
+        boolean changed = false;
+        while (index < sql.length()) {
+            if (sql.charAt(index) != '\'') {
+                rewritten.append(sql.charAt(index++));
+                continue;
+            }
+            int end = skipSingleQuotedString(sql, index);
+            String literalExpression = sql.substring(index, end);
+            String literal = singleQuotedSqlLiteralValue(literalExpression);
+            if (Pattern.compile("(?is)^\\s*(?:ALTER|CREATE)\\s+TABLE\\b").matcher(literal).find()
+                    && Pattern.compile("(?is)\\b(?:VAR)?CHAR\\s*\\(\\s*\\d+\\s*\\)").matcher(literal).find()) {
+                LengthRewrite literalRewrite = rewritePlainDdlVarcharLengths(literal, multiplier);
+                if (literalRewrite.overflow()) {
+                    return new LengthRewrite(sql, false, true);
+                }
+                rewritten.append(sqlStringLiteral(literalRewrite.sql()));
+                changed |= literalRewrite.changed();
+            } else {
+                rewritten.append(literalExpression);
+            }
+            index = end;
+        }
+        String result = rewriteMetadataGuardLengths(rewritten.toString(), multiplier);
+        changed |= !result.equals(rewritten.toString());
+        return new LengthRewrite(result, changed, false);
+    }
+
+    private LengthRewrite rewritePlainDdlVarcharLengths(String sql, int multiplier) {
+        Pattern typePattern = Pattern.compile(
+                "(?is)\\b(?<type>VARCHAR|CHAR)\\s*\\(\\s*(?<length>[0-9]+)\\s*\\)"
+        );
+        StringBuilder rewritten = new StringBuilder(sql.length());
+        int index = 0;
+        boolean changed = false;
+        while (index < sql.length()) {
+            int ignoredEnd = index;
+            if (sql.charAt(index) == '\'') {
+                ignoredEnd = skipSingleQuotedString(sql, index);
+            } else if (sql.charAt(index) == '"') {
+                ignoredEnd = skipDoubleQuotedText(sql, index);
+            } else if (sql.charAt(index) == '`') {
+                ignoredEnd = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                ignoredEnd = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                ignoredEnd = skipUntilBlockCommentEnd(sql, index);
+            }
+            if (ignoredEnd > index) {
+                rewritten.append(sql, index, ignoredEnd);
+                index = ignoredEnd;
+                continue;
+            }
+            Matcher matcher = typePattern.matcher(sql).region(index, sql.length());
+            if (!matcher.lookingAt()) {
+                rewritten.append(sql.charAt(index++));
+                continue;
+            }
+            int targetLength;
+            try {
+                targetLength = Math.multiplyExact(
+                        Integer.parseInt(matcher.group("length")),
+                        multiplier
+                );
+            } catch (ArithmeticException | NumberFormatException e) {
+                return new LengthRewrite(sql, false, true);
+            }
+            if (targetLength > 32_767) {
+                return new LengthRewrite(sql, false, true);
+            }
+            rewritten.append(matcher.group("type").toUpperCase(Locale.ROOT))
+                    .append('(')
+                    .append(targetLength)
+                    .append(')');
+            index = matcher.end();
+            changed = true;
+        }
+        if (!changed) {
+            return new LengthRewrite(sql, false, false);
+        }
+        String result = rewritten.toString();
+        result = replaceOutsideIgnoredText(
+                result,
+                Pattern.compile("(?is)\\bCHAR_LENGTH\\b"),
+                ignored -> "DATA_LENGTH"
+        );
+        return new LengthRewrite(result, true, false);
+    }
+
+    private String rewriteMetadataGuardLengths(String sql, int multiplier) {
+        Pattern pattern = Pattern.compile(
+                "(?is)\\b(?<column>CHAR_LENGTH|DATA_LENGTH)\\b"
+                        + "(?<operator>\\s*(?:=|<=|>=|<|>)\\s*)"
+                        + "(?<quote>'?)(?<length>[0-9]+)\\k<quote>"
+        );
+        Matcher matcher = pattern.matcher(sql);
+        StringBuilder rewritten = new StringBuilder(sql.length());
+        int previous = 0;
+        boolean changed = false;
+        while (matcher.find()) {
+            int target;
+            try {
+                target = Math.multiplyExact(Integer.parseInt(matcher.group("length")), multiplier);
+            } catch (ArithmeticException | NumberFormatException e) {
+                return sql;
+            }
+            rewritten.append(sql, previous, matcher.start())
+                    .append("DATA_LENGTH")
+                    .append(matcher.group("operator"))
+                    .append(target);
+            previous = matcher.end();
+            changed = true;
+        }
+        if (!changed) {
+            return sql;
+        }
+        rewritten.append(sql, previous, sql.length());
+        return rewritten.toString();
+    }
+
     private Path resolvePath(Path projectRoot, Path path) {
         return path.isAbsolute()
                 ? path.toAbsolutePath().normalize()
@@ -8728,6 +9492,39 @@ class SqlScriptMigrator {
         }
     }
 
+    private record TableKey(String schema, String name) {
+    }
+
+    private record DynamicDdlDependencies(
+            Set<TableKey> tables,
+            Set<TableKey> conditionalCreates,
+            boolean unresolved
+    ) {
+        private DynamicDdlDependencies {
+            tables = Set.copyOf(tables == null ? Set.of() : tables);
+            conditionalCreates = Set.copyOf(
+                    conditionalCreates == null ? Set.of() : conditionalCreates
+            );
+        }
+    }
+
+    private record ProcedureVersionState(
+            ProcedureReference reference,
+            Set<TableKey> dependencies,
+            Set<TableKey> dynamicDdlTables,
+            boolean manualReview,
+            boolean dirty
+    ) {
+        private ProcedureVersionState {
+            dependencies = Set.copyOf(dependencies == null ? Set.of() : dependencies);
+            dynamicDdlTables = Set.copyOf(dynamicDdlTables == null ? Set.of() : dynamicDdlTables);
+        }
+
+        ProcedureVersionState withDirty(boolean value) {
+            return new ProcedureVersionState(reference, dependencies, dynamicDdlTables, manualReview, value);
+        }
+    }
+
     private record SafeRuleConversion(String sql, boolean changed, List<String> appliedRules) {
         private SafeRuleConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
@@ -8781,6 +9578,15 @@ class SqlScriptMigrator {
     }
 
     private record ScriptUserVariableInline(String sql, boolean changed) {
+    }
+
+    private record LengthRewrite(String sql, boolean changed, boolean overflow) {
+    }
+
+    private record CharsetResolution(Set<String> charsets, boolean unresolved) {
+        private CharsetResolution {
+            charsets = Set.copyOf(charsets == null ? Set.of() : charsets);
+        }
     }
 
     private record StatementConversionPlan(
