@@ -687,7 +687,9 @@ class SqlScriptMigratorTest {
                 .contains("DELETE FROM tmp_demo_b;")
                 .contains("INSERT INTO tmp_demo_a (id) SELECT 1 AS id;")
                 .contains("INSERT INTO tmp_demo_b (id, extra_name) SELECT id, extra_name FROM tmp_demo_a;")
-                .contains("NULL;")
+                .doesNotContain("NULL;")
+                .doesNotContain("temporary table index DDL")
+                .doesNotContain("tmp_demo_idx")
                 .doesNotContain("DROP TABLE IF EXISTS tmp_demo_a;")
                 .doesNotContain("DROP TABLE IF EXISTS tmp_demo_b;")
                 .doesNotContain("label_exit:BEGIN")
@@ -700,6 +702,42 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE));
+    }
+
+    @Test
+    void keepsExplainedNoopWhenOmittedTemporaryIndexWouldEmptyNestedBlock() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc(IN create_index int)
+                BEGIN
+                    CREATE TEMPORARY TABLE IF NOT EXISTS tmp_demo (id bigint);
+                    IF create_index = 1 THEN
+                        ALTER TABLE tmp_demo ADD INDEX idx_demo_id (id);
+                    END IF;
+                    SELECT COUNT(*) FROM tmp_demo;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("IF create_index = 1 THEN")
+                .contains("NULL /* DM_ADAPTER: omitted MySQL temporary table index DDL */;")
+                .contains("END IF;")
+                .doesNotContain("ADD INDEX idx_demo_id");
     }
 
     @Test
