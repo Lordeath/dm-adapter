@@ -7444,7 +7444,11 @@ class SqlScriptMigrator {
             } else if (startsProcedureDdl(sql, index)) {
                 int end = findStatementTerminator(sql, index);
                 List<ProcedureStatement> ddlStatements =
-                        convertProcedureDdlStatements(sql.substring(index, end).strip(), temporaryTableColumns);
+                        convertProcedureDdlStatements(
+                                sql.substring(index, end).strip(),
+                                temporaryTableColumns,
+                                isDirectProcedureBodyStatement(sql, index)
+                        );
                 for (int i = 0; i < ddlStatements.size(); i++) {
                     if (i > 0) {
                         converted.append("\n");
@@ -7461,7 +7465,9 @@ class SqlScriptMigrator {
                     }
                 }
                 if (end < sql.length() && sql.charAt(end) == ';') {
-                    converted.append(';');
+                    if (!ddlStatements.isEmpty()) {
+                        converted.append(';');
+                    }
                     index = end + 1;
                 } else {
                     index = end;
@@ -7474,6 +7480,86 @@ class SqlScriptMigrator {
         }
         String convertedSql = changed ? converted.toString() : sql;
         return addTemporaryInsertSelectColumnLists(convertedSql, temporaryTableColumns);
+    }
+
+    private boolean isDirectProcedureBodyStatement(String sql, int statementIndex) {
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0 || statementIndex <= beginIndex) {
+            return false;
+        }
+        int depth = 1;
+        int parenthesisDepth = 0;
+        int index = beginIndex + "BEGIN".length();
+        boolean statementStart = true;
+        boolean pendingLoop = false;
+        while (index < statementIndex) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+                statementStart = false;
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+                statementStart = false;
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+                statementStart = false;
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                parenthesisDepth++;
+                statementStart = false;
+                index++;
+            } else if (current == ')') {
+                parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+                statementStart = false;
+                index++;
+            } else if (current == ';' && parenthesisDepth == 0) {
+                statementStart = true;
+                pendingLoop = false;
+                index++;
+            } else if (Character.isLetter(current) || current == '_') {
+                int end = index + 1;
+                while (end < statementIndex && isIdentifierPart(sql.charAt(end))) {
+                    end++;
+                }
+                String keyword = sql.substring(index, end).toUpperCase(Locale.ROOT);
+                if (parenthesisDepth == 0 && statementStart && "BEGIN".equals(keyword)) {
+                    depth++;
+                    statementStart = true;
+                } else if (parenthesisDepth == 0 && statementStart
+                        && ("IF".equals(keyword) || "CASE".equals(keyword))) {
+                    depth++;
+                    statementStart = false;
+                } else if (parenthesisDepth == 0 && statementStart && "END".equals(keyword)) {
+                    depth = Math.max(0, depth - 1);
+                    statementStart = false;
+                } else if (parenthesisDepth == 0 && statementStart
+                        && ("FOR".equals(keyword) || "WHILE".equals(keyword))) {
+                    pendingLoop = true;
+                    statementStart = false;
+                } else if (parenthesisDepth == 0 && "LOOP".equals(keyword)
+                        && (statementStart || pendingLoop)) {
+                    depth++;
+                    statementStart = true;
+                    pendingLoop = false;
+                } else if (parenthesisDepth == 0
+                        && ("THEN".equals(keyword) || "ELSE".equals(keyword)
+                        || "EXCEPTION".equals(keyword))) {
+                    statementStart = true;
+                } else {
+                    statementStart = false;
+                }
+                index = end;
+            } else {
+                if (!Character.isWhitespace(current)) {
+                    statementStart = false;
+                }
+                index++;
+            }
+        }
+        return depth == 1;
     }
 
     private Map<String, String> procedureVariableNamesByLowercase(String sql) {
@@ -7634,7 +7720,8 @@ class SqlScriptMigrator {
 
     private List<ProcedureStatement> convertProcedureDdlStatements(
             String ddl,
-            Map<String, LinkedHashSet<String>> temporaryTableColumns
+            Map<String, LinkedHashSet<String>> temporaryTableColumns,
+            boolean directProcedureBodyStatement
     ) {
         String converted = removeMysqlTemporaryKeyword(ddl);
         List<ProcedureStatement> temporaryDropTables = convertTemporaryDropTableToDml(converted);
@@ -7671,12 +7758,12 @@ class SqlScriptMigrator {
         converted = convertMysqlAlterTableDropForeignKey(converted);
         ProcedureStatement temporaryIndexDdl = convertTemporaryIndexDdlToNoop(converted);
         if (temporaryIndexDdl != null) {
-            return List.of(temporaryIndexDdl);
+            return directProcedureBodyStatement ? List.of() : List.of(temporaryIndexDdl);
         }
         converted = normalizeCreateIndexForDm(converted);
         temporaryIndexDdl = convertTemporaryIndexDdlToNoop(converted);
         if (temporaryIndexDdl != null) {
-            return List.of(temporaryIndexDdl);
+            return directProcedureBodyStatement ? List.of() : List.of(temporaryIndexDdl);
         }
         converted = normalizeMysqlAlterModifySyntax(converted);
         converted = normalizeMysqlAlterChangeSyntax(converted);
@@ -8128,13 +8215,17 @@ class SqlScriptMigrator {
                 "(?is)^CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+\\S+\\s+ON\\s+(?<table>`[^`]+`|\"[^\"]+\"|[^\\s(]+).*$"
         ).matcher(ddl.strip());
         if (createIndexMatcher.matches() && isProcedureTemporaryTableName(createIndexMatcher.group("table"))) {
-            return ProcedureStatement.directSql("NULL");
+            return ProcedureStatement.directSql(
+                    "NULL /* DM_ADAPTER: omitted MySQL temporary table index DDL */"
+            );
         }
         Matcher dropIndexMatcher = Pattern.compile(
                 "(?is)^DROP\\s+INDEX\\s+\\S+\\s+ON\\s+(?<table>`[^`]+`|\"[^\"]+\"|[^\\s(]+)\\s*$"
         ).matcher(ddl.strip());
         if (dropIndexMatcher.matches() && isProcedureTemporaryTableName(dropIndexMatcher.group("table"))) {
-            return ProcedureStatement.directSql("NULL");
+            return ProcedureStatement.directSql(
+                    "NULL /* DM_ADAPTER: omitted MySQL temporary table index DDL */"
+            );
         }
         return null;
     }
