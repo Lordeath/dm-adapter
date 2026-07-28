@@ -10,6 +10,7 @@ import com.github.dmadapter.core.SqlScriptFileResult;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
+import com.github.dmadapter.core.SqlScriptValidationReport;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -26,6 +27,8 @@ public class ReportWriter {
     public static final String MIGRATION_REPORT_JSON = "dm-adapter-report.json";
     public static final String SQL_SCRIPT_REPORT_MARKDOWN = "dm-adapter-sql-script-report.md";
     public static final String SQL_SCRIPT_REPORT_JSON = "dm-adapter-sql-script-report.json";
+    public static final String SQL_SCRIPT_VALIDATION_REPORT_MARKDOWN = "sql-script-validation-report.md";
+    public static final String SQL_SCRIPT_VALIDATION_REPORT_JSON = "sql-script-validation-report.json";
     public static final String SUMMARY_MARKDOWN = "dm-adapter-summary.md";
     public static final String SUMMARY_JSON = "dm-adapter-summary.json";
 
@@ -57,6 +60,18 @@ public class ReportWriter {
         Path jsonPath = reportDir.resolve(SQL_SCRIPT_REPORT_JSON);
         Files.writeString(markdownPath, sqlScriptMarkdown(redactedReport), StandardCharsets.UTF_8);
         objectMapper.writerWithDefaultPrettyPrinter().writeValue(jsonPath.toFile(), redactedReport);
+        return new ReportPaths(markdownPath, jsonPath);
+    }
+
+    public ReportPaths writeSqlScriptValidationReport(
+            SqlScriptValidationReport report,
+            Path reportDir
+    ) throws IOException {
+        Files.createDirectories(reportDir);
+        Path markdownPath = reportDir.resolve(SQL_SCRIPT_VALIDATION_REPORT_MARKDOWN);
+        Path jsonPath = reportDir.resolve(SQL_SCRIPT_VALIDATION_REPORT_JSON);
+        writeStringAtomically(markdownPath, sqlScriptValidationMarkdown(report));
+        writeJsonAtomically(jsonPath, report);
         return new ReportPaths(markdownPath, jsonPath);
     }
 
@@ -178,6 +193,9 @@ public class ReportWriter {
         markdown.append("- 扫描 SQL 文件数：`").append(report.scannedFileCount()).append("`\n");
         markdown.append("- 已转换文件数：`").append(report.convertedFileCount()).append("`\n");
         markdown.append("- 需人工确认 SQL 数：`").append(report.manualReviewSqlCount()).append("`\n");
+        if (!report.validationPlan().isBlank()) {
+            markdown.append("- 严格验证清单：`").append(report.validationPlan()).append("`\n");
+        }
         markdown.append("- 是否执行达梦试执行：`").append(yesNo(report.validationAttempted())).append("`\n");
         markdown.append("- 试执行状态：`").append(sqlScriptStatus(report.validationStatus())).append("`\n");
         markdown.append("- 试执行成功 SQL 数：`").append(report.validationSuccessCount()).append("`\n");
@@ -186,6 +204,20 @@ public class ReportWriter {
         appendSqlScriptFiles(markdown, report.files());
         appendSqlScriptManualReviewItems(markdown, report.manualReviewItems());
         appendSqlScriptValidationFailures(markdown, report.validationFailures());
+        appendSqlScriptWarnings(markdown, report.warnings());
+        return markdown.toString();
+    }
+
+    private String sqlScriptValidationMarkdown(SqlScriptValidationReport report) {
+        StringBuilder markdown = new StringBuilder();
+        markdown.append("# 达梦 SQL 脚本严格验证报告\n\n");
+        markdown.append("- 验证清单：`").append(report.validationPlan()).append("`\n");
+        markdown.append("- 是否连接并执行：`").append(yesNo(report.attempted())).append("`\n");
+        markdown.append("- 状态：`").append(sqlScriptStatus(report.status())).append("`\n");
+        markdown.append("- 成功 SQL 数：`").append(report.successCount()).append("`\n");
+        markdown.append("- 失败 SQL 数：`").append(report.failureCount()).append("`\n");
+        markdown.append("- 跳过人工确认 SQL 数：`").append(report.manualReviewSkippedCount()).append("`\n\n");
+        appendSqlScriptValidationFailures(markdown, report.failures());
         appendSqlScriptWarnings(markdown, report.warnings());
         return markdown.toString();
     }
@@ -451,7 +483,8 @@ public class ReportWriter {
                 report.files(),
                 redactManualReviewItems(report.manualReviewItems()),
                 redactValidationFailures(report.validationFailures()),
-                report.warnings()
+                report.warnings(),
+                report.validationPlan()
         );
     }
 

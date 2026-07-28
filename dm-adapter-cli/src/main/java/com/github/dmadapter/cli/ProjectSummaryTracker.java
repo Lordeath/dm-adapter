@@ -460,6 +460,10 @@ final class ProjectSummaryTracker {
         if (issues.stream().anyMatch(issue -> "OBJECT_STATUS_VALIDATION_FAILED".equals(issue.pattern()))) {
             nextActions.add("确认达梦验证账号可查询当前 schema 的 ALL_OBJECTS 后重新运行。");
         }
+        if (issues.stream().anyMatch(issue -> "OBJECT_DEFINITION_CHANGED".equals(issue.pattern()))) {
+            nextActions.add("检查 -7184 失败前最近修改依赖对象的 DDL，并在 CALL 前重新编译对应过程；"
+                    + "不要由工具修改 PL_SQL_STRIP。");
+        }
         if (issues.stream().anyMatch(issue -> issue.rootCount() > 0L)) {
             nextActions.add("按主要问题中的根因优先级处理详细报告，再重新执行完整数据库验证。");
         }
@@ -497,6 +501,8 @@ final class ProjectSummaryTracker {
             case "VALIDATION_TIMEOUT" -> "检查慢 SQL，必要时调整总验证时限。";
             case "INVALID_DATABASE_OBJECT" -> "修复新建对象的编译错误，确保对象状态为 VALID。";
             case "OBJECT_STATUS_VALIDATION_FAILED" -> "授予验证账号查询当前 schema 对象状态的权限后重新运行。";
+            case "OBJECT_DEFINITION_CHANGED" -> "根据报告中的最近相关 DDL 检查过程依赖并重新编译；"
+                    + "复杂动态 DDL 改为人工确认。";
             case "TEST_SCHEMA_OBJECT", "TEST_SCHEMA_FUNCTION" -> "先补齐测试库对象，再判断是否属于业务 SQL 问题。";
             default -> "查看详细报告中的首个失败样例并按迁移分类处理。";
         };

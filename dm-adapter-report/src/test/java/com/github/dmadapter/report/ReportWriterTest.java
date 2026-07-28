@@ -9,6 +9,7 @@ import com.github.dmadapter.core.SqlScriptFileResult;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
+import com.github.dmadapter.core.SqlScriptValidationReport;
 import com.github.dmadapter.core.StageStatus;
 import com.github.dmadapter.core.SummaryIssue;
 import com.github.dmadapter.core.SummaryStage;
@@ -25,6 +26,37 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ReportWriterTest {
     @TempDir
     Path tempDir;
+
+    @Test
+    void writesStandaloneSqlScriptValidationReport() throws Exception {
+        SqlScriptValidationReport report = new SqlScriptValidationReport(
+                tempDir.resolve("sql-script-validation-plan.json").toString(),
+                true,
+                "Dameng SQL script validation completed with failed SQL statements.",
+                3,
+                1,
+                2,
+                List.of(new SqlScriptValidationFailure(
+                        "demo.sql",
+                        "demo-dm.sql",
+                        "sample-system",
+                        4,
+                        "OBJECT_DEFINITION_CHANGED",
+                        "对象定义[demo]被修改，版本检查失败 -7184",
+                        "CALL demo_proc()"
+                )),
+                List.of("Skipped 2 manual statements.")
+        );
+
+        ReportPaths paths = new ReportWriter().writeSqlScriptValidationReport(report, tempDir);
+
+        assertThat(Files.readString(paths.markdownPath()))
+                .contains("达梦 SQL 脚本严格验证报告")
+                .contains("OBJECT_DEFINITION_CHANGED")
+                .contains("-7184")
+                .contains("跳过人工确认 SQL 数：`2`");
+        assertThat(Files.readString(paths.jsonPath())).contains("\"manualReviewSkippedCount\" : 2");
+    }
 
     @Test
     void writesReadableProjectSummaryAtomically() throws Exception {

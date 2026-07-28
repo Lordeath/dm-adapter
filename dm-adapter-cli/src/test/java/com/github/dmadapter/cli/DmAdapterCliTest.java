@@ -30,6 +30,45 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void exposesValidateSqlCommand() {
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("validate-sql", "--help");
+
+        assertThat(exitCode).isZero();
+    }
+
+    @Test
+    void sqlScriptMigrationWritesStrictValidationPlan() throws Exception {
+        writeDemoProject();
+        writeFile("sql/v2/demo.sql", "SELECT 1 FROM dual;\n");
+
+        int exitCode = execute(
+                "migrate",
+                "--project",
+                tempDir.toString(),
+                "--sql-scripts-only",
+                "--sql-root",
+                "sql/v2",
+                "--sql-root-out",
+                "sql/v2-dm",
+                "--schema",
+                "sample-system",
+                "--target-length-semantics",
+                "CHAR"
+        );
+
+        Path plan = tempDir.resolve(".dm-adapter/sql-script-validation-plan.json");
+        assertThat(exitCode).isZero();
+        assertThat(plan).exists();
+        assertThat(Files.readString(plan))
+                .contains("\"formatVersion\" : 1")
+                .contains("\"disposition\" : \"EXECUTE\"")
+                .contains("\"sha256\"")
+                .doesNotContain("SELECT 1 FROM dual");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-sql-script-report.md")))
+                .contains("严格验证清单");
+    }
+
+    @Test
     void migrateDryRunWritesReportWithoutChangingProjectFiles() throws Exception {
         writeDemoProject();
         String pomBefore = Files.readString(tempDir.resolve("pom.xml"));
