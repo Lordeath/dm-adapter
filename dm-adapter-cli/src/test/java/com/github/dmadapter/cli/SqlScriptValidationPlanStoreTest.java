@@ -77,6 +77,45 @@ class SqlScriptValidationPlanStoreTest {
     }
 
     @Test
+    void hashesStatementsAsParsedFromTheWrittenScript() throws Exception {
+        Path outputRoot = tempDir.resolve("sql-dm");
+        Path output = outputRoot.resolve("trailing-whitespace.sql");
+        Files.createDirectories(output.getParent());
+        List<String> migratedStatements = List.of("SELECT 1;\r\n    ");
+        Files.writeString(output, SqlScriptParser.scriptContent(migratedStatements));
+        SqlScriptMigrator.PlannedSqlScriptFile file = new SqlScriptMigrator.PlannedSqlScriptFile(
+                "trailing-whitespace.sql",
+                output.toString(),
+                "sample-system",
+                true,
+                true,
+                true,
+                1,
+                1,
+                0,
+                Set.of(),
+                List.of("TEST_RULE"),
+                migratedStatements
+        );
+        Path plan = tempDir.resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME);
+        SqlScriptValidationPlanStore store = new SqlScriptValidationPlanStore();
+
+        store.write(
+                plan,
+                tempDir,
+                outputRoot,
+                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                List.of(file),
+                List.of()
+        );
+
+        assertThat(store.load(plan).files())
+                .singleElement()
+                .satisfies(loadedFile ->
+                        assertThat(loadedFile.statements()).containsExactly("SELECT 1"));
+    }
+
+    @Test
     void rejectsBackticksWhenTargetIsNotMysqlCompatible() {
         SqlScriptValidationPlanStore store = new SqlScriptValidationPlanStore();
 
