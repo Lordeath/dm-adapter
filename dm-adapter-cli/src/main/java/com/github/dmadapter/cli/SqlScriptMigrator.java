@@ -9961,6 +9961,13 @@ class SqlScriptMigrator {
         if (isConvertedSimpleDateEndTrigger(sql)) {
             return "";
         }
+        String searchableSql = replaceIgnoredSqlWithSpaces(sql == null ? "" : sql);
+        if (Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
+                .matcher(searchableSql)
+                .find()) {
+            return "ON DUPLICATE KEY UPDATE inside a compound SQL statement still requires keyColumns; "
+                    + "the original SQL is preserved until its real primary/unique conflict key can be resolved.";
+        }
         String suspiciousLengthModifyReason = suspiciousLengthModifyReason(sql);
         if (!suspiciousLengthModifyReason.isBlank()) {
             return suspiciousLengthModifyReason;
