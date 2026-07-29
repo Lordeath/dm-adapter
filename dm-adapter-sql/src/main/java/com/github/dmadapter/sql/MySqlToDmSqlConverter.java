@@ -42,6 +42,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT";
     public static final String MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR_RULE =
             "MYSQL_SUBSTRING_INDEX_TO_REGEXP_SUBSTR";
+    public static final String MYSQL_HELP_TOPIC_SPLIT_TO_CROSS_APPLY_RULE =
+            "MYSQL_HELP_TOPIC_SPLIT_TO_DM_CROSS_APPLY";
     public static final String MYSQL_HAVING_AGGREGATE_ALIAS_RULE = "MYSQL_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION";
     public static final String MYSQL_NOT_FIND_IN_SET_RULE = "MYSQL_NOT_FIND_IN_SET_TO_EQUALS_ZERO";
     public static final String MYSQL_STR_TO_DATE_YEARMONTH_RULE = "MYSQL_STR_TO_DATE_YEARMONTH_TO_TO_DATE";
@@ -339,6 +341,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^\\s*(?<alias>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\.\\s*"
                     + "(?<column>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*="
     );
+    private static final String SIMPLE_IDENTIFIER = "[A-Za-z_][A-Za-z0-9_$]*";
+    private static final String SIMPLE_QUALIFIED_IDENTIFIER =
+            SIMPLE_IDENTIFIER + "(?:\\s*\\.\\s*" + SIMPLE_IDENTIFIER + ")?";
+    private static final Pattern MYSQL_HELP_TOPIC_SPLIT_JOIN_PATTERN = Pattern.compile(
+            "(?is)\\bJOIN\\s+mysql\\s*\\.\\s*help_topic\\s+"
+                    + "(?<alias>" + SIMPLE_IDENTIFIER + ")\\s+ON\\s+"
+                    + "(?<conditionAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*help_topic_id\\s*"
+                    + "(?<lessThan>&lt;|<)\\s*\\(\\s*"
+                    + "LENGTH\\s*\\(\\s*(?<source>" + SIMPLE_QUALIFIED_IDENTIFIER + ")\\s*\\)\\s*-\\s*"
+                    + "LENGTH\\s*\\(\\s*REPLACE\\s*\\(\\s*"
+                    + "(?<replaceSource>" + SIMPLE_QUALIFIED_IDENTIFIER + ")\\s*,\\s*','\\s*,\\s*''\\s*\\)\\s*\\)"
+                    + "\\s*\\+\\s*1\\s*\\)"
+    );
 
     @Override
     public SqlConversionResult convert(String sql) {
@@ -607,6 +622,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (nullSafeEqualConversion.changed()) {
             converted = nullSafeEqualConversion.convertedSql();
             rules.add(MYSQL_NULL_SAFE_EQUAL_RULE);
+        }
+
+        GenericConversion helpTopicSplitConversion = convertMysqlHelpTopicSplit(converted);
+        if (helpTopicSplitConversion.changed()) {
+            converted = helpTopicSplitConversion.convertedSql();
+            rules.add(MYSQL_HELP_TOPIC_SPLIT_TO_CROSS_APPLY_RULE);
         }
 
         GenericConversion tableAliasAsConversion = removeAsFromTableAliases(converted);
@@ -8198,6 +8219,86 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
+    private GenericConversion convertMysqlHelpTopicSplit(String sql) {
+        Matcher joinMatcher = MYSQL_HELP_TOPIC_SPLIT_JOIN_PATTERN.matcher(sql);
+        StringBuilder converted = new StringBuilder(sql.length());
+        List<HelpTopicSplit> convertedSplits = new ArrayList<>();
+        int appendFrom = 0;
+        while (joinMatcher.find()) {
+            String alias = joinMatcher.group("alias");
+            String conditionAlias = joinMatcher.group("conditionAlias");
+            String source = normalizedQualifiedIdentifier(joinMatcher.group("source"));
+            String replaceSource = normalizedQualifiedIdentifier(joinMatcher.group("replaceSource"));
+            Pattern splitExpressionPattern = mysqlHelpTopicSplitExpressionPattern(alias, source);
+            if (!alias.equalsIgnoreCase(conditionAlias)
+                    || !source.equalsIgnoreCase(replaceSource)
+                    || !splitExpressionPattern.matcher(sql).find()) {
+                continue;
+            }
+
+            converted.append(sql, appendFrom, joinMatcher.start());
+            String comparison = "&lt;".equalsIgnoreCase(joinMatcher.group("lessThan"))
+                    ? "&lt;="
+                    : "<=";
+            converted.append("CROSS APPLY (")
+                    .append("SELECT LEVEL - 1 AS help_topic_id FROM dual CONNECT BY LEVEL ")
+                    .append(comparison)
+                    .append(" LENGTH(")
+                    .append(source)
+                    .append(") - LENGTH(REPLACE(")
+                    .append(source)
+                    .append(", ',', '')) + 1")
+                    .append(") ")
+                    .append(alias);
+            appendFrom = joinMatcher.end();
+            convertedSplits.add(new HelpTopicSplit(alias, source));
+        }
+        if (convertedSplits.isEmpty()) {
+            return new GenericConversion(sql, false);
+        }
+        converted.append(sql, appendFrom, sql.length());
+
+        String rewritten = converted.toString();
+        for (HelpTopicSplit split : convertedSplits) {
+            Matcher expressionMatcher = mysqlHelpTopicSplitExpressionPattern(
+                    split.alias(),
+                    split.source()
+            ).matcher(rewritten);
+            String replacement = "REGEXP_SUBSTR("
+                    + split.source()
+                    + ", '[^,]+', 1, "
+                    + split.alias()
+                    + ".help_topic_id + 1)";
+            rewritten = expressionMatcher.replaceAll(Matcher.quoteReplacement(replacement));
+        }
+        return new GenericConversion(rewritten, !rewritten.equals(sql));
+    }
+
+    private Pattern mysqlHelpTopicSplitExpressionPattern(String alias, String source) {
+        String sourcePattern = qualifiedIdentifierPattern(source);
+        return Pattern.compile(
+                "(?is)\\bSUBSTRING_INDEX\\s*\\(\\s*"
+                        + "SUBSTRING_INDEX\\s*\\(\\s*"
+                        + sourcePattern
+                        + "\\s*,\\s*','\\s*,\\s*"
+                        + Pattern.quote(alias)
+                        + "\\s*\\.\\s*help_topic_id\\s*\\+\\s*1\\s*\\)"
+                        + "\\s*,\\s*','\\s*,\\s*-\\s*1\\s*\\)"
+        );
+    }
+
+    private String normalizedQualifiedIdentifier(String value) {
+        return value == null ? "" : value.replaceAll("\\s+", "");
+    }
+
+    private String qualifiedIdentifierPattern(String value) {
+        String[] parts = value.split("\\.", -1);
+        if (parts.length == 1) {
+            return Pattern.quote(parts[0]);
+        }
+        return Pattern.quote(parts[0]) + "\\s*\\.\\s*" + Pattern.quote(parts[1]);
+    }
+
     private String rewriteSubstringIndex(FunctionCall substringIndexCall) {
         List<TopLevelArgument> arguments = splitTopLevelArguments(substringIndexCall.body());
         if (arguments.size() != 3) {
@@ -9106,6 +9207,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         private static GenericConversion unchanged(String sql) {
             return new GenericConversion(sql, false);
         }
+    }
+
+    private record HelpTopicSplit(String alias, String source) {
     }
 
     private record ArithmeticConversion(
