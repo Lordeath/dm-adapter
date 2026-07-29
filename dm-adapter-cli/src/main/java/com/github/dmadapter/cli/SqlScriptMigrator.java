@@ -186,6 +186,12 @@ class SqlScriptMigrator {
             "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?:\\s*\\.\\s*(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
+    private static final Pattern MYSQL_ON_DUPLICATE_INSERT_SHAPE_PATTERN = Pattern.compile(
+            "(?is)\\bINSERT\\s+(?:IGNORE\\s+)?INTO\\s+"
+                    + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s*"
+                    + "\\((?<columns>[^()]*)\\)"
+                    + "(?:(?!;).)*?\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b"
+    );
     private static final Pattern CONVERTED_SIMPLE_DATE_END_TRIGGER_PATTERN = Pattern.compile(
             "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TRIGGER\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
                     + "BEFORE\\s+(?:INSERT|UPDATE)\\s+ON\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
@@ -339,6 +345,7 @@ class SqlScriptMigrator {
     private final Validator validator;
     private final Consumer<String> progressConsumer;
     private final SqlScriptValidationPlanStore validationPlanStore = new SqlScriptValidationPlanStore();
+    private final ProjectDdlKeyMetadataReader projectDdlKeyMetadataReader = new ProjectDdlKeyMetadataReader();
 
     SqlScriptMigrator(SqlConverter converter, Validator validator) {
         this(converter, validator, message -> {
@@ -448,6 +455,7 @@ class SqlScriptMigrator {
         plannedFiles = plannedFiles.stream()
                 .sorted(Comparator.comparing(file -> plannedFileSortKey(sqlRootOut, file)))
                 .toList();
+        refineOriginalUpsertKeyConflicts(projectRoot, manualReviewItems, warnings);
         ProcedureDependencyAnalysis dependencyAnalysis = analyzeProcedureDependencies(
                 plannedFiles,
                 manualReviewItems
@@ -567,6 +575,98 @@ class SqlScriptMigrator {
             paths.add(normalized);
         }
         return Set.copyOf(paths);
+    }
+
+    private void refineOriginalUpsertKeyConflicts(
+            Path projectRoot,
+            List<SqlScriptManualReviewItem> manualReviewItems,
+            List<String> warnings
+    ) {
+        LinkedHashMap<Integer, List<UpsertInsertShape>> candidates = new LinkedHashMap<>();
+        LinkedHashSet<String> tables = new LinkedHashSet<>();
+        for (int index = 0; index < manualReviewItems.size(); index++) {
+            SqlScriptManualReviewItem item = manualReviewItems.get(index);
+            if (!item.reason().contains("ON DUPLICATE KEY UPDATE")
+                    || !item.reason().contains("keyColumns")) {
+                continue;
+            }
+            List<UpsertInsertShape> shapes = upsertInsertShapes(item.originalSql());
+            if (!shapes.isEmpty()) {
+                candidates.put(index, shapes);
+                shapes.stream().map(UpsertInsertShape::table).forEach(tables::add);
+            }
+        }
+        if (candidates.isEmpty()) {
+            return;
+        }
+
+        Map<String, TableKeyMetadata> metadata;
+        try {
+            metadata = projectDdlKeyMetadataReader.readTableKeys(projectRoot, List.copyOf(tables));
+        } catch (IOException e) {
+            warnings.add("Project DDL metadata inference for SQL script upserts was skipped: " + e.getMessage());
+            return;
+        }
+        candidates.forEach((itemIndex, shapes) -> {
+            LinkedHashSet<String> conflictingTables = new LinkedHashSet<>();
+            for (UpsertInsertShape shape : shapes) {
+                TableKeyMetadata tableMetadata = metadata.get(shape.table());
+                if (tableMetadata == null
+                        || tableMetadata.constraints().isEmpty()
+                        || hasCompleteConflictKey(shape.insertColumns(), tableMetadata)) {
+                    return;
+                }
+                conflictingTables.add(shape.table());
+            }
+            if (conflictingTables.isEmpty()) {
+                return;
+            }
+            SqlScriptManualReviewItem item = manualReviewItems.get(itemIndex);
+            String tableList = conflictingTables.stream()
+                    .sorted()
+                    .map(table -> "`" + table + "`")
+                    .collect(Collectors.joining("、"));
+            String reason = "原始 SQL/键元数据冲突：按项目 DDL 当前可识别的主键/唯一键，表 "
+                    + tableList
+                    + " 的 INSERT 列不包含任何完整冲突键，ON DUPLICATE KEY UPDATE 无法按预期触发；"
+                    + "请先修正原 SQL 或补充真实唯一约束，不能猜测 keyColumns 生成达梦 MERGE。";
+            manualReviewItems.set(itemIndex, new SqlScriptManualReviewItem(
+                    item.sourceFile(),
+                    item.outputFile(),
+                    item.statementIndex(),
+                    reason,
+                    item.originalSql(),
+                    item.convertedSql()
+            ));
+        });
+    }
+
+    private List<UpsertInsertShape> upsertInsertShapes(String sql) {
+        Matcher matcher = MYSQL_ON_DUPLICATE_INSERT_SHAPE_PATTERN.matcher(sql == null ? "" : sql);
+        List<UpsertInsertShape> shapes = new ArrayList<>();
+        while (matcher.find()) {
+            String table = DamengMetadataReader.normalizeTableName(matcher.group("table"));
+            LinkedHashSet<String> columns = splitTopLevelComma(matcher.group("columns")).stream()
+                    .map(String::strip)
+                    .filter(column -> Pattern.compile("(?is)^" + SQL_SIMPLE_IDENTIFIER_TOKEN + "$")
+                            .matcher(column)
+                            .matches())
+                    .map(DamengMetadataReader::normalizeIdentifier)
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            if (!table.isBlank() && !columns.isEmpty()) {
+                shapes.add(new UpsertInsertShape(table, columns));
+            }
+        }
+        return List.copyOf(shapes);
+    }
+
+    private boolean hasCompleteConflictKey(Set<String> insertColumns, TableKeyMetadata metadata) {
+        return metadata.constraints().stream()
+                .map(TableConstraint::columns)
+                .map(columns -> columns.stream()
+                        .map(DamengMetadataReader::normalizeIdentifier)
+                        .collect(Collectors.toCollection(LinkedHashSet::new)))
+                .anyMatch(insertColumns::containsAll);
     }
 
     private long safeFileSize(Path path) {
@@ -5580,23 +5680,28 @@ class SqlScriptMigrator {
             return sql;
         }
         LinkedHashSet<String> flags = mysqlCursorNotFoundHandlerFlags(sql);
-        if (flags.isEmpty()) {
-            return sql;
-        }
-
         String converted = sql;
         LinkedHashSet<String> convertedFlags = new LinkedHashSet<>();
+        LinkedHashSet<String> convertedNullSentinels = new LinkedHashSet<>();
         boolean changed = false;
-        for (int i = 0; i < 20; i++) {
-            CursorLoopConversion loopConversion = convertMysqlCursorLoops(converted, flags);
-            if (!loopConversion.changed()) {
-                break;
+        if (!flags.isEmpty()) {
+            for (int i = 0; i < 20; i++) {
+                CursorLoopConversion loopConversion = convertMysqlCursorLoops(converted, flags);
+                if (!loopConversion.changed()) {
+                    break;
+                }
+                converted = loopConversion.sql();
+                convertedFlags.addAll(loopConversion.convertedFlags());
+                changed = true;
             }
-            converted = loopConversion.sql();
-            convertedFlags.addAll(loopConversion.convertedFlags());
+        }
+        CursorLoopConversion nullSentinelLoops = convertMysqlNullSentinelCursorLoops(converted);
+        if (nullSentinelLoops.changed()) {
+            converted = nullSentinelLoops.sql();
+            convertedNullSentinels.addAll(nullSentinelLoops.convertedFlags());
             changed = true;
         }
-        if (!changed || convertedFlags.isEmpty()) {
+        if (!changed) {
             return sql;
         }
         converted = Pattern.compile(
@@ -5636,6 +5741,17 @@ class SqlScriptMigrator {
                     .matcher(converted)
                     .replaceAll("");
         }
+        converted = Pattern.compile(
+                        "(?is)\\s*DECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+"
+                                + "(?:SQLSTATE\\s+'02000'|NOT\\s+FOUND)\\s*SET\\s+("
+                                + SQL_SIMPLE_IDENTIFIER_TOKEN
+                                + ")\\s*=\\s*NULL\\s*;"
+                )
+                .matcher(converted)
+                .replaceAll(matchResult -> convertedNullSentinels
+                        .contains(unquoteIdentifier(matchResult.group(1)).toLowerCase(Locale.ROOT))
+                        ? ""
+                        : matchResult.group());
         for (String flag : convertedFlags) {
             if (containsIdentifierReferenceOutsideIgnoredText(converted, flag)) {
                 return sql;
@@ -5712,8 +5828,7 @@ class SqlScriptMigrator {
             }
             String fetchTargets = loopHeadMatcher.group(3).strip();
             String body = sql.substring(loopHeadMatcher.end(), loopTailMatcher.start());
-            if (loopHeadMatcher.group(5).stripLeading().startsWith("=")
-                    && containsSelectIntoOutsideIgnoredText(body)) {
+            if (containsSelectIntoThatCanRaiseNotFound(body)) {
                 searchCursor = loopHeadMatcher.end();
                 continue;
             }
@@ -5740,6 +5855,177 @@ class SqlScriptMigrator {
         }
         converted.append(sql.substring(appendCursor));
         return new CursorLoopConversion(converted.toString(), true, convertedFlags);
+    }
+
+    private CursorLoopConversion convertMysqlNullSentinelCursorLoops(String sql) {
+        Matcher loopHeadMatcher = Pattern.compile(
+                "(?is)\\bOPEN\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*;"
+                        + SQL_WS_OR_COMMENT_TOKEN
+                        + "FETCH\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+INTO\\s+([^;]+?)\\s*;"
+                        + SQL_WS_OR_COMMENT_TOKEN
+                        + "(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*:\\s*LOOP"
+                        + SQL_WS_OR_COMMENT_TOKEN
+                        + "IF\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+IS\\s+NULL\\s+THEN\\b"
+        ).matcher(sql);
+        LinkedHashSet<String> handlerSentinels = mysqlCursorNotFoundNullSentinels(sql);
+        if (handlerSentinels.isEmpty()) {
+            return new CursorLoopConversion(sql, false, Set.of());
+        }
+
+        StringBuilder converted = new StringBuilder(sql.length());
+        LinkedHashSet<String> convertedSentinels = new LinkedHashSet<>();
+        int searchCursor = 0;
+        int appendCursor = 0;
+        boolean changed = false;
+        while (loopHeadMatcher.find(searchCursor)) {
+            String cursorName = loopHeadMatcher.group(1).strip();
+            String fetchedCursorName = loopHeadMatcher.group(2).strip();
+            String fetchTargets = loopHeadMatcher.group(3).strip();
+            String loopLabel = loopHeadMatcher.group(4).strip();
+            String sentinel = unquoteIdentifier(loopHeadMatcher.group(5).strip()).toLowerCase(Locale.ROOT);
+            if (!sameIdentifier(cursorName, fetchedCursorName)
+                    || !handlerSentinels.contains(sentinel)
+                    || !cursorFetchTargetsContain(fetchTargets, sentinel)) {
+                searchCursor = loopHeadMatcher.end();
+                continue;
+            }
+            CursorLeaveIfBlock leaveIfBlock = readCursorLeaveIfBlock(sql, loopHeadMatcher.end(), loopLabel);
+            if (leaveIfBlock == null || !leaveIfBlock.loopBody().isBlank()) {
+                searchCursor = loopHeadMatcher.end();
+                continue;
+            }
+            Matcher loopTailMatcher = Pattern.compile(
+                    "(?is)\\bFETCH\\s+"
+                            + identifierReferencePattern(unquoteIdentifier(cursorName))
+                            + "\\s+INTO\\s+(.+?)\\s*;"
+                            + SQL_WS_OR_COMMENT_TOKEN
+                            + "END\\s+LOOP(?:\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?\\s*;"
+                            + SQL_WS_OR_COMMENT_TOKEN
+                            + "CLOSE\\s+"
+                            + identifierReferencePattern(unquoteIdentifier(cursorName))
+                            + "\\s*;"
+            ).matcher(sql);
+            loopTailMatcher.region(leaveIfBlock.endIfEnd(), sql.length());
+            if (!loopTailMatcher.find()
+                    || !sameCursorFetchTargets(fetchTargets, loopTailMatcher.group(1))
+                    || (loopTailMatcher.group(2) != null
+                    && !sameIdentifier(loopLabel, loopTailMatcher.group(2)))) {
+                searchCursor = loopHeadMatcher.end();
+                continue;
+            }
+            String body = sql.substring(leaveIfBlock.endIfEnd(), loopTailMatcher.start());
+            NullSafeSelectIntoRewrite bodyRewrite = rewriteNullInitializedSelectIntoAssignments(body);
+            if (!bodyRewrite.safe()
+                    || containsKeywordOutsideIgnoredText(bodyRewrite.sql(), "FETCH")) {
+                searchCursor = loopHeadMatcher.end();
+                continue;
+            }
+
+            converted.append(sql, appendCursor, loopHeadMatcher.start());
+            String indent = lineIndentBefore(sql, loopHeadMatcher.start());
+            String innerIndent = indent + "    ";
+            converted.append("OPEN ").append(cursorName).append(";\n")
+                    .append(indent).append("LOOP\n")
+                    .append(innerIndent).append("FETCH ").append(cursorName).append(" INTO ").append(fetchTargets).append(";\n")
+                    .append(innerIndent).append("EXIT WHEN ").append(cursorName).append("%NOTFOUND;\n")
+                    .append(bodyRewrite.sql().stripLeading());
+            if (!bodyRewrite.sql().endsWith("\n") && !bodyRewrite.sql().endsWith("\r")) {
+                converted.append("\n");
+            }
+            converted.append(indent).append("END LOOP;\n")
+                    .append(indent).append("CLOSE ").append(cursorName).append(";");
+            convertedSentinels.add(sentinel);
+            appendCursor = loopTailMatcher.end();
+            searchCursor = loopTailMatcher.end();
+            changed = true;
+        }
+        if (!changed) {
+            return new CursorLoopConversion(sql, false, Set.of());
+        }
+        converted.append(sql.substring(appendCursor));
+        return new CursorLoopConversion(converted.toString(), true, convertedSentinels);
+    }
+
+    private LinkedHashSet<String> mysqlCursorNotFoundNullSentinels(String sql) {
+        Matcher handlerMatcher = Pattern.compile(
+                "(?is)\\bDECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+"
+                        + "(?:SQLSTATE\\s+'02000'|NOT\\s+FOUND)\\s*SET\\s+("
+                        + SQL_SIMPLE_IDENTIFIER_TOKEN
+                        + ")\\s*=\\s*NULL\\s*;"
+        ).matcher(sql);
+        LinkedHashSet<String> sentinels = new LinkedHashSet<>();
+        while (handlerMatcher.find()) {
+            sentinels.add(unquoteIdentifier(handlerMatcher.group(1)).toLowerCase(Locale.ROOT));
+        }
+        return sentinels;
+    }
+
+    private boolean cursorFetchTargetsContain(String fetchTargets, String expectedTarget) {
+        return splitTopLevelComma(fetchTargets).stream()
+                .map(String::strip)
+                .anyMatch(target -> sameIdentifier(target, expectedTarget));
+    }
+
+    private boolean sameCursorFetchTargets(String left, String right) {
+        List<String> leftTargets = splitTopLevelComma(left);
+        List<String> rightTargets = splitTopLevelComma(right);
+        if (leftTargets.size() != rightTargets.size()) {
+            return false;
+        }
+        for (int i = 0; i < leftTargets.size(); i++) {
+            if (!sameIdentifier(leftTargets.get(i), rightTargets.get(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private NullSafeSelectIntoRewrite rewriteNullInitializedSelectIntoAssignments(String sql) {
+        Matcher setMatcher = Pattern.compile(
+                "(?is)\\bSET\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*=\\s*NULL\\s*;"
+        ).matcher(sql);
+        StringBuilder converted = new StringBuilder(sql.length());
+        int appendCursor = 0;
+        int searchCursor = 0;
+        boolean changed = false;
+        while (setMatcher.find(searchCursor)) {
+            String target = setMatcher.group(1).strip();
+            int selectStart = skipWhitespaceAndComments(sql, setMatcher.end());
+            if (!startsKeyword(sql, selectStart, "SELECT")) {
+                searchCursor = setMatcher.end();
+                continue;
+            }
+            int statementEnd = findStatementTerminator(sql, selectStart);
+            if (statementEnd >= sql.length()) {
+                return new NullSafeSelectIntoRewrite(sql, false);
+            }
+            String selectStatement = sql.substring(selectStart, statementEnd);
+            Matcher selectMatcher = Pattern.compile(
+                    "(?is)^SELECT\\s+(.+?)\\s+INTO\\s+("
+                            + SQL_SIMPLE_IDENTIFIER_TOKEN
+                            + ")\\s+(FROM\\b.+)$"
+            ).matcher(selectStatement);
+            if (!selectMatcher.matches() || !sameIdentifier(target, selectMatcher.group(2))) {
+                searchCursor = setMatcher.end();
+                continue;
+            }
+            converted.append(sql, appendCursor, setMatcher.start())
+                    .append("SET ").append(target).append(" = (SELECT ")
+                    .append(selectMatcher.group(1).strip()).append(" ")
+                    .append(selectMatcher.group(3).strip()).append(");");
+            appendCursor = statementEnd + 1;
+            searchCursor = statementEnd + 1;
+            changed = true;
+        }
+        if (!changed) {
+            return new NullSafeSelectIntoRewrite(sql, !containsSelectIntoOutsideIgnoredText(sql));
+        }
+        converted.append(sql.substring(appendCursor));
+        String rewritten = converted.toString();
+        return new NullSafeSelectIntoRewrite(
+                rewritten,
+                !containsSelectIntoOutsideIgnoredText(rewritten)
+        );
     }
 
     private boolean containsSelectIntoOutsideIgnoredText(String sql) {
@@ -5795,6 +6081,41 @@ class SqlScriptMigrator {
             }
         }
         return false;
+    }
+
+    private boolean containsSelectIntoThatCanRaiseNotFound(String sql) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        Matcher selectIntoMatcher = Pattern.compile(
+                "(?is)\\bSELECT\\s+[^;]*?\\s+INTO\\b"
+        ).matcher(searchable);
+        while (selectIntoMatcher.find()) {
+            int statementEnd = searchable.indexOf(';', selectIntoMatcher.start());
+            String statement = searchable.substring(
+                    selectIntoMatcher.start(),
+                    statementEnd < 0 ? searchable.length() : statementEnd
+            );
+            if (!isGuaranteedRowAggregateSelectInto(statement)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isGuaranteedRowAggregateSelectInto(String sql) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        int intoIndex = topLevelKeywordIndex(searchable, "INTO");
+        if (intoIndex < 0
+                || topLevelKeywordIndex(searchable, "GROUP") >= 0
+                || topLevelKeywordIndex(searchable, "HAVING") >= 0) {
+            return false;
+        }
+        String selectList = searchable.substring("SELECT".length(), intoIndex).strip();
+        return Pattern.compile(
+                        "(?is)^(?:(?:COUNT|SUM|AVG|MIN|MAX)\\s*\\([^;]+?\\)"
+                                + "(?:\\s*,\\s*)?)+$"
+                )
+                .matcher(selectList)
+                .matches();
     }
 
     private CursorLoopConversion convertMysqlCursorLabelLoops(String sql, LinkedHashSet<String> handlerFlags) {
@@ -9468,8 +9789,48 @@ class SqlScriptMigrator {
     }
 
     private String originalSqlSyntaxManualReviewReason(String sql) {
+        String cursorHandlerConflictReason = mysqlCursorHandlerSelectIntoConflictReason(sql);
+        if (!cursorHandlerConflictReason.isBlank()) {
+            return cursorHandlerConflictReason;
+        }
         if (hasDanglingInsertValuesCommaBeforeBlockEnd(sql)) {
             return ORIGINAL_SQL_DANGLING_INSERT_VALUES_REASON;
+        }
+        return "";
+    }
+
+    private String mysqlCursorHandlerSelectIntoConflictReason(String sql) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql == null ? "" : sql);
+        Matcher handlerMatcher = Pattern.compile(
+                "(?is)\\bDECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+"
+                        + "(?:SQLSTATE\\s+'02000'|NOT\\s+FOUND)\\s*SET\\s+("
+                        + SQL_SIMPLE_IDENTIFIER_TOKEN
+                        + ")\\s*=\\s*(?:1|TRUE)\\s*;"
+        ).matcher(sql == null ? "" : sql);
+        while (handlerMatcher.find()) {
+            String flag = unquoteIdentifier(handlerMatcher.group(1));
+            Matcher loopHeadMatcher = Pattern.compile(
+                    "(?is)\\bWHILE\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*"
+                            + "(?:(?:<>|!=)\\s*(?:1|TRUE)|=\\s*(?:0|FALSE))\\s+DO\\b"
+            ).matcher(searchable);
+            loopHeadMatcher.region(handlerMatcher.end(), searchable.length());
+            while (loopHeadMatcher.find()) {
+                if (!sameIdentifier(flag, loopHeadMatcher.group(1))) {
+                    continue;
+                }
+                Matcher loopEndMatcher = Pattern.compile("(?is)\\bEND\\s+WHILE\\b").matcher(searchable);
+                loopEndMatcher.region(loopHeadMatcher.end(), searchable.length());
+                if (!loopEndMatcher.find()) {
+                    break;
+                }
+                String body = sql.substring(loopHeadMatcher.end(), loopEndMatcher.start());
+                if (containsSelectIntoThatCanRaiseNotFound(body)) {
+                    return "原始 SQL 逻辑缺陷：NOT FOUND/SQLSTATE '02000' CONTINUE HANDLER "
+                            + "将游标结束与循环体 SELECT ... INTO 无结果共用同一标志；"
+                            + "后者会提前结束 WHILE，可能在游标耗尽前漏处理后续数据。"
+                            + "请先在原 SQL 中隔离可选查询的无结果处理，或改写为保持 NULL 语义的标量子查询。";
+                }
+            }
         }
         return "";
     }
@@ -10058,6 +10419,19 @@ class SqlScriptMigrator {
     }
 
     private record CursorLeaveIfBlock(int endIfEnd, String loopBody) {
+    }
+
+    private record NullSafeSelectIntoRewrite(String sql, boolean safe) {
+        private NullSafeSelectIntoRewrite {
+            sql = sql == null ? "" : sql;
+        }
+    }
+
+    private record UpsertInsertShape(String table, Set<String> insertColumns) {
+        private UpsertInsertShape {
+            table = table == null ? "" : table;
+            insertColumns = Set.copyOf(insertColumns == null ? Set.of() : insertColumns);
+        }
     }
 
     private record NestedBlockDeclarations(List<String> declarations, int declarationsEnd, String leadingTrivia) {
