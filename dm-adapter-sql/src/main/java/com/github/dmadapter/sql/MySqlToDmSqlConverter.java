@@ -2301,10 +2301,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     changed = true;
                 }
             }
-            if (startsKeyword(sql, cursor, "UNSIGNED")) {
-                cursor = skipWhitespace(sql, cursor + "UNSIGNED".length());
-                changed = true;
-            }
+            boolean numericAttributeFound;
+            do {
+                numericAttributeFound = false;
+                if (startsKeyword(sql, cursor, "UNSIGNED")) {
+                    cursor = skipWhitespace(sql, cursor + "UNSIGNED".length());
+                    changed = true;
+                    numericAttributeFound = true;
+                } else if (startsKeyword(sql, cursor, "ZEROFILL")) {
+                    cursor = skipWhitespace(sql, cursor + "ZEROFILL".length());
+                    changed = true;
+                    numericAttributeFound = true;
+                }
+            } while (numericAttributeFound);
             return changed ? new NumericTypeRewrite(cursor, token.text()) : null;
         }
         if ("DOUBLE".equals(upper)) {
