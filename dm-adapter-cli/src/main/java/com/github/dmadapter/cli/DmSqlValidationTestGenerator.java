@@ -9273,6 +9273,7 @@ class DmSqlValidationTestGenerator {
                     String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
+                            || Pattern.compile("(?i)### SQL:\\\\s*update\\\\s+from\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
                             || Pattern.compile(
                                     "(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+[^\\\\s,()]+\\\\s+"
