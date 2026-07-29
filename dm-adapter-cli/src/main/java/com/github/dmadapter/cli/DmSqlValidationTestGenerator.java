@@ -8411,9 +8411,11 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_METADATA_SQL",
                             "MYSQL_UPDATE_JOIN_MULTI_TARGET",
                             "MYSQL_USER_VARIABLE",
-                            "ORIGINAL_XML_SYNTAX_DEFECT",
                             "SQL_SYNTAX_OTHER")) {
                         markdown.append("- 人工复核 GROUP_CONCAT、JSON SQL、REGEXP、MySQL 元数据查询，以及其他未分类的达梦语法失败等复杂 SQL 模式。\\n");
+                    }
+                    if (countsByPattern.containsKey("ORIGINAL_XML_SYNTAX_DEFECT")) {
+                        markdown.append("- 修正原始 mapper XML 中已确认的 SQL 语法缺陷，例如缺少 AND、列值数量不一致或非法逗号；不要在 mapper-dm 中掩盖原始错误。\\n");
                     }
                     if (countsByPattern.containsKey("ORIGINAL_XML_REQUIRED_COLUMN_OMISSION")) {
                         markdown.append("- 修正原始 mapper INSERT：把达梦表要求的非空列同时加入显式列清单和值清单；不要通过测试参数或 ignore 掩盖。\\n");
@@ -9439,6 +9441,9 @@ class DmSqlValidationTestGenerator {
                     if (hasRequiredInsertColumnOmission(message)) {
                         return "ORIGINAL_SQL";
                     }
+                    if (hasOriginalXmlSyntaxDefect(message)) {
+                        return "ORIGINAL_SQL";
+                    }
                     if (hasTestDataOrConstraintIssue(message)
                             || containsAny(message, "数据类型不匹配", "NumberFormatException", "违反引用约束")) {
                         return "TEST_DATA_OR_SCHEMA";
@@ -9449,8 +9454,7 @@ class DmSqlValidationTestGenerator {
                     if (hasUnresolvedFunctionObject(message)) {
                         return "TEST_SCHEMA";
                     }
-                    if (hasMysqlCollateClause(message)
-                            || hasOriginalXmlSyntaxDefect(message)) {
+                    if (hasMysqlCollateClause(message)) {
                         return "SQL_SYNTAX";
                     }
                     if (hasRegexpOperatorIssue(message)) {
@@ -9458,8 +9462,7 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasMysqlMakeDate(message)
                             || hasMysqlSubdate(message)
-                            || hasMysqlUpdateJoinMultiTarget(message)
-                            || hasOriginalXmlSyntaxDefect(message)) {
+                            || hasMysqlUpdateJoinMultiTarget(message)) {
                         return "SQL_SYNTAX";
                     }
                     if (containsAny(message,

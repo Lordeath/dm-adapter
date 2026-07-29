@@ -80,6 +80,23 @@ class GeneratedFailurePatternTest {
                     validation,
                     failedRecord(validationClass, suppliedRequiredColumn)
             )).isTrue();
+
+            String missingAnd = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: update ns_paid_in_audit
+                    set account_actual_audit_status = ?
+                    where enterprise_id = ?
+                    accountActualAuditId in (?, ?)
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object missingAndRecord = failedRecord(validationClass, missingAnd);
+            assertThat(failurePattern(validationClass, validation, missingAndRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, missingAndRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, missingAndRecord))
+                    .isFalse();
         }
     }
 
