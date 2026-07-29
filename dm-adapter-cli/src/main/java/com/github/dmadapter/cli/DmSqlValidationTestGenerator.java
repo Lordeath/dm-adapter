@@ -9274,6 +9274,11 @@ class DmSqlValidationTestGenerator {
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
+                            || Pattern.compile(
+                                    "(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+[^\\\\s,()]+\\\\s+"
+                                            + "(?:\\\"and\\\"|\\\"or\\\"|and|or)\\\\s+"
+                                            + "[A-Za-z_][A-Za-z0-9_$]*\\\\s*(?:=|<>|!=|>=|<=|>|<|like\\\\b|in\\\\s*\\\\()"
+                            ).matcher(value).find()
                             || hasUnbalancedSqlParentheses(value)
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(value).find()

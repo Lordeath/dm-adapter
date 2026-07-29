@@ -141,6 +141,22 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("ORIGINAL_SQL");
             assertThat(shouldSuggestValidationArguments(validationClass, validation, missingAndRecord))
                     .isFalse();
+
+            String missingWhere = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select id, enterpriseId
+                    from ns_integration_interface "and" deleteFlag = 0
+                    and enterpriseId = ?
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object missingWhereRecord = failedRecord(validationClass, missingWhere);
+            assertThat(failurePattern(validationClass, validation, missingWhereRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, missingWhereRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, missingWhereRecord))
+                    .isFalse();
         }
     }
 
