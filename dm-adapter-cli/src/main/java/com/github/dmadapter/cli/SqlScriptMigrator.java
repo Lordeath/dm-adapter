@@ -50,6 +50,8 @@ class SqlScriptMigrator {
             "MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX";
     static final String MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE =
             "MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE";
+    static final String MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE =
+            "MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM";
     static final String MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE =
             "MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL";
     static final String MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE =
@@ -3024,6 +3026,10 @@ class SqlScriptMigrator {
         rules.addAll(safeRuleConversion.appliedRules());
         rules.addAll(sqlConversion.appliedRules());
         String convertedBody = sqlConversion.convertedSql();
+        if (safeRuleConversion.appliedRules()
+                .contains(MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE)) {
+            convertedBody = restoreDmLocalTemporaryTableNames(convertedBody);
+        }
         if (MYSQL_PREFIX_INDEX_DDL_PATTERN.matcher(sqlBody).find()
                 && DM_PREFIX_FUNCTION_INDEX_PATTERN.matcher(convertedBody).find()) {
             rules.add(MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE);
@@ -3891,6 +3897,9 @@ class SqlScriptMigrator {
         LinkedHashMap<String, LinkedHashSet<String>> tableColumns =
                 temporaryProcedureTableDefinitions(leadingSqlPrefix.body());
         for (Map.Entry<String, LinkedHashSet<String>> entry : tableColumns.entrySet()) {
+            if (unquoteIdentifier(lastIdentifierPart(entry.getKey().strip())).startsWith("#")) {
+                continue;
+            }
             placeholders.add("CREATE TABLE IF NOT EXISTS " + entry.getKey()
                     + " (" + procedureTempTableColumnDefinitions(entry.getValue()) + ")");
         }
@@ -5372,6 +5381,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_DATE_TIME_TO_DM_RULE);
         }
 
+        String localTemporaryTableSql = convertMysqlProcedureLocalTemporaryTables(converted);
+        if (!localTemporaryTableSql.equals(converted)) {
+            converted = localTemporaryTableSql;
+            rules.add(MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE);
+        }
+
         String tempInsertIgnoreSql = convertMysqlProcedureTemporaryInsertIgnore(converted);
         if (!tempInsertIgnoreSql.equals(converted)) {
             converted = tempInsertIgnoreSql;
@@ -6604,7 +6619,12 @@ class SqlScriptMigrator {
         if (!matcher.matches()) {
             return stripped;
         }
-        return matcher.group(2)
+        String mysqlIdentifier = matcher.group(2);
+        String identifier = dmRoutineIdentifier(
+                unquoteIdentifier(mysqlIdentifier),
+                mysqlIdentifier
+        );
+        return identifier
                 + " "
                 + matcher.group(1).toUpperCase(Locale.ROOT)
                 + " "
@@ -9543,6 +9563,10 @@ class SqlScriptMigrator {
                 int end = skipUntilBlockCommentEnd(sql, index);
                 converted.append(sql, index, end);
                 index = end;
+            } else if (startsProcedureLocalTemporaryTableCreate(sql, index)) {
+                int end = findStatementTerminator(sql, index);
+                converted.append(sql, index, end);
+                index = end;
             } else if (startsProcedureDdl(sql, index)) {
                 int end = findStatementTerminator(sql, index);
                 List<ProcedureStatement> ddlStatements =
@@ -10334,7 +10358,221 @@ class SqlScriptMigrator {
 
     private boolean isProcedureTemporaryTableName(String tableToken) {
         String tableName = unquoteIdentifier(lastIdentifierPart(tableToken.strip()));
-        return tableName.toLowerCase(Locale.ROOT).startsWith("tmp_");
+        return tableName.startsWith("#")
+                || tableName.regionMatches(
+                        true,
+                        0,
+                        "DM_ADAPTER_LOCAL_TEMP_",
+                        0,
+                        "DM_ADAPTER_LOCAL_TEMP_".length()
+                )
+                || tableName.toLowerCase(Locale.ROOT).startsWith("tmp_");
+    }
+
+    private String convertMysqlProcedureLocalTemporaryTables(String sql) {
+        if (!isCreateProcedureStatement(sql)
+                || !Pattern.compile("(?is)\\bCREATE\\s+TEMPORARY\\s+TABLE\\b").matcher(sql).find()) {
+            return sql;
+        }
+        LinkedHashMap<String, String> candidates = new LinkedHashMap<>();
+        LinkedHashMap<String, Integer> declarationCounts = new LinkedHashMap<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "CREATE")) {
+                int cursor = skipWhitespace(sql, index + "CREATE".length());
+                if (!startsKeyword(sql, cursor, "TEMPORARY")) {
+                    index += "CREATE".length();
+                    continue;
+                }
+                cursor = skipWhitespace(sql, cursor + "TEMPORARY".length());
+                if (!startsKeyword(sql, cursor, "TABLE")) {
+                    index += "CREATE".length();
+                    continue;
+                }
+                cursor = skipWhitespace(sql, cursor + "TABLE".length());
+                if (startsKeyword(sql, cursor, "IF")) {
+                    cursor = skipWhitespace(sql, cursor + "IF".length());
+                    if (!startsKeyword(sql, cursor, "NOT")) {
+                        index += "CREATE".length();
+                        continue;
+                    }
+                    cursor = skipWhitespace(sql, cursor + "NOT".length());
+                    if (!startsKeyword(sql, cursor, "EXISTS")) {
+                        index += "CREATE".length();
+                        continue;
+                    }
+                    cursor = skipWhitespace(sql, cursor + "EXISTS".length());
+                }
+                SqlIdentifierReference table = sqlIdentifierReferenceAt(sql, cursor);
+                if (table == null) {
+                    index += "CREATE".length();
+                    continue;
+                }
+                String token = sql.substring(cursor, table.end()).strip();
+                String name = unquoteIdentifier(lastIdentifierPart(token));
+                String normalized = name.toLowerCase(Locale.ROOT);
+                if (!token.contains(".")
+                        && !normalized.startsWith("tmp_")
+                        && Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*").matcher(name).matches()) {
+                    candidates.putIfAbsent(normalized, "DM_ADAPTER_LOCAL_TEMP_" + name);
+                    declarationCounts.merge(normalized, 1, Integer::sum);
+                }
+                index = table.end();
+            } else {
+                index++;
+            }
+        }
+        candidates.entrySet().removeIf(entry ->
+                declarationCounts.getOrDefault(entry.getKey(), 0) != 1);
+        if (candidates.isEmpty()) {
+            return sql;
+        }
+
+        String converted = sql;
+        List<Map.Entry<String, String>> names = candidates.entrySet().stream()
+                .sorted(Map.Entry.<String, String>comparingByKey(
+                        Comparator.comparingInt(String::length).reversed()
+                ))
+                .toList();
+        for (Map.Entry<String, String> entry : names) {
+            String name = entry.getKey();
+            Pattern identifier = Pattern.compile(
+                    "(?i)(?<![A-Za-z0-9_$#])(?:`" + Pattern.quote(name) + "`|"
+                            + Pattern.quote(name) + ")(?![A-Za-z0-9_$])"
+            );
+            converted = identifier.matcher(converted)
+                    .replaceAll(Matcher.quoteReplacement(entry.getValue()));
+        }
+        return rewriteMysqlProcedureLocalTemporaryTableDdl(converted);
+    }
+
+    private String rewriteMysqlProcedureLocalTemporaryTableDdl(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                int end = skipSingleQuotedString(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '"') {
+                int end = skipDoubleQuotedText(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '`') {
+                int end = skipBacktickIdentifier(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                int end = skipUntilLineEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsBlockComment(sql, index)) {
+                int end = skipUntilBlockCommentEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsKeyword(sql, index, "CREATE")) {
+                int end = findStatementTerminator(sql, index);
+                String ddl = sql.substring(index, end);
+                Matcher matcher = Pattern.compile(
+                        "(?is)^CREATE\\s+TEMPORARY\\s+TABLE\\s+"
+                                + "(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                                + "(?<table>DM_ADAPTER_LOCAL_TEMP_[A-Za-z_][A-Za-z0-9_$]*)"
+                ).matcher(ddl);
+                if (!matcher.find()) {
+                    converted.append(current);
+                    index++;
+                    continue;
+                }
+                converted.append(normalizeDmLocalTemporaryTableCreate(
+                        ddl,
+                        matcher.group("table"),
+                        matcher.end()
+                ));
+                index = end;
+                changed = true;
+            } else if (startsKeyword(sql, index, "DROP")) {
+                int end = findStatementTerminator(sql, index);
+                String ddl = sql.substring(index, end);
+                Matcher matcher = Pattern.compile(
+                        "(?is)^DROP\\s+TEMPORARY\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?<tables>.+)$"
+                ).matcher(ddl.strip());
+                if (!matcher.matches()
+                        || splitTopLevelComma(matcher.group("tables")).stream()
+                        .map(String::strip)
+                        .anyMatch(table -> !table.matches(
+                                "(?i)DM_ADAPTER_LOCAL_TEMP_[A-Za-z_][A-Za-z0-9_$]*"
+                        ))) {
+                    converted.append(current);
+                    index++;
+                    continue;
+                }
+                converted.append("NULL /* DM_ADAPTER: local temporary tables start empty and are released "
+                        + "when the routine exits */");
+                index = end;
+                changed = true;
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return changed ? converted.toString() : sql;
+    }
+
+    private String normalizeDmLocalTemporaryTableCreate(String ddl, String table, int prefixEnd) {
+        String placeholder = "dm_adapter_local_temp_table";
+        String candidate = "CREATE TABLE " + placeholder + ddl.substring(prefixEnd);
+        String converted = converter.convert(candidate).convertedSql().strip();
+        converted = Pattern.compile("(?i)\\b" + Pattern.quote(placeholder) + "\\b")
+                .matcher(converted)
+                .replaceFirst(Matcher.quoteReplacement(table));
+        converted = normalizeMysqlDynamicDdlForDameng(converted);
+        converted = removeMysqlCreateTableInlineKeyDefinitions(converted);
+        return normalizeProcedureDynamicDdlSpacing(converted);
+    }
+
+    private boolean startsProcedureLocalTemporaryTableCreate(String sql, int index) {
+        if (!startsKeyword(sql, index, "CREATE")) {
+            return false;
+        }
+        int cursor = skipWhitespace(sql, index + "CREATE".length());
+        if (!startsKeyword(sql, cursor, "TABLE")) {
+            return false;
+        }
+        cursor = skipWhitespace(sql, cursor + "TABLE".length());
+        if (startsKeyword(sql, cursor, "IF")) {
+            cursor = skipWhitespace(sql, cursor + "IF".length());
+            if (!startsKeyword(sql, cursor, "NOT")) {
+                return false;
+            }
+            cursor = skipWhitespace(sql, cursor + "NOT".length());
+            if (!startsKeyword(sql, cursor, "EXISTS")) {
+                return false;
+            }
+            cursor = skipWhitespace(sql, cursor + "EXISTS".length());
+        }
+        SqlIdentifierReference table = sqlIdentifierReferenceAt(sql, cursor);
+        return table != null
+                && unquoteIdentifier(sql.substring(cursor, table.end()).strip())
+                .regionMatches(true, 0, "DM_ADAPTER_LOCAL_TEMP_", 0, "DM_ADAPTER_LOCAL_TEMP_".length());
+    }
+
+    private String restoreDmLocalTemporaryTableNames(String sql) {
+        return Pattern.compile(
+                "(?i)\\bDM_ADAPTER_LOCAL_TEMP_(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\b"
+        ).matcher(sql).replaceAll(matchResult -> "#" + matchResult.group(1));
     }
 
     private String convertMysqlCreateTableSelect(String ddl) {

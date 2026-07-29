@@ -1294,7 +1294,7 @@ class SqlScriptMigratorTest {
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("procedure.sql"), """
                 DELIMITER $$
-                CREATE PROCEDURE demo_proc(IN input_json JSON, out row_count int)
+                CREATE PROCEDURE demo_proc(IN `input_json` JSON, out `row_count` int)
                 label_exit:BEGIN
                     DECLARE v_index INT DEFAULT 0;
                     DECLARE v_code, v_name varchar(64);
@@ -1326,6 +1326,8 @@ class SqlScriptMigratorTest {
                 .contains("CREATE TABLE IF NOT EXISTS tmp_demo_a (id BIGINT, extra_name VARCHAR(200));")
                 .contains("CREATE TABLE IF NOT EXISTS tmp_demo_b (id BIGINT, extra_name VARCHAR(200));")
                 .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON, row_count OUT int) AS")
+                .doesNotContain("`input_json`")
+                .doesNotContain("`row_count`")
                 .contains("""
                             v_index INT := 0;
                             v_code varchar(64);
@@ -1352,6 +1354,51 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE));
+    }
+
+    @Test
+    void convertsExplicitNonTmpProcedureTemporaryTablesToDmLocalTables() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE calculate_formula(IN targetId BIGINT)
+                BEGIN
+                    DROP TEMPORARY TABLE IF EXISTS temp_target, spilt_target;
+                    CREATE TEMPORARY TABLE IF NOT EXISTS temp_target (
+                        id BIGINT(0) NOT NULL AUTO_INCREMENT,
+                        targetId BIGINT,
+                        PRIMARY KEY (`id`) USING BTREE
+                    );
+                    CREATE TEMPORARY TABLE IF NOT EXISTS spilt_target (
+                        id BIGINT(0) NOT NULL AUTO_INCREMENT,
+                        targetId VARCHAR(10),
+                        PRIMARY KEY (`id`) USING BTREE
+                    );
+                    INSERT INTO temp_target(targetId) VALUES (targetId);
+                    INSERT INTO spilt_target(targetId)
+                    SELECT targetId FROM temp_target;
+                    TRUNCATE TABLE spilt_target;
+                    DROP TABLE temp_target;
+                    DROP TABLE spilt_target;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE TABLE #temp_target")
+                .contains("CREATE TABLE #spilt_target")
+                .contains("IDENTITY(1,1)")
+                .contains("INSERT INTO #temp_target(targetId) VALUES (targetId)")
+                .contains("INSERT INTO #spilt_target(targetId)")
+                .contains("SELECT targetId FROM #temp_target")
+                .contains("DELETE FROM #spilt_target")
+                .doesNotContain("CREATE TEMPORARY TABLE")
+                .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE #")
+                .doesNotContain("CAST(targetId AS VARCHAR")
+                .doesNotContain("CREATE TABLE IF NOT EXISTS #temp_target");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE));
     }
 
     @Test
