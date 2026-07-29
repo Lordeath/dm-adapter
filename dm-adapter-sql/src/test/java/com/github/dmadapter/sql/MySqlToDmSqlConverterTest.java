@@ -2962,6 +2962,43 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsBooleanNullPredicatesProjectedAsFlags() {
+        SqlConversionResult result = converter.convert("""
+                select re.*,
+                       (coll.id is not null) as isCollection,
+                       (re.deleted_at IS NULL) AS active
+                from ns_finance_receivables re
+                left join ns_finance_collection coll on coll.documentNumber = re.documentNumber
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select re.*,
+                       CASE WHEN coll.id IS NOT NULL THEN 1 ELSE 0 END as isCollection,
+                       CASE WHEN re.deleted_at IS NULL THEN 1 ELSE 0 END AS active
+                from ns_finance_receivables re
+                left join ns_finance_collection coll on coll.documentNumber = re.documentNumber
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_BOOLEAN_NULL_PROJECTION_RULE);
+    }
+
+    @Test
+    void leavesBooleanNullPredicatesOutsideSelectProjectionUnchanged() {
+        String sql = """
+                select id
+                from ns_finance_receivables
+                where (deleted_at is null)
+                  and note = '(coll.id is not null) as isCollection'
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
     void convertsBareBooleanPredicateColumnsToEqualsOne() {
         SqlConversionResult result = converter.convert("""
                 select count(*)

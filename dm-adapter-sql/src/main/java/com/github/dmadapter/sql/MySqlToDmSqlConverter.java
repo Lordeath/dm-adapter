@@ -51,6 +51,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE = "MYSQL_COUNT_DISTINCT_IF_TO_CASE";
     public static final String MYSQL_IF_TO_CASE_RULE = "MYSQL_IF_TO_CASE";
     public static final String MYSQL_NOT_ISNULL_RULE = "MYSQL_NOT_ISNULL_TO_CASE";
+    public static final String MYSQL_BOOLEAN_NULL_PROJECTION_RULE =
+            "MYSQL_BOOLEAN_NULL_PROJECTION_TO_CASE";
     public static final String MYSQL_BOOLEAN_OPERATOR_RULE = "MYSQL_BOOLEAN_OPERATOR_TO_WORD_OPERATOR";
     public static final String MYSQL_BARE_BOOLEAN_PREDICATE_RULE = "MYSQL_BARE_BOOLEAN_PREDICATE_TO_EQUALS_ONE";
     public static final String MYSQL_BOOLEAN_LITERAL_COMPARISON_RULE =
@@ -265,6 +267,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern LIMIT_SIZE_PATTERN = Pattern.compile(
             "(?is)^(?<base>.+?)\\s+LIMIT\\s+(?<size>" + TOKEN + ")\\s*;?\\s*$");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\")";
+    private static final Pattern MYSQL_BOOLEAN_NULL_PROJECTION_PATTERN = Pattern.compile(
+            "(?is)^\\s*(?<expression>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")*)\\s+IS\\s+(?<not>NOT\\s+)?NULL\\s*$"
+    );
     private static final Pattern UPDATE_SET_TABLE_ORDER_PATTERN = Pattern.compile(
             "(?is)^(\\s*)update\\s+set\\s+("
                     + DM_IDENTIFIER
@@ -669,6 +678,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (notIsNullConversion.changed()) {
             converted = notIsNullConversion.convertedSql();
             rules.add(MYSQL_NOT_ISNULL_RULE);
+        }
+
+        GenericConversion booleanNullProjectionConversion = convertBooleanNullProjection(converted);
+        if (booleanNullProjectionConversion.changed()) {
+            converted = booleanNullProjectionConversion.convertedSql();
+            rules.add(MYSQL_BOOLEAN_NULL_PROJECTION_RULE);
         }
 
         GenericConversion booleanOperatorConversion = convertBooleanOperatorsInIfConditions(converted);
@@ -6882,6 +6897,67 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertBooleanNullProjection(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(' && isInsideSelectList(sql, index)) {
+                int closeParenIndex = findMatchingParen(sql, index);
+                if (closeParenIndex < 0) {
+                    index++;
+                    continue;
+                }
+                Matcher matcher = MYSQL_BOOLEAN_NULL_PROJECTION_PATTERN.matcher(
+                        sql.substring(index + 1, closeParenIndex)
+                );
+                int asIndex = skipWhitespace(sql, closeParenIndex + 1);
+                if (matcher.matches() && startsKeyword(sql, asIndex, "AS")) {
+                    int aliasIndex = skipWhitespace(sql, asIndex + "AS".length());
+                    IdentifierToken alias = readIdentifierToken(sql, aliasIndex);
+                    if (alias != null
+                            && !isSqlClauseKeyword(alias.text())
+                            && isSelectItemTerminator(sql, alias.endIndex())) {
+                        String operator = matcher.group("not") == null ? "IS NULL" : "IS NOT NULL";
+                        replacements.add(new TextReplacement(
+                                index,
+                                closeParenIndex + 1,
+                                "CASE WHEN " + matcher.group("expression").trim() + " " + operator
+                                        + " THEN 1 ELSE 0 END"
+                        ));
+                    }
+                }
+                index = closeParenIndex + 1;
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(sql, replacements);
+    }
+
+    private boolean isSelectItemTerminator(String sql, int index) {
+        int next = skipWhitespace(sql, index);
+        return next >= sql.length()
+                || sql.charAt(next) == ','
+                || sql.charAt(next) == ')'
+                || sql.charAt(next) == ';'
+                || startsKeyword(sql, next, "FROM")
+                || startsMyBatisXmlTag(sql, next);
     }
 
     private GenericConversion convertCountConditionOrNull(String sql) {
