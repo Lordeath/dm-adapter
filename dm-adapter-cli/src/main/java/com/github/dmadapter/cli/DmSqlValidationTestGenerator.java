@@ -8473,6 +8473,9 @@ class DmSqlValidationTestGenerator {
                     if (countsByPattern.containsKey("ORIGINAL_SQL_COLUMN_NAME_MISMATCH")) {
                         markdown.append("- 原始 mapper 引用了测试表中不存在、但与现有字段仅差一个字符的列名；应对照源 DDL 修正原始 mapper，不能作为达梦转换或测试库缺对象问题忽略。\\n");
                     }
+                    if (countsByPattern.containsKey("ORIGINAL_MAPPER_PROPERTY_NAME_MISMATCH")) {
+                        markdown.append("- 原始 mapper XML 引用了实际参数实体不存在的属性；应同步修正 XML 属性名或 Java 实体，不能通过修改验证示例参数掩盖。\\n");
+                    }
                     if (countsByPattern.containsKey("DM_CTAS_BIND_PARAMETER")) {
                         markdown.append("- 达梦不支持在 CREATE TABLE AS SELECT 中使用 JDBC 绑定参数；将该 mapper 拆为显式建临时表和参数化 INSERT 两个步骤。\\n");
                     }
@@ -8745,6 +8748,8 @@ class DmSqlValidationTestGenerator {
                             return "foreach 元素绑定问题";
                         case "MAPPER_PROPERTY_NAME":
                             return "Mapper 属性名不匹配";
+                        case "ORIGINAL_MAPPER_PROPERTY_NAME_MISMATCH":
+                            return "原 Mapper 属性名与实体不匹配";
                         case "KEY_PROPERTY_PARAMETER_OBJECT_MISMATCH":
                             return "keyProperty 与参数对象不匹配";
                         case "JAVA_MAPPER_PARAM_ANNOTATION":
@@ -9129,6 +9134,9 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("parameter '") && lower.contains("not found")) {
                         return "BINDING_PARAMETER_NAME";
                     }
+                    if (hasOriginalMapperPropertyNameMismatch(message)) {
+                        return "ORIGINAL_MAPPER_PROPERTY_NAME_MISMATCH";
+                    }
                     if (lower.contains("there is no getter for property")) {
                         return "MAPPER_PROPERTY_NAME";
                     }
@@ -9151,6 +9159,21 @@ class DmSqlValidationTestGenerator {
                             || lowerMessage.contains("无效的变量名")
                             || lowerMessage.contains("无效的模式名")
                             || lowerMessage.contains("无法解析的成员访问表达式");
+                }
+
+                private boolean hasOriginalMapperPropertyNameMismatch(String message) {
+                    Matcher matcher = Pattern.compile(
+                            "(?i)there is no getter for property(?: named)?\\\\s+['\\\"]?[^'\\\"]+['\\\"]?"
+                                    + "\\\\s+in\\\\s+['\\\"]?class\\\\s+([A-Za-z_$][A-Za-z0-9_$.]*)"
+                    ).matcher(message);
+                    if (!matcher.find()) {
+                        return false;
+                    }
+                    String parameterClass = matcher.group(1).toLowerCase(Locale.ROOT);
+                    return !parameterClass.startsWith("java.")
+                            && !parameterClass.startsWith("javax.")
+                            && !parameterClass.startsWith("jakarta.")
+                            && !parameterClass.startsWith("kotlin.");
                 }
 
                 private boolean isMysqlMetadataSql(String message) {
@@ -9597,6 +9620,9 @@ class DmSqlValidationTestGenerator {
                         return "SQL_SYNTAX";
                     }
                     if (hasLikelyOriginalColumnNameMismatch(message)) {
+                        return "ORIGINAL_SQL";
+                    }
+                    if (hasOriginalMapperPropertyNameMismatch(message)) {
                         return "ORIGINAL_SQL";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
