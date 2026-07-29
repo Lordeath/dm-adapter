@@ -1701,6 +1701,9 @@ class SqlScriptMigrator {
         copy.currentSchemaVariables.addAll(source.currentSchemaVariables);
         copy.dynamicDdlVariables.addAll(source.dynamicDdlVariables);
         copy.preparedDynamicDdlStatements.addAll(source.preparedDynamicDdlStatements);
+        copy.indexExistenceChecks.putAll(source.indexExistenceChecks);
+        copy.indexDdlAssignments.putAll(source.indexDdlAssignments);
+        copy.handledIndexExistenceVariables.addAll(source.handledIndexExistenceVariables);
         return copy;
     }
 
@@ -1859,7 +1862,7 @@ class SqlScriptMigrator {
                 + ", elapsedMs=" + elapsedMillis(parseStartedAt));
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
-        ScriptDynamicDdlState scriptDynamicDdlState = new ScriptDynamicDdlState();
+        ScriptDynamicDdlState scriptDynamicDdlState = scriptDynamicDdlState(originalStatements);
         LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns = new LinkedHashMap<>();
         LinkedHashMap<String, String> scriptIdentityFirstColumns = new LinkedHashMap<>();
         Map<String, Set<String>> sourceTableCharsets = sourceTableCharsets(originalStatements);
@@ -2589,6 +2592,16 @@ class SqlScriptMigrator {
     ) {
         long preparationStartedAt = System.nanoTime();
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(originalStatement);
+        ScriptStatementConversion indexExistenceConversion =
+                convertScriptIndexExistenceAssignment(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
+        if (indexExistenceConversion != null) {
+            return indexExistenceConversion;
+        }
+        ScriptStatementConversion indexDdlConversion =
+                convertScriptIndexDdlAssignment(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
+        if (indexDdlConversion != null) {
+            return indexDdlConversion;
+        }
         ScriptStatementConversion currentSchemaVariableConversion =
                 convertScriptCurrentSchemaVariableAssignment(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
         if (currentSchemaVariableConversion != null) {
@@ -2738,19 +2751,268 @@ class SqlScriptMigrator {
         return "";
     }
 
+    private ScriptDynamicDdlState scriptDynamicDdlState(List<String> statements) {
+        ScriptDynamicDdlState state = new ScriptDynamicDdlState();
+        if (statements == null || statements.size() < 5) {
+            return state;
+        }
+        ScriptDynamicDdlState analysisState = new ScriptDynamicDdlState();
+        List<ScriptIndexDdlAssignment> candidates = new ArrayList<>();
+        LinkedHashMap<String, Integer> existenceVariableCounts = new LinkedHashMap<>();
+        LinkedHashMap<String, Integer> sqlVariableCounts = new LinkedHashMap<>();
+        for (int index = 0; index < statements.size(); index++) {
+            String body = splitLeadingSqlPrefix(statements.get(index)).body();
+            String currentSchemaVariable = scriptCurrentSchemaVariableName(body);
+            if (!currentSchemaVariable.isBlank()) {
+                analysisState.currentSchemaVariables.add(currentSchemaVariable.toLowerCase(Locale.ROOT));
+            }
+            if (index + 4 >= statements.size()) {
+                continue;
+            }
+            ScriptIndexExistenceCheck check = scriptIndexExistenceCheck(body, analysisState);
+            if (check == null) {
+                continue;
+            }
+            ScriptIndexDdlAssignment assignment = scriptIndexDdlAssignment(
+                    splitLeadingSqlPrefix(statements.get(index + 1)).body(),
+                    Map.of(check.variableName().toLowerCase(Locale.ROOT), check)
+            );
+            if (assignment == null || !hasCompleteScriptIndexDdlExecutionSequence(statements, index, assignment)) {
+                continue;
+            }
+            candidates.add(assignment);
+            existenceVariableCounts.merge(
+                    check.variableName().toLowerCase(Locale.ROOT),
+                    1,
+                    Integer::sum
+            );
+            sqlVariableCounts.merge(
+                    assignment.sqlVariable().toLowerCase(Locale.ROOT),
+                    1,
+                    Integer::sum
+            );
+        }
+        for (ScriptIndexDdlAssignment assignment : candidates) {
+            ScriptIndexExistenceCheck check = assignment.existenceCheck();
+            String existenceVariable = check.variableName().toLowerCase(Locale.ROOT);
+            String sqlVariable = assignment.sqlVariable().toLowerCase(Locale.ROOT);
+            if (existenceVariableCounts.getOrDefault(existenceVariable, 0) != 1
+                    || sqlVariableCounts.getOrDefault(sqlVariable, 0) != 1) {
+                continue;
+            }
+            state.indexExistenceChecks.put(existenceVariable, check);
+            state.indexDdlAssignments.put(sqlVariable, assignment);
+            state.handledIndexExistenceVariables.add(
+                    existenceVariable
+            );
+        }
+        return state;
+    }
+
+    private boolean hasCompleteScriptIndexDdlExecutionSequence(
+            List<String> statements,
+            int existenceAssignmentIndex,
+            ScriptIndexDdlAssignment assignment
+    ) {
+        Matcher prepare = Pattern.compile(
+                "(?is)^\\s*PREPARE\\s+(?<statement>[A-Za-z_][A-Za-z0-9_$]*)\\s+FROM\\s+@"
+                        + Pattern.quote(assignment.sqlVariable())
+                        + "\\s*$"
+        ).matcher(splitLeadingSqlPrefix(statements.get(existenceAssignmentIndex + 2)).body().strip());
+        if (!prepare.matches()) {
+            return false;
+        }
+        String statementName = prepare.group("statement");
+        String execute = splitLeadingSqlPrefix(statements.get(existenceAssignmentIndex + 3)).body().strip();
+        String deallocate = splitLeadingSqlPrefix(statements.get(existenceAssignmentIndex + 4)).body().strip();
+        return Pattern.compile(
+                "(?is)^\\s*EXECUTE\\s+" + Pattern.quote(statementName) + "\\s*$"
+        ).matcher(execute).matches()
+                && Pattern.compile(
+                "(?is)^\\s*DEALLOCATE\\s+PREPARE\\s+" + Pattern.quote(statementName) + "\\s*$"
+        ).matcher(deallocate).matches();
+    }
+
+    private ScriptIndexExistenceCheck scriptIndexExistenceCheck(
+            String sql,
+            ScriptDynamicDdlState scriptDynamicDdlState
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+@(?<variable>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*\\(\\s*"
+                        + "SELECT\\s+COUNT\\s*\\(\\s*(?:\\*|1)\\s*\\)\\s+"
+                        + "FROM\\s+information_schema\\s*\\.\\s*(?:`STATISTICS`|\"STATISTICS\"|STATISTICS)\\s+"
+                        + "WHERE\\s+(?<where>.*?)\\s*\\)\\s*$"
+        ).matcher(sql == null ? "" : sql.strip());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String whereClause = matcher.group("where");
+        String tableName = metadataPredicateLiteral(whereClause, "table_name");
+        String indexName = metadataPredicateLiteral(whereClause, "index_name");
+        String ownerPredicate = metadataSchemaPredicate(whereClause, scriptDynamicDdlState);
+        if (tableName.isBlank()
+                || indexName.isBlank()
+                || ownerPredicate.isBlank()
+                || !onlyIndexMetadataPredicates(whereClause)) {
+            return null;
+        }
+        return new ScriptIndexExistenceCheck(
+                matcher.group("variable"),
+                ownerPredicate,
+                tableName,
+                indexName
+        );
+    }
+
+    private boolean onlyIndexMetadataPredicates(String whereClause) {
+        String residual = whereClause;
+        residual = Pattern.compile(
+                "(?is)\\btable_schema\\b\\s*=\\s*(?:"
+                        + "@[A-Za-z_][A-Za-z0-9_$]*|"
+                        + "(?:\\(\\s*SELECT\\s+)?DATABASE\\s*\\(\\s*\\)\\s*\\)?|"
+                        + SQL_STRING_LITERAL_TOKEN
+                        + ")"
+        ).matcher(residual).replaceFirst("");
+        residual = Pattern.compile(
+                "(?is)\\btable_name\\b\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN
+        ).matcher(residual).replaceFirst("");
+        residual = Pattern.compile(
+                "(?is)\\bindex_name\\b\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN
+        ).matcher(residual).replaceFirst("");
+        residual = Pattern.compile("(?is)\\bAND\\b").matcher(residual).replaceAll("");
+        return residual.replaceAll("[()\\s]", "").isBlank();
+    }
+
+    private ScriptIndexDdlAssignment scriptIndexDdlAssignment(
+            String sql,
+            Map<String, ScriptIndexExistenceCheck> checks
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+@(?<sqlVariable>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*"
+                        + "IF\\s*\\(\\s*@(?<existsVariable>[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*0\\s*,\\s*"
+                        + "(?<ddl>" + SQL_STRING_LITERAL_TOKEN + ")\\s*,\\s*"
+                        + "(?<noop>" + SQL_STRING_LITERAL_TOKEN + ")\\s*\\)\\s*$"
+        ).matcher(sql == null ? "" : sql.strip());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String noop = singleQuotedSqlLiteralValue(matcher.group("noop"));
+        if (!"SELECT 1".equalsIgnoreCase(noop) && !"DO 0".equalsIgnoreCase(noop)) {
+            return null;
+        }
+        ScriptIndexExistenceCheck check = checks.get(matcher.group("existsVariable").toLowerCase(Locale.ROOT));
+        if (check == null) {
+            return null;
+        }
+        String mysqlDdl = singleQuotedSqlLiteralValue(matcher.group("ddl"));
+        if (!dynamicIndexDdlMatchesCheck(mysqlDdl, check)) {
+            return null;
+        }
+        String ddl = normalizeMysqlDynamicDdlForDameng(mysqlDdl);
+        ddl = convertMysqlAlterTableAddIndex(ddl);
+        ddl = normalizeCreateIndexForDm(ddl);
+        if (ddl.isBlank() || Pattern.compile("(?is)\\bADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b").matcher(ddl).find()) {
+            return null;
+        }
+        return new ScriptIndexDdlAssignment(matcher.group("sqlVariable"), check, ddl);
+    }
+
+    private boolean dynamicIndexDdlMatchesCheck(String ddl, ScriptIndexExistenceCheck check) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+ADD\\s+"
+                        + "(?:UNIQUE\\s+)?(?:INDEX|KEY)\\s+(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\("
+        ).matcher(ddl == null ? "" : ddl);
+        if (!matcher.find()) {
+            return false;
+        }
+        String ddlTable = unquoteIdentifier(lastIdentifierPart(matcher.group("table")));
+        String ddlIndex = unquoteIdentifier(lastIdentifierPart(matcher.group("index")));
+        return ddlTable.equalsIgnoreCase(check.tableName())
+                && ddlIndex.equalsIgnoreCase(check.indexName());
+    }
+
+    private ScriptStatementConversion convertScriptIndexExistenceAssignment(
+            String originalStatement,
+            LeadingSqlPrefix leadingSqlPrefix,
+            ScriptDynamicDdlState scriptDynamicDdlState
+    ) {
+        ScriptIndexExistenceCheck check = scriptIndexExistenceCheck(
+                leadingSqlPrefix.body(),
+                scriptDynamicDdlState
+        );
+        if (check == null
+                || !scriptDynamicDdlState.handledIndexExistenceVariables.contains(
+                check.variableName().toLowerCase(Locale.ROOT)
+        )) {
+            return null;
+        }
+        String convertedSql = leadingSqlPrefix.prefix()
+                + "-- DM_ADAPTER: MySQL index-existence variable @"
+                + check.variableName()
+                + " is evaluated in the following Dameng EXECUTE IMMEDIATE block";
+        return new ScriptStatementConversion(
+                originalStatement,
+                convertedSql,
+                convertedSql,
+                true,
+                false,
+                "",
+                List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE)
+        );
+    }
+
+    private ScriptStatementConversion convertScriptIndexDdlAssignment(
+            String originalStatement,
+            LeadingSqlPrefix leadingSqlPrefix,
+            ScriptDynamicDdlState scriptDynamicDdlState
+    ) {
+        ScriptIndexDdlAssignment parsed = scriptIndexDdlAssignment(
+                leadingSqlPrefix.body(),
+                scriptDynamicDdlState.indexExistenceChecks
+        );
+        if (parsed == null) {
+            return null;
+        }
+        ScriptIndexDdlAssignment assignment =
+                scriptDynamicDdlState.indexDdlAssignments.get(parsed.sqlVariable().toLowerCase(Locale.ROOT));
+        if (assignment == null || !assignment.equals(parsed)) {
+            return null;
+        }
+        scriptDynamicDdlState.dynamicDdlVariables.add(assignment.sqlVariable().toLowerCase(Locale.ROOT));
+        ScriptIndexExistenceCheck check = assignment.existenceCheck();
+        String convertedSql = leadingSqlPrefix.prefix()
+                + "DECLARE\n"
+                + "    dm_existing_count INT;\n"
+                + "BEGIN\n"
+                + "    SELECT COUNT(*) INTO dm_existing_count\n"
+                + "    FROM ALL_INDEXES\n"
+                + "    WHERE " + check.ownerPredicate() + "\n"
+                + "      AND TABLE_NAME = UPPER(" + sqlStringLiteral(check.tableName()) + ")\n"
+                + "      AND INDEX_NAME = UPPER(" + sqlStringLiteral(check.indexName()) + ");\n\n"
+                + "    IF dm_existing_count = 0 THEN\n"
+                + "        EXECUTE IMMEDIATE " + sqlStringLiteral(assignment.ddl()) + ";\n"
+                + "    END IF;\n"
+                + "END";
+        return new ScriptStatementConversion(
+                originalStatement,
+                convertedSql,
+                convertedSql,
+                true,
+                false,
+                "",
+                List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE)
+        );
+    }
+
     private ScriptStatementConversion convertScriptCurrentSchemaVariableAssignment(
             String originalStatement,
             LeadingSqlPrefix leadingSqlPrefix,
             ScriptDynamicDdlState scriptDynamicDdlState
     ) {
-        Matcher matcher = Pattern.compile(
-                "(?is)^\\s*SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*"
-                        + "(?:DATABASE\\s*\\(\\s*\\)|\\(\\s*SELECT\\s+DATABASE\\s*\\(\\s*\\)\\s*\\))\\s*$"
-        ).matcher(leadingSqlPrefix.body().strip());
-        if (!matcher.matches()) {
+        String variableName = scriptCurrentSchemaVariableName(leadingSqlPrefix.body());
+        if (variableName.isBlank()) {
             return null;
         }
-        String variableName = matcher.group("name");
         scriptDynamicDdlState.currentSchemaVariables.add(variableName.toLowerCase(Locale.ROOT));
         String convertedSql = leadingSqlPrefix.prefix()
                 + "-- DM_ADAPTER: MySQL script variable @"
@@ -2765,6 +3027,17 @@ class SqlScriptMigrator {
                 "",
                 List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE)
         );
+    }
+
+    private String scriptCurrentSchemaVariableName(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*"
+                        + "(?:DATABASE\\s*\\(\\s*\\)|\\(\\s*SELECT\\s+DATABASE\\s*\\(\\s*\\)\\s*\\))\\s*$"
+        ).matcher(sql == null ? "" : sql.strip());
+        if (!matcher.matches()) {
+            return "";
+        }
+        return matcher.group("name");
     }
 
     private ScriptStatementConversion convertScriptDynamicDdlAssignment(
@@ -2915,7 +3188,9 @@ class SqlScriptMigrator {
             }
             return "";
         }
-        if (Pattern.compile("(?is)\\btable_schema\\b\\s*=\\s*DATABASE\\s*\\(").matcher(whereClause).find()) {
+        if (Pattern.compile(
+                "(?is)\\btable_schema\\b\\s*=\\s*(?:\\(\\s*SELECT\\s+)?DATABASE\\s*\\(\\s*\\)"
+        ).matcher(whereClause).find()) {
             return "OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
         }
         Matcher literalMatcher = Pattern.compile(
@@ -10929,6 +11204,26 @@ class SqlScriptMigrator {
         private final LinkedHashSet<String> currentSchemaVariables = new LinkedHashSet<>();
         private final LinkedHashSet<String> dynamicDdlVariables = new LinkedHashSet<>();
         private final LinkedHashSet<String> preparedDynamicDdlStatements = new LinkedHashSet<>();
+        private final LinkedHashMap<String, ScriptIndexExistenceCheck> indexExistenceChecks =
+                new LinkedHashMap<>();
+        private final LinkedHashMap<String, ScriptIndexDdlAssignment> indexDdlAssignments =
+                new LinkedHashMap<>();
+        private final LinkedHashSet<String> handledIndexExistenceVariables = new LinkedHashSet<>();
+    }
+
+    private record ScriptIndexExistenceCheck(
+            String variableName,
+            String ownerPredicate,
+            String tableName,
+            String indexName
+    ) {
+    }
+
+    private record ScriptIndexDdlAssignment(
+            String sqlVariable,
+            ScriptIndexExistenceCheck existenceCheck,
+            String ddl
+    ) {
     }
 
     private record ProcedureExistsCondition(int start, int end, List<String> variableNames, String replacement) {
