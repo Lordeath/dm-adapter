@@ -2,6 +2,7 @@ package com.github.dmadapter.cli;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.xml.sax.InputSource;
 
@@ -216,6 +217,124 @@ class GeneratedFailurePatternTest {
         }
     }
 
+    @Test
+    void correctsConfiguredMapValuesUsingDmlColumnMetadata() throws Exception {
+        Path source = tempDir.resolve("src/com/example/DmSqlValidationTest.java");
+        Path pojoSource = tempDir.resolve("src/com/example/SamplePayment.java");
+        Files.createDirectories(source.getParent());
+        Files.writeString(source, generatedTestSource(), StandardCharsets.UTF_8);
+        Files.writeString(pojoSource, """
+                package com.example;
+
+                public class SamplePayment {
+                    public String isMonthClosing;
+                }
+                """, StandardCharsets.UTF_8);
+        Path classes = tempDir.resolve("classes");
+        compile(List.of(source, pojoSource), classes);
+
+        try (URLClassLoader classLoader = new URLClassLoader(
+                new URL[] {classes.toUri().toURL()},
+                getClass().getClassLoader()
+        )) {
+            Class<?> validationClass = classLoader.loadClass("com.example.DmSqlValidationTest");
+            Object validation = validationClass.getDeclaredConstructor().newInstance();
+            setDatabaseColumns(validationClass, validation);
+            Object metadata = dynamicIdentifierMetadata(
+                    validationClass,
+                    validation,
+                    """
+                            <update id="dayClosingByIds">
+                                update payment
+                                set ClosingDay = #{closingDay},
+                                    IsMonthClosing = #{isMonthClosing}
+                                where id = #{id}
+                            </update>
+                            """
+            );
+            Object statement = mapperStatement(validationClass, metadata);
+            Field dbColumnMetadata = validationClass.getDeclaredField("dbColumnMetadata");
+            dbColumnMetadata.setAccessible(true);
+            Object columnMetadata = dbColumnMetadata.get(validation);
+            Method defaultColumnType = statement.getClass().getDeclaredMethod(
+                    "defaultColumnType",
+                    String.class,
+                    columnMetadata.getClass()
+            );
+            defaultColumnType.setAccessible(true);
+            assertThat(defaultColumnType.invoke(statement, "closingDay", columnMetadata)).isEqualTo("DATE");
+            Method incompatible = validationClass.getDeclaredMethod(
+                    "configuredValueIncompatibleWithColumn",
+                    String.class,
+                    Object.class,
+                    statement.getClass()
+            );
+            incompatible.setAccessible(true);
+            assertThat(incompatible.invoke(validation, "closingDay", "1", statement)).isEqualTo(true);
+            Method defaultParameterMap = validationClass.getDeclaredMethod(
+                    "defaultParameterMap",
+                    statement.getClass()
+            );
+            defaultParameterMap.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> defaults = (Map<String, Object>) defaultParameterMap.invoke(validation, statement);
+            assertThat(String.valueOf(defaults.get("closingDay"))).startsWith("2024-01-01");
+            Method configuredParameterMap = validationClass.getDeclaredMethod(
+                    "configuredParameterMap",
+                    statement.getClass(),
+                    Map.class
+            );
+            configuredParameterMap.setAccessible(true);
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parameters = (Map<String, Object>) configuredParameterMap.invoke(
+                    validation,
+                    statement,
+                    Map.of(
+                            "closingDay", "1",
+                            "isMonthClosing", "202401",
+                            "id", 1
+                    )
+            );
+
+            assertThat(String.valueOf(parameters.get("closingDay"))).startsWith("2024-01-01");
+            assertThat(String.valueOf(parameters.get("isMonthClosing"))).hasSizeLessThanOrEqualTo(2);
+
+            Class<?> paymentClass = classLoader.loadClass("com.example.SamplePayment");
+            Method configuredPojoValue = validationClass.getDeclaredMethod(
+                    "configuredPojoValue",
+                    Class.class,
+                    java.lang.reflect.Type.class,
+                    Map.class,
+                    statement.getClass()
+            );
+            configuredPojoValue.setAccessible(true);
+            Object valueResult = configuredPojoValue.invoke(
+                    validation,
+                    paymentClass,
+                    paymentClass,
+                    Map.of("isMonthClosing", "202401"),
+                    statement
+            );
+            Field valueField = valueResult.getClass().getDeclaredField("value");
+            valueField.setAccessible(true);
+            Object payment = valueField.get(valueResult);
+            Field isMonthClosing = paymentClass.getDeclaredField("isMonthClosing");
+            assertThat(String.valueOf(isMonthClosing.get(payment))).hasSizeLessThanOrEqualTo(2);
+
+            Path bomMapper = tempDir.resolve("bom-mapper.xml");
+            Files.writeString(
+                    bomMapper,
+                    "\uFEFF<mapper namespace=\"com.example.Mapper\"><select id=\"one\">select 1</select></mapper>",
+                    StandardCharsets.UTF_8
+            );
+            Method parseXml = validationClass.getDeclaredMethod("parseXml", Path.class);
+            parseXml.setAccessible(true);
+            Document document = (Document) parseXml.invoke(validation, bomMapper);
+            assertThat(document.getDocumentElement().getAttribute("namespace")).isEqualTo("com.example.Mapper");
+        }
+    }
+
     private String failurePattern(Class<?> validationClass, Object validation, String message) throws Exception {
         return failurePattern(validationClass, validation, failedRecord(validationClass, message));
     }
@@ -299,8 +418,72 @@ class GeneratedFailurePatternTest {
         dbColumnMetadata.set(validation, metadata);
     }
 
+    private void setDatabaseColumns(Class<?> validationClass, Object validation) throws Exception {
+        Class<?> metadataClass = Class.forName(
+                validationClass.getName() + "$DbColumnMetadata",
+                true,
+                validationClass.getClassLoader()
+        );
+        var constructor = metadataClass.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        Object metadata = constructor.newInstance();
+        Method addColumn = metadataClass.getDeclaredMethod(
+                "addColumn",
+                String.class,
+                String.class,
+                String.class,
+                int.class,
+                boolean.class
+        );
+        addColumn.setAccessible(true);
+        addColumn.invoke(metadata, "payment", "ClosingDay", "DATE", 3, false);
+        addColumn.invoke(metadata, "payment", "IsMonthClosing", "VARCHAR", 2, false);
+        addColumn.invoke(metadata, "payment", "id", "BIGINT", 8, false);
+        Field dbColumnMetadata = validationClass.getDeclaredField("dbColumnMetadata");
+        dbColumnMetadata.setAccessible(true);
+        dbColumnMetadata.set(validation, metadata);
+    }
+
+    private Object mapperStatement(Class<?> validationClass, Object metadata) throws Exception {
+        Class<?> statementClass = Class.forName(
+                validationClass.getName() + "$MapperStatement",
+                true,
+                validationClass.getClassLoader()
+        );
+        var constructor = statementClass.getDeclaredConstructor(
+                String.class,
+                String.class,
+                List.class,
+                metadata.getClass(),
+                Set.class,
+                Set.class,
+                Set.class
+        );
+        constructor.setAccessible(true);
+        return constructor.newInstance(
+                "com.example.Mapper",
+                "dayClosingByIds",
+                List.of(),
+                metadata,
+                Set.of("closingDay", "isMonthClosing", "id"),
+                Set.of("closingDay", "isMonthClosing", "id"),
+                Set.of()
+        );
+    }
+
     @SuppressWarnings("unchecked")
     private Set<String> referencedTables(
+            Class<?> validationClass,
+            Object validation,
+            String statementXml
+    ) throws Exception {
+        Object metadata = dynamicIdentifierMetadata(validationClass, validation, statementXml);
+        Method referencedTableNames = metadata.getClass().getDeclaredMethod("referencedTableNames");
+        referencedTableNames.setAccessible(true);
+        return (Set<String>) referencedTableNames.invoke(metadata);
+    }
+
+    private Object dynamicIdentifierMetadata(
             Class<?> validationClass,
             Object validation,
             String statementXml
@@ -316,10 +499,7 @@ class GeneratedFailurePatternTest {
                 String.class
         );
         metadataMethod.setAccessible(true);
-        Object metadata = metadataMethod.invoke(validation, statement, Map.of(), "com.example.Mapper");
-        Method referencedTableNames = metadata.getClass().getDeclaredMethod("referencedTableNames");
-        referencedTableNames.setAccessible(true);
-        return (Set<String>) referencedTableNames.invoke(metadata);
+        return metadataMethod.invoke(validation, statement, Map.of(), "com.example.Mapper");
     }
 
     private String generatedTestSource() throws Exception {
