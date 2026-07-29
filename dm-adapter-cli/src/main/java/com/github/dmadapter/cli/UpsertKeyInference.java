@@ -8,14 +8,34 @@ import java.util.Optional;
 import java.util.Set;
 
 final class UpsertKeyInference {
+    static final String RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY =
+            "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
+    static final String RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED =
+            "MANUAL_KEY_COLUMNS_REQUIRED";
+    static final String RESOLUTION_METADATA_UNAVAILABLE =
+            "KEY_METADATA_UNAVAILABLE";
+
     Optional<InferenceResult> infer(RewriteConfigCandidate candidate, TableKeyMetadata metadata) {
-        if (metadata == null || metadata.constraints().isEmpty()) {
-            return Optional.of(InferenceResult.unresolved("No primary key or unique key metadata was found for table "
-                    + candidate.tableName() + "."));
+        if (metadata == null) {
+            return Optional.of(InferenceResult.unresolved(
+                    RESOLUTION_METADATA_UNAVAILABLE,
+                    "No table key metadata was available for table "
+                            + candidate.tableName() + "."
+            ));
+        }
+        if (metadata.constraints().isEmpty()) {
+            return Optional.of(InferenceResult.unresolved(
+                    RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY,
+                    "No primary key or unique key metadata was found for table "
+                            + candidate.tableName() + "."
+            ));
         }
         if (normalizedColumns(candidate.insertColumns()).isEmpty()) {
-            return Optional.of(InferenceResult.unresolved("Could not determine INSERT columns for "
-                    + candidate.methodKey() + "; keyColumns must be configured manually."));
+            return Optional.of(InferenceResult.unresolved(
+                    RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED,
+                    "Could not determine INSERT columns for "
+                            + candidate.methodKey() + "; keyColumns must be configured manually."
+            ));
         }
 
         List<TableConstraint> usablePrimaryKeys = usableConstraints(candidate, metadata.primaryKeys());
@@ -26,8 +46,11 @@ final class UpsertKeyInference {
             ));
         }
         if (usablePrimaryKeys.size() > 1) {
-            return Optional.of(InferenceResult.unresolved("Multiple primary key metadata rows matched table "
-                    + candidate.tableName() + "."));
+            return Optional.of(InferenceResult.unresolved(
+                    RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED,
+                    "Multiple primary key metadata rows matched table "
+                            + candidate.tableName() + "."
+            ));
         }
 
         List<TableConstraint> usableUniqueKeys = usableConstraints(candidate, metadata.uniqueKeys());
@@ -38,12 +61,18 @@ final class UpsertKeyInference {
             ));
         }
         if (usableUniqueKeys.size() > 1) {
-            return Optional.of(InferenceResult.unresolved("Multiple unique keys matched INSERT columns for table "
-                    + candidate.tableName() + ": " + describe(usableUniqueKeys) + "."));
+            return Optional.of(InferenceResult.unresolved(
+                    RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED,
+                    "Multiple unique keys matched INSERT columns for table "
+                            + candidate.tableName() + ": " + describe(usableUniqueKeys) + "."
+            ));
         }
 
-        return Optional.of(InferenceResult.unresolved("No primary key or unique key columns are fully present in INSERT columns for "
-                + candidate.methodKey() + "."));
+        return Optional.of(InferenceResult.unresolved(
+                RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY,
+                "No primary key or unique key columns are fully present in INSERT columns for "
+                        + candidate.methodKey() + "."
+        ));
     }
 
     private List<TableConstraint> usableConstraints(RewriteConfigCandidate candidate, List<TableConstraint> constraints) {
@@ -102,14 +131,21 @@ final class UpsertKeyInference {
             boolean inferred,
             List<String> keyColumns,
             String source,
+            String resolutionCode,
             String reason
     ) {
         static InferenceResult inferred(List<String> keyColumns, String source) {
-            return new InferenceResult(true, keyColumns, source == null ? "" : source, "");
+            return new InferenceResult(true, keyColumns, source == null ? "" : source, "", "");
         }
 
-        static InferenceResult unresolved(String reason) {
-            return new InferenceResult(false, List.of(), "", reason == null ? "" : reason);
+        static InferenceResult unresolved(String resolutionCode, String reason) {
+            return new InferenceResult(
+                    false,
+                    List.of(),
+                    "",
+                    resolutionCode == null ? "" : resolutionCode,
+                    reason == null ? "" : reason
+            );
         }
 
         InferenceResult {

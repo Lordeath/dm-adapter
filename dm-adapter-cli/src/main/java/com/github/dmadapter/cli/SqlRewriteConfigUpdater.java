@@ -39,9 +39,12 @@ class SqlRewriteConfigUpdater {
 
         for (RewriteConfigCandidate candidate : candidates) {
             model.ensureTable(candidate.tableName(), List.of());
-            if (metadataAvailable
-                    && !hasConfiguredKeyColumns(model.methodColumns(candidate.methodKey()))
-                    && !hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()))) {
+            boolean configured = hasConfiguredKeyColumns(model.methodColumns(candidate.methodKey()))
+                    || hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()));
+            if (configured) {
+                model.ensureMethod(candidate.methodKey(), List.of());
+                model.removeMethodResolution(candidate.methodKey());
+            } else if (metadataAvailable) {
                 TableKeyMetadata metadata = metadataByTable.get(DamengMetadataReader.normalizeTableName(candidate.tableName()));
                 Optional<UpsertKeyInference.InferenceResult> result = inference.infer(candidate, metadata);
                 result.ifPresent(inferenceResult -> {
@@ -51,17 +54,23 @@ class SqlRewriteConfigUpdater {
                     if (inferenceResult.inferred()) {
                         inferredMethodKeys.put(candidate.methodKey(), inferenceResult.keyColumns());
                         model.putMethod(candidate.methodKey(), inferenceResult.keyColumns());
+                        model.removeMethodResolution(candidate.methodKey());
                         warnings.add("Inferred keyColumns " + inferenceResult.keyColumns()
                                 + " for " + candidate.methodKey()
                                 + " from " + inferenceResult.source() + ".");
                     } else {
                         model.ensureMethod(candidate.methodKey(), List.of());
+                        model.putMethodResolution(candidate.methodKey(), inferenceResult.resolutionCode());
                         warnings.add("Could not infer keyColumns for " + candidate.methodKey()
                                 + ": " + inferenceResult.reason());
                     }
                 });
             } else {
                 model.ensureMethod(candidate.methodKey(), List.of());
+                model.putMethodResolution(
+                        candidate.methodKey(),
+                        UpsertKeyInference.RESOLUTION_METADATA_UNAVAILABLE
+                );
             }
         }
 
@@ -178,6 +187,7 @@ class SqlRewriteConfigUpdater {
     private static final class RewriteConfigModel {
         private final LinkedHashMap<String, List<String>> tableKeys = new LinkedHashMap<>();
         private final LinkedHashMap<String, List<String>> methodKeys = new LinkedHashMap<>();
+        private final LinkedHashMap<String, String> methodResolutions = new LinkedHashMap<>();
         private final List<String> identityInsertLines = new ArrayList<>();
         private final LinkedHashSet<String> identityInsertTables = new LinkedHashSet<>();
         private final List<String> validationIgnoreLines = new ArrayList<>();
@@ -222,6 +232,19 @@ class SqlRewriteConfigUpdater {
                 return;
             }
             methodKeys.put(method.trim(), cleanColumns(columns));
+        }
+
+        void putMethodResolution(String method, String resolutionCode) {
+            if (method == null || method.isBlank() || resolutionCode == null || resolutionCode.isBlank()) {
+                return;
+            }
+            methodResolutions.put(method.trim(), resolutionCode.trim());
+        }
+
+        void removeMethodResolution(String method) {
+            if (method != null) {
+                methodResolutions.remove(method.trim());
+            }
         }
 
         List<String> tableColumns(String table) {
@@ -288,6 +311,16 @@ class SqlRewriteConfigUpdater {
                         .append(inlineList(columns))
                         .append("\n"));
             }
+            if (!methodResolutions.isEmpty()) {
+                yaml.append("\n")
+                        .append("upsertKeyResolutions:\n")
+                        .append("  methods:\n");
+                methodResolutions.forEach((method, resolutionCode) -> yaml.append("    \"")
+                        .append(escapeYaml(method))
+                        .append("\": \"")
+                        .append(escapeYaml(resolutionCode))
+                        .append("\"\n"));
+            }
             if (!validationArgsLines.isEmpty()) {
                 yaml.append("\n");
                 validationArgsLines.forEach(line -> yaml.append(line).append("\n"));
@@ -316,6 +349,35 @@ class SqlRewriteConfigUpdater {
                 if (indent == 0 && "upsertKeys:".equals(trimmed)) {
                     section = "upsertKeys";
                     currentName = "";
+                    continue;
+                }
+                if (indent == 0 && "upsertKeyResolutions:".equals(trimmed)) {
+                    section = "upsertKeyResolutions";
+                    currentName = "";
+                    continue;
+                }
+                if (indent == 0) {
+                    section = "";
+                    currentName = "";
+                    continue;
+                }
+                if (indent == 2
+                        && ("upsertKeyResolutions".equals(section)
+                        || "upsertKeyResolutionMethods".equals(section))
+                        && "methods:".equals(trimmed)) {
+                    section = "upsertKeyResolutionMethods";
+                    currentName = "";
+                    continue;
+                }
+                if ("upsertKeyResolutionMethods".equals(section) && indent == 4) {
+                    int colon = trimmed.lastIndexOf(':');
+                    if (colon > 0) {
+                        String method = unquote(trimmed.substring(0, colon).trim());
+                        String resolutionCode = unquote(trimmed.substring(colon + 1).trim());
+                        if (!method.isBlank() && !resolutionCode.isBlank()) {
+                            methodResolutions.put(method, resolutionCode);
+                        }
+                    }
                     continue;
                 }
                 if (indent == 2

@@ -83,6 +83,31 @@ class UpsertKeyInferenceTest {
         UpsertKeyInference.InferenceResult result = inference.infer(candidate, metadata).orElseThrow();
 
         assertThat(result.inferred()).isFalse();
+        assertThat(result.resolutionCode())
+                .isEqualTo(UpsertKeyInference.RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED);
         assertThat(result.reason()).contains("Multiple unique keys");
+    }
+
+    @Test
+    void marksMissingConflictConstraintAsOriginalSqlIssue() {
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.BankFileMapper.insertIgnore",
+                "ns_bank_file",
+                List.of("file_id", "file_name")
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("ns_bank_file", List.of(
+                new TableConstraint(
+                        "PK_NS_BANK_FILE",
+                        TableConstraint.ConstraintType.PRIMARY_KEY,
+                        List.of("id")
+                )
+        ));
+
+        UpsertKeyInference.InferenceResult result = inference.infer(candidate, metadata).orElseThrow();
+
+        assertThat(result.inferred()).isFalse();
+        assertThat(result.resolutionCode())
+                .isEqualTo(UpsertKeyInference.RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY);
+        assertThat(result.reason()).contains("No primary key or unique key columns are fully present");
     }
 }

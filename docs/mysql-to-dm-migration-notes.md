@@ -40,7 +40,7 @@
 - MySQL `DATE_ADD`/`DATE_SUB`/`INTERVAL` 形式应改写为 `DATEADD`。`YEARWEEK`、无法识别的 `DATE_ADD`/`DATE_SUB` 形态、以及未被规则覆盖的 `PERIOD_DIFF` 需要人工确认；已识别的 `PERIOD_DIFF(DATE_FORMAT(...,'%Y%m'), ...)` 可转为月份差。
 - MySQL `CONVERT(expr, DECIMAL(n))`、`CONVERT(expr, DECIMAL(n,m))` 应转为 `CAST(expr AS DECIMAL(...))`，不能按达梦 `CONVERT` 函数原样保留。
 - MySQL `ON DUPLICATE KEY UPDATE` 不能直接在达梦执行，通常要改为 `MERGE INTO` 或业务侧先查后写。dm-adapter 不应在无法确认唯一键和更新列语义时强行转换。项目 DDL 已明确主键/唯一键、但 INSERT 列不包含任何一个完整冲突键时，原写法本身无法按预期触发冲突更新，应归为原始 SQL/键元数据冲突；普通非唯一索引不能冒充冲突键，也不能据此猜测 `keyColumns`。`column = column` 这类自赋值仅用于表达“冲突时不更新”，转换后的 `MERGE` 应省略 `WHEN MATCHED`，不能生成歧义的自赋值表达式。
-- MySQL `INSERT IGNORE`、`REPLACE INTO` 需要确认唯一键、忽略冲突和替换删除语义。无法配置 `keyColumns` 时必须人工确认。
+- MySQL `INSERT IGNORE`、`REPLACE INTO` 需要确认唯一键、忽略冲突和替换删除语义。达梦元数据存在多个可用唯一键、元数据不可用或工具无法解析 INSERT 列时，必须人工配置真实 `keyColumns`；表不存在可用主键/唯一键，或 INSERT 未包含任何完整冲突键时，原写法本身无法表达预期的冲突忽略语义，应归类为原始 SQL/键约束冲突，不能猜测 `keyColumns`。
 - MySQL `UPDATE ... JOIN ... SET ...` 在达梦 53 兼容模式下可执行，默认保留，不再自动改写为 `UPDATE FROM`。如果目标环境验证失败，或存在多目标更新、触发器副作用、行数语义差异，再按业务 SQL 人工处理。
 - MySQL 用户变量和累加写法如 `@rownum := @rownum + 1` 不能直接迁移，通常改为达梦窗口函数 `ROW_NUMBER() OVER (...)`，或在存储过程/业务代码中显式声明变量。
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。

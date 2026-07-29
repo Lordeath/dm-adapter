@@ -8363,7 +8363,10 @@ class DmSqlValidationTestGenerator {
                     if (containsAnyPattern(countsByPattern,
                             "ON_DUPLICATE_KEY_UPDATE",
                             "INSERT_IGNORE")) {
-                        markdown.append("- 为 ON DUPLICATE KEY UPDATE / INSERT IGNORE 改写补充 sql-rewrite.yml 中的 keyColumns，重新执行 migrate 后再验证。\\n");
+                        markdown.append("- 达梦元数据存在可用冲突键但工具无法唯一选择时，在 sql-rewrite.yml 中配置真实 keyColumns，重新执行 migrate 后再验证。\\n");
+                    }
+                    if (countsByPattern.containsKey("ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY")) {
+                        markdown.append("- 原始 ON DUPLICATE KEY UPDATE / INSERT IGNORE 没有可用于冲突判断的主键或唯一键；应修正原始业务 SQL 或补充真实唯一约束，不能猜测 keyColumns。\\n");
                     }
                     if (countsByPattern.containsKey("DM_CTAS_BIND_PARAMETER")) {
                         markdown.append("- 达梦不支持在 CREATE TABLE AS SELECT 中使用 JDBC 绑定参数；将该 mapper 拆为显式建临时表和参数化 INSERT 两个步骤。\\n");
@@ -8555,6 +8558,8 @@ class DmSqlValidationTestGenerator {
                             return "Mapper 返回类型不匹配";
                         case "INSERT_IGNORE":
                             return "INSERT IGNORE";
+                        case "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY":
+                            return "原始 SQL 缺少可用冲突键";
                         case "MYSQL_GROUP_CONCAT":
                             return "GROUP_CONCAT 函数";
                         case "MYSQL_CONCAT_WS":
@@ -8796,6 +8801,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isDatabaseStatementTimeout(message)) {
                         return "DATABASE_STATEMENT_TIMEOUT";
+                    }
+                    if (hasOriginalSqlConflictKeyIssue(record, message)) {
+                        return "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
                         return "JAVA_MAPPER_PARAM_ANNOTATION";
@@ -9344,6 +9352,19 @@ class DmSqlValidationTestGenerator {
                     return record.parameterSource != null && record.parameterSource.startsWith("auto");
                 }
 
+                private boolean hasOriginalSqlConflictKeyIssue(ValidationRecord record, String message) {
+                    if (!"ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY".equals(
+                            currentConfig.upsertKeyResolution(record.key))) {
+                        return false;
+                    }
+                    String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
+                    return lower.contains("on duplicate key update")
+                            || Pattern.compile(
+                                    "insert\\\\s+ignore\\\\s+into",
+                                    Pattern.CASE_INSENSITIVE
+                            ).matcher(message == null ? "" : message).find();
+                }
+
                 private boolean hasJavaMapperParamAnnotationIssue(String message) {
                     String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
                     return lower.contains("java mapper signature has duplicate @param")
@@ -9383,6 +9404,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isDatabaseStatementTimeout(message)) {
                         return "TEST_DATABASE_RUNTIME";
+                    }
+                    if (hasOriginalSqlConflictKeyIssue(record, message)) {
+                        return "ORIGINAL_SQL";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
                         return "METHOD_ARGS_OR_BINDING";
@@ -9474,7 +9498,7 @@ class DmSqlValidationTestGenerator {
                         return "达梦拒绝了 SQL 语法；请检查 mapper-dm SQL，并手工处理未兼容的片段。";
                     }
                     if ("ORIGINAL_SQL".equals(category)) {
-                        return "原始 mapper INSERT 漏写了达梦表要求的非空列；应修正原始业务 SQL，不能用测试参数或忽略规则掩盖。";
+                        return "原始 mapper SQL 本身与表约束或列要求冲突；应修正原始业务 SQL 或真实约束，不能用测试参数、猜测 keyColumns 或忽略规则掩盖。";
                     }
                     if ("TEST_SCHEMA".equals(category)) {
                         return "达梦测试库缺少表、视图、字段、函数，或对象命名与 mapper SQL 不一致。";
@@ -10878,6 +10902,7 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> ignoredMissingColumns = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
                     private final Set<String> ignoredNotNullColumns = new LinkedHashSet<>();
+                    private final Map<String, String> upsertKeyResolutions = new LinkedHashMap<>();
 
                     static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
@@ -11010,6 +11035,12 @@ class DmSqlValidationTestGenerator {
                                 valueMode = "";
                                 continue;
                             }
+                            if (indent == 0 && "upsertKeyResolutions:".equals(trimmed)) {
+                                section = "upsertKeyResolutions";
+                                currentMethod = null;
+                                valueMode = "";
+                                continue;
+                            }
                             if (indent == 0 && "validationIgnores:".equals(trimmed)) {
                                 section = "validationIgnores";
                                 currentMethod = null;
@@ -11026,6 +11057,25 @@ class DmSqlValidationTestGenerator {
                                 section = "validationMethods";
                                 currentMethod = null;
                                 valueMode = "";
+                                continue;
+                            }
+                            if ("upsertKeyResolutions".equals(section)
+                                    && indent == 2
+                                    && "methods:".equals(trimmed)) {
+                                section = "upsertKeyResolutionMethods";
+                                currentMethod = null;
+                                valueMode = "";
+                                continue;
+                            }
+                            if ("upsertKeyResolutionMethods".equals(section) && indent == 4) {
+                                int colon = trimmed.lastIndexOf(':');
+                                if (colon > 0) {
+                                    String method = scalar(trimmed.substring(0, colon));
+                                    String resolutionCode = scalar(trimmed.substring(colon + 1));
+                                    if (!isBlank(method) && !isBlank(resolutionCode)) {
+                                        upsertKeyResolutions.put(method, resolutionCode);
+                                    }
+                                }
                                 continue;
                             }
                             if (isValidationIgnoreSection(section) && indent == 2 && trimmed.startsWith("missingTables:")) {
@@ -11111,6 +11161,15 @@ class DmSqlValidationTestGenerator {
                                 || "validationMissingColumns".equals(section)
                                 || "validationMissingSchemas".equals(section)
                                 || "validationNotNullColumns".equals(section);
+                    }
+
+                    private String upsertKeyResolution(String recordKey) {
+                        String methodKey = recordKey;
+                        int labelStart = methodKey == null ? -1 : methodKey.indexOf(" [");
+                        if (labelStart > 0) {
+                            methodKey = methodKey.substring(0, labelStart);
+                        }
+                        return upsertKeyResolutions.getOrDefault(methodKey, "");
                     }
 
                     private void addIgnoredMissingTables(Object value) {
