@@ -4984,6 +4984,58 @@ class MapperMigratorTest {
     }
 
     @Test
+    void convertsDescendantUserVariableTraversalAroundSqlIncludeToDamengHierarchyQuery() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/CategoryMapper.xml", """
+                select
+                <include refid="Category_Column_List" />
+                from category_tree
+                where deleted = 0 and node_id in (select node_id from (
+                    select ordered.node_id,
+                    if(find_in_set(parent_node_id, @descendants) > 0,
+                       @descendants := concat(@descendants, ',', node_id), 0) as is_child
+                    from (
+                        select node_id, parent_node_id
+                        from category_tree source_tree
+                        order by parent_node_id, node_id
+                    ) ordered,
+                    (select @descendants := #{parentNodeId}) seed
+                ) discovered where is_child != 0)
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CategoryMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/CategoryMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("<include refid=\"Category_Column_List\" />")
+                .contains("WHERE deleted = 0 AND node_id IN (")
+                .contains("SELECT node_id")
+                .contains("FROM category_tree")
+                .contains("START WITH parent_node_id = #{parentNodeId}")
+                .contains("CONNECT BY NOCYCLE PRIOR node_id = parent_node_id")
+                .doesNotContain("@descendants")
+                .doesNotContainIgnoringCase("find_in_set");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void convertsPeriodDiffWithYearMonthParameterInsideDynamicXml() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/TaskMapper.xml", """
                 select t.id
