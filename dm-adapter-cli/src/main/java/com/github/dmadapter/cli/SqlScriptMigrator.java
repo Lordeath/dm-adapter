@@ -2753,6 +2753,11 @@ class SqlScriptMigrator {
         converted = normalizeMysqlDataTypes(converted);
         converted = replaceOutsideIgnoredText(
                 converted,
+                Pattern.compile("(?is)\\s+(?:UNSIGNED|ZEROFILL)\\b"),
+                matcher -> ""
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
                 Pattern.compile("(?is)\\bADD\\s+COLUMN\\b"),
                 matcher -> "ADD"
         );
