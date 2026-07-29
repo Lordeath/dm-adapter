@@ -77,7 +77,7 @@
 ## MyBatis 迁移判断准则
 
 - 原始 mapper XML 不由 dm-adapter 迁移流程覆盖；自动迁移输出保持在 `src/main/resources/mapper-dm`。
-- MySQL `LEFT JOIN` 更新若右表列参与赋值，不能直接降级成达梦 `UPDATE ... FROM`，因为无匹配行和重复来源行的语义会变化。只有项目 DDL 的真实主键或唯一键被 `ON` 条件完整绑定，且赋值形态可等价表示时，才可把右表列改为相关标量子查询；缺少唯一性证明时应准确报告约束风险，不能任选一条来源记录。
+- MySQL `LEFT JOIN` 更新若右表列参与赋值，不能直接降级成达梦 `UPDATE ... FROM`，因为无匹配行和重复来源行的语义会变化。只有项目 DDL 的真实主键或唯一键被 `ON` 条件完整绑定，或右侧派生表按连接列 `GROUP BY` 已直接证明每个键最多一行，且赋值形态可等价表示时，才可把右表表达式改为相关标量子查询；`WHERE` 中引用右表的 `AND` 条件必须同时下推到标量子查询并在外层补等价 `EXISTS`，不能留下失效的右表别名。动态 `<foreach>` 只是外层过滤条件时应原样保留，不应阻止上述转换。赋值完全不依赖右表时，可用 `EXISTS` 保留匹配过滤语义，不需要唯一性证明。缺少必要的唯一性证明时应准确报告约束风险，不能任选一条来源记录。
 - 原始 SQL 明显错误时，可以修原始业务 SQL。例如列名写错、insert 列和值数量不一致、`set` 末尾多逗号、把 `UPDATE table` 写成 `UPDATE FROM table`。这类错误即使后续通用规则引用了达梦关键字，也仍应按原始 XML 语法缺陷分类。若问题来自 Java mapper 方法签名，如多个参数复用同一个 `@Param` 名称，或多个简单参数缺少必要 `@Param`，应修 Java mapper 方法签名，不应为了绕过绑定错误去改 XML 参数名。
 - Java 注解里的 SQL 如果包含复杂动态 SQL、MySQL 专有语法或需要达梦改写，应优先迁移到 mapper XML，再由 dm-adapter 生成 `mapper-dm`；自动迁移也应把可识别的 `@Select`、`@Insert`、`@Update`、`@Delete` SQL 提取到 `mapper-dm` XML 后再执行达梦改写和验证。
 - mapper XML 可能带 UTF-8 BOM。解析器必须按字节流交给 XML 解析器识别 BOM；不能把 BOM 作为正文字符传入 `Reader`，否则整份文件会退化为“无法安全解析”，后续动态 SQL 结构转换将被跳过。

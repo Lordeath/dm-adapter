@@ -2563,6 +2563,286 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicLeftJoinUpdateUsesConfiguredSourceKeyAcrossForeach() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.OrganizationMapper">
+                    <update id="updatePathNames">
+                        update sample_organization child
+                        left join sample_organization parent
+                            on child.parent_id = parent.id
+                        set child.path_name = concat(parent.path_name, "-", child.name)
+                        where child.id in
+                        <foreach collection="ids" item="id" open="(" separator="," close=")">
+                            #{id}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/OrganizationMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/OrganizationMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(Map.of("sample_organization", List.of("id")), Map.of())
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/OrganizationMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("update sample_organization child set path_name = (SELECT concat(parent.path_name, '-', child.name)")
+                .contains("FROM sample_organization parent WHERE child.parent_id = parent.id)")
+                .contains("<foreach collection='ids'")
+                .doesNotContainIgnoringCase("left join");
+        assertThat(result.automaticConversions()).singleElement()
+                .satisfies(change -> assertThat(change.appliedRules())
+                        .contains(
+                                MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE,
+                                MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE
+                        ));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void staticLeftJoinUpdateUsesConfiguredSourceKey() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/CategoryMapper.xml", """
+                update sample_category child
+                left join sample_category parent on child.parent_id = parent.id
+                set child.path_name = concat(parent.path_name, child.name),
+                    child.category_level = ifnull(parent.category_level, 1) + 1
+                where parent.id is not null and child.category_level = #{level}
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CategoryMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(Map.of("sample_category", List.of("id")), Map.of())
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CategoryMapper.xml"));
+        assertThat(rewritten)
+                .contains("path_name = (SELECT concat(parent.path_name, child.name)")
+                .contains("category_level = (SELECT ifnull(parent.category_level, 1) + 1")
+                .contains("EXISTS (SELECT 1 FROM sample_category parent")
+                .doesNotContainIgnoringCase("left join");
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicLeftJoinSourceFilterBecomesScalarAndExistsSubqueries() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateOrganizationNames">
+                        update sample_user user_row
+                        left join sample_organization organization
+                            on user_row.organization_id = organization.id
+                        set user_row.organization_name = organization.name,
+                            user_row.update_time = now()
+                        where organization.id in
+                        <foreach collection="ids" item="id" open="(" separator="," close=")">
+                            #{id}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(Map.of("sample_organization", List.of("id")), Map.of())
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("organization_name = (SELECT organization.name FROM sample_organization organization")
+                .contains("where EXISTS (SELECT 1 FROM sample_organization organization")
+                .contains("<foreach collection='ids'")
+                .doesNotContain("where organization.id in")
+                .doesNotContainIgnoringCase("left join");
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicLeftJoinGroupedSourceIsConvertedWithoutConfiguredKey() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.BillMapper">
+                    <update id="updateTotals">
+                        update sample_header header
+                        left join (
+                            select detail.header_id, sum(detail.amount) as total_amount
+                            from sample_detail detail
+                            group by detail.header_id
+                        ) totals on header.id = totals.header_id
+                        set header.total_amount = ifnull(totals.total_amount, 0)
+                        where header.id in
+                        <foreach collection="ids" item="id" open="(" separator="," close=")">
+                            #{id}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/BillMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BillMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BillMapper.xml"));
+        assertThat(rewritten)
+                .contains("total_amount = (SELECT ifnull(totals.total_amount, 0) FROM (")
+                .contains("group by detail.header_id")
+                .contains(") totals WHERE header.id = totals.header_id)")
+                .contains("<foreach collection='ids'")
+                .doesNotContainIgnoringCase("left join");
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicLeftJoinConstantTargetAssignmentUsesExistsWithoutSourceKey() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ContractRoomMapper">
+                    <update id="deletePendingRooms">
+                        update sample_contract_room room
+                        left join sample_contract contract on room.contract_id = contract.id
+                        set room.is_deleted = 1
+                        where contract.status in ('PENDING', 'REVIEW')
+                        and room.contract_id in
+                        <foreach collection="ids" item="id" open="(" separator="," close=")">
+                            #{id}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ContractRoomMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ContractRoomMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/ContractRoomMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("update sample_contract_room room set is_deleted = 1")
+                .contains("room.contract_id in")
+                .contains("EXISTS (SELECT 1 FROM sample_contract contract")
+                .contains("contract.status in ('PENDING', 'REVIEW')")
+                .doesNotContainIgnoringCase("left join");
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicOuterJoinUpdatingJoinedTargetUsesRowIdMergeAcrossForeach() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.DetailMapper">
+                    <update id="deleteSettlementDetails">
+                        update sample_extension extension
+                        left join sample_detail detail on detail.id = extension.detail_id
+                        set detail.is_deleted = "1"
+                        where detail.scope_id = #{scopeId}
+                        and extension.settlement_id in
+                        <foreach collection="ids" item="id" open="(" separator="," close=")">
+                            #{id}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/DetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/DetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/DetailMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO sample_detail detail")
+                .contains("SELECT DISTINCT detail.ROWID AS dm_target_rowid")
+                .contains("<foreach collection=\"ids\"")
+                .contains("WHEN MATCHED THEN UPDATE SET detail.is_deleted = '1'")
+                .doesNotContainIgnoringCase("update sample_extension extension");
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicSqlTextNodesRewriteDoubleQuotedStringLiterals() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

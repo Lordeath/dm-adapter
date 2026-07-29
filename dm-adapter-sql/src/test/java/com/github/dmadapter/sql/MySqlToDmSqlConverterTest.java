@@ -2417,6 +2417,101 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void extractsLeftJoinSourceColumnsForMetadataLookup() {
+        assertThat(converter.outerJoinSourceKeyCandidate("""
+                update sample_user user_row
+                left join sample_organization organization
+                    on user_row.organization_id = organization.id
+                    and user_row.enterprise_id = organization.enterprise_id
+                set user_row.organization_name = organization.name
+                where user_row.id in
+                <foreach collection="ids" item="id" open="(" separator="," close=")">
+                    #{id}
+                </foreach>
+                """))
+                .hasValueSatisfying(candidate -> {
+                    assertThat(candidate.tableName()).isEqualTo("sample_organization");
+                    assertThat(candidate.joinColumns()).containsExactly("id", "enterprise_id");
+                });
+    }
+
+    @Test
+    void convertsUniqueLeftJoinExpressionAcrossDynamicTargetFilter() {
+        SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
+                update sample_organization child
+                left join sample_organization parent
+                    on child.parent_id = parent.id
+                set child.path_name = concat(parent.path_name, "-", child.name)
+                where child.id in
+                <foreach collection="ids" item="id" open="(" separator="," close=")">
+                    #{id}
+                </foreach>
+                """, Map.of("sample_organization", List.of("id")));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("update sample_organization child set path_name = (SELECT concat(parent.path_name, '-', child.name)")
+                .contains("FROM sample_organization parent WHERE child.parent_id = parent.id)")
+                .contains("where child.id in")
+                .contains("<foreach collection='ids'");
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE,
+                "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING"
+        );
+    }
+
+    @Test
+    void movesUniqueLeftJoinSourceFilterIntoScalarAndExistsSubqueries() {
+        SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
+                update sample_user user_row
+                left join sample_organization organization
+                    on user_row.organization_id = organization.id
+                set user_row.organization_name = organization.name,
+                    user_row.update_time = now()
+                where organization.id in
+                <foreach collection="ids" item="id" open="(" separator="," close=")">
+                    #{id}
+                </foreach>
+                """, Map.of("sample_organization", List.of("id")));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("organization_name = (SELECT organization.name FROM sample_organization organization")
+                .contains("user_row.organization_id = organization.id AND organization.id in")
+                .contains("update_time = now()")
+                .contains("where EXISTS (SELECT 1 FROM sample_organization organization")
+                .contains("<foreach collection='ids'");
+        assertThat(result.convertedSql()).doesNotContain("where organization.id in");
+    }
+
+    @Test
+    void convertsLeftJoinToGroupedDerivedSourceWithoutExternalKeyMetadata() {
+        SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
+                update sample_header header
+                left join (
+                    select detail.header_id, sum(detail.amount) as total_amount
+                    from sample_detail detail
+                    group by detail.header_id
+                ) totals on header.id = totals.header_id
+                set header.total_amount = ifnull(totals.total_amount, 0)
+                where header.id in
+                <foreach collection="ids" item="id" open="(" separator="," close=")">
+                    #{id}
+                </foreach>
+                """, Map.of());
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("total_amount = (SELECT ifnull(totals.total_amount, 0) FROM (")
+                .contains("group by detail.header_id")
+                .contains(") totals WHERE header.id = totals.header_id)")
+                .contains("<foreach collection='ids'");
+    }
+
+    @Test
     void keepsLeftJoinUpdateManualWhenJoinDoesNotBindProvenUniqueKey() {
         SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
                 UPDATE sample_detail detail
