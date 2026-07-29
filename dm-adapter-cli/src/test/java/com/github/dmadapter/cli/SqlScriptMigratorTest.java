@@ -5091,6 +5091,81 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsSqlExceptionContinueHandlerToStatementLevelDmBlocks() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE refresh_summary(target_month VARCHAR(10))
+                BEGIN
+                    DECLARE state_code CHAR(5) DEFAULT '00000';
+                    DECLARE error_message TEXT;
+                    DECLARE affected_rows INT;
+                    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        GET DIAGNOSTICS CONDITION 1
+                            state_code = RETURNED_SQLSTATE, error_message = MESSAGE_TEXT;
+                    END;
+                    IF EXISTS (SELECT 1 FROM summary_result WHERE month_no = target_month) THEN
+                        DELETE FROM summary_result WHERE month_no = target_month;
+                    END IF;
+                    INSERT INTO summary_result(month_no, amount)
+                    SELECT target_month, SUM(amount)
+                    FROM summary_source;
+                    IF state_code = '00000' THEN
+                        GET DIAGNOSTICS affected_rows = ROW_COUNT;
+                        INSERT INTO migration_log(message)
+                        VALUES (CONCAT('rows=', affected_rows));
+                    ELSE
+                        INSERT INTO migration_log(message) VALUES (error_message);
+                    END IF;
+                END;
+                /
+                CALL refresh_summary('2026-07');
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("state_code := 'HY000'")
+                .contains("error_message := SQLERRM")
+                .contains("affected_rows := SQL%ROWCOUNT")
+                .contains("EXCEPTION")
+                .contains("WHEN OTHERS THEN")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("GET DIAGNOSTICS")
+                .doesNotContain("RETURNED_SQLSTATE")
+                .doesNotContain("MESSAGE_TEXT");
+        assertThat(converted.sql().split("WHEN OTHERS THEN", -1).length - 1)
+                .isGreaterThanOrEqualTo(5);
+        assertThat(converted.report().files()).singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE));
+    }
+
+    @Test
+    void keepsSqlExceptionContinueHandlerWithProcedureCallForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE refresh_summary()
+                BEGIN
+                    DECLARE state_code CHAR(5) DEFAULT '00000';
+                    DECLARE error_message TEXT;
+                    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        GET DIAGNOSTICS CONDITION 1
+                            state_code = RETURNED_SQLSTATE, error_message = MESSAGE_TEXT;
+                    END;
+                    CALL refresh_summary_source();
+                    INSERT INTO migration_log(message) VALUES (error_message);
+                END;
+                /
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.report().manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("HANDLER"));
+        assertThat(converted.sql())
+                .contains("DECLARE CONTINUE HANDLER FOR SQLEXCEPTION")
+                .doesNotContain("state_code := 'HY000'");
+    }
+
+    @Test
     void sqlScriptValidationTimeoutCanBeOverriddenWithSystemProperty() {
         String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
         String previous = System.getProperty(property);
