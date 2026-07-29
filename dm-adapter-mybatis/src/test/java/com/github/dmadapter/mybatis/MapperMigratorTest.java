@@ -745,6 +745,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -923,6 +924,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -986,6 +988,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -1425,7 +1428,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicXmlKeepsSafeTextConversionsWhenRemainingSqlNeedsManualReview() throws Exception {
+    void dynamicXmlConvertsDefaultYearWeekWithoutManualReview() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -1457,13 +1460,16 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AuditMapper.xml"));
         assertThat(rewritten)
-                .contains("select 'ACTIVE' as status, YEARWEEK(created_at) from audit_log");
+                .contains("select 'ACTIVE' as status, "
+                        + "(YEAR(DATEADD(DAY, -WEEKDAY(created_at), created_at)) * 100 "
+                        + "+ WEEK(created_at, 2)) from audit_log");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason())
-                .contains("dynamic XML", "YEARWEEK");
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_YEARWEEK_RULE
+                );
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -1561,6 +1567,79 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void columnAndIndexDescriptorMetadataAreRewrittenWithoutSchemaHardcoding() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.InformationSchemaMapper">
+                    <select id="selectColumnNames" resultType="map">
+                        select c.COLUMN_NAME as columnName
+                        , c.COLUMN_TYPE as columnType
+                        , c.COLUMN_COMMENT as columnComment
+                        , c.COLUMN_DEFAULT as columnDefault
+                        , c.COLUMN_KEY as columnKey
+                        , c.EXTRA as extra
+                        from information_schema.`COLUMNS` c
+                        where TABLE_SCHEMA = '${schema}'
+                        and TABLE_NAME = '${tableName}'
+                        order by ORDINAL_POSITION
+                    </select>
+                    <select id="selectColumnNamesNowDatabase" resultType="map">
+                        select c.COLUMN_NAME as columnName
+                        , c.COLUMN_TYPE as columnType
+                        , c.COLUMN_COMMENT as columnComment
+                        , c.COLUMN_DEFAULT as columnDefault
+                        , c.COLUMN_KEY as columnKey
+                        , c.EXTRA as extra
+                        from information_schema.`COLUMNS` c
+                        where TABLE_SCHEMA = (select DATABASE())
+                        and TABLE_NAME = '${tableName}'
+                        order by ORDINAL_POSITION
+                    </select>
+                    <select id="selectIndexNamesNowDatabase" resultType="java.lang.String">
+                        select distinct s.INDEX_NAME
+                        from information_schema.`STATISTICS` s
+                        where TABLE_SCHEMA = (select DATABASE())
+                        and TABLE_NAME = '${tableName}'
+                        and INDEX_NAME != 'PRIMARY'
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/InformationSchemaMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/InformationSchemaMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/InformationSchemaMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("FROM SYS.SYSCOLUMNS sc")
+                .contains("WHERE sch.NAME = UPPER('${schema}')")
+                .contains("WHERE sch.NAME = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .contains("AND obj.NAME = UPPER('${tableName}')")
+                .contains("FROM ALL_INDEXES i")
+                .contains("ac.CONSTRAINT_TYPE = 'P'")
+                .doesNotContain("information_schema")
+                .doesNotContain("DATABASE()");
+        assertThat(result.automaticConversions()).hasSize(3);
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
@@ -4307,7 +4386,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void mysqlSpecificFunctionIsMarkedForManualReview() throws Exception {
+    void defaultYearWeekIsAutomaticallyConverted() throws Exception {
         Path mapper = writeMapper(
                 "src/main/resources/mapper/UserMapper.xml",
                 "select YEARWEEK(created_at) from user"
@@ -4328,9 +4407,10 @@ class MapperMigratorTest {
                 new MySqlToDmSqlConverter()
         );
 
-        assertThat(result.automaticConversions()).isEmpty();
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("YEARWEEK");
+        assertThat(result.automaticConversions()).singleElement()
+                .satisfies(change -> assertThat(change.appliedRules())
+                        .containsExactly(MySqlToDmSqlConverter.MYSQL_YEARWEEK_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -4377,7 +4457,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void skipsTextSegmentUpdateJoinWhenFollowedByDynamicWhere() throws Exception {
+    void rewritesUpdateJoinFollowedByDynamicWhere() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -4385,10 +4465,13 @@ class MapperMigratorTest {
                 <mapper namespace="com.example.UserMapper">
                     <update id="updateBalance">
                         update ns_payment_prepayment npp
-                        INNER JOIN ns_payment_prepaymentdetail nppd on npp.Id = nppd.RefPrePaymentID
-                        set npp.Balance = npp.Balance + nppd.OccurBalance
+                        INNER JOIN ns_payment_prepaymentdetail nppd
+                            on npp.Id = nppd.RefPrePaymentID AND nppd.IsDelete = 0
+                        set npp.Balance = npp.Balance + nppd.OccurBalance * -1,
+                            npp.AddSum = npp.AddSum - nppd.OccurBalance
                         <where>
                             nppd.ChargePaymentID = #{id}
+                            AND npp.Balance + nppd.OccurBalance * -1 >= 0
                         </where>
                     </update>
                 </mapper>
@@ -4412,14 +4495,17 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("INNER JOIN ns_payment_prepaymentdetail")
+                .contains("update ns_payment_prepayment npp set Balance = npp.Balance + nppd.OccurBalance * -1")
+                .contains("AddSum = npp.AddSum - nppd.OccurBalance")
+                .contains("from ns_payment_prepaymentdetail nppd")
                 .contains("<where>")
-                .doesNotContain(" from ns_payment_prepaymentdetail nppd where npp.Id = nppd.RefPrePaymentID");
-        assertThat(result.automaticConversions()).isEmpty();
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason())
-                .contains("MyBatis <where>")
-                .contains("duplicate WHERE");
+                .contains("npp.Id = nppd.RefPrePaymentID AND nppd.IsDelete = 0")
+                .contains("and nppd.ChargePaymentID = #{id}")
+                .doesNotContain("INNER JOIN");
+        assertThat(result.automaticConversions()).singleElement()
+                .satisfies(change -> assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test

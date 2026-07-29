@@ -1889,18 +1889,39 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void keepsSafeConversionsWhenRemainingSqlNeedsManualReview() {
+    void convertsDefaultYearWeekWhileKeepingOtherSafeConversions() {
         SqlConversionResult result = converter.convert(
                 "select \"ACTIVE\" as status, YEARWEEK(created_at) from audit_log"
         );
 
         assertThat(result.changed()).isTrue();
-        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("select 'ACTIVE' as status, YEARWEEK(created_at) from audit_log");
-        assertThat(result.reason()).contains("YEARWEEK");
+                .isEqualTo("select 'ACTIVE' as status, "
+                        + "(YEAR(DATEADD(DAY, -WEEKDAY(created_at), created_at)) * 100 "
+                        + "+ WEEK(created_at, 2)) from audit_log");
         assertThat(result.appliedRules())
-                .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
+                .containsExactly(
+                        "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                        MySqlToDmSqlConverter.MYSQL_YEARWEEK_RULE
+                );
+    }
+
+    @Test
+    void convertsYearWeekDateFormatEqualityUsingOriginalDateValues() {
+        SqlConversionResult result = converter.convert(
+                "select * from payment where "
+                        + "YEARWEEK(date_format(OperatorDate,'%Y-%m-%d')) = YEARWEEK(now())"
+        );
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("(YEAR(DATEADD(DAY, -WEEKDAY(OperatorDate), OperatorDate)) * 100 "
+                        + "+ WEEK(OperatorDate, 2))")
+                .contains("(YEAR(DATEADD(DAY, -WEEKDAY(now()), now())) * 100 + WEEK(now(), 2))")
+                .doesNotContain("YEARWEEK")
+                .doesNotContain("DATE_FORMAT");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_YEARWEEK_RULE);
     }
 
     @Test
@@ -2499,8 +2520,7 @@ class MySqlToDmSqlConverterTest {
                 "DATE_ADD",
                 "DATE_SUB",
                 "MAKEDATE",
-                "PERIOD_DIFF",
-                "YEARWEEK"
+                "PERIOD_DIFF"
         );
 
         for (String functionName : functionNames) {
@@ -2513,6 +2533,15 @@ class MySqlToDmSqlConverterTest {
             assertThat(result.convertedSql()).isEqualTo(result.originalSql());
             assertThat(result.reason()).contains(functionName);
         }
+    }
+
+    @Test
+    void keepsExplicitYearWeekModeForManualReview() {
+        SqlConversionResult result = converter.convert("select YEARWEEK(created_at, 3) from user");
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("YEARWEEK");
     }
 
     @Test
@@ -2857,6 +2886,64 @@ class MySqlToDmSqlConverterTest {
                 """.strip());
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
+    void convertsMysqlColumnDescriptorMetadataForDifferentRuntimeSchemas() {
+        for (String schema : List.of("tenant_alpha", "tenant_beta")) {
+            SqlConversionResult result = converter.convert("""
+                    select c.COLUMN_NAME as columnName
+                    , c.COLUMN_TYPE as columnType
+                    , c.COLUMN_COMMENT as columnComment
+                    , c.COLUMN_DEFAULT as columnDefault
+                    , c.COLUMN_KEY as columnKey
+                    , c.EXTRA as extra
+                    from information_schema.`COLUMNS` c
+                    where TABLE_SCHEMA = '%s'
+                    and TABLE_NAME = '${tableName}'
+                    order by ORDINAL_POSITION
+                    """.formatted(schema));
+
+            assertThat(result.changed()).isTrue();
+            assertThat(result.manualReviewRequired()).isFalse();
+            assertThat(result.convertedSql())
+                    .contains("sc.NAME AS \"columnName\"")
+                    .contains("END AS \"columnType\"")
+                    .contains("scc.COMMENT$ AS \"columnComment\"")
+                    .contains("sc.DEFVAL AS \"columnDefault\"")
+                    .contains("THEN 'PRI'")
+                    .contains("THEN 'UNI'")
+                    .contains("THEN 'MUL'")
+                    .contains("MOD(sc.INFO2, 2) = 1")
+                    .contains("WHERE sch.NAME = UPPER('" + schema + "')")
+                    .contains("AND obj.NAME = UPPER('${tableName}')")
+                    .doesNotContain("information_schema");
+            assertThat(result.appliedRules())
+                    .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+        }
+    }
+
+    @Test
+    void convertsMysqlIndexMetadataForCurrentRuntimeSchema() {
+        SqlConversionResult result = converter.convert("""
+                select distinct s.INDEX_NAME
+                from information_schema.`STATISTICS` s
+                where TABLE_SCHEMA = (select DATABASE())
+                and TABLE_NAME = '${tableName}'
+                and INDEX_NAME != 'PRIMARY'
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("FROM ALL_INDEXES i")
+                .contains("WHERE i.OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .contains("AND i.TABLE_NAME = UPPER('${tableName}')")
+                .contains("ac.CONSTRAINT_TYPE = 'P'")
+                .doesNotContain("information_schema")
+                .doesNotContain("DATABASE()");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_STATISTICS_RULE);
     }
 
     @Test
