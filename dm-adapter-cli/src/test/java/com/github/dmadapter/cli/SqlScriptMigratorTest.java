@@ -586,6 +586,51 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void clearsManualProcedureDependencyAfterSuccessfulRecreation() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        RecordingValidator validator = new RecordingValidator();
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE recreate_demo()
+                BEGIN
+                    INSERT INTO ns_demo(id) VALUES (1),
+                END$$
+                DELIMITER ;
+                CALL recreate_demo();
+                DROP PROCEDURE IF EXISTS recreate_demo;
+                DELIMITER $$
+                CREATE PROCEDURE recreate_demo()
+                BEGIN
+                    INSERT INTO ns_demo(id) VALUES (1);
+                END$$
+                DELIMITER ;
+                CALL recreate_demo();
+                """);
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(2);
+        assertThat(report.manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::statementIndex)
+                .containsExactly(1, 2);
+        assertThat(validator.files)
+                .singleElement()
+                .satisfies(file -> {
+                    assertThat(file.manualReviewStatementIndexes()).containsExactlyInAnyOrder(1, 2);
+                    assertThat(file.statements().get(4)).contains("CALL recreate_demo()");
+                });
+    }
+
+    @Test
     void reportsSuspiciousLengthModifyWhenCheckOnlyComparesTargetLengthWithoutTypeGuard() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -1126,7 +1171,7 @@ class SqlScriptMigratorTest {
                     DECLARE CONTINUE HANDLER FOR SQLSTATE '02000'SET STOP=1;
                     OPEN object;
                     FETCH object INTO house_id1;
-                    WHILE STOP<> 1 DO
+                    WHILE STOP = 0 DO
                         INSERT INTO ns_equip_room(precinctid) VALUES (house_id1);
                         FETCH object INTO house_id1;
                     END WHILE;
@@ -1161,6 +1206,50 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_RESERVED_CURSOR_RENAME_RULE));
+    }
+
+    @Test
+    void keepsZeroFlagCursorHandlerWhenSelectIntoCanTriggerIt() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE unsafe_optional_lookup()
+                BEGIN
+                    DECLARE siteId BIGINT;
+                    DECLARE enumId BIGINT;
+                    DECLARE done INT DEFAULT 0;
+                    DECLARE site_cursor CURSOR FOR SELECT id FROM ns_site;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+                    OPEN site_cursor;
+                    FETCH site_cursor INTO siteId;
+                    WHILE done = 0 DO
+                        SELECT id INTO enumId FROM ns_enums WHERE site_id = siteId LIMIT 1;
+                        FETCH site_cursor INTO siteId;
+                    END WHILE;
+                    CLOSE site_cursor;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-association",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("HANDLER"));
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1")
+                .contains("WHILE done = 0 DO")
+                .doesNotContain("site_cursor%NOTFOUND");
     }
 
     @Test
