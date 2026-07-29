@@ -42,7 +42,7 @@
 - MySQL `CONVERT(expr, DECIMAL(n))`、`CONVERT(expr, DECIMAL(n,m))` 应转为 `CAST(expr AS DECIMAL(...))`，不能按达梦 `CONVERT` 函数原样保留。
 - MySQL `ON DUPLICATE KEY UPDATE` 不能直接在达梦执行，通常要改为 `MERGE INTO` 或业务侧先查后写。dm-adapter 不应在无法确认唯一键和更新列语义时强行转换。项目 DDL 已明确主键/唯一键、但 INSERT 列不包含任何一个完整冲突键时，原写法本身无法按预期触发冲突更新，应归为原始 SQL/键元数据冲突；普通非唯一索引不能冒充冲突键，也不能据此猜测 `keyColumns`。`column = column` 这类自赋值仅用于表达“冲突时不更新”，转换后的 `MERGE` 应省略 `WHEN MATCHED`，不能生成歧义的自赋值表达式。
 - MySQL `INSERT IGNORE`、`REPLACE INTO` 需要确认唯一键、忽略冲突和替换删除语义。达梦元数据存在多个可用唯一键、元数据不可用或工具无法解析 INSERT 列时，必须人工配置真实 `keyColumns`；表不存在可用主键/唯一键，或 INSERT 未包含任何完整冲突键时，原写法本身无法表达预期的冲突忽略语义，应归类为原始 SQL/键约束冲突，不能猜测 `keyColumns`。
-- MySQL `UPDATE ... JOIN ... SET ...` 在达梦 53 兼容模式下可执行，默认保留，不再自动改写为 `UPDATE FROM`。如果目标环境验证失败，或存在多目标更新、触发器副作用、行数语义差异，再按业务 SQL 人工处理。
+- MySQL `UPDATE ... JOIN ... SET ...` 只更新一个表别名且目标达梦可执行时可以保留；同时更新多个别名时，达梦会报“多表更新时仅支持更新同一个表上的列”。拆分语句必须保持原 JOIN 匹配快照，不能让第一条 UPDATE 改掉后续语句仍依赖的谓词。若只有一个目标会修改匹配谓词且各目标右值不依赖其他目标被修改的列，可按“未改谓词的目标在前、改谓词的目标最后”生成达梦匿名块；若两个目标都会修改谓词，但能证明主表 `ID` 由方法参数唯一绑定、JOIN 将该 ID 映射到从表外键，则先更新主表，并用 `IF SQL%ROWCOUNT > 0 THEN` 和推导出的从表外键条件更新从表。表名、别名、列名和参数都必须从原 SQL 提取，不能写死项目值；无法证明等价时保留原 SQL 并报告，不能盲目顺序拆分。
 - MySQL 用户变量和累加写法如 `@rownum := @rownum + 1` 不能直接迁移，通常改为达梦窗口函数 `ROW_NUMBER() OVER (...)`，或在存储过程/业务代码中显式声明变量。
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
 - 同一列定义出现两个或更多 `DEFAULT` 子句时，原始 MySQL DDL 本身存在互相冲突的默认值，工具不能替业务选择保留哪一个。数据库验证应将其归为 `ORIGINAL_SQL`，保留转换结果并要求修正源脚本，不能误报为待补充的达梦转换规则。
@@ -95,7 +95,7 @@
    - SQL 脚本单条语句默认硬超时为 600 秒。真实全量脚本中同一合法数据同步过程的耗时会随测试库数据量从约 187 秒增长到超过 300 秒；项目确有更长过程时应显式配置 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS`，不能把合法慢过程误分为 SQL 兼容失败。
    - Mapper 单条语句默认 JDBC 超时为 120 秒，可用 `dm.sql.validation.statementTimeoutSeconds` 覆盖。真实查询在 30 秒默认值下可能被误判为运行时超时；放宽后仍超时的项再按锁等待、数据库负载或执行计划问题分类。
 4. 每次 dm-adapter 代码变更后执行 `mvn test`，通过后提交并推送 `main`。
-5. 同步 Windows 镜像，执行 Windows Maven 构建，再用 Windows CLI 对业务项目回归验证。
+5. 同步 Windows 镜像后先执行 Windows Maven `clean install`，再用 Windows CLI 对业务项目回归验证。同步保留源文件时间戳且目标目录残留旧 `target/` 时，单独执行 `install` 可能把旧 class 误判为最新，产生“部分模块用了新代码、部分模块仍是旧代码”的假回归结果。
 
 ## 当前项目优先关注模式
 

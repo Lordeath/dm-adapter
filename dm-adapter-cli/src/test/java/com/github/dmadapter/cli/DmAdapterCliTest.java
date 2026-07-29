@@ -553,6 +553,8 @@ class DmAdapterCliTest {
                 .contains("configuredValueIncompatibleWithColumn")
                 .contains("data_length as column_length")
                 .contains("defaultColumnLength")
+                .contains("primaryDmlTable")
+                .contains("isBlank(existing.tableName())")
                 .contains("validationIgnores")
                 .contains("validationIgnores.missingTables")
                 .contains("validationIgnores.missingColumns")

@@ -2769,24 +2769,30 @@ class DmSqlValidationTestGenerator {
 
                 private SqlStatementContext sqlStatementContext(Element statement) {
                     Map<String, String> tableAliases = new LinkedHashMap<>();
+                    String primaryDmlTable = "";
                     String sql = compactSql(statement.getTextContent());
                     String identifier = sqlIdentifierPattern();
                     Matcher matcher = Pattern.compile(
-                            "(?i)\\\\b(?:from|join|update|into)\\\\s+(" + identifier + "(?:\\\\s*\\\\.\\\\s*" + identifier + ")?)"
+                            "(?i)\\\\b(from|join|update|into)\\\\s+(" + identifier + "(?:\\\\s*\\\\.\\\\s*" + identifier + ")?)"
                                     + "(?:\\\\s+(?:as\\\\s+)?(" + identifier + "))?"
                     ).matcher(sql);
                     while (matcher.find()) {
-                        String table = lastIdentifierPart(matcher.group(1));
-                        String alias = matcher.group(2);
+                        String clause = matcher.group(1);
+                        String table = lastIdentifierPart(matcher.group(2));
+                        String alias = matcher.group(3);
                         if (isBlank(table)) {
                             continue;
+                        }
+                        if (isBlank(primaryDmlTable)
+                                && ("update".equalsIgnoreCase(clause) || "into".equalsIgnoreCase(clause))) {
+                            primaryDmlTable = table;
                         }
                         tableAliases.put(normalizeSqlIdentifier(table), table);
                         if (alias != null && !isBlank(alias) && !isSqlKeyword(alias)) {
                             tableAliases.put(normalizeSqlIdentifier(alias), table);
                         }
                     }
-                    return new SqlStatementContext(tableAliases);
+                    return new SqlStatementContext(tableAliases, primaryDmlTable);
                 }
 
                 private ColumnReference inOperatorColumnReference(Element element, SqlStatementContext sqlContext) {
@@ -2821,7 +2827,8 @@ class DmSqlValidationTestGenerator {
                         return null;
                     }
                     if (parts.size() == 1) {
-                        return new ColumnReference("", cleanSqlIdentifier(parts.get(0)));
+                        String table = sqlContext == null ? "" : sqlContext.primaryDmlTable();
+                        return new ColumnReference(table, cleanSqlIdentifier(parts.get(0)));
                     }
                     String qualifier = cleanSqlIdentifier(parts.get(parts.size() - 2));
                     String table = sqlContext == null ? "" : sqlContext.tableName(qualifier);
@@ -11703,9 +11710,11 @@ class DmSqlValidationTestGenerator {
 
                 private final class SqlStatementContext {
                     private final Map<String, String> tableAliases;
+                    private final String primaryDmlTable;
 
-                    private SqlStatementContext(Map<String, String> tableAliases) {
+                    private SqlStatementContext(Map<String, String> tableAliases, String primaryDmlTable) {
                         this.tableAliases = copyMap(tableAliases == null ? emptyMap() : tableAliases);
+                        this.primaryDmlTable = primaryDmlTable == null ? "" : primaryDmlTable;
                     }
 
                     private String tableName(String qualifier) {
@@ -11717,6 +11726,10 @@ class DmSqlValidationTestGenerator {
 
                     private Set<String> tableNames() {
                         return copySet(new LinkedHashSet<>(tableAliases.values()));
+                    }
+
+                    private String primaryDmlTable() {
+                        return primaryDmlTable;
                     }
                 }
 
@@ -12284,7 +12297,11 @@ class DmSqlValidationTestGenerator {
                     private void addDefaultColumnReference(String propertyName, ColumnReference columnReference) {
                         String normalizedPropertyName = normalizeMetadataName(propertyName);
                         if (!isBlank(normalizedPropertyName) && columnReference != null && !isBlank(columnReference.columnName())) {
-                            defaultColumnReferences.putIfAbsent(normalizedPropertyName, columnReference);
+                            ColumnReference existing = defaultColumnReferences.get(normalizedPropertyName);
+                            if (existing == null
+                                    || (isBlank(existing.tableName()) && !isBlank(columnReference.tableName()))) {
+                                defaultColumnReferences.put(normalizedPropertyName, columnReference);
+                            }
                         }
                     }
 

@@ -2053,7 +2053,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesMysqlUpdateJoinThatSetsMultipleAliasesNative() {
+    void convertsMysqlUpdateJoinThatSetsMultipleAliasesWhenPredicatesStayStable() {
         SqlConversionResult result = converter.convert("""
                 update ns_quality_check_schedule_task a
                 join ns_quality_check_schedule_task_user u on a.ID = u.checkScheduleTaskID
@@ -2061,9 +2061,55 @@ class MySqlToDmSqlConverterTest {
                 where a.ID = #{id}
                 """);
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql())
+                .contains("BEGIN")
+                .contains("update ns_quality_check_schedule_task_user u set u.checkUserID = #{userId}")
+                .contains("update ns_quality_check_schedule_task a set a.transferType = 1")
+                .endsWith("END;");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void convertsSelfJoinMultiTargetUpdateWithRowCountGuardWhenBothPredicatesChange() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE ns_payment_chargepayment a
+                INNER JOIN ns_payment_chargepayment b
+                    ON a.id = b.RefPaymentID AND b.IsDelete = 0
+                SET a.canRefundPaid = a.canRefundPaid + abs(b.ChargePaid),
+                    a.IsCanceled = 0,
+                    b.IsDelete = 1
+                WHERE a.id = #{id} AND a.IsCanceled = 1;
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("BEGIN")
+                .contains("update ns_payment_chargepayment a set a.canRefundPaid")
+                .contains("IF SQL%ROWCOUNT > 0 THEN")
+                .contains("update ns_payment_chargepayment b set b.IsDelete = 1")
+                .contains("where b.RefPaymentID = #{id} and b.IsDelete = 0")
+                .contains("END;")
+                .doesNotContain("END;;");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void leavesMultiTargetUpdateNativeWhenOneAssignmentReadsAColumnUpdatedOnAnotherTarget() {
+        String sql = """
+                update account a
+                join account_detail d on a.ID = d.accountID
+                set d.status = 1,
+                    a.previousStatus = d.status
+                where a.ID = #{id}
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
     }
 
     @Test
