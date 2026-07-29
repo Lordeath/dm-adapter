@@ -2830,7 +2830,7 @@ class DmSqlValidationTestGenerator {
                         return null;
                     }
                     if (parts.size() == 1) {
-                        String table = sqlContext == null ? "" : sqlContext.primaryDmlTable();
+                        String table = sqlContext == null ? "" : sqlContext.primaryColumnTable();
                         return new ColumnReference(table, cleanSqlIdentifier(parts.get(0)));
                     }
                     String qualifier = cleanSqlIdentifier(parts.get(parts.size() - 2));
@@ -11806,8 +11806,12 @@ class DmSqlValidationTestGenerator {
                         return copySet(new LinkedHashSet<>(tableAliases.values()));
                     }
 
-                    private String primaryDmlTable() {
-                        return primaryDmlTable;
+                    private String primaryColumnTable() {
+                        if (!isBlank(primaryDmlTable)) {
+                            return primaryDmlTable;
+                        }
+                        Set<String> tables = tableNames();
+                        return tables.size() == 1 ? tables.iterator().next() : "";
                     }
                 }
 

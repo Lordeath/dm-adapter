@@ -361,6 +361,42 @@ class GeneratedFailurePatternTest {
             );
             defaultColumnType.setAccessible(true);
             assertThat(defaultColumnType.invoke(statement, "closingDay", columnMetadata)).isEqualTo("DATE");
+
+            Object selectMetadata = dynamicIdentifierMetadata(
+                    validationClass,
+                    validation,
+                    """
+                            <select id="getDetailList">
+                                select id
+                                from Charge_CustomerChargeDetail
+                                where AccountBook &gt;= #{accountBookStartDate}
+                            </select>
+                            """
+            );
+            Object selectStatement = mapperStatement(validationClass, selectMetadata);
+            Method selectDefaultColumnType = selectStatement.getClass().getDeclaredMethod(
+                    "defaultColumnType",
+                    String.class,
+                    columnMetadata.getClass()
+            );
+            selectDefaultColumnType.setAccessible(true);
+            assertThat(selectDefaultColumnType.invoke(
+                    selectStatement,
+                    "accountBookStartDate",
+                    columnMetadata
+            )).isEqualTo("VARCHAR");
+            Method selectDefaultParameterMap = validationClass.getDeclaredMethod(
+                    "defaultParameterMap",
+                    selectStatement.getClass()
+            );
+            selectDefaultParameterMap.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> selectDefaults = (Map<String, Object>) selectDefaultParameterMap.invoke(
+                    validation,
+                    selectStatement
+            );
+            assertThat(selectDefaults.get("accountBookStartDate")).isInstanceOf(String.class);
+
             Method incompatible = validationClass.getDeclaredMethod(
                     "configuredValueIncompatibleWithColumn",
                     String.class,
@@ -537,6 +573,8 @@ class GeneratedFailurePatternTest {
         addColumn.invoke(metadata, "payment", "ClosingDay", "DATE", 3, false);
         addColumn.invoke(metadata, "payment", "IsMonthClosing", "VARCHAR", 2, false);
         addColumn.invoke(metadata, "payment", "id", "BIGINT", 8, false);
+        addColumn.invoke(metadata, "Charge_CustomerChargeDetail", "AccountBook", "VARCHAR", 20, false);
+        addColumn.invoke(metadata, "other_table", "AccountBook", "DATE", 8, false);
         Field dbColumnMetadata = validationClass.getDeclaredField("dbColumnMetadata");
         dbColumnMetadata.setAccessible(true);
         dbColumnMetadata.set(validation, metadata);
