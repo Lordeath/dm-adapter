@@ -24,6 +24,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -126,7 +127,13 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             } catch (SQLException ignored) {
                 // DDL validation can still proceed on drivers that do not allow changing auto-commit.
             }
-            SqlScriptValidationFailure schemaFailure = preflightSchemas(connection, files, environment, diagnostics);
+            SqlScriptValidationFailure schemaFailure = preflightSchemas(
+                    connection,
+                    files,
+                    environment,
+                    diagnostics,
+                    statementExecutor
+            );
             if (schemaFailure != null) {
                 failures.add(schemaFailure);
                 return new SqlScriptValidationRun(
@@ -243,15 +250,28 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 + ", executable=" + executableCount
                 + ", manualReview=" + file.manualReviewStatementIndexes().size());
         try {
-            applySchema(connection, file.schema(), environment, diagnostics, file.sourceDisplay());
+            applySchema(
+                    connection,
+                    file.schema(),
+                    environment,
+                    diagnostics,
+                    statementExecutor,
+                    file.sourceDisplay()
+            );
         } catch (Exception e) {
+            boolean timedOut = e instanceof StatementValidationTimeoutException;
             failures.add(new SqlScriptValidationFailure(
                     file.sourceDisplay(),
                     file.outputDisplay(),
                     file.schema(),
                     0,
-                    "INVALID_SCHEMA",
-                    compact(redact("Invalid Dameng schema " + file.schema() + ": " + safeMessage(e), environment)),
+                    timedOut ? "VALIDATION_TIMEOUT" : "INVALID_SCHEMA",
+                    compact(redact(
+                            timedOut
+                                    ? safeMessage(e)
+                                    : "Invalid Dameng schema " + file.schema() + ": " + safeMessage(e),
+                            environment
+                    )),
                     ""
             ));
             return new SqlScriptFileValidation(file.outputDisplay(), 0, failures);
@@ -285,46 +305,10 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             );
             CreatedObject createdObject = createdObject(sql);
             String alteredObject = alteredObject(sql);
-            Statement statement = null;
             boolean statementTimedOut = false;
             try {
-                statement = connection.createStatement();
-                configureStatement(statement, environment);
-                executeStatement(statementExecutor, connection, statement, sql, environment);
+                executeStatement(statementExecutor, connection, sql, createdObject, environment);
                 if (createdObject != null) {
-                    String warningSummary = warningSummary(statement);
-                    CreatedObjectStatus objectStatus;
-                    try {
-                        objectStatus = createdObjectStatus(connection, createdObject, environment);
-                    } catch (SQLException e) {
-                        throw new ObjectStatusValidationException(
-                                "Unable to validate " + createdObject.displayName()
-                                        + " in the active schema: " + safeMessage(e),
-                                e
-                        );
-                    }
-                    if (objectStatus == null) {
-                        throw new ObjectStatusValidationException(
-                                "Created object status was not found for " + createdObject.displayName()
-                                        + " in the active schema."
-                        );
-                    }
-                    if (!"VALID".equalsIgnoreCase(objectStatus.status())) {
-                        String message = "Created object " + createdObject.displayName()
-                                + " is " + objectStatus.status() + ".";
-                        if (!warningSummary.isBlank()) {
-                            message += " JDBC warning: " + warningSummary;
-                        }
-                        String compileDiagnostic = invalidCreatedObjectCompileDiagnostic(
-                                connection,
-                                createdObject,
-                                environment
-                        );
-                        if (!compileDiagnostic.isBlank()) {
-                            message += " Recompile diagnostic: " + compileDiagnostic;
-                        }
-                        throw new InvalidCreatedObjectException(message);
-                    }
                     failedCreatedObjects.remove(createdObject.key());
                 }
                 if (!alteredObject.isBlank()) {
@@ -382,9 +366,6 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         + ", errorType=" + e.getClass().getSimpleName());
             } finally {
                 cancel(slowWarning);
-                if (!statementTimedOut) {
-                    closeStatement(statement);
-                }
             }
             if (statementTimedOut) {
                 break;
@@ -409,17 +390,28 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     private void executeStatement(
             ExecutorService executor,
             Connection connection,
-            Statement statement,
             String sql,
+            CreatedObject createdObject,
             DmValidationEnvironment environment
     ) throws Exception {
         int timeoutSeconds = effectiveStatementTimeoutSeconds(environment);
-        Future<Boolean> execution = executor.submit(() -> statement.execute(sql));
+        AtomicReference<Statement> activeStatement = new AtomicReference<>();
+        Future<Boolean> execution = executor.submit(() -> {
+            try (Statement statement = connection.createStatement()) {
+                activeStatement.set(statement);
+                configureStatement(statement, environment);
+                statement.execute(sql);
+                validateCreatedObject(connection, statement, createdObject, environment);
+                return true;
+            } finally {
+                activeStatement.set(null);
+            }
+        });
         try {
             execution.get(timeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
             execution.cancel(true);
-            cancelTimedOutStatement(connection, statement);
+            cancelTimedOutStatement(connection, activeStatement.get());
             throw new StatementValidationTimeoutException(
                     "Dameng SQL statement exceeded the adapter hard timeout of "
                             + timeoutSeconds
@@ -434,7 +426,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             throw new IllegalStateException(cause);
         } catch (InterruptedException e) {
             execution.cancel(true);
-            cancelTimedOutStatement(connection, statement);
+            cancelTimedOutStatement(connection, activeStatement.get());
             Thread.currentThread().interrupt();
             throw new StatementValidationTimeoutException(
                     "Dameng SQL statement validation was interrupted; cancellation was requested.",
@@ -443,14 +435,61 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         }
     }
 
+    private void validateCreatedObject(
+            Connection connection,
+            Statement statement,
+            CreatedObject createdObject,
+            DmValidationEnvironment environment
+    ) throws SQLException {
+        if (createdObject == null) {
+            return;
+        }
+        String warnings = warningSummary(statement);
+        CreatedObjectStatus objectStatus;
+        try {
+            objectStatus = createdObjectStatus(connection, createdObject, environment);
+        } catch (SQLException e) {
+            throw new ObjectStatusValidationException(
+                    "Unable to validate " + createdObject.displayName()
+                            + " in the active schema: " + safeMessage(e),
+                    e
+            );
+        }
+        if (objectStatus == null) {
+            throw new ObjectStatusValidationException(
+                    "Created object status was not found for " + createdObject.displayName()
+                            + " in the active schema."
+            );
+        }
+        if ("VALID".equalsIgnoreCase(objectStatus.status())) {
+            return;
+        }
+        String message = "Created object " + createdObject.displayName()
+                + " is " + objectStatus.status() + ".";
+        if (!warnings.isBlank()) {
+            message += " JDBC warning: " + warnings;
+        }
+        String compileDiagnostic = invalidCreatedObjectCompileDiagnostic(
+                connection,
+                createdObject,
+                environment
+        );
+        if (!compileDiagnostic.isBlank()) {
+            message += " Recompile diagnostic: " + compileDiagnostic;
+        }
+        throw new InvalidCreatedObjectException(message);
+    }
+
     private void cancelTimedOutStatement(Connection connection, Statement statement) {
-        startDaemon("dm-sql-validation-statement-cancel", () -> {
-            try {
-                statement.cancel();
-            } catch (SQLException ignored) {
-                // The hard timeout must return even if the driver cannot cancel the statement.
-            }
-        });
+        if (statement != null) {
+            startDaemon("dm-sql-validation-statement-cancel", () -> {
+                try {
+                    statement.cancel();
+                } catch (SQLException ignored) {
+                    // The hard timeout must return even if the driver cannot cancel the statement.
+                }
+            });
+        }
         startDaemon("dm-sql-validation-connection-abort", () -> {
             try {
                 connection.abort(command -> startDaemon("dm-sql-validation-abort-worker", command));
@@ -460,22 +499,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         });
     }
 
-    private void closeStatement(Statement statement) {
-        if (statement == null) {
-            return;
-        }
-        try {
-            statement.close();
-        } catch (SQLException ignored) {
-            // Statement cleanup must not replace the validation result.
-        }
-    }
-
     private SqlScriptValidationFailure preflightSchemas(
             Connection connection,
             List<SqlScriptMigrator.PlannedSqlScriptFile> files,
             DmValidationEnvironment environment,
-            ScheduledExecutorService diagnostics
+            ScheduledExecutorService diagnostics,
+            ExecutorService statementExecutor
     ) {
         Set<String> schemas = new LinkedHashSet<>();
         for (SqlScriptMigrator.PlannedSqlScriptFile file : files) {
@@ -491,15 +520,28 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 );
             }
             try {
-                applySchema(connection, schema, environment, diagnostics, "(schema-preflight)");
+                applySchema(
+                        connection,
+                        schema,
+                        environment,
+                        diagnostics,
+                        statementExecutor,
+                        "(schema-preflight)"
+                );
             } catch (Exception e) {
+                boolean timedOut = e instanceof StatementValidationTimeoutException;
                 return new SqlScriptValidationFailure(
                         "(schema-preflight)",
                         "",
                         schema,
                         0,
-                        "INVALID_SCHEMA",
-                        compact(redact("Invalid Dameng schema " + schema + ": " + safeMessage(e), environment)),
+                        timedOut ? "VALIDATION_TIMEOUT" : "INVALID_SCHEMA",
+                        compact(redact(
+                                timedOut
+                                        ? safeMessage(e)
+                                        : "Invalid Dameng schema " + schema + ": " + safeMessage(e),
+                                environment
+                        )),
                         ""
                 );
             }
@@ -528,8 +570,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             String schema,
             DmValidationEnvironment environment,
             ScheduledExecutorService diagnostics,
+            ExecutorService statementExecutor,
             String sourceDisplay
-    ) throws SQLException {
+    ) throws Exception {
         if (schema == null || schema.isBlank()) {
             return;
         }
@@ -539,9 +582,14 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 "Slow schema selection still running: file=" + sourceDisplay,
                 startedAt
         );
-        try (Statement statement = connection.createStatement()) {
-            configureStatement(statement, environment);
-            statement.execute("set schema " + quotedIdentifier(schema));
+        try {
+            executeStatement(
+                    statementExecutor,
+                    connection,
+                    "set schema " + quotedIdentifier(schema),
+                    null,
+                    environment
+            );
         } finally {
             cancel(slowWarning);
         }
