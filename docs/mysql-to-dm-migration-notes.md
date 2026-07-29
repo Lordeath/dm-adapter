@@ -39,7 +39,7 @@
 - MySQL `REGEXP`/`NOT REGEXP` 操作符应改写为达梦 `REGEXP_LIKE`。右侧表达式如果已经是达梦可执行的 `CONCAT(...)`，不需要额外转成 `||`。
 - MySQL `DATE_ADD`/`DATE_SUB`/`INTERVAL` 形式应改写为 `DATEADD`。`YEARWEEK`、无法识别的 `DATE_ADD`/`DATE_SUB` 形态、以及未被规则覆盖的 `PERIOD_DIFF` 需要人工确认；已识别的 `PERIOD_DIFF(DATE_FORMAT(...,'%Y%m'), ...)` 可转为月份差。
 - MySQL `CONVERT(expr, DECIMAL(n))`、`CONVERT(expr, DECIMAL(n,m))` 应转为 `CAST(expr AS DECIMAL(...))`，不能按达梦 `CONVERT` 函数原样保留。
-- MySQL `ON DUPLICATE KEY UPDATE` 不能直接在达梦执行，通常要改为 `MERGE INTO` 或业务侧先查后写。dm-adapter 不应在无法确认唯一键和更新列语义时强行转换。
+- MySQL `ON DUPLICATE KEY UPDATE` 不能直接在达梦执行，通常要改为 `MERGE INTO` 或业务侧先查后写。dm-adapter 不应在无法确认唯一键和更新列语义时强行转换。项目 DDL 已明确主键/唯一键、但 INSERT 列不包含任何一个完整冲突键时，原写法本身无法按预期触发冲突更新，应归为原始 SQL/键元数据冲突；普通非唯一索引不能冒充冲突键，也不能据此猜测 `keyColumns`。
 - MySQL `INSERT IGNORE`、`REPLACE INTO` 需要确认唯一键、忽略冲突和替换删除语义。无法配置 `keyColumns` 时必须人工确认。
 - MySQL `UPDATE ... JOIN ... SET ...` 在达梦 53 兼容模式下可执行，默认保留，不再自动改写为 `UPDATE FROM`。如果目标环境验证失败，或存在多目标更新、触发器副作用、行数语义差异，再按业务 SQL 人工处理。
 - MySQL 用户变量和累加写法如 `@rownum := @rownum + 1` 不能直接迁移，通常改为达梦窗口函数 `ROW_NUMBER() OVER (...)`，或在存储过程/业务代码中显式声明变量。
@@ -55,7 +55,7 @@
 
 - 达梦官方迁移流程强调：DTS 可以迁移部分对象，但 MySQL 与 DM 在存储过程、函数、触发器语法上差异明显，迁移失败或自动转换后仍不兼容时要按 DM 语法人工重建。
 - MySQL 存储过程中的局部变量、游标、异常处理、临时表、动态 SQL、函数调用不能直接照搬。dm-adapter 当前主要处理 MyBatis mapper SQL，遇到存储过程/函数/触发器调用失败，应先判断目标库是否已创建等价对象。
-- MySQL `CONTINUE HANDLER FOR SQLSTATE '02000'`/`NOT FOUND` 仅作为游标结束标志，且能由完整的 `OPEN`、`FETCH`、循环退出和 `CLOSE` 结构证明语义等价时，可自动改写为达梦游标循环与 `cursor%NOTFOUND`；结构关键字之间的空白和 SQL 注释不应阻止识别。处理标志还有业务用途，或同一处理器还可能捕获循环体内 `SELECT ... INTO` 的无结果情况时，不能只删除处理器，必须保留并进入人工确认，直到能完整保持继续执行语义。
+- MySQL `CONTINUE HANDLER FOR SQLSTATE '02000'`/`NOT FOUND` 仅作为游标结束标志，且能由完整的 `OPEN`、`FETCH`、循环退出和 `CLOSE` 结构证明语义等价时，可自动改写为达梦游标循环与 `cursor%NOTFOUND`；结构关键字之间的空白和 SQL 注释不应阻止识别。以游标目标为 NULL 哨兵的写法，只有在循环内每个可能无结果的 `SELECT ... INTO` 都先把同一目标置为 NULL、并可等价改成保留 NULL 语义的标量子查询时才能自动转换。处理标志还有业务用途，或同一处理器还可能捕获循环体内其他可能无结果的 `SELECT ... INTO` 时，原 SQL 会提前结束循环并漏处理后续游标数据，应归为原始 SQL 逻辑缺陷，不能只删除处理器。
 - 脚本反复 `DROP`、重建并调用同名存储过程时，人工确认状态必须按执行顺序跟随当前过程版本；后续成功转换的 `CREATE PROCEDURE` 会覆盖前一人工版本，不能仅按过程名把后续 `CALL` 永久连带标记。
 - Java 或 mapper 中调用业务自定义函数时，如果达梦测试库缺函数，应归类为测试库缺对象；如果函数存在但签名或返回类型不同，应归类为业务对象迁移问题，不能通过 SQL 字符串替换掩盖。
 - SQL 脚本中的存储过程依赖必须按目标 schema 判断。当前迁移队列内尚未创建就被引用属于脚本顺序问题；当前队列未定义的过程可能是系统库预置的共享依赖，不能仅凭当前项目缺少其 `CREATE PROCEDURE` 就判定对象缺失。

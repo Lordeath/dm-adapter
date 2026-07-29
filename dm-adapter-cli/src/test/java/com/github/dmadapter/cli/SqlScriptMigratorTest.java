@@ -1070,6 +1070,118 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsNullSentinelCursorLoopAndPreservesOptionalSelectIntoSemantics() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE init_enums()
+                BEGIN
+                    DECLARE siteId BIGINT;
+                    DECLARE enumId BIGINT;
+                    DECLARE site_cursor CURSOR FOR SELECT id FROM ns_site WHERE deleted = 0;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET siteId = NULL;
+                    OPEN site_cursor;
+                    -- initialize the cursor
+                    FETCH site_cursor INTO siteId;
+                    -- iterate through every site
+                    main_loop: LOOP
+                        IF siteId IS NULL THEN
+                            LEAVE main_loop;
+                        END IF;
+                        SET enumId = NULL;
+                        SELECT id INTO enumId
+                        FROM ns_enums
+                        WHERE site_id = siteId AND enum_code = 'companyType'
+                        LIMIT 1;
+                        IF enumId IS NOT NULL THEN
+                            INSERT INTO ns_enum_log(enum_id) VALUES (enumId);
+                        END IF;
+                        FETCH site_cursor INTO siteId;
+                    END LOOP main_loop;
+                    CLOSE site_cursor;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-association",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("site_cursor CURSOR FOR SELECT id FROM ns_site WHERE deleted = 0;")
+                .contains("FETCH site_cursor INTO siteId;")
+                .contains("EXIT WHEN site_cursor%NOTFOUND;")
+                .contains("enumId := (SELECT id FROM ns_enums")
+                .contains("WHERE site_id = siteId AND enum_code = 'companyType'")
+                .contains("LIMIT 1);")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("main_loop")
+                .doesNotContain("IF siteId IS NULL")
+                .doesNotContain("SELECT id INTO enumId");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(
+                                SqlScriptMigrator.MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE
+                        ));
+    }
+
+    @Test
+    void keepsNullSentinelHandlerWhenOptionalSelectIntoIsNotNullInitialized() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE unsafe_null_sentinel()
+                BEGIN
+                    DECLARE siteId BIGINT;
+                    DECLARE enumId BIGINT;
+                    DECLARE site_cursor CURSOR FOR SELECT id FROM ns_site;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET siteId = NULL;
+                    OPEN site_cursor;
+                    FETCH site_cursor INTO siteId;
+                    main_loop: LOOP
+                        IF siteId IS NULL THEN
+                            LEAVE main_loop;
+                        END IF;
+                        SELECT id INTO enumId FROM ns_enums WHERE site_id = siteId LIMIT 1;
+                        FETCH site_cursor INTO siteId;
+                    END LOOP main_loop;
+                    CLOSE site_cursor;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-association",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("HANDLER"));
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("DECLARE CONTINUE HANDLER FOR NOT FOUND SET siteId = NULL")
+                .doesNotContain("site_cursor%NOTFOUND");
+    }
+
+    @Test
     void movesMysqlProcedureDeclarationsAfterLeadingComments() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -1245,11 +1357,97 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isEqualTo(1);
         assertThat(report.manualReviewItems())
                 .singleElement()
-                .satisfies(item -> assertThat(item.reason()).contains("HANDLER"));
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("原始 SQL 逻辑缺陷")
+                        .contains("SELECT ... INTO")
+                        .contains("提前结束 WHILE"));
         assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
                 .contains("DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1")
                 .contains("WHILE done = 0 DO")
                 .doesNotContain("site_cursor%NOTFOUND");
+    }
+
+    @Test
+    void convertsZeroFlagCursorHandlerWhenAggregateSelectIntoAlwaysReturnsOneRow() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE safe_count_lookup()
+                BEGIN
+                    DECLARE siteId BIGINT;
+                    DECLARE enumCount BIGINT;
+                    DECLARE done INT DEFAULT 0;
+                    DECLARE site_cursor CURSOR FOR SELECT id FROM ns_site;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+                    OPEN site_cursor;
+                    FETCH site_cursor INTO siteId;
+                    WHILE done = 0 DO
+                        SELECT COUNT(*) INTO enumCount FROM ns_enums WHERE site_id = siteId;
+                        FETCH site_cursor INTO siteId;
+                    END WHILE;
+                    CLOSE site_cursor;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-association",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("EXIT WHEN site_cursor%NOTFOUND;")
+                .contains("SELECT COUNT(*) INTO enumCount")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("WHILE done = 0");
+    }
+
+    @Test
+    void classifiesUpsertAsOriginalKeyConflictWhenInsertOmitsEveryKnownUniqueKey() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("upsert.sql"), """
+                CREATE TABLE `ns_base_settings` (
+                    `id` BIGINT NOT NULL AUTO_INCREMENT,
+                    `siteId` BIGINT NOT NULL,
+                    `cfgGroup` VARCHAR(64) NOT NULL,
+                    `cfgValue` VARCHAR(255),
+                    PRIMARY KEY (`id`),
+                    KEY `idx_site_group` (`siteId`, `cfgGroup`)
+                );
+
+                INSERT INTO `ns_base_settings` (`siteId`, `cfgGroup`, `cfgValue`)
+                VALUES (1, 'system', 'enabled')
+                ON DUPLICATE KEY UPDATE `cfgValue` = VALUES(`cfgValue`);
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-association",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("原始 SQL/键元数据冲突")
+                        .contains("`ns_base_settings`")
+                        .contains("不包含任何完整冲突键")
+                        .contains("不能猜测 keyColumns"));
+        assertThat(Files.readString(sqlRootOut.resolve("upsert.sql")))
+                .contains("ON DUPLICATE KEY UPDATE");
     }
 
     @Test
