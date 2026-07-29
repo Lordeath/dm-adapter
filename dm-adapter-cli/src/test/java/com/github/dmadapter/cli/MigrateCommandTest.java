@@ -4,6 +4,7 @@ import com.github.dmadapter.core.SqlScriptValidationFailure;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -37,6 +38,40 @@ class MigrateCommandTest {
                 TimeUnit.SECONDS,
                 "metadata lookup"
         )).isEqualTo("done");
+    }
+
+    @Test
+    void metadataLookupRetriesTransientFailures() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+
+        assertThat(MigrateCommand.runWithMetadataRetries(
+                () -> {
+                    if (attempts.incrementAndGet() < 3) {
+                        throw new IllegalStateException("database is temporarily busy");
+                    }
+                    return "done";
+                },
+                5,
+                0
+        )).isEqualTo("done");
+        assertThat(attempts).hasValue(3);
+    }
+
+    @Test
+    void metadataLookupStopsAfterConfiguredAttempts() {
+        AtomicInteger attempts = new AtomicInteger();
+
+        assertThatThrownBy(() -> MigrateCommand.runWithMetadataRetries(
+                () -> {
+                    attempts.incrementAndGet();
+                    throw new IllegalStateException("database remains unavailable");
+                },
+                3,
+                0
+        ))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("remains unavailable");
+        assertThat(attempts).hasValue(3);
     }
 
     @Test
