@@ -33,21 +33,24 @@ class DamengSqlScriptIntegrationTest {
                 statement.execute("CREATE TABLE " + table + " (ID INT)");
                 statement.execute("""
                         DECLARE
-                            dm_adapter_schema VARCHAR(128) :=
-                                SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);
                             dm_adapter_exists INT;
                         BEGIN
                             SELECT COUNT(*) INTO dm_adapter_exists
-                            FROM ALL_TAB_COLUMNS
-                            WHERE OWNER = dm_adapter_schema
-                              AND UPPER(TABLE_NAME) = UPPER('%s')
-                              AND UPPER(COLUMN_NAME) = UPPER('status');
+                            FROM (
+                                SELECT 1
+                                FROM SYS.SYSOBJECTS T
+                                JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID
+                                WHERE T.SCHID = CURRENT_SCHID
+                                  AND T.SUBTYPE$ = 'UTAB'
+                                  AND T.NAME IN ('%s', UPPER('%s'))
+                                  AND C.NAME IN ('status', UPPER('status'))
+                            ) dm_adapter_exists_check;
                             IF dm_adapter_exists = 0 THEN
                                 EXECUTE IMMEDIATE
                                     'ALTER TABLE %s ADD status VARCHAR(20 CHAR) DEFAULT NULL';
                             END IF;
                         END
-                        """.formatted(table, table));
+                        """.formatted(table, table, table));
                 try (PreparedStatement metadata = connection.prepareStatement("""
                         SELECT COUNT(*)
                         FROM ALL_TAB_COLUMNS

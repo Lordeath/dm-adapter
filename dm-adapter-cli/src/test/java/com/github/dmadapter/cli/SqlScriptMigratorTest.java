@@ -5284,14 +5284,19 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("DECLARE")
-                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
-                .contains("OWNER = dm_adapter_schema")
+                .contains("FROM SYS.SYSOBJECTS T")
+                .contains("JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID")
+                .contains("T.SCHID = CURRENT_SCHID")
+                .contains("T.NAME IN ('ns_system_organization', UPPER('ns_system_organization'))")
+                .contains("C.NAME IN ('organization_no', UPPER('organization_no'))")
                 .doesNotContain("CREATE OR REPLACE PROCEDURE")
                 .doesNotContain("CALL add_column_organization_no")
                 .doesNotContain("DROP PROCEDURE IF EXISTS")
                 .doesNotContain("INFORMATION_SCHEMA")
+                .doesNotContain("ALL_TAB_COLUMNS")
                 .doesNotContain("DATABASE()")
                 .doesNotContain("SYS_CONTEXT")
+                .doesNotContain("dm_adapter_schema")
                 .doesNotContain("'sample-app'");
     }
 
@@ -5585,7 +5590,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("UPPER(COLUMN_NAME) = UPPER('paramName')")
+                .contains("C.NAME IN ('paramName', UPPER('paramName'))")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_wms_parameter_setting")
                 .contains("ADD `paramName` varchar(255) DEFAULT NULL'")
                 .doesNotContain("CREATE OR REPLACE PROCEDURE")
@@ -5833,16 +5838,74 @@ class SqlScriptMigratorTest {
         assertThat(converted.sql())
                 .contains("/* demo_table 添加 status 字段 */")
                 .contains("DECLARE")
-                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("FROM SYS.SYSOBJECTS T")
+                .contains("JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID")
+                .contains("T.SCHID = CURRENT_SCHID")
+                .contains("T.NAME IN ('demo_table', UPPER('demo_table'))")
+                .contains("C.NAME IN ('status', UPPER('status'))")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo_table ADD status varchar(20) DEFAULT NULL'")
                 .contains("SELECT 1 FROM dual")
+                .doesNotContain("ALL_TAB_COLUMNS")
+                .doesNotContain("dm_adapter_schema")
                 .doesNotContain("CREATE OR REPLACE PROCEDURE add_demo_status")
                 .doesNotContain("CALL add_demo_status")
                 .doesNotContain("DROP PROCEDURE IF EXISTS add_demo_status");
         assertThat(SqlScriptParser.statements(converted.sql())).hasSize(2);
         assertThat(converted.report().files()).singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
-                        .contains(SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE));
+                        .contains(
+                                SqlScriptMigrator.DM_CURRENT_SCHEMA_COLUMN_GUARD_TO_SYSTEM_DICTIONARY_RULE,
+                                SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE
+                        ));
+    }
+
+    @Test
+    void currentSchemaColumnGuardDoesNotEmbedConfiguredSchema() throws Exception {
+        String script = """
+                DROP PROCEDURE IF EXISTS add_demo_status;
+                CREATE PROCEDURE add_demo_status()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database())
+                          AND table_name = 'demo_table'
+                          AND column_name = 'status'
+                    ) THEN
+                        ALTER TABLE demo_table ADD status int;
+                    END IF;
+                END;
+                /
+                CALL add_demo_status();
+                DROP PROCEDURE IF EXISTS add_demo_status;
+                """;
+        List<String> outputs = new ArrayList<>();
+        for (String schema : List.of("tenant_alpha", "tenant_beta")) {
+            Path projectRoot = tempDir.resolve(schema);
+            Path sqlRoot = projectRoot.resolve("sql/v2");
+            Path sqlRootOut = projectRoot.resolve("sql/v2-dm");
+            write(sqlRoot.resolve("procedure.sql"), script);
+            migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                    projectRoot,
+                    sqlRoot,
+                    sqlRootOut,
+                    false,
+                    schema,
+                    "",
+                    DmValidationEnvironment.from(Map.of())
+            ));
+            outputs.add(Files.readString(sqlRootOut.resolve("procedure.sql")));
+        }
+
+        assertThat(outputs).hasSize(2);
+        assertThat(outputs.get(0)).isEqualTo(outputs.get(1));
+        assertThat(outputs).allSatisfy(output -> assertThat(output)
+                .contains("T.SCHID = CURRENT_SCHID")
+                .contains("T.NAME IN ('demo_table', UPPER('demo_table'))")
+                .contains("C.NAME IN ('status', UPPER('status'))")
+                .doesNotContain("tenant_alpha")
+                .doesNotContain("tenant_beta")
+                .doesNotContain("ALL_TAB_COLUMNS"));
     }
 
     @Test

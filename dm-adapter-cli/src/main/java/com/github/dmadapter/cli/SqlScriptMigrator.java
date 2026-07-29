@@ -57,6 +57,8 @@ class SqlScriptMigrator {
     static final String MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE =
             "MYSQL_PROCEDURE_JSON_TEXT_TYPE";
     static final String DM_METADATA_IDENTIFIER_CASE_RULE = "DM_METADATA_IDENTIFIER_CASE";
+    static final String DM_CURRENT_SCHEMA_COLUMN_GUARD_TO_SYSTEM_DICTIONARY_RULE =
+            "DM_CURRENT_SCHEMA_COLUMN_GUARD_TO_SYSTEM_DICTIONARY";
     static final String DM_METADATA_SCHEMA_LOCAL_VARIABLE_RULE = "DM_METADATA_SCHEMA_LOCAL_VARIABLE";
     static final String MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE =
             "MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT";
@@ -2974,6 +2976,71 @@ class SqlScriptMigrator {
         );
     }
 
+    private String convertCurrentSchemaColumnGuardsToSystemDictionary(String sql) {
+        if (sql == null || sql.isBlank()
+                || !Pattern.compile("(?is)\\bALL_TAB_COLUMNS\\b").matcher(sql).find()
+                || !containsCurrentSchemaContext(sql)) {
+            return sql == null ? "" : sql;
+        }
+        Pattern guard = Pattern.compile(
+                "(?is)\\bSELECT\\s+(?<projection>COLUMN_NAME|1)\\s+"
+                        + "FROM\\s+ALL_TAB_COLUMNS\\s+WHERE\\s+"
+                        + "(?<predicates>.*?)"
+                        + "(?<suffix>\\s*\\)\\s*dm_adapter_exists_check\\b)"
+        );
+        Pattern owner = Pattern.compile(
+                "(?is)\\bOWNER\\s*=\\s*"
+                        + "SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
+        );
+        Pattern table = Pattern.compile(
+                "(?is)\\bUPPER\\s*\\(\\s*TABLE_NAME\\s*\\)\\s*=\\s*"
+                        + "UPPER\\s*\\(\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")\\s*\\)"
+        );
+        Pattern column = Pattern.compile(
+                "(?is)\\bUPPER\\s*\\(\\s*COLUMN_NAME\\s*\\)\\s*=\\s*"
+                        + "UPPER\\s*\\(\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")\\s*\\)"
+        );
+        Matcher matcher = guard.matcher(sql);
+        StringBuffer converted = new StringBuffer(sql.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            String predicates = matcher.group("predicates");
+            Matcher ownerMatcher = owner.matcher(predicates);
+            Matcher tableMatcher = table.matcher(predicates);
+            Matcher columnMatcher = column.matcher(predicates);
+            if (!ownerMatcher.find() || !tableMatcher.find() || !columnMatcher.find()) {
+                matcher.appendReplacement(converted, Matcher.quoteReplacement(matcher.group()));
+                continue;
+            }
+            String remaining = owner.matcher(predicates).replaceFirst("");
+            remaining = table.matcher(remaining).replaceFirst("");
+            remaining = column.matcher(remaining).replaceFirst("");
+            remaining = Pattern.compile("(?is)\\bAND\\b").matcher(remaining).replaceAll("");
+            remaining = Pattern.compile("\\s+").matcher(remaining).replaceAll("");
+            if (!remaining.isEmpty()) {
+                matcher.appendReplacement(converted, Matcher.quoteReplacement(matcher.group()));
+                continue;
+            }
+            String projection = "COLUMN_NAME".equalsIgnoreCase(matcher.group("projection"))
+                    ? "C.NAME AS COLUMN_NAME"
+                    : "1";
+            String tableLiteral = tableMatcher.group("value");
+            String columnLiteral = columnMatcher.group("value");
+            String replacement = "SELECT " + projection + "\n"
+                    + "FROM SYS.SYSOBJECTS T\n"
+                    + "JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID\n"
+                    + "WHERE T.SCHID = CURRENT_SCHID\n"
+                    + "  AND T.SUBTYPE$ = 'UTAB'\n"
+                    + "  AND T.NAME IN (" + tableLiteral + ", UPPER(" + tableLiteral + "))\n"
+                    + "  AND C.NAME IN (" + columnLiteral + ", UPPER(" + columnLiteral + "))"
+                    + matcher.group("suffix");
+            matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return changed ? converted.toString() : sql;
+    }
+
     private String normalizeDamengMetadataNumericLengths(String sql) {
         if (sql == null || sql.isBlank()
                 || !Pattern.compile("(?is)\\bALL_TAB_COLUMNS\\b").matcher(sql).find()) {
@@ -4510,6 +4577,12 @@ class SqlScriptMigrator {
         if (!procedureIfExistsSql.equals(converted)) {
             converted = procedureIfExistsSql;
             rules.add(MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE);
+        }
+
+        String currentSchemaColumnGuardSql = convertCurrentSchemaColumnGuardsToSystemDictionary(converted);
+        if (!currentSchemaColumnGuardSql.equals(converted)) {
+            converted = currentSchemaColumnGuardSql;
+            rules.add(DM_CURRENT_SCHEMA_COLUMN_GUARD_TO_SYSTEM_DICTIONARY_RULE);
         }
 
         String countGuardIndexSql = synchronizeSchemaScopedIndexNames(converted);
