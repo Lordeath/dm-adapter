@@ -30,6 +30,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_INFORMATION_SCHEMA_COLUMNS_TO_ALL_TAB_COLUMNS";
     public static final String MYSQL_INFORMATION_SCHEMA_TABLES_RULE =
             "MYSQL_INFORMATION_SCHEMA_TABLES_TO_ALL_TABLES";
+    public static final String MYSQL_INFORMATION_SCHEMA_STATISTICS_RULE =
+            "MYSQL_INFORMATION_SCHEMA_STATISTICS_TO_ALL_INDEXES";
     public static final String MYSQL_DESCRIBE_TABLE_RULE = "MYSQL_DESCRIBE_TABLE_TO_USER_TAB_COLUMNS";
     public static final String MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE = "MYSQL_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
@@ -48,6 +50,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_NOT_FIND_IN_SET_RULE = "MYSQL_NOT_FIND_IN_SET_TO_EQUALS_ZERO";
     public static final String MYSQL_STR_TO_DATE_YEARMONTH_RULE = "MYSQL_STR_TO_DATE_YEARMONTH_TO_TO_DATE";
     public static final String MYSQL_PERIOD_DIFF_YEARMONTH_RULE = "MYSQL_PERIOD_DIFF_YEARMONTH_TO_DATEDIFF";
+    public static final String MYSQL_YEARWEEK_RULE = "MYSQL_YEARWEEK_TO_DM_WEEK";
     public static final String MYSQL_DATEDIFF_2ARG_RULE = "MYSQL_DATEDIFF_2ARG_TO_DM_DATEDIFF";
     public static final String MYSQL_COUNT_CONDITION_OR_NULL_RULE = "MYSQL_COUNT_CONDITION_OR_NULL_TO_CASE";
     public static final String MYSQL_COUNT_DISTINCT_IF_TO_CASE_RULE = "MYSQL_COUNT_DISTINCT_IF_TO_CASE";
@@ -816,10 +819,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
         }
 
+        GenericConversion informationSchemaStatisticsConversion = convertInformationSchemaStatistics(converted);
+        if (informationSchemaStatisticsConversion.changed()) {
+            converted = informationSchemaStatisticsConversion.convertedSql();
+            rules.add(MYSQL_INFORMATION_SCHEMA_STATISTICS_RULE);
+        }
+
         GenericConversion currentSchemaFunctionConversion = convertMysqlCurrentSchemaFunctions(converted);
         if (currentSchemaFunctionConversion.changed()) {
             converted = currentSchemaFunctionConversion.convertedSql();
             rules.add(MYSQL_CURRENT_SCHEMA_FUNCTION_RULE);
+        }
+
+        GenericConversion yearWeekConversion = convertDefaultYearWeek(converted);
+        if (yearWeekConversion.changed()) {
+            converted = yearWeekConversion.convertedSql();
+            rules.add(MYSQL_YEARWEEK_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -3718,6 +3733,69 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
+    private GenericConversion convertDefaultYearWeek(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "YEARWEEK")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "YEARWEEK");
+                String replacement = functionCall == null ? null : rewriteDefaultYearWeek(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteDefaultYearWeek(FunctionCall yearWeekCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(yearWeekCall.body());
+        if (arguments.size() != 1) {
+            return null;
+        }
+        String expression = unwrapDateOnlyFormat(arguments.get(0).text());
+        if (expression.isBlank()) {
+            return null;
+        }
+        String weekStart = "DATEADD(DAY, -WEEKDAY(" + expression + "), " + expression + ")";
+        return "(YEAR(" + weekStart + ") * 100 + WEEK(" + expression + ", 2))";
+    }
+
+    private String unwrapDateOnlyFormat(String expression) {
+        String trimmed = expression.trim();
+        int start = leadingWhitespaceLength(trimmed);
+        FunctionCall dateFormatCall = readFunctionCall(trimmed, start, "DATE_FORMAT");
+        if (dateFormatCall == null || skipWhitespace(trimmed, dateFormatCall.endIndex()) != trimmed.length()) {
+            return trimmed;
+        }
+        List<TopLevelArgument> arguments = splitTopLevelArguments(dateFormatCall.body());
+        if (arguments.size() != 2) {
+            return trimmed;
+        }
+        String format = normalizedStringLiteral(arguments.get(1).text());
+        return "'%Y-%m-%d'".equalsIgnoreCase(format) ? arguments.get(0).text().trim() : trimmed;
+    }
+
     private String rewritePeriodDiffYearMonth(FunctionCall periodDiffCall) {
         List<TopLevelArgument> arguments = splitTopLevelArguments(periodDiffCall.body());
         if (arguments.size() != 2) {
@@ -4279,6 +4357,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertInformationSchemaColumns(String sql) {
+        GenericConversion descriptorConversion = convertInformationSchemaColumnDescriptors(sql);
+        if (descriptorConversion.changed()) {
+            return descriptorConversion;
+        }
         GenericConversion detailConversion = convertInformationSchemaColumnsDetail(sql);
         if (detailConversion.changed()) {
             return detailConversion;
@@ -4314,6 +4396,142 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + " ORDER BY COLUMN_ID"
                 + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
         return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaColumnDescriptors(String sql) {
+        String alias = "(?:\"[^\"]+\"|`[^`]+`|[A-Za-z_][A-Za-z0-9_$]*)";
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*select\\s+"
+                        + "c\\s*\\.\\s*COLUMN_NAME\\s+(?:as\\s+)?(?<columnAlias>" + alias + ")\\s*,\\s*"
+                        + "c\\s*\\.\\s*COLUMN_TYPE\\s+(?:as\\s+)?(?<typeAlias>" + alias + ")\\s*,\\s*"
+                        + "c\\s*\\.\\s*COLUMN_COMMENT\\s+(?:as\\s+)?(?<commentAlias>" + alias + ")\\s*,\\s*"
+                        + "c\\s*\\.\\s*COLUMN_DEFAULT\\s+(?:as\\s+)?(?<defaultAlias>" + alias + ")\\s*,\\s*"
+                        + "c\\s*\\.\\s*COLUMN_KEY\\s+(?:as\\s+)?(?<keyAlias>" + alias + ")\\s*,\\s*"
+                        + "c\\s*\\.\\s*EXTRA\\s+(?:as\\s+)?(?<extraAlias>" + alias + ")\\s+"
+                        + "from\\s+information_schema\\s*\\.\\s*(?:\"COLUMNS\"|`COLUMNS`|COLUMNS)\\s+c\\s+"
+                        + "where\\s+(?:c\\s*\\.\\s*)?TABLE_SCHEMA\\s*=\\s*(?<schema>.+?)\\s+"
+                        + "and\\s+(?:c\\s*\\.\\s*)?TABLE_NAME\\s*=\\s*(?<table>.+?)\\s+"
+                        + "order\\s+by\\s+(?:c\\s*\\.\\s*)?ORDINAL_POSITION(?:\\s+(?:asc|desc))?\\s*;?\\s*$"
+        ).matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String owner = metadataOwnerExpression(matcher.group("schema"));
+        String table = matcher.group("table").trim();
+        if (owner.isBlank() || table.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT\n"
+                + "    sc.NAME AS " + quotedMetadataAlias(matcher.group("columnAlias")) + ",\n"
+                + "    CASE\n"
+                + "        WHEN sc.SCALE = 0\n"
+                + "            AND (REGEXP_LIKE(sc.TYPE$, 'INT|REAL|BIT|^DATE$|TIME|FLOAT|DOUBLE')\n"
+                + "                OR sc.LENGTH$ = 2147483647)\n"
+                + "            THEN sc.TYPE$\n"
+                + "        WHEN sc.SCALE <> 0 AND REGEXP_LIKE(sc.TYPE$, 'NUM|DEC')\n"
+                + "            THEN sc.TYPE$ || '(' || sc.LENGTH$ || ',' || sc.SCALE || ')'\n"
+                + "        WHEN sc.SCALE <> 0 AND REGEXP_LIKE(sc.TYPE$, 'TIME')\n"
+                + "            THEN sc.TYPE$ || '(' || sc.SCALE || ')'\n"
+                + "        ELSE sc.TYPE$ || '(' || sc.LENGTH$ || ')'\n"
+                + "    END AS " + quotedMetadataAlias(matcher.group("typeAlias")) + ",\n"
+                + "    scc.COMMENT$ AS " + quotedMetadataAlias(matcher.group("commentAlias")) + ",\n"
+                + "    sc.DEFVAL AS " + quotedMetadataAlias(matcher.group("defaultAlias")) + ",\n"
+                + "    CASE\n"
+                + "        WHEN EXISTS (\n"
+                + "            SELECT 1\n"
+                + "            FROM ALL_CONS_COLUMNS acc\n"
+                + "            JOIN ALL_CONSTRAINTS ac\n"
+                + "                ON ac.OWNER = acc.OWNER\n"
+                + "                AND ac.CONSTRAINT_NAME = acc.CONSTRAINT_NAME\n"
+                + "            WHERE ac.OWNER = sch.NAME\n"
+                + "                AND ac.TABLE_NAME = obj.NAME\n"
+                + "                AND acc.COLUMN_NAME = sc.NAME\n"
+                + "                AND ac.CONSTRAINT_TYPE = 'P'\n"
+                + "        ) THEN 'PRI'\n"
+                + "        WHEN EXISTS (\n"
+                + "            SELECT 1\n"
+                + "            FROM ALL_CONS_COLUMNS acc\n"
+                + "            JOIN ALL_CONSTRAINTS ac\n"
+                + "                ON ac.OWNER = acc.OWNER\n"
+                + "                AND ac.CONSTRAINT_NAME = acc.CONSTRAINT_NAME\n"
+                + "            WHERE ac.OWNER = sch.NAME\n"
+                + "                AND ac.TABLE_NAME = obj.NAME\n"
+                + "                AND acc.COLUMN_NAME = sc.NAME\n"
+                + "                AND ac.CONSTRAINT_TYPE = 'U'\n"
+                + "        ) THEN 'UNI'\n"
+                + "        WHEN EXISTS (\n"
+                + "            SELECT 1\n"
+                + "            FROM ALL_IND_COLUMNS aic\n"
+                + "            WHERE aic.TABLE_OWNER = sch.NAME\n"
+                + "                AND aic.TABLE_NAME = obj.NAME\n"
+                + "                AND aic.COLUMN_NAME = sc.NAME\n"
+                + "        ) THEN 'MUL'\n"
+                + "        ELSE ''\n"
+                + "    END AS " + quotedMetadataAlias(matcher.group("keyAlias")) + ",\n"
+                + "    CASE WHEN MOD(sc.INFO2, 2) = 1 THEN 'auto_increment' ELSE '' END AS "
+                + quotedMetadataAlias(matcher.group("extraAlias")) + "\n"
+                + "FROM SYS.SYSCOLUMNS sc\n"
+                + "JOIN SYS.SYSOBJECTS obj\n"
+                + "    ON obj.ID = sc.ID\n"
+                + "    AND obj.TYPE$ = 'SCHOBJ'\n"
+                + "    AND obj.SUBTYPE$ = 'UTAB'\n"
+                + "JOIN SYS.SYSOBJECTS sch\n"
+                + "    ON sch.ID = obj.SCHID\n"
+                + "    AND sch.TYPE$ = 'SCH'\n"
+                + "LEFT JOIN SYS.SYSCOLUMNCOMMENTS scc\n"
+                + "    ON scc.SCHNAME = sch.NAME\n"
+                + "    AND scc.TVNAME = obj.NAME\n"
+                + "    AND scc.COLNAME = sc.NAME\n"
+                + "WHERE sch.NAME = " + owner + "\n"
+                + "    AND obj.NAME = UPPER(" + table + ")\n"
+                + "ORDER BY sc.COLID";
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaStatistics(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*select\\s+distinct\\s+(?:s\\s*\\.\\s*)?INDEX_NAME\\s+"
+                        + "from\\s+information_schema\\s*\\.\\s*(?:\"STATISTICS\"|`STATISTICS`|STATISTICS)"
+                        + "(?:\\s+s)?\\s+"
+                        + "where\\s+(?:s\\s*\\.\\s*)?TABLE_SCHEMA\\s*=\\s*(?<schema>.+?)\\s+"
+                        + "and\\s+(?:s\\s*\\.\\s*)?TABLE_NAME\\s*=\\s*(?<table>.+?)\\s+"
+                        + "and\\s+(?:s\\s*\\.\\s*)?INDEX_NAME\\s*(?:!=|<>)\\s*'PRIMARY'\\s*;?\\s*$"
+        ).matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String owner = metadataOwnerExpression(matcher.group("schema"));
+        String table = matcher.group("table").trim();
+        if (owner.isBlank() || table.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT DISTINCT i.INDEX_NAME\n"
+                + "FROM ALL_INDEXES i\n"
+                + "WHERE i.OWNER = " + owner + "\n"
+                + "    AND i.TABLE_NAME = UPPER(" + table + ")\n"
+                + "    AND NOT EXISTS (\n"
+                + "        SELECT 1\n"
+                + "        FROM ALL_CONSTRAINTS ac\n"
+                + "        WHERE ac.OWNER = i.OWNER\n"
+                + "            AND ac.TABLE_NAME = i.TABLE_NAME\n"
+                + "            AND ac.CONSTRAINT_TYPE = 'P'\n"
+                + "            AND ac.INDEX_NAME = i.INDEX_NAME\n"
+                + "    )";
+        return new GenericConversion(converted, true);
+    }
+
+    private String metadataOwnerExpression(String tableSchema) {
+        if (tableSchema == null || tableSchema.isBlank()) {
+            return "";
+        }
+        if (isMysqlCurrentSchemaExpression(tableSchema)) {
+            return DM_CURRENT_SCHEMA_EXPRESSION;
+        }
+        return "UPPER(" + tableSchema.trim() + ")";
+    }
+
+    private String quotedMetadataAlias(String value) {
+        return "\"" + unquoteIdentifier(value).replace("\"", "\"\"") + "\"";
     }
 
     private GenericConversion convertInformationSchemaColumnsDetail(String sql) {

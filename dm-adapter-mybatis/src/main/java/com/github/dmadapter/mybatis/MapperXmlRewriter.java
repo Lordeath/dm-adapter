@@ -809,6 +809,12 @@ public class MapperXmlRewriter {
         if (!containsMysqlOnDuplicateKeyUpdate(rewrittenBody)) {
             manualReviewReasons.removeIf(this::isMysqlOnDuplicateKeyUpdateManualReviewReason);
         }
+        if (!containsMysqlInsertIgnore(rewrittenBody)) {
+            manualReviewReasons.removeIf(this::isMysqlInsertIgnoreManualReviewReason);
+        }
+        if (appliedRules.contains(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE)) {
+            manualReviewReasons.removeIf(DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON::equals);
+        }
         return new DynamicBodyConversion(
                 rawBody,
                 changed ? rewrittenBody : rawBody,
@@ -913,6 +919,17 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
+            DynamicBodyConversion dynamicWhereUpdateJoin = convertDynamicUpdateJoinWithWhereTag(
+                    converted,
+                    statementKey,
+                    sqlConverter,
+                    rewriteConfig
+            );
+            if (dynamicWhereUpdateJoin.changed()) {
+                converted = dynamicWhereUpdateJoin.convertedBody();
+                addAppliedRules(appliedRules, dynamicWhereUpdateJoin.appliedRules());
+                addManualReviewReasons(manualReviewReasons, dynamicWhereUpdateJoin.manualReviewReasons());
+            }
             TextRewrite mergedSetTrims = mergeConsecutiveDynamicSetTrimBlocks(converted);
             if (mergedSetTrims.changed()) {
                 appliedRules.add(MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED_RULE);
@@ -1703,6 +1720,19 @@ public class MapperXmlRewriter {
 
     private boolean isMysqlOnDuplicateKeyUpdateManualReviewReason(String reason) {
         return reason != null && reason.contains("ON DUPLICATE KEY UPDATE");
+    }
+
+    private boolean containsMysqlInsertIgnore(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        return Pattern.compile("(?is)\\bINSERT\\s+IGNORE\\b")
+                .matcher(sqlView(value).text())
+                .find();
+    }
+
+    private boolean isMysqlInsertIgnoreManualReviewReason(String reason) {
+        return reason != null && reason.contains("INSERT IGNORE");
     }
 
     private boolean isUserVariableNamePart(char value) {
@@ -4735,6 +4765,149 @@ public class MapperXmlRewriter {
                 manualReviewReasons,
                 true
         );
+    }
+
+    private DynamicBodyConversion convertDynamicUpdateJoinWithWhereTag(
+            String body,
+            String statementKey,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        MyBatisWhereBlock whereBlock = findMyBatisWhereBlock(body, 0, body.length());
+        if (whereBlock == null || !body.substring(whereBlock.closingEnd()).strip().matches(";?")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String whereClause = body.substring(whereBlock.openingEnd(), whereBlock.closingStart()).strip();
+        if (whereClause.isBlank() || whereClause.startsWith("<")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        String statement = body.substring(0, whereBlock.openingStart());
+        int updateIndex = leadingWhitespaceLength(statement);
+        if (!isKeywordAt(statement, updateIndex, "UPDATE")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int joinIndex = findTopLevelKeywordSkippingXml(statement, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int setIndex = findTopLevelKeywordSkippingXml(statement, "SET", joinIndex + "JOIN".length());
+        if (setIndex < 0) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        int joinTypeStart = dynamicJoinTypeStart(statement, joinIndex);
+        String leading = statement.substring(0, updateIndex);
+        String target = statement.substring(updateIndex + "UPDATE".length(), joinTypeStart).strip();
+        String joinSourceWithCondition = statement.substring(joinIndex + "JOIN".length(), setIndex).strip();
+        String setClause = statement.substring(setIndex + "SET".length()).strip();
+        DynamicJoinSource splitJoin = splitDynamicJoinSource(joinSourceWithCondition);
+        if (target.isBlank()
+                || splitJoin == null
+                || splitJoin.sourceSql().isBlank()
+                || splitJoin.conditionSql().isBlank()
+                || setClause.isBlank()
+                || containsJoinKeyword(target)
+                || containsTopLevelJoinKeyword(splitJoin.sourceSql())
+                || containsTopLevelJoinKeyword(splitJoin.conditionSql())
+                || containsXmlMarkup(setClause)
+                || findTopLevelKeywordSkippingXml(setClause, "SET", 0) >= 0) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        TextSegmentConversion targetConversion = convertSqlTextWithXmlTags(
+                target,
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion sourceConversion = convertSqlTextWithXmlTags(
+                splitJoin.sourceSql(),
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion conditionConversion = convertSqlTextWithXmlTags(
+                splitJoin.conditionSql(),
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion setConversion = convertSqlTextWithXmlTags(
+                stripDynamicUpdateTargetAlias(target, setClause),
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        TextSegmentConversion whereConversion = convertSqlTextWithXmlTags(
+                removeLeadingBooleanConnector(whereClause),
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        List<String> appliedRules = new ArrayList<>();
+        List<String> manualReviewReasons = new ArrayList<>();
+        appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, targetConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, sourceConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, conditionConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, setConversion);
+        addSqlFragmentConversion(appliedRules, manualReviewReasons, whereConversion);
+
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        String convertedWhere = body.substring(whereBlock.openingStart(), whereBlock.openingEnd())
+                + "\n"
+                + childIndent
+                + indentBlock(conditionConversion.convertedText().strip(), childIndent)
+                + "\n"
+                + childIndent
+                + "and "
+                + indentBlock(whereConversion.convertedText().strip(), childIndent)
+                + "\n"
+                + baseIndent
+                + body.substring(whereBlock.closingStart(), whereBlock.closingEnd());
+        String converted = leading
+                + "update "
+                + targetConversion.convertedText().strip()
+                + " set "
+                + setConversion.convertedText().strip()
+                + "\n"
+                + baseIndent
+                + "from "
+                + sourceConversion.convertedText().strip()
+                + "\n"
+                + baseIndent
+                + convertedWhere
+                + body.substring(whereBlock.closingEnd());
+        return new DynamicBodyConversion(
+                body,
+                converted,
+                appliedRules,
+                manualReviewReasons,
+                true
+        );
+    }
+
+    private String stripDynamicUpdateTargetAlias(String target, String setClause) {
+        String targetAlias = updateTargetAlias(target);
+        if (targetAlias.isBlank()) {
+            return setClause;
+        }
+        Pattern qualifiedAssignment = Pattern.compile(
+                "(?is)(?<![A-Za-z0-9_$])"
+                        + Pattern.quote(targetAlias)
+                        + "\\s*\\.\\s*(?<column>"
+                        + DM_IDENTIFIER
+                        + ")(?=\\s*=)"
+        );
+        Matcher matcher = qualifiedAssignment.matcher(setClause);
+        StringBuilder converted = new StringBuilder(setClause.length());
+        while (matcher.find()) {
+            matcher.appendReplacement(converted, Matcher.quoteReplacement(matcher.group("column")));
+        }
+        matcher.appendTail(converted);
+        return converted.toString();
     }
 
     private DynamicBodyConversion convertDynamicUpdateOrderLimitOneWithSetClause(String body) {
