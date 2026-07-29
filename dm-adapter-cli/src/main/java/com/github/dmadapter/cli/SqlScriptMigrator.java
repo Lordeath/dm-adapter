@@ -112,6 +112,8 @@ class SqlScriptMigrator {
             "MYSQL_VARCHAR_LENGTH_SEMANTICS_TO_DM";
     static final String DM_PROCEDURE_RECOMPILE_AFTER_DDL_RULE =
             "DM_PROCEDURE_RECOMPILE_AFTER_DDL";
+    static final String DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE =
+            "DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK";
     static final String DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE =
             "DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC";
     static final String MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE_RULE =
@@ -1999,6 +2001,17 @@ class SqlScriptMigrator {
             convertedStatements = new ArrayList<>(metadataSchemaBinding.statements());
             appliedRules.add(DM_METADATA_SCHEMA_LOCAL_VARIABLE_RULE);
         }
+        TransientProcedureCollapse transientProcedureCollapse = collapseTransientProcedures(
+                convertedStatements,
+                manualReviewStatementIndexes
+        );
+        if (transientProcedureCollapse.changed()) {
+            convertedStatements = new ArrayList<>(transientProcedureCollapse.statements());
+            manualReviewStatementIndexes = new LinkedHashSet<>(
+                    transientProcedureCollapse.manualReviewStatementIndexes()
+            );
+            appliedRules.add(DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE);
+        }
         String convertedContent = originalStatements.isEmpty()
                 ? originalContent
                 : SqlScriptParser.scriptContent(convertedStatements);
@@ -2092,6 +2105,184 @@ class SqlScriptMigrator {
             changed |= !rewritten.equals(statement);
         }
         return new MetadataSchemaBinding(List.copyOf(converted), changed);
+    }
+
+    private TransientProcedureCollapse collapseTransientProcedures(
+            List<String> statements,
+            Set<Integer> manualReviewStatementIndexes
+    ) {
+        if (statements == null || statements.size() < 4) {
+            return new TransientProcedureCollapse(
+                    statements == null ? List.of() : statements,
+                    manualReviewStatementIndexes,
+                    false
+            );
+        }
+        Map<String, Integer> createCounts = new LinkedHashMap<>();
+        Map<String, Integer> callCounts = new LinkedHashMap<>();
+        for (String statement : statements) {
+            String created = procedureNameFromCreateProcedure(statement);
+            if (!created.isBlank()) {
+                createCounts.merge(created.toLowerCase(Locale.ROOT), 1, Integer::sum);
+            }
+            String called = procedureNameFromCall(statement);
+            if (!called.isBlank()) {
+                callCounts.merge(called.toLowerCase(Locale.ROOT), 1, Integer::sum);
+            }
+        }
+
+        Set<Integer> manualIndexes = manualReviewStatementIndexes == null
+                ? Set.of()
+                : manualReviewStatementIndexes;
+        List<String> collapsed = new ArrayList<>(statements.size());
+        LinkedHashSet<Integer> remappedManualIndexes = new LinkedHashSet<>();
+        boolean changed = false;
+        for (int index = 0; index < statements.size();) {
+            TransientProcedureSequence sequence = transientProcedureSequenceAt(
+                    statements,
+                    manualIndexes,
+                    createCounts,
+                    callCounts,
+                    index
+            );
+            if (sequence != null) {
+                collapsed.add(sequence.anonymousBlock());
+                index += 4;
+                changed = true;
+                continue;
+            }
+            collapsed.add(statements.get(index));
+            if (manualIndexes.contains(index + 1)) {
+                remappedManualIndexes.add(collapsed.size());
+            }
+            index++;
+        }
+        return new TransientProcedureCollapse(
+                List.copyOf(collapsed),
+                Set.copyOf(remappedManualIndexes),
+                changed
+        );
+    }
+
+    private TransientProcedureSequence transientProcedureSequenceAt(
+            List<String> statements,
+            Set<Integer> manualReviewStatementIndexes,
+            Map<String, Integer> createCounts,
+            Map<String, Integer> callCounts,
+            int index
+    ) {
+        if (index + 3 >= statements.size()) {
+            return null;
+        }
+        for (int offset = 0; offset < 4; offset++) {
+            if (manualReviewStatementIndexes.contains(index + offset + 1)) {
+                return null;
+            }
+        }
+        String leadingDrop = statements.get(index);
+        String create = statements.get(index + 1);
+        String call = statements.get(index + 2);
+        String trailingDrop = statements.get(index + 3);
+        String leadingDropName = procedureNameFromDropProcedure(leadingDrop);
+        String createdName = procedureNameFromCreateProcedure(create);
+        String calledName = procedureNameFromCall(call);
+        String trailingDropName = procedureNameFromDropProcedure(trailingDrop);
+        if (leadingDropName.isBlank()
+                || createdName.isBlank()
+                || calledName.isBlank()
+                || trailingDropName.isBlank()
+                || !leadingDropName.equalsIgnoreCase(createdName)
+                || !createdName.equalsIgnoreCase(calledName)
+                || !calledName.equalsIgnoreCase(trailingDropName)) {
+            return null;
+        }
+        String normalizedName = createdName.toLowerCase(Locale.ROOT);
+        if (createCounts.getOrDefault(normalizedName, 0) != 1
+                || callCounts.getOrDefault(normalizedName, 0) != 1
+                || !hasEmptyProcedureParameters(create)
+                || !hasEmptyCallArguments(call)
+                || hasLeadingComment(call)
+                || hasLeadingComment(trailingDrop)) {
+            return null;
+        }
+        String anonymousBlock = transientProcedureAnonymousBlock(leadingDrop, create);
+        return anonymousBlock.isBlank()
+                ? null
+                : new TransientProcedureSequence(anonymousBlock);
+    }
+
+    private String procedureNameFromDropProcedure(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return "";
+        }
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*DROP\\s+PROCEDURE\\s+IF\\s+EXISTS\\s+(?<name>"
+                        + SQL_IDENTIFIER_TOKEN + ")\\s*$"
+        ).matcher(leadingSqlPrefix.body());
+        if (!matcher.matches()) {
+            return "";
+        }
+        return unquoteIdentifier(lastIdentifierPart(matcher.group("name").strip()));
+    }
+
+    private boolean hasEmptyProcedureParameters(String sql) {
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?PROCEDURE\\s+"
+                        + "(?:" + SQL_IDENTIFIER_TOKEN + ")\\s*\\(\\s*\\)"
+        ).matcher(leadingSqlPrefix.body());
+        return matcher.find();
+    }
+
+    private boolean hasEmptyCallArguments(String sql) {
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*CALL\\s+(?:" + SQL_IDENTIFIER_TOKEN + ")\\s*\\(\\s*\\)\\s*$"
+        ).matcher(leadingSqlPrefix.body());
+        return matcher.matches();
+    }
+
+    private boolean hasLeadingComment(String sql) {
+        return !splitLeadingSqlPrefix(sql).prefix().strip().isEmpty();
+    }
+
+    private String transientProcedureAnonymousBlock(String leadingDrop, String create) {
+        LeadingSqlPrefix dropPrefix = splitLeadingSqlPrefix(leadingDrop);
+        LeadingSqlPrefix createPrefix = splitLeadingSqlPrefix(create);
+        Matcher header = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+(?:OR\\s+REPLACE\\s+)?PROCEDURE\\s+"
+                        + "(?:" + SQL_IDENTIFIER_TOKEN + ")\\s*\\(\\s*\\)\\s+(?:AS|IS)\\b"
+        ).matcher(createPrefix.body());
+        if (!header.find()) {
+            return "";
+        }
+        String moduleBody = createPrefix.body().substring(header.end()).strip();
+        if (moduleBody.isBlank()
+                || moduleBody.regionMatches(true, 0, "DECLARE", 0, "DECLARE".length())
+                || !Pattern.compile("(?is)\\bEND\\s*;?\\s*$").matcher(moduleBody).find()) {
+            return "";
+        }
+        int begin = skipWhitespace(moduleBody, 0);
+        boolean beginsWithBegin = startsKeyword(moduleBody, begin, "BEGIN");
+        if (!beginsWithBegin
+                && !Pattern.compile("(?is)\\bBEGIN\\b").matcher(moduleBody).find()) {
+            return "";
+        }
+        StringBuilder block = new StringBuilder(create.length());
+        block.append(dropPrefix.prefix());
+        if (!dropPrefix.prefix().isBlank() && !dropPrefix.prefix().endsWith("\n")) {
+            block.append('\n');
+        }
+        block.append(createPrefix.prefix());
+        if (!createPrefix.prefix().isBlank() && !createPrefix.prefix().endsWith("\n")) {
+            block.append('\n');
+        }
+        if (!beginsWithBegin) {
+            block.append("DECLARE\n");
+        }
+        block.append(moduleBody);
+        return block.toString();
     }
 
     private boolean containsCurrentSchemaContext(String sql) {
@@ -10600,6 +10791,22 @@ class SqlScriptMigrator {
         private MetadataSchemaBinding {
             statements = List.copyOf(statements == null ? List.of() : statements);
         }
+    }
+
+    private record TransientProcedureCollapse(
+            List<String> statements,
+            Set<Integer> manualReviewStatementIndexes,
+            boolean changed
+    ) {
+        private TransientProcedureCollapse {
+            statements = List.copyOf(statements == null ? List.of() : statements);
+            manualReviewStatementIndexes = Set.copyOf(
+                    manualReviewStatementIndexes == null ? Set.of() : manualReviewStatementIndexes
+            );
+        }
+    }
+
+    private record TransientProcedureSequence(String anonymousBlock) {
     }
 
     private record InsertValuesColumnListRewrite(String sql, List<String> appliedRules) {
