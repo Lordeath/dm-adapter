@@ -202,6 +202,20 @@ class GeneratedFailurePatternTest {
             assertThat(shouldSuggestValidationArguments(validationClass, validation, updateFromRecord))
                     .isFalse();
 
+            String updateWithoutSet = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: update ads_report_detailfilling where id = ?
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object updateWithoutSetRecord = failedRecord(validationClass, updateWithoutSet);
+            assertThat(failurePattern(validationClass, validation, updateWithoutSetRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, updateWithoutSetRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, updateWithoutSetRecord))
+                    .isFalse();
+
             String missingInsertColumnComma = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
@@ -239,6 +253,24 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("ORIGINAL_SQL");
             assertThat(shouldSuggestValidationArguments(validationClass, validation, trailingSelectCommaRecord))
                     .isFalse();
+
+            String boundValueAsPredicate = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 查询使用值表达式作为过滤条件
+                    ### SQL: select id from ns_finance_collection
+                    where deleteFlag = 0 and ?
+                    ### Cause: dm.jdbc.driver.DMException: 查询使用值表达式作为过滤条件
+                    """;
+            Object boundValueAsPredicateRecord = failedRecord(validationClass, boundValueAsPredicate);
+            assertThat(failurePattern(validationClass, validation, boundValueAsPredicateRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, boundValueAsPredicateRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    boundValueAsPredicateRecord
+            )).isFalse();
         }
     }
 

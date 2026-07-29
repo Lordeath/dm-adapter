@@ -9277,6 +9277,7 @@ class DmSqlValidationTestGenerator {
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
                             || Pattern.compile("(?i)### SQL:\\\\s*update\\\\s+from\\\\b").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:\\\\s*update\\\\s+(?!from\\\\b)[^\\\\s;]+\\\\s+where\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
                             || Pattern.compile(
                                     "(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+[^\\\\s,()]+\\\\s+"
@@ -9288,6 +9289,7 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\blike\\\\s+\\\\?\\\\s*'").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\band[A-Za-z_][A-Za-z0-9_$]*\\\\s+(?:in|=|<>|!=|>|<|like)\\\\b").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:where|and|or)\\\\s+\\\\?(?=\\\\s*(?:and|or|group\\\\s+by|order\\\\s+by|having|### Cause:|$))").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\binsert\\\\s+into\\\\b[\\\\s\\\\S]*?\\\\([^)]*(?:`[^`]+`|\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)\\\\s+(?:`[^`]+`|\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)\\\\s*(?:,|\\\\))").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?,\\\\s*from\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(value).find()
