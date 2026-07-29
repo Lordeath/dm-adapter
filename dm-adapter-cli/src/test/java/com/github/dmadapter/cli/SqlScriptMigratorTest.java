@@ -1601,6 +1601,53 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void classifiesProcedureUpsertAsOriginalKeyConflictWhenOnlyMatchingIndexIsNonUnique() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(tempDir.resolve("sql/00_Create_Association.sql"), """
+                CREATE TABLE IF NOT EXISTS `ns_base_settings` (
+                    `id` BIGINT NOT NULL AUTO_INCREMENT,
+                    `siteId` BIGINT NOT NULL,
+                    `cfgGroup` VARCHAR(64) NOT NULL,
+                    `cfgValue` VARCHAR(255),
+                    PRIMARY KEY (`id`),
+                    KEY `index_site_id` (`siteId`, `cfgGroup`)
+                );
+                """);
+        write(sqlRoot.resolve("20260618.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE init_site_information(IN targetSiteId BIGINT)
+                BEGIN
+                    INSERT INTO ns_base_settings
+                        (cfgValue, cfgGroup, siteId)
+                    VALUES
+                        ('enabled', 'COMPANY_USER_EXCEL_MODEL', targetSiteId)
+                    ON DUPLICATE KEY UPDATE cfgValue = VALUES(cfgValue);
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-association",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("原始 SQL/键元数据冲突")
+                        .contains("`ns_base_settings`")
+                        .contains("不包含任何完整冲突键"));
+        assertThat(Files.readString(sqlRootOut.resolve("20260618.sql")))
+                .contains("ON DUPLICATE KEY UPDATE cfgValue = VALUES(cfgValue)");
+    }
+
+    @Test
     void addsColumnListForInsertValuesWhenTableDefinitionIsKnown() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
