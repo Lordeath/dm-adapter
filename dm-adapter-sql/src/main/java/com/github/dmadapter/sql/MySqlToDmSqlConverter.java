@@ -1471,6 +1471,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private String unsupportedReason(String sql) {
+        if (containsMysqlUpdateJoin(sql)) {
+            return "MySQL UPDATE JOIN shape could not be converted safely to Dameng UPDATE FROM.";
+        }
         if (containsPatternOutsideIgnoredText(sql, Pattern.compile("<=>"))) {
             return "MySQL null-safe equality <=> could not be parsed safely for automatic Dameng rewrite.";
         }
@@ -5547,6 +5550,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (multiTarget.changed()) {
             return multiTarget;
         }
+        GenericConversion singleTargetChain = convertSingleTargetMysqlUpdateJoinChain(
+                sql,
+                updateIndex,
+                target,
+                joinSource,
+                setClause,
+                whereClause,
+                setIndex,
+                statementEnd
+        );
+        if (singleTargetChain.changed()) {
+            return singleTargetChain;
+        }
         JoinSource splitJoin = splitJoinSource(joinSource);
         if (splitJoin.sourceSql().isBlank() || !splitJoin.sourceSql().startsWith("(")) {
             return GenericConversion.unchanged(sql);
@@ -5576,6 +5592,48 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 .append(convertedSetClause)
                 .append(" from ")
                 .append(splitJoin.sourceSql());
+        if (!whereParts.isEmpty()) {
+            converted.append(" where ").append(String.join(" and ", whereParts));
+        }
+        converted.append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertSingleTargetMysqlUpdateJoinChain(
+            String sql,
+            int updateIndex,
+            String target,
+            String joinSource,
+            String setClause,
+            String whereClause,
+            int setIndex,
+            int statementEnd
+    ) {
+        UpdateJoinChain chain = updateJoinChain(target, joinSource);
+        if (chain == null
+                || chain.tables().size() < 2
+                || updatesJoinedTableAlias(target, setClause)
+                || Pattern.compile(
+                "(?is)\\b(?:LEFT|RIGHT|FULL|CROSS)\\s+(?:OUTER\\s+)?JOIN\\b"
+        ).matcher(sql.substring(updateIndex, setIndex)).find()) {
+            return GenericConversion.unchanged(sql);
+        }
+        List<String> sources = chain.tables().subList(1, chain.tables().size()).stream()
+                .map(UpdateJoinTable::tableSql)
+                .toList();
+        if (sources.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String convertedSetClause = stripTargetAliasFromUpdateSetClause(target, setClause);
+        List<String> whereParts = updateJoinPredicates(chain.conditions(), whereClause);
+        StringBuilder converted = new StringBuilder(sql.length() + 32);
+        converted.append(sql, 0, updateIndex)
+                .append("update ")
+                .append(target)
+                .append(" set ")
+                .append(convertedSetClause)
+                .append(" from ")
+                .append(String.join(", ", sources));
         if (!whereParts.isEmpty()) {
             converted.append(" where ").append(String.join(" and ", whereParts));
         }
@@ -9674,7 +9732,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return LimitConversion.none();
         }
         String lower = sql.stripLeading().toLowerCase(Locale.ROOT);
-        if (lower.startsWith("update") || lower.startsWith("delete")) {
+        if ((lower.startsWith("update") || lower.startsWith("delete"))
+                && findTopLevelKeyword(sql, "LIMIT", 0) >= 0) {
             return LimitConversion.manual("LIMIT on non-SELECT DML requires manual confirmation for Dameng.");
         }
         return LimitConversion.none();

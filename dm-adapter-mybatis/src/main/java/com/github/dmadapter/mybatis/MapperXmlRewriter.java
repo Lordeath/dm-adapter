@@ -4801,6 +4801,17 @@ public class MapperXmlRewriter {
         String target = statement.substring(updateIndex + "UPDATE".length(), joinTypeStart).strip();
         String joinSourceWithCondition = statement.substring(joinIndex + "JOIN".length(), setIndex).strip();
         String setClause = statement.substring(setIndex + "SET".length()).strip();
+        if (containsTopLevelJoinKeyword(joinSourceWithCondition)) {
+            return convertDynamicMultiJoinUpdateWithWhereTag(
+                    body,
+                    statement,
+                    whereBlock,
+                    whereClause,
+                    statementKey,
+                    sqlConverter,
+                    rewriteConfig
+            );
+        }
         DynamicJoinSource splitJoin = splitDynamicJoinSource(joinSourceWithCondition);
         if (target.isBlank()
                 || splitJoin == null
@@ -4876,6 +4887,83 @@ public class MapperXmlRewriter {
                 + baseIndent
                 + "from "
                 + sourceConversion.convertedText().strip()
+                + "\n"
+                + baseIndent
+                + convertedWhere
+                + body.substring(whereBlock.closingEnd());
+        return new DynamicBodyConversion(
+                body,
+                converted,
+                appliedRules,
+                manualReviewReasons,
+                true
+        );
+    }
+
+    private DynamicBodyConversion convertDynamicMultiJoinUpdateWithWhereTag(
+            String body,
+            String statement,
+            MyBatisWhereBlock whereBlock,
+            String whereClause,
+            String statementKey,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        if (containsXmlMarkup(statement)) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String sentinel = "DM_ADAPTER_DYNAMIC_WHERE_SENTINEL = 1";
+        SqlConversionResult staticConversion = sqlConverter.convert(
+                statement.stripTrailing() + "\nWHERE " + sentinel
+        );
+        if (!staticConversion.changed()
+                || staticConversion.manualReviewRequired()
+                || !staticConversion.appliedRules().contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE)) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String convertedStatic = staticConversion.convertedSql().stripTrailing();
+        int whereIndex = findTopLevelKeywordSkippingXml(convertedStatic, "WHERE", 0);
+        if (whereIndex < 0) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String convertedJoinPredicates = convertedStatic.substring(whereIndex + "WHERE".length()).strip();
+        Matcher sentinelMatcher = Pattern.compile(
+                "(?is)^(?<predicates>.+?)\\s+AND\\s+DM_ADAPTER_DYNAMIC_WHERE_SENTINEL\\s*=\\s*1\\s*$"
+        ).matcher(convertedJoinPredicates);
+        if (!sentinelMatcher.matches()) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String joinPredicates = sentinelMatcher.group("predicates").strip();
+        if (joinPredicates.isBlank()) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        TextSegmentConversion whereConversion = convertSqlTextWithXmlTags(
+                removeLeadingBooleanConnector(whereClause),
+                statementKey,
+                sqlConverter,
+                rewriteConfig
+        );
+        List<String> appliedRules = new ArrayList<>();
+        appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+        addAppliedRules(appliedRules, staticConversion.appliedRules());
+        addAppliedRules(appliedRules, whereConversion.appliedRules());
+        List<String> manualReviewReasons = new ArrayList<>(whereConversion.manualReviewReasons());
+
+        String leading = statement.substring(0, leadingWhitespaceLength(statement));
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        String convertedWhere = body.substring(whereBlock.openingStart(), whereBlock.openingEnd())
+                + "\n"
+                + childIndent
+                + indentBlock(joinPredicates, childIndent)
+                + "\n"
+                + childIndent
+                + "and "
+                + indentBlock(whereConversion.convertedText().strip(), childIndent)
+                + "\n"
+                + baseIndent
+                + body.substring(whereBlock.closingStart(), whereBlock.closingEnd());
+        String converted = convertedStatic.substring(0, whereIndex).stripTrailing()
                 + "\n"
                 + baseIndent
                 + convertedWhere

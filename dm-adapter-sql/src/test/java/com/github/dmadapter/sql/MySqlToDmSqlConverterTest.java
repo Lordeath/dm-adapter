@@ -481,6 +481,26 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void acceptsSelectLimitInsideUpdateScalarSubquery() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_event
+                SET handled_at = #{handledAt}
+                WHERE event_id = (
+                    SELECT event_id FROM (
+                        SELECT event_id
+                        FROM sample_event
+                        WHERE account_id = #{accountId}
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                    ) latest_event
+                )
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
     void leavesDateFormatNativeAndStillAppliesOtherSafeRules() {
         SqlConversionResult result = converter.convert("select DATE_FORMAT(created_at, '%Y-%m-%d') from user");
 
@@ -986,12 +1006,12 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                UPDATE ns_core_module target
-                JOIN ns_core_module "ref" ON "ref".enterprise_id = target.enterprise_id
-                SET target.module_group = "ref".module_group
-                WHERE target.module_id = #{moduleId}
+                update ns_core_module target set module_group = "ref".module_group from ns_core_module "ref" where "ref".enterprise_id = target.enterprise_id and target.module_id = #{moduleId}
                 """);
-        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
+                MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE
+        );
     }
 
     @Test
@@ -2253,7 +2273,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesOrdinaryMysqlUpdateJoinNative() {
+    void convertsOrdinaryMysqlUpdateJoinToDamengUpdateFrom() {
         SqlConversionResult result = converter.convert("""
                 update ns_system_user nu
                 inner join ys_user c on nu.ys_user_id = c.sso_user_id
@@ -2262,13 +2282,17 @@ class MySqlToDmSqlConverterTest {
                 where nu.enterprise_id = #{enterpriseId}
                 """);
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ns_system_user nu set user_name = c.user_name,
+                    update_time = now() from ys_user c where nu.ys_user_id = c.sso_user_id and nu.enterprise_id = #{enterpriseId}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
     }
 
     @Test
-    void leavesMultipleMysqlUpdateJoinStatementsNative() {
+    void convertsMultipleMysqlUpdateJoinStatements() {
         SqlConversionResult result = converter.convert("""
                 update ns_system_organization_detail od inner join ns_system_organization o on od.organization_id =o.organization_id
                     set od.organization_type = o.organization_type,od.organization_nature = o.organization_nature,od.organization_path = o.organization_path;
@@ -2277,8 +2301,69 @@ class MySqlToDmSqlConverterTest {
                     set od.affiliated_organization_type = o.organization_type,od.affiliated_organization_nature = o.organization_nature,od.affiliated_organization_path = o.organization_path;
                 """);
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("update ns_system_organization_detail od set organization_type = o.organization_type")
+                .contains("from ns_system_organization o where od.organization_id =o.organization_id")
+                .contains("update ns_system_organization_detail od set affiliated_organization_type = o.organization_type")
+                .contains("from ns_system_organization o where od.affiliated_organization_id =o.organization_id");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void convertsSingleTargetMysqlUpdateWithMultipleInnerJoins() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_target extend
+                INNER JOIN sample_info info ON extend.id = info.id
+                INNER JOIN sample_base base ON info.base_id = base.id
+                INNER JOIN sample_scope scope ON base.scope_id = scope.id
+                SET extend.kind = scope.kind
+                WHERE base.is_deleted = 0 AND scope.kind IS NOT NULL
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update sample_target extend set kind = scope.kind from sample_info info, sample_base base, sample_scope scope where extend.id = info.id and info.base_id = base.id and base.scope_id = scope.id and base.is_deleted = 0 AND scope.kind IS NOT NULL
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void leavesSingleTargetMysqlUpdateWithOuterJoinForManualHandling() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_target target
+                LEFT JOIN sample_source source ON target.source_id = source.id
+                SET target.label = source.label
+                WHERE target.is_deleted = 0
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("UPDATE JOIN");
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void keepsUnconvertedDerivedTableUpdateJoinInManualReview() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_task target
+                JOIN (
+                    SELECT candidate.id
+                    FROM sample_task candidate
+                    JOIN sample_transfer transfer ON transfer.owner_id = candidate.owner_id
+                    WHERE transfer.id = #{transferId}
+                    LIMIT #{rowCount}
+                ) selected ON target.id = selected.id
+                JOIN sample_transfer transfer ON transfer.owner_id = target.owner_id
+                SET target.owner_id = transfer.new_owner_id
+                WHERE transfer.id = #{transferId}
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("UPDATE JOIN");
         assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
@@ -2377,7 +2462,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesComplexMultiJoinUpdateNative() {
+    void convertsComplexMultiJoinUpdateToDamengUpdateFrom() {
         SqlConversionResult result = converter.convert("""
                 update ys_role_permission_exp yrpe
                 inner join ns_core_resourcebutton ncrb on yrpe.button_id = ncrb.id
@@ -2386,9 +2471,12 @@ class MySqlToDmSqlConverterTest {
                 where yrpe.enterprise_id = #{enterpriseId}
                 """);
 
-        assertThat(result.changed()).isFalse();
+        assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.convertedSql()).isEqualTo("""
+                update ys_role_permission_exp yrpe set func_name = f.funcinfo_funcname from ns_core_resourcebutton ncrb, ns_core_funcinfo f where yrpe.button_id = ncrb.id and f.id = ncrb.funcinfo_id and yrpe.enterprise_id = #{enterpriseId}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
     }
 
     @Test

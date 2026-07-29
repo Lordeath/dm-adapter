@@ -5778,9 +5778,9 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ADD status VARCHAR(20)'")
-                .contains("EXECUTE IMMEDIATE 'UPDATE demo")
-                .contains("INNER JOIN demo_source ON demo.id = demo_source.id")
-                .contains("SET demo.status = ''ready'''")
+                .contains("EXECUTE IMMEDIATE 'update demo")
+                .contains("from demo_source where demo.id = demo_source.id")
+                .contains("set status = ''ready''")
                 .doesNotContain("newsee-system.");
         assertThat(converted.report().files()).singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
