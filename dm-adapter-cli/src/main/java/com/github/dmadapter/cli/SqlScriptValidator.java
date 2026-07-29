@@ -315,6 +315,14 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         if (!warningSummary.isBlank()) {
                             message += " JDBC warning: " + warningSummary;
                         }
+                        String compileDiagnostic = invalidCreatedObjectCompileDiagnostic(
+                                connection,
+                                createdObject,
+                                environment
+                        );
+                        if (!compileDiagnostic.isBlank()) {
+                            message += " Recompile diagnostic: " + compileDiagnostic;
+                        }
                         throw new InvalidCreatedObjectException(message);
                     }
                     failedCreatedObjects.remove(createdObject.key());
@@ -558,11 +566,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             return null;
         }
         String type = matcher.group(1).toUpperCase(Locale.ROOT);
-        String reference = matcher.group(2).replace("`", "").replace("\"", "");
+        String sqlReference = matcher.group(2);
+        String reference = sqlReference.replace("`", "").replace("\"", "");
         int separator = reference.lastIndexOf('.');
         String owner = separator < 0 ? "" : reference.substring(0, separator);
         String name = separator < 0 ? reference : reference.substring(separator + 1);
-        return name.isBlank() ? null : new CreatedObject(type, owner, name);
+        return name.isBlank() ? null : new CreatedObject(type, owner, name, sqlReference);
     }
 
     private CreatedObjectStatus createdObjectStatus(
@@ -605,6 +614,23 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             warning = warning.getNextWarning();
         }
         return String.join(" | ", warnings);
+    }
+
+    private String invalidCreatedObjectCompileDiagnostic(
+            Connection connection,
+            CreatedObject object,
+            DmValidationEnvironment environment
+    ) {
+        if (!Set.of("PROCEDURE", "FUNCTION", "TRIGGER").contains(object.type())) {
+            return "";
+        }
+        try (Statement statement = connection.createStatement()) {
+            configureStatement(statement, environment);
+            statement.execute("ALTER " + object.type() + " " + object.sqlReference() + " COMPILE");
+            return warningSummary(statement);
+        } catch (Exception e) {
+            return safeMessage(e);
+        }
     }
 
     private String blockedObject(String sql, Set<String> failedObjects) {
@@ -911,6 +937,17 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
 
     private String classify(Exception e, String sql) {
         if (e instanceof InvalidCreatedObjectException) {
+            String message = safeMessage(e).toLowerCase(Locale.ROOT);
+            if (message.contains("无效的表") || message.contains("无效的视图")
+                    || message.contains("无效的列") || message.contains("无效的模式")) {
+                return "TEST_SCHEMA_OBJECT";
+            }
+            if (message.contains("无效的函数") || message.contains("无法解析的成员访问表达式")) {
+                return "TEST_SCHEMA_FUNCTION";
+            }
+            if (message.contains("语法") || message.contains("syntax")) {
+                return "SQL_SYNTAX";
+            }
             return "INVALID_DATABASE_OBJECT";
         }
         if (e instanceof ObjectStatusValidationException) {
@@ -1207,7 +1244,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         return compact.substring(0, 237) + "...";
     }
 
-    private record CreatedObject(String type, String owner, String name) {
+    private record CreatedObject(String type, String owner, String name, String sqlReference) {
         String key() {
             String normalizedName = name.replace("`", "").replace("\"", "").toUpperCase(Locale.ROOT);
             if (owner == null || owner.isBlank()) {
