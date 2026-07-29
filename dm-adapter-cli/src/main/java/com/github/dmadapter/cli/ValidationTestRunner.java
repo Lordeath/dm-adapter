@@ -25,6 +25,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 class ValidationTestRunner {
     private static final int MAX_PATH_CANDIDATES = 20;
@@ -35,6 +37,8 @@ class ValidationTestRunner {
     private static final String REWRITE_CONFIG_PROPERTY = "dm.adapter.rewriteConfig";
     private static final String PREVIOUS_MARKDOWN_REPORT = "sql-validation-report.previous.md";
     private static final String PREVIOUS_JSON_REPORT = "sql-validation-report.previous.json";
+    private static final Pattern FAILED_COUNT_PATTERN =
+            Pattern.compile("\"failed\"\\s*:\\s*(\\d+)");
 
     private final Map<String, String> processEnvironment;
     private final String osName;
@@ -182,6 +186,14 @@ class ValidationTestRunner {
                 }
             }
             int exitCode = effectiveExecution.exitCode();
+            int reportFailureCount = validationReportFailureCount(generationResult.workspaceDir());
+            if (exitCode == 0 && reportFailureCount > 0) {
+                exitCode = 1;
+                publishMavenOutput(
+                        "Generated validation report contains " + reportFailureCount
+                                + " failure(s); treating the validation run as failed even though Maven returned success."
+                );
+            }
             String combinedOutput = combinedOutput(executions);
             return new ValidationTestRunResult(
                     true,
@@ -330,6 +342,22 @@ class ValidationTestRunner {
 
     private Path existingReportPath(Path reportPath) {
         return Files.isRegularFile(reportPath) ? reportPath : null;
+    }
+
+    private int validationReportFailureCount(Path workspaceDir) {
+        Path report = workspaceDir.resolve("sql-validation-report.json");
+        if (!Files.isRegularFile(report)) {
+            return 0;
+        }
+        try {
+            Matcher matcher = FAILED_COUNT_PATTERN.matcher(Files.readString(report, StandardCharsets.UTF_8));
+            if (!matcher.find()) {
+                return 0;
+            }
+            return Integer.parseInt(matcher.group(1));
+        } catch (IOException | NumberFormatException e) {
+            return 0;
+        }
     }
 
     private static final class ValidationProcessTimeoutException extends TimeoutException {

@@ -864,6 +864,7 @@ class DmSqlValidationTestGenerator {
                             log("FAILED discovery: No mapper XML files matched mapperXmlLocations.");
                         } else {
                             SqlSessionFactory sqlSessionFactory = buildSqlSessionFactory(config, mapperXmlFiles, projectRoot);
+                            addDuplicateMappedStatementRecords(records, sqlSessionFactory.getConfiguration());
                             ValidationRecord connectionFailure = databaseConnectionFailure(sqlSessionFactory);
                             if (connectionFailure != null) {
                                 records.add(connectionFailure);
@@ -1046,6 +1047,29 @@ class DmSqlValidationTestGenerator {
                     return new SqlSessionFactoryBuilder().build(configuration);
                 }
 
+                private void addDuplicateMappedStatementRecords(
+                        List<ValidationRecord> records,
+                        Configuration configuration
+                ) {
+                    if (!(configuration instanceof XmlOnlyConfiguration)) {
+                        return;
+                    }
+                    XmlOnlyConfiguration xmlConfiguration = (XmlOnlyConfiguration) configuration;
+                    for (String statementId : xmlConfiguration.duplicateMappedStatementIds()) {
+                        ValidationRecord record = ValidationRecord.failed(
+                                statementId,
+                                "original-mapper",
+                                "Original mapper XML defines duplicate statement id '" + statementId
+                                        + "'. MyBatis can register only one definition; validation kept the first "
+                                        + "definition so the remaining mapper SQL can still be checked."
+                        );
+                        records.add(record);
+                        log("FAILED original mapper: " + record.message);
+                    }
+                }
+
+                """,
+            """
                 private ValidationRecord databaseConnectionFailure(SqlSessionFactory sqlSessionFactory) {
                     log("Checking database connection...");
                     Throwable lastFailure = null;
@@ -8656,6 +8680,8 @@ class DmSqlValidationTestGenerator {
                             return "MySQL CONVERT DECIMAL";
                         case "MYSQL_USER_VARIABLE":
                             return "MySQL 用户变量";
+                        case "ORIGINAL_MAPPER_DUPLICATE_STATEMENT_ID":
+                            return "原始 Mapper statement id 重复";
                         case "DYNAMIC_IDENTIFIER_PARAMETER":
                             return "动态标识符参数";
                         case "DYNAMIC_SQL_FRAGMENT_PARAMETER":
@@ -8923,6 +8949,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isDatabaseStatementTimeout(message)) {
                         return "DATABASE_STATEMENT_TIMEOUT";
+                    }
+                    if (hasOriginalMapperDuplicateStatementId(message)) {
+                        return "ORIGINAL_MAPPER_DUPLICATE_STATEMENT_ID";
                     }
                     if (hasOriginalSqlConflictKeyIssue(record, message)) {
                         return "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
@@ -9584,6 +9613,11 @@ class DmSqlValidationTestGenerator {
                             || lower.contains("java mapper method has multiple simple parameters without @param");
                 }
 
+                private boolean hasOriginalMapperDuplicateStatementId(String message) {
+                    return message != null
+                            && message.contains("Original mapper XML defines duplicate statement id");
+                }
+
                 private boolean containsAnyPattern(Map<String, Long> countsByPattern, String... patterns) {
                     for (String pattern : patterns) {
                         if (countsByPattern.containsKey(pattern)) {
@@ -9620,6 +9654,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isDatabaseStatementTimeout(message)) {
                         return "TEST_DATABASE_RUNTIME";
+                    }
+                    if (hasOriginalMapperDuplicateStatementId(message)) {
+                        return "ORIGINAL_SQL";
                     }
                     if (hasOriginalSqlConflictKeyIssue(record, message)) {
                         return "ORIGINAL_SQL";
@@ -9973,8 +10010,21 @@ class DmSqlValidationTestGenerator {
                     if (throwable == null) {
                         return "Unknown failure.";
                     }
-                    String message = throwable.getMessage();
-                    return throwable.getClass().getName() + (message == null || isBlank(message) ? "" : ": " + message);
+                    StringBuilder summary = new StringBuilder();
+                    Set<Throwable> visited = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+                    Throwable current = throwable;
+                    while (current != null && visited.add(current)) {
+                        if (summary.length() > 0) {
+                            summary.append(" <- caused by ");
+                        }
+                        String message = current.getMessage();
+                        summary.append(current.getClass().getName());
+                        if (message != null && !isBlank(message)) {
+                            summary.append(": ").append(message);
+                        }
+                        current = current.getCause();
+                    }
+                    return summary.toString();
                 }
 
                 private String escapeMarkdown(String value) {
@@ -12837,6 +12887,7 @@ class DmSqlValidationTestGenerator {
 
                 private static final class XmlOnlyConfiguration extends Configuration {
                     private boolean suppressMapperBinding;
+                    private final Set<String> duplicateMappedStatementIds = new LinkedHashSet<>();
 
                     private XmlOnlyConfiguration(Environment environment) {
                         super(environment);
@@ -12849,6 +12900,19 @@ class DmSqlValidationTestGenerator {
                     @Override
                     public boolean hasMapper(Class<?> type) {
                         return suppressMapperBinding || super.hasMapper(type);
+                    }
+
+                    @Override
+                    public void addMappedStatement(MappedStatement mappedStatement) {
+                        if (hasStatement(mappedStatement.getId(), false)) {
+                            duplicateMappedStatementIds.add(mappedStatement.getId());
+                            return;
+                        }
+                        super.addMappedStatement(mappedStatement);
+                    }
+
+                    private Set<String> duplicateMappedStatementIds() {
+                        return copySet(duplicateMappedStatementIds);
                     }
                 }
 

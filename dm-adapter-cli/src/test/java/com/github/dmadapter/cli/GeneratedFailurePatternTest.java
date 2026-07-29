@@ -41,6 +41,24 @@ class GeneratedFailurePatternTest {
         )) {
             Class<?> validationClass = classLoader.loadClass("com.example.DmSqlValidationTest");
             Object validation = validationClass.getDeclaredConstructor().newInstance();
+            String duplicateStatement = "Original mapper XML defines duplicate statement id "
+                    + "'com.example.Mapper.listPage_COUNT'. MyBatis can register only one definition.";
+            Object duplicateStatementRecord = failedRecord(validationClass, duplicateStatement);
+            assertThat(category(validationClass, validation, duplicateStatementRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(failurePattern(validationClass, validation, duplicateStatementRecord))
+                    .isEqualTo("ORIGINAL_MAPPER_DUPLICATE_STATEMENT_ID");
+
+            Method throwableSummary = validationClass.getDeclaredMethod("throwableSummary", Throwable.class);
+            throwableSummary.setAccessible(true);
+            Throwable nestedFailure = new IllegalStateException(
+                    "outer",
+                    new IllegalArgumentException("inner")
+            );
+            assertThat((String) throwableSummary.invoke(validation, nestedFailure))
+                    .contains("java.lang.IllegalStateException: outer")
+                    .contains(" <- caused by java.lang.IllegalArgumentException: inner");
+
             assertThat(referencedTables(
                     validationClass,
                     validation,
