@@ -783,6 +783,37 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void stopsStableQueryVariableInliningBeforeRoutineReassignment() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT id INTO @typeId
+                FROM tenant_type
+                WHERE type_code = 'base'
+                LIMIT 1;
+                INSERT INTO tenant_setting(tenant_id, type_id)
+                SELECT tenant_id, @typeId FROM tenant;
+                DELIMITER $$
+                CREATE PROCEDURE seed_other_type()
+                BEGIN
+                    SELECT id INTO @typeId
+                    FROM tenant_type
+                    WHERE type_code = 'other'
+                    LIMIT 1;
+                    INSERT INTO tenant_other_setting(type_id) VALUES (@typeId);
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT tenant_id, (SELECT id FROM tenant_type")
+                .contains("WHERE type_code = 'base'")
+                .contains("SELECT id INTO dm_typeId")
+                .contains("WHERE type_code = 'other'")
+                .contains("VALUES (dm_typeId)")
+                .doesNotContain("VALUES ((SELECT id FROM tenant_type");
+    }
+
+    @Test
     void keepsSelectIntoScriptVariableWhenItsSourceTableChanges() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SELECT tenant_id INTO @tenantId
