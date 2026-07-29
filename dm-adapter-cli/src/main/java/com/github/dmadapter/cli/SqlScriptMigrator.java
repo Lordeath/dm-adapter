@@ -5670,8 +5670,10 @@ class SqlScriptMigrator {
 
     private CursorLoopConversion convertMysqlCursorWhileLoops(String sql, LinkedHashSet<String> handlerFlags) {
         Matcher loopHeadMatcher = Pattern.compile(
-                "(?is)\\bOPEN\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*;\\s*"
-                        + "FETCH\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+INTO\\s+([^;]+?)\\s*;\\s*"
+                "(?is)\\bOPEN\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*;"
+                        + SQL_WS_OR_COMMENT_TOKEN
+                        + "FETCH\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+INTO\\s+([^;]+?)\\s*;"
+                        + SQL_WS_OR_COMMENT_TOKEN
                         + "WHILE\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*(?:<>|!=)\\s*(?:1|TRUE)\\s+DO\\b"
         ).matcher(sql);
         StringBuilder converted = new StringBuilder(sql.length());

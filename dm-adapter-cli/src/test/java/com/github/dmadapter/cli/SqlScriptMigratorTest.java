@@ -974,7 +974,9 @@ class SqlScriptMigratorTest {
                     DECLARE ENTERPRISE CURSOR FOR SELECT DISTINCT ENTERPRISE_ID FROM `sample-system`.`ns_system_organization`;
                     DECLARE CONTINUE HANDLER FOR SQLSTATE '02000'SET STOP=1;
                     OPEN ENTERPRISE;
+                    -- initialize the first cursor row
                     FETCH ENTERPRISE INTO etrId;
+                    /* continue until the cursor is exhausted */
                     WHILE STOP<> 1 DO
                         SELECT count(1) INTO @count FROM ns_hr_parameter_setting WHERE paramKey = p_key;
                         IF @count < 1 THEN
