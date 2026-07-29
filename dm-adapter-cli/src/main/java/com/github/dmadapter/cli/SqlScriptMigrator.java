@@ -1824,10 +1824,12 @@ class SqlScriptMigrator {
                 boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
                         && manualReviewProcedureNames.contains(calledProcedureName.toLowerCase(Locale.ROOT));
                 boolean manualReviewRequired = conversion.manualReviewRequired() || dependencyManualReviewRequired;
-                if (conversion.manualReviewRequired()) {
-                    String procedureName = procedureNameFromCreateProcedure(originalStatement);
-                    if (!procedureName.isBlank()) {
+                String procedureName = procedureNameFromCreateProcedure(originalStatement);
+                if (!procedureName.isBlank()) {
+                    if (conversion.manualReviewRequired()) {
                         manualReviewProcedureNames.add(procedureName.toLowerCase(Locale.ROOT));
+                    } else {
+                        manualReviewProcedureNames.remove(procedureName.toLowerCase(Locale.ROOT));
                     }
                 }
                 if (manualReviewRequired) {
@@ -5674,22 +5676,24 @@ class SqlScriptMigrator {
                         + SQL_WS_OR_COMMENT_TOKEN
                         + "FETCH\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+INTO\\s+([^;]+?)\\s*;"
                         + SQL_WS_OR_COMMENT_TOKEN
-                        + "WHILE\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*(?:<>|!=)\\s*(?:1|TRUE)\\s+DO\\b"
+                        + "WHILE\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*"
+                        + "((?:<>|!=)\\s*(?:1|TRUE)|=\\s*(?:0|FALSE))\\s+DO\\b"
         ).matcher(sql);
         StringBuilder converted = new StringBuilder(sql.length());
         LinkedHashSet<String> convertedFlags = new LinkedHashSet<>();
-        int cursor = 0;
+        int searchCursor = 0;
+        int appendCursor = 0;
         boolean changed = false;
-        while (loopHeadMatcher.find(cursor)) {
+        while (loopHeadMatcher.find(searchCursor)) {
             String cursorName = loopHeadMatcher.group(1).strip();
             String fetchedCursorName = loopHeadMatcher.group(2).strip();
             if (!sameIdentifier(cursorName, fetchedCursorName)) {
-                cursor = loopHeadMatcher.end();
+                searchCursor = loopHeadMatcher.end();
                 continue;
             }
             String flag = unquoteIdentifier(loopHeadMatcher.group(4).strip()).toLowerCase(Locale.ROOT);
             if (!handlerFlags.contains(flag)) {
-                cursor = loopHeadMatcher.end();
+                searchCursor = loopHeadMatcher.end();
                 continue;
             }
             Matcher loopTailMatcher = Pattern.compile(
@@ -5703,12 +5707,17 @@ class SqlScriptMigrator {
             ).matcher(sql);
             loopTailMatcher.region(loopHeadMatcher.end(), sql.length());
             if (!loopTailMatcher.find()) {
-                cursor = loopHeadMatcher.end();
+                searchCursor = loopHeadMatcher.end();
                 continue;
             }
-            converted.append(sql, cursor, loopHeadMatcher.start());
             String fetchTargets = loopHeadMatcher.group(3).strip();
             String body = sql.substring(loopHeadMatcher.end(), loopTailMatcher.start());
+            if (loopHeadMatcher.group(5).stripLeading().startsWith("=")
+                    && containsSelectIntoOutsideIgnoredText(body)) {
+                searchCursor = loopHeadMatcher.end();
+                continue;
+            }
+            converted.append(sql, appendCursor, loopHeadMatcher.start());
             String indent = lineIndentBefore(sql, loopHeadMatcher.start());
             String innerIndent = indent + "    ";
             converted.append("OPEN ").append(cursorName).append(";\n")
@@ -5722,14 +5731,70 @@ class SqlScriptMigrator {
             converted.append(indent).append("END LOOP;\n")
                     .append(indent).append("CLOSE ").append(cursorName).append(";");
             convertedFlags.add(flag);
-            cursor = loopTailMatcher.end();
+            appendCursor = loopTailMatcher.end();
+            searchCursor = loopTailMatcher.end();
             changed = true;
         }
         if (!changed) {
             return new CursorLoopConversion(sql, false, Set.of());
         }
-        converted.append(sql.substring(cursor));
+        converted.append(sql.substring(appendCursor));
         return new CursorLoopConversion(converted.toString(), true, convertedFlags);
+    }
+
+    private boolean containsSelectIntoOutsideIgnoredText(String sql) {
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "SELECT")) {
+                int cursor = index + "SELECT".length();
+                int depth = 0;
+                while (cursor < sql.length()) {
+                    char candidate = sql.charAt(cursor);
+                    if (candidate == '\'') {
+                        cursor = skipSingleQuotedString(sql, cursor);
+                    } else if (candidate == '"') {
+                        cursor = skipDoubleQuotedText(sql, cursor);
+                    } else if (candidate == '`') {
+                        cursor = skipBacktickIdentifier(sql, cursor);
+                    } else if (startsLineComment(sql, cursor)) {
+                        cursor = skipUntilLineEnd(sql, cursor);
+                    } else if (startsBlockComment(sql, cursor)) {
+                        cursor = skipUntilBlockCommentEnd(sql, cursor);
+                    } else if (candidate == '(') {
+                        depth++;
+                        cursor++;
+                    } else if (candidate == ')') {
+                        if (depth == 0) {
+                            break;
+                        }
+                        depth--;
+                        cursor++;
+                    } else if (depth == 0 && startsKeyword(sql, cursor, "INTO")) {
+                        return true;
+                    } else if (depth == 0
+                            && (startsKeyword(sql, cursor, "FROM") || candidate == ';')) {
+                        break;
+                    } else {
+                        cursor++;
+                    }
+                }
+                index = Math.max(index + 1, cursor);
+            } else {
+                index++;
+            }
+        }
+        return false;
     }
 
     private CursorLoopConversion convertMysqlCursorLabelLoops(String sql, LinkedHashSet<String> handlerFlags) {
@@ -5742,21 +5807,22 @@ class SqlScriptMigrator {
         ).matcher(sql);
         StringBuilder converted = new StringBuilder(sql.length());
         LinkedHashSet<String> convertedFlags = new LinkedHashSet<>();
-        int cursor = 0;
+        int searchCursor = 0;
+        int appendCursor = 0;
         boolean changed = false;
-        while (loopHeadMatcher.find(cursor)) {
+        while (loopHeadMatcher.find(searchCursor)) {
             String cursorName = loopHeadMatcher.group(1).strip();
             String loopLabel = loopHeadMatcher.group(2).strip();
             String fetchedCursorName = loopHeadMatcher.group(3).strip();
             String flag = unquoteIdentifier(loopHeadMatcher.group(5).strip()).toLowerCase(Locale.ROOT);
             if (!sameIdentifier(cursorName, fetchedCursorName)
                     || !handlerFlags.contains(flag)) {
-                cursor = loopHeadMatcher.end();
+                searchCursor = loopHeadMatcher.end();
                 continue;
             }
             CursorLeaveIfBlock leaveIfBlock = readCursorLeaveIfBlock(sql, loopHeadMatcher.end(), loopLabel);
             if (leaveIfBlock == null) {
-                cursor = loopHeadMatcher.end();
+                searchCursor = loopHeadMatcher.end();
                 continue;
             }
             Matcher loopTailMatcher = Pattern.compile(
@@ -5768,10 +5834,10 @@ class SqlScriptMigrator {
             ).matcher(sql);
             loopTailMatcher.region(leaveIfBlock.endIfEnd(), sql.length());
             if (!loopTailMatcher.find()) {
-                cursor = loopHeadMatcher.end();
+                searchCursor = loopHeadMatcher.end();
                 continue;
             }
-            converted.append(sql, cursor, loopHeadMatcher.start());
+            converted.append(sql, appendCursor, loopHeadMatcher.start());
             String fetchTargets = loopHeadMatcher.group(4).strip();
             String body = leaveIfBlock.loopBody() + sql.substring(leaveIfBlock.endIfEnd(), loopTailMatcher.start());
             String indent = lineIndentBefore(sql, loopHeadMatcher.start());
@@ -5787,13 +5853,14 @@ class SqlScriptMigrator {
             converted.append(indent).append("END LOOP;\n")
                     .append(indent).append("CLOSE ").append(cursorName).append(";");
             convertedFlags.add(flag);
-            cursor = loopTailMatcher.end();
+            appendCursor = loopTailMatcher.end();
+            searchCursor = loopTailMatcher.end();
             changed = true;
         }
         if (!changed) {
             return new CursorLoopConversion(sql, false, Set.of());
         }
-        converted.append(sql.substring(cursor));
+        converted.append(sql.substring(appendCursor));
         return new CursorLoopConversion(converted.toString(), true, convertedFlags);
     }
 
