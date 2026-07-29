@@ -124,6 +124,8 @@ class SqlScriptMigrator {
             "MYSQL_VARCHAR_LENGTH_SEMANTICS_TO_DM";
     static final String DM_PROCEDURE_RECOMPILE_AFTER_DDL_RULE =
             "DM_PROCEDURE_RECOMPILE_AFTER_DDL";
+    static final String DM_PROCEDURE_RECOMPILE_AFTER_FORWARD_DEPENDENCY_RULE =
+            "DM_PROCEDURE_RECOMPILE_AFTER_FORWARD_DEPENDENCY";
     static final String DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE =
             "DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK";
     static final String DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE =
@@ -726,6 +728,32 @@ class SqlScriptMigrator {
         List<PlannedSqlScriptFile> result = new ArrayList<>(plannedFiles.size());
         for (PlannedSqlScriptFile file : plannedFiles) {
             LinkedHashSet<Integer> manualIndexes = new LinkedHashSet<>(file.manualReviewStatementIndexes());
+            LinkedHashMap<ProcedureKey, Integer> declarationCounts = new LinkedHashMap<>();
+            LinkedHashMap<ProcedureKey, Integer> lastCreateIndexes = new LinkedHashMap<>();
+            LinkedHashMap<ProcedureKey, Integer> lastDropIndexes = new LinkedHashMap<>();
+            LinkedHashSet<ProcedureKey> manuallyDeclaredInFile = new LinkedHashSet<>();
+            LinkedHashSet<ProcedureKey> topLevelCallsInFile = new LinkedHashSet<>();
+            for (int index = 0; index < file.statements().size(); index++) {
+                String statement = file.statements().get(index);
+                ProcedureReference created = procedureReferenceFromCreateProcedure(statement, file.schema());
+                if (created != null) {
+                    declarationCounts.merge(created.key(), 1, Integer::sum);
+                    lastCreateIndexes.put(created.key(), index);
+                    if (manualIndexes.contains(index + 1)) {
+                        manuallyDeclaredInFile.add(created.key());
+                    }
+                }
+                ProcedureReference dropped = procedureReferenceFromDropProcedure(statement, file.schema());
+                if (dropped != null) {
+                    lastDropIndexes.put(dropped.key(), index);
+                }
+                ProcedureReference called = procedureReferenceFromCall(statement, file.schema());
+                if (called != null) {
+                    topLevelCallsInFile.add(called.key());
+                }
+            }
+            LinkedHashMap<ProcedureKey, ProcedureReference> forwardDependencyRecompiles =
+                    new LinkedHashMap<>();
             for (int index = 0; index < file.statements().size(); index++) {
                 String statement = file.statements().get(index);
                 int statementIndex = index + 1;
@@ -736,6 +764,7 @@ class SqlScriptMigrator {
                 if (createdProcedure != null) {
                     if (!manualIndexes.contains(statementIndex)) {
                         String dependencyReason = "";
+                        boolean forwardDependency = false;
                         for (ProcedureReference calledProcedure
                                 : calledProceduresInRoutine(statement, file.schema())) {
                             if (calledProcedure.key().equals(createdProcedure.key())
@@ -749,12 +778,35 @@ class SqlScriptMigrator {
                                 break;
                             }
                             if (declaredProcedures.contains(calledProcedure.key())) {
-                                dependencyReason = "存储过程依赖顺序错误：`"
-                                        + calledProcedure.displayName()
-                                        + "` 在当前迁移队列中尚未创建；请调整脚本顺序后再验证。";
+                                if (isSafeSameFileForwardProcedureDependency(
+                                        index,
+                                        createdProcedure,
+                                        calledProcedure,
+                                        declarationCounts,
+                                        lastCreateIndexes,
+                                        lastDropIndexes,
+                                        manuallyDeclaredInFile,
+                                        topLevelCallsInFile
+                                )) {
+                                    forwardDependency = true;
+                                    continue;
+                                }
+                                dependencyReason = manuallyDeclaredInFile.contains(calledProcedure.key())
+                                        ? "依赖当前迁移队列中需要人工确认的存储过程 `"
+                                                + calledProcedure.displayName()
+                                                + "`；请先修正该存储过程后再验证。"
+                                        : "存储过程依赖顺序错误：`"
+                                                + calledProcedure.displayName()
+                                                + "` 在当前迁移队列中尚未创建；请调整脚本顺序后再验证。";
                                 break;
                             }
                             addExternalProcedureDependency(externalDependencies, calledProcedure);
+                        }
+                        if (dependencyReason.isBlank() && forwardDependency) {
+                            forwardDependencyRecompiles.put(
+                                    createdProcedure.key(),
+                                    createdProcedure
+                            );
                         }
                         if (!dependencyReason.isBlank() && manualIndexes.add(statementIndex)) {
                             manualReviewItems.add(new SqlScriptManualReviewItem(
@@ -805,19 +857,26 @@ class SqlScriptMigrator {
                     ));
                 }
             }
+            List<String> statements = new ArrayList<>(file.statements());
+            forwardDependencyRecompiles.values().forEach(procedure ->
+                    statements.add("ALTER PROCEDURE " + procedure.sqlDisplay() + " COMPILE"));
+            LinkedHashSet<String> appliedRules = new LinkedHashSet<>(file.appliedRules());
+            if (!forwardDependencyRecompiles.isEmpty()) {
+                appliedRules.add(DM_PROCEDURE_RECOMPILE_AFTER_FORWARD_DEPENDENCY_RULE);
+            }
             result.add(new PlannedSqlScriptFile(
                     file.sourceDisplay(),
                     file.outputDisplay(),
                     file.schema(),
                     file.systemScript(),
                     file.written(),
-                    file.converted(),
+                    file.converted() || !forwardDependencyRecompiles.isEmpty(),
                     file.originalStatementCount(),
-                    file.convertedStatementCount(),
+                    file.convertedStatementCount() + forwardDependencyRecompiles.size(),
                     manualIndexes.size(),
                     manualIndexes,
-                    file.appliedRules(),
-                    file.statements()
+                    List.copyOf(appliedRules),
+                    List.copyOf(statements)
             ));
         }
         LinkedHashMap<String, Set<String>> immutableExternalDependencies = new LinkedHashMap<>();
@@ -827,6 +886,28 @@ class SqlScriptMigrator {
                 List.copyOf(result),
                 Map.copyOf(immutableExternalDependencies)
         );
+    }
+
+    private boolean isSafeSameFileForwardProcedureDependency(
+            int callerCreateIndex,
+            ProcedureReference caller,
+            ProcedureReference dependency,
+            Map<ProcedureKey, Integer> declarationCounts,
+            Map<ProcedureKey, Integer> lastCreateIndexes,
+            Map<ProcedureKey, Integer> lastDropIndexes,
+            Set<ProcedureKey> manuallyDeclaredInFile,
+            Set<ProcedureKey> topLevelCallsInFile
+    ) {
+        int dependencyCreateIndex = lastCreateIndexes.getOrDefault(dependency.key(), -1);
+        int dependencyDropIndex = lastDropIndexes.getOrDefault(dependency.key(), -1);
+        int callerDropIndex = lastDropIndexes.getOrDefault(caller.key(), -1);
+        return declarationCounts.getOrDefault(caller.key(), 0) == 1
+                && declarationCounts.getOrDefault(dependency.key(), 0) == 1
+                && dependencyCreateIndex > callerCreateIndex
+                && dependencyCreateIndex > dependencyDropIndex
+                && callerDropIndex < callerCreateIndex
+                && !manuallyDeclaredInFile.contains(dependency.key())
+                && !topLevelCallsInFile.contains(caller.key());
     }
 
     private List<PlannedSqlScriptFile> addSafeProcedureRecompiles(
