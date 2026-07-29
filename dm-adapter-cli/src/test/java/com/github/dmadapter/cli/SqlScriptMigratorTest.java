@@ -5856,8 +5856,8 @@ class SqlScriptMigratorTest {
                 END$$
                 DELIMITER ;
                 CALL refresh_demo();
-                DROP PROCEDURE IF EXISTS refresh_demo;
                 CALL refresh_demo();
+                DROP PROCEDURE IF EXISTS refresh_demo;
                 """);
 
         assertThat(converted.sql())
@@ -5867,6 +5867,40 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().files()).singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .doesNotContain(SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE));
+    }
+
+    @Test
+    void collapsesIndependentLifecyclesThatReuseTheSameProcedureName() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS add_demo_column;
+                CREATE PROCEDURE add_demo_column()
+                BEGIN
+                    ALTER TABLE first_demo ADD status int;
+                END;
+                /
+                CALL add_demo_column();
+                DROP PROCEDURE IF EXISTS add_demo_column;
+
+                DROP PROCEDURE IF EXISTS add_demo_column;
+                CREATE PROCEDURE add_demo_column()
+                BEGIN
+                    ALTER TABLE second_demo ADD status int;
+                END;
+                /
+                CALL add_demo_column();
+                DROP PROCEDURE IF EXISTS add_demo_column;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE first_demo ADD status int'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE second_demo ADD status int'")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE")
+                .doesNotContain("CALL add_demo_column")
+                .doesNotContain("DROP PROCEDURE IF EXISTS");
+        assertThat(SqlScriptParser.statements(converted.sql()))
+                .hasSize(2)
+                .allSatisfy(statement -> assertThat(statement).startsWith("BEGIN"));
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {
