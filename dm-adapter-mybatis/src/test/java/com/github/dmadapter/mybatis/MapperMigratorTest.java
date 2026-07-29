@@ -2449,6 +2449,66 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateWithMultipleInnerJoinsAndWhereTagIsRewrittenToUpdateFrom() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.SampleMapper">
+                    <update id="updateKinds">
+                        UPDATE sample_target extend
+                        INNER JOIN sample_info info ON extend.id = info.id
+                        INNER JOIN sample_base base ON info.base_id = base.id
+                        INNER JOIN sample_scope scope ON base.scope_id = scope.id
+                        SET extend.kind = scope.kind
+                        <where>
+                            base.is_deleted = 0 AND scope.kind IS NOT NULL
+                            <if test="scopeIds != null and scopeIds.size > 0">
+                                AND base.scope_id IN
+                                <foreach collection="scopeIds" open="(" separator="," item="scopeId" close=")">
+                                    #{scopeId}
+                                </foreach>
+                            </if>
+                        </where>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/SampleMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/SampleMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/SampleMapper.xml"));
+        assertThat(rewritten)
+                .contains("update sample_target extend set kind = scope.kind from sample_info info, sample_base base, sample_scope scope")
+                .contains("extend.id = info.id and info.base_id = base.id and base.scope_id = scope.id")
+                .contains("and base.is_deleted = 0 AND scope.kind IS NOT NULL")
+                .contains("<if test=\"scopeIds != null and scopeIds.size > 0\">")
+                .doesNotContain("INNER JOIN")
+                .doesNotContain("DM_ADAPTER_DYNAMIC_WHERE_SENTINEL");
+        assertThat(result.manualReviewItems()).isEmpty();
+        assertThat(result.automaticConversions())
+                .singleElement()
+                .satisfies(change -> assertThat(change.appliedRules())
+                        .contains(
+                                MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE,
+                                MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE
+                        ));
+    }
+
+    @Test
     void dynamicSqlTextNodesRewriteDoubleQuotedStringLiterals() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
