@@ -672,6 +672,96 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void preservesQueryBackedScriptVariableSnapshotInAnonymousBlock() throws Exception {
+        Path sqlRoot = tempDir.resolve("snapshot/sql/v2");
+        Path sqlRootOut = tempDir.resolve("snapshot/sql/v2-dm");
+        write(sqlRoot.resolve("seed.sql"), """
+                -- Capture the state before any seed insert changes it.
+                SET @tenant_entity_exists := (
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM tenant_entity
+                        WHERE entity_code = 'tenant'
+                          AND delete_flag = 0
+                    )
+                );
+
+                INSERT INTO tenant_entity(id, entity_code, delete_flag)
+                SELECT 11, 'tenant', 0
+                WHERE @tenant_entity_exists = 0
+                  AND NOT EXISTS (SELECT 1 FROM tenant_entity WHERE id = 11);
+
+                CREATE TABLE IF NOT EXISTS tenant_tag (
+                    id BIGINT PRIMARY KEY,
+                    tag_code VARCHAR(100)
+                );
+
+                INSERT INTO tenant_tag(id, tag_code)
+                SELECT 21, 'active'
+                WHERE @tenant_entity_exists = 0
+                  AND NOT EXISTS (SELECT 1 FROM tenant_tag WHERE id = 21);
+
+                INSERT INTO unrelated_audit(id) VALUES (31);
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir.resolve("snapshot"),
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "tenant_alpha",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        String output = Files.readString(sqlRootOut.resolve("seed.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(output)
+                .contains("-- Capture the state before any seed insert changes it.")
+                .contains("dm_tenant_entity_exists BIGINT;")
+                .contains("SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END INTO dm_tenant_entity_exists")
+                .contains("WHERE dm_tenant_entity_exists = 0")
+                .contains("EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS tenant_tag")
+                .contains("INSERT INTO unrelated_audit(id) VALUES (31);")
+                .doesNotContain("@tenant_entity_exists")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE dm_adapter_snapshot_")
+                .doesNotContain("CALL dm_adapter_snapshot_")
+                .doesNotContain("DROP PROCEDURE IF EXISTS dm_adapter_snapshot_");
+        assertThat(output.indexOf("INTO dm_tenant_entity_exists"))
+                .isLessThan(output.indexOf("INSERT INTO tenant_entity"));
+        assertThat(report.files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE,
+                        SqlScriptMigrator.MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE,
+                        SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE,
+                        SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE
+                ));
+    }
+
+    @Test
+    void doesNotGroupQueryBackedScriptVariableAcrossStoredRoutine() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @tenant_id := (
+                    SELECT MIN(id) FROM tenant
+                );
+                CREATE PROCEDURE seed_tenant()
+                BEGIN
+                    INSERT INTO tenant_audit(tenant_id) VALUES (@tenant_id);
+                END;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isGreaterThan(0);
+        assertThat(converted.sql())
+                .contains("SET @tenant_id")
+                .doesNotContain("dm_adapter_snapshot_tenant_id");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE));
+    }
+
+    @Test
     void doesNotExecuteMysqlScriptIndexDdlWhenPrepareSequenceIsIncomplete() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");

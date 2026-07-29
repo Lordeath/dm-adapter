@@ -78,6 +78,8 @@ class SqlScriptMigrator {
             "MYSQL_SET_NAMES_NOOP";
     static final String MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE =
             "MYSQL_SCRIPT_USER_VARIABLE_LITERAL";
+    static final String MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE =
+            "MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK";
     static final String MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE =
             "MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_DROP_PROCEDURE_IF_EXISTS_RULE =
@@ -1975,6 +1977,211 @@ class SqlScriptMigrator {
         );
     }
 
+    private SnapshotUserVariableGrouping groupSnapshotUserVariableSequences(List<String> statements) {
+        if (statements == null || statements.size() < 2) {
+            return new SnapshotUserVariableGrouping(
+                    statements == null ? List.of() : statements,
+                    false,
+                    0
+            );
+        }
+        LinkedHashSet<String> reservedProcedureNames = new LinkedHashSet<>();
+        for (String statement : statements) {
+            for (String name : List.of(
+                    procedureNameFromCreateProcedure(statement),
+                    procedureNameFromDropProcedure(statement),
+                    procedureNameFromCall(statement)
+            )) {
+                if (!name.isBlank()) {
+                    reservedProcedureNames.add(name.toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+
+        List<String> grouped = new ArrayList<>(statements.size());
+        int groupCount = 0;
+        for (int index = 0; index < statements.size();) {
+            SnapshotUserVariableAssignment assignment =
+                    snapshotUserVariableAssignment(statements.get(index));
+            if (assignment == null) {
+                grouped.add(statements.get(index));
+                index++;
+                continue;
+            }
+            int lastReference = snapshotUserVariableLastReference(
+                    statements,
+                    index,
+                    assignment.name()
+            );
+            if (lastReference <= index
+                    || !snapshotUserVariableRangeIsSafe(
+                    statements,
+                    index,
+                    lastReference,
+                    assignment.name()
+            )) {
+                grouped.add(statements.get(index));
+                index++;
+                continue;
+            }
+
+            String procedureName = uniqueSnapshotProcedureName(
+                    assignment.name(),
+                    index + 1,
+                    reservedProcedureNames
+            );
+            StringBuilder procedure = new StringBuilder();
+            procedure.append("CREATE PROCEDURE ")
+                    .append(procedureName)
+                    .append("()\nBEGIN\n");
+            for (int statementIndex = index; statementIndex <= lastReference; statementIndex++) {
+                String statement = statements.get(statementIndex);
+                if (statementIndex == index) {
+                    statement = "SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END INTO @"
+                            + assignment.name()
+                            + "\nFROM (\n"
+                            + assignment.existsQuery().strip()
+                            + "\n) dm_adapter_snapshot_source";
+                }
+                procedure.append(statement.strip())
+                        .append(";\n");
+            }
+            procedure.append("END");
+
+            String prefix = splitLeadingSqlPrefix(statements.get(index)).prefix();
+            grouped.add(prefix + "DROP PROCEDURE IF EXISTS " + procedureName);
+            grouped.add(procedure.toString());
+            grouped.add("CALL " + procedureName + "()");
+            grouped.add("DROP PROCEDURE IF EXISTS " + procedureName);
+            groupCount++;
+            index = lastReference + 1;
+        }
+        return new SnapshotUserVariableGrouping(
+                List.copyOf(grouped),
+                groupCount > 0,
+                groupCount
+        );
+    }
+
+    private SnapshotUserVariableAssignment snapshotUserVariableAssignment(String statement) {
+        LeadingSqlPrefix prefix = splitLeadingSqlPrefix(statement);
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*:=\\s*"
+                        + "(?<expression>\\(.*\\))\\s*$"
+        ).matcher(prefix.body());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String expression = matcher.group("expression").strip();
+        int closeParen = findMatchingParen(expression, 0);
+        if (closeParen != expression.length() - 1) {
+            return null;
+        }
+        String query = expression.substring(1, expression.length() - 1).stripLeading();
+        if (!startsKeyword(query, 0, "SELECT")) {
+            return null;
+        }
+        int existsIndex = skipWhitespace(query, "SELECT".length());
+        if (!startsKeyword(query, existsIndex, "EXISTS")) {
+            return null;
+        }
+        int existsOpenParen = skipWhitespace(query, existsIndex + "EXISTS".length());
+        if (existsOpenParen >= query.length() || query.charAt(existsOpenParen) != '(') {
+            return null;
+        }
+        int existsCloseParen = findMatchingParen(query, existsOpenParen);
+        if (existsCloseParen <= existsOpenParen
+                || skipWhitespace(query, existsCloseParen + 1) != query.length()) {
+            return null;
+        }
+        String existsQuery = query.substring(existsOpenParen + 1, existsCloseParen).strip();
+        if (!startsKeyword(existsQuery, 0, "SELECT")) {
+            return null;
+        }
+        return new SnapshotUserVariableAssignment(
+                matcher.group("name").toLowerCase(Locale.ROOT),
+                existsQuery
+        );
+    }
+
+    private int snapshotUserVariableLastReference(
+            List<String> statements,
+            int assignmentIndex,
+            String variableName
+    ) {
+        int lastReference = -1;
+        for (int index = assignmentIndex + 1; index < statements.size(); index++) {
+            SnapshotUserVariableAssignment reassignment =
+                    snapshotUserVariableAssignment(statements.get(index));
+            if (reassignment != null && reassignment.name().equals(variableName)) {
+                break;
+            }
+            if (referencesUserVariable(statements.get(index), variableName)) {
+                lastReference = index;
+            }
+        }
+        return lastReference;
+    }
+
+    private boolean snapshotUserVariableRangeIsSafe(
+            List<String> statements,
+            int assignmentIndex,
+            int lastReference,
+            String variableName
+    ) {
+        for (int index = assignmentIndex; index <= lastReference; index++) {
+            String statement = statements.get(index);
+            for (UserVariableReference reference : mysqlUserVariableReferences(statement)) {
+                if (!reference.name().equalsIgnoreCase(variableName)) {
+                    return false;
+                }
+            }
+            if (index == assignmentIndex) {
+                continue;
+            }
+            String body = splitLeadingSqlPrefix(statement).body().stripLeading();
+            if (!(startsKeyword(body, 0, "INSERT")
+                    || startsKeyword(body, 0, "UPDATE")
+                    || startsKeyword(body, 0, "DELETE")
+                    || startsKeyword(body, 0, "MERGE")
+                    || startsWithTableDdl(body))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean startsWithTableDdl(String sql) {
+        return startsWithKeywords(sql, "CREATE", "TABLE")
+                || startsWithKeywords(sql, "CREATE", "TEMPORARY", "TABLE")
+                || startsWithKeywords(sql, "ALTER", "TABLE")
+                || startsWithKeywords(sql, "DROP", "TABLE")
+                || startsWithKeywords(sql, "TRUNCATE", "TABLE")
+                || startsWithKeywords(sql, "CREATE", "INDEX")
+                || startsWithKeywords(sql, "CREATE", "UNIQUE", "INDEX")
+                || startsWithKeywords(sql, "DROP", "INDEX");
+    }
+
+    private boolean referencesUserVariable(String statement, String variableName) {
+        return mysqlUserVariableReferences(statement).stream()
+                .anyMatch(reference -> reference.name().equalsIgnoreCase(variableName));
+    }
+
+    private String uniqueSnapshotProcedureName(
+            String variableName,
+            int statementIndex,
+            Set<String> reservedProcedureNames
+    ) {
+        String base = "dm_adapter_snapshot_" + variableName + "_" + statementIndex;
+        String candidate = base;
+        int suffix = 1;
+        while (reservedProcedureNames.contains(candidate.toLowerCase(Locale.ROOT))) {
+            candidate = base + "_" + ++suffix;
+        }
+        reservedProcedureNames.add(candidate.toLowerCase(Locale.ROOT));
+        return candidate;
+    }
+
     private PlannedSqlScriptFile planFile(
             Path sqlRoot,
             Path sqlRootOut,
@@ -1996,9 +2203,13 @@ class SqlScriptMigrator {
 
         String originalContent = readSqlScriptContent(sqlFile);
         long parseStartedAt = System.nanoTime();
-        List<String> originalStatements = SqlScriptParser.statements(originalContent);
+        List<String> parsedStatements = SqlScriptParser.statements(originalContent);
+        SnapshotUserVariableGrouping snapshotUserVariableGrouping =
+                groupSnapshotUserVariableSequences(parsedStatements);
+        List<String> originalStatements = snapshotUserVariableGrouping.statements();
         progress("Parsed SQL script: " + relative
-                + ", statements=" + originalStatements.size()
+                + ", statements=" + parsedStatements.size()
+                + ", groupedSnapshotVariables=" + snapshotUserVariableGrouping.groupCount()
                 + ", elapsedMs=" + elapsedMillis(parseStartedAt));
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
@@ -2013,6 +2224,9 @@ class SqlScriptMigrator {
                 + ", elapsedMs=" + elapsedMillis(preparationStartedAt));
         LinkedHashSet<String> manualReviewProcedureNames = new LinkedHashSet<>();
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
+        if (snapshotUserVariableGrouping.changed()) {
+            appliedRules.add(MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE);
+        }
         int convertedStatementCount = 0;
         int manualReviewStatementCount = 0;
         LinkedHashSet<Integer> manualReviewStatementIndexes = new LinkedHashSet<>();
@@ -5229,7 +5443,12 @@ class SqlScriptMigrator {
 
     private SafeRuleConversion convertEmbeddedSqlLiterals(String sql, String targetSchema) {
         String body = splitLeadingSqlPrefix(sql).body().stripLeading();
-        if (!(startsKeyword(body, 0, "INSERT") || startsKeyword(body, 0, "UPDATE"))) {
+        String procedureName = procedureNameFromCreateProcedure(body);
+        boolean generatedSnapshotProcedure =
+                procedureName.toLowerCase(Locale.ROOT).startsWith("dm_adapter_snapshot_");
+        if (!(startsKeyword(body, 0, "INSERT")
+                || startsKeyword(body, 0, "UPDATE")
+                || generatedSnapshotProcedure)) {
             return new SafeRuleConversion(sql, false, List.of(), "");
         }
         StringBuilder rewritten = new StringBuilder(sql.length());
@@ -11531,6 +11750,19 @@ class SqlScriptMigrator {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
             manualReviewReason = manualReviewReason == null ? "" : manualReviewReason;
         }
+    }
+
+    private record SnapshotUserVariableGrouping(
+            List<String> statements,
+            boolean changed,
+            int groupCount
+    ) {
+        private SnapshotUserVariableGrouping {
+            statements = List.copyOf(statements == null ? List.of() : statements);
+        }
+    }
+
+    private record SnapshotUserVariableAssignment(String name, String existsQuery) {
     }
 
     private record MetadataSchemaBinding(List<String> statements, boolean changed) {
