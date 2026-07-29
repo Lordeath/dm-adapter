@@ -7436,7 +7436,8 @@ class DmSqlValidationTestGenerator {
                         if (record.parameters == null
                                 || !record.parameters.resolved
                                 || record.parameterSource == null
-                                || !record.parameterSource.startsWith("auto")) {
+                                || !record.parameterSource.startsWith("auto")
+                                || !shouldSuggestValidationArguments(record)) {
                             continue;
                         }
                         String methodKey = baseRecordKey(record.key);
@@ -7459,6 +7460,13 @@ class DmSqlValidationTestGenerator {
                     writeString(rewriteConfigPath, String.join("\\n", merged) + "\\n", StandardCharsets.UTF_8);
                     log("Updated validation args in " + rewriteConfigPath + " for "
                             + suggestions.size() + " failed mapper methods.");
+                }
+
+                private boolean shouldSuggestValidationArguments(ValidationRecord record) {
+                    String failureCategory = category(record);
+                    return !"CONFIGURATION".equals(failureCategory)
+                            && !"TEST_SCHEMA".equals(failureCategory)
+                            && !"ORIGINAL_SQL".equals(failureCategory);
                 }
 
                 private MethodArgumentConfig suggestedArgumentConfig(ParameterResolution parameters) {

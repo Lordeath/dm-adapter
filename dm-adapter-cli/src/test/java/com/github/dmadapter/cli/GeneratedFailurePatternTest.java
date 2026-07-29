@@ -43,6 +43,11 @@ class GeneratedFailurePatternTest {
                     """;
             assertThat(failurePattern(validationClass, validation, missingColumn))
                     .isEqualTo("TEST_SCHEMA_OBJECT");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    failedRecord(validationClass, missingColumn)
+            )).isFalse();
 
             String omittedRequiredColumn = """
                     org.apache.ibatis.exceptions.PersistenceException:
@@ -57,6 +62,8 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("ORIGINAL_XML_REQUIRED_COLUMN_OMISSION");
             assertThat(category(validationClass, validation, omittedRecord))
                     .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, omittedRecord))
+                    .isFalse();
 
             String suppliedRequiredColumn = """
                     org.apache.ibatis.exceptions.PersistenceException:
@@ -68,6 +75,11 @@ class GeneratedFailurePatternTest {
                     """;
             assertThat(failurePattern(validationClass, validation, suppliedRequiredColumn))
                     .isEqualTo("TEST_DATA_OR_CONSTRAINT");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    failedRecord(validationClass, suppliedRequiredColumn)
+            )).isTrue();
         }
     }
 
@@ -85,6 +97,16 @@ class GeneratedFailurePatternTest {
         Method method = validationClass.getDeclaredMethod("category", record.getClass());
         method.setAccessible(true);
         return (String) method.invoke(validation, record);
+    }
+
+    private boolean shouldSuggestValidationArguments(
+            Class<?> validationClass,
+            Object validation,
+            Object record
+    ) throws Exception {
+        Method method = validationClass.getDeclaredMethod("shouldSuggestValidationArguments", record.getClass());
+        method.setAccessible(true);
+        return (boolean) method.invoke(validation, record);
     }
 
     private Object failedRecord(Class<?> validationClass, String message) throws Exception {
