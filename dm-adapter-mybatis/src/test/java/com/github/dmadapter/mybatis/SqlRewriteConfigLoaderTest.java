@@ -60,4 +60,21 @@ class SqlRewriteConfigLoaderTest {
         assertThat(config.requiresIdentityInsert("owner_house")).isTrue();
         assertThat(config.requiresIdentityInsert("other_table")).isFalse();
     }
+
+    @Test
+    void parsesInsertIgnorePlainInsertResolution() {
+        SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
+                "upsertKeys:",
+                "  tables:",
+                "    {}",
+                "  methods:",
+                "    {}",
+                "upsertKeyResolutions:",
+                "  methods:",
+                "    \"com.example.BankFileMapper.insert\": \"INSERT_IGNORE_AS_PLAIN_INSERT\""
+        ));
+
+        assertThat(config.convertsInsertIgnoreToPlainInsert("com.example.BankFileMapper.insert")).isTrue();
+        assertThat(config.convertsInsertIgnoreToPlainInsert("com.example.BankFileMapper.other")).isFalse();
+    }
 }

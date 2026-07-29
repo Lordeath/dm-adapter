@@ -11,7 +11,7 @@
 - 检查 `pom.xml` 是否已有达梦 JDBC 驱动依赖。
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
 - 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页、`DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`、`CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`、`FROM/JOIN ... AS 别名` -> `FROM/JOIN ... 别名`，并将 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦特殊列名重命名为追加下划线形式。
-- 支持通过应用工作目录中的 `sql-rewrite.yml` 配置 `keyColumns`，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；配置达梦验证环境变量后，`migrate` 会优先从测试库主键/唯一键元数据自动推断并维护该配置，无法确认时保留原 SQL 并写入报告。
+- 支持通过应用工作目录中的 `sql-rewrite.yml` 配置 `keyColumns`，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；配置达梦验证环境变量后，`migrate` 会优先从测试库主键、唯一键和自增列元数据自动推断并维护该配置。若元数据证明 `INSERT IGNORE` 不可能发生重复键冲突，则自动转为普通 `INSERT`；其他无法确认的情况保留原 SQL 并写入报告。
 - 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore 等标记为人工确认；达梦 MySQL 兼容模式可执行的反引号标识符默认保留。
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类，在工具侧应用工作目录生成 `sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean；若 `DM_SQL_VALIDATION=true` 且连接环境变量齐全，生成后会自动执行一次验证测试并输出报告路径。
 - 默认将配置、Markdown/JSON 报告和验证临时文件输出到 `<当前命令目录>/.dm-adapter/<应用 artifactId>/`，不在业务项目中创建 `.dm-adapter`。

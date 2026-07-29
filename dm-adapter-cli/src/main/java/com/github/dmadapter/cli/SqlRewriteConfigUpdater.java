@@ -76,8 +76,15 @@ class SqlRewriteConfigUpdater {
                     } else {
                         model.ensureMethod(candidate.methodKey(), List.of());
                         model.putMethodResolution(candidate.methodKey(), inferenceResult.resolutionCode());
-                        warnings.add("Could not infer keyColumns for " + candidate.methodKey()
-                                + ": " + inferenceResult.reason());
+                        if (UpsertKeyInference.RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT.equals(
+                                inferenceResult.resolutionCode()
+                        )) {
+                            warnings.add("Resolved " + candidate.methodKey()
+                                    + " as a plain INSERT: " + inferenceResult.reason());
+                        } else {
+                            warnings.add("Could not infer keyColumns for " + candidate.methodKey()
+                                    + ": " + inferenceResult.reason());
+                        }
                     }
                 });
             } else {
@@ -184,7 +191,8 @@ class SqlRewriteConfigUpdater {
                 loadedRewriteConfig.ignoredMissingTables(),
                 loadedRewriteConfig.ignoredMissingColumns(),
                 loadedRewriteConfig.ignoredMissingSchemas(),
-                mergedIdentityInsertTables(loadedRewriteConfig, model)
+                mergedIdentityInsertTables(loadedRewriteConfig, model),
+                model.methodResolutions()
         );
     }
 
@@ -330,6 +338,10 @@ class SqlRewriteConfigUpdater {
                 }
             });
             return result;
+        }
+
+        Map<String, String> methodResolutions() {
+            return Map.copyOf(methodResolutions);
         }
 
         Set<String> identityInsertTables() {

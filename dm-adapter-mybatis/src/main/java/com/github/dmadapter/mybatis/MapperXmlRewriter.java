@@ -49,6 +49,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE =
             "MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE";
+    public static final String MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT_RULE =
+            "MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE =
             "MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED_RULE =
@@ -89,6 +91,9 @@ public class MapperXmlRewriter {
     );
     private static final Pattern INSERT_TRIM_THEN_FOREACH_PATTERN = Pattern.compile(
             "(?is)(\\binsert\\s+into\\b[\\s\\S]*?</trim>)(\\s*)(<foreach\\b)"
+    );
+    private static final Pattern LEADING_INSERT_IGNORE_PATTERN = Pattern.compile(
+            "(?is)^(?<insert>\\s*insert)\\s+ignore(?<into>\\s+into\\b)"
     );
     private static final Pattern INSERT_TRIM_VALUES_FOREACH_PATTERN = Pattern.compile(
             "(?is)(?<prefix>\\binsert\\s+into\\b[\\s\\S]*?<trim\\b[^>]*>[\\s\\S]*?</trim>\\s*values\\s*)"
@@ -428,6 +433,15 @@ public class MapperXmlRewriter {
             List<String> staticRules = new ArrayList<>();
             if (!commentSafeSql.equals(originalSql)) {
                 staticRules.add(MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
+            }
+            TextRewrite plainInsert = convertConfiguredInsertIgnoreToPlainInsert(
+                    commentSafeSql,
+                    statementKey,
+                    rewriteConfig
+            );
+            if (plainInsert.changed()) {
+                commentSafeSql = plainInsert.text();
+                staticRules.add(MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT_RULE);
             }
             SqlConversionResult conversionResult =
                     sqlConverter.convert(commentSafeSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
@@ -7339,20 +7353,49 @@ public class MapperXmlRewriter {
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig
     ) {
+        TextRewrite plainInsert = convertConfiguredInsertIgnoreToPlainInsert(
+                text,
+                statementKey,
+                rewriteConfig
+        );
         SqlConversionResult conversionResult =
-                sqlConverter.convert(text, rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(text)));
+                sqlConverter.convert(
+                        plainInsert.text(),
+                        rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(plainInsert.text()))
+                );
         List<String> manualReviewReasons = conversionResult.manualReviewRequired()
                 ? List.of(conversionResult.reason())
                 : List.of();
-        if (!conversionResult.changed()) {
+        if (!plainInsert.changed() && !conversionResult.changed()) {
             return new TextSegmentConversion(text, List.of(), manualReviewReasons, false);
         }
+        List<String> appliedRules = new ArrayList<>();
+        if (plainInsert.changed()) {
+            appliedRules.add(MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT_RULE);
+        }
+        addAppliedRules(appliedRules, conversionResult.appliedRules());
         return new TextSegmentConversion(
-                conversionResult.convertedSql(),
-                conversionResult.appliedRules(),
+                conversionResult.changed() ? conversionResult.convertedSql() : plainInsert.text(),
+                appliedRules,
                 manualReviewReasons,
                 true
         );
+    }
+
+    private TextRewrite convertConfiguredInsertIgnoreToPlainInsert(
+            String sql,
+            String statementKey,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        if (!rewriteConfig.convertsInsertIgnoreToPlainInsert(statementKey)) {
+            return new TextRewrite(sql, false);
+        }
+        Matcher matcher = LEADING_INSERT_IGNORE_PATTERN.matcher(sql);
+        if (!matcher.find()) {
+            return new TextRewrite(sql, false);
+        }
+        String converted = matcher.replaceFirst("${insert}${into}");
+        return new TextRewrite(converted, !converted.equals(sql));
     }
 
     private String nextTagName(String rawBody, int startIndex) {
