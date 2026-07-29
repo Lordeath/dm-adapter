@@ -42,6 +42,9 @@ import java.util.concurrent.TimeoutException;
 @Command(name = "migrate", description = "Create a low-intrusion Dameng migration plan or apply it.")
 public class MigrateCommand implements Callable<Integer> {
     private static final long DEFAULT_METADATA_READ_TIMEOUT_SECONDS = 12L;
+    private static final int DEFAULT_METADATA_READ_ATTEMPTS = 5;
+    private static final long DEFAULT_METADATA_RETRY_DELAY_MILLIS = 5_000L;
+    private static final long MAX_METADATA_RETRY_DELAY_MILLIS = 30_000L;
 
     @Option(names = "--project", required = true, description = "Project root path.")
     private Path project;
@@ -742,16 +745,21 @@ public class MigrateCommand implements Callable<Integer> {
         DamengTargetCapabilities detected = DamengTargetCapabilities.unknown();
         if (environment != null && environment.ready()) {
             try {
-                detected = runWithMetadataTimeout(
-                        () -> targetCapabilitiesReader.read(environment),
-                        DEFAULT_METADATA_READ_TIMEOUT_SECONDS,
-                        TimeUnit.SECONDS,
-                        "Dameng target capability lookup"
+                detected = runWithMetadataRetries(
+                        () -> runWithMetadataTimeout(
+                                () -> targetCapabilitiesReader.read(environment),
+                                DEFAULT_METADATA_READ_TIMEOUT_SECONDS,
+                                TimeUnit.SECONDS,
+                                "Dameng target capability lookup"
+                        ),
+                        DEFAULT_METADATA_READ_ATTEMPTS,
+                        DEFAULT_METADATA_RETRY_DELAY_MILLIS
                 );
             } catch (Exception e) {
                 throw new DmAdapterException(
                         "Dameng target capability preflight failed before SQL execution. "
-                                + "Verify the validation connection and V$DM_INI read permission.",
+                                + "Verify the validation connection and V$DM_INI read permission. "
+                                + "Cause: " + redactedMetadataFailure(e, environment),
                         e
                 );
             }
@@ -772,6 +780,73 @@ public class MigrateCommand implements Callable<Integer> {
             return DamengTargetCapabilities.offline(targetLengthSemantics);
         }
         return detected;
+    }
+
+    static <T> T runWithMetadataRetries(
+            Callable<T> task,
+            int maxAttempts,
+            long initialDelayMillis
+    ) throws Exception {
+        if (maxAttempts <= 0) {
+            throw new IllegalArgumentException("maxAttempts must be positive.");
+        }
+        Exception lastFailure = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return task.call();
+            } catch (Exception e) {
+                lastFailure = e;
+                if (attempt >= maxAttempts) {
+                    throw e;
+                }
+                long delayMillis = Math.min(
+                        MAX_METADATA_RETRY_DELAY_MILLIS,
+                        Math.max(0L, initialDelayMillis)
+                );
+                for (int backoff = 1; backoff < attempt && delayMillis < MAX_METADATA_RETRY_DELAY_MILLIS; backoff++) {
+                    delayMillis = Math.min(MAX_METADATA_RETRY_DELAY_MILLIS, delayMillis * 2);
+                }
+                CliLogger.info("Dameng target capability lookup failed; retrying in "
+                        + delayMillis + " ms (" + attempt + "/" + maxAttempts + ").");
+                if (delayMillis > 0) {
+                    try {
+                        TimeUnit.MILLISECONDS.sleep(delayMillis);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw interrupted;
+                    }
+                }
+            }
+        }
+        throw lastFailure == null
+                ? new IllegalStateException("Dameng target capability lookup failed.")
+                : lastFailure;
+    }
+
+    private String redactedMetadataFailure(Exception failure, DmValidationEnvironment environment) {
+        Throwable current = failure;
+        String message = "";
+        while (current != null) {
+            if (current.getMessage() != null && !current.getMessage().isBlank()) {
+                message = current.getMessage();
+            }
+            current = current.getCause();
+        }
+        if (message.isBlank()) {
+            message = failure.getClass().getSimpleName();
+        }
+        if (environment != null) {
+            for (String sensitive : List.of(
+                    environment.password(),
+                    environment.username(),
+                    environment.jdbcUrl()
+            )) {
+                if (sensitive != null && !sensitive.isBlank()) {
+                    message = message.replace(sensitive, "******");
+                }
+            }
+        }
+        return message.replaceAll("\\s+", " ").trim();
     }
 
     private void printMigrationSummary(
