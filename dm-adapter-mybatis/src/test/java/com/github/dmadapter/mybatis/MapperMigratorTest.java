@@ -2605,6 +2605,96 @@ class MapperMigratorTest {
     }
 
     @Test
+    void rewritesDeleteOrderByLimitOneToRowidSubquery() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.TenantEventLogMapper">
+                    <delete id="deleteNewestByTenantId">
+                        delete from tenant_event_log
+                        where tenant_id = #{tenantId} order by event_id desc limit 1
+                    </delete>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/TenantEventLogMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TenantEventLogMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/TenantEventLogMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("""
+                        delete from tenant_event_log where ROWID in (select rid from (select ROWID rid from tenant_event_log where tenant_id = #{tenantId} order by event_id desc) where ROWNUM &lt;= 1)
+                        """.strip())
+                .doesNotContain("order by event_id desc limit 1");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_DELETE_ORDER_LIMIT_ONE_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void rewritesTimeToSecTimeDiffChainedDivisionInMapperSelect() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.TenantTaskMapper">
+                    <select id="findUrgentTasks">
+                        select task.id
+                        from tenant_task task
+                        where TIME_TO_SEC(TIMEDIFF(NOW(), task.created_at))/60/task.complete_limit &gt; 0.8
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/TenantTaskMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TenantTaskMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/TenantTaskMapper.xml"));
+        assertThat(rewritten)
+                .contains("CAST(DATEDIFF(SECOND, task.created_at, SYSDATE) AS DECIMAL(38,10))")
+                .contains("/ NULLIF(CAST(60 AS DECIMAL(38,10)), 0)")
+                .contains("/ NULLIF(CAST(task.complete_limit AS DECIMAL(38,10)), 0)")
+                .doesNotContain("TIME_TO_SEC")
+                .doesNotContain("TIMEDIFF");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_TIME_TO_SEC_TIMEDIFF_RULE,
+                MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE
+        );
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicDeleteUpdateAddsMissingAndBetweenStaticWherePredicates() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

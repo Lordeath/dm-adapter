@@ -274,6 +274,36 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsTimeToSecTimeDiffAndChainedIntegerDivision() {
+        SqlConversionResult result = converter.convert(
+                "select TIME_TO_SEC(TIMEDIFF(NOW(), task.created_at))/60/task.complete_limit "
+                        + "from tenant_task task"
+        );
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select CAST(DATEDIFF(SECOND, task.created_at, SYSDATE) AS DECIMAL(38,10))"
+                        + " / NULLIF(CAST(60 AS DECIMAL(38,10)), 0)"
+                        + " / NULLIF(CAST(task.complete_limit AS DECIMAL(38,10)), 0) "
+                        + "from tenant_task task"
+        );
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_TIME_TO_SEC_TIMEDIFF_RULE,
+                MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE
+        );
+    }
+
+    @Test
+    void leavesUnsupportedTimeToSecShapeForManualReview() {
+        SqlConversionResult result = converter.convert(
+                "select TIME_TO_SEC(duration_value)/60 from tenant_task"
+        );
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+    }
+
+    @Test
     void convertsMysqlDivOperatorToTruncDecimalArithmetic() {
         SqlConversionResult result = converter.convert("select 5 DIV 2, -5 DIV #{count} from dual");
 
@@ -2519,6 +2549,36 @@ class MySqlToDmSqlConverterTest {
                     payTime = #{payTime} where ROWID in (select rid from (select ROWID rid from ns_bill_billsharing where customerId = #{oldCustomerId} order by createTime desc) where ROWNUM <= 1)
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE);
+    }
+
+    @Test
+    void convertsSimpleMysqlDeleteOrderLimitOneToDamengRowidSubquery() {
+        SqlConversionResult result = converter.convert("""
+                DELETE FROM tenant_event_log
+                WHERE tenant_id = #{tenantId} ORDER BY event_id DESC LIMIT 1
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                delete from tenant_event_log where ROWID in (select rid from (select ROWID rid from tenant_event_log where tenant_id = #{tenantId} order by event_id DESC) where ROWNUM <= 1)
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_DELETE_ORDER_LIMIT_ONE_RULE
+        );
+    }
+
+    @Test
+    void doesNotConvertUnsafeMysqlDeleteOrderLimitShapes() {
+        SqlConversionResult aliasResult = converter.convert(
+                "delete from tenant_event_log e where e.tenant_id = #{tenantId} order by e.event_id desc limit 1"
+        );
+        SqlConversionResult multiLimitResult = converter.convert(
+                "delete from tenant_event_log where tenant_id = #{tenantId} order by event_id desc limit 2"
+        );
+
+        assertThat(aliasResult.manualReviewRequired()).isTrue();
+        assertThat(multiLimitResult.manualReviewRequired()).isTrue();
     }
 
     @Test
