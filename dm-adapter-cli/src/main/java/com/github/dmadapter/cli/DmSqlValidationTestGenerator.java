@@ -749,7 +749,7 @@ class DmSqlValidationTestGenerator {
                 private static final long DATABASE_CONNECTION_RETRY_DELAY_MILLIS =
                         Math.max(0L, Long.getLong("dm.sql.validation.connectionRetryDelayMillis", 2000L));
                 private static final int MAPPER_STATEMENT_TIMEOUT_SECONDS =
-                        Math.max(1, Integer.getInteger("dm.sql.validation.statementTimeoutSeconds", 30));
+                        Math.max(1, Integer.getInteger("dm.sql.validation.statementTimeoutSeconds", 120));
                 private static final Set<String> DEFAULT_COLLECTION_PARAMETER_NAMES = new LinkedHashSet<>(Arrays.asList(
                         "list",
                         "collection",
@@ -6030,6 +6030,9 @@ class DmSqlValidationTestGenerator {
                                 && !shouldKeepConfiguredCollectionValue(entryPath, configuredValue, existing)) {
                             continue;
                         }
+                        if (configuredValueIncompatibleWithColumn(entryPath, configuredValue, statement)) {
+                            continue;
+                        }
                         if (existing != null
                                 && configuredValue != null
                                 && !(existing instanceof Map<?, ?>)
@@ -6044,6 +6047,44 @@ class DmSqlValidationTestGenerator {
                         }
                         target.put(entry.getKey(), configuredValue);
                     }
+                }
+
+                private boolean configuredValueIncompatibleWithColumn(
+                        String valueName,
+                        Object configuredValue,
+                        MapperStatement statement
+                ) {
+                    if (configuredValue == null || statement == null) {
+                        return false;
+                    }
+                    String columnType = statement.defaultColumnType(valueName, dbColumnMetadata);
+                    if (isBlank(columnType)) {
+                        return false;
+                    }
+                    String text = stripSqlLiteralQuotes(String.valueOf(configuredValue).trim());
+                    if (isDateTimeColumnType(columnType)) {
+                        return configuredInstant(text) == null;
+                    }
+                    int columnLength = statement.defaultColumnLength(valueName, dbColumnMetadata);
+                    if (isCharacterColumnType(columnType) && columnLength > 0) {
+                        return text.length() > columnLength;
+                    }
+                    String normalizedType = columnType.toUpperCase(Locale.ROOT);
+                    if (normalizedType.contains("INT")
+                            || normalizedType.contains("NUMBER")
+                            || normalizedType.contains("DECIMAL")
+                            || normalizedType.contains("NUMERIC")
+                            || normalizedType.contains("DOUBLE")
+                            || normalizedType.contains("FLOAT")
+                            || normalizedType.contains("REAL")) {
+                        try {
+                            new BigDecimal(text);
+                            return false;
+                        } catch (NumberFormatException ignored) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
 
                 private boolean configuredMapOverridesGeneratedCollection(
@@ -6259,11 +6300,15 @@ class DmSqlValidationTestGenerator {
                         return configuredDefault;
                     }
                     String columnType = statement == null ? "" : statement.defaultColumnType(valueName, dbColumnMetadata);
+                    int columnLength = statement == null ? -1 : statement.defaultColumnLength(valueName, dbColumnMetadata);
                     if (!isBlank(columnType) && isDateTimeColumnType(columnType)) {
                         return defaultStringDateTimeForColumnType(columnType);
                     }
                     if (!isBlank(columnType) && !isCharacterColumnType(columnType)) {
                         return defaultValueForColumnType(valueName, Object.class, columnType);
+                    }
+                    if (!isBlank(columnType) && columnLength > 0) {
+                        return defaultCharacterColumnValue(valueName, columnLength);
                     }
                     if (configuredDefault != null && isDateTimeDefaultValue(configuredDefault)) {
                         return defaultStringDateTimeForConfiguredDefault(configuredDefault);
@@ -6499,16 +6544,31 @@ class DmSqlValidationTestGenerator {
                     return "'" + (value == null ? "" : value.replace("'", "''")) + "'";
                 }
 
+                """,
+            """
                 private Object defaultTypedColumnValue(String valueName, Class<?> targetType, MapperStatement statement) {
                     if (!String.class.equals(targetType) && !Object.class.equals(targetType)) {
                         return null;
                     }
                     String columnType = statement == null ? "" : statement.defaultColumnType(valueName, dbColumnMetadata);
-                    if (isBlank(columnType)
-                            || (String.class.equals(targetType) && isCharacterColumnType(columnType))) {
+                    if (isBlank(columnType)) {
                         return null;
                     }
+                    if (String.class.equals(targetType) && isCharacterColumnType(columnType)) {
+                        int columnLength = statement.defaultColumnLength(valueName, dbColumnMetadata);
+                        return columnLength > 0 ? defaultCharacterColumnValue(valueName, columnLength) : null;
+                    }
                     return defaultValueForColumnType(valueName, targetType, columnType);
+                }
+
+                private String defaultCharacterColumnValue(String valueName, int columnLength) {
+                    if (columnLength == 1) {
+                        return "1";
+                    }
+                    String value = defaultNameBasedString(valueName);
+                    return columnLength > 0 && value.length() > columnLength
+                            ? value.substring(0, columnLength)
+                            : value;
                 }
 
                 private Object defaultValueForColumnType(String valueName, Class<?> targetType, String columnType) {
@@ -11664,6 +11724,8 @@ class DmSqlValidationTestGenerator {
                     private static final int METADATA_QUERY_TIMEOUT_SECONDS = 8;
                     private final Map<String, String> tableColumnTypes = new LinkedHashMap<>();
                     private final Map<String, Set<String>> columnTypes = new LinkedHashMap<>();
+                    private final Map<String, Integer> tableColumnLengths = new LinkedHashMap<>();
+                    private final Map<String, Set<Integer>> columnLengths = new LinkedHashMap<>();
                     private final Map<String, Set<String>> tableColumns = new LinkedHashMap<>();
 
                     private static DbColumnMetadata empty() {
@@ -11721,7 +11783,9 @@ class DmSqlValidationTestGenerator {
                                     addColumn(
                                             resultSet.getString("table_name"),
                                             resultSet.getString("column_name"),
-                                            resultSet.getString("data_type")
+                                            resultSet.getString("data_type"),
+                                            resultSet.getInt("column_length"),
+                                            resultSet.wasNull()
                                     );
                                 }
                             }
@@ -11730,12 +11794,12 @@ class DmSqlValidationTestGenerator {
 
                     private String columnTypeQuerySql(boolean schemaQualified) {
                         if (schemaQualified) {
-                            return "select table_name, column_name, data_type from all_tab_columns "
+                            return "select table_name, column_name, data_type, data_length as column_length from all_tab_columns "
                                     + "where (owner = ? or upper(owner) = upper(?)) "
                                     + "and (table_name = ? or upper(table_name) = upper(?)) "
                                     + "order by table_name, column_id";
                         }
-                        return "select table_name, column_name, data_type from user_tab_columns "
+                        return "select table_name, column_name, data_type, data_length as column_length from user_tab_columns "
                                 + "where table_name = ? or upper(table_name) = upper(?) "
                                 + "order by table_name, column_id";
                     }
@@ -11748,7 +11812,13 @@ class DmSqlValidationTestGenerator {
                         }
                     }
 
-                    private void addColumn(String tableName, String columnName, String dataType) {
+                    private void addColumn(
+                            String tableName,
+                            String columnName,
+                            String dataType,
+                            int columnLength,
+                            boolean columnLengthNull
+                    ) {
                         String normalizedTable = normalizeIdentifier(tableName);
                         String normalizedColumn = normalizeIdentifier(columnName);
                         if (isBlank(normalizedTable) || isBlank(normalizedColumn) || dataType == null || isBlank(dataType)) {
@@ -11757,7 +11827,15 @@ class DmSqlValidationTestGenerator {
                         String normalizedType = dataType.toUpperCase(Locale.ROOT);
                         tableColumnTypes.putIfAbsent(tableKey(normalizedTable, normalizedColumn), normalizedType);
                         columnTypes.computeIfAbsent(normalizedColumn, ignored -> new LinkedHashSet<>()).add(normalizedType);
+                        if (!columnLengthNull && columnLength > 0) {
+                            tableColumnLengths.putIfAbsent(tableKey(normalizedTable, normalizedColumn), columnLength);
+                            columnLengths.computeIfAbsent(normalizedColumn, ignored -> new LinkedHashSet<>()).add(columnLength);
+                        }
                         tableColumns.computeIfAbsent(normalizedTable, ignored -> new LinkedHashSet<>()).add(normalizedColumn);
+                    }
+
+                    private void addColumn(String tableName, String columnName, String dataType) {
+                        addColumn(tableName, columnName, dataType, -1, true);
                     }
 
                     private String columnType(ColumnReference columnReference) {
@@ -11774,6 +11852,22 @@ class DmSqlValidationTestGenerator {
                         }
                         Set<String> types = columnTypes.get(normalizedColumn);
                         return types != null && types.size() == 1 ? types.iterator().next() : "";
+                    }
+
+                    private int columnLength(ColumnReference columnReference) {
+                        if (columnReference == null || isBlank(columnReference.columnName())) {
+                            return -1;
+                        }
+                        String normalizedColumn = normalizeIdentifier(columnReference.columnName());
+                        String normalizedTable = normalizeIdentifier(columnReference.tableName());
+                        if (!isBlank(normalizedTable)) {
+                            Integer length = tableColumnLengths.get(tableKey(normalizedTable, normalizedColumn));
+                            if (length != null) {
+                                return length;
+                            }
+                        }
+                        Set<Integer> lengths = columnLengths.get(normalizedColumn);
+                        return lengths != null && lengths.size() == 1 ? lengths.iterator().next() : -1;
                     }
 
                     private int columnCount() {
@@ -11933,6 +12027,13 @@ class DmSqlValidationTestGenerator {
                         return columnReference == null || columnMetadata == null
                                 ? ""
                                 : columnMetadata.columnType(columnReference);
+                    }
+
+                    private int defaultColumnLength(String valueName, DbColumnMetadata columnMetadata) {
+                        ColumnReference columnReference = dynamicIdentifierMetadata.defaultColumnReference(valueName);
+                        return columnReference == null || columnMetadata == null
+                                ? -1
+                                : columnMetadata.columnLength(columnReference);
                     }
 
                     private Object defaultValue(String valueName) {

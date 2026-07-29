@@ -23,7 +23,7 @@
 
 - MySQL `VARCHAR(n)`/`CHAR(n)` 迁移到 `LENGTH_IN_CHAR=0` 的达梦实例时，应定义为 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`，保持原字符数上限。不要按 `utf8` 3 倍或 `utf8mb4` 4 倍修改 `n`：倍数扩长只能增加字节容量，还会允许写入超过 MySQL 上限的较短字节字符。达梦 DTS 的 MySQL 类型映射同样使用 `VARCHAR(n char)`/`CHAR(n char)`。
 - MySQL `TEXT`、`LONGTEXT`、`JSON` 等类型迁移到达梦时通常需要映射到大字段或字符串类型，并检查业务是否依赖 MySQL JSON 函数。
-- 自增列迁移后要特别处理。MySQL `AUTO_INCREMENT` 可对应达梦 `IDENTITY(start, increment)` 或迁移工具提供的 `auto_increment` 兼容方案；`IDENTITY` 自增列类型只能使用 `INT` 或 `BIGINT`。脚本里无列清单的 `INSERT INTO t VALUES(NULL, ...)` / `VALUES(DEFAULT, ...)` 如果首列明确是自增列，可省略该列和值，让达梦继续自动生成主键；显式插入具体 id 且列清单可从同脚本表定义确定时，可补列清单并用 `SET IDENTITY_INSERT ... ON/OFF` 保留种子 id。验证中出现“仅当指定列列表，且 SET IDENTITY_INSERT 为 ON 时，才能对自增列赋值”时，通常不是 SQL 语法转换问题，而是测试数据、表结构或业务插入策略问题。
+- 自增列迁移后要特别处理。MySQL `AUTO_INCREMENT` 可对应达梦 `IDENTITY(start, increment)` 或迁移工具提供的 `auto_increment` 兼容方案；`IDENTITY` 自增列类型只能使用 `INT` 或 `BIGINT`。脚本里无列清单的 `INSERT INTO t VALUES(NULL, ...)` / `VALUES(DEFAULT, ...)` 如果首列明确是自增列，可省略该列和值，让达梦继续自动生成主键；显式插入具体 id 且列清单可从同脚本表定义确定时，可补列清单并用 `SET IDENTITY_INSERT ... ON/OFF` 保留种子 id。MyBatis 批量插入可能同时包含空 id 和显式 id，不能按首个元素决定整批是否保留 id；达梦 8 已验证 `SET IDENTITY_INSERT ... ON WITH REPLACE NULL` 能让空值自动生成、同时保留显式值。dm-adapter 应从语句表名和验证报告学习项目级 `identityInsertTables`，不能把具体表名写死在通用规则里。
 - 触发器、函数、存储过程、视图、事件、外键、索引等对象不能只靠 mapper SQL 验证判断完整性。缺对象导致的 `无效的表或视图名`、`无效的列名`、`无法解析成员访问表达式`，优先归类为测试库对象缺失或原始 SQL 引用错误。
 
 ## SQL 语法差异
@@ -36,6 +36,7 @@
 - `CONCAT`、`CONCAT_WS`、`IFNULL`、`IF`、`ISNULL`、`FIND_IN_SET`、`DATE_FORMAT`、`STR_TO_DATE`、`SUBSTRING_INDEX`、两参数 `DATEDIFF`、`UNIX_TIMESTAMP`、`FROM_UNIXTIME`、`TIMESTAMPDIFF`、常见 `JSON_*` 函数在达梦 53 验证可执行，默认保留 MySQL 函数形态。
 - `NOW()` 与达梦 `SYSDATE` 在 53 环境中存在时区/时间来源差异，不能再把 `NOW()` 盲目替换为 `SYSDATE`。原始 mapper 中也应保留 MySQL 函数形态，不能把达梦函数反写到原始 MySQL XML。
 - MySQL `GROUP_CONCAT(DISTINCT a, ',', b)` 这类聚合不能保留 MySQL 形态，要先把参数拼接为一个表达式，再转为达梦 `LISTAGG(DISTINCT ..., ',') WITHIN GROUP (...)`。
+- MySQL 允许在 `HAVING` 中写未聚合、未列入 `GROUP BY` 的普通列条件，达梦会报“无效的 HAVING 项”。仅由 `AND` 连接、没有聚合函数、子查询、`OR` 或动态标识符的普通比较条件，应前移到同一查询作用域的 `WHERE`，聚合条件继续保留在 `HAVING`；嵌套子查询必须在各自作用域内改写。
 - MySQL `REGEXP`/`NOT REGEXP` 操作符应改写为达梦 `REGEXP_LIKE`。右侧表达式如果已经是达梦可执行的 `CONCAT(...)`，不需要额外转成 `||`。
 - MySQL `DATE_ADD`/`DATE_SUB`/`INTERVAL` 形式应改写为 `DATEADD`。`YEARWEEK`、无法识别的 `DATE_ADD`/`DATE_SUB` 形态、以及未被规则覆盖的 `PERIOD_DIFF` 需要人工确认；已识别的 `PERIOD_DIFF(DATE_FORMAT(...,'%Y%m'), ...)` 可转为月份差。
 - MySQL `CONVERT(expr, DECIMAL(n))`、`CONVERT(expr, DECIMAL(n,m))` 应转为 `CAST(expr AS DECIMAL(...))`，不能按达梦 `CONVERT` 函数原样保留。
@@ -71,7 +72,7 @@
 - 原始 SQL 明显错误时，可以修原始业务 SQL。例如列名写错、insert 列和值数量不一致、`set` 末尾多逗号。若问题来自 Java mapper 方法签名，如多个参数复用同一个 `@Param` 名称，或多个简单参数缺少必要 `@Param`，应修 Java mapper 方法签名，不应为了绕过绑定错误去改 XML 参数名。
 - Java 注解里的 SQL 如果包含复杂动态 SQL、MySQL 专有语法或需要达梦改写，应优先迁移到 mapper XML，再由 dm-adapter 生成 `mapper-dm`；自动迁移也应把可识别的 `@Select`、`@Insert`、`@Update`、`@Delete` SQL 提取到 `mapper-dm` XML 后再执行达梦改写和验证。
 - 参数推测失败时，先增强 dm-adapter 的参数推测或 `sql-rewrite.yml` 回放能力；如果参数本身是业务枚举、动态表名、动态列名或 SQL 片段，必须写入配置或标记为人工确认。
-- 参数类型不匹配不能按 mapper 方法加入忽略名单。应利用表字段元数据修正自动测试参数，或在 `validationArgs` 中提供类型正确的业务示例；否则必须保留失败，不能靠 `typeMismatchMethods` 制造全绿。
+- 参数类型不匹配不能按 mapper 方法加入忽略名单。应利用表字段类型和长度元数据修正自动测试参数，日期时间列不能沿用普通字符串，单字符状态列不能沿用月份等超长占位值；`validationArgs` 中与实际列类型或长度明显不兼容的旧生成值也应在运行时纠正。真正的业务枚举或无法推断的入参仍需提供正确示例，不能靠 `typeMismatchMethods` 制造全绿。
 - `${}` 动态 SQL 需要区分三类值：
   - 动态标识符，如表名、列名、schema，需要白名单配置，验证参数不能来自任意字符串。
   - SQL 片段，如排序、条件、函数表达式，只能通过 `sql-rewrite.yml` 或安全枚举回放，不能自动拼接用户输入。
@@ -92,6 +93,7 @@
    - 外部存储过程依赖：联网验证以过程编译结果和 `ALL_OBJECTS.STATUS` 为准；离线报告中的汇总警告不等同于失败。
    - `VALIDATION_TIMEOUT`：属于验证运行环境/执行时限问题，不是 SQL 兼容失败。SQL 脚本单条语句达到 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS` 后，工具必须主动取消并停止本轮脚本验证；不能只依赖可能被驱动忽略的 JDBC `setQueryTimeout`，也不能继续复用仍有语句运行的连接。
    - SQL 脚本单条语句默认硬超时为 600 秒。真实全量脚本中同一合法数据同步过程的耗时会随测试库数据量从约 187 秒增长到超过 300 秒；项目确有更长过程时应显式配置 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS`，不能把合法慢过程误分为 SQL 兼容失败。
+   - Mapper 单条语句默认 JDBC 超时为 120 秒，可用 `dm.sql.validation.statementTimeoutSeconds` 覆盖。真实查询在 30 秒默认值下可能被误判为运行时超时；放宽后仍超时的项再按锁等待、数据库负载或执行计划问题分类。
 4. 每次 dm-adapter 代码变更后执行 `mvn test`，通过后提交并推送 `main`。
 5. 同步 Windows 镜像，执行 Windows Maven 构建，再用 Windows CLI 对业务项目回归验证。
 

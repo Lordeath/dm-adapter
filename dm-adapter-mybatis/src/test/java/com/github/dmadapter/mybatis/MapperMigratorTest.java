@@ -314,7 +314,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void migrationDoesNotWrapConfiguredIdentityInsertTableWithDynamicColumnList() throws Exception {
+    void migrationWrapsConfiguredIdentityInsertTableWithReplaceNull() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -363,9 +363,12 @@ class MapperMigratorTest {
                 .contains("insert into ns_equip_area_class")
                 .contains("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">")
                 .contains("<foreach collection=\"list\" item=\"item\" separator=\",\">")
-                .doesNotContain("SET IDENTITY_INSERT")
+                .contains("SET IDENTITY_INSERT ns_equip_area_class ON WITH REPLACE NULL;")
+                .contains("SET IDENTITY_INSERT ns_equip_area_class OFF")
                 .doesNotContain("BEGIN");
-        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE);
     }
 
     @Test
@@ -412,9 +415,13 @@ class MapperMigratorTest {
         );
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/SiKuBankFlowMapper.xml"));
-        String generatedKeyTest = "list != null and !list.isEmpty() and list[0].id != null";
+        String generatedKeyFlag = "_dmAdapterHasExplicitId";
         assertThat(rewritten)
-                .contains("<if test=\"" + generatedKeyTest + "\">")
+                .contains("<bind name=\"" + generatedKeyFlag + "\"")
+                .contains("list.{? #this.id != null}.size() > 0")
+                .contains("<if test=\"" + generatedKeyFlag + "\">")
+                .contains("SET IDENTITY_INSERT ns_si_ku_bank_flow ON WITH REPLACE NULL;")
+                .contains("SET IDENTITY_INSERT ns_si_ku_bank_flow OFF")
                 .contains("`id`,")
                 .contains("#{item.id, jdbcType=BIGINT},")
                 .contains("useGeneratedKeys=\"true\" keyProperty=\"id\"")
@@ -425,7 +432,66 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .contains(
                         MapperXmlRewriter.MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE,
-                        MapperXmlRewriter.MYBATIS_FOREACH_TRAILING_COMMA_RULE
+                        MapperXmlRewriter.MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE
+                );
+    }
+
+    @Test
+    void generatedBatchIdentityRewriteDoesNotDuplicateLastTupleValue() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ProcessDefMapper">
+                    <insert id="insertBatch" parameterType="java.util.List"
+                            useGeneratedKeys="true" keyProperty="id">
+                        insert into ns_process_def
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            `id`,
+                            `enterprise_id`,
+                            `update_date_time`
+                        </trim>
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (
+                            #{item.id, jdbcType=BIGINT},
+                            #{item.enterpriseId, jdbcType=BIGINT},
+                            #{item.updateDateTime, jdbcType=TIMESTAMP}
+                            )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ProcessDefMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ProcessDefMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ProcessDefMapper.xml"));
+        assertThat(rewritten)
+                .contains("SET IDENTITY_INSERT ns_process_def ON WITH REPLACE NULL;")
+                .containsOnlyOnce("#{item.updateDateTime, jdbcType=TIMESTAMP}")
+                .doesNotContain("""
+                        #{item.updateDateTime, jdbcType=TIMESTAMP},
+                        #{item.updateDateTime, jdbcType=TIMESTAMP}
+                        """);
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MapperXmlRewriter.MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE,
+                        MapperXmlRewriter.MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE
                 );
     }
 
@@ -488,7 +554,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void migrationDoesNotWrapStaticInsertForConfiguredIdentityInsertTable() throws Exception {
+    void migrationWrapsStaticInsertForConfiguredIdentityInsertTable() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -528,9 +594,12 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ThirdAddHouseInfoMapper.xml"));
         assertThat(rewritten)
                 .contains("insert zj_add_house_info (id, enterprise_id, roomName)")
-                .doesNotContain("SET IDENTITY_INSERT")
+                .contains("SET IDENTITY_INSERT zj_add_house_info ON WITH REPLACE NULL;")
+                .contains("SET IDENTITY_INSERT zj_add_house_info OFF")
                 .doesNotContain("BEGIN");
-        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE);
     }
 
     @Test
@@ -3427,7 +3496,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicNestedHavingKeepsNonGroupBySimpleConditionsInHaving() throws Exception {
+    void dynamicNestedHavingMovesNonAggregateConditionsBeforeGroupBy() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -3480,11 +3549,15 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BillUsedMapper.xml"));
         assertThat(rewritten)
-                .contains("HAVING\n                b.IsDelete = 0")
+                .contains("WHERE\n                    b.IsDelete = 0")
                 .contains("and a.PrecinctId = #{precinctId}")
+                .contains("GROUP BY\n                a.id")
+                .contains("HAVING\n                to_days(")
                 .contains("AND to_days(")
-                .doesNotContain("\n                            and b.IsDelete = 0");
-        assertThat(result.automaticConversions()).isEmpty();
+                .doesNotContain("HAVING\n                b.IsDelete = 0");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
         assertThat(result.manualReviewItems()).hasSize(1);
         assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
     }
@@ -3573,11 +3646,11 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
                 .contains("and status is not null")
-                .contains("having tenant_id is not null")
+                .contains("and tenant_id is not null")
                 .contains("group by status")
                 .doesNotContain("nullgroup")
                 .doesNotContain("nullGROUP")
-                .doesNotContain("and tenant_id is not null");
+                .doesNotContain("having tenant_id is not null");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);

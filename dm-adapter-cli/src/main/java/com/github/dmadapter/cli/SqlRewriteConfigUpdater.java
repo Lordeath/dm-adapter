@@ -1,5 +1,7 @@
 package com.github.dmadapter.cli;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dmadapter.core.AdapterContext;
 import com.github.dmadapter.core.FileChange;
 import com.github.dmadapter.mybatis.SqlRewriteConfig;
@@ -16,9 +18,17 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 class SqlRewriteConfigUpdater {
+    private static final String VALIDATION_REPORT_JSON = "sql-validation-report.json";
+    private static final Pattern IDENTITY_INSERT_TABLE_PATTERN = Pattern.compile(
+            "(?is)\\bINSERT\\s+INTO\\s+((?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`)"
+                    + "(?:\\s*\\.\\s*(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`))?)\\s*\\("
+    );
     private final UpsertKeyInference inference = new UpsertKeyInference();
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     SqlRewriteConfigUpdate update(
             AdapterContext context,
@@ -29,11 +39,16 @@ class SqlRewriteConfigUpdater {
             boolean metadataAvailable
     ) {
         List<String> warnings = new ArrayList<>();
-        if (candidates.isEmpty()) {
-            return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), List.of());
-        }
-
         RewriteConfigModel model = RewriteConfigModel.load(rewriteConfigPath);
+        boolean learnedIdentityInsertTable = learnIdentityInsertTables(context, model, warnings);
+        if (candidates.isEmpty()) {
+            if (!learnedIdentityInsertTable) {
+                return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), warnings);
+            }
+            SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, Map.of());
+            Optional<FileChange> fileChange = writeIfChanged(context, rewriteConfigPath, model);
+            return new SqlRewriteConfigUpdate(rewriteConfig, fileChange, warnings);
+        }
         Map<String, List<String>> inferredMethodKeys = new LinkedHashMap<>();
         Map<String, List<UpsertKeyInference.InferenceResult>> tableInferenceResults = new LinkedHashMap<>();
 
@@ -79,6 +94,47 @@ class SqlRewriteConfigUpdater {
         SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, inferredMethodKeys);
         Optional<FileChange> fileChange = writeIfChanged(context, rewriteConfigPath, model);
         return new SqlRewriteConfigUpdate(rewriteConfig, fileChange, warnings);
+    }
+
+    private boolean learnIdentityInsertTables(
+            AdapterContext context,
+            RewriteConfigModel model,
+            List<String> warnings
+    ) {
+        Path reportPath = context.reportDir().resolve(VALIDATION_REPORT_JSON);
+        if (!Files.isRegularFile(reportPath)) {
+            return false;
+        }
+        boolean changed = false;
+        try {
+            JsonNode records = objectMapper.readTree(reportPath.toFile()).path("records");
+            if (!records.isArray()) {
+                return false;
+            }
+            for (JsonNode record : records) {
+                if (!"FAILED".equalsIgnoreCase(record.path("status").asText())) {
+                    continue;
+                }
+                String details = record.path("summary").asText("") + "\n"
+                        + record.path("message").asText("");
+                if (!details.contains("SET IDENTITY_INSERT") || !details.contains("自增列")) {
+                    continue;
+                }
+                Matcher matcher = IDENTITY_INSERT_TABLE_PATTERN.matcher(details);
+                if (!matcher.find()) {
+                    continue;
+                }
+                String tableName = matcher.group(1).replaceAll("\\s+", "");
+                if (model.addIdentityInsertTable(tableName)) {
+                    changed = true;
+                    warnings.add("Learned identityInsertTables entry " + tableName
+                            + " from the previous Dameng validation failure.");
+                }
+            }
+        } catch (IOException ignored) {
+            // A malformed or partially written previous report must not block migration.
+        }
+        return changed;
     }
 
     private void applyUnambiguousTableKeys(
@@ -278,6 +334,21 @@ class SqlRewriteConfigUpdater {
 
         Set<String> identityInsertTables() {
             return Set.copyOf(identityInsertTables);
+        }
+
+        boolean addIdentityInsertTable(String tableName) {
+            if (tableName == null || tableName.isBlank() || !identityInsertTables.add(tableName.trim())) {
+                return false;
+            }
+            while (!identityInsertLines.isEmpty()
+                    && identityInsertLines.get(identityInsertLines.size() - 1).isBlank()) {
+                identityInsertLines.remove(identityInsertLines.size() - 1);
+            }
+            if (identityInsertLines.isEmpty()) {
+                identityInsertLines.add("identityInsertTables:");
+            }
+            identityInsertLines.add("  - \"" + escapeYaml(tableName.trim()) + "\"");
+            return true;
         }
 
         String toYaml() {
