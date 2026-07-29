@@ -422,10 +422,27 @@ public class MigrateCommand implements Callable<Integer> {
     private List<RewriteConfigCandidate> rewriteConfigCandidates(MapperMigrationResult mapperMigrationResult) {
         List<RewriteConfigCandidate> candidates = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
+        MySqlToDmSqlConverter candidateExtractor = new MySqlToDmSqlConverter();
         for (com.github.dmadapter.core.SqlChange sqlChange : mapperMigrationResult.manualReviewItems()) {
             String sql = sqlChange.originalSql() == null ? "" : sqlChange.originalSql();
             String lower = sql.toLowerCase();
             String reason = sqlChange.reason() == null ? "" : sqlChange.reason().toLowerCase();
+            String methodKey = sqlChange.statementId();
+            if (methodKey != null && !methodKey.isBlank() && !methodKey.startsWith("(")) {
+                candidateExtractor.outerJoinSourceKeyCandidate(sql).ifPresent(sourceCandidate -> {
+                    String key = methodKey
+                            + "|outer|"
+                            + DamengMetadataReader.normalizeTableName(sourceCandidate.tableName());
+                    if (seen.add(key)) {
+                        candidates.add(new RewriteConfigCandidate(
+                                methodKey,
+                                sourceCandidate.tableName(),
+                                sourceCandidate.joinColumns(),
+                                RewriteConfigCandidate.RewriteKind.OUTER_JOIN_SOURCE
+                        ));
+                    }
+                });
+            }
             boolean needsKeyColumns = lower.contains("on duplicate key update")
                     || lower.contains("insert ignore")
                     || reason.contains("on duplicate key update requires configured keycolumns")
@@ -437,11 +454,10 @@ public class MigrateCommand implements Callable<Integer> {
             if (tableName.isBlank()) {
                 continue;
             }
-            String methodKey = sqlChange.statementId();
             if (methodKey == null || methodKey.isBlank() || methodKey.startsWith("(")) {
                 continue;
             }
-            String key = methodKey + "|" + DamengMetadataReader.normalizeTableName(tableName);
+            String key = methodKey + "|upsert|" + DamengMetadataReader.normalizeTableName(tableName);
             if (seen.add(key)) {
                 RewriteConfigCandidate.RewriteKind rewriteKind = lower.contains("insert ignore")
                         ? RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
@@ -548,11 +564,14 @@ public class MigrateCommand implements Callable<Integer> {
                     tableNames
             );
             Path resolvedSqlRoot = resolvedSqlRoot(context);
-            if (resolvedSqlRoot == null || resolvedSqlRoot.startsWith(context.projectRoot())) {
+            Path sqlMetadataRoot = resolvedSqlRoot == null || resolvedSqlRoot.getParent() == null
+                    ? resolvedSqlRoot
+                    : resolvedSqlRoot.getParent();
+            if (sqlMetadataRoot == null || sqlMetadataRoot.startsWith(context.projectRoot())) {
                 return metadata;
             }
             return mergeMetadata(
-                    projectDdlKeyMetadataReader.readTableKeys(resolvedSqlRoot, tableNames),
+                    projectDdlKeyMetadataReader.readTableKeys(sqlMetadataRoot, tableNames),
                     metadata
             );
         } catch (Exception e) {

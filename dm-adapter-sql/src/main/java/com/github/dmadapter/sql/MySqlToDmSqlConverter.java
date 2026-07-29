@@ -7,6 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -1002,11 +1003,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             String sql,
             Map<String, List<String>> tableKeyColumns
     ) {
-        if (sql == null || sql.isBlank() || tableKeyColumns == null || tableKeyColumns.isEmpty()) {
+        if (sql == null || sql.isBlank()) {
             return convert(sql);
         }
         GenericConversion outerJoinConversion =
-                convertUniqueSourceLeftJoinUpdate(sql, tableKeyColumns);
+                convertUniqueSourceLeftJoinUpdate(
+                        sql,
+                        tableKeyColumns == null ? Map.of() : tableKeyColumns
+                );
         if (!outerJoinConversion.changed()) {
             return convert(sql);
         }
@@ -1027,6 +1031,80 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             );
         }
         return SqlConversionResult.changed(sql, remaining.convertedSql(), rules);
+    }
+
+    public Optional<OuterJoinSourceKeyCandidate> outerJoinSourceKeyCandidate(String sql) {
+        if (sql == null || sql.isBlank() || splitTopLevelStatements(sql).size() != 1) {
+            return Optional.empty();
+        }
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return Optional.empty();
+        }
+        int joinIndex = findTopLevelKeyword(sql, "JOIN", updateIndex + "UPDATE".length());
+        int setIndex = joinIndex < 0
+                ? -1
+                : findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length());
+        if (joinIndex < 0
+                || setIndex < 0
+                || findTopLevelKeyword(sql, "JOIN", joinIndex + "JOIN".length()) >= 0) {
+            return Optional.empty();
+        }
+        int joinTypeStart = joinTypeStart(sql, joinIndex);
+        String joinType = sql.substring(joinTypeStart, joinIndex).strip();
+        if (!Pattern.compile("(?is)^LEFT(?:\\s+OUTER)?$").matcher(joinType).matches()) {
+            return Optional.empty();
+        }
+        String target = sql.substring(updateIndex + "UPDATE".length(), joinTypeStart).strip();
+        String joinSource = sql.substring(joinIndex + "JOIN".length(), setIndex).strip();
+        UpdateJoinChain chain = updateJoinChain(target, joinSource, true);
+        if (chain == null || chain.tables().size() != 2 || chain.conditions().size() != 1) {
+            return Optional.empty();
+        }
+        UpdateJoinTable sourceTable = chain.tables().get(1);
+        if (sourceTable.tableSql().stripLeading().startsWith("(")) {
+            return Optional.empty();
+        }
+        List<String> joinColumns = new ArrayList<>();
+        for (String predicate : splitStrictTopLevelAndPredicates(chain.conditions().get(0))) {
+            int equalsIndex = findTopLevelChar(predicate, '=', 0);
+            if (equalsIndex < 0
+                    || findTopLevelChar(predicate, '=', equalsIndex + 1) >= 0) {
+                continue;
+            }
+            String left = predicate.substring(0, equalsIndex).strip();
+            String right = predicate.substring(equalsIndex + 1).strip();
+            String sourceColumn = qualifiedColumnForAlias(left, sourceTable.aliasKey());
+            if (sourceColumn.isBlank()
+                    && !referencesAliasOutsideIgnoredText(left, sourceTable.aliasKey())) {
+                sourceColumn = qualifiedColumnForAlias(right, sourceTable.aliasKey());
+            }
+            if (!sourceColumn.isBlank()
+                    && !joinColumns.stream()
+                    .map(this::normalizeIdentifierKey)
+                    .toList()
+                    .contains(normalizeIdentifierKey(sourceColumn))) {
+                joinColumns.add(sourceColumn);
+            }
+        }
+        if (joinColumns.isEmpty()) {
+            return Optional.empty();
+        }
+        String tableName = Pattern.compile("\\s+")
+                .split(sourceTable.tableSql().strip(), 2)[0];
+        return Optional.of(new OuterJoinSourceKeyCandidate(tableName, joinColumns));
+    }
+
+    private String qualifiedColumnForAlias(String expression, String aliasKey) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*(?<alias>" + DM_IDENTIFIER + ")\\s*\\.\\s*"
+                        + "(?<column>" + DM_IDENTIFIER + ")\\s*$"
+        ).matcher(expression == null ? "" : expression);
+        if (!matcher.matches()
+                || !normalizeIdentifierKey(matcher.group("alias")).equals(aliasKey)) {
+            return "";
+        }
+        return matcher.group("column");
     }
 
     private SqlConversionResult manualReviewResult(
@@ -5902,26 +5980,40 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String whereClause = whereIndex < 0
                 ? ""
                 : sql.substring(whereIndex + "WHERE".length(), statementEnd).strip();
-        UpdateJoinChain chain = updateJoinChain(target, joinSource, false);
+        UpdateJoinChain chain = updateJoinChain(target, joinSource, true);
         if (chain == null || chain.tables().size() != 2 || chain.conditions().size() != 1) {
             return GenericConversion.unchanged(sql);
         }
         UpdateJoinTable targetTable = chain.tables().get(0);
         UpdateJoinTable sourceTable = chain.tables().get(1);
-        if (referencesAliasOutsideIgnoredText(whereClause, sourceTable.aliasKey())) {
-            return GenericConversion.unchanged(sql);
+        List<String> outerWherePredicates = new ArrayList<>();
+        List<String> sourceWherePredicates = new ArrayList<>();
+        if (!whereClause.isBlank()) {
+            List<String> predicates = splitStrictTopLevelAndPredicates(whereClause);
+            if (predicates.isEmpty()) {
+                return GenericConversion.unchanged(sql);
+            }
+            for (String predicate : predicates) {
+                if (referencesAliasOutsideIgnoredText(predicate, sourceTable.aliasKey())) {
+                    sourceWherePredicates.add(predicate);
+                } else {
+                    outerWherePredicates.add(predicate);
+                }
+            }
         }
         List<String> sourceKeys = uniqueSourceKeyColumns(tableKeyColumns, sourceTable.tableSql());
-        if (sourceKeys.isEmpty()
-                || !joinConditionBindsUniqueSourceKey(
-                chain.conditions().get(0),
-                sourceTable.aliasKey(),
-                sourceKeys
-        )) {
-            return GenericConversion.unchanged(sql);
-        }
+        boolean uniqueSource = !sourceKeys.isEmpty()
+                && joinConditionBindsUniqueSourceKey(
+                        chain.conditions().get(0),
+                        sourceTable.aliasKey(),
+                        sourceKeys
+                );
+        List<String> sourceQueryPredicates = new ArrayList<>();
+        sourceQueryPredicates.add(chain.conditions().get(0));
+        sourceQueryPredicates.addAll(sourceWherePredicates);
 
         List<String> assignments = new ArrayList<>();
+        boolean sourceDependentAssignment = false;
         for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
             Matcher targetMatcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
             if (!targetMatcher.find()
@@ -5932,23 +6024,20 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             String rightSide = assignmentRightSide(assignment.text()).strip();
             String convertedRightSide = rightSide;
             if (referencesAliasOutsideIgnoredText(rightSide, sourceTable.aliasKey())) {
-                Matcher sourceColumn = Pattern.compile(
-                        "(?is)^\\s*(?<alias>" + DM_IDENTIFIER + ")\\s*\\.\\s*"
-                                + "(?<column>" + DM_IDENTIFIER + ")\\s*$"
-                ).matcher(rightSide);
-                if (!sourceColumn.matches()
-                        || !normalizeIdentifierKey(sourceColumn.group("alias"))
-                        .equals(sourceTable.aliasKey())) {
+                if (!uniqueSource
+                        || containsPatternOutsideIgnoredText(
+                        rightSide,
+                        Pattern.compile("(?is)\\bSELECT\\b")
+                )) {
                     return GenericConversion.unchanged(sql);
                 }
+                sourceDependentAssignment = true;
                 convertedRightSide = "(SELECT "
-                        + sourceColumn.group("alias")
-                        + "."
-                        + sourceColumn.group("column")
+                        + rightSide
                         + " FROM "
                         + sourceTable.tableSql()
                         + " WHERE "
-                        + chain.conditions().get(0)
+                        + String.join(" AND ", sourceQueryPredicates)
                         + ")";
             }
             assignments.add(
@@ -5960,6 +6049,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (assignments.isEmpty()) {
             return GenericConversion.unchanged(sql);
         }
+        if (sourceDependentAssignment && !uniqueSource) {
+            return GenericConversion.unchanged(sql);
+        }
+        if (!sourceWherePredicates.isEmpty()) {
+            outerWherePredicates.add(
+                    "EXISTS (SELECT 1 FROM "
+                            + sourceTable.tableSql()
+                            + " WHERE "
+                            + String.join(" AND ", sourceQueryPredicates)
+                            + ")"
+            );
+        }
 
         StringBuilder converted = new StringBuilder(sql.length() + 64);
         converted.append(sql, 0, updateIndex)
@@ -5967,8 +6068,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 .append(targetTable.tableSql())
                 .append(" set ")
                 .append(String.join(", ", assignments));
-        if (!whereClause.isBlank()) {
-            converted.append(" where ").append(whereClause);
+        if (!outerWherePredicates.isEmpty()) {
+            converted.append(" where ").append(String.join(" AND ", outerWherePredicates));
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
@@ -5981,6 +6082,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String trimmed = tableSql == null ? "" : tableSql.strip();
         if (trimmed.isBlank()) {
             return List.of();
+        }
+        if (trimmed.startsWith("(")) {
+            return derivedGroupedSourceKeyColumns(trimmed);
         }
         String tableToken = Pattern.compile("\\s+").split(trimmed, 2)[0];
         String normalizedTable = normalizeIdentifierKey(tableLeaf(tableToken))
@@ -5996,6 +6100,50 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return List.of();
+    }
+
+    private List<String> derivedGroupedSourceKeyColumns(String tableSql) {
+        int closeParen = findMatchingParen(tableSql, 0);
+        if (closeParen < 0) {
+            return List.of();
+        }
+        String query = tableSql.substring(1, closeParen).strip();
+        if (!startsKeyword(query, 0, "SELECT")) {
+            return List.of();
+        }
+        int groupIndex = findTopLevelKeyword(query, "GROUP", 0);
+        if (groupIndex < 0) {
+            return List.of();
+        }
+        int byIndex = skipWhitespace(query, groupIndex + "GROUP".length());
+        if (!startsKeyword(query, byIndex, "BY")) {
+            return List.of();
+        }
+        int groupStart = skipWhitespace(query, byIndex + "BY".length());
+        int groupEnd = query.length();
+        for (String clause : List.of("HAVING", "ORDER", "LIMIT", "FETCH")) {
+            int clauseIndex = findTopLevelKeyword(query, clause, groupStart);
+            if (clauseIndex >= 0) {
+                groupEnd = Math.min(groupEnd, clauseIndex);
+            }
+        }
+        String groupClause = query.substring(groupStart, groupEnd).strip();
+        if (groupClause.isBlank()) {
+            return List.of();
+        }
+        Pattern simpleColumn = Pattern.compile(
+                "(?is)^\\s*(?:(?:" + DM_IDENTIFIER + ")\\s*\\.\\s*)?"
+                        + "(?<column>" + DM_IDENTIFIER + ")\\s*$"
+        );
+        List<String> columns = new ArrayList<>();
+        for (TopLevelArgument argument : splitTopLevelArguments(groupClause)) {
+            Matcher matcher = simpleColumn.matcher(argument.text());
+            if (!matcher.matches()) {
+                return List.of();
+            }
+            columns.add(matcher.group("column"));
+        }
+        return List.copyOf(columns);
     }
 
     private boolean joinConditionBindsUniqueSourceKey(
@@ -10698,6 +10846,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record UpdateJoinChain(List<UpdateJoinTable> tables, List<String> conditions) {
+    }
+
+    public record OuterJoinSourceKeyCandidate(String tableName, List<String> joinColumns) {
+        public OuterJoinSourceKeyCandidate {
+            tableName = tableName == null ? "" : tableName.strip();
+            joinColumns = List.copyOf(joinColumns == null ? List.of() : joinColumns);
+        }
     }
 
     private record UpdateSetAssignment(String aliasKey, String columnKey, String text) {

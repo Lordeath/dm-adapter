@@ -54,11 +54,15 @@ class SqlRewriteConfigUpdater {
 
         for (RewriteConfigCandidate candidate : candidates) {
             model.ensureTable(candidate.tableName(), List.of());
-            boolean configured = hasConfiguredKeyColumns(model.methodColumns(candidate.methodKey()))
+            boolean configured = candidate.outerJoinSource()
+                    ? hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()))
+                    : hasConfiguredKeyColumns(model.methodColumns(candidate.methodKey()))
                     || hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()));
             if (configured) {
-                model.ensureMethod(candidate.methodKey(), List.of());
-                model.removeMethodResolution(candidate.methodKey());
+                if (!candidate.outerJoinSource()) {
+                    model.ensureMethod(candidate.methodKey(), List.of());
+                    model.removeMethodResolution(candidate.methodKey());
+                }
             } else if (metadataAvailable) {
                 TableKeyMetadata metadata = metadataByTable.get(DamengMetadataReader.normalizeTableName(candidate.tableName()));
                 Optional<UpsertKeyInference.InferenceResult> result = inference.infer(candidate, metadata);
@@ -67,32 +71,46 @@ class SqlRewriteConfigUpdater {
                             .computeIfAbsent(DamengMetadataReader.normalizeTableName(candidate.tableName()), ignored -> new ArrayList<>())
                             .add(inferenceResult);
                     if (inferenceResult.inferred()) {
-                        inferredMethodKeys.put(candidate.methodKey(), inferenceResult.keyColumns());
-                        model.putMethod(candidate.methodKey(), inferenceResult.keyColumns());
-                        model.removeMethodResolution(candidate.methodKey());
-                        warnings.add("Inferred keyColumns " + inferenceResult.keyColumns()
-                                + " for " + candidate.methodKey()
-                                + " from " + inferenceResult.source() + ".");
-                    } else {
-                        model.ensureMethod(candidate.methodKey(), List.of());
-                        model.putMethodResolution(candidate.methodKey(), inferenceResult.resolutionCode());
-                        if (UpsertKeyInference.RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT.equals(
-                                inferenceResult.resolutionCode()
-                        )) {
-                            warnings.add("Resolved " + candidate.methodKey()
-                                    + " as a plain INSERT: " + inferenceResult.reason());
+                        if (candidate.outerJoinSource()) {
+                            model.putTable(candidate.tableName(), inferenceResult.keyColumns());
+                            warnings.add("Inferred source keyColumns " + inferenceResult.keyColumns()
+                                    + " for outer UPDATE JOIN table " + candidate.tableName()
+                                    + " from " + inferenceResult.source() + ".");
                         } else {
-                            warnings.add("Could not infer keyColumns for " + candidate.methodKey()
-                                    + ": " + inferenceResult.reason());
+                            inferredMethodKeys.put(candidate.methodKey(), inferenceResult.keyColumns());
+                            model.putMethod(candidate.methodKey(), inferenceResult.keyColumns());
+                            model.removeMethodResolution(candidate.methodKey());
+                            warnings.add("Inferred keyColumns " + inferenceResult.keyColumns()
+                                    + " for " + candidate.methodKey()
+                                    + " from " + inferenceResult.source() + ".");
+                        }
+                    } else {
+                        if (candidate.outerJoinSource()) {
+                            warnings.add("Could not prove source keyColumns for outer UPDATE JOIN table "
+                                    + candidate.tableName() + ": " + inferenceResult.reason());
+                        } else {
+                            model.ensureMethod(candidate.methodKey(), List.of());
+                            model.putMethodResolution(candidate.methodKey(), inferenceResult.resolutionCode());
+                            if (UpsertKeyInference.RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT.equals(
+                                    inferenceResult.resolutionCode()
+                            )) {
+                                warnings.add("Resolved " + candidate.methodKey()
+                                        + " as a plain INSERT: " + inferenceResult.reason());
+                            } else {
+                                warnings.add("Could not infer keyColumns for " + candidate.methodKey()
+                                        + ": " + inferenceResult.reason());
+                            }
                         }
                     }
                 });
             } else {
-                model.ensureMethod(candidate.methodKey(), List.of());
-                model.putMethodResolution(
-                        candidate.methodKey(),
-                        UpsertKeyInference.RESOLUTION_METADATA_UNAVAILABLE
-                );
+                if (!candidate.outerJoinSource()) {
+                    model.ensureMethod(candidate.methodKey(), List.of());
+                    model.putMethodResolution(
+                            candidate.methodKey(),
+                            UpsertKeyInference.RESOLUTION_METADATA_UNAVAILABLE
+                    );
+                }
             }
         }
 

@@ -23,8 +23,13 @@ record RewriteConfigCandidate(
         return rewriteKind == RewriteKind.INSERT_IGNORE;
     }
 
+    boolean outerJoinSource() {
+        return rewriteKind == RewriteKind.OUTER_JOIN_SOURCE;
+    }
+
     enum RewriteKind {
         ON_DUPLICATE_KEY_UPDATE,
-        INSERT_IGNORE
+        INSERT_IGNORE,
+        OUTER_JOIN_SOURCE
     }
 }

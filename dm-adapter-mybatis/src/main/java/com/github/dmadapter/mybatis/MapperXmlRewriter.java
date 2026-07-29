@@ -478,8 +478,17 @@ public class MapperXmlRewriter {
                 commentSafeSql = plainInsert.text();
                 staticRules.add(MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT_RULE);
             }
-            SqlConversionResult conversionResult =
-                    sqlConverter.convert(commentSafeSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
+            SqlConversionResult conversionResult;
+            if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                    && containsOuterUpdateJoin(commentSafeSql)) {
+                conversionResult = mySqlToDmSqlConverter.convertOuterJoinWithUniqueSourceKeys(
+                        commentSafeSql,
+                        rewriteConfig.tableKeyColumns()
+                );
+            } else {
+                conversionResult =
+                        sqlConverter.convert(commentSafeSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
+            }
             String convertedSql = conversionResult.changed()
                     ? conversionResult.convertedSql()
                     : commentSafeSql;
@@ -964,6 +973,16 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
+            DynamicBodyConversion uniqueSourceOuterJoin = convertDynamicUniqueSourceOuterJoin(
+                    converted,
+                    sqlConverter,
+                    rewriteConfig
+            );
+            if (uniqueSourceOuterJoin.changed()) {
+                converted = uniqueSourceOuterJoin.convertedBody();
+                addAppliedRules(appliedRules, uniqueSourceOuterJoin.appliedRules());
+                addManualReviewReasons(manualReviewReasons, uniqueSourceOuterJoin.manualReviewReasons());
+            }
             DynamicBodyConversion dynamicOuterJoinMerge = convertDynamicTargetOnlyOuterJoinToMerge(
                     converted,
                     sqlConverter
@@ -1091,6 +1110,38 @@ public class MapperXmlRewriter {
             converted = duplicateBlockSemicolon.text();
         }
         return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
+    }
+
+    private DynamicBodyConversion convertDynamicUniqueSourceOuterJoin(
+            String body,
+            SqlConverter sqlConverter,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        if (!(sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter)
+                || !containsOuterUpdateJoin(body)) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        SqlConversionResult conversionResult =
+                mySqlToDmSqlConverter.convertOuterJoinWithUniqueSourceKeys(
+                        body,
+                        rewriteConfig.tableKeyColumns()
+                );
+        if (!conversionResult.changed()
+                || conversionResult.manualReviewRequired()
+                || !conversionResult.appliedRules().contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE)
+                || !conversionResult.convertedSql().stripLeading().toUpperCase(Locale.ROOT).startsWith("UPDATE ")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        List<String> appliedRules = new ArrayList<>();
+        appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+        addAppliedRules(appliedRules, conversionResult.appliedRules());
+        return new DynamicBodyConversion(
+                body,
+                conversionResult.convertedSql(),
+                appliedRules,
+                List.of(),
+                true
+        );
     }
 
     private TextRewrite removeDuplicateDamengBlockSemicolons(String body) {

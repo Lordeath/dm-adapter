@@ -53,6 +53,44 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
+    void writesOnlyTableKeyForOuterJoinSourceMetadata() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.UserMapper.updateOrganizationName",
+                "sample_organization",
+                List.of("id"),
+                RewriteConfigCandidate.RewriteKind.OUTER_JOIN_SOURCE
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("sample_organization", List.of(
+                new TableConstraint(
+                        "PK_SAMPLE_ORGANIZATION",
+                        TableConstraint.ConstraintType.PRIMARY_KEY,
+                        List.of("id")
+                )
+        ));
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(candidate),
+                Map.of("sample_organization", metadata),
+                true
+        );
+
+        assertThat(update.rewriteConfig().tableKeyColumns())
+                .containsEntry("sample_organization", List.of("id"));
+        assertThat(update.rewriteConfig().methodKeyColumns()).isEmpty();
+        assertThat(update.warnings())
+                .containsExactly("Inferred source keyColumns [id] for outer UPDATE JOIN table "
+                        + "sample_organization from primary key PK_SAMPLE_ORGANIZATION.");
+        assertThat(Files.readString(config))
+                .contains("\"sample_organization\":")
+                .contains("keyColumns: [\"id\"]")
+                .doesNotContain("\"com.example.UserMapper.updateOrganizationName\":");
+    }
+
+    @Test
     void preservesExistingMethodKeyColumnsWhenMetadataDiffers() throws Exception {
         Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         Files.createDirectories(config.getParent());

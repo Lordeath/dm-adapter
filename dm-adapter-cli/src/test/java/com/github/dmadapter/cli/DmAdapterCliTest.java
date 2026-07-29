@@ -413,6 +413,50 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateInfersOuterJoinSourceKeyAndRewritesDynamicUpdate() throws Exception {
+        writeDemoProject();
+        Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <update id="updateOrganizationNames">
+                        update sample_user user_row
+                        left join sample_organization organization
+                            on user_row.organization_id = organization.id
+                        set user_row.organization_name = organization.name,
+                            user_row.update_time = now()
+                        where organization.id in
+                        <foreach collection="ids" item="id" open="(" separator="," close=")">
+                            #{id}
+                        </foreach>
+                    </update>
+                </mapper>
+                """);
+        writeFile("sql/schema.sql", """
+                CREATE TABLE `sample_organization` (
+                  `id` bigint NOT NULL,
+                  `name` varchar(100) DEFAULT NULL,
+                  PRIMARY KEY (`id`)
+                );
+                """);
+
+        int exitCode = execute("migrate", "--project", tempDir.toString());
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-rewrite.yml")))
+                .contains("\"sample_organization\":")
+                .contains("keyColumns: [\"id\"]")
+                .doesNotContain("\"com.example.UserMapper.updateOrganizationNames\":");
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .contains("organization_name = (SELECT organization.name FROM sample_organization organization")
+                .contains("where EXISTS (SELECT 1 FROM sample_organization organization")
+                .doesNotContainIgnoringCase("left join");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
+                .doesNotContain("MySQL UPDATE JOIN continues across dynamic MyBatis XML elements");
+    }
+
+    @Test
     void migrateReadsExternalSqlRootForOriginalUpsertConflictKeyDiagnosis() throws Exception {
         Path projectRoot = tempDir.resolve("service/01_Java/sample-service");
         writeDemoProject(projectRoot);
