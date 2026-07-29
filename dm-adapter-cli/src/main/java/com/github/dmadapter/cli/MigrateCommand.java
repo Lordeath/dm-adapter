@@ -539,14 +539,35 @@ public class MigrateCommand implements Callable<Integer> {
             List<String> warnings
     ) {
         try {
-            return projectDdlKeyMetadataReader.readTableKeys(
+            List<String> tableNames = candidates.stream()
+                    .map(RewriteConfigCandidate::tableName)
+                    .distinct()
+                    .toList();
+            Map<String, TableKeyMetadata> metadata = projectDdlKeyMetadataReader.readTableKeys(
                     context.projectRoot(),
-                    candidates.stream().map(RewriteConfigCandidate::tableName).distinct().toList()
+                    tableNames
+            );
+            Path resolvedSqlRoot = resolvedSqlRoot(context);
+            if (resolvedSqlRoot == null || resolvedSqlRoot.startsWith(context.projectRoot())) {
+                return metadata;
+            }
+            return mergeMetadata(
+                    projectDdlKeyMetadataReader.readTableKeys(resolvedSqlRoot, tableNames),
+                    metadata
             );
         } catch (Exception e) {
             warnings.add("Project DDL metadata inference was skipped: " + e.getMessage());
             return Map.of();
         }
+    }
+
+    private Path resolvedSqlRoot(AdapterContext context) {
+        if (sqlRoot == null) {
+            return null;
+        }
+        return (sqlRoot.isAbsolute() ? sqlRoot : context.projectRoot().resolve(sqlRoot))
+                .toAbsolutePath()
+                .normalize();
     }
 
     private Map<String, TableKeyMetadata> mergeMetadata(

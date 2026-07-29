@@ -76,5 +76,29 @@ class SqlRewriteConfigLoaderTest {
 
         assertThat(config.convertsInsertIgnoreToPlainInsert("com.example.BankFileMapper.insert")).isTrue();
         assertThat(config.convertsInsertIgnoreToPlainInsert("com.example.BankFileMapper.other")).isFalse();
+        assertThat(config.upsertKeyResolutionFor("com.example.BankFileMapper.insert"))
+                .isEqualTo("INSERT_IGNORE_AS_PLAIN_INSERT");
+        assertThat(config.upsertKeyResolutionFor("com.example.BankFileMapper.other")).isEmpty();
+    }
+
+    @Test
+    void resolvesUpsertManualReviewReasonFromMetadataDiagnosis() {
+        SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
+                "upsertKeyResolutions:",
+                "  methods:",
+                "    \"com.example.ScoreRuleMapper.upsert\": \"ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY\"",
+                "    \"com.example.UnknownMapper.upsert\": \"KEY_METADATA_UNAVAILABLE\""
+        ));
+
+        assertThat(config.resolveUpsertManualReviewReason(
+                "com.example.ScoreRuleMapper.upsert",
+                "ON DUPLICATE KEY UPDATE requires configured keyColumns."
+        )).contains("UPDATE branch cannot be reached")
+                .contains("do not guess keyColumns");
+        assertThat(config.resolveUpsertManualReviewReason(
+                "com.example.UnknownMapper.upsert",
+                "ON DUPLICATE KEY UPDATE requires configured keyColumns."
+        )).contains("metadata was unavailable")
+                .contains("--sql-root");
     }
 }

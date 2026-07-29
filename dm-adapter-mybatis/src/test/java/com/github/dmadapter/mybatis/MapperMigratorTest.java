@@ -362,6 +362,60 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationReportsOriginalUpsertWithoutReachableConflictKey() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ScoreRuleMapper">
+                    <insert id="insertOrUpdateBatch">
+                        INSERT INTO sample_score_rule (rule_id, score)
+                        VALUES
+                        <foreach collection="entities" item="entity" separator=",">
+                            (#{entity.ruleId}, #{entity.score})
+                        </foreach>
+                        ON DUPLICATE KEY UPDATE score = VALUES(score)
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ScoreRuleMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ScoreRuleMapper.xml")),
+                List.of()
+        );
+        String statementKey = "com.example.ScoreRuleMapper.insertOrUpdateBatch";
+        SqlRewriteConfig rewriteConfig = new SqlRewriteConfig(
+                Map.of(),
+                Map.of(),
+                Set.of(),
+                Set.of(),
+                Set.of(),
+                Set.of(),
+                Map.of(statementKey, SqlRewriteConfig.ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY)
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                rewriteConfig
+        );
+
+        assertThat(result.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("Original ON DUPLICATE KEY UPDATE")
+                        .contains("UPDATE branch cannot be reached")
+                        .contains("do not guess keyColumns")
+                        .doesNotContain("requires configured keyColumns"));
+    }
+
+    @Test
     void migrationWrapsConfiguredIdentityInsertTableWithReplaceNull() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

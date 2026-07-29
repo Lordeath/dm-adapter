@@ -16,6 +16,13 @@ public record SqlRewriteConfig(
         Set<String> identityInsertTables,
         Map<String, String> upsertKeyResolutions
 ) {
+    public static final String ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY =
+            "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
+    public static final String KEY_METADATA_UNAVAILABLE =
+            "KEY_METADATA_UNAVAILABLE";
+    public static final String MANUAL_KEY_COLUMNS_REQUIRED =
+            "MANUAL_KEY_COLUMNS_REQUIRED";
+
     public SqlRewriteConfig(
             Map<String, List<String>> tableKeyColumns,
             Map<String, List<String>> methodKeyColumns,
@@ -129,6 +136,34 @@ public record SqlRewriteConfig(
             return false;
         }
         return "INSERT_IGNORE_AS_PLAIN_INSERT".equals(upsertKeyResolutions.get(methodKey.trim()));
+    }
+
+    public String upsertKeyResolutionFor(String methodKey) {
+        if (methodKey == null || methodKey.isBlank()) {
+            return "";
+        }
+        return upsertKeyResolutions.getOrDefault(methodKey.trim(), "");
+    }
+
+    public String resolveUpsertManualReviewReason(String methodKey, String defaultReason) {
+        if (defaultReason == null || !defaultReason.contains("ON DUPLICATE KEY UPDATE")) {
+            return defaultReason;
+        }
+        return switch (upsertKeyResolutionFor(methodKey)) {
+            case ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY ->
+                    "Original ON DUPLICATE KEY UPDATE has no usable primary or unique conflict key "
+                            + "among the inserted columns according to project or Dameng metadata; "
+                            + "its UPDATE branch cannot be reached as written. Fix the original SQL "
+                            + "or its real unique constraint; do not guess keyColumns.";
+            case KEY_METADATA_UNAVAILABLE ->
+                    "ON DUPLICATE KEY UPDATE could not be converted because authoritative primary "
+                            + "or unique key metadata was unavailable from --project, --sql-root, or "
+                            + "Dameng. Provide the real DDL/connection or explicitly verified keyColumns.";
+            case MANUAL_KEY_COLUMNS_REQUIRED ->
+                    "ON DUPLICATE KEY UPDATE has more than one possible conflict key or could not be "
+                            + "resolved unambiguously. Configure only explicitly verified keyColumns.";
+            default -> defaultReason;
+        };
     }
 
     static String normalizeTableName(String tableName) {

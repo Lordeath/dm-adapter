@@ -2392,7 +2392,10 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.reason()).contains("UPDATE JOIN");
+        assertThat(result.reason())
+                .contains("outer/cross UPDATE JOIN")
+                .contains("at most one source row")
+                .contains("real uniqueness guarantee");
         assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
