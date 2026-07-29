@@ -273,6 +273,41 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void writesExecutableNoOpsForConsumedMysqlStatementsInStrictValidationPlan() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        Path validationPlan = tempDir.resolve(".dm-adapter/sql-script-validation-plan.json");
+        write(sqlRoot.resolve("20260604.sql"), """
+                SET @db_name = (SELECT database());
+                SELECT 1;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-association",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                        validationPlan
+                )
+        );
+
+        String converted = Files.readString(sqlRootOut.resolve("20260604.sql"));
+        assertThat(report.validationPlan()).isEqualTo(validationPlan.toAbsolutePath().normalize().toString());
+        assertThat(converted)
+                .contains("-- DM_ADAPTER: MySQL script variable @db_name uses "
+                        + "SYS_CONTEXT('USERENV','CURRENT_SCHEMA') in converted metadata checks")
+                .contains("BEGIN\n    NULL;\nEND;\n/")
+                .contains("SELECT 1;");
+        assertThat(SqlScriptParser.statements(converted)).hasSize(2);
+    }
+
+    @Test
     void convertsScriptDynamicColumnDdlToDamengAnonymousBlock() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
