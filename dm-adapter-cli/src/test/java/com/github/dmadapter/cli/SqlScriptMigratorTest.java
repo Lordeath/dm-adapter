@@ -307,6 +307,39 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void ignoresMysqlSetNamesBecauseJdbcControlsClientEncoding() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                SET NAMES utf8mb4;
+                SET NAMES 'utf8' COLLATE 'utf8_general_ci';
+                SELECT 1;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-schema",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260205.sql"));
+        assertThat(converted)
+                .contains("-- DM_ADAPTER: ignored MySQL SET NAMES utf8mb4")
+                .contains("-- DM_ADAPTER: ignored MySQL SET NAMES 'utf8'")
+                .contains("BEGIN\n    NULL;\nEND;\n/")
+                .contains("SELECT 1;")
+                .doesNotContainPattern("(?im)^\\s*SET\\s+NAMES\\b");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SET_NAMES_NOOP_RULE));
+    }
+
+    @Test
     void writesExecutableNoOpsForConsumedMysqlStatementsInStrictValidationPlan() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
