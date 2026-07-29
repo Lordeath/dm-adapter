@@ -5670,7 +5670,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void marksProcedureDeclaredLaterInSameSchemaAsOrderingProblem() throws Exception {
+    void recompilesProcedureAfterSafeForwardDependencyInSameFile() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("20260205.sql"), """
@@ -5690,10 +5690,18 @@ class SqlScriptMigratorTest {
                 tempDir, sqlRoot, sqlRootOut, false, "sample-app", "", DmValidationEnvironment.from(Map.of())
         ));
 
-        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
-        assertThat(report.manualReviewItems()).singleElement().satisfies(item -> assertThat(item.reason())
-                .contains("依赖顺序错误")
-                .contains("sample-app.later_proc"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        String output = Files.readString(sqlRootOut.resolve("20260205.sql"));
+        assertThat(output)
+                .contains("CREATE OR REPLACE PROCEDURE caller_proc() AS")
+                .contains("CREATE OR REPLACE PROCEDURE later_proc() AS")
+                .contains("ALTER PROCEDURE caller_proc COMPILE");
+        assertThat(output.indexOf("CREATE OR REPLACE PROCEDURE later_proc() AS"))
+                .isLessThan(output.indexOf("ALTER PROCEDURE caller_proc COMPILE"));
+        assertThat(report.files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.DM_PROCEDURE_RECOMPILE_AFTER_FORWARD_DEPENDENCY_RULE
+                ));
     }
 
     @Test
