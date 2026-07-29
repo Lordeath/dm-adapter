@@ -741,6 +741,70 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void inlinesStableSelectIntoScriptVariablesAcrossTransientProcedure() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT DISTINCT tenant_id INTO @tenantId
+                FROM tenant_registry
+                ORDER BY tenant_id ASC
+                LIMIT 1;
+                SELECT MIN(org_id) INTO @orgId
+                FROM tenant_org
+                WHERE tenant_id = @tenantId;
+                DROP PROCEDURE IF EXISTS seed_tenant;
+                DELIMITER $$
+                CREATE PROCEDURE seed_tenant()
+                BEGIN
+                    INSERT INTO tenant_audit(tenant_id, org_id)
+                    VALUES (@tenantId, @orgId);
+                END$$
+                DELIMITER ;
+                CALL seed_tenant();
+                DROP PROCEDURE IF EXISTS seed_tenant;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("query-backed script variable @tenantId was inlined from a stable scalar query")
+                .contains("query-backed script variable @orgId was inlined from a stable scalar query")
+                .contains("SELECT DISTINCT tenant_id FROM tenant_registry")
+                .contains("ORDER BY tenant_id ASC\nLIMIT 1")
+                .contains("SELECT MIN(org_id) FROM tenant_org")
+                .contains("INSERT INTO tenant_audit(tenant_id, org_id)")
+                .doesNotContain("INTO @tenantId")
+                .doesNotContain("INTO @orgId")
+                .doesNotContain("VALUES (@tenantId, @orgId)")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE seed_tenant")
+                .doesNotContain("CALL seed_tenant()");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE,
+                        SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE
+                ));
+    }
+
+    @Test
+    void keepsSelectIntoScriptVariableWhenItsSourceTableChanges() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT tenant_id INTO @tenantId
+                FROM tenant_registry
+                ORDER BY tenant_id ASC
+                LIMIT 1;
+                UPDATE tenant_registry SET active = 1 WHERE tenant_id = @tenantId;
+                INSERT INTO tenant_audit(tenant_id) VALUES (@tenantId);
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isGreaterThan(0);
+        assertThat(converted.sql())
+                .contains("INTO @tenantId")
+                .contains("UPDATE tenant_registry")
+                .contains("VALUES (@tenantId)")
+                .doesNotContain("query-backed script variable @tenantId was inlined");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE));
+    }
+
+    @Test
     void doesNotGroupQueryBackedScriptVariableAcrossStoredRoutine() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SET @tenant_id := (

@@ -80,6 +80,8 @@ class SqlScriptMigrator {
             "MYSQL_SET_NAMES_NOOP";
     static final String MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE =
             "MYSQL_SCRIPT_USER_VARIABLE_LITERAL";
+    static final String MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE =
+            "MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE";
     static final String MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE =
             "MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK";
     static final String MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE =
@@ -210,6 +212,20 @@ class SqlScriptMigrator {
             "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?:\\s*\\.\\s*(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
+    private static final Pattern SCRIPT_QUERY_SOURCE_TABLE_PATTERN = Pattern.compile(
+            "(?is)\\b(?:FROM|JOIN)\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
+    );
+    private static final Pattern SCRIPT_TABLE_MUTATION_PATTERN = Pattern.compile(
+            "(?is)\\b(?:"
+                    + "INSERT\\s+(?:IGNORE\\s+)?INTO"
+                    + "|REPLACE\\s+INTO"
+                    + "|UPDATE"
+                    + "|DELETE\\s+FROM"
+                    + "|MERGE\\s+INTO"
+                    + "|(?:ALTER|CREATE|DROP|TRUNCATE)\\s+(?:TEMPORARY\\s+)?TABLE"
+                    + "(?:\\s+IF\\s+(?:NOT\\s+)?EXISTS)?"
+                    + ")\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
+    );
     private static final Pattern MYSQL_ON_DUPLICATE_INSERT_SHAPE_PATTERN = Pattern.compile(
             "(?is)\\bINSERT\\s+(?:IGNORE\\s+)?INTO\\s+"
                     + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s*"
@@ -2117,6 +2133,292 @@ class SqlScriptMigrator {
         );
     }
 
+    private QueryUserVariableInlining inlineStableQueryBackedScriptVariables(List<String> statements) {
+        if (statements == null || statements.size() < 2) {
+            return new QueryUserVariableInlining(
+                    statements == null ? List.of() : statements,
+                    false,
+                    0,
+                    Set.of()
+            );
+        }
+        List<String> converted = new ArrayList<>(statements);
+        LinkedHashMap<String, String> knownExpressions = new LinkedHashMap<>();
+        LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
+        int inlineCount = 0;
+        for (int index = 0; index < converted.size(); index++) {
+            String statement = converted.get(index);
+            ScriptUserVariableAssignment literalAssignment =
+                    scriptUserVariableAssignment(splitLeadingSqlPrefix(statement).body());
+            if (literalAssignment != null) {
+                knownExpressions.put(
+                        literalAssignment.name().toLowerCase(Locale.ROOT),
+                        literalAssignment.literal()
+                );
+                continue;
+            }
+
+            QueryBackedUserVariableAssignment assignment =
+                    queryBackedUserVariableAssignment(statement, knownExpressions);
+            if (assignment == null) {
+                String assignedName = topLevelAssignedUserVariableName(statement);
+                if (!assignedName.isBlank()) {
+                    knownExpressions.remove(assignedName.toLowerCase(Locale.ROOT));
+                }
+                continue;
+            }
+            int lastReference = queryUserVariableLastReference(
+                    converted,
+                    index,
+                    assignment.name()
+            );
+            if (lastReference <= index
+                    || queryUserVariableSourceChanges(
+                    converted,
+                    index,
+                    lastReference,
+                    assignment.sourceTables()
+            )) {
+                knownExpressions.remove(assignment.name().toLowerCase(Locale.ROOT));
+                continue;
+            }
+
+            LeadingSqlPrefix prefix = splitLeadingSqlPrefix(statement);
+            converted.set(
+                    index,
+                    prefix.prefix()
+                            + "-- DM_ADAPTER: query-backed script variable @"
+                            + assignment.name()
+                            + " was inlined from a stable scalar query"
+            );
+            for (int referenceIndex = index + 1;
+                 referenceIndex <= lastReference;
+                 referenceIndex++) {
+                converted.set(
+                        referenceIndex,
+                        replaceScriptUserVariable(
+                                converted.get(referenceIndex),
+                                assignment.name(),
+                                assignment.scalarExpression()
+                        )
+                );
+            }
+            knownExpressions.put(
+                    assignment.name().toLowerCase(Locale.ROOT),
+                    assignment.scalarExpression()
+            );
+            appliedRules.add(MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE);
+            appliedRules.addAll(assignment.appliedRules());
+            inlineCount++;
+        }
+        return new QueryUserVariableInlining(
+                List.copyOf(converted),
+                inlineCount > 0,
+                inlineCount,
+                Set.copyOf(appliedRules)
+        );
+    }
+
+    private QueryBackedUserVariableAssignment queryBackedUserVariableAssignment(
+            String statement,
+            Map<String, String> knownExpressions
+    ) {
+        LeadingSqlPrefix prefix = splitLeadingSqlPrefix(statement);
+        String body = prefix.body().strip();
+        int selectIndex = skipWhitespace(body, 0);
+        if (!startsKeyword(body, selectIndex, "SELECT")) {
+            return null;
+        }
+        int intoIndex = topLevelKeywordIndexAfter(
+                body,
+                "INTO",
+                selectIndex + "SELECT".length()
+        );
+        if (intoIndex < 0) {
+            return null;
+        }
+        String projection = body.substring(
+                selectIndex + "SELECT".length(),
+                intoIndex
+        ).strip();
+        if (projection.isBlank() || splitTopLevelComma(projection).size() != 1) {
+            return null;
+        }
+
+        int cursor = skipWhitespace(body, intoIndex + "INTO".length());
+        if (cursor >= body.length() || body.charAt(cursor) != '@') {
+            return null;
+        }
+        int nameStart = cursor + 1;
+        if (nameStart >= body.length() || !isUserVariableStart(body.charAt(nameStart))) {
+            return null;
+        }
+        int nameEnd = nameStart + 1;
+        while (nameEnd < body.length() && isUserVariablePart(body.charAt(nameEnd))) {
+            nameEnd++;
+        }
+        String name = body.substring(nameStart, nameEnd);
+        cursor = skipWhitespace(body, nameEnd);
+        if (!startsKeyword(body, cursor, "FROM")) {
+            return null;
+        }
+
+        String query = "SELECT " + projection + " " + body.substring(cursor).strip();
+        ScriptUserVariableInline dependencyInline =
+                inlineScriptUserVariables(query, new LinkedHashMap<>(knownExpressions));
+        if (!mysqlUserVariableReferences(dependencyInline.sql()).isEmpty()) {
+            return null;
+        }
+        SqlConversionResult queryConversion = converter.convert(dependencyInline.sql());
+        if (queryConversion.manualReviewRequired()) {
+            return null;
+        }
+        String convertedQuery = queryConversion.convertedSql().strip();
+        if (!startsKeyword(convertedQuery, skipWhitespace(convertedQuery, 0), "SELECT")
+                || !mysqlUserVariableReferences(convertedQuery).isEmpty()) {
+            return null;
+        }
+        Set<String> sourceTables = capturedTableKeysOutsideIgnoredText(
+                dependencyInline.sql(),
+                SCRIPT_QUERY_SOURCE_TABLE_PATTERN
+        );
+        if (sourceTables.isEmpty()) {
+            return null;
+        }
+        return new QueryBackedUserVariableAssignment(
+                name,
+                "(" + convertedQuery + ")",
+                sourceTables,
+                queryConversion.appliedRules()
+        );
+    }
+
+    private int queryUserVariableLastReference(
+            List<String> statements,
+            int assignmentIndex,
+            String variableName
+    ) {
+        int lastReference = -1;
+        for (int index = assignmentIndex + 1; index < statements.size(); index++) {
+            String statement = statements.get(index);
+            String assignedName = topLevelAssignedUserVariableName(statement);
+            if (assignedName.equalsIgnoreCase(variableName)
+                    || assignsUserVariableOutsideSetOrSelectInto(statement, variableName)) {
+                break;
+            }
+            if (referencesUserVariable(statement, variableName)) {
+                lastReference = index;
+            }
+        }
+        return lastReference;
+    }
+
+    private String topLevelAssignedUserVariableName(String statement) {
+        String body = splitLeadingSqlPrefix(statement).body().strip();
+        Matcher setMatcher = Pattern.compile(
+                "(?is)^SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)"
+        ).matcher(body);
+        if (setMatcher.find()) {
+            return setMatcher.group("name");
+        }
+        int selectIndex = skipWhitespace(body, 0);
+        if (!startsKeyword(body, selectIndex, "SELECT")) {
+            return "";
+        }
+        int intoIndex = topLevelKeywordIndexAfter(
+                body,
+                "INTO",
+                selectIndex + "SELECT".length()
+        );
+        if (intoIndex < 0) {
+            return "";
+        }
+        int cursor = skipWhitespace(body, intoIndex + "INTO".length());
+        if (cursor >= body.length() || body.charAt(cursor) != '@') {
+            return "";
+        }
+        int start = cursor + 1;
+        if (start >= body.length() || !isUserVariableStart(body.charAt(start))) {
+            return "";
+        }
+        int end = start + 1;
+        while (end < body.length() && isUserVariablePart(body.charAt(end))) {
+            end++;
+        }
+        return body.substring(start, end);
+    }
+
+    private boolean assignsUserVariableOutsideSetOrSelectInto(
+            String statement,
+            String variableName
+    ) {
+        List<UserVariableReference> references = mysqlUserVariableReferences(statement).stream()
+                .filter(reference -> reference.name().equalsIgnoreCase(variableName))
+                .toList();
+        return !references.isEmpty() && hasUnsafeUserVariableAssignment(statement, references);
+    }
+
+    private boolean queryUserVariableSourceChanges(
+            List<String> statements,
+            int assignmentIndex,
+            int lastReference,
+            Set<String> sourceTables
+    ) {
+        for (int index = assignmentIndex + 1; index <= lastReference; index++) {
+            Set<String> mutationTargets = capturedTableKeysOutsideIgnoredText(
+                    statements.get(index),
+                    SCRIPT_TABLE_MUTATION_PATTERN
+            );
+            if (mutationTargets.stream().anyMatch(sourceTables::contains)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Set<String> capturedTableKeysOutsideIgnoredText(String sql, Pattern pattern) {
+        LinkedHashSet<String> tables = new LinkedHashSet<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                Matcher matcher = pattern.matcher(sql);
+                matcher.region(index, sql.length());
+                if (matcher.lookingAt()) {
+                    tables.add(normalizedTableKey(matcher.group("table")));
+                    index = matcher.end();
+                } else {
+                    index++;
+                }
+            }
+        }
+        return Set.copyOf(tables);
+    }
+
+    private String replaceScriptUserVariable(
+            String sql,
+            String variableName,
+            String expression
+    ) {
+        return inlineScriptUserVariables(
+                sql,
+                new LinkedHashMap<>(Map.of(
+                        variableName.toLowerCase(Locale.ROOT),
+                        expression
+                ))
+        ).sql();
+    }
+
     private SnapshotUserVariableGrouping groupSnapshotUserVariableSequences(List<String> statements) {
         if (statements == null || statements.size() < 2) {
             return new SnapshotUserVariableGrouping(
@@ -2344,11 +2646,14 @@ class SqlScriptMigrator {
         String originalContent = readSqlScriptContent(sqlFile);
         long parseStartedAt = System.nanoTime();
         List<String> parsedStatements = SqlScriptParser.statements(originalContent);
+        QueryUserVariableInlining queryUserVariableInlining =
+                inlineStableQueryBackedScriptVariables(parsedStatements);
         SnapshotUserVariableGrouping snapshotUserVariableGrouping =
-                groupSnapshotUserVariableSequences(parsedStatements);
+                groupSnapshotUserVariableSequences(queryUserVariableInlining.statements());
         List<String> originalStatements = snapshotUserVariableGrouping.statements();
         progress("Parsed SQL script: " + relative
                 + ", statements=" + parsedStatements.size()
+                + ", inlinedQueryVariables=" + queryUserVariableInlining.inlineCount()
                 + ", groupedSnapshotVariables=" + snapshotUserVariableGrouping.groupCount()
                 + ", elapsedMs=" + elapsedMillis(parseStartedAt));
         List<String> convertedStatements = new ArrayList<>();
@@ -2366,6 +2671,9 @@ class SqlScriptMigrator {
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
         if (snapshotUserVariableGrouping.changed()) {
             appliedRules.add(MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE);
+        }
+        if (queryUserVariableInlining.changed()) {
+            appliedRules.addAll(queryUserVariableInlining.appliedRules());
         }
         int convertedStatementCount = 0;
         int manualReviewStatementCount = 0;
@@ -12218,6 +12526,30 @@ class SqlScriptMigrator {
         private SafeRuleConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
             manualReviewReason = manualReviewReason == null ? "" : manualReviewReason;
+        }
+    }
+
+    private record QueryUserVariableInlining(
+            List<String> statements,
+            boolean changed,
+            int inlineCount,
+            Set<String> appliedRules
+    ) {
+        private QueryUserVariableInlining {
+            statements = List.copyOf(statements == null ? List.of() : statements);
+            appliedRules = Set.copyOf(appliedRules == null ? Set.of() : appliedRules);
+        }
+    }
+
+    private record QueryBackedUserVariableAssignment(
+            String name,
+            String scalarExpression,
+            Set<String> sourceTables,
+            List<String> appliedRules
+    ) {
+        private QueryBackedUserVariableAssignment {
+            sourceTables = Set.copyOf(sourceTables == null ? Set.of() : sourceTables);
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
         }
     }
 
