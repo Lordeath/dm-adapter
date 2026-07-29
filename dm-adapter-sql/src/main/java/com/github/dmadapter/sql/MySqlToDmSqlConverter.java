@@ -298,6 +298,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^\\s*select\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
                     + "(?<where>.+?)(?:\\s+order\\s+by\\s+ordinal_position\\s*(?<direction>asc|desc)?\\s*)?;?\\s*$"
     );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_COUNT_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+count\\s*\\(\\s*(?:\\*|1)\\s*\\)"
+                    + "(?:\\s+(?:as\\s+)?(?<alias>" + DM_IDENTIFIER + "))?"
+                    + "\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+(?<where>.+?)\\s*;?\\s*$"
+    );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_AGGREGATE_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+listagg\\s*\\(\\s*column_name\\s*,\\s*','\\s*\\)"
+                    + "\\s+within\\s+group\\s*\\(\\s*order\\s+by\\s+column_name\\s*\\)"
+                    + "(?:\\s+(?:as\\s+)?(?<alias>" + DM_IDENTIFIER + "))?"
+                    + "\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+(?<where>.+?)\\s*;?\\s*$"
+    );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_SIMPLE_DETAIL_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+column_name\\s*,\\s*column_comment\\s*,\\s*data_type\\s*,\\s*"
+                    + "is_nullable\\s*,\\s*column_default\\s*,\\s*character_maximum_length\\s+"
+                    + "from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+(?<where>.+?)\\s*;?\\s*$"
+    );
     private static final Pattern INFORMATION_SCHEMA_COLUMNS_DETAIL_PATTERN = Pattern.compile(
             "(?is)^\\s*select\\s+"
                     + "table_schema\\s+(?:as\\s+)?(?<schemaAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
@@ -348,8 +364,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern METADATA_TABLE_NAME_LIKE_CONDITION = Pattern.compile(
             "(?is)\\btable_name\\s+like\\s+(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*'|\\([^)]*\\))"
     );
+    private static final Pattern METADATA_COLUMN_NAME_CONDITION = Pattern.compile(
+            "(?is)\\bcolumn_name\\s*=\\s*(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*')"
+    );
     private static final Pattern METADATA_TABLE_SCHEMA_CONDITION = Pattern.compile(
             "(?is)\\btable_schema\\s*=\\s*(?<value>\\?|#\\{[^}]+}|\\$\\{[^}]+}|'(?:''|[^'])*'|database\\s*\\(\\s*\\)|\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\))"
+    );
+    private static final Pattern METADATA_TABLE_TYPE_CONDITION = Pattern.compile(
+            "(?is)\\btable_type\\s*=\\s*(?<value>'(?:''|[^'])*')"
     );
     private static final Pattern UPDATE_SET_QUALIFIED_ASSIGNMENT = Pattern.compile(
             "(?is)^\\s*(?<alias>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\.\\s*"
@@ -4369,6 +4391,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (tableListConversion.changed()) {
             return tableListConversion;
         }
+        GenericConversion commonProjectionConversion = convertInformationSchemaCommonColumnProjections(sql);
+        if (commonProjectionConversion.changed()) {
+            return commonProjectionConversion;
+        }
         Matcher matcher = INFORMATION_SCHEMA_COLUMNS_PATTERN.matcher(sql);
         if (!matcher.matches()) {
             return GenericConversion.unchanged(sql);
@@ -4396,6 +4422,121 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + " ORDER BY COLUMN_ID"
                 + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
         return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaCommonColumnProjections(String sql) {
+        Matcher countMatcher = INFORMATION_SCHEMA_COLUMNS_COUNT_PATTERN.matcher(sql);
+        if (countMatcher.matches()) {
+            return convertInformationSchemaColumnCount(
+                    sql,
+                    countMatcher.group("where"),
+                    countMatcher.group("alias")
+            );
+        }
+        Matcher aggregateMatcher = INFORMATION_SCHEMA_COLUMNS_AGGREGATE_PATTERN.matcher(sql);
+        if (aggregateMatcher.matches()) {
+            return convertInformationSchemaColumnAggregate(
+                    sql,
+                    aggregateMatcher.group("where"),
+                    aggregateMatcher.group("alias")
+            );
+        }
+        Matcher detailMatcher = INFORMATION_SCHEMA_COLUMNS_SIMPLE_DETAIL_PATTERN.matcher(sql);
+        if (detailMatcher.matches()) {
+            return convertInformationSchemaSimpleColumnDetail(sql, detailMatcher.group("where"));
+        }
+        return GenericConversion.unchanged(sql);
+    }
+
+    private GenericConversion convertInformationSchemaColumnCount(
+            String sql,
+            String whereClause,
+            String alias
+    ) {
+        MetadataColumnFilter filter = parseMetadataColumnFilter(whereClause, true);
+        if (filter == null || filter.columnName().isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT COUNT(*)"
+                + (alias == null || alias.isBlank() ? "" : " AS " + alias)
+                + " FROM ALL_TAB_COLUMNS"
+                + metadataColumnFilterCondition(filter);
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaColumnAggregate(
+            String sql,
+            String whereClause,
+            String alias
+    ) {
+        MetadataColumnFilter filter = parseMetadataColumnFilter(whereClause, false);
+        if (filter == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT LISTAGG(COLUMN_NAME, ',') WITHIN GROUP (ORDER BY COLUMN_ID)"
+                + (alias == null || alias.isBlank() ? "" : " AS " + alias)
+                + " FROM ALL_TAB_COLUMNS"
+                + metadataColumnFilterCondition(filter);
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaSimpleColumnDetail(String sql, String whereClause) {
+        MetadataColumnFilter filter = parseMetadataColumnFilter(whereClause, false);
+        if (filter == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT\n"
+                + "    c.COLUMN_NAME AS COLUMN_NAME,\n"
+                + "    cc.COMMENTS AS COLUMN_COMMENT,\n"
+                + "    c.DATA_TYPE AS DATA_TYPE,\n"
+                + "    CASE c.NULLABLE WHEN 'Y' THEN 'YES' ELSE 'NO' END AS IS_NULLABLE,\n"
+                + "    c.DATA_DEFAULT AS COLUMN_DEFAULT,\n"
+                + "    c.CHAR_LENGTH AS CHARACTER_MAXIMUM_LENGTH\n"
+                + "FROM ALL_TAB_COLUMNS c\n"
+                + "LEFT JOIN ALL_COL_COMMENTS cc\n"
+                + "    ON cc.OWNER = c.OWNER\n"
+                + "    AND cc.TABLE_NAME = c.TABLE_NAME\n"
+                + "    AND cc.COLUMN_NAME = c.COLUMN_NAME\n"
+                + metadataColumnFilterCondition(filter, "c.")
+                + "\nORDER BY c.COLUMN_ID";
+        return new GenericConversion(converted, true);
+    }
+
+    private MetadataColumnFilter parseMetadataColumnFilter(String whereClause, boolean requireColumnName) {
+        Matcher tableNameMatcher = METADATA_TABLE_NAME_CONDITION.matcher(whereClause);
+        if (!tableNameMatcher.find()) {
+            return null;
+        }
+        String tableName = tableNameMatcher.group("value").trim();
+        Matcher tableSchemaMatcher = METADATA_TABLE_SCHEMA_CONDITION.matcher(whereClause);
+        String tableSchema = tableSchemaMatcher.find() ? tableSchemaMatcher.group("value").trim() : "";
+        Matcher columnNameMatcher = METADATA_COLUMN_NAME_CONDITION.matcher(whereClause);
+        String columnName = columnNameMatcher.find() ? columnNameMatcher.group("value").trim() : "";
+        if (requireColumnName && columnName.isBlank()) {
+            return null;
+        }
+        String residual = tableNameMatcher.replaceAll("");
+        residual = METADATA_TABLE_SCHEMA_CONDITION.matcher(residual).replaceAll("");
+        residual = METADATA_COLUMN_NAME_CONDITION.matcher(residual).replaceAll("");
+        residual = residual.replaceAll("(?i)\\bAND\\b", "")
+                .replaceAll("[()\\s]", "");
+        if (!residual.isBlank()) {
+            return null;
+        }
+        return new MetadataColumnFilter(tableName, tableSchema, columnName);
+    }
+
+    private String metadataColumnFilterCondition(MetadataColumnFilter filter) {
+        return metadataColumnFilterCondition(filter, "");
+    }
+
+    private String metadataColumnFilterCondition(MetadataColumnFilter filter, String qualifier) {
+        String owner = metadataOwnerExpression(filter.tableSchema());
+        return " WHERE " + qualifier + "TABLE_NAME = UPPER(" + filter.tableName() + ")"
+                + (owner.isBlank() ? "" : " AND " + qualifier + "OWNER = " + owner)
+                + (filter.columnName().isBlank()
+                        ? ""
+                        : " AND " + qualifier + "COLUMN_NAME = UPPER(" + filter.columnName() + ")");
     }
 
     private GenericConversion convertInformationSchemaColumnDescriptors(String sql) {
@@ -4649,6 +4790,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (tableDetailConversion.changed()) {
             return tableDetailConversion;
         }
+        GenericConversion simpleTableListConversion = convertInformationSchemaSimpleTableList(sql);
+        if (simpleTableListConversion.changed()) {
+            return simpleTableListConversion;
+        }
         GenericConversion tableListConversion = convertInformationSchemaTablesList(sql);
         if (tableListConversion.changed()) {
             return tableListConversion;
@@ -4679,6 +4824,53 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + tableName
                 + ")"
                 + metadataOwnerCondition(tableSchema);
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaSimpleTableList(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*select\\s+table_name\\s+from\\s+information_schema\\s*\\.\\s*tables\\s+"
+                        + "where\\s+(?<where>.+?)\\s*;?\\s*$"
+        ).matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String whereClause = matcher.group("where");
+        Matcher schemaMatcher = METADATA_TABLE_SCHEMA_CONDITION.matcher(whereClause);
+        if (!schemaMatcher.find()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String schema = schemaMatcher.group("value").trim();
+        Matcher typeMatcher = METADATA_TABLE_TYPE_CONDITION.matcher(whereClause);
+        if (!typeMatcher.find()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableTypeLiteral = typeMatcher.group("value");
+        String tableType = tableTypeLiteral.substring(1, tableTypeLiteral.length() - 1)
+                .replace("''", "'");
+        if (!"VIEW".equalsIgnoreCase(tableType) && !"BASE TABLE".equalsIgnoreCase(tableType)) {
+            return GenericConversion.unchanged(sql);
+        }
+        Matcher likeMatcher = METADATA_TABLE_NAME_LIKE_CONDITION.matcher(whereClause);
+        String tableLike = likeMatcher.find() ? likeMatcher.group("value").trim() : "";
+        String residual = schemaMatcher.replaceAll("");
+        residual = METADATA_TABLE_TYPE_CONDITION.matcher(residual).replaceAll("");
+        residual = METADATA_TABLE_NAME_LIKE_CONDITION.matcher(residual).replaceAll("");
+        residual = residual.replaceAll("(?i)\\bAND\\b", "")
+                .replaceAll("[()\\s]", "");
+        if (!residual.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String owner = metadataOwnerExpression(schema);
+        if (owner.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        boolean view = "VIEW".equalsIgnoreCase(tableType);
+        String nameColumn = view ? "VIEW_NAME" : "TABLE_NAME";
+        String converted = "SELECT " + nameColumn + (view ? " AS TABLE_NAME" : "")
+                + " FROM " + (view ? "ALL_VIEWS" : "ALL_TABLES")
+                + " WHERE OWNER = " + owner
+                + (tableLike.isBlank() ? "" : " AND " + nameColumn + " LIKE UPPER(" + tableLike + ")");
         return new GenericConversion(converted, true);
     }
 
@@ -9648,6 +9840,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record GroupConcatOrderBy(String orderBy, String separator) {
+    }
+
+    private record MetadataColumnFilter(String tableName, String tableSchema, String columnName) {
     }
 
     private record LikePlaceholderLiteralConcat(int operandStartIndex, int endIndex, String replacement) {

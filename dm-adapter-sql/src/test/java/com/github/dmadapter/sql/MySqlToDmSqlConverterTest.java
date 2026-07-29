@@ -2852,6 +2852,84 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlInformationSchemaColumnCountForDifferentRuntimeSchemas() {
+        for (String schema : List.of("tenant_alpha", "tenant_beta")) {
+            SqlConversionResult result = converter.convert("""
+                    SELECT COUNT(1)
+                    FROM information_schema.COLUMNS
+                    WHERE table_schema = '%s'
+                      AND table_name = #{tableName}
+                      AND column_name = #{columnName}
+                    """.formatted(schema));
+
+            assertThat(result.changed()).isTrue();
+            assertThat(result.manualReviewRequired()).isFalse();
+            assertThat(result.convertedSql())
+                    .isEqualTo("SELECT COUNT(*) FROM ALL_TAB_COLUMNS"
+                            + " WHERE TABLE_NAME = UPPER(#{tableName})"
+                            + " AND OWNER = UPPER('" + schema + "')"
+                            + " AND COLUMN_NAME = UPPER(#{columnName})");
+            assertThat(result.appliedRules())
+                    .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+        }
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaColumnNameAggregation() {
+        SqlConversionResult result = converter.convert("""
+                SELECT GROUP_CONCAT(COLUMN_NAME) AS result
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = (select database())
+                  AND TABLE_NAME = #{tableName}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT LISTAGG(COLUMN_NAME, ',') WITHIN GROUP (ORDER BY COLUMN_ID) AS result"
+                        + " FROM ALL_TAB_COLUMNS"
+                        + " WHERE TABLE_NAME = UPPER(#{tableName})"
+                        + " AND OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')");
+        assertThat(result.appliedRules())
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE,
+                        MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE
+                );
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaSimpleColumnDetails() {
+        SqlConversionResult result = converter.convert("""
+                SELECT COLUMN_NAME, COLUMN_COMMENT, DATA_TYPE, IS_NULLABLE,
+                       COLUMN_DEFAULT, CHARACTER_MAXIMUM_LENGTH
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = (select database())
+                  AND TABLE_NAME = #{tableName}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT
+                    c.COLUMN_NAME AS COLUMN_NAME,
+                    cc.COMMENTS AS COLUMN_COMMENT,
+                    c.DATA_TYPE AS DATA_TYPE,
+                    CASE c.NULLABLE WHEN 'Y' THEN 'YES' ELSE 'NO' END AS IS_NULLABLE,
+                    c.DATA_DEFAULT AS COLUMN_DEFAULT,
+                    c.CHAR_LENGTH AS CHARACTER_MAXIMUM_LENGTH
+                FROM ALL_TAB_COLUMNS c
+                LEFT JOIN ALL_COL_COMMENTS cc
+                    ON cc.OWNER = c.OWNER
+                    AND cc.TABLE_NAME = c.TABLE_NAME
+                    AND cc.COLUMN_NAME = c.COLUMN_NAME
+                 WHERE c.TABLE_NAME = UPPER(#{tableName}) AND c.OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                ORDER BY c.COLUMN_ID
+                """.strip());
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
     void convertsMysqlInformationSchemaColumnDetailsToDamengMetadataViews() {
         SqlConversionResult result = converter.convert("""
                 select
@@ -3029,6 +3107,39 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql())
                 .isEqualTo("SELECT TABLE_NAME FROM ALL_TABLES WHERE TABLE_NAME LIKE UPPER('${tablePrefix}%') AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') GROUP BY TABLE_NAME FETCH FIRST 500 ROWS ONLY");
         assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaBaseTableAndViewLists() {
+        SqlConversionResult baseTableResult = converter.convert("""
+                SELECT TABLE_NAME
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = (select database())
+                  AND TABLE_TYPE = 'BASE TABLE'
+                """);
+        SqlConversionResult viewResult = converter.convert("""
+                SELECT TABLE_NAME
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = (select database())
+                  AND TABLE_TYPE = 'VIEW'
+                  AND TABLE_NAME LIKE 'vw_datacenter_%'
+                """);
+
+        assertThat(baseTableResult.changed()).isTrue();
+        assertThat(baseTableResult.manualReviewRequired()).isFalse();
+        assertThat(baseTableResult.convertedSql())
+                .isEqualTo("SELECT TABLE_NAME FROM ALL_TABLES"
+                        + " WHERE OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')");
+        assertThat(viewResult.changed()).isTrue();
+        assertThat(viewResult.manualReviewRequired()).isFalse();
+        assertThat(viewResult.convertedSql())
+                .isEqualTo("SELECT VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS"
+                        + " WHERE OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
+                        + " AND VIEW_NAME LIKE UPPER('vw_datacenter_%')");
+        assertThat(baseTableResult.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+        assertThat(viewResult.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }
 

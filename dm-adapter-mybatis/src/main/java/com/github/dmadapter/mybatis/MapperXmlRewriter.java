@@ -5464,7 +5464,9 @@ public class MapperXmlRewriter {
             }
 
             Matcher constantMatcher = Pattern.compile(
-                    "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*(?<constant>NULL|[-+]?\\d+(?:\\.\\d+)?|N?'(?:''|[^'])*')\\s*$"
+                    "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*"
+                            + "(?<constant>NULL|[-+]?\\d+(?:\\.\\d+)?|N?'(?:''|[^'])*'|"
+                            + "NOW\\s*\\(\\s*\\)|CURRENT_TIMESTAMP(?:\\s*\\(\\s*\\))?)\\s*$"
             ).matcher(assignment);
             if (constantMatcher.matches()) {
                 assignments.add(new BatchUpdateAssignment(
