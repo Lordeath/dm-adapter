@@ -773,7 +773,7 @@ public class MapperXmlRewriter {
                         rewriteConfig,
                         isDynamicWhereTag(nextTagName(rawBody, textEnd))
                 );
-                convertedBody.append(conversion.convertedText());
+                convertedBody.append(escapeBareXmlLessThan(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
                 addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
                 changed = changed || conversion.changed();
@@ -7890,6 +7890,10 @@ public class MapperXmlRewriter {
             }
         }
         return escaped.toString();
+    }
+
+    private String escapeBareXmlLessThan(String text) {
+        return text.indexOf('<') < 0 ? text : text.replace("<", "&lt;");
     }
 
     private record IfWrapper(String leading, String openingTag, String body, String closingTag, String trailing) {

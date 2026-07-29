@@ -4921,12 +4921,18 @@ class MapperMigratorTest {
                 new MySqlToDmSqlConverter()
         );
 
-        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml"));
+        Path rewrittenMapper = tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml");
+        String rewritten = Files.readString(rewrittenMapper);
         assertThat(rewritten)
                 .contains("(YEAR(t.finished_at) * 12 + MONTH(t.finished_at))")
                 .contains("CAST(#{criteria.yearMonth} AS DECIMAL(38, 0))")
+                .contains("&lt; 70")
+                .contains("&lt; 100")
+                .doesNotContain(" < 70")
+                .doesNotContain(" < 100")
                 .doesNotContainIgnoringCase("PERIOD_DIFF")
                 .doesNotContainIgnoringCase("DATE_FORMAT");
+        assertThat(XmlSupport.parse(rewrittenMapper).getDocumentElement().getTagName()).isEqualTo("mapper");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .contains(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
