@@ -4975,6 +4975,100 @@ class MapperMigratorTest {
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
+    @Test
+    void convertsUpdateJoinWithLimitedDerivedSelectionAndAdditionalSource() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/TaskMapper.xml", """
+                update sample_task target
+                join (
+                    select candidate.id
+                    from sample_task candidate
+                    join sample_transfer filter_transfer
+                      on filter_transfer.owner_id = candidate.owner_id
+                    where filter_transfer.id = #{criteria.transferId}
+                    limit #{criteria.rowCount}
+                ) selected on target.id = selected.id
+                join sample_transfer transfer on transfer.owner_id = target.owner_id
+                set target.owner_id = transfer.new_owner_id,
+                    target.updated_by = #{operatorId}
+                where transfer.id = #{criteria.transferId}
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TaskMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml"));
+        assertThat(rewritten)
+                .contains("update sample_task target set owner_id = transfer.new_owner_id")
+                .contains("from (")
+                .contains("select candidate.id")
+                .contains(") selected, sample_transfer transfer where target.id = selected.id")
+                .contains("transfer.owner_id = target.owner_id")
+                .doesNotContainIgnoringCase("update sample_task target\n            join");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void convertsUpdateOfJoinedTableAfterLimitedDerivedSelection() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/AssigneeMapper.xml", """
+                update sample_task target
+                join (
+                    select candidate.id
+                    from sample_task candidate
+                    join sample_transfer filter_transfer
+                      on filter_transfer.owner_id = candidate.owner_id
+                    where filter_transfer.id = #{criteria.transferId}
+                    limit #{criteria.rowCount}
+                ) selected on target.id = selected.id
+                join sample_transfer transfer on transfer.scope_id = target.scope_id
+                join sample_task_assignee assignee on assignee.task_id = target.id
+                set assignee.owner_id = transfer.new_owner_id,
+                    assignee.updated_by = #{operatorId}
+                where transfer.id = #{criteria.transferId}
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/AssigneeMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/AssigneeMapper.xml"));
+        assertThat(rewritten)
+                .contains("update sample_task_assignee assignee set owner_id = transfer.new_owner_id")
+                .contains("from sample_task target, (")
+                .contains(") selected, sample_transfer transfer where target.id = selected.id")
+                .contains("assignee.task_id = target.id")
+                .doesNotContainIgnoringCase("set assignee.owner_id");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
     private int countMatches(String value, String needle) {
         int count = 0;
         int index = 0;
