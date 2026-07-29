@@ -11,6 +11,7 @@ import com.github.dmadapter.sql.SqlConverter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -2013,7 +2014,31 @@ class SqlScriptMigrator {
     }
 
     private String readSqlScriptContent(Path sqlFile) throws IOException {
-        return stripLeadingBom(Files.readString(sqlFile, StandardCharsets.UTF_8));
+        byte[] bytes = Files.readAllBytes(sqlFile);
+        String content;
+        if (startsWith(bytes, 0xFF, 0xFE)) {
+            content = new String(bytes, 2, bytes.length - 2, StandardCharsets.UTF_16LE);
+        } else if (startsWith(bytes, 0xFE, 0xFF)) {
+            content = new String(bytes, 2, bytes.length - 2, StandardCharsets.UTF_16BE);
+        } else {
+            int offset = startsWith(bytes, 0xEF, 0xBB, 0xBF) ? 3 : 0;
+            content = StandardCharsets.UTF_8.newDecoder()
+                    .decode(ByteBuffer.wrap(bytes, offset, bytes.length - offset))
+                    .toString();
+        }
+        return stripLeadingBom(content);
+    }
+
+    private boolean startsWith(byte[] bytes, int... prefix) {
+        if (bytes == null || bytes.length < prefix.length) {
+            return false;
+        }
+        for (int index = 0; index < prefix.length; index++) {
+            if (Byte.toUnsignedInt(bytes[index]) != prefix[index]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private String stripLeadingBom(String content) {
@@ -2881,18 +2906,46 @@ class SqlScriptMigrator {
 
     private List<String> procedureCreateTableLikeCompilePlaceholders(String sql) {
         LinkedHashSet<String> placeholders = new LinkedHashSet<>();
-        Matcher matcher = Pattern.compile(
-                "(?is)\\bEXECUTE\\s+IMMEDIATE\\s+(?<ddl>'(?:''|[^'])*')"
-        ).matcher(sql);
         Pattern createTableLike = Pattern.compile(
                 "(?is)^\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+"
                         + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+LIKE\\s+"
                         + "(?<source>" + SQL_IDENTIFIER_TOKEN + ")\\s*$"
         );
-        while (matcher.find()) {
-            String ddl = decodeMysqlSingleQuotedLiteral(matcher.group("ddl"));
-            if (createTableLike.matcher(ddl).matches()) {
-                placeholders.add(ddl);
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "EXECUTE")) {
+                int immediateIndex = skipWhitespace(sql, index + "EXECUTE".length());
+                if (!startsKeyword(sql, immediateIndex, "IMMEDIATE")) {
+                    index += "EXECUTE".length();
+                    continue;
+                }
+                int literalStart = skipWhitespace(sql, immediateIndex + "IMMEDIATE".length());
+                if (literalStart >= sql.length() || sql.charAt(literalStart) != '\'') {
+                    index = immediateIndex + "IMMEDIATE".length();
+                    continue;
+                }
+                int literalEnd = skipSingleQuotedString(sql, literalStart);
+                if (literalEnd <= literalStart || sql.charAt(literalEnd - 1) != '\'') {
+                    index = literalEnd;
+                    continue;
+                }
+                String literal = sql.substring(literalStart, literalEnd);
+                String ddl = decodeMysqlSingleQuotedLiteral(literal);
+                if (createTableLike.matcher(ddl).matches()) {
+                    placeholders.add(ddl);
+                }
+                index = literalEnd;
+            } else {
+                index++;
             }
         }
         return List.copyOf(placeholders);

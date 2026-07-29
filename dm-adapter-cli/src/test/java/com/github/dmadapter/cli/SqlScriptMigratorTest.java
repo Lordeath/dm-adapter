@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Proxy;
 import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -26,6 +27,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
@@ -439,6 +441,42 @@ class SqlScriptMigratorTest {
                         SqlScriptMigrator.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
                         SqlScriptMigrator.MYSQL_TEMPORARY_INDEX_NOOP_RULE
                 ));
+    }
+
+    @Test
+    void readsUtf16LittleEndianSqlScriptAndWritesUtf8Output() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        Path source = sqlRoot.resolve("20260813_system.sql");
+        Files.createDirectories(source.getParent());
+        byte[] content = """
+                update ns_core_menu
+                set menu_menusubname = 'budgetParameterSetting'
+                where id = 1;
+                """.getBytes(StandardCharsets.UTF_16LE);
+        byte[] withBom = new byte[content.length + 2];
+        withBom[0] = (byte) 0xFF;
+        withBom[1] = (byte) 0xFE;
+        System.arraycopy(content, 0, withBom, 2, content.length);
+        Files.write(source, withBom);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-budget",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        byte[] output = Files.readAllBytes(sqlRootOut.resolve("20260813_system.sql"));
+        assertThat(report.validationFailureCount()).isZero();
+        assertThat(output[0]).isEqualTo((byte) 'u');
+        assertThat(new String(output, StandardCharsets.UTF_8))
+                .contains("update ns_core_menu")
+                .contains("menu_menusubname = 'budgetParameterSetting'")
+                .doesNotContain("\u0000");
     }
 
     @Test
@@ -3551,6 +3589,78 @@ class SqlScriptMigratorTest {
                 .contains("MERGE INTO tmp_menu_copy t")
                 .contains("ON (t.source_id = s.source_id)")
                 .doesNotContain("roleid VARCHAR(200)");
+    }
+
+    @Test
+    void convertsLongDynamicViewProcedureWithSmallThreadStack() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("view.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE create_budget_plan_view()
+                BEGIN
+                    IF NOT EXISTS(
+                        SELECT 1
+                        FROM INFORMATION_SCHEMA.VIEWS
+                        WHERE TABLE_NAME = N'ns_budget_plan_view'
+                          AND TABLE_SCHEMA = DATABASE()
+                    )
+                    THEN
+                        CREATE VIEW ns_budget_plan_view AS
+                            SELECT
+                                p.id,
+                                p.budgetTitle,
+                                p.departmentName,
+                                p.templateName,
+                                p.year,
+                                p.remark,
+                                p.financeNum,
+                                p.tradeName,
+                                p.processNum,
+                                p.outBpmFlowUrl,
+                                p.departmentId,
+                                p.organizationShortName,
+                                p.auditStatus,
+                                p.createUserId,
+                                p.createUserName,
+                                p.createDateTime,
+                                p.updateUserId,
+                                p.updateUserName,
+                                p.updateDateTime,
+                                p.deleteFlag
+                            FROM ns_budget_plan p
+                            WHERE p.deleteFlag = 0
+                            ORDER BY p.id;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread worker = new Thread(null, () -> {
+            try {
+                migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-budget",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                ));
+            } catch (Throwable throwable) {
+                failure.set(throwable);
+            }
+        }, "small-stack-sql-converter", 256 * 1024L);
+
+        worker.start();
+        worker.join(TimeUnit.SECONDS.toMillis(10));
+
+        assertThat(worker.isAlive()).isFalse();
+        assertThat(failure.get()).isNull();
+        assertThat(Files.readString(sqlRootOut.resolve("view.sql")))
+                .contains("EXECUTE IMMEDIATE 'CREATE VIEW ns_budget_plan_view AS")
+                .contains("ORDER BY p.id'");
     }
 
     @Test
