@@ -456,6 +456,8 @@ class DmAdapterCliTest {
     @Test
     void generateValidationTestWritesConfigAndMyBatisJdbcTest() throws Exception {
         writeDemoProject();
+        Path mapper = tempDir.resolve("src/main/resources/mapper/UserMapper.xml");
+        Files.writeString(mapper, "\uFEFF" + Files.readString(mapper));
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
 
         int exitCode = execute(
@@ -557,7 +559,7 @@ class DmAdapterCliTest {
                         + "                            field.getName(),\n"
                         + "                            configured,\n"
                         + "                            statement")
-                .contains("data_length as column_length")
+                .contains("case when char_length > 0 then char_length else data_length end as column_length")
                 .contains("defaultColumnLength")
                 .contains("primaryDmlTable")
                 .contains("isBlank(existing.tableName())")
@@ -1066,7 +1068,8 @@ class DmAdapterCliTest {
                 .contains("normalizedName.contains(\"thisday\")")
                 .contains("hasTemporalRangeQualifier")
                 .contains("shouldPreferConfiguredSqlFragmentDefault")
-                .contains("configuredDefault != null && shouldPreferConfiguredSqlFragmentDefault(valueName)")
+                .contains("if (isBlank(columnType)")
+                .contains("&& shouldPreferConfiguredSqlFragmentDefault(valueName)")
                 .contains("isDayOfMonthParameterName")
                 .contains("DateTimeFormatter.ofPattern(\"yyyy-MM-dd HH:mm:ss\")")
                 .contains("\"yyyy-MM-dd HH:mm:ss.S\"")

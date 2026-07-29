@@ -8,12 +8,10 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
-import org.xml.sax.InputSource;
-
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.IOException;
-import java.io.Reader;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -614,8 +612,8 @@ class DmSqlValidationTestGenerator {
         enableFeature(factory, "http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
         enableFeature(factory, "http://xml.org/sax/features/external-general-entities", false);
         enableFeature(factory, "http://xml.org/sax/features/external-parameter-entities", false);
-        try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
-            return factory.newDocumentBuilder().parse(new InputSource(reader));
+        try (InputStream input = Files.newInputStream(path)) {
+            return factory.newDocumentBuilder().parse(input);
         }
     }
 
@@ -665,14 +663,11 @@ class DmSqlValidationTestGenerator {
             import org.w3c.dom.Element;
             import org.w3c.dom.Node;
             import org.w3c.dom.NodeList;
-            import org.xml.sax.InputSource;
-
             import javax.xml.XMLConstants;
             import javax.xml.parsers.DocumentBuilderFactory;
             import java.io.DataInputStream;
             import java.io.IOException;
             import java.io.InputStream;
-            import java.io.Reader;
             import java.lang.annotation.Annotation;
             import java.lang.reflect.Array;
             import java.lang.reflect.Constructor;
@@ -4195,12 +4190,16 @@ class DmSqlValidationTestGenerator {
                         return ValueResult.resolved(null);
                     }
                     if (String.class.equals(targetType) && rawValue instanceof String) {
-                        return ValueResult.resolved(normalizeConfiguredDynamicIdentifierValue(
+                        Object configured = normalizeConfiguredDynamicIdentifierValue(
                                 rawValue,
                                 statement,
                                 valueName,
                                 statement == null ? null : statement.defaultValue(valueName)
-                        ));
+                        );
+                        if (configuredValueIncompatibleWithColumn(valueName, configured, statement)) {
+                            return defaultValue(valueName, targetType, genericType, 0, statement);
+                        }
+                        return ValueResult.resolved(configured);
                     }
                     if (Map.class.isAssignableFrom(targetType) && rawValue instanceof Map) {
                         Map<String, Object> configuredValue = new LinkedHashMap<>((Map<String, Object>) rawValue);
@@ -4956,6 +4955,9 @@ class DmSqlValidationTestGenerator {
                             );
                             continue;
                         }
+                        if (configuredValueIncompatibleWithColumn(entryPath, configured, statement)) {
+                            continue;
+                        }
                         if (existing == null) {
                             if (isGeneratedNullPlaceholderValue(configured)) {
                                 continue;
@@ -5694,26 +5696,41 @@ class DmSqlValidationTestGenerator {
                             || targetType.isArray()) {
                         return null;
                     }
-                    if (statement.hasDefaultValue(valueName)) {
+                    boolean hasConfiguredDefault = statement.hasDefaultValue(valueName);
+                    Object configuredDefault = hasConfiguredDefault ? statement.defaultValue(valueName) : null;
+                    String columnType = statement.defaultColumnType(valueName, dbColumnMetadata);
+                    if (hasConfiguredDefault
+                            && (isBlank(columnType)
+                            || !configuredValueIncompatibleWithColumn(valueName, configuredDefault, statement))) {
                         return adaptContextualDefaultValue(
                                 valueName,
-                                statement.defaultValue(valueName),
+                                configuredDefault,
                                 targetType,
                                 genericType,
                                 ""
                         );
                     }
-                    String columnType = statement.defaultColumnType(valueName, dbColumnMetadata);
-                    if (isBlank(columnType)) {
-                        return null;
+                    if (!isBlank(columnType)) {
+                        Object columnDefault = defaultTypedColumnValue(valueName, targetType, statement);
+                        return adaptContextualDefaultValue(
+                                valueName,
+                                columnDefault == null
+                                        ? defaultValueForColumnType(valueName, Object.class, columnType)
+                                        : columnDefault,
+                                targetType,
+                                genericType,
+                                columnType
+                        );
                     }
-                    return adaptContextualDefaultValue(
-                            valueName,
-                            defaultValueForColumnType(valueName, Object.class, columnType),
-                            targetType,
-                            genericType,
-                            columnType
-                    );
+                    return hasConfiguredDefault
+                            ? adaptContextualDefaultValue(
+                                    valueName,
+                                    configuredDefault,
+                                    targetType,
+                                    genericType,
+                                    ""
+                            )
+                            : null;
                 }
 
             """,
@@ -6318,11 +6335,13 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private Object defaultParameterMapValue(String valueName, Object configuredDefault, MapperStatement statement) {
-                    if (configuredDefault != null && shouldPreferConfiguredSqlFragmentDefault(valueName)) {
-                        return configuredDefault;
-                    }
                     String columnType = statement == null ? "" : statement.defaultColumnType(valueName, dbColumnMetadata);
                     int columnLength = statement == null ? -1 : statement.defaultColumnLength(valueName, dbColumnMetadata);
+                    if (isBlank(columnType)
+                            && configuredDefault != null
+                            && shouldPreferConfiguredSqlFragmentDefault(valueName)) {
+                        return configuredDefault;
+                    }
                     if (!isBlank(columnType) && isDateTimeColumnType(columnType)) {
                         return defaultStringDateTimeForColumnType(columnType);
                     }
@@ -9956,8 +9975,8 @@ class DmSqlValidationTestGenerator {
                     enableFeature(factory, "http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
                     enableFeature(factory, "http://xml.org/sax/features/external-general-entities", false);
                     enableFeature(factory, "http://xml.org/sax/features/external-parameter-entities", false);
-                    try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
-                        return factory.newDocumentBuilder().parse(new InputSource(reader));
+                    try (InputStream input = Files.newInputStream(path)) {
+                        return factory.newDocumentBuilder().parse(input);
                     }
                 }
 
@@ -11822,12 +11841,16 @@ class DmSqlValidationTestGenerator {
 
                     private String columnTypeQuerySql(boolean schemaQualified) {
                         if (schemaQualified) {
-                            return "select table_name, column_name, data_type, data_length as column_length from all_tab_columns "
+                            return "select table_name, column_name, data_type, "
+                                    + "case when char_length > 0 then char_length else data_length end as column_length "
+                                    + "from all_tab_columns "
                                     + "where (owner = ? or upper(owner) = upper(?)) "
                                     + "and (table_name = ? or upper(table_name) = upper(?)) "
                                     + "order by table_name, column_id";
                         }
-                        return "select table_name, column_name, data_type, data_length as column_length from user_tab_columns "
+                        return "select table_name, column_name, data_type, "
+                                + "case when char_length > 0 then char_length else data_length end as column_length "
+                                + "from user_tab_columns "
                                 + "where table_name = ? or upper(table_name) = upper(?) "
                                 + "order by table_name, column_id";
                     }
