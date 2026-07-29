@@ -34,8 +34,8 @@ class DamengSqlScriptIntegrationTest {
                 statement.execute("CREATE TABLE " + table + " (ID INT)");
                 statement.execute("""
                         CREATE OR REPLACE PROCEDURE %s() AS
-                            dm_adapter_schema VARCHAR(128)
-                                := '%s';
+                            dm_adapter_schema VARCHAR(128) :=
+                                SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);
                             dm_adapter_exists INT;
                         BEGIN
                             SELECT COUNT(*) INTO dm_adapter_exists
@@ -48,7 +48,7 @@ class DamengSqlScriptIntegrationTest {
                                     'ALTER TABLE %s ADD `paramName` VARCHAR(10 CHAR) DEFAULT NULL';
                             END IF;
                         END
-                        """.formatted(procedure, schema, table, table));
+                        """.formatted(procedure, table, table));
                 statement.execute("CALL " + procedure + "()");
                 try (PreparedStatement metadata = connection.prepareStatement("""
                         SELECT COLUMN_NAME, CHAR_LENGTH, CHAR_USED

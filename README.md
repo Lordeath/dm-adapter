@@ -84,8 +84,10 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar validate-sql \
 
 生成脚本保留 `DROP PROCEDURE IF EXISTS`、`CREATE OR REPLACE PROCEDURE`、`CALL`、再次 `DROP` 的生命周期，并使用单独一行 `/` 结束过程块。在 DBeaver 中应使用“执行 SQL 脚本”（Windows/Linux 默认 `Alt+X`），不要选中整段后使用“执行 SQL 语句”（默认 `Ctrl+Enter`），否则多个语句可能被一次发送并在第二个 `PROCEDURE` 附近报语法错误。连接的 SQL Processing 设置中需保留 `;` 语句分隔符，并将 `/` 配置为脚本/过程块分隔符。
 
-临时过程不再接收 schema 参数；过程内部使用 `--schema` 对应的目标 schema 字面量初始化一次局部变量，调用统一为 `CALL procedure_name()`。不能在过程内部使用
-`SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` 推断目标 schema：过程执行期间该值可能切换为过程定义者的默认 schema，导致存在性检查查错对象。反引号字段名用于保留源字段大小写，因此包含反引号的脚本要求目标达梦实例 `COMPATIBLE_MODE=4`。
+临时过程不再接收 schema 参数，也不会把 `--schema` 的值写入脚本；过程内部使用
+`SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)` 在运行时解析当前 schema，并将结果保存到局部变量，调用统一为
+`CALL procedure_name()`。不能在过程内部使用 `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` 推断目标 schema：
+过程执行期间该值可能切换为过程定义者的默认 schema，导致存在性检查查错对象。反引号字段名用于保留源字段大小写，因此包含反引号的脚本要求目标达梦实例 `COMPATIBLE_MODE=4`。
 
 数据库验证的总时限由 `DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS` 控制，默认 `7200` 秒（2 小时），SQL 脚本验证和 Mapper 验证共享同一时限。Mapper 验证每累计 50 条记录会原子更新报告；超时或进程中断后可读取已完成部分。新一轮运行开始前，上一轮报告会保留为 `sql-validation-report.previous.md/json`。
 

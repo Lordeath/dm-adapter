@@ -88,9 +88,12 @@ Generated procedure scripts must be run in DBeaver with **Execute SQL Script**
 (`Alt+X` by default), not by sending a multi-statement selection with
 `Ctrl+Enter`. Keep `;` as the statement delimiter and configure `/` as the
 procedure-block/script delimiter. Temporary procedures resolve
-`SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` once into a local variable and are
-called without an extra schema argument. Scripts containing backtick
-identifiers require Dameng `COMPATIBLE_MODE=4`.
+`SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)` once into a local variable at runtime
+and are called without an extra schema argument. The generated script does not
+embed the CLI `--schema` value. `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` is not
+used inside these procedures because it may resolve to the procedure owner's
+default schema. Scripts containing backtick identifiers require Dameng
+`COMPATIBLE_MODE=4`.
 
 The same environment variables are also used by `migrate` for read-only Dameng metadata inference. Schema resolution prefers CLI `--schema` / the workspace `sql-validation.yml`, then the JDBC URL `schema` parameter, then the connection default schema or username. Inference only writes table names, method names, and `keyColumns`; it never stores JDBC URLs, usernames, or passwords in repository files.
 

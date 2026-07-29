@@ -632,7 +632,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
                 .contains("CREATE OR REPLACE PROCEDURE modify_details() AS")
-                .contains("dm_adapter_schema VARCHAR(128) := 'sample-bill';")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("LOWER(DATA_TYPE) IN ('char', 'varchar')")
                 .contains("CHAR_LENGTH < 1000")
                 .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` varchar(1000) DEFAULT NULL'");
@@ -867,7 +867,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON) AS")
-                .contains("dm_adapter_schema VARCHAR(128) := 'sample-bill';")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("dm_has_menu_ver BIGINT;")
                 .contains("dm_new_form_data VARCHAR(4000);")
                 .contains("dm_roleId VARCHAR(4000);")
@@ -2108,7 +2108,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("CREATE OR REPLACE PROCEDURE add_prefix_index() AS")
-                .contains("dm_adapter_schema VARCHAR(128) := 'sample-system';")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("dm_adapter_exists INT;")
                 .contains("dm_adapter_exists_2 INT;")
                 .contains("ALL_IND_COLUMNS")
@@ -2773,7 +2773,7 @@ class SqlScriptMigratorTest {
                 .contains("ALL_TABLES")
                 .contains("FROM ALL_IND_COLUMNS")
                 .contains("CREATE OR REPLACE PROCEDURE add_col() AS")
-                .contains("dm_adapter_schema VARCHAR(128) := 'sample-bill';")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("INDEX_OWNER = dm_adapter_schema")
                 .contains("OWNER = dm_adapter_schema")
                 .contains("CALL add_col()")
@@ -2866,7 +2866,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("CREATE OR REPLACE PROCEDURE rebuild_view_and_constraints() AS")
-                .contains("dm_adapter_schema VARCHAR(128) := 'sample-bill';")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("FROM (SELECT OWNER, OWNER AS TABLE_SCHEMA, VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS)")
                 .contains("FROM (SELECT USERNAME AS SCHEMA_NAME FROM ALL_USERS)")
                 .contains("FROM (SELECT OWNER, OWNER AS CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME")
@@ -4233,7 +4233,7 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl() AS")
-                .contains("dm_adapter_schema VARCHAR(128) := 'sample-app';")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("OWNER = dm_adapter_schema")
                 .contains("UPPER(TABLE_NAME) = UPPER('ns_contract_bpm')")
                 .contains("UPPER(COLUMN_NAME) = UPPER('bpmUrl')")
@@ -4241,7 +4241,8 @@ class SqlScriptMigratorTest {
                 .contains("IF dm_adapter_exists > 0 THEN")
                 .contains("CALL change_col_ns_contract_bpm_bpmurl()")
                 .doesNotContain("dm_adapter_schema IN VARCHAR")
-                .doesNotContain("SYS_CONTEXT");
+                .doesNotContain("SYS_CONTEXT")
+                .doesNotContain("'sample-app'");
     }
 
     @Test
@@ -4278,10 +4279,46 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl () AS")
-                .contains("dm_adapter_schema VARCHAR(128) := 'sample-app';")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("CALL change_col_ns_contract_bpm_bpmurl ()")
                 .doesNotContain("dm_adapter_schema IN VARCHAR")
-                .doesNotContain("SYS_CONTEXT");
+                .doesNotContain("SYS_CONTEXT")
+                .doesNotContain("'sample-app'");
+    }
+
+    @Test
+    void resolvesMysqlProcedureMetadataSchemaAtRuntimeWithoutEmbeddingCliSchema() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS add_column_organization_no;
+                DELIMITER $$
+                CREATE PROCEDURE `add_column_organization_no`()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE table_name = 'ns_system_organization'
+                          AND table_schema = (SELECT DATABASE())
+                          AND column_name = 'organization_no'
+                    ) THEN
+                        ALTER TABLE `ns_system_organization`
+                            ADD COLUMN `organization_no` varchar(64) NULL COMMENT '组织编号';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL `add_column_organization_no`();
+                DROP PROCEDURE IF EXISTS add_column_organization_no;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE OR REPLACE PROCEDURE add_column_organization_no() AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
+                .contains("OWNER = dm_adapter_schema")
+                .contains("CALL add_column_organization_no()")
+                .doesNotContain("INFORMATION_SCHEMA")
+                .doesNotContain("DATABASE()")
+                .doesNotContain("SYS_CONTEXT")
+                .doesNotContain("'sample-app'");
     }
 
     @Test

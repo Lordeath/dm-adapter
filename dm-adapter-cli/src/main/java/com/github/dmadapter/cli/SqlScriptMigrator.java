@@ -37,6 +37,8 @@ class SqlScriptMigrator {
     private static final Path DEFAULT_PRESERVED_SQL_PATH = Path.of("00000000.sql");
     private static final int PARALLEL_PROCEDURE_MIN_CHARS = 50_000;
     private static final String CONVERSION_THREADS_PROPERTY = "dm.adapter.sqlScriptConversionThreads";
+    private static final String DM_CURRENT_SCHEMA_EXPRESSION =
+            "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)";
     static final String MYSQL_CREATE_DEFINER_REMOVAL_RULE = "MYSQL_CREATE_DEFINER_REMOVED";
     static final String MYSQL_CREATE_PROCEDURE_TO_DM_RULE = "MYSQL_CREATE_PROCEDURE_TO_DM";
     static final String MYSQL_CREATE_FUNCTION_TO_DM_RULE = "MYSQL_CREATE_FUNCTION_TO_DM";
@@ -1547,10 +1549,8 @@ class SqlScriptMigrator {
                 + ", outputStatements=" + convertedStatements.size()
                 + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
 
-        MetadataSchemaBinding metadataSchemaBinding = bindMetadataSchemaAtProcedureCalls(
-                convertedStatements,
-                targetSchema
-        );
+        MetadataSchemaBinding metadataSchemaBinding =
+                bindMetadataSchemaAtProcedureCalls(convertedStatements);
         if (metadataSchemaBinding.changed()) {
             convertedStatements = new ArrayList<>(metadataSchemaBinding.statements());
             appliedRules.add(DM_METADATA_SCHEMA_LOCAL_VARIABLE_RULE);
@@ -1598,10 +1598,7 @@ class SqlScriptMigrator {
         return stripped;
     }
 
-    private MetadataSchemaBinding bindMetadataSchemaAtProcedureCalls(
-            List<String> statements,
-            String targetSchema
-    ) {
+    private MetadataSchemaBinding bindMetadataSchemaAtProcedureCalls(List<String> statements) {
         LinkedHashSet<String> procedures = new LinkedHashSet<>();
         for (String statement : statements) {
             String procedureName = procedureNameFromCreateProcedure(statement);
@@ -1619,7 +1616,7 @@ class SqlScriptMigrator {
             String rewritten = statement;
             if (!procedureName.isBlank()
                     && procedures.contains(procedureName.toLowerCase(Locale.ROOT))) {
-                rewritten = addMetadataSchemaLocalVariable(rewritten, targetSchema);
+                rewritten = addMetadataSchemaLocalVariable(rewritten);
             } else if (!procedureNameFromCall(statement).isBlank()) {
                 rewritten = removeLegacyMetadataSchemaCallArgument(rewritten, procedures);
             }
@@ -1637,7 +1634,7 @@ class SqlScriptMigrator {
                 .find();
     }
 
-    private String addMetadataSchemaLocalVariable(String sql, String targetSchema) {
+    private String addMetadataSchemaLocalVariable(String sql) {
         String schemaBoundSql = replaceOutsideIgnoredText(
                 sql,
                 Pattern.compile(
@@ -1672,12 +1669,9 @@ class SqlScriptMigrator {
             return sql;
         }
         int insertionPoint = declarationStart.end();
-        String schemaInitializer = targetSchema == null || targetSchema.isBlank()
-                ? "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
-                : sqlStringLiteral(targetSchema);
         return schemaBoundSql.substring(0, insertionPoint)
                 + "\n    dm_adapter_schema VARCHAR(128) := "
-                + schemaInitializer
+                + DM_CURRENT_SCHEMA_EXPRESSION
                 + ";"
                 + schemaBoundSql.substring(insertionPoint);
     }
