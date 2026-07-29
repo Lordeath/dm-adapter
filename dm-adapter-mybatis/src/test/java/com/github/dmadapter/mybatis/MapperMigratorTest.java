@@ -56,7 +56,7 @@ class MapperMigratorTest {
         );
         Path sqlServerMapper = writeMapper(
                 "src/main/resources/mapper/sqlserver/ActivityMapper.xml",
-                "select * from Register_Member with(nolock)"
+                "select top 1 * from Register_Member with(nolock) order by createDate desc"
         );
         writeFile("src/main/resources/application.properties", """
                 mybatis.mapperLocations=classpath:/mapper/*.xml
@@ -90,6 +90,7 @@ class MapperMigratorTest {
                 tempDir.resolve("src/main/resources/mapper-dm/sqlserver/ActivityMapper.xml");
         assertThat(Files.readString(convertedSqlServerMapper))
                 .contains("select * from Register_Member")
+                .contains("order by createDate desc FETCH FIRST 1 ROWS ONLY")
                 .doesNotContainIgnoringCase("with(nolock)");
         assertThat(Files.exists(
                 tempDir.resolve("src/main/resources/mapper-dm/mysql/EquipAddressMapper.xml")
