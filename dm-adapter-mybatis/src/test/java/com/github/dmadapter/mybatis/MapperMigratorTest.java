@@ -1428,6 +1428,65 @@ class MapperMigratorTest {
     }
 
     @Test
+    void configuredBatchUpsertWithCurrentTimestampIsRewrittenToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CustomerMapper">
+                    <insert id="batchUpsert">
+                        INSERT INTO dw_sample_customer (
+                            customer_id, name, raw_json, created_at, updated_at
+                        ) VALUES
+                        <foreach collection="list" item="item" separator=",">
+                            (
+                                #{item.customerId,jdbcType=VARCHAR},
+                                #{item.name,jdbcType=VARCHAR},
+                                #{item.rawJson,jdbcType=LONGVARCHAR},
+                                NOW(),
+                                NOW()
+                            )
+                        </foreach>
+                        ON DUPLICATE KEY UPDATE
+                            name = VALUES(name),
+                            raw_json = VALUES(raw_json),
+                            updated_at = NOW()
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CustomerMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CustomerMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.CustomerMapper.batchUpsert", List.of("customer_id"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CustomerMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO dw_sample_customer t")
+                .contains("ON (t.customer_id = s.customer_id)")
+                .contains("t.name = s.name")
+                .contains("t.raw_json = s.raw_json")
+                .contains("t.updated_at = NOW()")
+                .doesNotContain("ON DUPLICATE KEY UPDATE");
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicXmlConvertsDefaultYearWeekWithoutManualReview() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -1640,6 +1699,80 @@ class MapperMigratorTest {
                 .doesNotContain("information_schema")
                 .doesNotContain("DATABASE()");
         assertThat(result.automaticConversions()).hasSize(3);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void commonTableAndColumnMetadataQueriesAreRewrittenWithoutManualReview() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.MetadataMapper">
+                    <select id="countColumn" resultType="int">
+                        SELECT COUNT(1)
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database())
+                          AND table_name = #{tableName}
+                          AND column_name = #{columnName}
+                    </select>
+                    <select id="listViews" resultType="string">
+                        SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = (select database())
+                          AND TABLE_TYPE = 'VIEW'
+                          AND TABLE_NAME LIKE 'vw_sample_%'
+                    </select>
+                    <select id="listTables" resultType="string">
+                        SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+                        WHERE TABLE_SCHEMA = (select database())
+                          AND TABLE_TYPE = 'BASE TABLE'
+                    </select>
+                    <select id="listColumnNames" resultType="string">
+                        SELECT GROUP_CONCAT(COLUMN_NAME) AS result
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = (select database())
+                          AND TABLE_NAME = #{tableName}
+                    </select>
+                    <select id="listColumnDetails" resultType="map">
+                        SELECT COLUMN_NAME, COLUMN_COMMENT, DATA_TYPE, IS_NULLABLE,
+                               COLUMN_DEFAULT, CHARACTER_MAXIMUM_LENGTH
+                        FROM INFORMATION_SCHEMA.COLUMNS
+                        WHERE TABLE_SCHEMA = (select database())
+                          AND TABLE_NAME = #{tableName}
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/MetadataMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/MetadataMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/MetadataMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("SELECT COUNT(*) FROM ALL_TAB_COLUMNS")
+                .contains("SELECT VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS")
+                .contains("SELECT TABLE_NAME FROM ALL_TABLES")
+                .contains("LISTAGG(COLUMN_NAME, ',') WITHIN GROUP (ORDER BY COLUMN_ID) AS result")
+                .contains("cc.COMMENTS AS COLUMN_COMMENT")
+                .contains("c.CHAR_LENGTH AS CHARACTER_MAXIMUM_LENGTH")
+                .contains("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .doesNotContain("information_schema")
+                .doesNotContain("database()");
+        assertThat(result.automaticConversions()).hasSize(5);
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
