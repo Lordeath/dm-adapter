@@ -68,6 +68,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_SINGLE_QUOTED_ALIAS_RULE = "MYSQL_SINGLE_QUOTED_ALIAS_TO_DM_IDENTIFIER";
     public static final String MYSQL_INSERT_VALUE_TO_VALUES_RULE = "MYSQL_INSERT_VALUE_TO_VALUES";
     public static final String MYSQL_INDEX_HINT_REMOVAL_RULE = "MYSQL_INDEX_HINT_REMOVED";
+    public static final String SQLSERVER_NOLOCK_HINT_REMOVAL_RULE = "SQLSERVER_NOLOCK_HINT_REMOVED";
     public static final String MYSQL_CONVERT_DECIMAL_RULE = "MYSQL_CONVERT_DECIMAL_TO_CAST";
     public static final String MYSQL_CONVERT_CHAR_RULE = "MYSQL_CONVERT_CHAR_TO_CAST";
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
@@ -630,6 +631,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (indexHintConversion.changed()) {
             converted = indexHintConversion.convertedSql();
             rules.add(MYSQL_INDEX_HINT_REMOVAL_RULE);
+        }
+
+        GenericConversion noLockHintConversion = removeSqlServerNoLockHints(converted);
+        if (noLockHintConversion.changed()) {
+            converted = noLockHintConversion.convertedSql();
+            rules.add(SQLSERVER_NOLOCK_HINT_REMOVAL_RULE);
         }
 
         GenericConversion deleteAliasStarAfterIndexHintConversion = convertMysqlDeleteAliasStar(converted);
@@ -6144,6 +6151,64 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql, lastCopiedIndex, sql.length());
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion removeSqlServerNoLockHints(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        int lastCopiedIndex = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                KeywordReplacement hint = readSqlServerNoLockHintRemoval(sql, index);
+                if (hint == null) {
+                    index++;
+                } else {
+                    converted.append(sql, lastCopiedIndex, hint.startIndex());
+                    lastCopiedIndex = hint.endIndex();
+                    index = hint.endIndex();
+                    changed = true;
+                }
+            }
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        converted.append(sql, lastCopiedIndex, sql.length());
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private KeywordReplacement readSqlServerNoLockHintRemoval(String sql, int index) {
+        if (!startsKeyword(sql, index, "WITH")) {
+            return null;
+        }
+        int openParenIndex = skipWhitespace(sql, index + "WITH".length());
+        if (openParenIndex >= sql.length() || sql.charAt(openParenIndex) != '(') {
+            return null;
+        }
+        int noLockIndex = skipWhitespace(sql, openParenIndex + 1);
+        if (!startsKeyword(sql, noLockIndex, "NOLOCK")) {
+            return null;
+        }
+        int closeParenIndex = skipWhitespace(sql, noLockIndex + "NOLOCK".length());
+        if (closeParenIndex >= sql.length() || sql.charAt(closeParenIndex) != ')') {
+            return null;
+        }
+        return new KeywordReplacement(index, skipWhitespace(sql, closeParenIndex + 1));
     }
 
     private KeywordReplacement readMysqlIndexHintRemoval(String sql, int index) {

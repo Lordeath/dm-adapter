@@ -1085,6 +1085,31 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesSqlServerNoLockTableHintsWithoutChangingCtesOrIgnoredText() {
+        SqlConversionResult result = converter.convert("""
+                WITH active_users AS (
+                    SELECT id FROM users WHERE state = 1
+                )
+                SELECT a.id, b.name
+                FROM CE_Standard_Scores a WITH(NOLOCK)
+                LEFT JOIN CE_ExpertsGroup_Project b with ( NOLOCK ) ON a.ProjectID = b.ProjectID
+                WHERE a.note = 'WITH(NOLOCK)'
+                -- WITH(NOLOCK)
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("WITH active_users AS (")
+                .contains("FROM CE_Standard_Scores a LEFT JOIN CE_ExpertsGroup_Project b ON")
+                .contains("a.note = 'WITH(NOLOCK)'")
+                .contains("-- WITH(NOLOCK)")
+                .doesNotContain("a WITH(NOLOCK)")
+                .doesNotContain("b with ( NOLOCK )");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.SQLSERVER_NOLOCK_HINT_REMOVAL_RULE);
+    }
+
+    @Test
     void convertsMysqlSingularInsertValueKeywordToValues() {
         SqlConversionResult result = converter.convert(
                 "insert into owner_customer_bank_account (owner_id, account_name) value (#{ownerId}, #{accountName})"
