@@ -964,7 +964,6 @@ class DmSqlValidationTestGenerator {
                                         record = skipGeneratedDynamicSqlOrArgs(record);
                                         record = skipExistingDdlObject(record);
                                         record = skipValidationTestDataIssue(record);
-                                        record = skipIgnoredTypeMismatchMethod(record, config);
                                         record = skipIgnoredMissingTable(record, config);
                                         record = skipIgnoredMissingColumn(record, config);
                                         record = skipIgnoredMissingSchema(record, config);
@@ -3716,24 +3715,6 @@ class DmSqlValidationTestGenerator {
                             "违反引用约束",
                             "唯一性约束",
                             "TooManyResultsException");
-                }
-
-                private ValidationRecord skipIgnoredTypeMismatchMethod(ValidationRecord record, ValidationConfig config) {
-                    if (record == null
-                            || !"FAILED".equals(record.status)
-                            || config == null
-                            || !config.ignoresTypeMismatchMethod(record.key)
-                            || !"TEST_DATA_TYPE_MISMATCH".equals(failurePattern(record))) {
-                        return record;
-                    }
-                    return ValidationRecord.skipped(
-                            record.key,
-                            "ignored-type-mismatch-method",
-                            record.parameterSummary,
-                            "Ignored test data/schema type mismatch for method [" + record.key
-                                    + "] by sql-rewrite.yml validationIgnores.typeMismatchMethods.\\n"
-                                    + "Original failure:\\n" + record.message
-                    );
                 }
 
                 private ValidationRecord skipUnsupportedReturnType(MapperMethod mapperMethod) {
@@ -8418,6 +8399,9 @@ class DmSqlValidationTestGenerator {
                             "SQL_SYNTAX_OTHER")) {
                         markdown.append("- 人工复核 GROUP_CONCAT、JSON SQL、REGEXP、MySQL 元数据查询，以及其他未分类的达梦语法失败等复杂 SQL 模式。\\n");
                     }
+                    if (countsByPattern.containsKey("ORIGINAL_XML_REQUIRED_COLUMN_OMISSION")) {
+                        markdown.append("- 修正原始 mapper INSERT：把达梦表要求的非空列同时加入显式列清单和值清单；不要通过测试参数或 ignore 掩盖。\\n");
+                    }
                     if (containsAnyPattern(countsByPattern,
                             "TEST_DATA_OR_CONSTRAINT",
                             "TEST_DATA_TYPE_MISMATCH",
@@ -8496,6 +8480,8 @@ class DmSqlValidationTestGenerator {
                             return "测试库对象问题";
                         case "TEST_DATA_OR_SCHEMA":
                             return "测试数据或库结构问题";
+                        case "ORIGINAL_SQL":
+                            return "原始业务 SQL 问题";
                         case "SQL_SYNTAX":
                             return "SQL 语法问题";
                         case "TEST_DATA":
@@ -8636,6 +8622,8 @@ class DmSqlValidationTestGenerator {
                             return "INSERT VALUES 中出现赋值表达式";
                         case "ORIGINAL_XML_SYNTAX_DEFECT":
                             return "原 XML SQL 语法缺陷";
+                        case "ORIGINAL_XML_REQUIRED_COLUMN_OMISSION":
+                            return "原 XML INSERT 漏写必填列";
                         case "TEST_DATA_OR_CONSTRAINT":
                             return "测试数据或约束问题";
                         default:
@@ -8834,6 +8822,9 @@ class DmSqlValidationTestGenerator {
                     if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "MYSQL_USER_VARIABLE";
                     }
+                    if (hasRequiredInsertColumnOmission(message)) {
+                        return "ORIGINAL_XML_REQUIRED_COLUMN_OMISSION";
+                    }
                     if (hasTestDataOrConstraintIssue(message)) {
                         return "TEST_DATA_OR_CONSTRAINT";
                     }
@@ -8858,17 +8849,17 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("on duplicate key update")) {
                         return "ON_DUPLICATE_KEY_UPDATE";
                     }
-                    if (hasOriginalXmlSyntaxDefect(message)) {
-                        return "ORIGINAL_XML_SYNTAX_DEFECT";
-                    }
-                    if (lower.contains("sql语句为null或空值") || hasBrokenDynamicSqlShape(message)) {
-                        return "BROKEN_DYNAMIC_SQL_OR_ARGS";
-                    }
                     if (hasUnresolvedFunctionObject(message)) {
                         return "TEST_SCHEMA_FUNCTION";
                     }
                     if (isSchemaObjectFailure(lower)) {
                         return "TEST_SCHEMA_OBJECT";
+                    }
+                    if (hasOriginalXmlSyntaxDefect(message)) {
+                        return "ORIGINAL_XML_SYNTAX_DEFECT";
+                    }
+                    if (lower.contains("sql语句为null或空值") || hasBrokenDynamicSqlShape(message)) {
+                        return "BROKEN_DYNAMIC_SQL_OR_ARGS";
                     }
                     if (Pattern.compile("insert\\\\s+ignore\\\\s+into", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
                         return "INSERT_IGNORE";
@@ -9166,6 +9157,38 @@ class DmSqlValidationTestGenerator {
                             "自增列");
                 }
 
+                private boolean hasRequiredInsertColumnOmission(String message) {
+                    String value = message == null ? "" : message;
+                    Matcher violation = Pattern.compile(
+                            "违反列\\\\[\\\\s*([^]\\\\s]+)\\\\s*]非空约束",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(value);
+                    if (!violation.find()) {
+                        return false;
+                    }
+                    String requiredColumn = normalizeInsertColumnName(violation.group(1));
+                    Matcher insert = Pattern.compile(
+                            "\\\\binsert\\\\s+into\\\\b[\\\\s\\\\S]*?\\\\(([^()]*)\\\\)\\\\s*values\\\\b",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(sqlFromMessage(value));
+                    if (!insert.find()) {
+                        return false;
+                    }
+                    for (String column : insert.group(1).split(",")) {
+                        if (requiredColumn.equals(normalizeInsertColumnName(column))) {
+                            return false;
+                        }
+                    }
+                    return !isBlank(requiredColumn);
+                }
+
+                private String normalizeInsertColumnName(String column) {
+                    String value = column == null ? "" : column.trim();
+                    int dot = value.lastIndexOf('.');
+                    String leaf = dot >= 0 ? value.substring(dot + 1) : value;
+                    return normalizeSqlIdentifier(leaf);
+                }
+
                 private boolean hasUnbalancedSqlParentheses(String message) {
                     return parenthesisBalance(sqlFromMessage(message)) != 0;
                 }
@@ -9366,6 +9389,9 @@ class DmSqlValidationTestGenerator {
                     if (containsAny(message, "无效的表或视图名", "无效的表名", "无效的列名", "无效的变量名", "无效的模式名", "无法解析的成员访问表达式")) {
                         return "TEST_SCHEMA";
                     }
+                    if (hasRequiredInsertColumnOmission(message)) {
+                        return "ORIGINAL_SQL";
+                    }
                     if (hasTestDataOrConstraintIssue(message)
                             || containsAny(message, "数据类型不匹配", "NumberFormatException", "违反引用约束")) {
                         return "TEST_DATA_OR_SCHEMA";
@@ -9423,6 +9449,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if ("SQL_SYNTAX".equals(category)) {
                         return "达梦拒绝了 SQL 语法；请检查 mapper-dm SQL，并手工处理未兼容的片段。";
+                    }
+                    if ("ORIGINAL_SQL".equals(category)) {
+                        return "原始 mapper INSERT 漏写了达梦表要求的非空列；应修正原始业务 SQL，不能用测试参数或忽略规则掩盖。";
                     }
                     if ("TEST_SCHEMA".equals(category)) {
                         return "达梦测试库缺少表、视图、字段、函数，或对象命名与 mapper SQL 不一致。";
@@ -10814,7 +10843,6 @@ class DmSqlValidationTestGenerator {
                     private final Set<String> ignoredMissingColumns = new LinkedHashSet<>();
                     private final Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
                     private final Set<String> ignoredNotNullColumns = new LinkedHashSet<>();
-                    private final Set<String> ignoredTypeMismatchMethods = new LinkedHashSet<>();
 
                     static ValidationConfig load(Path path, Path rewriteConfigPath) throws IOException {
                         ValidationConfig config = new ValidationConfig();
@@ -10993,13 +11021,6 @@ class DmSqlValidationTestGenerator {
                                 addIgnoredNotNullColumns(parseYamlValue(trimmed.substring("notNullColumns:".length())));
                                 continue;
                             }
-                            if (isValidationIgnoreSection(section) && indent == 2 && trimmed.startsWith("typeMismatchMethods:")) {
-                                section = "validationTypeMismatchMethods";
-                                currentMethod = null;
-                                valueMode = "";
-                                addIgnoredTypeMismatchMethods(parseYamlValue(trimmed.substring("typeMismatchMethods:".length())));
-                                continue;
-                            }
                             if ("validationMissingTables".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredMissingTables(parseYamlValue(trimmed.substring(2)));
                                 continue;
@@ -11014,10 +11035,6 @@ class DmSqlValidationTestGenerator {
                             }
                             if ("validationNotNullColumns".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
                                 addIgnoredNotNullColumns(parseYamlValue(trimmed.substring(2)));
-                                continue;
-                            }
-                            if ("validationTypeMismatchMethods".equals(section) && indent >= 4 && trimmed.startsWith("- ")) {
-                                addIgnoredTypeMismatchMethods(parseYamlValue(trimmed.substring(2)));
                                 continue;
                             }
                             if ("validationMethods".equals(section) && indent == 4 && trimmed.endsWith(":")) {
@@ -11058,8 +11075,7 @@ class DmSqlValidationTestGenerator {
                                 || "validationMissingTables".equals(section)
                                 || "validationMissingColumns".equals(section)
                                 || "validationMissingSchemas".equals(section)
-                                || "validationNotNullColumns".equals(section)
-                                || "validationTypeMismatchMethods".equals(section);
+                                || "validationNotNullColumns".equals(section);
                     }
 
                     private void addIgnoredMissingTables(Object value) {
@@ -11189,34 +11205,6 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         return false;
-                    }
-
-                    private void addIgnoredTypeMismatchMethods(Object value) {
-                        if (value instanceof Collection<?>) {
-                            for (Object item : (Collection<?>) value) {
-                                addIgnoredTypeMismatchMethod(String.valueOf(item));
-                            }
-                        } else if (value != null) {
-                            addIgnoredTypeMismatchMethod(String.valueOf(value));
-                        }
-                    }
-
-                    private void addIgnoredTypeMismatchMethod(String methodKey) {
-                        String normalized = methodKey == null ? "" : scalar(methodKey).trim();
-                        if (!isBlank(normalized)) {
-                            ignoredTypeMismatchMethods.add(normalized);
-                        }
-                    }
-
-                    boolean ignoresTypeMismatchMethod(String methodKey) {
-                        if (isBlank(methodKey)) {
-                            return false;
-                        }
-                        if (ignoredTypeMismatchMethods.contains(methodKey)) {
-                            return true;
-                        }
-                        int lastDot = methodKey.lastIndexOf('.');
-                        return lastDot > 0 && ignoredTypeMismatchMethods.contains(methodKey.substring(0, lastDot) + ".*");
                     }
 
                     private String normalizeMissingTableName(String table) {

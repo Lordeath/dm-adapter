@@ -67,6 +67,7 @@
 - 原始 SQL 明显错误时，可以修原始业务 SQL。例如列名写错、insert 列和值数量不一致、`set` 末尾多逗号。若问题来自 Java mapper 方法签名，如多个参数复用同一个 `@Param` 名称，或多个简单参数缺少必要 `@Param`，应修 Java mapper 方法签名，不应为了绕过绑定错误去改 XML 参数名。
 - Java 注解里的 SQL 如果包含复杂动态 SQL、MySQL 专有语法或需要达梦改写，应优先迁移到 mapper XML，再由 dm-adapter 生成 `mapper-dm`；自动迁移也应把可识别的 `@Select`、`@Insert`、`@Update`、`@Delete` SQL 提取到 `mapper-dm` XML 后再执行达梦改写和验证。
 - 参数推测失败时，先增强 dm-adapter 的参数推测或 `sql-rewrite.yml` 回放能力；如果参数本身是业务枚举、动态表名、动态列名或 SQL 片段，必须写入配置或标记为人工确认。
+- 参数类型不匹配不能按 mapper 方法加入忽略名单。应利用表字段元数据修正自动测试参数，或在 `validationArgs` 中提供类型正确的业务示例；否则必须保留失败，不能靠 `typeMismatchMethods` 制造全绿。
 - `${}` 动态 SQL 需要区分三类值：
   - 动态标识符，如表名、列名、schema，需要白名单配置，验证参数不能来自任意字符串。
   - SQL 片段，如排序、条件、函数表达式，只能通过 `sql-rewrite.yml` 或安全枚举回放，不能自动拼接用户输入。
@@ -90,6 +91,7 @@
 ## 当前项目优先关注模式
 
 - `ORIGINAL_XML_SYNTAX_DEFECT`：优先判断是否原始 SQL 也有问题。常见包括 insert 列值数量不一致、动态 `<set>` 末尾逗号、非法 XML 转义。
+- `ORIGINAL_XML_REQUIRED_COLUMN_OMISSION`：达梦明确报告某列违反非空约束，且原始 INSERT 的显式列清单确实漏写该列；这是原始业务 SQL 问题，不能归为测试数据或通过 ignore 掩盖。
 - `TEST_SCHEMA_OBJECT`：缺表、缺视图、缺列、缺函数。确认缺失对象后可跳过；如果是 SQL 引用错列，修业务 SQL。
 - `DYNAMIC_IDENTIFIER_PARAMETER` / `DYNAMIC_SQL_FRAGMENT_PARAMETER`：动态表名、列名、排序、where 片段。不能盲猜，优先白名单配置或跳过。
 - `ON_DUPLICATE_KEY_UPDATE`、`INSERT_IGNORE`、`REPLACE_INTO`、`MYSQL_USER_VARIABLE`、`YEARWEEK`、未覆盖的 `PERIOD_DIFF`：MySQL 专有或语义不确定写法，除非能完整识别业务语义，否则不要自动强转。
