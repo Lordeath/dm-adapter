@@ -38,6 +38,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
     public static final String MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE = "MYSQL_GROUP_CONCAT_TO_DM_LISTAGG";
+    public static final String MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE =
+            "MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY";
     public static final String MYSQL_CONCAT_TO_DM_OPERATOR_RULE = "MYSQL_CONCAT_TO_DM_OPERATOR";
     public static final String MYSQL_SINGLE_ARGUMENT_CONCAT_RULE = "MYSQL_SINGLE_ARGUMENT_CONCAT_TO_EXPRESSION";
     public static final String MYSQL_LIKE_PLACEHOLDER_LITERAL_TO_DM_CONCAT_RULE =
@@ -388,6 +390,46 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final String SIMPLE_IDENTIFIER = "[A-Za-z_][A-Za-z0-9_$]*";
     private static final String SIMPLE_QUALIFIED_IDENTIFIER =
             SIMPLE_IDENTIFIER + "(?:\\s*\\.\\s*" + SIMPLE_IDENTIFIER + ")?";
+    private static final String MYSQL_UNQUOTED_ALIAS = "[A-Za-z0-9_$]+";
+    private static final String MYBATIS_PARAMETER = "#\\{[^}]+}";
+    private static final Pattern MYSQL_ANCESTOR_USER_VARIABLE_TRAVERSAL_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)SELECT\\s+GROUP_CONCAT\\s*\\(\\s*"
+                    + "(?<valueColumn>" + DM_IDENTIFIER + ")\\s+ORDER\\s+BY\\s+"
+                    + "(?<aggregateAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                    + "(?<aggregateId>" + DM_IDENTIFIER + ")\\s+SEPARATOR\\s+"
+                    + "(?<separator>'(?:''|[^'])*')\\s*\\)"
+                    + "(?:\\s+(?:AS\\s+)?(?<resultAlias>" + DM_IDENTIFIER + "))?\\s+"
+                    + "FROM\\s*\\(\\s*SELECT\\s+"
+                    + "@(?<cursorRead>" + SIMPLE_IDENTIFIER + ")\\s+AS\\s+"
+                    + "(?<walkIdAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                    + "\\(\\s*SELECT\\s+@(?<cursorWrite>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                    + "(?<parentColumn>" + DM_IDENTIFIER + ")\\s+FROM\\s+"
+                    + "(?<lookupTable>" + SIMPLE_QUALIFIED_IDENTIFIER + ")\\s+WHERE\\s+"
+                    + "(?<lookupId>" + DM_IDENTIFIER + ")\\s*=\\s*"
+                    + "(?<lookupWalkIdAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s+AS\\s+"
+                    + "(?<scratchAlias>" + MYSQL_UNQUOTED_ALIAS + ")\\s*,\\s*"
+                    + "@(?<levelWrite>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                    + "@(?<levelRead>" + SIMPLE_IDENTIFIER + ")\\s*\\+\\s*1\\s+AS\\s+"
+                    + "(?<levelAlias>" + SIMPLE_IDENTIFIER + ")\\s+FROM\\s+"
+                    + "\\(\\s*SELECT\\s+@(?<seedCursor>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                    + "(?<seed>" + MYBATIS_PARAMETER + ")\\s*\\)\\s+"
+                    + "(?<varsAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                    + "(?<driverTable>" + SIMPLE_QUALIFIED_IDENTIFIER + ")\\s+"
+                    + "(?<driverAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+"
+                    + "(?<driverAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                    + "(?<driverParent>" + DM_IDENTIFIER + ")\\s*!=\\s*0\\s*\\)\\s+"
+                    + "(?<walkAlias>" + SIMPLE_IDENTIFIER + ")\\s+JOIN\\s+"
+                    + "(?<outputTable>" + SIMPLE_QUALIFIED_IDENTIFIER + ")\\s+"
+                    + "(?<outputAlias>" + SIMPLE_IDENTIFIER + ")\\s+ON\\s+"
+                    + "(?<walkAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                    + "(?<walkIdAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*=\\s*"
+                    + "(?<outputAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                    + "(?<outputId>" + DM_IDENTIFIER + ")\\s+AND\\s+"
+                    + "(?<filterAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                    + "(?<filterId>" + DM_IDENTIFIER + ")\\s*!=\\s*"
+                    + "(?<filterSeed>" + MYBATIS_PARAMETER + ")"
+                    + "(?<trailing>\\s*;?\\s*)$"
+    );
     private static final Pattern MYSQL_HELP_TOPIC_SPLIT_JOIN_PATTERN = Pattern.compile(
             "(?is)\\bJOIN\\s+mysql\\s*\\.\\s*help_topic\\s+"
                     + "(?<alias>" + SIMPLE_IDENTIFIER + ")\\s+ON\\s+"
@@ -769,6 +811,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (keywordQuoteConversion.changed()) {
             converted = keywordQuoteConversion.convertedSql();
             rules.add(DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+        }
+
+        GenericConversion hierarchyUserVariableConversion = convertMysqlAncestorUserVariableTraversal(converted);
+        if (hierarchyUserVariableConversion.changed()) {
+            converted = hierarchyUserVariableConversion.convertedSql();
+            rules.add(MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
         }
 
         GenericConversion groupConcatConversion = convertGroupConcat(converted);
@@ -8971,6 +9019,73 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertMysqlAncestorUserVariableTraversal(String sql) {
+        Matcher matcher = MYSQL_ANCESTOR_USER_VARIABLE_TRAVERSAL_PATTERN.matcher(sql);
+        if (!matcher.matches()
+                || !sameIdentifier(matcher, "cursorRead", "cursorWrite", "seedCursor")
+                || !sameIdentifier(matcher, "levelWrite", "levelRead")
+                || !sameIdentifier(matcher, "walkIdAlias", "lookupWalkIdAlias", "walkIdAliasRef")
+                || !sameIdentifier(matcher, "driverAlias", "driverAliasRef")
+                || !sameIdentifier(matcher, "walkAlias", "walkAliasRef")
+                || !sameIdentifier(
+                        matcher,
+                        "aggregateAlias",
+                        "outputAlias",
+                        "outputAliasRef",
+                        "filterAlias"
+                )
+                || !sameIdentifier(
+                        matcher,
+                        "aggregateId",
+                        "lookupId",
+                        "outputId",
+                        "filterId"
+                )
+                || !sameIdentifier(matcher, "parentColumn", "driverParent")
+                || !sameIdentifier(matcher, "lookupTable", "driverTable", "outputTable")
+                || !matcher.group("seed").equals(matcher.group("filterSeed"))) {
+            return new GenericConversion(sql, false);
+        }
+
+        String table = matcher.group("lookupTable");
+        String idColumn = matcher.group("lookupId");
+        String parentColumn = matcher.group("parentColumn");
+        String valueColumn = matcher.group("valueColumn");
+        String seed = matcher.group("seed");
+        String hierarchyAlias = "dm_hierarchy";
+        String resultAlias = matcher.group("resultAlias");
+        String converted = matcher.group("leading")
+                + "SELECT LISTAGG(" + hierarchyAlias + "." + valueColumn + ", "
+                + matcher.group("separator") + ") WITHIN GROUP (ORDER BY "
+                + hierarchyAlias + "." + idColumn + ")"
+                + (resultAlias == null ? "" : " AS " + resultAlias)
+                + "\nFROM (\n"
+                + "    SELECT " + idColumn + ", " + valueColumn + "\n"
+                + "    FROM " + table + "\n"
+                + "    START WITH " + idColumn + " = " + seed + "\n"
+                + "    CONNECT BY NOCYCLE PRIOR " + parentColumn + " = " + idColumn + "\n"
+                + ") " + hierarchyAlias + "\n"
+                + "WHERE " + hierarchyAlias + "." + idColumn + " != " + seed
+                + matcher.group("trailing");
+        return new GenericConversion(converted, true);
+    }
+
+    private boolean sameIdentifier(Matcher matcher, String firstGroup, String... otherGroups) {
+        String expected = normalizeQualifiedIdentifier(matcher.group(firstGroup));
+        for (String group : otherGroups) {
+            if (!expected.equals(normalizeQualifiedIdentifier(matcher.group(group)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String normalizeQualifiedIdentifier(String value) {
+        return value == null
+                ? ""
+                : value.replaceAll("\\s+", "").replace("\"", "").toLowerCase(Locale.ROOT);
     }
 
     private String rewriteGroupConcat(FunctionCall groupConcatCall) {

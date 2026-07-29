@@ -147,6 +147,39 @@ public class MapperXmlRewriter {
     );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`|\\$\\{[^}]+})";
+    private static final String SIMPLE_IDENTIFIER = "[A-Za-z_][A-Za-z0-9_$]*";
+    private static final String SIMPLE_RELATION =
+            DM_IDENTIFIER + "(?:\\s*\\.\\s*" + DM_IDENTIFIER + ")?";
+    private static final Pattern DYNAMIC_DESCENDANT_USER_VARIABLE_TRAVERSAL_PATTERN = Pattern.compile(
+            "(?is)^(?<prefix>\\s*SELECT\\s+"
+                    + "(?<projection><include\\b[^>]*?/?>)\\s+FROM\\s+"
+                    + "(?<outerTable>" + SIMPLE_RELATION + ")\\s+)"
+                    + "WHERE\\s+(?<deleteColumn>" + DM_IDENTIFIER + ")\\s*=\\s*0\\s+AND\\s+"
+                    + "(?<outerId>" + DM_IDENTIFIER + ")\\s+IN\\s*\\(\\s*"
+                    + "SELECT\\s+(?<selectedId>" + DM_IDENTIFIER + ")\\s+FROM\\s*\\(\\s*"
+                    + "SELECT\\s+(?<rowAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                    + "(?<rowId>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "IF\\s*\\(\\s*FIND_IN_SET\\s*\\(\\s*"
+                    + "(?<findParent>" + DM_IDENTIFIER + ")\\s*,\\s*@"
+                    + "(?<readVariable>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s*(?:>|&gt;)\\s*0\\s*,\\s*@"
+                    + "(?<writeVariable>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                    + "CONCAT\\s*\\(\\s*@(?<concatVariable>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*','\\s*,\\s*"
+                    + "(?<concatId>" + DM_IDENTIFIER + ")\\s*\\)\\s*,\\s*0\\s*\\)\\s+AS\\s+"
+                    + "(?<childAlias>" + SIMPLE_IDENTIFIER + ")\\s+FROM\\s*\\(\\s*"
+                    + "SELECT\\s+(?<innerId>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "(?<innerParent>" + DM_IDENTIFIER + ")\\s+FROM\\s+"
+                    + "(?<innerTable>" + SIMPLE_RELATION + ")\\s+"
+                    + "(?<innerTableAlias>" + SIMPLE_IDENTIFIER + ")\\s+ORDER\\s+BY\\s+"
+                    + "(?<orderParent>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "(?<orderId>" + DM_IDENTIFIER + ")\\s*\\)\\s+"
+                    + "(?<rowAliasDeclaration>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                    + "\\(\\s*SELECT\\s+@(?<seedVariable>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                    + "(?<seed>#\\{[^}]+})\\s*\\)\\s+"
+                    + "(?<seedAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s+"
+                    + "(?<resultAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+"
+                    + "(?<childAliasReference>" + SIMPLE_IDENTIFIER + ")\\s*!=\\s*0\\s*\\)"
+                    + "(?<trailing>\\s*;?\\s*)$"
+    );
     private static final Pattern GENERATED_KEY_BATCH_INSERT_PATTERN = Pattern.compile(
             "(?is)^(?<leading>\\s*insert\\s+into\\s+"
                     + DM_IDENTIFIER
@@ -798,7 +831,10 @@ public class MapperXmlRewriter {
             addManualReviewReasons(manualReviewReasons, structuralConversion.manualReviewReasons());
             changed = true;
         }
-        if (appliedRules.contains(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE)
+        if ((appliedRules.contains(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE)
+                || appliedRules.contains(
+                        MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE
+                ))
                 && !containsMysqlUserVariable(rewrittenBody)) {
             manualReviewReasons.removeIf(this::isMysqlUserVariableManualReviewReason);
         }
@@ -877,6 +913,12 @@ public class MapperXmlRewriter {
         if (informationSchemaColumns.changed()) {
             converted = informationSchemaColumns.text();
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+        }
+
+        TextRewrite descendantHierarchy = convertDynamicDescendantUserVariableTraversal(converted);
+        if (descendantHierarchy.changed()) {
+            converted = descendantHierarchy.text();
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
         }
 
         if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
@@ -4912,6 +4954,61 @@ public class MapperXmlRewriter {
                 manualReviewReasons,
                 true
         );
+    }
+
+    private TextRewrite convertDynamicDescendantUserVariableTraversal(String body) {
+        Matcher matcher = DYNAMIC_DESCENDANT_USER_VARIABLE_TRAVERSAL_PATTERN.matcher(body);
+        if (!matcher.matches()
+                || !sameNormalizedValue(matcher, "readVariable", "writeVariable", "concatVariable", "seedVariable")
+                || !sameNormalizedValue(matcher, "rowAlias", "rowAliasDeclaration")
+                || !sameNormalizedValue(matcher, "childAlias", "childAliasReference")
+                || !sameNormalizedValue(
+                        matcher,
+                        "outerId",
+                        "selectedId",
+                        "rowId",
+                        "concatId",
+                        "innerId",
+                        "orderId"
+                )
+                || !sameNormalizedValue(matcher, "findParent", "innerParent", "orderParent")
+                || !normalizeRelation(matcher.group("outerTable"))
+                .equals(normalizeRelation(matcher.group("innerTable")))) {
+            return new TextRewrite(body, false);
+        }
+
+        String idColumn = matcher.group("outerId");
+        String parentColumn = matcher.group("innerParent");
+        String seed = matcher.group("seed");
+        String converted = matcher.group("prefix")
+                + "WHERE " + matcher.group("deleteColumn") + " = 0"
+                + " AND " + idColumn + " IN (\n"
+                + "    SELECT " + idColumn + "\n"
+                + "    FROM " + matcher.group("outerTable") + "\n"
+                + "    START WITH " + parentColumn + " = " + seed + "\n"
+                + "    CONNECT BY NOCYCLE PRIOR " + idColumn + " = " + parentColumn + "\n"
+                + ")"
+                + matcher.group("trailing");
+        return new TextRewrite(converted, true);
+    }
+
+    private boolean sameNormalizedValue(Matcher matcher, String firstGroup, String... otherGroups) {
+        String expected = normalizeRelation(matcher.group(firstGroup));
+        for (String group : otherGroups) {
+            if (!expected.equals(normalizeRelation(matcher.group(group)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String normalizeRelation(String value) {
+        return value == null
+                ? ""
+                : value.replaceAll("\\s+", "")
+                .replace("`", "")
+                .replace("\"", "")
+                .toLowerCase(Locale.ROOT);
     }
 
     private DynamicBodyConversion convertDynamicTargetOnlyOuterJoinToMerge(

@@ -3562,6 +3562,62 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsAncestorUserVariableTraversalToDamengHierarchyQuery() {
+        SqlConversionResult result = converter.convert("""
+                SELECT group_concat(node_label order by N2.node_id separator ' / ') AS path_label
+                FROM (
+                    SELECT
+                    @cursor AS current_id,
+                    (SELECT @cursor := parent_node_id FROM category_tree WHERE node_id = current_id) AS 2v2,
+                    @depth := @depth + 1 AS lvl
+                    FROM
+                    (SELECT @cursor := #{nodeId}) vars,
+                    category_tree h
+                    WHERE h.parent_node_id != 0) N1
+                JOIN category_tree N2 ON N1.current_id = N2.node_id AND N2.node_id != #{nodeId}
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT LISTAGG(dm_hierarchy.node_label, ' / ') WITHIN GROUP (ORDER BY dm_hierarchy.node_id) AS path_label
+                FROM (
+                    SELECT node_id, node_label
+                    FROM category_tree
+                    START WITH node_id = #{nodeId}
+                    CONNECT BY NOCYCLE PRIOR parent_node_id = node_id
+                ) dm_hierarchy
+                WHERE dm_hierarchy.node_id != #{nodeId}
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
+    }
+
+    @Test
+    void keepsAncestorTraversalWithMismatchedTablesForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                SELECT group_concat(node_label order by N2.node_id separator '-') AS path_label
+                FROM (
+                    SELECT
+                    @cursor AS current_id,
+                    (SELECT @cursor := parent_node_id FROM category_tree WHERE node_id = current_id) AS scratch,
+                    @depth := @depth + 1 AS lvl
+                    FROM
+                    (SELECT @cursor := #{nodeId}) vars,
+                    another_tree h
+                    WHERE h.parent_node_id != 0) N1
+                JOIN category_tree N2 ON N1.current_id = N2.node_id AND N2.node_id != #{nodeId}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.convertedSql()).contains("LISTAGG").contains("@cursor");
+        assertThat(result.reason()).contains("MySQL user variables");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+    }
+
+    @Test
     void marksInsertIgnoreForManualReview() {
         SqlConversionResult result = converter.convert("insert ignore into user(id, name) values(1, 'a')");
 
