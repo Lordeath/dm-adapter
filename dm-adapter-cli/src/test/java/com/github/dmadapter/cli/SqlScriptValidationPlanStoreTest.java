@@ -116,6 +116,57 @@ class SqlScriptValidationPlanStoreTest {
     }
 
     @Test
+    void preservesConsumedStatementsAsExecutableDamengNoOps() throws Exception {
+        Path outputRoot = tempDir.resolve("sql-dm");
+        Path output = outputRoot.resolve("consumed-mysql-statements.sql");
+        Files.createDirectories(output.getParent());
+        List<String> migratedStatements = List.of(
+                "-- DM_ADAPTER: MySQL script variable @db_name uses the current schema",
+                "SELECT 1"
+        );
+        Files.writeString(output, SqlScriptParser.scriptContent(migratedStatements));
+        SqlScriptMigrator.PlannedSqlScriptFile file = new SqlScriptMigrator.PlannedSqlScriptFile(
+                "consumed-mysql-statements.sql",
+                output.toString(),
+                "sample-system",
+                true,
+                true,
+                true,
+                2,
+                1,
+                0,
+                Set.of(),
+                List.of("TEST_RULE"),
+                migratedStatements
+        );
+        Path plan = tempDir.resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME);
+        SqlScriptValidationPlanStore store = new SqlScriptValidationPlanStore();
+
+        store.write(
+                plan,
+                tempDir,
+                outputRoot,
+                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                List.of(file),
+                List.of()
+        );
+
+        assertThat(Files.readString(output))
+                .contains("-- DM_ADAPTER: MySQL script variable @db_name uses the current schema")
+                .contains("BEGIN\n    NULL;\nEND;\n/");
+        assertThat(store.load(plan).files())
+                .singleElement()
+                .satisfies(loadedFile -> {
+                    assertThat(loadedFile.statements()).hasSize(2);
+                    assertThat(loadedFile.statements().get(0))
+                            .contains("-- DM_ADAPTER:")
+                            .contains("BEGIN")
+                            .contains("NULL;")
+                            .contains("END;");
+                });
+    }
+
+    @Test
     void rejectsBackticksWhenTargetIsNotMysqlCompatible() {
         SqlScriptValidationPlanStore store = new SqlScriptValidationPlanStore();
 

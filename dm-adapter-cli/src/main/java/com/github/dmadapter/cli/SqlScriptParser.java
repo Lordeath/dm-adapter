@@ -64,14 +64,15 @@ final class SqlScriptParser {
             if (statement == null || statement.isBlank()) {
                 continue;
             }
+            String renderedStatement = renderStatement(statement);
             if (!content.isEmpty()) {
                 content.append("\n\n");
             }
-            content.append(statement.stripTrailing());
-            if (!endsWithSemicolon(statement)) {
+            content.append(renderedStatement);
+            if (!endsWithSemicolon(renderedStatement)) {
                 content.append(";");
             }
-            if (requiresSlashTerminator(statement)) {
+            if (requiresSlashTerminator(renderedStatement)) {
                 content.append("\n/");
             }
         }
@@ -83,6 +84,14 @@ final class SqlScriptParser {
 
     static boolean executable(String statement) {
         return !isBlankSql(statement);
+    }
+
+    private static String renderStatement(String statement) {
+        String renderedStatement = statement.stripTrailing();
+        if (executable(renderedStatement)) {
+            return renderedStatement;
+        }
+        return renderedStatement + "\nBEGIN\n    NULL;\nEND";
     }
 
     private static void addStatement(List<String> statements, String rawStatement) {
