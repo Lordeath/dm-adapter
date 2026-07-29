@@ -2412,6 +2412,46 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsOuterJoinUpdateWhoseAssignmentsOnlyDependOnTarget() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_action action
+                LEFT JOIN sample_step step ON action.step_id = step.id
+                SET action.enabled = #{enabled}
+                WHERE step.enabled = #{enabled}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                MERGE INTO sample_action action USING (SELECT DISTINCT action.ROWID AS dm_target_rowid FROM sample_action action
+                LEFT JOIN sample_step step ON action.step_id = step.id WHERE step.enabled = #{enabled}) dm_update_source ON (action.ROWID = dm_update_source.dm_target_rowid) WHEN MATCHED THEN UPDATE SET action.enabled = #{enabled}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void convertsOuterJoinUpdateOfJoinedAliasWhenAssignmentsOnlyDependOnThatAlias() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_ticket ticket
+                LEFT JOIN sample_flow flow ON ticket.flow_id = flow.id
+                SET flow.current_user_id = CASE WHEN flow.current_user_id = 0 THEN 0 ELSE #{newUserId} END,
+                    flow.current_user_name = REPLACE(flow.current_user_name, #{oldName}, #{newName})
+                WHERE ticket.status = #{status}
+                  AND flow.current_user_id = #{oldUserId}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .startsWith("MERGE INTO sample_flow flow USING (SELECT DISTINCT flow.ROWID AS dm_target_rowid")
+                .contains("FROM sample_ticket ticket\nLEFT JOIN sample_flow flow ON ticket.flow_id = flow.id")
+                .contains("ON (flow.ROWID = dm_update_source.dm_target_rowid)")
+                .contains("WHEN MATCHED THEN UPDATE SET flow.current_user_id")
+                .contains("flow.current_user_name = REPLACE(flow.current_user_name, #{oldName}, #{newName})");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
     void convertsDerivedTableFollowedByAnotherMysqlUpdateJoin() {
         SqlConversionResult result = converter.convert("""
                 UPDATE sample_task target

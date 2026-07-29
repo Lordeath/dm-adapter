@@ -5165,6 +5165,68 @@ class MapperMigratorTest {
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
+    @Test
+    void convertsDynamicOuterJoinUpdateOfJoinedTargetToRowIdMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.FlowMapper">
+                    <update id="transferCurrentUser">
+                        update sample_ticket ticket
+                        left join sample_flow flow on ticket.flow_id = flow.id
+                        set flow.current_user_id =
+                            case when flow.current_user_id = 0 then 0 else #{newUserId} end,
+                            flow.current_user_name =
+                            replace(flow.current_user_name, #{oldUserName}, #{newUserName})
+                        where 1 = 1
+                        <if test="statuses != null and statuses.size() > 0">
+                            and ticket.status in
+                            <foreach collection="statuses" item="status" open="(" close=")" separator=",">
+                                #{status}
+                            </foreach>
+                        </if>
+                        and flow.current_user_id = #{oldUserId}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/FlowMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/FlowMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/FlowMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO sample_flow flow")
+                .contains("SELECT DISTINCT flow.ROWID AS dm_target_rowid")
+                .contains("FROM sample_ticket ticket")
+                .contains("left join sample_flow flow on ticket.flow_id = flow.id")
+                .contains("<if test=\"statuses != null and statuses.size() > 0\">")
+                .contains("and flow.current_user_id = #{oldUserId}")
+                .contains("ON (flow.ROWID = dm_update_source.dm_target_rowid)")
+                .contains("WHEN MATCHED THEN UPDATE SET flow.current_user_id")
+                .doesNotContainIgnoringCase("update sample_ticket ticket");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE,
+                        MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE
+                );
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
     private int countMatches(String value, String needle) {
         int count = 0;
         int index = 0;
