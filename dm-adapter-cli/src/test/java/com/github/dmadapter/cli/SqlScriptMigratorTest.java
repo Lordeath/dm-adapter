@@ -92,6 +92,8 @@ class SqlScriptMigratorTest {
     void convertsScriptLeftJoinUpdateWhenProjectDdlProvesSourceKeyUnique() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        Path projectRoot = tempDir.resolve("java/sample-app");
+        Files.createDirectories(projectRoot);
         write(tempDir.resolve("sql/00_Create.sql"), """
                 CREATE TABLE sample_header (
                     id BIGINT NOT NULL,
@@ -111,7 +113,17 @@ class SqlScriptMigratorTest {
                 SET detail.document_type = header.document_type;
                 """);
 
-        SqlScriptMigrationReport report = migrateScriptRoot(sqlRoot, sqlRootOut);
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        projectRoot,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
 
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(Files.readString(sqlRootOut.resolve("20260729.sql")))
