@@ -301,6 +301,27 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void keepsDecimalDivisionWithScalarSubqueryDenominatorWithoutManualReview() {
+        SqlConversionResult result = converter.convert("""
+                SELECT ROUND(COUNT(DISTINCT companyId) * 100.0 /
+                    (SELECT COUNT(DISTINCT companyId) FROM member_charge), 2) AS ratio
+                FROM member_charge
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
+    void marksIncompleteDecimalDivisionForManualReview() {
+        SqlConversionResult result = converter.convert("SELECT 1.0 /");
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("整数算术");
+    }
+
+    @Test
     void marksUnsafeArithmeticDivisionForManualReview() {
         List<String> sqlItems = List.of(
                 "select '10'/4 from dual",

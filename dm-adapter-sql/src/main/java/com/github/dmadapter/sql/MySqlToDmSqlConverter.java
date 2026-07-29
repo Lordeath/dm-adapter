@@ -991,12 +991,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             } else if (current == '/') {
                 ArithmeticOperand left = readArithmeticLeftOperand(sql, index);
                 ArithmeticOperand right = readArithmeticRightOperand(sql, index + 1);
-                if (!isConvertibleArithmeticOperation(left, right) || left.startIndex() < protectedEnd) {
-                    return ArithmeticConversion.manual(sql);
-                }
-                if (isDecimalArithmeticExpression(left.text()) || isDecimalArithmeticExpression(right.text())) {
+                if (left != null
+                        && right != null
+                        && (isDecimalArithmeticExpression(left.text())
+                        || isDecimalArithmeticExpression(right.text()))) {
                     index++;
                     continue;
+                }
+                if (!isConvertibleArithmeticOperation(left, right) || left.startIndex() < protectedEnd) {
+                    return ArithmeticConversion.manual(sql);
                 }
                 replacements.add(new TextReplacement(
                         left.startIndex(),
