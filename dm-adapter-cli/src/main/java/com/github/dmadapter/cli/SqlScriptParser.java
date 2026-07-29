@@ -27,7 +27,10 @@ final class SqlScriptParser {
         ScriptScanState scanState = new ScriptScanState();
         for (String line : lines(content)) {
             Matcher delimiterMatcher = DELIMITER_DIRECTIVE.matcher(line.strip());
-            if (!slashTerminatedBlock && delimiterMatcher.matches() && !scanState.pendingExecutable()) {
+            if (!slashTerminatedBlock
+                    && delimiterMatcher.matches()
+                    && !scanState.pendingExecutable()
+                    && !scanState.insideLexicalContext()) {
                 delimiter = delimiterMatcher.group(1);
                 continue;
             }
@@ -40,12 +43,17 @@ final class SqlScriptParser {
                 buffer.append(line);
                 continue;
             }
-            if (";".equals(delimiter) && !scanState.pendingExecutable() && startsSlashTerminatedBlock(line)) {
+            if (";".equals(delimiter)
+                    && !scanState.pendingExecutable()
+                    && !scanState.insideLexicalContext()
+                    && startsSlashTerminatedBlock(line)) {
                 slashTerminatedBlock = true;
                 buffer.append(line);
                 continue;
             }
-            if (isSlashTerminator(line) && !scanState.pendingExecutable()) {
+            if (isSlashTerminator(line)
+                    && !scanState.pendingExecutable()
+                    && !scanState.insideLexicalContext()) {
                 continue;
             }
             buffer.append(line);
@@ -216,6 +224,10 @@ final class SqlScriptParser {
 
         boolean pendingExecutable() {
             return pendingExecutable;
+        }
+
+        boolean insideLexicalContext() {
+            return singleQuoted || doubleQuoted || backtickQuoted || lineComment || blockComment;
         }
 
         void scanAppendedText(StringBuilder sql, String delimiter, List<String> statements) {
