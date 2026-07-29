@@ -227,6 +227,55 @@ class ValidationTestRunnerTest {
     }
 
     @Test
+    void treatsFreshValidationReportFailuresAsFailureWhenMavenIgnoresTestFailures() {
+        List<String> streamedLines = new ArrayList<>();
+        ValidationTestRunner runner = new ValidationTestRunner(
+                Map.of(),
+                "Linux",
+                processBuilder -> processWithOutput("BUILD SUCCESS\n", 0, () -> {
+                    try {
+                        Path workspace = tempDir.resolve(".dm-adapter");
+                        Files.createDirectories(workspace);
+                        Files.writeString(workspace.resolve("sql-validation-report.json"), """
+                                {
+                                  "runStatus": "COMPLETE",
+                                  "summary": {"passed": 12, "failed": 2, "skipped": 1}
+                                }
+                                """);
+                        Files.writeString(workspace.resolve("sql-validation-report.md"), """
+                                # 达梦 SQL 验证报告
+
+                                - 通过: `12`
+                                - 失败: `2`
+                                - 跳过: `1`
+                                """);
+                    } catch (IOException e) {
+                        throw new AssertionError(e);
+                    }
+                }),
+                new RecordingShutdownHookRegistry(),
+                streamedLines::add
+        );
+
+        ValidationTestRunResult result = runner.runIfConfigured(
+                generationResult(),
+                DmValidationEnvironment.from(Map.of(
+                        "DM_SQL_VALIDATION", "true",
+                        "DM_JDBC_URL", "jdbc:dm://localhost:5236",
+                        "DM_DB_USERNAME", "SYSDBA",
+                        "DM_DB_PASSWORD", "SYSDBA"
+                ))
+        );
+
+        assertThat(result.exitCode()).isEqualTo(1);
+        assertThat(result.message()).contains("exited with code 1");
+        assertThat(streamedLines)
+                .anySatisfy(line -> assertThat(line)
+                        .contains("report contains 2 failure(s)")
+                        .contains("Maven returned success"));
+    }
+
+    @Test
     void includesValidationReportSummaryInRunOutput() throws IOException {
         String reportContent = """
                 # 达梦 SQL 验证报告
