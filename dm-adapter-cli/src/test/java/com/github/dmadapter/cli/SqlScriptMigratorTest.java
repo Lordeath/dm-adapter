@@ -3811,7 +3811,7 @@ class SqlScriptMigratorTest {
                         alter table demo modify column amount decimal(14, 2) null, modify column tax decimal(14, 2) null;
                     END IF;
                     IF EXISTS (
-                        SELECT 1 FROM information_schema.TABLES
+                        SELECT 1 FROM information_schema.`TABLES`
                         WHERE table_schema = database() AND table_name = 'demo'
                     ) THEN
                         SELECT 1;

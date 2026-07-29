@@ -281,15 +281,22 @@ class SqlScriptMigrator {
                     "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*columns\\b"),
+                    Pattern.compile(
+                            "(?is)\\binformation_schema\\s*\\.\\s*(?:columns|`columns`|\"columns\")"
+                    ),
                     "ALL_TAB_COLUMNS"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\bselect\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*statistics\\b"),
+                    Pattern.compile(
+                            "(?is)\\bselect\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*"
+                                    + "(?:statistics|`statistics`|\"statistics\")"
+                    ),
                     "SELECT INDEX_NAME FROM ALL_INDEXES"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*statistics\\b"),
+                    Pattern.compile(
+                            "(?is)\\binformation_schema\\s*\\.\\s*(?:statistics|`statistics`|\"statistics\")"
+                    ),
                     "(SELECT I.OWNER, I.TABLE_NAME, I.INDEX_NAME, "
                             + "CASE WHEN I.UNIQUENESS = 'UNIQUE' THEN 0 ELSE 1 END AS NON_UNIQUE, "
                             + "C.COLUMN_NAME, C.COLUMN_POSITION AS SEQ_IN_INDEX "
@@ -301,15 +308,22 @@ class SqlScriptMigrator {
                             + "AND C.TABLE_NAME = I.TABLE_NAME)"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*tables\\b"),
+                    Pattern.compile(
+                            "(?is)\\binformation_schema\\s*\\.\\s*(?:tables|`tables`|\"tables\")"
+                    ),
                     "ALL_TABLES"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*views\\b"),
+                    Pattern.compile(
+                            "(?is)\\binformation_schema\\s*\\.\\s*(?:views|`views`|\"views\")"
+                    ),
                     "(SELECT OWNER, OWNER AS TABLE_SCHEMA, VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS)"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*table_constraints\\b"),
+                    Pattern.compile(
+                            "(?is)\\binformation_schema\\s*\\.\\s*"
+                                    + "(?:table_constraints|`table_constraints`|\"table_constraints\")"
+                    ),
                     "(SELECT OWNER, OWNER AS CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, "
                             + "CASE CONSTRAINT_TYPE "
                             + "WHEN 'R' THEN 'FOREIGN KEY' "
@@ -318,11 +332,16 @@ class SqlScriptMigrator {
                             + "ELSE CONSTRAINT_TYPE END AS CONSTRAINT_TYPE FROM ALL_CONSTRAINTS)"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*schemata\\b"),
+                    Pattern.compile(
+                            "(?is)\\binformation_schema\\s*\\.\\s*(?:schemata|`schemata`|\"schemata\")"
+                    ),
                     "(SELECT USERNAME AS SCHEMA_NAME FROM ALL_USERS)"
             ),
             new TextReplacement(
-                    Pattern.compile("(?is)\\binformation_schema\\s*\\.\\s*key_column_usage\\b"),
+                    Pattern.compile(
+                            "(?is)\\binformation_schema\\s*\\.\\s*"
+                                    + "(?:key_column_usage|`key_column_usage`|\"key_column_usage\")"
+                    ),
                     "(SELECT C.OWNER, C.TABLE_NAME, C.CONSTRAINT_NAME, CC.COLUMN_NAME, "
                             + "RC.TABLE_NAME AS REFERENCED_TABLE_NAME "
                             + "FROM ALL_CONSTRAINTS C "
