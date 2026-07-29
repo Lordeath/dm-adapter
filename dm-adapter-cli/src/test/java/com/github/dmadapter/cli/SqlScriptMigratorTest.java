@@ -4341,6 +4341,34 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsDynamicPrepareSequenceSeparatedByComments() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE execute_formula()
+                BEGIN
+                    SET @dynamic_sql = 'SELECT 1 FROM dual';
+                    PREPARE formula_stmt FROM @dynamic_sql;
+                    -- prepare completed
+                    EXECUTE formula_stmt;
+                    /* release the MySQL prepared statement */
+                    DEALLOCATE PREPARE formula_stmt;
+                END;
+                /
+                CALL execute_formula();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("dm_dynamic_sql VARCHAR(4000)")
+                .contains("EXECUTE IMMEDIATE dm_dynamic_sql")
+                .doesNotContain("PREPARE formula_stmt")
+                .doesNotContain("EXECUTE formula_stmt")
+                .doesNotContain("DEALLOCATE PREPARE formula_stmt");
+        assertThat(converted.report().files()).singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_DYNAMIC_PREPARE_TO_EXECUTE_IMMEDIATE_RULE));
+    }
+
+    @Test
     void convertsProcedureInsertIgnoreIntoBackupTableCreatedLikeSourceWhenIdIsAvailable() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
