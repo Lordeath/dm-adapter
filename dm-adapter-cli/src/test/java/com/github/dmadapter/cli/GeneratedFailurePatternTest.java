@@ -49,6 +49,28 @@ class GeneratedFailurePatternTest {
                     failedRecord(validationClass, missingColumn)
             )).isFalse();
 
+            addDatabaseColumn(
+                    validationClass,
+                    validation,
+                    "ns_bid_supplier_bid_info",
+                    "biddingManagementId",
+                    "BIGINT"
+            );
+            String misspelledSourceColumn = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 无效的列名[biddingManagement2Id]
+                    ### SQL: update ns_bid_supplier_bid_info set `deleteFlag` = 1
+                    where `biddingManagement2Id` = ?
+                    ### Cause: dm.jdbc.driver.DMException: 无效的列名[biddingManagement2Id]
+                    """;
+            Object misspelledRecord = failedRecord(validationClass, misspelledSourceColumn);
+            assertThat(failurePattern(validationClass, validation, misspelledRecord))
+                    .isEqualTo("ORIGINAL_SQL_COLUMN_NAME_MISMATCH");
+            assertThat(category(validationClass, validation, misspelledRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, misspelledRecord))
+                    .isFalse();
+
             String omittedRequiredColumn = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error updating database. Cause: dm.jdbc.driver.DMException: 违反列[business_id]非空约束
@@ -226,6 +248,34 @@ class GeneratedFailurePatternTest {
         Field currentConfig = validationClass.getDeclaredField("currentConfig");
         currentConfig.setAccessible(true);
         currentConfig.set(validation, config);
+    }
+
+    private void addDatabaseColumn(
+            Class<?> validationClass,
+            Object validation,
+            String table,
+            String column,
+            String type
+    ) throws Exception {
+        Class<?> metadataClass = Class.forName(
+                validationClass.getName() + "$DbColumnMetadata",
+                true,
+                validationClass.getClassLoader()
+        );
+        var constructor = metadataClass.getDeclaredConstructor();
+        constructor.setAccessible(true);
+        Object metadata = constructor.newInstance();
+        Method addColumn = metadataClass.getDeclaredMethod(
+                "addColumn",
+                String.class,
+                String.class,
+                String.class
+        );
+        addColumn.setAccessible(true);
+        addColumn.invoke(metadata, table, column, type);
+        Field dbColumnMetadata = validationClass.getDeclaredField("dbColumnMetadata");
+        dbColumnMetadata.setAccessible(true);
+        dbColumnMetadata.set(validation, metadata);
     }
 
     private String generatedTestSource() throws Exception {

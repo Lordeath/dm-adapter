@@ -44,6 +44,7 @@
 - MySQL `UPDATE ... JOIN ... SET ...` 在达梦 53 兼容模式下可执行，默认保留，不再自动改写为 `UPDATE FROM`。如果目标环境验证失败，或存在多目标更新、触发器副作用、行数语义差异，再按业务 SQL 人工处理。
 - MySQL 用户变量和累加写法如 `@rownum := @rownum + 1` 不能直接迁移，通常改为达梦窗口函数 `ROW_NUMBER() OVER (...)`，或在存储过程/业务代码中显式声明变量。
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
+- 同一列定义出现两个或更多 `DEFAULT` 子句时，原始 MySQL DDL 本身存在互相冲突的默认值，工具不能替业务选择保留哪一个。数据库验证应将其归为 `ORIGINAL_SQL`，保留转换结果并要求修正源脚本，不能误报为待补充的达梦转换规则。
 - MySQL `AUTO_INCREMENT` 和 `ALTER TABLE t AUTO_INCREMENT = n` 默认不再为了验证而改写。目标环境如果不支持或业务依赖重置序列语义，应按达梦身份列/序列方案人工确认，不能把 `AUTO_INCREMENT = n` 删除后留下半截 `ALTER TABLE`。
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
 - MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。
@@ -77,6 +78,7 @@
   - 已被 SQL 引号包住的字符串值，如 `'${item.code}'`，配置值应是不带外层 SQL 引号的普通字符串；如果 `${item.code}` 本身承担 SQL 片段，配置值才可能需要带引号。
 - 动态表名或动态列名缺少业务入参时，验证生成的 `ID`、`test`、空字符串等占位值只用于暴露问题，不能当作真实 SQL 兼容失败。能从 mapper 上下文推断的增强工具，不能推断的写配置或跳过。
 - 缺表、缺视图、缺函数、缺列等测试环境问题可以加入 validation ignore，但必须能从错误信息确认是测试库对象缺失，不应掩盖 mapper 语法错误。
+- 测试库表存在但 mapper 引用的列不存在，且该列名与表中唯一一个现有列仅相差一个字符时，应报告为 `ORIGINAL_SQL_COLUMN_NAME_MISMATCH` / `ORIGINAL_SQL`，提示对照源 DDL 修正原始 mapper。没有这种强相似证据的缺列仍归为 `TEST_SCHEMA_OBJECT`，避免把尚未部署到测试库的新字段误判为原始 SQL。
 
 ## 验证和分类流程
 

@@ -317,8 +317,14 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 successCount++;
             } catch (Exception e) {
                 String blockedObject = blockedObject(sql, failedCreatedObjects.keySet());
-                String category = blockedObject.isBlank() ? classify(e) : "BLOCKED_BY_PRIOR_FAILURE";
+                String category = blockedObject.isBlank() ? classify(e, sql) : "BLOCKED_BY_PRIOR_FAILURE";
                 String errorSummary = compact(redact(safeMessage(e), environment));
+                if ("ORIGINAL_SQL".equals(category) && containsDuplicateColumnDefault(sql)) {
+                    errorSummary = compact(
+                            "Original SQL defines multiple DEFAULT clauses for one column; "
+                                    + "fix the source SQL before migration. " + errorSummary
+                    );
+                }
                 if ("OBJECT_DEFINITION_CHANGED".equals(category)) {
                     errorSummary = objectDefinitionChangedSummary(errorSummary, e, recentObjectDdl);
                 }
@@ -694,7 +700,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         return quote + identifier.replace(quote, quote + quote) + quote;
     }
 
-    private String classify(Exception e) {
+    private String classify(Exception e, String sql) {
         if (e instanceof InvalidCreatedObjectException) {
             return "INVALID_DATABASE_OBJECT";
         }
@@ -716,9 +722,157 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             return "TEST_SCHEMA_FUNCTION";
         }
         if (message.contains("语法") || message.contains("syntax")) {
+            if (containsDuplicateColumnDefault(sql)) {
+                return "ORIGINAL_SQL";
+            }
             return "SQL_SYNTAX";
         }
         return "SQL_EXECUTION";
+    }
+
+    private boolean containsDuplicateColumnDefault(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return false;
+        }
+        Matcher createTable = Pattern.compile(
+                "(?is)\\bCREATE\\s+(?:(?:GLOBAL\\s+)?TEMPORARY\\s+)?TABLE\\b"
+        ).matcher(sql);
+        while (createTable.find()) {
+            int openIndex = nextUnquotedCharacter(sql, createTable.end(), '(');
+            if (openIndex < 0) {
+                continue;
+            }
+            int closeIndex = matchingParenthesis(sql, openIndex);
+            if (closeIndex < 0) {
+                continue;
+            }
+            for (String definition : splitTopLevelComma(sql.substring(openIndex + 1, closeIndex))) {
+                if (keywordCount(definition, "DEFAULT") > 1) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private int nextUnquotedCharacter(String text, int start, char target) {
+        char quote = '\0';
+        for (int index = Math.max(0, start); index < text.length(); index++) {
+            char current = text.charAt(index);
+            if (quote != '\0') {
+                if (current == quote) {
+                    if (index + 1 < text.length() && text.charAt(index + 1) == quote) {
+                        index++;
+                    } else {
+                        quote = '\0';
+                    }
+                }
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+            } else if (current == target) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    private int matchingParenthesis(String text, int openIndex) {
+        int depth = 0;
+        char quote = '\0';
+        for (int index = openIndex; index < text.length(); index++) {
+            char current = text.charAt(index);
+            if (quote != '\0') {
+                if (current == quote) {
+                    if (index + 1 < text.length() && text.charAt(index + 1) == quote) {
+                        index++;
+                    } else {
+                        quote = '\0';
+                    }
+                }
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+            } else if (current == '(') {
+                depth++;
+            } else if (current == ')' && --depth == 0) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    private List<String> splitTopLevelComma(String text) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        char quote = '\0';
+        for (int index = 0; index < text.length(); index++) {
+            char current = text.charAt(index);
+            if (quote != '\0') {
+                if (current == quote) {
+                    if (index + 1 < text.length() && text.charAt(index + 1) == quote) {
+                        index++;
+                    } else {
+                        quote = '\0';
+                    }
+                }
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+            } else if (current == '(') {
+                depth++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+            } else if (current == ',' && depth == 0) {
+                parts.add(text.substring(start, index));
+                start = index + 1;
+            }
+        }
+        parts.add(text.substring(start));
+        return parts;
+    }
+
+    private int keywordCount(String text, String keyword) {
+        int count = 0;
+        char quote = '\0';
+        for (int index = 0; index < text.length();) {
+            char current = text.charAt(index);
+            if (quote != '\0') {
+                if (current == quote) {
+                    if (index + 1 < text.length() && text.charAt(index + 1) == quote) {
+                        index += 2;
+                        continue;
+                    }
+                    quote = '\0';
+                }
+                index++;
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+                index++;
+                continue;
+            }
+            int end = index + keyword.length();
+            if (end <= text.length()
+                    && text.regionMatches(true, index, keyword, 0, keyword.length())
+                    && (index == 0 || !isSqlWordCharacter(text.charAt(index - 1)))
+                    && (end == text.length() || !isSqlWordCharacter(text.charAt(end)))) {
+                count++;
+                index = end;
+                continue;
+            }
+            index++;
+        }
+        return count;
+    }
+
+    private boolean isSqlWordCharacter(char value) {
+        return Character.isLetterOrDigit(value) || value == '_' || value == '$';
     }
 
     private int damengErrorCode(Throwable throwable) {

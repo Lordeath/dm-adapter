@@ -8368,6 +8368,9 @@ class DmSqlValidationTestGenerator {
                     if (countsByPattern.containsKey("ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY")) {
                         markdown.append("- 原始 ON DUPLICATE KEY UPDATE / INSERT IGNORE 没有可用于冲突判断的主键或唯一键；应修正原始业务 SQL 或补充真实唯一约束，不能猜测 keyColumns。\\n");
                     }
+                    if (countsByPattern.containsKey("ORIGINAL_SQL_COLUMN_NAME_MISMATCH")) {
+                        markdown.append("- 原始 mapper 引用了测试表中不存在、但与现有字段仅差一个字符的列名；应对照源 DDL 修正原始 mapper，不能作为达梦转换或测试库缺对象问题忽略。\\n");
+                    }
                     if (countsByPattern.containsKey("DM_CTAS_BIND_PARAMETER")) {
                         markdown.append("- 达梦不支持在 CREATE TABLE AS SELECT 中使用 JDBC 绑定参数；将该 mapper 拆为显式建临时表和参数化 INSERT 两个步骤。\\n");
                     }
@@ -8562,6 +8565,8 @@ class DmSqlValidationTestGenerator {
                             return "INSERT IGNORE";
                         case "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY":
                             return "原始 SQL 缺少可用冲突键";
+                        case "ORIGINAL_SQL_COLUMN_NAME_MISMATCH":
+                            return "原始 SQL 疑似写错列名";
                         case "MYSQL_GROUP_CONCAT":
                             return "GROUP_CONCAT 函数";
                         case "MYSQL_CONCAT_WS":
@@ -8806,6 +8811,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasOriginalSqlConflictKeyIssue(record, message)) {
                         return "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
+                    }
+                    if (hasLikelyOriginalColumnNameMismatch(message)) {
+                        return "ORIGINAL_SQL_COLUMN_NAME_MISMATCH";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
                         return "JAVA_MAPPER_PARAM_ANNOTATION";
@@ -9367,6 +9375,36 @@ class DmSqlValidationTestGenerator {
                             ).matcher(message == null ? "" : message).find();
                 }
 
+                private boolean hasLikelyOriginalColumnNameMismatch(String message) {
+                    if (dbColumnMetadata == null || isBlank(message)) {
+                        return false;
+                    }
+                    List<String> invalidColumns = bracketedValuesAfterMarker(message, "无效的列名");
+                    if (invalidColumns.isEmpty()) {
+                        return false;
+                    }
+                    String sql = sqlFromMessage(message);
+                    if (isBlank(sql)) {
+                        return false;
+                    }
+                    LinkedHashSet<String> tables = new LinkedHashSet<>();
+                    Matcher tableMatcher = Pattern.compile(
+                            "\\\\b(?:from|update|into|join)\\\\s+([A-Za-z0-9_$.`-]+)",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(sql);
+                    while (tableMatcher.find()) {
+                        tables.add(tableMatcher.group(1));
+                    }
+                    for (String invalidColumn : invalidColumns) {
+                        for (String table : tables) {
+                            if (dbColumnMetadata.hasSingleEditColumn(table, invalidColumn)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+
                 private boolean hasJavaMapperParamAnnotationIssue(String message) {
                     String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
                     return lower.contains("java mapper signature has duplicate @param")
@@ -9408,6 +9446,9 @@ class DmSqlValidationTestGenerator {
                         return "TEST_DATABASE_RUNTIME";
                     }
                     if (hasOriginalSqlConflictKeyIssue(record, message)) {
+                        return "ORIGINAL_SQL";
+                    }
+                    if (hasLikelyOriginalColumnNameMismatch(message)) {
                         return "ORIGINAL_SQL";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
@@ -11618,6 +11659,7 @@ class DmSqlValidationTestGenerator {
                     private static final int METADATA_QUERY_TIMEOUT_SECONDS = 8;
                     private final Map<String, String> tableColumnTypes = new LinkedHashMap<>();
                     private final Map<String, Set<String>> columnTypes = new LinkedHashMap<>();
+                    private final Map<String, Set<String>> tableColumns = new LinkedHashMap<>();
 
                     private static DbColumnMetadata empty() {
                         return new DbColumnMetadata();
@@ -11710,6 +11752,7 @@ class DmSqlValidationTestGenerator {
                         String normalizedType = dataType.toUpperCase(Locale.ROOT);
                         tableColumnTypes.putIfAbsent(tableKey(normalizedTable, normalizedColumn), normalizedType);
                         columnTypes.computeIfAbsent(normalizedColumn, ignored -> new LinkedHashSet<>()).add(normalizedType);
+                        tableColumns.computeIfAbsent(normalizedTable, ignored -> new LinkedHashSet<>()).add(normalizedColumn);
                     }
 
                     private String columnType(ColumnReference columnReference) {
@@ -11730,6 +11773,61 @@ class DmSqlValidationTestGenerator {
 
                     private int columnCount() {
                         return tableColumnTypes.size();
+                    }
+
+                    private boolean hasSingleEditColumn(String tableName, String invalidColumn) {
+                        String normalizedTable = normalizeIdentifier(tableName);
+                        int separator = normalizedTable.lastIndexOf('.');
+                        if (separator >= 0) {
+                            normalizedTable = normalizedTable.substring(separator + 1);
+                        }
+                        String normalizedInvalidColumn = normalizeIdentifier(invalidColumn);
+                        if (normalizedInvalidColumn.length() < 4) {
+                            return false;
+                        }
+                        Set<String> columns = tableColumns.get(normalizedTable);
+                        if (columns == null || columns.contains(normalizedInvalidColumn)) {
+                            return false;
+                        }
+                        int candidates = 0;
+                        for (String column : columns) {
+                            if (editDistanceAtMostOne(column, normalizedInvalidColumn)) {
+                                candidates++;
+                                if (candidates > 1) {
+                                    return false;
+                                }
+                            }
+                        }
+                        return candidates == 1;
+                    }
+
+                    private boolean editDistanceAtMostOne(String left, String right) {
+                        if (left.equals(right) || Math.abs(left.length() - right.length()) > 1) {
+                            return false;
+                        }
+                        String shorter = left.length() <= right.length() ? left : right;
+                        String longer = left.length() <= right.length() ? right : left;
+                        int shorterIndex = 0;
+                        int longerIndex = 0;
+                        int differences = 0;
+                        while (shorterIndex < shorter.length() && longerIndex < longer.length()) {
+                            if (shorter.charAt(shorterIndex) == longer.charAt(longerIndex)) {
+                                shorterIndex++;
+                                longerIndex++;
+                                continue;
+                            }
+                            if (++differences > 1) {
+                                return false;
+                            }
+                            if (shorter.length() == longer.length()) {
+                                shorterIndex++;
+                            }
+                            longerIndex++;
+                        }
+                        if (longerIndex < longer.length()) {
+                            differences++;
+                        }
+                        return differences == 1;
                     }
 
                     private static String tableKey(String normalizedTable, String normalizedColumn) {

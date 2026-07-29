@@ -3838,6 +3838,43 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void classifiesDuplicateColumnDefaultsAsOriginalSql() {
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")
+                    && ((String) args[0]).contains("CREATE TABLE")) {
+                throw new SQLException("第 3 行, 第 37 列[DEFAULT]附近出现错误: 语法分析出错");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "duplicate-default.sql",
+                        "sample-bill",
+                        List.of("""
+                                CREATE TABLE demo (
+                                    id BIGINT NOT NULL,
+                                    status TINYINT DEFAULT NULL DEFAULT '0',
+                                    note VARCHAR(64) DEFAULT 'DEFAULT text'
+                                )
+                                """)
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("ORIGINAL_SQL");
+            assertThat(failure.errorSummary())
+                    .contains("multiple DEFAULT clauses")
+                    .contains("fix the source SQL");
+        });
+    }
+
+    @Test
     void schemaPreflightStopsAllSqlStatementsAndReportsOneRootFailure() {
         AtomicInteger businessStatementCount = new AtomicInteger();
         Statement statement = proxy(Statement.class, (ignored, method, args) -> {
