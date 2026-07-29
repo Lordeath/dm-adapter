@@ -7214,6 +7214,7 @@ class DmSqlValidationTestGenerator {
                     return normalizedName.endsWith("status")
                             || normalizedName.endsWith("state")
                             || normalizedName.endsWith("flag")
+                            || normalizedName.endsWith("method")
                             || normalizedName.endsWith("type")
                             || normalizedName.endsWith("sex")
                             || normalizedName.endsWith("unit")

@@ -369,6 +369,67 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationMakesGeneratedBatchKeyConditionalForDamengIdentity() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.SiKuBankFlowMapper">
+                    <insert id="insertBatch" parameterType="java.util.List"
+                            useGeneratedKeys="true" keyProperty="id">
+                        insert into ns_si_ku_bank_flow
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            `id`,
+                            `enterpriseId`,
+                            `organizationId`
+                        </trim>
+                        values
+                        <foreach collection="list" item="item" index="index" separator=",">
+                            (
+                            #{item.id, jdbcType=BIGINT},
+                            #{item.enterpriseId, jdbcType=BIGINT},
+                            #{item.organizationId, jdbcType=BIGINT}
+                            )
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/SiKuBankFlowMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/SiKuBankFlowMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/SiKuBankFlowMapper.xml"));
+        String generatedKeyTest = "list != null and !list.isEmpty() and list[0].id != null";
+        assertThat(rewritten)
+                .contains("<if test=\"" + generatedKeyTest + "\">")
+                .contains("`id`,")
+                .contains("#{item.id, jdbcType=BIGINT},")
+                .contains("useGeneratedKeys=\"true\" keyProperty=\"id\"")
+                .contains("`enterpriseId`,")
+                .contains("#{item.enterpriseId, jdbcType=BIGINT}")
+                .contains("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MapperXmlRewriter.MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE,
+                        MapperXmlRewriter.MYBATIS_FOREACH_TRAILING_COMMA_RULE
+                );
+    }
+
+    @Test
     void migrationDoesNotWrapGeneratedKeyInsertForConfiguredIdentityInsertTable() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
