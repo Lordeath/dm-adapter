@@ -540,6 +540,68 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesBatchOnDuplicateKeySelfAssignmentToInsertOnlyMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.BankFlowMapper">
+                    <insert id="insertBatch">
+                        insert into ns_bill_bank_flow
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            enterprise_id,
+                            transaction_serial_number,
+                            create_user_name
+                        </trim>
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (
+                            #{item.enterpriseId},
+                            #{item.transactionSerialNumber},
+                            #{item.createUserName}
+                            )
+                        </foreach>
+                        on duplicate key update create_user_name = create_user_name
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/BankFlowMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BankFlowMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(
+                                "com.example.BankFlowMapper.insertBatch",
+                                List.of("transaction_serial_number")
+                        )
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BankFlowMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_bill_bank_flow t")
+                .contains("ON (t.transaction_serial_number = s.transaction_serial_number)")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContain("WHEN MATCHED")
+                .doesNotContain("on duplicate key update");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
     void migrationRewritesBacktickBatchInsertIgnoreToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -740,6 +802,68 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
+    void migrationRewritesConditionalTrimOnDuplicateKeySelfAssignmentToInsertOnlyMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaidInAuditMapper">
+                    <insert id="insert">
+                        insert into ns_paid_in_audit
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="enterpriseId != null">
+                                `enterpriseId`,
+                            </if>
+                            <if test="orderNo != null">
+                                `orderNo`,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="enterpriseId != null">
+                                #{enterpriseId},
+                            </if>
+                            <if test="orderNo != null">
+                                #{orderNo},
+                            </if>
+                        </trim>
+                        on duplicate key update enterpriseId = enterpriseId
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaidInAuditMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaidInAuditMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.PaidInAuditMapper.insert", List.of("orderNo"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaidInAuditMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ns_paid_in_audit t")
+                .contains("ON (t.orderNo = s.orderNo)")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContain("WHEN MATCHED")
+                .doesNotContain("on duplicate key update");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
     }
 
     @Test
