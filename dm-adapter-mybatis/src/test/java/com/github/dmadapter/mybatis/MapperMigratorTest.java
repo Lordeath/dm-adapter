@@ -3864,6 +3864,63 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUngroupedHavingAliasMovesIntoMyBatisWhere() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ArrearsHouseMapper">
+                    <select id="listArrearsHouse">
+                        select IF(f.house_id is not null, 1, 0) as isFollowUp
+                        from arrears_house h
+                        left join follow_record f on h.house_id = f.house_id
+                        <where>
+                            <if test="enabled != null">
+                                h.enabled = #{enabled}
+                            </if>
+                        </where>
+                        having 1 = 1
+                        <if test="isFollowUp != null">
+                            and isFollowUp = #{isFollowUp}
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ArrearsHouseMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ArrearsHouseMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "src/main/resources/mapper-dm/ArrearsHouseMapper.xml"
+        ));
+        assertThat(rewritten)
+                .contains("<where>")
+                .contains("and 1 = 1")
+                .contains("and (IF(f.house_id is not null, 1, 0)) = #{isFollowUp}")
+                .doesNotContain("having 1 = 1")
+                .doesNotContain("and isFollowUp = #{isFollowUp}");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE
+                );
+    }
+
+    @Test
     void dynamicUngroupedAggregateHavingKeepsHavingAndExpandsAlias() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
