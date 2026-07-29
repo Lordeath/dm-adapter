@@ -8901,9 +8901,9 @@ class DmSqlValidationTestGenerator {
                     }
                     String message = normalizeMessage(record.message);
                     String lower = message.toLowerCase(Locale.ROOT);
-                    if (lower.contains("invalid dameng schema(s)")
+                    if (lower.contains("invalid dameng schema")
                             || lower.contains("failed to set dameng schema")) {
-                        return "INVALID_SCHEMA";
+                        return "TEST_SCHEMA_OBJECT";
                     }
                     if (isDatabaseConnectionFailure(message)) {
                         return "DATABASE_CONNECTION";
@@ -9538,19 +9538,22 @@ class DmSqlValidationTestGenerator {
                         return "SKIPPED";
                     }
                     String message = record.message == null ? "" : record.message;
+                    String lower = message.toLowerCase(Locale.ROOT);
                     if (containsAny(message,
                             "No mapper XML files matched",
                             "No mapped statements were found",
                             "Could not find",
                             "Failed to parse mapper XML",
-                            "Invalid Dameng schema(s)",
-                            "Failed to set Dameng schema",
                             "Failed to open Dameng validation connection",
                             "Error getting a new connection",
                             "Mapped statement was not registered",
                             "Parsing error was found in mapping",
                             "datasource.")) {
                         return "CONFIGURATION";
+                    }
+                    if (lower.contains("invalid dameng schema")
+                            || lower.contains("failed to set dameng schema")) {
+                        return "TEST_SCHEMA";
                     }
                     if (isDatabaseStatementTimeout(message)) {
                         return "TEST_DATABASE_RUNTIME";
