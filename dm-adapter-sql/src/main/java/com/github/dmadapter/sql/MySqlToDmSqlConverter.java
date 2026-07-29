@@ -111,10 +111,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_DUPLICATE_UPDATE_SET_LITERAL_REMOVED";
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
+    public static final String MYSQL_DELETE_ORDER_LIMIT_ONE_RULE = "MYSQL_DELETE_ORDER_LIMIT_ONE_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYSQL_HOUR_SECOND_INTERVAL_RULE =
             "MYSQL_HOUR_SECOND_INTERVAL_TO_DATEADD_SECOND";
+    public static final String MYSQL_TIME_TO_SEC_TIMEDIFF_RULE =
+            "MYSQL_TIME_TO_SEC_TIMEDIFF_TO_DATEDIFF_SECOND";
     public static final String MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE =
             "MYSQL_INTEGER_DIVISION_TO_DECIMAL";
     public static final String MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL_RULE =
@@ -209,7 +212,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "NULLIF",
             "NVL",
             "ROUND",
-            "SUM"
+            "SUM",
+            "DATEDIFF"
     );
     private static final Set<String> DAMENG_KEYWORDS_REQUIRING_QUOTES = Set.of(
             "ADD",
@@ -863,10 +867,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_YEARWEEK_RULE);
         }
 
+        GenericConversion timeToSecTimeDiffConversion = convertTimeToSecTimeDiff(converted);
+        if (timeToSecTimeDiffConversion.changed()) {
+            converted = timeToSecTimeDiffConversion.convertedSql();
+            rules.add(MYSQL_TIME_TO_SEC_TIMEDIFF_RULE);
+        }
+
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
         if (updateOrderLimitConversion.changed()) {
             converted = updateOrderLimitConversion.convertedSql();
             rules.add(MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE);
+        }
+
+        GenericConversion deleteOrderLimitConversion = convertMysqlDeleteOrderLimitOne(converted);
+        if (deleteOrderLimitConversion.changed()) {
+            converted = deleteOrderLimitConversion.convertedSql();
+            rules.add(MYSQL_DELETE_ORDER_LIMIT_ONE_RULE);
         }
 
         LimitConversion limitConversion = convertLimit(converted);
@@ -1010,7 +1026,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private ArithmeticConversion convertSlashDivisionOperators(String sql) {
         List<TextReplacement> replacements = new ArrayList<>();
-        int protectedEnd = -1;
         int index = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
@@ -1039,16 +1054,34 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     index++;
                     continue;
                 }
-                if (!isConvertibleArithmeticOperation(left, right) || left.startIndex() < protectedEnd) {
+                if (!isConvertibleArithmeticOperation(left, right)) {
                     return ArithmeticConversion.manual(sql);
+                }
+                List<ArithmeticOperand> denominators = new ArrayList<>();
+                denominators.add(right);
+                int chainEnd = right.endIndex();
+                while (true) {
+                    int nextOperator = skipWhitespace(sql, chainEnd);
+                    if (nextOperator >= sql.length() || sql.charAt(nextOperator) != '/') {
+                        break;
+                    }
+                    ArithmeticOperand nextDenominator = readArithmeticRightOperand(sql, nextOperator + 1);
+                    if (nextDenominator == null || !isSimpleArithmeticOperand(nextDenominator.text())) {
+                        return ArithmeticConversion.manual(sql);
+                    }
+                    denominators.add(nextDenominator);
+                    chainEnd = nextDenominator.endIndex();
+                }
+                StringBuilder replacement = new StringBuilder(decimalArithmeticOperand(left.text()));
+                for (ArithmeticOperand denominator : denominators) {
+                    replacement.append(" / ").append(nullSafeArithmeticDenominator(denominator.text()));
                 }
                 replacements.add(new TextReplacement(
                         left.startIndex(),
-                        right.endIndex(),
-                        decimalArithmeticOperand(left.text()) + " / " + nullSafeArithmeticDenominator(right.text())
+                        chainEnd,
+                        replacement.toString()
                 ));
-                protectedEnd = right.endIndex();
-                index = right.endIndex();
+                index = chainEnd;
             } else {
                 index++;
             }
@@ -3958,6 +3991,70 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return "DATEDIFF(DAY, " + right + ", " + left + ")";
     }
 
+    private GenericConversion convertTimeToSecTimeDiff(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "TIME_TO_SEC")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "TIME_TO_SEC");
+                String replacement = functionCall == null ? null : rewriteTimeToSecTimeDiff(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteTimeToSecTimeDiff(FunctionCall timeToSecCall) {
+        List<TopLevelArgument> outerArguments = splitTopLevelArguments(timeToSecCall.body());
+        if (outerArguments.size() != 1) {
+            return null;
+        }
+        String timeDiffExpression = outerArguments.get(0).text().trim();
+        int start = leadingWhitespaceLength(timeDiffExpression);
+        FunctionCall timeDiffCall = readFunctionCall(timeDiffExpression, start, "TIMEDIFF");
+        if (timeDiffCall == null || skipWhitespace(timeDiffExpression, timeDiffCall.endIndex())
+                != timeDiffExpression.length()) {
+            return null;
+        }
+        List<TopLevelArgument> arguments = splitTopLevelArguments(timeDiffCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String end = dmDateTimeExpression(arguments.get(0).text());
+        String startExpression = dmDateTimeExpression(arguments.get(1).text());
+        if (end.isBlank() || startExpression.isBlank()) {
+            return null;
+        }
+        return "DATEDIFF(SECOND, " + startExpression + ", " + end + ")";
+    }
+
+    private String dmDateTimeExpression(String expression) {
+        String trimmed = expression == null ? "" : expression.trim();
+        return isNowExpression(trimmed) ? "SYSDATE" : trimmed;
+    }
+
     private boolean isNowExpression(String expression) {
         String trimmed = expression.trim();
         return "SYSDATE".equalsIgnoreCase(trimmed) || readOnlyFunctionCall(trimmed, "NOW") != null;
@@ -6691,6 +6788,63 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 .append(tableName)
                 .append(" set ")
                 .append(setClause)
+                .append(" where ROWID in (select rid from (select ROWID rid from ")
+                .append(tableName)
+                .append(" where ")
+                .append(whereClause)
+                .append(" order by ")
+                .append(orderClause)
+                .append(") where ROWNUM <= 1)")
+                .append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertMysqlDeleteOrderLimitOne(String sql) {
+        int deleteIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, deleteIndex, "DELETE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int fromIndex = skipWhitespace(sql, deleteIndex + "DELETE".length());
+        if (!startsKeyword(sql, fromIndex, "FROM")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableStart = skipWhitespace(sql, fromIndex + "FROM".length());
+        IdentifierToken table = readQualifiedIdentifierToken(sql, tableStart);
+        if (table == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        int whereIndex = skipWhitespace(sql, table.endIndex());
+        if (!startsKeyword(sql, whereIndex, "WHERE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int orderIndex = findTopLevelKeyword(sql, "ORDER", whereIndex + "WHERE".length());
+        if (orderIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int byIndex = skipWhitespace(sql, orderIndex + "ORDER".length());
+        if (!startsKeyword(sql, byIndex, "BY")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int limitIndex = findTopLevelKeyword(sql, "LIMIT", byIndex + "BY".length());
+        if (limitIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        if (!isOnlyLimitOne(sql.substring(limitIndex + "LIMIT".length(), statementEnd))) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String tableName = table.text();
+        String whereClause = sql.substring(whereIndex + "WHERE".length(), orderIndex).trim();
+        String orderClause = sql.substring(byIndex + "BY".length(), limitIndex).trim();
+        if (whereClause.isBlank() || orderClause.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        StringBuilder converted = new StringBuilder(sql.length() + whereClause.length() + orderClause.length() + 80);
+        converted.append(sql, 0, deleteIndex)
+                .append("delete from ")
+                .append(tableName)
                 .append(" where ROWID in (select rid from (select ROWID rid from ")
                 .append(tableName)
                 .append(" where ")

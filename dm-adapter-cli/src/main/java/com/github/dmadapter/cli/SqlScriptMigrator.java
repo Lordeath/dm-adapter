@@ -1841,6 +1841,7 @@ class SqlScriptMigrator {
         copy.indexExistenceChecks.putAll(source.indexExistenceChecks);
         copy.indexDdlAssignments.putAll(source.indexDdlAssignments);
         copy.handledIndexExistenceVariables.addAll(source.handledIndexExistenceVariables);
+        copy.combinedIndexDdlAssignments.addAll(source.combinedIndexDdlAssignments);
         return copy;
     }
 
@@ -2903,6 +2904,16 @@ class SqlScriptMigrator {
             if (!currentSchemaVariable.isBlank()) {
                 analysisState.currentSchemaVariables.add(currentSchemaVariable.toLowerCase(Locale.ROOT));
             }
+            ScriptIndexDdlAssignment combinedAssignment =
+                    scriptCombinedIndexDdlAssignment(body, analysisState);
+            if (combinedAssignment != null
+                    && hasCompleteScriptIndexDdlExecutionSequence(
+                    statements,
+                    index + 1,
+                    combinedAssignment
+            )) {
+                state.combinedIndexDdlAssignments.add(combinedAssignment);
+            }
             if (index + 4 >= statements.size()) {
                 continue;
             }
@@ -2914,7 +2925,8 @@ class SqlScriptMigrator {
                     splitLeadingSqlPrefix(statements.get(index + 1)).body(),
                     Map.of(check.variableName().toLowerCase(Locale.ROOT), check)
             );
-            if (assignment == null || !hasCompleteScriptIndexDdlExecutionSequence(statements, index, assignment)) {
+            if (assignment == null
+                    || !hasCompleteScriptIndexDdlExecutionSequence(statements, index + 2, assignment)) {
                 continue;
             }
             candidates.add(assignment);
@@ -2948,20 +2960,23 @@ class SqlScriptMigrator {
 
     private boolean hasCompleteScriptIndexDdlExecutionSequence(
             List<String> statements,
-            int existenceAssignmentIndex,
+            int prepareIndex,
             ScriptIndexDdlAssignment assignment
     ) {
+        if (prepareIndex < 0 || prepareIndex + 2 >= statements.size()) {
+            return false;
+        }
         Matcher prepare = Pattern.compile(
                 "(?is)^\\s*PREPARE\\s+(?<statement>[A-Za-z_][A-Za-z0-9_$]*)\\s+FROM\\s+@"
                         + Pattern.quote(assignment.sqlVariable())
                         + "\\s*$"
-        ).matcher(splitLeadingSqlPrefix(statements.get(existenceAssignmentIndex + 2)).body().strip());
+        ).matcher(splitLeadingSqlPrefix(statements.get(prepareIndex)).body().strip());
         if (!prepare.matches()) {
             return false;
         }
         String statementName = prepare.group("statement");
-        String execute = splitLeadingSqlPrefix(statements.get(existenceAssignmentIndex + 3)).body().strip();
-        String deallocate = splitLeadingSqlPrefix(statements.get(existenceAssignmentIndex + 4)).body().strip();
+        String execute = splitLeadingSqlPrefix(statements.get(prepareIndex + 1)).body().strip();
+        String deallocate = splitLeadingSqlPrefix(statements.get(prepareIndex + 2)).body().strip();
         return Pattern.compile(
                 "(?is)^\\s*EXECUTE\\s+" + Pattern.quote(statementName) + "\\s*$"
         ).matcher(execute).matches()
@@ -3051,13 +3066,90 @@ class SqlScriptMigrator {
         if (ddl.isBlank() || Pattern.compile("(?is)\\bADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b").matcher(ddl).find()) {
             return null;
         }
-        return new ScriptIndexDdlAssignment(matcher.group("sqlVariable"), check, ddl);
+        return new ScriptIndexDdlAssignment(matcher.group("sqlVariable"), check, ddl, true);
+    }
+
+    private ScriptIndexDdlAssignment scriptCombinedIndexDdlAssignment(
+            String sql,
+            ScriptDynamicDdlState scriptDynamicDdlState
+    ) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+@(?<sqlVariable>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*"
+                        + "\\(\\s*SELECT\\s+IF\\s*\\(\\s*(?<not>NOT\\s+)?EXISTS\\s*\\(\\s*"
+                        + "SELECT\\s+1\\s+FROM\\s+information_schema\\s*\\.\\s*"
+                        + "(?:`STATISTICS`|\"STATISTICS\"|STATISTICS)\\s+WHERE\\s+(?<where>.*?)"
+                        + "\\)\\s*,\\s*(?<ddl>" + SQL_STRING_LITERAL_TOKEN + ")\\s*,\\s*"
+                        + "(?<noop>" + SQL_STRING_LITERAL_TOKEN + ")\\s*\\)\\s*\\)\\s*$"
+        ).matcher(sql == null ? "" : sql.strip());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String noop = singleQuotedSqlLiteralValue(matcher.group("noop"));
+        if (!"SELECT 1".equalsIgnoreCase(noop) && !"DO 0".equalsIgnoreCase(noop)) {
+            return null;
+        }
+        String whereClause = matcher.group("where");
+        String tableName = metadataPredicateLiteral(whereClause, "table_name");
+        String indexName = metadataPredicateLiteral(whereClause, "index_name");
+        String ownerPredicate = metadataSchemaPredicate(whereClause, scriptDynamicDdlState);
+        if (tableName.isBlank()
+                || indexName.isBlank()
+                || ownerPredicate.isBlank()
+                || !onlyIndexMetadataPredicates(whereClause)) {
+            return null;
+        }
+        ScriptIndexExistenceCheck check = new ScriptIndexExistenceCheck(
+                matcher.group("sqlVariable"),
+                ownerPredicate,
+                tableName,
+                indexName
+        );
+        String mysqlDdl = singleQuotedSqlLiteralValue(matcher.group("ddl"));
+        if (!dynamicIndexDdlMatchesCheck(mysqlDdl, check)) {
+            return null;
+        }
+        boolean executeWhenMissing = matcher.group("not") != null;
+        boolean addIndex = Pattern.compile(
+                "(?is)^\\s*ALTER\\s+TABLE\\s+(?:" + SQL_IDENTIFIER_TOKEN + ")"
+                        + "\\s+ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b"
+        ).matcher(mysqlDdl).find();
+        boolean dropIndex = Pattern.compile(
+                "(?is)^\\s*ALTER\\s+TABLE\\s+(?:" + SQL_IDENTIFIER_TOKEN + ")"
+                        + "\\s+DROP\\s+INDEX\\b"
+        ).matcher(mysqlDdl).find();
+        if ((!addIndex && !dropIndex)
+                || (addIndex && !executeWhenMissing)
+                || (dropIndex && executeWhenMissing)) {
+            return null;
+        }
+        String ddl = convertSingleMysqlAlterTableIndex(mysqlDdl);
+        if (ddl.isBlank()) {
+            return null;
+        }
+        return new ScriptIndexDdlAssignment(
+                matcher.group("sqlVariable"),
+                check,
+                ddl,
+                executeWhenMissing
+        );
+    }
+
+    private String convertSingleMysqlAlterTableIndex(String ddl) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+(?<part>.+?)\\s*$"
+        ).matcher(ddl == null ? "" : ddl);
+        if (!matcher.matches()) {
+            return "";
+        }
+        String converted = convertMysqlAlterTableIndexPart(matcher.group("table"), matcher.group("part"));
+        return converted.isBlank() ? "" : normalizeCreateIndexForDm(converted);
     }
 
     private boolean dynamicIndexDdlMatchesCheck(String ddl, ScriptIndexExistenceCheck check) {
         Matcher matcher = Pattern.compile(
-                "(?is)^\\s*ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+ADD\\s+"
-                        + "(?:UNIQUE\\s+)?(?:INDEX|KEY)\\s+(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\("
+                "(?is)^\\s*ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+"
+                        + "(?:ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)|DROP\\s+INDEX)\\s+"
+                        + "(?<index>" + SQL_IDENTIFIER_TOKEN + ")(?:\\s*\\(|\\s*$)"
         ).matcher(ddl == null ? "" : ddl);
         if (!matcher.find()) {
             return false;
@@ -3107,13 +3199,23 @@ class SqlScriptMigrator {
                 leadingSqlPrefix.body(),
                 scriptDynamicDdlState.indexExistenceChecks
         );
-        if (parsed == null) {
-            return null;
-        }
-        ScriptIndexDdlAssignment assignment =
-                scriptDynamicDdlState.indexDdlAssignments.get(parsed.sqlVariable().toLowerCase(Locale.ROOT));
-        if (assignment == null || !assignment.equals(parsed)) {
-            return null;
+        ScriptIndexDdlAssignment assignment = null;
+        if (parsed != null) {
+            assignment = scriptDynamicDdlState.indexDdlAssignments.get(
+                    parsed.sqlVariable().toLowerCase(Locale.ROOT)
+            );
+            if (!parsed.equals(assignment)) {
+                return null;
+            }
+        } else {
+            parsed = scriptCombinedIndexDdlAssignment(
+                    leadingSqlPrefix.body(),
+                    scriptDynamicDdlState
+            );
+            if (parsed == null || !scriptDynamicDdlState.combinedIndexDdlAssignments.contains(parsed)) {
+                return null;
+            }
+            assignment = parsed;
         }
         scriptDynamicDdlState.dynamicDdlVariables.add(assignment.sqlVariable().toLowerCase(Locale.ROOT));
         ScriptIndexExistenceCheck check = assignment.existenceCheck();
@@ -3126,7 +3228,7 @@ class SqlScriptMigrator {
                 + "    WHERE " + check.ownerPredicate() + "\n"
                 + "      AND TABLE_NAME = UPPER(" + sqlStringLiteral(check.tableName()) + ")\n"
                 + "      AND INDEX_NAME = UPPER(" + sqlStringLiteral(check.indexName()) + ");\n\n"
-                + "    IF dm_existing_count = 0 THEN\n"
+                + "    IF dm_existing_count " + (assignment.executeWhenMissing() ? "= 0" : "> 0") + " THEN\n"
                 + "        EXECUTE IMMEDIATE " + sqlStringLiteral(assignment.ddl()) + ";\n"
                 + "    END IF;\n"
                 + "END";
@@ -11412,6 +11514,8 @@ class SqlScriptMigrator {
         private final LinkedHashMap<String, ScriptIndexDdlAssignment> indexDdlAssignments =
                 new LinkedHashMap<>();
         private final LinkedHashSet<String> handledIndexExistenceVariables = new LinkedHashSet<>();
+        private final LinkedHashSet<ScriptIndexDdlAssignment> combinedIndexDdlAssignments =
+                new LinkedHashSet<>();
     }
 
     private record ScriptIndexExistenceCheck(
@@ -11425,7 +11529,8 @@ class SqlScriptMigrator {
     private record ScriptIndexDdlAssignment(
             String sqlVariable,
             ScriptIndexExistenceCheck existenceCheck,
-            String ddl
+            String ddl,
+            boolean executeWhenMissing
     ) {
     }
 

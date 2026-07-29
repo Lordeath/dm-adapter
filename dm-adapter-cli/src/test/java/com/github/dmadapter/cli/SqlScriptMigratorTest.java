@@ -575,6 +575,103 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsCombinedReusableScriptIndexDdlAssignmentsForAddAndDrop() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260522.sql"), """
+                SET @ddl := (
+                    SELECT IF(
+                        NOT EXISTS (
+                            SELECT 1
+                            FROM information_schema.STATISTICS
+                            WHERE TABLE_SCHEMA = DATABASE()
+                              AND TABLE_NAME = 'tenant_alpha_event'
+                              AND INDEX_NAME = 'idx_event_state'
+                        ),
+                        'ALTER TABLE `tenant_alpha_event` ADD INDEX `idx_event_state` (`state`, `event_id`)',
+                        'SELECT 1'
+                    )
+                );
+                PREPARE stmt FROM @ddl;
+                EXECUTE stmt;
+                DEALLOCATE PREPARE stmt;
+
+                SET @ddl := (
+                    SELECT IF(
+                        EXISTS (
+                            SELECT 1
+                            FROM information_schema.STATISTICS
+                            WHERE TABLE_SCHEMA = DATABASE()
+                              AND TABLE_NAME = 'tenant_beta_event'
+                              AND INDEX_NAME = 'idx_obsolete'
+                        ),
+                        'ALTER TABLE `tenant_beta_event` DROP INDEX `idx_obsolete`',
+                        'SELECT 1'
+                    )
+                );
+                PREPARE stmt FROM @ddl;
+                EXECUTE stmt;
+                DEALLOCATE PREPARE stmt;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-office",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260522.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("TABLE_NAME = UPPER('tenant_alpha_event')")
+                .contains("INDEX_NAME = UPPER('idx_event_state')")
+                .contains("IF dm_existing_count = 0 THEN")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX tenant_alpha_event_idx_event_state"
+                        + " ON `tenant_alpha_event` (`state`, `event_id`)'")
+                .contains("TABLE_NAME = UPPER('tenant_beta_event')")
+                .contains("INDEX_NAME = UPPER('idx_obsolete')")
+                .contains("IF dm_existing_count > 0 THEN")
+                .contains("EXECUTE IMMEDIATE 'DROP INDEX tenant_beta_event_idx_obsolete'")
+                .doesNotContain("SET @ddl")
+                .doesNotContain("PREPARE stmt FROM @ddl")
+                .doesNotContain("EXECUTE stmt;");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE));
+    }
+
+    @Test
+    void doesNotExecuteCombinedScriptIndexDdlWhenPrepareSequenceIsIncomplete() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @ddl := (
+                    SELECT IF(
+                        NOT EXISTS (
+                            SELECT 1
+                            FROM information_schema.STATISTICS
+                            WHERE TABLE_SCHEMA = DATABASE()
+                              AND TABLE_NAME = 'tenant_gamma_event'
+                              AND INDEX_NAME = 'idx_event_state'
+                        ),
+                        'ALTER TABLE `tenant_gamma_event` ADD INDEX `idx_event_state` (`state`)',
+                        'SELECT 1'
+                    )
+                );
+                SELECT @ddl;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isGreaterThan(0);
+        assertThat(converted.sql())
+                .contains("SET @ddl")
+                .contains("ALTER TABLE `tenant_gamma_event` ADD INDEX `idx_event_state`")
+                .doesNotContain("EXECUTE IMMEDIATE 'CREATE INDEX");
+    }
+
+    @Test
     void doesNotExecuteMysqlScriptIndexDdlWhenPrepareSequenceIsIncomplete() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
