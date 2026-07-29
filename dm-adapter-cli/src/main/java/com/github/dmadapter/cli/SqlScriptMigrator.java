@@ -1129,7 +1129,7 @@ class SqlScriptMigrator {
                 parenthesisDepth = Math.max(0, parenthesisDepth - 1);
                 index++;
             } else if (parenthesisDepth == 0 && startsRoutineStaticSql(sql, index)) {
-                int end = findStatementTerminator(sql, index);
+                int end = findRoutineStatementTerminator(sql, index);
                 if (end >= sql.length()) {
                     return List.of();
                 }
@@ -1140,6 +1140,41 @@ class SqlScriptMigrator {
             }
         }
         return List.copyOf(statements);
+    }
+
+    private int findRoutineStatementTerminator(String sql, int index) {
+        int cursor = index;
+        while (cursor < sql.length()) {
+            char current = sql.charAt(cursor);
+            if (current == '\'') {
+                cursor = skipSingleQuotedString(sql, cursor);
+            } else if (current == '"') {
+                cursor = skipDoubleQuotedText(sql, cursor);
+            } else if (current == '`') {
+                cursor = skipBacktickIdentifier(sql, cursor);
+            } else if (isDmLocalTemporaryIdentifierStart(sql, cursor)) {
+                cursor++;
+                while (cursor < sql.length() && isIdentifierPart(sql.charAt(cursor))) {
+                    cursor++;
+                }
+            } else if (startsLineComment(sql, cursor)) {
+                cursor = skipUntilLineEnd(sql, cursor);
+            } else if (startsBlockComment(sql, cursor)) {
+                cursor = skipUntilBlockCommentEnd(sql, cursor);
+            } else if (current == ';') {
+                return cursor;
+            } else {
+                cursor++;
+            }
+        }
+        return sql.length();
+    }
+
+    private boolean isDmLocalTemporaryIdentifierStart(String sql, int index) {
+        return index >= 0
+                && index + 1 < sql.length()
+                && sql.charAt(index) == '#'
+                && (Character.isLetter(sql.charAt(index + 1)) || sql.charAt(index + 1) == '_');
     }
 
     private boolean startsRoutineStaticSql(String sql, int index) {
