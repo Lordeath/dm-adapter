@@ -373,6 +373,39 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void removesMysqlRoutineCharacteristicsFromProcedureHeader() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE alter_city_user()
+                DETERMINISTIC
+                READS SQL DATA
+                SQL SECURITY DEFINER
+                BEGIN
+                    SELECT 1;
+                END$$
+                DELIMITER ;
+                """);
+
+        migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-schema",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("CREATE OR REPLACE PROCEDURE alter_city_user() AS")
+                .doesNotContain("DETERMINISTIC")
+                .doesNotContain("READS SQL DATA")
+                .doesNotContain("SQL SECURITY DEFINER");
+    }
+
+    @Test
     void writesExecutableNoOpsForConsumedMysqlStatementsInStrictValidationPlan() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");

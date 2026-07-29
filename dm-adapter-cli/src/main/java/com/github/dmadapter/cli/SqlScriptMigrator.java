@@ -5454,7 +5454,7 @@ class SqlScriptMigrator {
         String convertedParameters = convertMysqlProcedureParameters(parameters);
         return signature.substring(0, openParen + 1)
                 + convertedParameters
-                + signature.substring(closeParen);
+                + signature.charAt(closeParen);
     }
 
     private String convertMysqlProcedureParameters(String parameters) {
