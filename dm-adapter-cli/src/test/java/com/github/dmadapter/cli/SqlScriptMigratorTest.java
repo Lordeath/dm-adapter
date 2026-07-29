@@ -4090,6 +4090,43 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void ignoresRoutineDefinitionsAndCallsInsideCommentsDuringValidation() {
+        AtomicInteger statusQueryCount = new AtomicInteger();
+        Statement statement = proxy(Statement.class, (ignored, method, args) ->
+                defaultValue(method.getReturnType()));
+        Connection connection = proxy(Connection.class, (ignored, method, args) -> {
+            if (method.getName().equals("createStatement")) {
+                return statement;
+            }
+            if (method.getName().equals("prepareStatement")) {
+                statusQueryCount.incrementAndGet();
+            }
+            return defaultValue(method.getReturnType());
+        });
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "commented-routine.sql",
+                        "sample-bill",
+                        List.of("""
+                                /*
+                                 * CREATE PROCEDURE ignored_proc()
+                                 * BEGIN
+                                 *     CALL ignored_dependency();
+                                 * END;
+                                 */
+                                DROP PROCEDURE IF EXISTS active_proc
+                                """)
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.successCount()).isEqualTo(1);
+        assertThat(result.failureCount()).isZero();
+        assertThat(statusQueryCount).hasValue(0);
+    }
+
+    @Test
     void sqlScriptValidationTimeoutCanBeOverriddenWithSystemProperty() {
         String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
         String previous = System.getProperty(property);

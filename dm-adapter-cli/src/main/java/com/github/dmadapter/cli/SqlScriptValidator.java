@@ -461,7 +461,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     }
 
     private CreatedObject createdObject(String sql) {
-        Matcher matcher = CREATE_ROUTINE_PATTERN.matcher(sql == null ? "" : sql);
+        Matcher matcher = CREATE_ROUTINE_PATTERN.matcher(sqlWithoutComments(sql));
         if (!matcher.find()) {
             return null;
         }
@@ -516,7 +516,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     }
 
     private String blockedObject(String sql, Set<String> failedObjects) {
-        Matcher matcher = CALL_PATTERN.matcher(sql == null ? "" : sql);
+        Matcher matcher = CALL_PATTERN.matcher(sqlWithoutComments(sql));
         if (!matcher.find()) {
             return "";
         }
@@ -541,8 +541,81 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         Matcher matcher = Pattern.compile(
                 "(?is)\\b(?:ALTER|CREATE|DROP|TRUNCATE)\\s+TABLE\\s+(?:IF\\s+(?:NOT\\s+)?EXISTS\\s+)?"
                         + "([`\"\\w.$-]+)"
-        ).matcher(sql == null ? "" : sql);
+        ).matcher(sqlWithoutComments(sql));
         return matcher.find() ? normalizedObject(matcher.group(1)) : "";
+    }
+
+    private String sqlWithoutComments(String sql) {
+        if (sql == null || sql.isEmpty()) {
+            return "";
+        }
+        StringBuilder result = new StringBuilder(sql.length());
+        boolean singleQuoted = false;
+        boolean doubleQuoted = false;
+        boolean backtickQuoted = false;
+        boolean lineComment = false;
+        boolean blockComment = false;
+        for (int index = 0; index < sql.length(); index++) {
+            char current = sql.charAt(index);
+            char next = index + 1 < sql.length() ? sql.charAt(index + 1) : '\0';
+            if (lineComment) {
+                if (current == '\n' || current == '\r') {
+                    lineComment = false;
+                    result.append(current);
+                } else {
+                    result.append(' ');
+                }
+                continue;
+            }
+            if (blockComment) {
+                if (current == '*' && next == '/') {
+                    result.append("  ");
+                    blockComment = false;
+                    index++;
+                } else {
+                    result.append(current == '\n' || current == '\r' ? current : ' ');
+                }
+                continue;
+            }
+            if (singleQuoted || doubleQuoted || backtickQuoted) {
+                result.append(current);
+                char quote = singleQuoted ? '\'' : doubleQuoted ? '"' : '`';
+                if (current == '\\' && next != '\0' && !backtickQuoted) {
+                    result.append(next);
+                    index++;
+                } else if (current == quote && next == quote) {
+                    result.append(next);
+                    index++;
+                } else if (current == quote) {
+                    singleQuoted = false;
+                    doubleQuoted = false;
+                    backtickQuoted = false;
+                }
+                continue;
+            }
+            if (current == '-' && next == '-') {
+                result.append("  ");
+                lineComment = true;
+                index++;
+            } else if (current == '#') {
+                result.append(' ');
+                lineComment = true;
+            } else if (current == '/' && next == '*') {
+                result.append("  ");
+                blockComment = true;
+                index++;
+            } else {
+                result.append(current);
+                if (current == '\'') {
+                    singleQuoted = true;
+                } else if (current == '"') {
+                    doubleQuoted = true;
+                } else if (current == '`') {
+                    backtickQuoted = true;
+                }
+            }
+        }
+        return result.toString();
     }
 
     private String objectDefinitionChangedSummary(
@@ -734,19 +807,20 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         if (sql == null || sql.isBlank()) {
             return false;
         }
+        String uncommentedSql = sqlWithoutComments(sql);
         Matcher createTable = Pattern.compile(
                 "(?is)\\bCREATE\\s+(?:(?:GLOBAL\\s+)?TEMPORARY\\s+)?TABLE\\b"
-        ).matcher(sql);
+        ).matcher(uncommentedSql);
         while (createTable.find()) {
-            int openIndex = nextUnquotedCharacter(sql, createTable.end(), '(');
+            int openIndex = nextUnquotedCharacter(uncommentedSql, createTable.end(), '(');
             if (openIndex < 0) {
                 continue;
             }
-            int closeIndex = matchingParenthesis(sql, openIndex);
+            int closeIndex = matchingParenthesis(uncommentedSql, openIndex);
             if (closeIndex < 0) {
                 continue;
             }
-            for (String definition : splitTopLevelComma(sql.substring(openIndex + 1, closeIndex))) {
+            for (String definition : splitTopLevelComma(uncommentedSql.substring(openIndex + 1, closeIndex))) {
                 if (keywordCount(definition, "DEFAULT") > 1) {
                     return true;
                 }
