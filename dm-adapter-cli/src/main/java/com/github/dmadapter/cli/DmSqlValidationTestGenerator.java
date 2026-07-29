@@ -7466,6 +7466,7 @@ class DmSqlValidationTestGenerator {
                     String failureCategory = category(record);
                     return !"CONFIGURATION".equals(failureCategory)
                             && !"TEST_SCHEMA".equals(failureCategory)
+                            && !"TEST_DATABASE_RUNTIME".equals(failureCategory)
                             && !"ORIGINAL_SQL".equals(failureCategory);
                 }
 
@@ -8366,6 +8367,9 @@ class DmSqlValidationTestGenerator {
                     if (countsByPattern.containsKey("DM_CTAS_BIND_PARAMETER")) {
                         markdown.append("- 达梦不支持在 CREATE TABLE AS SELECT 中使用 JDBC 绑定参数；将该 mapper 拆为显式建临时表和参数化 INSERT 两个步骤。\\n");
                     }
+                    if (countsByPattern.containsKey("DATABASE_STATEMENT_TIMEOUT")) {
+                        markdown.append("- 排查达梦测试库中的阻塞事务、锁等待和瞬时负载后重跑；语句超时不应通过修改 mapper 参数掩盖。\\n");
+                    }
                     if (countsByPattern.containsKey("TEST_SCHEMA_OBJECT")
                             || countsByPattern.containsKey("TEST_SCHEMA_FUNCTION")) {
                         markdown.append("- 先对齐达梦测试 schema 中缺失的表、视图、字段、函数或对象命名差异，再将其视为 SQL 改写失败。\\n");
@@ -8494,6 +8498,8 @@ class DmSqlValidationTestGenerator {
                             return "SQL 语法问题";
                         case "TEST_DATA":
                             return "测试数据问题";
+                        case "TEST_DATABASE_RUNTIME":
+                            return "测试库运行时问题";
                         case "UNKNOWN_FAILURE":
                             return "未分类失败";
                         default:
@@ -8512,6 +8518,8 @@ class DmSqlValidationTestGenerator {
                     switch (pattern) {
                         case "DATABASE_CONNECTION":
                             return "数据库连接失败";
+                        case "DATABASE_STATEMENT_TIMEOUT":
+                            return "数据库语句超时";
                         case "MYSQL_METADATA_SQL":
                             return "MySQL 元数据查询";
                         case "MYSQL_COLLATE_CLAUSE":
@@ -8784,6 +8792,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (isDatabaseConnectionFailure(message)) {
                         return "DATABASE_CONNECTION";
+                    }
+                    if (isDatabaseStatementTimeout(message)) {
+                        return "DATABASE_STATEMENT_TIMEOUT";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
                         return "JAVA_MAPPER_PARAM_ANNOTATION";
@@ -9369,6 +9380,9 @@ class DmSqlValidationTestGenerator {
                             "datasource.")) {
                         return "CONFIGURATION";
                     }
+                    if (isDatabaseStatementTimeout(message)) {
+                        return "TEST_DATABASE_RUNTIME";
+                    }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
@@ -9470,6 +9484,9 @@ class DmSqlValidationTestGenerator {
                     if ("TEST_DATA".equals(category)) {
                         return "SQL 已执行，但当前测试数据不符合 mapper 预期；请调整种子数据或方法参数。";
                     }
+                    if ("TEST_DATABASE_RUNTIME".equals(category)) {
+                        return "测试库执行期间发生语句超时或锁等待；先排查阻塞事务和数据库负载，再重跑验证。";
+                    }
                     if ("UNKNOWN_FAILURE".equals(category)) {
                         return "查看失败详情，判断属于 SQL 兼容、测试库结构还是测试数据问题。";
                     }
@@ -9521,6 +9538,15 @@ class DmSqlValidationTestGenerator {
                             || lower.contains("error getting a new connection")
                             || lower.contains("connection refused")
                             || lower.contains("communication error");
+                }
+
+                private boolean isDatabaseStatementTimeout(String message) {
+                    String normalized = normalizeMessage(message);
+                    String lower = normalized.toLowerCase(Locale.ROOT);
+                    return normalized.contains("请求执行超时")
+                            || lower.contains("sqltimeoutexception")
+                            || lower.contains("statement timeout")
+                            || lower.contains("lock wait timeout");
                 }
 
                 private boolean hasRegexpOperatorIssue(String message) {

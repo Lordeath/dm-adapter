@@ -3828,6 +3828,9 @@ public class MapperXmlRewriter {
         if (updateAssignments == null) {
             return null;
         }
+        updateAssignments = updateAssignments.stream()
+                .filter(assignment -> !isNoOpSelfAssignment(assignment))
+                .toList();
 
         Map<String, BatchUpdateAssignment> assignmentsByTarget = new LinkedHashMap<>();
         for (BatchUpdateAssignment assignment : updateAssignments) {
@@ -4082,7 +4085,7 @@ public class MapperXmlRewriter {
         List<ConditionalTrimItem> columns = conditionalTrimItems(columnList);
         List<ConditionalTrimItem> values = conditionalTrimItems(valueList);
         List<ConditionalTrimItem> updates = conditionalTrimItems(updateBody);
-        if (columns.isEmpty() || columns.size() != values.size() || updates.isEmpty()) {
+        if (columns.isEmpty() || columns.size() != values.size()) {
             return null;
         }
         List<String> normalizedKeys = normalizeIdentifiers(keyColumns);
@@ -4112,27 +4115,33 @@ public class MapperXmlRewriter {
         }
 
         List<ConditionalUpdateAssignment> updateAssignments = new ArrayList<>();
-        for (ConditionalTrimItem update : updates) {
-            List<BatchUpdateAssignment> parsed = updateAssignments(stripTrailingComma(update.content()).trim());
-            if (parsed == null || parsed.size() != 1) {
+        if (updates.isEmpty()) {
+            List<BatchUpdateAssignment> parsed = updateAssignments(updateBody);
+            if (parsed == null
+                    || parsed.isEmpty()
+                    || parsed.stream().anyMatch(assignment -> !isNoOpSelfAssignment(assignment))) {
                 return null;
             }
-            BatchUpdateAssignment assignment = parsed.get(0);
-            String normalizedTarget = normalizeIdentifier(assignment.target());
-            if (normalizedKeys.contains(normalizedTarget)) {
-                continue;
-            }
-            if (assignment.valuesReference()) {
-                String normalizedSource = normalizeIdentifier(assignment.sourceExpression());
-                if (!columnTestsByName.containsKey(normalizedSource)
-                        || !columnTestsByName.get(normalizedSource).equals(update.test())) {
+        } else {
+            for (ConditionalTrimItem update : updates) {
+                List<BatchUpdateAssignment> parsed = updateAssignments(stripTrailingComma(update.content()).trim());
+                if (parsed == null || parsed.size() != 1) {
                     return null;
                 }
+                BatchUpdateAssignment assignment = parsed.get(0);
+                String normalizedTarget = normalizeIdentifier(assignment.target());
+                if (normalizedKeys.contains(normalizedTarget) || isNoOpSelfAssignment(assignment)) {
+                    continue;
+                }
+                if (assignment.valuesReference()) {
+                    String normalizedSource = normalizeIdentifier(assignment.sourceExpression());
+                    if (!columnTestsByName.containsKey(normalizedSource)
+                            || !columnTestsByName.get(normalizedSource).equals(update.test())) {
+                        return null;
+                    }
+                }
+                updateAssignments.add(new ConditionalUpdateAssignment(update.opening(), assignment));
             }
-            updateAssignments.add(new ConditionalUpdateAssignment(update.opening(), assignment));
-        }
-        if (updateAssignments.isEmpty()) {
-            return null;
         }
 
         String baseIndent = indentationOfLastLine(leading);
@@ -4183,33 +4192,35 @@ public class MapperXmlRewriter {
                     .append(" = s.")
                     .append(dmIdentifier(keyColumn));
         }
-        converted.append(")\n")
-                .append(baseIndent)
-                .append("WHEN MATCHED THEN UPDATE SET\n")
-                .append(baseIndent)
-                .append("<trim suffixOverrides=\",\">\n");
-        for (ConditionalUpdateAssignment update : updateAssignments) {
-            BatchUpdateAssignment assignment = update.assignment();
-            converted.append(childIndent)
-                    .append(update.opening())
-                    .append("\n")
-                    .append(nestedIndent)
-                    .append("t.")
-                    .append(dmIdentifier(assignment.target()))
-                    .append(" = ");
-            if (assignment.valuesReference()) {
-                converted.append("s.")
-                        .append(dmIdentifier(assignment.sourceExpression()));
-            } else {
-                converted.append(assignment.sourceExpression());
+        converted.append(")\n");
+        if (!updateAssignments.isEmpty()) {
+            converted.append(baseIndent)
+                    .append("WHEN MATCHED THEN UPDATE SET\n")
+                    .append(baseIndent)
+                    .append("<trim suffixOverrides=\",\">\n");
+            for (ConditionalUpdateAssignment update : updateAssignments) {
+                BatchUpdateAssignment assignment = update.assignment();
+                converted.append(childIndent)
+                        .append(update.opening())
+                        .append("\n")
+                        .append(nestedIndent)
+                        .append("t.")
+                        .append(dmIdentifier(assignment.target()))
+                        .append(" = ");
+                if (assignment.valuesReference()) {
+                    converted.append("s.")
+                            .append(dmIdentifier(assignment.sourceExpression()));
+                } else {
+                    converted.append(assignment.sourceExpression());
+                }
+                converted.append(",\n")
+                        .append(childIndent)
+                        .append("</if>\n");
             }
-            converted.append(",\n")
-                    .append(childIndent)
-                    .append("</if>\n");
+            converted.append(baseIndent)
+                    .append("</trim>\n");
         }
         converted.append(baseIndent)
-                .append("</trim>\n")
-                .append(baseIndent)
                 .append("WHEN NOT MATCHED THEN INSERT\n")
                 .append(baseIndent)
                 .append("<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">\n");
@@ -5144,16 +5155,37 @@ public class MapperXmlRewriter {
             Matcher constantMatcher = Pattern.compile(
                     "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*(?<constant>NULL|[-+]?\\d+(?:\\.\\d+)?|N?'(?:''|[^'])*')\\s*$"
             ).matcher(assignment);
-            if (!constantMatcher.matches()) {
+            if (constantMatcher.matches()) {
+                assignments.add(new BatchUpdateAssignment(
+                        constantMatcher.group("target"),
+                        constantMatcher.group("constant").trim(),
+                        false
+                ));
+                continue;
+            }
+
+            Matcher selfAssignmentMatcher = Pattern.compile(
+                    "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*(?<source>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
+            ).matcher(assignment);
+            if (!selfAssignmentMatcher.matches()
+                    || !normalizeIdentifier(selfAssignmentMatcher.group("target"))
+                    .equals(normalizeIdentifier(selfAssignmentMatcher.group("source")))) {
                 return null;
             }
             assignments.add(new BatchUpdateAssignment(
-                    constantMatcher.group("target"),
-                    constantMatcher.group("constant").trim(),
+                    selfAssignmentMatcher.group("target"),
+                    selfAssignmentMatcher.group("source"),
                     false
             ));
         }
         return assignments;
+    }
+
+    private boolean isNoOpSelfAssignment(BatchUpdateAssignment assignment) {
+        return !assignment.valuesReference()
+                && normalizeIdentifier(assignment.target())
+                .equals(normalizeIdentifier(assignment.sourceExpression()))
+                && !assignment.sourceExpression().matches("(?is)NULL|[-+]?\\d+(?:\\.\\d+)?|N?'(?:''|[^'])*'");
     }
 
     private List<String> normalizeIdentifiers(List<String> identifiers) {

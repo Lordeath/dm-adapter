@@ -83,6 +83,40 @@ class GeneratedFailurePatternTest {
         }
     }
 
+    @Test
+    void classifiesDatabaseStatementTimeoutWithoutSuggestingDifferentArguments() throws Exception {
+        Path source = tempDir.resolve("src/com/example/DmSqlValidationTest.java");
+        Files.createDirectories(source.getParent());
+        Files.writeString(source, generatedTestSource(), StandardCharsets.UTF_8);
+        Path classes = tempDir.resolve("classes");
+        compile(List.of(source), classes);
+
+        try (URLClassLoader classLoader = new URLClassLoader(
+                new URL[] {classes.toUri().toURL()},
+                getClass().getClassLoader()
+        )) {
+            Class<?> validationClass = classLoader.loadClass("com.example.DmSqlValidationTest");
+            Object validation = validationClass.getDeclaredConstructor().newInstance();
+            String timeout = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 请求执行超时
+                    ### SQL: INSERT INTO ns_backlog_executor (backlog_id, executor)
+                    SELECT ?, ? WHERE NOT EXISTS (
+                        SELECT 1 FROM ns_backlog_executor WHERE backlog_id = ? AND executor = ?
+                    )
+                    ### Cause: dm.jdbc.driver.DMException: 请求执行超时
+                    """;
+            Object record = failedRecord(validationClass, timeout);
+
+            assertThat(failurePattern(validationClass, validation, record))
+                    .isEqualTo("DATABASE_STATEMENT_TIMEOUT");
+            assertThat(category(validationClass, validation, record))
+                    .isEqualTo("TEST_DATABASE_RUNTIME");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, record))
+                    .isFalse();
+        }
+    }
+
     private String failurePattern(Class<?> validationClass, Object validation, String message) throws Exception {
         return failurePattern(validationClass, validation, failedRecord(validationClass, message));
     }
