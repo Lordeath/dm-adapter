@@ -34,7 +34,13 @@ public class MapperXmlScanner {
             List<MapperLocationPattern> patterns = configuredMapperLocations.stream()
                     .map(MapperLocationPattern::from)
                     .toList();
-            return scanResources(resourcesRoots, relativePath -> patterns.stream().anyMatch(pattern -> pattern.matches(relativePath)));
+            List<MapperXmlFile> configuredFiles = scanResources(
+                    resourcesRoots,
+                    relativePath -> patterns.stream().anyMatch(pattern -> pattern.matches(relativePath))
+            );
+            if (!configuredFiles.isEmpty()) {
+                return configuredFiles;
+            }
         }
         return scanResources(resourcesRoots, relativePath -> true);
     }

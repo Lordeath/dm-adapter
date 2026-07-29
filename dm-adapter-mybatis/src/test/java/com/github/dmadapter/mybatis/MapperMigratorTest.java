@@ -49,6 +49,54 @@ class MapperMigratorTest {
     }
 
     @Test
+    void fallsBackToActualMapperXmlWhenConfiguredLocationsMatchNothing() throws Exception {
+        Path mysqlMapper = writeMapper(
+                "src/main/resources/mapper/mysql/EquipAddressMapper.xml",
+                "select * from equip_address"
+        );
+        Path sqlServerMapper = writeMapper(
+                "src/main/resources/mapper/sqlserver/ActivityMapper.xml",
+                "select * from Register_Member with(nolock)"
+        );
+        writeFile("src/main/resources/application.properties", """
+                mybatis.mapperLocations=classpath:/mapper/*.xml
+                """);
+
+        List<MapperXmlFile> files = new MapperXmlScanner().scan(tempDir);
+
+        assertThat(files)
+                .extracting(MapperXmlFile::path)
+                .containsExactly(
+                        mysqlMapper.toAbsolutePath().normalize().toString(),
+                        sqlServerMapper.toAbsolutePath().normalize().toString()
+                );
+
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                files,
+                List.of()
+        );
+        new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path convertedSqlServerMapper =
+                tempDir.resolve("src/main/resources/mapper-dm/sqlserver/ActivityMapper.xml");
+        assertThat(Files.readString(convertedSqlServerMapper))
+                .contains("select * from Register_Member")
+                .doesNotContainIgnoringCase("with(nolock)");
+        assertThat(Files.exists(
+                tempDir.resolve("src/main/resources/mapper-dm/mysql/EquipAddressMapper.xml")
+        )).isTrue();
+    }
+
+    @Test
     void scansMapperXmlFromYamlMapperLocations() throws Exception {
         Path mapper = writeMapper("src/main/resources/sqlmap/UserMapper.xml", "select * from user");
         writeMapper("src/main/resources/mapper/OtherMapper.xml", "select * from other");
