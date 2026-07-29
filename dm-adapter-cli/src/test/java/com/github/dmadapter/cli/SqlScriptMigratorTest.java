@@ -277,33 +277,58 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void convertsMysqlUseToDamengSetSchemaWithoutHardcodedProjectSchema() throws Exception {
+    void ignoresMysqlUseWithoutEmbeddingSourceOrConfiguredSchema() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
-        write(sqlRoot.resolve("20260205.sql"), """
-                USE newsee-center-pay;
-                USE `tenant-database`;
-                """);
+        write(sqlRoot.resolve("20260205.sql"), "USE tenant_alpha;");
+        write(sqlRoot.resolve("20260205_system.sql"), "USE `tenant-beta`;");
 
         SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
                 tempDir,
                 sqlRoot,
                 sqlRootOut,
                 false,
-                "configured-schema-must-not-be-substituted",
+                "tenant_alpha",
+                "tenant-beta",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(List.of(
+                Files.readString(sqlRootOut.resolve("20260205.sql")),
+                Files.readString(sqlRootOut.resolve("20260205_system.sql"))
+        )).allSatisfy(converted -> assertThat(converted)
+                .contains("-- DM_ADAPTER: ignored MySQL USE; target schema is selected externally")
+                .doesNotContain("tenant_alpha", "tenant-beta")
+                .doesNotContainPattern("(?im)^\\s*(?:USE|SET\\s+SCHEMA)\\b"));
+        assertThat(report.files())
+                .allSatisfy(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_USE_SCHEMA_TO_DM_RULE));
+    }
+
+    @Test
+    void retainsMysqlUseForManualMappingWhenTargetSchemaDiffers() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), "USE source_alpha;");
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "target_beta",
                 "",
                 DmValidationEnvironment.from(Map.of())
         ));
 
-        String converted = Files.readString(sqlRootOut.resolve("20260205.sql"));
-        assertThat(converted)
-                .contains("SET SCHEMA \"newsee-center-pay\";")
-                .contains("SET SCHEMA \"tenant-database\";")
-                .doesNotContainIgnoringCase("USE ");
-        assertThat(report.files())
+        assertThat(Files.readString(sqlRootOut.resolve("20260205.sql")))
+                .contains("USE source_alpha")
+                .doesNotContain("target_beta");
+        assertThat(report.manualReviewSqlCount()).isOne();
+        assertThat(report.manualReviewItems())
                 .singleElement()
-                .satisfies(file -> assertThat(file.appliedRules())
-                        .contains(SqlScriptMigrator.MYSQL_USE_SCHEMA_TO_DM_RULE));
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("does not match the configured target schema"));
     }
 
     @Test

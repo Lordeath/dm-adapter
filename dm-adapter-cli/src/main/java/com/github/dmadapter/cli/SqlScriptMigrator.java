@@ -349,6 +349,9 @@ class SqlScriptMigrator {
                     "(?is)\\bPREPARE\\s+\\w+\\s+FROM\\b|\\bEXECUTE\\s+(?!IMMEDIATE\\b)\\w+\\b|\\bDEALLOCATE\\s+PREPARE\\b"
             ),
             "MySQL dynamic SQL in procedures needs manual confirmation for Dameng.",
+            Pattern.compile("(?is)^\\s*USE\\s+"),
+            "MySQL USE does not match the configured target schema, or no target schema was configured. "
+                    + "Provide a matching --schema/--system-schema or an explicit database-to-schema mapping.",
             Pattern.compile("(?is)\\bCREATE\\s+(?:OR\\s+REPLACE\\s+)?TRIGGER\\b"),
             "Trigger syntax differs between MySQL and Dameng and needs manual confirmation."
     );
@@ -1620,7 +1623,8 @@ class SqlScriptMigrator {
             ScriptDynamicDdlState scriptDynamicDdlState,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptIdentityFirstColumns,
-            Map<String, String> scriptProcedureRenames
+            Map<String, String> scriptProcedureRenames,
+            String targetSchema
     ) {
         long startedAt = System.nanoTime();
         boolean largeStatement = originalStatement.length() >= 100_000;
@@ -1638,6 +1642,7 @@ class SqlScriptMigrator {
                 scriptTableColumns,
                 scriptIdentityFirstColumns,
                 scriptProcedureRenames,
+                targetSchema,
                 timings
         );
         long elapsedMillis = elapsedMillis(startedAt);
@@ -1898,7 +1903,8 @@ class SqlScriptMigrator {
                                     dynamicDdlStateSnapshot,
                                     tableColumnsSnapshot,
                                     identityFirstColumnsSnapshot,
-                                    scriptProcedureRenames
+                                    scriptProcedureRenames,
+                                    targetSchema
                             ),
                             conversionExecutor
                     );
@@ -1912,7 +1918,8 @@ class SqlScriptMigrator {
                             scriptDynamicDdlState,
                             scriptTableColumns,
                             scriptIdentityFirstColumns,
-                            scriptProcedureRenames
+                            scriptProcedureRenames,
+                            targetSchema
                     ));
                 }
                 conversionPlans.add(new StatementConversionPlan(statementIndex, originalStatement, conversion));
@@ -2404,6 +2411,7 @@ class SqlScriptMigrator {
             Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptIdentityFirstColumns,
             Map<String, String> scriptProcedureRenames,
+            String targetSchema,
             ConversionTimings timings
     ) {
         long preparationStartedAt = System.nanoTime();
@@ -2460,7 +2468,8 @@ class SqlScriptMigrator {
         SafeRuleConversion safeRuleConversion = applyScriptSafeRules(
                 sqlBody,
                 scriptTableColumns,
-                scriptIdentityFirstColumns
+                scriptIdentityFirstColumns,
+                targetSchema
         );
         timings.safeRulesNanos += System.nanoTime() - safeRulesStartedAt;
         long genericConverterStartedAt = System.nanoTime();
@@ -2472,9 +2481,6 @@ class SqlScriptMigrator {
         rules.addAll(safeRuleConversion.appliedRules());
         rules.addAll(sqlConversion.appliedRules());
         String convertedBody = sqlConversion.convertedSql();
-        if (rules.contains(MYSQL_USE_SCHEMA_TO_DM_RULE)) {
-            convertedBody = normalizeDamengSetSchemaIdentifier(convertedBody);
-        }
         if (MYSQL_PREFIX_INDEX_DDL_PATTERN.matcher(sqlBody).find()
                 && DM_PREFIX_FUNCTION_INDEX_PATTERN.matcher(convertedBody).find()) {
             rules.add(MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE);
@@ -4128,7 +4134,8 @@ class SqlScriptMigrator {
     private SafeRuleConversion applyScriptSafeRules(
             String sql,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
-            Map<String, String> scriptIdentityFirstColumns
+            Map<String, String> scriptIdentityFirstColumns,
+            String targetSchema
     ) {
         if (sql == null || sql.isBlank()) {
             return new SafeRuleConversion(sql == null ? "" : sql, false, List.of());
@@ -4142,7 +4149,7 @@ class SqlScriptMigrator {
             rules.add(MYSQL_FOREIGN_KEY_CHECKS_NOOP_RULE);
         }
 
-        String useSchemaSql = convertMysqlUseSchemaToDm(converted);
+        String useSchemaSql = convertMysqlUseSchemaToNoop(converted, targetSchema);
         if (!useSchemaSql.equals(converted)) {
             converted = useSchemaSql;
             rules.add(MYSQL_USE_SCHEMA_TO_DM_RULE);
@@ -4808,7 +4815,7 @@ class SqlScriptMigrator {
         return "-- DM_ADAPTER: ignored MySQL FOREIGN_KEY_CHECKS = " + matcher.group(1);
     }
 
-    private String convertMysqlUseSchemaToDm(String sql) {
+    private String convertMysqlUseSchemaToNoop(String sql, String targetSchema) {
         if (sql == null || sql.isBlank()) {
             return sql == null ? "" : sql;
         }
@@ -4818,22 +4825,12 @@ class SqlScriptMigrator {
         if (!matcher.matches()) {
             return sql;
         }
-        String schema = unquoteIdentifier(matcher.group("schema"));
-        if (Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*").matcher(schema).matches()) {
-            return "SET SCHEMA " + schema;
-        }
-        return "SET SCHEMA `" + schema.replace("`", "``") + "`";
-    }
-
-    private String normalizeDamengSetSchemaIdentifier(String sql) {
-        Matcher matcher = Pattern.compile(
-                "(?is)^\\s*SET\\s+SCHEMA\\s+`(?<schema>(?:``|[^`])+)`\\s*$"
-        ).matcher(sql);
-        if (!matcher.matches()) {
+        String sourceSchema = unquoteIdentifier(matcher.group("schema"));
+        String configuredSchema = unquoteIdentifier(targetSchema == null ? "" : targetSchema.trim());
+        if (configuredSchema.isBlank() || !sourceSchema.equalsIgnoreCase(configuredSchema)) {
             return sql;
         }
-        String schema = matcher.group("schema").replace("``", "`");
-        return "SET SCHEMA \"" + schema.replace("\"", "\"\"") + "\"";
+        return "-- DM_ADAPTER: ignored MySQL USE; target schema is selected externally";
     }
 
     private String convertMysqlSetNamesToNoop(String sql) {
