@@ -69,6 +69,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_INSERT_VALUE_TO_VALUES_RULE = "MYSQL_INSERT_VALUE_TO_VALUES";
     public static final String MYSQL_INDEX_HINT_REMOVAL_RULE = "MYSQL_INDEX_HINT_REMOVED";
     public static final String SQLSERVER_NOLOCK_HINT_REMOVAL_RULE = "SQLSERVER_NOLOCK_HINT_REMOVED";
+    public static final String SQLSERVER_TOP_TO_DM_FETCH_FIRST_RULE = "SQLSERVER_TOP_TO_DM_FETCH_FIRST";
+    public static final String SQLSERVER_DBO_SCHEMA_REMOVAL_RULE = "SQLSERVER_DBO_SCHEMA_REMOVED";
+    public static final String SQLSERVER_STRING_PLUS_TO_DM_CONCAT_RULE =
+            "SQLSERVER_STRING_PLUS_TO_DM_CONCAT";
+    public static final String SQLSERVER_CHARINDEX_TO_DM_INSTR_RULE =
+            "SQLSERVER_CHARINDEX_TO_DM_INSTR";
     public static final String MYSQL_CONVERT_DECIMAL_RULE = "MYSQL_CONVERT_DECIMAL_TO_CAST";
     public static final String MYSQL_CONVERT_CHAR_RULE = "MYSQL_CONVERT_CHAR_TO_CAST";
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
@@ -609,12 +615,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_TABLE_ALIAS_AS_RULE);
         }
 
-        GenericConversion keywordTableAliasConversion = quoteDamengKeywordTableAliases(converted);
-        if (keywordTableAliasConversion.changed()) {
-            converted = keywordTableAliasConversion.convertedSql();
-            rules.add(DAMENG_KEYWORD_TABLE_ALIAS_RULE);
-        }
-
         GenericConversion implicitCrossJoinConversion = convertImplicitCrossJoins(converted);
         if (implicitCrossJoinConversion.changed()) {
             converted = implicitCrossJoinConversion.convertedSql();
@@ -637,6 +637,36 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (noLockHintConversion.changed()) {
             converted = noLockHintConversion.convertedSql();
             rules.add(SQLSERVER_NOLOCK_HINT_REMOVAL_RULE);
+        }
+
+        GenericConversion keywordTableAliasConversion = quoteDamengKeywordTableAliases(converted);
+        if (keywordTableAliasConversion.changed()) {
+            converted = keywordTableAliasConversion.convertedSql();
+            rules.add(DAMENG_KEYWORD_TABLE_ALIAS_RULE);
+        }
+
+        GenericConversion dboSchemaConversion = removeSqlServerDboSchemaQualifiers(converted);
+        if (dboSchemaConversion.changed()) {
+            converted = dboSchemaConversion.convertedSql();
+            rules.add(SQLSERVER_DBO_SCHEMA_REMOVAL_RULE);
+        }
+
+        GenericConversion stringPlusConversion = convertSqlServerStringPlusOperators(converted);
+        if (stringPlusConversion.changed()) {
+            converted = stringPlusConversion.convertedSql();
+            rules.add(SQLSERVER_STRING_PLUS_TO_DM_CONCAT_RULE);
+        }
+
+        GenericConversion charIndexConversion = convertSqlServerCharIndexFunctions(converted);
+        if (charIndexConversion.changed()) {
+            converted = charIndexConversion.convertedSql();
+            rules.add(SQLSERVER_CHARINDEX_TO_DM_INSTR_RULE);
+        }
+
+        GenericConversion sqlServerTopConversion = convertSqlServerTopClauses(converted);
+        if (sqlServerTopConversion.changed()) {
+            converted = sqlServerTopConversion.convertedSql();
+            rules.add(SQLSERVER_TOP_TO_DM_FETCH_FIRST_RULE);
         }
 
         GenericConversion deleteAliasStarAfterIndexHintConversion = convertMysqlDeleteAliasStar(converted);
@@ -5828,7 +5858,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 "HAVING",
                 "LIMIT",
                 "FETCH",
-                "UNION"
+                "UNION",
+                "WITH"
         ).contains(upper);
     }
 
@@ -6209,6 +6240,307 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return new KeywordReplacement(index, skipWhitespace(sql, closeParenIndex + 1));
+    }
+
+    private GenericConversion removeSqlServerDboSchemaQualifiers(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                int qualifierEnd = sqlServerDboQualifierEnd(sql, index);
+                if (qualifierEnd < 0) {
+                    index++;
+                } else {
+                    replacements.add(new TextReplacement(index, qualifierEnd, ""));
+                    index = qualifierEnd;
+                }
+            }
+        }
+        return applyTextReplacements(sql, replacements);
+    }
+
+    private int sqlServerDboQualifierEnd(String sql, int index) {
+        int afterDbo;
+        if (startsKeyword(sql, index, "DBO")) {
+            afterDbo = index + "DBO".length();
+        } else if (index + "[DBO]".length() <= sql.length()
+                && sql.regionMatches(true, index, "[DBO]", 0, "[DBO]".length())) {
+            afterDbo = index + "[DBO]".length();
+        } else {
+            return -1;
+        }
+        int dotIndex = skipWhitespace(sql, afterDbo);
+        if (dotIndex >= sql.length() || sql.charAt(dotIndex) != '.') {
+            return -1;
+        }
+        return skipWhitespace(sql, dotIndex + 1);
+    }
+
+    private GenericConversion convertSqlServerStringPlusOperators(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '+'
+                    && (isSqlServerStringOperandBefore(sql, index)
+                    || isSqlServerStringOperandAfter(sql, index + 1))) {
+                replacements.add(new TextReplacement(index, index + 1, "||"));
+                index++;
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(sql, replacements);
+    }
+
+    private boolean isSqlServerStringOperandBefore(String sql, int beforeIndex) {
+        int end = skipWhitespaceBackward(sql, beforeIndex);
+        if (end <= 0) {
+            return false;
+        }
+        if (sql.charAt(end - 1) == '\'') {
+            return true;
+        }
+        if (sql.charAt(end - 1) != ')') {
+            return false;
+        }
+        int openParenIndex = findMatchingOpenParenBackward(sql, end - 1);
+        if (openParenIndex < 0) {
+            return false;
+        }
+        int functionStart = readFunctionNameStartBeforeParen(sql, openParenIndex);
+        String functionName = sql.substring(functionStart, openParenIndex).trim();
+        return Set.of("CONVERT", "CAST", "CONCAT").contains(functionName.toUpperCase(Locale.ROOT));
+    }
+
+    private boolean isSqlServerStringOperandAfter(String sql, int afterIndex) {
+        int start = skipWhitespace(sql, afterIndex);
+        if (start >= sql.length()) {
+            return false;
+        }
+        if (sql.charAt(start) == '\'') {
+            return true;
+        }
+        return startsFunction(sql, start, "CONVERT")
+                || startsFunction(sql, start, "CAST")
+                || startsFunction(sql, start, "CONCAT");
+    }
+
+    private GenericConversion convertSqlServerCharIndexFunctions(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "CHARINDEX")) {
+                FunctionCall functionCall = readFunctionCall(sql, index, "CHARINDEX");
+                String replacement = functionCall == null ? null : rewriteSqlServerCharIndex(functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String rewriteSqlServerCharIndex(FunctionCall functionCall) {
+        List<TopLevelArgument> arguments = splitTopLevelArguments(functionCall.body());
+        if (arguments.size() != 2 && arguments.size() != 3) {
+            return null;
+        }
+        String needle = arguments.get(0).text().trim();
+        String haystack = arguments.get(1).text().trim();
+        if (needle.isBlank() || haystack.isBlank()) {
+            return null;
+        }
+        if (arguments.size() == 2) {
+            return "INSTR(" + haystack + ", " + needle + ")";
+        }
+        String start = arguments.get(2).text().trim();
+        return start.isBlank() ? null : "INSTR(" + haystack + ", " + needle + ", " + start + ")";
+    }
+
+    private GenericConversion convertSqlServerTopClauses(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int depth = 0;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (startsKeyword(sql, index, "SELECT")) {
+                SqlServerTopClause topClause = readSqlServerTopClause(sql, index, depth);
+                if (topClause != null) {
+                    replacements.add(new TextReplacement(
+                            topClause.topStartIndex(),
+                            topClause.topEndIndex(),
+                            ""
+                    ));
+                    replacements.add(new TextReplacement(
+                            topClause.scopeEndIndex(),
+                            topClause.scopeEndIndex(),
+                            " FETCH FIRST " + topClause.rowCount() + " ROWS ONLY"
+                    ));
+                }
+                index += "SELECT".length();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(sql, replacements);
+    }
+
+    private SqlServerTopClause readSqlServerTopClause(String sql, int selectIndex, int selectDepth) {
+        int cursor = skipWhitespace(sql, selectIndex + "SELECT".length());
+        for (String modifier : List.of("ALL", "DISTINCT")) {
+            if (startsKeyword(sql, cursor, modifier)) {
+                cursor = skipWhitespace(sql, cursor + modifier.length());
+                break;
+            }
+        }
+        if (!startsKeyword(sql, cursor, "TOP")) {
+            return null;
+        }
+        int topStartIndex = cursor;
+        cursor = skipWhitespace(sql, cursor + "TOP".length());
+        String rowCount;
+        if (cursor < sql.length() && sql.charAt(cursor) == '(') {
+            int closeParenIndex = findMatchingParen(sql, cursor);
+            if (closeParenIndex < 0) {
+                return null;
+            }
+            rowCount = sql.substring(cursor + 1, closeParenIndex).trim();
+            cursor = closeParenIndex + 1;
+        } else {
+            int rowCountEnd = cursor;
+            while (rowCountEnd < sql.length()
+                    && !Character.isWhitespace(sql.charAt(rowCountEnd))
+                    && sql.charAt(rowCountEnd) != ',') {
+                rowCountEnd++;
+            }
+            rowCount = sql.substring(cursor, rowCountEnd).trim();
+            cursor = rowCountEnd;
+        }
+        if (!rowCount.matches("(?is)(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})")) {
+            return null;
+        }
+        int afterTopIndex = skipWhitespace(sql, cursor);
+        if (startsKeyword(sql, afterTopIndex, "PERCENT")
+                || startsKeyword(sql, afterTopIndex, "WITH")) {
+            return null;
+        }
+        int scopeEndIndex = findSqlServerSelectScopeEnd(sql, afterTopIndex, selectDepth);
+        if (scopeEndIndex < 0) {
+            return null;
+        }
+        return new SqlServerTopClause(
+                topStartIndex,
+                afterTopIndex,
+                skipWhitespaceBackward(sql, scopeEndIndex),
+                rowCount
+        );
+    }
+
+    private int findSqlServerSelectScopeEnd(String sql, int startIndex, int selectDepth) {
+        int depth = selectDepth;
+        int index = startIndex;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth == selectDepth) {
+                    return index;
+                }
+                depth--;
+                index++;
+            } else if (depth == selectDepth
+                    && (current == ';'
+                    || startsKeyword(sql, index, "UNION")
+                    || startsKeyword(sql, index, "EXCEPT")
+                    || startsKeyword(sql, index, "INTERSECT"))) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return sql.length();
     }
 
     private KeywordReplacement readMysqlIndexHintRemoval(String sql, int index) {
@@ -8804,6 +9136,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record KeywordReplacement(int startIndex, int endIndex) {
+    }
+
+    private record SqlServerTopClause(
+            int topStartIndex,
+            int topEndIndex,
+            int scopeEndIndex,
+            String rowCount
+    ) {
     }
 
     private record TextReplacement(int startIndex, int endIndex, String replacement) {

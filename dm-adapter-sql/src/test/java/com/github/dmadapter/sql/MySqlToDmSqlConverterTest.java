@@ -1093,6 +1093,7 @@ class MySqlToDmSqlConverterTest {
                 SELECT a.id, b.name
                 FROM CE_Standard_Scores a WITH(NOLOCK)
                 LEFT JOIN CE_ExpertsGroup_Project b with ( NOLOCK ) ON a.ProjectID = b.ProjectID
+                LEFT JOIN System_Area with(nolock) ON System_Area.id = a.area_id
                 WHERE a.note = 'WITH(NOLOCK)'
                 -- WITH(NOLOCK)
                 """);
@@ -1101,12 +1102,94 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql())
                 .contains("WITH active_users AS (")
                 .contains("FROM CE_Standard_Scores a LEFT JOIN CE_ExpertsGroup_Project b ON")
+                .contains("LEFT JOIN System_Area ON")
                 .contains("a.note = 'WITH(NOLOCK)'")
                 .contains("-- WITH(NOLOCK)")
                 .doesNotContain("a WITH(NOLOCK)")
-                .doesNotContain("b with ( NOLOCK )");
+                .doesNotContain("b with ( NOLOCK )")
+                .doesNotContain("\"with\"(nolock)");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.SQLSERVER_NOLOCK_HINT_REMOVAL_RULE);
+    }
+
+    @Test
+    void convertsSqlServerTopInOuterAndNestedSelectScopes() {
+        SqlConversionResult result = converter.convert("""
+                SELECT TOP 1 id,
+                       ABS(DATEDIFF(DAY, planned_date, (
+                           SELECT TOP (1) paid_date
+                           FROM payments
+                           ORDER BY paid_date DESC
+                       ))) AS days
+                FROM contracts
+                ORDER BY create_date DESC
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT id,
+                       ABS(DATEDIFF(DAY, planned_date, (
+                           SELECT paid_date
+                           FROM payments
+                           ORDER BY paid_date DESC FETCH FIRST 1 ROWS ONLY
+                       ))) AS days
+                FROM contracts
+                ORDER BY create_date DESC FETCH FIRST 1 ROWS ONLY
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.SQLSERVER_TOP_TO_DM_FETCH_FIRST_RULE);
+    }
+
+    @Test
+    void convertsSqlServerDefaultSchemaStringConcatenationAndCharIndex() {
+        SqlConversionResult result = converter.convert("""
+                SELECT c.MemberID
+                FROM dbo.Register_CompanyMember c WITH(NOLOCK)
+                WHERE ',' + CONVERT(VARCHAR(100), c.MemberType) + ',' LIKE '%,1,%'
+                  AND CHARINDEX(#{keywords}, c.CompanyName) > 0
+                  AND CHARINDEX('x', c.CompanyName, 2) > 0
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT c.MemberID
+                FROM Register_CompanyMember c WHERE ',' || CONVERT(VARCHAR(100), c.MemberType) || ',' LIKE '%,1,%'
+                  AND INSTR(c.CompanyName, #{keywords}) > 0
+                  AND INSTR(c.CompanyName, 'x', 2) > 0
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.SQLSERVER_NOLOCK_HINT_REMOVAL_RULE,
+                MySqlToDmSqlConverter.SQLSERVER_DBO_SCHEMA_REMOVAL_RULE,
+                MySqlToDmSqlConverter.SQLSERVER_STRING_PLUS_TO_DM_CONCAT_RULE,
+                MySqlToDmSqlConverter.SQLSERVER_CHARINDEX_TO_DM_INSTR_RULE
+        );
+    }
+
+    @Test
+    void leavesDboAndSqlServerOperatorsInsideIgnoredText() {
+        SqlConversionResult result = converter.convert("""
+                SELECT 'dbo.users ''a'' + CONVERT(VARCHAR(10), id) CHARINDEX(x, y)' AS sample
+                FROM users
+                -- dbo.audit ',' + name CHARINDEX(x, y)
+                """);
+
+        assertThat(result.changed()).isFalse();
+    }
+
+    @Test
+    void doesNotConvertSqlServerTopInsideIgnoredTextOrUnsupportedPercentClause() {
+        SqlConversionResult result = converter.convert("""
+                SELECT 'SELECT TOP 1 id' AS sample
+                FROM users
+                -- SELECT TOP 1 id FROM users
+                WHERE note = #{note}
+                """);
+        SqlConversionResult percent = converter.convert("SELECT TOP 10 PERCENT id FROM users");
+
+        assertThat(result.changed()).isFalse();
+        assertThat(percent.convertedSql()).contains("TOP 10");
+        assertThat(percent.appliedRules())
+                .doesNotContain(MySqlToDmSqlConverter.SQLSERVER_TOP_TO_DM_FETCH_FIRST_RULE);
     }
 
     @Test
