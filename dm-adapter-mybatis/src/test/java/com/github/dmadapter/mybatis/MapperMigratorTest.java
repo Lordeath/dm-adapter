@@ -358,8 +358,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .contains(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -1264,7 +1263,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicSqlIsMarkedForManualReview() throws Exception {
+    void dynamicSqlWithoutCompatibilityRiskDoesNotRequireManualReview() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
                 select * from user
                 <where>
@@ -1287,8 +1286,7 @@ class MapperMigratorTest {
                 new MySqlToDmSqlConverter()
         );
 
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -1330,7 +1328,8 @@ class MapperMigratorTest {
                 .doesNotContain("MERGE INTO");
         assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems().get(0).reason())
+                .contains("ON DUPLICATE KEY UPDATE");
     }
 
     @Test
@@ -1539,11 +1538,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason())
-                .contains("dynamic XML")
-                .doesNotContain("information_schema")
-                .doesNotContain("database()");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -1609,8 +1604,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -1724,7 +1718,8 @@ class MapperMigratorTest {
                 .doesNotContain("MERGE INTO");
         assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems().get(0).reason())
+                .contains("ON DUPLICATE KEY UPDATE");
     }
 
     @Test
@@ -1775,7 +1770,8 @@ class MapperMigratorTest {
                 .doesNotContain("MERGE INTO");
         assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems().get(0).reason())
+                .contains("ON DUPLICATE KEY UPDATE");
     }
 
     @Test
@@ -2127,8 +2123,7 @@ class MapperMigratorTest {
                 .contains("inner join ys_organization c")
                 .doesNotContain("from ys_organization b");
         assertThat(result.automaticConversions()).isEmpty();
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2174,8 +2169,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2225,8 +2219,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2274,8 +2267,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_STATIC_WHERE_MISSING_AND_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2480,8 +2472,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_MISSING_COMMA_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2540,8 +2531,7 @@ class MapperMigratorTest {
                         MapperXmlRewriter.MYBATIS_DYNAMIC_SET_TRIM_BLOCKS_MERGED_RULE,
                         MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_SET_TARGET_QUALIFIED_RULE
                 );
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2652,8 +2642,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2774,8 +2763,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2834,8 +2822,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_DUPLICATE_ASSIGNMENT_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2892,8 +2879,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_TRIM_MISSING_COMMA_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2946,7 +2932,7 @@ class MapperMigratorTest {
                 .doesNotContain("#{treeCode},\n")
                 .doesNotContain("#{treeCode},\r\n");
         assertThat(result.automaticConversions()).isEmpty();
-        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -2991,8 +2977,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_FOREACH_TUPLE_MISSING_COMMA_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3049,8 +3034,7 @@ class MapperMigratorTest {
                         MapperXmlRewriter.MYBATIS_BATCH_INSERT_ADD_VALUES_RULE,
                         MapperXmlRewriter.MYBATIS_FOREACH_TRAILING_COMMA_RULE
                 );
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3106,8 +3090,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_FOREACH_TUPLE_MISSING_COMMA_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3176,8 +3159,7 @@ class MapperMigratorTest {
                         MapperXmlRewriter.MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE,
                         MapperXmlRewriter.MYBATIS_FOREACH_TRAILING_COMMA_RULE
                 );
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3376,8 +3358,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly("DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING");
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3429,8 +3410,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3493,8 +3473,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_DYNAMIC_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3555,8 +3534,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_DYNAMIC_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3616,8 +3594,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3680,8 +3657,7 @@ class MapperMigratorTest {
                         MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE,
                         MapperXmlRewriter.MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION_RULE
                 );
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3736,8 +3712,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3803,8 +3778,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -3921,8 +3895,7 @@ class MapperMigratorTest {
                         MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE,
                         MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE
                 );
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -4067,8 +4040,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -4117,8 +4089,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -4170,8 +4141,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -4214,8 +4184,7 @@ class MapperMigratorTest {
                 .contains("having status = 'A' or status = 'B'")
                 .doesNotContain("and status = 'A'");
         assertThat(result.automaticConversions()).isEmpty();
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason()).contains("dynamic XML");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
@@ -4532,10 +4501,7 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE);
-        assertThat(result.manualReviewItems()).hasSize(1);
-        assertThat(result.manualReviewItems().get(0).reason())
-                .doesNotContain("@var")
-                .doesNotContain("MySQL user variables");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     private int countMatches(String value, String needle) {

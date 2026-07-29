@@ -399,15 +399,17 @@ public class MapperXmlRewriter {
                                 statement.getAttribute("keyProperty"),
                                 statement.getAttribute("keyColumn")
                         );
-                manualReviewItems.add(new SqlChange(
-                        reportPath,
-                        statementKey,
-                        dynamicBodyConversion.originalBody(),
-                        dynamicBodyConversion.convertedBody(),
-                        dynamicBodyConversion.appliedRules(),
-                        true,
-                        dynamicXmlManualReviewReason(dynamicBodyConversion.manualReviewReasons())
-                ));
+                if (!dynamicBodyConversion.manualReviewReasons().isEmpty()) {
+                    manualReviewItems.add(new SqlChange(
+                            reportPath,
+                            statementKey,
+                            dynamicBodyConversion.originalBody(),
+                            dynamicBodyConversion.convertedBody(),
+                            dynamicBodyConversion.appliedRules(),
+                            true,
+                            dynamicXmlManualReviewReason(dynamicBodyConversion.manualReviewReasons())
+                    ));
+                }
                 if (dynamicBodyConversion.changed()) {
                     replacements.add(StatementReplacement.dynamicBody(
                             tagName,
@@ -514,11 +516,8 @@ public class MapperXmlRewriter {
     }
 
     private String dynamicXmlManualReviewReason(List<String> manualReviewReasons) {
-        String baseReason = "Statement contains dynamic XML elements and requires manual confirmation.";
-        if (manualReviewReasons == null || manualReviewReasons.isEmpty()) {
-            return baseReason;
-        }
-        return baseReason + " Additional SQL review: " + String.join("; ", manualReviewReasons);
+        return "Statement contains dynamic XML elements with unresolved compatibility risks. "
+                + "Additional SQL review: " + String.join("; ", manualReviewReasons);
     }
 
     private String statementKey(String namespace, String statementId) {
@@ -806,6 +805,9 @@ public class MapperXmlRewriter {
         if (appliedRules.contains(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE)
                 && !containsMysqlMetadataSql(rewrittenBody)) {
             manualReviewReasons.removeIf(this::isMysqlMetadataManualReviewReason);
+        }
+        if (!containsMysqlOnDuplicateKeyUpdate(rewrittenBody)) {
+            manualReviewReasons.removeIf(this::isMysqlOnDuplicateKeyUpdateManualReviewReason);
         }
         return new DynamicBodyConversion(
                 rawBody,
@@ -1688,6 +1690,19 @@ public class MapperXmlRewriter {
                 && (reason.contains("MySQL metadata SQL")
                 || reason.contains("information_schema")
                 || reason.contains("database()"));
+    }
+
+    private boolean containsMysqlOnDuplicateKeyUpdate(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        return Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
+                .matcher(sqlView(value).text())
+                .find();
+    }
+
+    private boolean isMysqlOnDuplicateKeyUpdateManualReviewReason(String reason) {
+        return reason != null && reason.contains("ON DUPLICATE KEY UPDATE");
     }
 
     private boolean isUserVariableNamePart(char value) {
