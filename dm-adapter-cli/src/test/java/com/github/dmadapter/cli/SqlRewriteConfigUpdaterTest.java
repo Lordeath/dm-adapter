@@ -171,7 +171,9 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(Files.readString(config))
                 .contains("\"role_perm\":")
                 .contains("\"com.example.UserMapper.insertIgnore\":")
-                .contains("keyColumns: []");
+                .contains("keyColumns: []")
+                .contains("upsertKeyResolutions:")
+                .contains("\"com.example.UserMapper.insertIgnore\": \"KEY_METADATA_UNAVAILABLE\"");
     }
 
     @Test
@@ -320,6 +322,39 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(Files.readString(config))
                 .contains("\"ns_recently_used\":")
                 .contains("\"com.example.RecentlyUsedMapper.insertOrUpdate\":")
-                .contains("keyColumns: []");
+                .contains("keyColumns: []")
+                .contains("\"com.example.RecentlyUsedMapper.insertOrUpdate\": \"MANUAL_KEY_COLUMNS_REQUIRED\"");
+    }
+
+    @Test
+    void persistsOriginalSqlResolutionWhenNoConflictKeyIsInserted() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.BankFileMapper.insertIgnore",
+                "ns_bank_file",
+                List.of("file_id", "file_name")
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("ns_bank_file", List.of(
+                new TableConstraint(
+                        "PK_NS_BANK_FILE",
+                        TableConstraint.ConstraintType.PRIMARY_KEY,
+                        List.of("id")
+                )
+        ));
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(candidate),
+                Map.of("ns_bank_file", metadata),
+                true
+        );
+
+        assertThat(update.rewriteConfig().keyColumnsFor(candidate.methodKey(), candidate.tableName())).isEmpty();
+        assertThat(Files.readString(config))
+                .contains("upsertKeyResolutions:")
+                .contains("\"com.example.BankFileMapper.insertIgnore\": "
+                        + "\"ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY\"");
     }
 }

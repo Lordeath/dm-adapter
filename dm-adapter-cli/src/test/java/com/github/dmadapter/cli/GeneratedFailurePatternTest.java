@@ -117,6 +117,45 @@ class GeneratedFailurePatternTest {
         }
     }
 
+    @Test
+    void classifiesInsertIgnoreWithoutUsableConflictKeyAsOriginalSql() throws Exception {
+        Path source = tempDir.resolve("src/com/example/DmSqlValidationTest.java");
+        Files.createDirectories(source.getParent());
+        Files.writeString(source, generatedTestSource(), StandardCharsets.UTF_8);
+        Path classes = tempDir.resolve("classes");
+        compile(List.of(source), classes);
+        Path rewriteConfig = tempDir.resolve("sql-rewrite.yml");
+        Files.writeString(rewriteConfig, """
+                upsertKeyResolutions:
+                  methods:
+                    "com.example.Mapper.method": "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY"
+                """);
+
+        try (URLClassLoader classLoader = new URLClassLoader(
+                new URL[] {classes.toUri().toURL()},
+                getClass().getClassLoader()
+        )) {
+            Class<?> validationClass = classLoader.loadClass("com.example.DmSqlValidationTest");
+            Object validation = validationClass.getDeclaredConstructor().newInstance();
+            loadRewriteConfig(validationClass, validation, rewriteConfig);
+            String insertIgnore = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 第1行附近出现错误
+                    ### SQL: insert ignore into ns_bank_file
+                    (file_id, file_name) values (?, ?)
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object record = failedRecord(validationClass, insertIgnore);
+
+            assertThat(failurePattern(validationClass, validation, record))
+                    .isEqualTo("ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY");
+            assertThat(category(validationClass, validation, record))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, record))
+                    .isFalse();
+        }
+    }
+
     private String failurePattern(Class<?> validationClass, Object validation, String message) throws Exception {
         return failurePattern(validationClass, validation, failedRecord(validationClass, message));
     }
@@ -152,6 +191,24 @@ class GeneratedFailurePatternTest {
         Method failed = recordClass.getDeclaredMethod("failed", String.class, String.class, String.class);
         failed.setAccessible(true);
         return failed.invoke(null, "com.example.Mapper.method", "configured", message);
+    }
+
+    private void loadRewriteConfig(
+            Class<?> validationClass,
+            Object validation,
+            Path rewriteConfig
+    ) throws Exception {
+        Class<?> configClass = Class.forName(
+                validationClass.getName() + "$ValidationConfig",
+                true,
+                validationClass.getClassLoader()
+        );
+        Method load = configClass.getDeclaredMethod("load", Path.class, Path.class);
+        load.setAccessible(true);
+        Object config = load.invoke(null, tempDir.resolve("missing-validation.yml"), rewriteConfig);
+        Field currentConfig = validationClass.getDeclaredField("currentConfig");
+        currentConfig.setAccessible(true);
+        currentConfig.set(validation, config);
     }
 
     private String generatedTestSource() throws Exception {
