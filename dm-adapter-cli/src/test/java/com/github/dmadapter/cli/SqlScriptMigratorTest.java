@@ -926,6 +926,49 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsBalancedProcedureIfWhoseParenthesizedSubqueryIsFollowedByComparison() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        RecordingValidator validator = new RecordingValidator();
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE insert_log_match_data()
+                BEGIN
+                    IF (SELECT COUNT(0) FROM ns_quality_log_match) = 0 THEN
+                        INSERT INTO ns_quality_log_match(table_name) VALUES ('schedule');
+                    END IF;
+                    IF (SELECT COUNT(0) FROM ns_quality_log_match WHERE table_name = 'cycle') != 0 THEN
+                        UPDATE ns_quality_log_match SET table_name = 'updated'
+                        WHERE table_name = 'cycle';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL insert_log_match_data();
+                """);
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-quality",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE insert_log_match_data()")
+                .contains("IF (SELECT COUNT(0) FROM ns_quality_log_match) = 0 THEN")
+                .contains("IF (SELECT COUNT(0) FROM ns_quality_log_match WHERE TABLE_NAME = 'cycle') != 0 THEN")
+                .contains("CALL insert_log_match_data()");
+        assertThat(validator.files)
+                .singleElement()
+                .satisfies(file -> assertThat(file.manualReviewStatementIndexes()).isEmpty());
+    }
+
+    @Test
     void clearsManualProcedureDependencyAfterSuccessfulRecreation() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -5817,26 +5860,49 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void keepsPostDdlDmlWithProcedureInputForManualReview() throws Exception {
+    void bindsProcedureInputsWhenRewritingPostDdlDml() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
-                CREATE PROCEDURE change_demo(new_status VARCHAR(20))
+                CREATE PROCEDURE change_demo(new_status VARCHAR(20), target_id BIGINT)
                 BEGIN
                     ALTER TABLE demo ADD status VARCHAR(20);
-                    UPDATE demo SET status = new_status;
+                    UPDATE demo
+                    SET status = new_status
+                    WHERE id = target_id OR parent_id = target_id;
                 END;
                 /
-                CALL change_demo('ready');
+                CALL change_demo('ready', 1);
                 """);
 
-        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
-        assertThat(converted.report().manualReviewItems())
-                .extracting(SqlScriptManualReviewItem::reason)
-                .anySatisfy(reason -> assertThat(reason)
-                        .contains("第一版不自动生成 USING 绑定")
-                        .contains("`demo`"));
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("UPDATE demo SET status = new_status")
-                .doesNotContain("EXECUTE IMMEDIATE 'UPDATE demo SET status = new_status'");
+                .contains("EXECUTE IMMEDIATE 'UPDATE demo")
+                .contains("SET status = ?")
+                .contains("WHERE id = ? OR parent_id = ?' USING new_status, target_id, target_id")
+                .doesNotContain("SET ? = ?");
+    }
+
+    @Test
+    void bindsProcedureInputAfterSelectIntoWhenRewritingPostDdlQuery() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE count_demo(new_status VARCHAR(20))
+                BEGIN
+                    DECLARE matching_count BIGINT;
+                    ALTER TABLE demo ADD status VARCHAR(20);
+                    SELECT COUNT(*) INTO matching_count
+                    FROM demo
+                    WHERE status = new_status;
+                END;
+                /
+                CALL count_demo('ready');
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*)")
+                .contains("FROM demo")
+                .contains("WHERE status = ?' INTO matching_count USING new_status")
+                .doesNotContain("INTO ?")
+                .doesNotContain("WHERE status = new_status");
     }
 
     @Test
