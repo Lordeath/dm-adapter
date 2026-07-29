@@ -2848,6 +2848,59 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicInsertTrimDoesNotAddCommaBeforeFollowingLeadingComma() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.InterfaceCallDetailsMapper">
+                    <insert id="insert">
+                        insert into ns_interface_call_details
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="treeCode != null">treeCode,</if>
+                            <if test="path != null">path,</if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="treeCode != null">
+                                #{treeCode}
+                            </if>
+                            <if test="path != null">
+                                ,#{path}
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/InterfaceCallDetailsMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/InterfaceCallDetailsMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/InterfaceCallDetailsMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("#{treeCode}\n")
+                .contains(",#{path}")
+                .doesNotContain("#{treeCode},\n")
+                .doesNotContain("#{treeCode},\r\n");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).hasSize(1);
+    }
+
+    @Test
     void dynamicBatchInsertAddsMissingForeachTupleCommas() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

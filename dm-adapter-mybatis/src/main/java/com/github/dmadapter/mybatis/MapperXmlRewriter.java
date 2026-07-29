@@ -7020,7 +7020,8 @@ public class MapperXmlRewriter {
     private int missingTrimCommaInsertionIndex(String body, int ifBodyStart, int ifBodyEnd, int afterIfEnd, int scopeEnd) {
         String ifBody = body.substring(ifBodyStart, ifBodyEnd);
         if (!isCommaSeparatedTrimItemFragment(ifBody)
-                || !hasFollowingCommaSeparatedTrimItem(body, afterIfEnd, scopeEnd)) {
+                || !hasFollowingCommaSeparatedTrimItem(body, afterIfEnd, scopeEnd)
+                || followingCommaSeparatedTrimItemStartsWithComma(body, afterIfEnd, scopeEnd)) {
             return -1;
         }
         int insertionIndex = trimTrailingWhitespaceIndex(body, ifBodyStart, ifBodyEnd);
@@ -7028,6 +7029,44 @@ public class MapperXmlRewriter {
             return -1;
         }
         return insertionIndex;
+    }
+
+    private boolean followingCommaSeparatedTrimItemStartsWithComma(String body, int start, int end) {
+        int index = start;
+        while (index < end) {
+            index = skipWhitespaceAndXmlComments(body, index, end);
+            if (index >= end) {
+                return false;
+            }
+            if (body.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                if (tag == null || tag.closing() || tag.selfClosing() || !"if".equalsIgnoreCase(tag.name())) {
+                    return false;
+                }
+                int closingStart = findClosingTag(body, tag.endIndex(), "if", end);
+                return closingStart >= 0
+                        && trimItemStartsWithComma(body.substring(tag.endIndex(), closingStart));
+            }
+            int nextTag = body.indexOf('<', index);
+            int textEnd = nextTag < 0 ? end : Math.min(nextTag, end);
+            String text = body.substring(index, textEnd);
+            if (!text.isBlank()) {
+                return trimItemStartsWithComma(text);
+            }
+            index = textEnd;
+        }
+        return false;
+    }
+
+    private boolean trimItemStartsWithComma(String fragment) {
+        String stripped = fragment == null ? "" : fragment.stripLeading();
+        if (stripped.startsWith("<![CDATA[")) {
+            int cdataEnd = stripped.indexOf("]]>");
+            if (cdataEnd > "<![CDATA[".length()) {
+                stripped = stripped.substring("<![CDATA[".length(), cdataEnd).stripLeading();
+            }
+        }
+        return stripped.startsWith(",");
     }
 
     private boolean hasFollowingCommaSeparatedTrimItem(String body, int start, int end) {
