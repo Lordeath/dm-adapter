@@ -19,6 +19,42 @@ class SqlScriptValidationPlanStoreTest {
     Path tempDir;
 
     @Test
+    void roundTripsDmProcedureAfterCommentedMysqlProcedure() {
+        List<String> statements = List.of(
+                """
+                        /*DROP PROCEDURE IF EXISTS ignored_proc;
+                        DELIMITER $$
+                        CREATE PROCEDURE ignored_proc()
+                        BEGIN
+                            SELECT 1;
+                        END$$
+                        DELIMITER ;
+                        CALL ignored_proc();
+                        DROP PROCEDURE IF EXISTS ignored_proc;*/
+
+                        DROP PROCEDURE IF EXISTS active_proc
+                        """,
+                """
+                        CREATE OR REPLACE PROCEDURE active_proc AS
+                        BEGIN
+                            NULL;
+                        END
+                        """,
+                "CALL active_proc()"
+        );
+
+        String rendered = SqlScriptParser.scriptContent(statements);
+
+        assertThat(SqlScriptParser.statements(rendered))
+                .hasSize(3)
+                .element(0).asString().contains("DROP PROCEDURE IF EXISTS active_proc");
+        assertThat(SqlScriptParser.statements(rendered))
+                .element(1).asString().startsWith("CREATE OR REPLACE PROCEDURE active_proc");
+        assertThat(SqlScriptParser.statements(rendered))
+                .element(2).asString().isEqualTo("CALL active_proc()");
+    }
+
+    @Test
     void writesLoadsAndRejectsTamperedSql() throws Exception {
         Path outputRoot = tempDir.resolve("sql-dm");
         Path output = outputRoot.resolve("demo.sql");
