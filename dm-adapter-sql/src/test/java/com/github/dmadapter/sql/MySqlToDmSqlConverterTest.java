@@ -2802,6 +2802,43 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlInformationSchemaColumnDetailsToDamengMetadataViews() {
+        SqlConversionResult result = converter.convert("""
+                select
+                    TABLE_SCHEMA as tableSchema,
+                    TABLE_NAME as tableName,
+                    COLUMN_NAME as columnName,
+                    COLUMN_TYPE as columnType,
+                    COLUMN_COMMENT as columnComment,
+                    IS_NULLABLE as isNullAble
+                from information_schema.COLUMNS
+                where TABLE_SCHEMA = (select database())
+                  and TABLE_NAME = #{tableName}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT
+                    c.OWNER AS "tableSchema",
+                    c.TABLE_NAME AS "tableName",
+                    c.COLUMN_NAME AS "columnName",
+                    c.DATA_TYPE AS "columnType",
+                    cc.COMMENTS AS "columnComment",
+                    CASE c.NULLABLE WHEN 'Y' THEN 'YES' ELSE 'NO' END AS "isNullAble"
+                FROM ALL_TAB_COLUMNS c
+                LEFT JOIN ALL_COL_COMMENTS cc
+                    ON cc.OWNER = c.OWNER
+                    AND cc.TABLE_NAME = c.TABLE_NAME
+                    AND cc.COLUMN_NAME = c.COLUMN_NAME
+                WHERE c.TABLE_NAME = UPPER(#{tableName}) AND c.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                ORDER BY c.COLUMN_ID
+                """.strip());
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
     void convertsMysqlInformationSchemaColumnsTableListQueryToAllTabColumns() {
         SqlConversionResult result = converter.convert("""
                 SELECT table_name

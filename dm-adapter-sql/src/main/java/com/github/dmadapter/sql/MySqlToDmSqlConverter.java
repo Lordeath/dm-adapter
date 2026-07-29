@@ -295,6 +295,17 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)^\\s*select\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
                     + "(?<where>.+?)(?:\\s+order\\s+by\\s+ordinal_position\\s*(?<direction>asc|desc)?\\s*)?;?\\s*$"
     );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_DETAIL_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+"
+                    + "table_schema\\s+(?:as\\s+)?(?<schemaAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
+                    + "table_name\\s+(?:as\\s+)?(?<tableAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
+                    + "column_name\\s+(?:as\\s+)?(?<columnAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
+                    + "column_type\\s+(?:as\\s+)?(?<typeAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
+                    + "column_comment\\s+(?:as\\s+)?(?<commentAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
+                    + "is_nullable\\s+(?:as\\s+)?(?<nullableAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s+"
+                    + "from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
+                    + "(?<where>.+?)\\s*;?\\s*$"
+    );
     private static final Pattern INFORMATION_SCHEMA_COLUMNS_TABLE_LIST_PATTERN = Pattern.compile(
             "(?is)^\\s*select\\s+table_name\\s+from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
                     + "table_name\\s+like\\s+(?<tableLike>.+?)\\s+and\\s+"
@@ -4265,6 +4276,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertInformationSchemaColumns(String sql) {
+        GenericConversion detailConversion = convertInformationSchemaColumnsDetail(sql);
+        if (detailConversion.changed()) {
+            return detailConversion;
+        }
         GenericConversion tableListConversion = convertInformationSchemaColumnsTableList(sql);
         if (tableListConversion.changed()) {
             return tableListConversion;
@@ -4295,6 +4310,50 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + metadataOwnerCondition(tableSchema)
                 + " ORDER BY COLUMN_ID"
                 + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaColumnsDetail(String sql) {
+        Matcher matcher = INFORMATION_SCHEMA_COLUMNS_DETAIL_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String whereClause = matcher.group("where");
+        Matcher tableNameMatcher = METADATA_TABLE_NAME_CONDITION.matcher(whereClause);
+        Matcher tableSchemaMatcher = METADATA_TABLE_SCHEMA_CONDITION.matcher(whereClause);
+        if (!tableNameMatcher.find()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableName = tableNameMatcher.group("value").trim();
+        String tableSchema = tableSchemaMatcher.find() ? tableSchemaMatcher.group("value").trim() : "";
+        String residual = tableNameMatcher.replaceAll("");
+        residual = METADATA_TABLE_SCHEMA_CONDITION.matcher(residual).replaceAll("");
+        residual = residual.replaceAll("(?i)\\bAND\\b", "")
+                .replaceAll("[()\\s]", "");
+        if (!residual.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String ownerCondition = tableSchema.isBlank()
+                ? ""
+                : isMysqlCurrentSchemaExpression(tableSchema)
+                        ? " AND c.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                        : " AND c.OWNER = UPPER(" + tableSchema + ")";
+        String converted = "SELECT\n"
+                + "    c.OWNER AS \"" + matcher.group("schemaAlias") + "\",\n"
+                + "    c.TABLE_NAME AS \"" + matcher.group("tableAlias") + "\",\n"
+                + "    c.COLUMN_NAME AS \"" + matcher.group("columnAlias") + "\",\n"
+                + "    c.DATA_TYPE AS \"" + matcher.group("typeAlias") + "\",\n"
+                + "    cc.COMMENTS AS \"" + matcher.group("commentAlias") + "\",\n"
+                + "    CASE c.NULLABLE WHEN 'Y' THEN 'YES' ELSE 'NO' END AS \""
+                + matcher.group("nullableAlias") + "\"\n"
+                + "FROM ALL_TAB_COLUMNS c\n"
+                + "LEFT JOIN ALL_COL_COMMENTS cc\n"
+                + "    ON cc.OWNER = c.OWNER\n"
+                + "    AND cc.TABLE_NAME = c.TABLE_NAME\n"
+                + "    AND cc.COLUMN_NAME = c.COLUMN_NAME\n"
+                + "WHERE c.TABLE_NAME = UPPER(" + tableName + ")"
+                + ownerCondition
+                + "\nORDER BY c.COLUMN_ID";
         return new GenericConversion(converted, true);
     }
 

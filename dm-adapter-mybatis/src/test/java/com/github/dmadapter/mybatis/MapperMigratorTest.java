@@ -1488,6 +1488,54 @@ class MapperMigratorTest {
     }
 
     @Test
+    void staticInformationSchemaColumnDetailsAreRewrittenWithoutManualReview() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/TableFieldMapper.xml", """
+                select
+                    TABLE_SCHEMA as tableSchema,
+                    TABLE_NAME as tableName,
+                    COLUMN_NAME as columnName,
+                    COLUMN_TYPE as columnType,
+                    COLUMN_COMMENT as columnComment,
+                    IS_NULLABLE as isNullAble
+                from information_schema.COLUMNS
+                where TABLE_SCHEMA = (select database())
+                  and TABLE_NAME = #{tableName}
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TableFieldMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/TableFieldMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("c.OWNER AS \"tableSchema\"")
+                .contains("c.DATA_TYPE AS \"columnType\"")
+                .contains("cc.COMMENTS AS \"columnComment\"")
+                .contains("CASE c.NULLABLE WHEN 'Y' THEN 'YES' ELSE 'NO' END AS \"isNullAble\"")
+                .contains("c.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("c.TABLE_NAME = UPPER(#{tableName})")
+                .doesNotContain("information_schema")
+                .doesNotContain("database()");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicInformationSchemaColumnsWithIncludeIsRewrittenToDamengMetadataViews() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
