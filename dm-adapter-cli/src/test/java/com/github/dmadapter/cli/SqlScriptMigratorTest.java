@@ -4433,6 +4433,61 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void recompilesInvalidRoutineToReportAndClassifyConcreteCompileError() {
+        AtomicInteger resultSetNextCount = new AtomicInteger();
+        ResultSet resultSet = proxy(ResultSet.class, (ignored, method, args) -> switch (method.getName()) {
+            case "next" -> resultSetNextCount.getAndIncrement() == 0;
+            case "getString" -> "INVALID";
+            default -> defaultValue(method.getReturnType());
+        });
+        PreparedStatement preparedStatement = proxy(PreparedStatement.class, (ignored, method, args) ->
+                method.getName().equals("executeQuery")
+                        ? resultSet
+                        : defaultValue(method.getReturnType()));
+        List<String> executedSql = new ArrayList<>();
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                executedSql.add(sql);
+                if (sql.startsWith("ALTER PROCEDURE")) {
+                    throw new SQLException("第 7 行附近出现错误: 无效的表或视图名[missing_dictionary]");
+                }
+                return false;
+            }
+            if (method.getName().equals("getWarnings")) {
+                return new SQLWarning("创建的对象带有编译错误");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) -> {
+            if (method.getName().equals("createStatement")) {
+                return statement;
+            }
+            if (method.getName().equals("prepareStatement")) {
+                return preparedStatement;
+            }
+            return defaultValue(method.getReturnType());
+        });
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "routine-compile-error.sql",
+                        "sample-system",
+                        List.of("CREATE OR REPLACE PROCEDURE demo_proc AS BEGIN NULL; END;")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(executedSql).contains("ALTER PROCEDURE demo_proc COMPILE");
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("TEST_SCHEMA_OBJECT");
+            assertThat(failure.errorSummary())
+                    .contains("Recompile diagnostic")
+                    .contains("missing_dictionary");
+        });
+    }
+
+    @Test
     void failsClosedWhenCreatedObjectStatusCannotBeQueried() {
         PreparedStatement preparedStatement = proxy(PreparedStatement.class, (ignored, method, args) -> {
             if (method.getName().equals("executeQuery")) {
