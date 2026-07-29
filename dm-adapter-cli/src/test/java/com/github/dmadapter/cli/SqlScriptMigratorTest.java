@@ -4974,6 +4974,123 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void hardTimeoutCoversJdbcStatementInitializationBeforeExecute() {
+        String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
+        String previous = System.getProperty(property);
+        CountDownLatch releaseInitialization = new CountDownLatch(1);
+        AtomicInteger timeoutConfigurationCount = new AtomicInteger();
+        AtomicInteger businessStatementCount = new AtomicInteger();
+        try {
+            System.setProperty(property, "1");
+            Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+                if (method.getName().equals("setQueryTimeout")
+                        && timeoutConfigurationCount.incrementAndGet() == 3) {
+                    while (releaseInitialization.getCount() > 0) {
+                        try {
+                            releaseInitialization.await(50, TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException ignoredInterrupt) {
+                            // Simulate a driver blocked before execute that ignores interruption.
+                        }
+                    }
+                }
+                if (method.getName().equals("execute")) {
+                    String sql = (String) args[0];
+                    if (!sql.startsWith("set schema")) {
+                        businessStatementCount.incrementAndGet();
+                    }
+                }
+                return defaultValue(method.getReturnType());
+            });
+            Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                    method.getName().equals("createStatement")
+                            ? statement
+                            : defaultValue(method.getReturnType()));
+
+            SqlScriptValidationRun result = assertTimeout(
+                    Duration.ofSeconds(3),
+                    () -> new SqlScriptValidator(env -> connection).validate(
+                            List.of(plannedValidationFile(
+                                    "blocking-initialization.sql",
+                                    "sample-bill",
+                                    List.of("select 1 from dual", "select 2 from dual")
+                            )),
+                            validationEnvironment()
+                    )
+            );
+
+            assertThat(result.status()).contains("timed out");
+            assertThat(result.successCount()).isZero();
+            assertThat(result.failures()).singleElement().satisfies(failure -> {
+                assertThat(failure.category()).isEqualTo("VALIDATION_TIMEOUT");
+                assertThat(failure.statementIndex()).isEqualTo(1);
+                assertThat(failure.errorSummary()).contains("hard timeout of 1 seconds");
+            });
+            assertThat(timeoutConfigurationCount).hasValue(3);
+            assertThat(businessStatementCount).hasValue(0);
+        } finally {
+            releaseInitialization.countDown();
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    @Test
+    void classifiesBlockedSchemaPreflightAsValidationTimeout() {
+        String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
+        String previous = System.getProperty(property);
+        CountDownLatch releaseSchemaSelection = new CountDownLatch(1);
+        try {
+            System.setProperty(property, "1");
+            Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+                if (method.getName().equals("setQueryTimeout")) {
+                    while (releaseSchemaSelection.getCount() > 0) {
+                        try {
+                            releaseSchemaSelection.await(50, TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException ignoredInterrupt) {
+                            // Simulate a driver blocked while preparing schema selection.
+                        }
+                    }
+                }
+                return defaultValue(method.getReturnType());
+            });
+            Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                    method.getName().equals("createStatement")
+                            ? statement
+                            : defaultValue(method.getReturnType()));
+
+            SqlScriptValidationRun result = assertTimeout(
+                    Duration.ofSeconds(3),
+                    () -> new SqlScriptValidator(env -> connection).validate(
+                            List.of(plannedValidationFile(
+                                    "schema-timeout.sql",
+                                    "sample-bill",
+                                    List.of("select 1 from dual")
+                            )),
+                            validationEnvironment()
+                    )
+            );
+
+            assertThat(result.status()).contains("timed out");
+            assertThat(result.successCount()).isZero();
+            assertThat(result.failures()).singleElement().satisfies(failure -> {
+                assertThat(failure.sourceFile()).isEqualTo("(schema-preflight)");
+                assertThat(failure.category()).isEqualTo("VALIDATION_TIMEOUT");
+                assertThat(failure.errorSummary()).contains("hard timeout of 1 seconds");
+            });
+        } finally {
+            releaseSchemaSelection.countDown();
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
+    }
+
+    @Test
     void sqlScriptValidationTimeoutCanBeOverriddenWithSystemProperty() {
         String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
         String previous = System.getProperty(property);
