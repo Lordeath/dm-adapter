@@ -520,6 +520,100 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsMysqlScriptIndexExistencePrepareSequenceToDamengBlock() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260522.sql"), """
+                SET @idx_mail_user_count_exists = (
+                    SELECT COUNT(*)
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'sample_mail_user'
+                      AND INDEX_NAME = 'idx_mail_user_count'
+                );
+                SET @idx_mail_user_count_sql = IF(
+                    @idx_mail_user_count_exists = 0,
+                    'ALTER TABLE `sample_mail_user` ADD INDEX `idx_mail_user_count` (`user_id`, `delete_flag`, `is_read`, `mail_id`)',
+                    'SELECT 1'
+                );
+                PREPARE idx_mail_user_count_stmt FROM @idx_mail_user_count_sql;
+                EXECUTE idx_mail_user_count_stmt;
+                DEALLOCATE PREPARE idx_mail_user_count_stmt;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-office",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260522.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("FROM ALL_INDEXES")
+                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("TABLE_NAME = UPPER('sample_mail_user')")
+                .contains("INDEX_NAME = UPPER('idx_mail_user_count')")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX sample_mail_user_idx_mail_user_count"
+                        + " ON `sample_mail_user` (`user_id`, `delete_flag`, `is_read`, `mail_id`)'")
+                .contains("MySQL PREPARE idx_mail_user_count_stmt is handled")
+                .contains("MySQL EXECUTE idx_mail_user_count_stmt is handled")
+                .contains("MySQL DEALLOCATE PREPARE idx_mail_user_count_stmt is unnecessary")
+                .doesNotContain("SET @idx_mail_user_count_exists")
+                .doesNotContain("SET @idx_mail_user_count_sql")
+                .doesNotContain("ALTER TABLE `sample_mail_user` ADD INDEX")
+                .doesNotContain("PREPARE idx_mail_user_count_stmt FROM")
+                .doesNotContain("EXECUTE idx_mail_user_count_stmt;");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE));
+    }
+
+    @Test
+    void doesNotExecuteMysqlScriptIndexDdlWhenPrepareSequenceIsIncomplete() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260523.sql"), """
+                SET @idx_sample_exists = (
+                    SELECT COUNT(*)
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'sample_account'
+                      AND INDEX_NAME = 'idx_sample_account_name'
+                );
+                SET @idx_sample_sql = IF(
+                    @idx_sample_exists = 0,
+                    'ALTER TABLE `sample_account` ADD INDEX `idx_sample_account_name` (`account_name`)',
+                    'SELECT 1'
+                );
+                SELECT @idx_sample_sql;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-incomplete",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260523.sql"));
+        assertThat(report.manualReviewSqlCount()).isGreaterThan(0);
+        assertThat(converted)
+                .contains("@idx_sample_exists")
+                .contains("@idx_sample_sql")
+                .doesNotContain("FROM ALL_INDEXES")
+                .doesNotContain("EXECUTE IMMEDIATE");
+    }
+
+    @Test
     void convertsMysqlBackslashEscapedSingleQuotesInsideSqlStringLiterals() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
