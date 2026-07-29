@@ -1410,6 +1410,53 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void doesNotMistakeInsertIntoAfterExistsQueryForSelectInto() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE initialize_component()
+                BEGIN
+                    DECLARE siteId BIGINT;
+                    DECLARE done INT DEFAULT 0;
+                    DECLARE site_cursor CURSOR FOR SELECT id FROM ns_site;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+                    OPEN site_cursor;
+                    FETCH site_cursor INTO siteId;
+                    WHILE done = 0 DO
+                        IF NOT EXISTS (
+                            SELECT 1 FROM ns_component
+                            WHERE site_id = siteId AND component_code = 'home'
+                        ) THEN
+                            INSERT INTO ns_component(site_id, component_code)
+                            VALUES (siteId, 'home');
+                        END IF;
+                        FETCH site_cursor INTO siteId;
+                    END WHILE;
+                    CLOSE site_cursor;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-association",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("EXIT WHEN site_cursor%NOTFOUND;")
+                .contains("INSERT INTO ns_component(site_id, component_code)")
+                .doesNotContain("DECLARE CONTINUE HANDLER")
+                .doesNotContain("WHILE done = 0");
+    }
+
+    @Test
     void classifiesUpsertAsOriginalKeyConflictWhenInsertOmitsEveryKnownUniqueKey() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
