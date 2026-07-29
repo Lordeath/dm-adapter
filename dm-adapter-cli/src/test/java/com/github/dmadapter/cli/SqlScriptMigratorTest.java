@@ -6210,6 +6210,36 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void rewritesTrailingSelectIntoAfterDynamicDdl() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE count_demo()
+                BEGIN
+                    DECLARE matching_count BIGINT;
+                    CREATE TABLE demo_snapshot AS SELECT id, status FROM demo_source;
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT status
+                        FROM demo_snapshot
+                        GROUP BY status
+                    ) grouped_status
+                    INTO matching_count;
+                    DROP TABLE demo_snapshot;
+                END;
+                /
+                CALL count_demo();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'CREATE TABLE demo_snapshot AS SELECT id, status FROM demo_source'")
+                .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*)")
+                .contains("FROM demo_snapshot")
+                .contains("GROUP BY status")
+                .contains(") grouped_status' INTO matching_count")
+                .doesNotContain("grouped_status\n    INTO matching_count");
+    }
+
+    @Test
     void keepsLoopWithSameObjectDdlForManualReview() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE PROCEDURE change_demo()
