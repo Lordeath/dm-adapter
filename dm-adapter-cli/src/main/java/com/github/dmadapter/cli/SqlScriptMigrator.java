@@ -5828,7 +5828,8 @@ class SqlScriptMigrator {
             }
             String fetchTargets = loopHeadMatcher.group(3).strip();
             String body = sql.substring(loopHeadMatcher.end(), loopTailMatcher.start());
-            if (containsSelectIntoThatCanRaiseNotFound(body)) {
+            if (loopHeadMatcher.group(5).stripLeading().startsWith("=")
+                    && containsSelectIntoThatCanRaiseNotFound(body)) {
                 searchCursor = loopHeadMatcher.end();
                 continue;
             }
@@ -9811,7 +9812,7 @@ class SqlScriptMigrator {
             String flag = unquoteIdentifier(handlerMatcher.group(1));
             Matcher loopHeadMatcher = Pattern.compile(
                     "(?is)\\bWHILE\\s+(" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*"
-                            + "(?:(?:<>|!=)\\s*(?:1|TRUE)|=\\s*(?:0|FALSE))\\s+DO\\b"
+                            + "=\\s*(?:0|FALSE)\\s+DO\\b"
             ).matcher(searchable);
             loopHeadMatcher.region(handlerMatcher.end(), searchable.length());
             while (loopHeadMatcher.find()) {
