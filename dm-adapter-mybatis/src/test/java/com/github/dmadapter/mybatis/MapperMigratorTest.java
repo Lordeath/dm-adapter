@@ -449,13 +449,43 @@ class MapperMigratorTest {
                         <trim prefix="(" suffix=")" suffixOverrides=",">
                             `id`,
                             `enterprise_id`,
+                            `organization_id`,
+                            `precinct_id`,
+                            `name`,
+                            `business_type`,
+                            `batch_number_prefix`,
+                            `process_channel`,
+                            `request_structure`,
+                            `process_def_status`,
+                            `description`,
+                            `delete_flag`,
+                            `create_user_id`,
+                            `create_user_name`,
+                            `create_date_time`,
+                            `update_user_id`,
+                            `update_user_name`,
                             `update_date_time`
                         </trim>
                         values
-                        <foreach collection="list" item="item" separator=",">
+                        <foreach collection="list" item="item" index="index" separator=",">
                             (
-                            #{item.id, jdbcType=BIGINT},
-                            #{item.enterpriseId, jdbcType=BIGINT},
+                            #{item.id, jdbcType=BIGINT} ,
+                            #{item.enterpriseId, jdbcType=BIGINT} ,
+                            #{item.organizationId, jdbcType=BIGINT} ,
+                            #{item.precinctId, jdbcType=BIGINT} ,
+                            #{item.name, jdbcType=VARCHAR} ,
+                            #{item.businessType, jdbcType=INTEGER} ,
+                            #{item.batchNumberPrefix, jdbcType=VARCHAR} ,
+                            #{item.processChannel, jdbcType=INTEGER} ,
+                            #{item.requestStructure, jdbcType=LONGVARCHAR} ,
+                            #{item.processDefStatus, jdbcType=INTEGER} ,
+                            #{item.description, jdbcType=VARCHAR} ,
+                            #{item.deleteFlag, jdbcType=INTEGER} ,
+                            #{item.createUserId, jdbcType=BIGINT} ,
+                            #{item.createUserName, jdbcType=VARCHAR} ,
+                            #{item.createDateTime, jdbcType=TIMESTAMP} ,
+                            #{item.updateUserId, jdbcType=BIGINT} ,
+                            #{item.updateUserName, jdbcType=VARCHAR} ,
                             #{item.updateDateTime, jdbcType=TIMESTAMP}
                             )
                         </foreach>
@@ -1780,10 +1810,61 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("inner join tmp_owner_precinct_result_20200322")
+                .contains("BEGIN")
+                .contains("from tmp_owner_precinct_result_20200322 t, owner_customer_base_info b")
+                .contains("update owner_customer_base_info b")
                 .contains("b.precinct_id = t.precinct_id")
-                .doesNotContain("BEGIN");
-        assertThat(result.automaticConversions()).isEmpty();
+                .doesNotContain("END;;");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void selfJoinMultiTargetUpdateUsesRowCountGuardedDamengBlock() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentMapper">
+                    <update id="updateByRefPaymentID">
+                        UPDATE ns_payment_chargepayment a
+                        INNER JOIN ns_payment_chargepayment b
+                            ON a.id = b.RefPaymentID AND b.IsDelete = 0
+                        SET a.canRefundPaid = a.canRefundPaid + abs(b.ChargePaid),
+                            a.IsCanceled = 0,
+                            b.IsDelete = 1
+                        WHERE a.id = #{id} AND a.IsCanceled = 1
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentMapper.xml"));
+        assertThat(rewritten)
+                .contains("BEGIN")
+                .contains("IF SQL%ROWCOUNT &gt; 0 THEN")
+                .contains("where b.RefPaymentID = #{id} and b.IsDelete = 0")
+                .contains("END;")
+                .doesNotContain("INNER JOIN");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
     }
 
     @Test
@@ -1830,12 +1911,15 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
-                .contains("join ns_quality_check_schedule_task_user u")
-                .contains("join ns_quality_day_task_transfer b")
+                .contains("BEGIN")
+                .contains("from ns_quality_check_schedule_task_user u, ns_quality_day_task_transfer b")
+                .contains("update ns_quality_check_schedule_task_user u")
                 .contains("<if test=\"importantFlag != null\">")
                 .contains("and a.searchStartDate between b.startDate and b.endDate")
-                .doesNotContain("BEGIN");
-        assertThat(result.automaticConversions()).isEmpty();
+                .contains("END;");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
     }
 
     @Test

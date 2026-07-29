@@ -4885,12 +4885,26 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             boolean changed = false;
             for (StatementSegment statement : statements) {
                 GenericConversion conversion = convertSingleMysqlUpdateJoin(statement.sql());
-                converted.append(conversion.convertedSql()).append(statement.separator());
+                converted.append(conversion.convertedSql());
+                if (!convertedAnonymousBlockAlreadyContainsSeparator(conversion, statement.separator())) {
+                    converted.append(statement.separator());
+                }
                 changed = changed || conversion.changed();
             }
             return changed ? new GenericConversion(converted.toString(), true) : GenericConversion.unchanged(sql);
         }
         return convertSingleMysqlUpdateJoin(sql);
+    }
+
+    private boolean convertedAnonymousBlockAlreadyContainsSeparator(
+            GenericConversion conversion,
+            String separator
+    ) {
+        if (!conversion.changed() || !";".equals(separator)) {
+            return false;
+        }
+        String converted = conversion.convertedSql().strip();
+        return startsKeyword(converted, 0, "BEGIN") && converted.endsWith(";");
     }
 
     private GenericConversion convertSingleMysqlUpdateJoin(String sql) {
@@ -4912,15 +4926,27 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (target.isBlank() || joinSource.isBlank()) {
             return GenericConversion.unchanged(sql);
         }
-        JoinSource splitJoin = splitJoinSource(joinSource);
-        if (splitJoin.sourceSql().isBlank() || !splitJoin.sourceSql().startsWith("(")) {
-            return GenericConversion.unchanged(sql);
-        }
         int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
         int statementEnd = stripTrailingSemicolon(sql);
         String setClause = sql.substring(setIndex + "SET".length(), whereIndex < 0 ? statementEnd : whereIndex).trim();
         String whereClause = whereIndex < 0 ? "" : sql.substring(whereIndex + "WHERE".length(), statementEnd).trim();
         if (setClause.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        GenericConversion multiTarget = convertMultiTargetMysqlUpdateJoin(
+                sql,
+                updateIndex,
+                target,
+                joinSource,
+                setClause,
+                whereClause,
+                statementEnd
+        );
+        if (multiTarget.changed()) {
+            return multiTarget;
+        }
+        JoinSource splitJoin = splitJoinSource(joinSource);
+        if (splitJoin.sourceSql().isBlank() || !splitJoin.sourceSql().startsWith("(")) {
             return GenericConversion.unchanged(sql);
         }
         if (updatesJoinedTableAlias(target, setClause)) {
@@ -5024,9 +5050,25 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (assignmentsByAlias.size() < 2) {
             return GenericConversion.unchanged(sql);
         }
+        if (hasCrossTargetAssignmentDependency(assignmentsByAlias)) {
+            return GenericConversion.unchanged(sql);
+        }
         List<Map.Entry<String, List<UpdateSetAssignment>>> orderedAssignments =
                 new ArrayList<>(assignmentsByAlias.entrySet());
         String predicates = String.join(" and ", updateJoinPredicates(chain.conditions(), whereClause));
+        long predicateUpdatingAliases = orderedAssignments.stream()
+                .filter(entry -> updatesPredicateColumn(entry.getKey(), entry.getValue(), predicates))
+                .count();
+        if (predicateUpdatingAliases > 1) {
+            return convertGuardedTwoTargetMysqlUpdateJoin(
+                    sql,
+                    updateIndex,
+                    statementEnd,
+                    chain,
+                    assignmentsByAlias,
+                    whereClause
+            );
+        }
         orderedAssignments.sort((left, right) -> Boolean.compare(
                 updatesPredicateColumn(left.getKey(), left.getValue(), predicates),
                 updatesPredicateColumn(right.getKey(), right.getValue(), predicates)
@@ -5060,6 +5102,271 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append("END;");
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertGuardedTwoTargetMysqlUpdateJoin(
+            String sql,
+            int updateIndex,
+            int statementEnd,
+            UpdateJoinChain chain,
+            Map<String, List<UpdateSetAssignment>> assignmentsByAlias,
+            String whereClause
+    ) {
+        if (chain.tables().size() != 2 || assignmentsByAlias.size() != 2 || chain.conditions().size() != 1) {
+            return GenericConversion.unchanged(sql);
+        }
+        UpdateJoinTable primary = chain.tables().get(0);
+        UpdateJoinTable secondary = chain.tables().get(1);
+        List<UpdateSetAssignment> primaryAssignments = assignmentsByAlias.get(primary.aliasKey());
+        List<UpdateSetAssignment> secondaryAssignments = assignmentsByAlias.get(secondary.aliasKey());
+        if (primaryAssignments == null || secondaryAssignments == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        for (UpdateSetAssignment assignment : secondaryAssignments) {
+            String rightSide = assignmentRightSide(assignment.text());
+            if (referencesAlias(rightSide, primary.aliasKey())) {
+                return GenericConversion.unchanged(sql);
+            }
+        }
+
+        List<String> wherePredicates = splitStrictTopLevelAndPredicates(whereClause);
+        List<String> joinPredicates = splitStrictTopLevelAndPredicates(chain.conditions().get(0));
+        if (wherePredicates.isEmpty() || joinPredicates.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+        BoundAliasValue primaryBinding = boundAliasValue(wherePredicates, primary.aliasKey());
+        if (primaryBinding == null || !isLikelyIdentityColumn(primaryBinding.columnKey())) {
+            return GenericConversion.unchanged(sql);
+        }
+        AliasJoinBinding joinBinding = aliasJoinBinding(
+                joinPredicates,
+                primary.aliasKey(),
+                primaryBinding.columnKey(),
+                secondary.aliasKey()
+        );
+        if (joinBinding == null) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<String> secondaryPredicates = new ArrayList<>();
+        secondaryPredicates.add(
+                joinBinding.secondaryExpression() + " = " + primaryBinding.boundValue()
+        );
+        List<String> allPredicates = new ArrayList<>();
+        allPredicates.addAll(joinPredicates);
+        allPredicates.addAll(wherePredicates);
+        for (String predicate : allPredicates) {
+            if (predicate.equals(joinBinding.originalPredicate())
+                    || predicate.equals(primaryBinding.originalPredicate())) {
+                continue;
+            }
+            boolean referencesPrimary = referencesAlias(predicate, primary.aliasKey());
+            boolean referencesSecondary = referencesAlias(predicate, secondary.aliasKey());
+            if (referencesPrimary && referencesSecondary) {
+                return GenericConversion.unchanged(sql);
+            }
+            if (referencesPrimary) {
+                continue;
+            }
+            if (referencesSecondary || (!referencesPrimary && !referencesSecondary)) {
+                secondaryPredicates.add(predicate);
+            }
+        }
+
+        String originalPredicates = String.join(
+                " and ",
+                updateJoinPredicates(chain.conditions(), whereClause)
+        );
+        StringBuilder converted = new StringBuilder(sql.length() + 96);
+        converted.append(sql, 0, updateIndex)
+                .append("BEGIN\n")
+                .append("update ")
+                .append(primary.tableSql())
+                .append(" set ")
+                .append(String.join(", ", primaryAssignments.stream().map(UpdateSetAssignment::text).toList()))
+                .append(" from ")
+                .append(secondary.tableSql())
+                .append(" where ")
+                .append(originalPredicates)
+                .append(";\n")
+                .append("IF SQL%ROWCOUNT > 0 THEN\n")
+                .append("update ")
+                .append(secondary.tableSql())
+                .append(" set ")
+                .append(String.join(", ", secondaryAssignments.stream().map(UpdateSetAssignment::text).toList()))
+                .append(" where ")
+                .append(String.join(" and ", secondaryPredicates))
+                .append(";\n")
+                .append("END IF;\n")
+                .append("END;")
+                .append(trailingWhitespace(sql));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private String trailingWhitespace(String sql) {
+        int start = sql.length();
+        while (start > 0 && Character.isWhitespace(sql.charAt(start - 1))) {
+            start--;
+        }
+        return sql.substring(start);
+    }
+
+    private String assignmentRightSide(String assignment) {
+        int equals = assignment == null ? -1 : assignment.indexOf('=');
+        return equals < 0 ? "" : assignment.substring(equals + 1);
+    }
+
+    private boolean hasCrossTargetAssignmentDependency(
+            Map<String, List<UpdateSetAssignment>> assignmentsByAlias
+    ) {
+        Pattern qualifiedColumn = Pattern.compile(
+                "(?is)(" + DM_IDENTIFIER + ")\\s*\\.\\s*(" + DM_IDENTIFIER + ")"
+        );
+        for (Map.Entry<String, List<UpdateSetAssignment>> entry : assignmentsByAlias.entrySet()) {
+            for (UpdateSetAssignment assignment : entry.getValue()) {
+                Matcher reference = qualifiedColumn.matcher(assignmentRightSide(assignment.text()));
+                while (reference.find()) {
+                    String referencedAlias = normalizeIdentifierKey(reference.group(1));
+                    if (referencedAlias.equals(entry.getKey())) {
+                        continue;
+                    }
+                    List<UpdateSetAssignment> referencedAssignments = assignmentsByAlias.get(referencedAlias);
+                    if (referencedAssignments == null) {
+                        continue;
+                    }
+                    String referencedColumn = normalizeIdentifierKey(reference.group(2));
+                    if (referencedAssignments.stream()
+                            .anyMatch(candidate -> candidate.columnKey().equals(referencedColumn))) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private List<String> splitStrictTopLevelAndPredicates(String value) {
+        if (value == null || value.isBlank()
+                || findTopLevelKeyword(value, "OR", 0) >= 0
+                || findTopLevelKeyword(value, "BETWEEN", 0) >= 0) {
+            return List.of();
+        }
+        List<String> predicates = new ArrayList<>();
+        String remaining = value.strip();
+        while (!remaining.isBlank()) {
+            int andIndex = findTopLevelKeyword(remaining, "AND", 0);
+            String predicate = andIndex < 0 ? remaining : remaining.substring(0, andIndex);
+            if (predicate.isBlank()) {
+                return List.of();
+            }
+            predicates.add(predicate.strip());
+            if (andIndex < 0) {
+                break;
+            }
+            remaining = remaining.substring(andIndex + "AND".length()).strip();
+        }
+        return predicates;
+    }
+
+    private BoundAliasValue boundAliasValue(List<String> predicates, String aliasKey) {
+        String identifier = DM_IDENTIFIER;
+        String placeholder = "(?:#\\{[^}]+}|\\?)";
+        Pattern columnFirst = Pattern.compile(
+                "(?is)^\\s*(" + identifier + ")\\s*\\.\\s*(" + identifier + ")\\s*=\\s*("
+                        + placeholder + ")\\s*$"
+        );
+        Pattern valueFirst = Pattern.compile(
+                "(?is)^\\s*(" + placeholder + ")\\s*=\\s*(" + identifier + ")\\s*\\.\\s*("
+                        + identifier + ")\\s*$"
+        );
+        BoundAliasValue found = null;
+        for (String predicate : predicates) {
+            Matcher columnMatcher = columnFirst.matcher(predicate);
+            String alias;
+            String column;
+            String value;
+            if (columnMatcher.matches()) {
+                alias = columnMatcher.group(1);
+                column = columnMatcher.group(2);
+                value = columnMatcher.group(3);
+            } else {
+                Matcher valueMatcher = valueFirst.matcher(predicate);
+                if (!valueMatcher.matches()) {
+                    continue;
+                }
+                value = valueMatcher.group(1);
+                alias = valueMatcher.group(2);
+                column = valueMatcher.group(3);
+            }
+            if (!normalizeIdentifierKey(alias).equals(aliasKey)) {
+                continue;
+            }
+            BoundAliasValue candidate = new BoundAliasValue(
+                    normalizeIdentifierKey(column),
+                    value.strip(),
+                    predicate
+            );
+            if (found != null && !found.equals(candidate)) {
+                return null;
+            }
+            found = candidate;
+        }
+        return found;
+    }
+
+    private AliasJoinBinding aliasJoinBinding(
+            List<String> predicates,
+            String primaryAlias,
+            String primaryColumn,
+            String secondaryAlias
+    ) {
+        String identifier = DM_IDENTIFIER;
+        Pattern equality = Pattern.compile(
+                "(?is)^\\s*(" + identifier + ")\\s*\\.\\s*(" + identifier + ")\\s*=\\s*("
+                        + identifier + ")\\s*\\.\\s*(" + identifier + ")\\s*$"
+        );
+        AliasJoinBinding found = null;
+        for (String predicate : predicates) {
+            Matcher matcher = equality.matcher(predicate);
+            if (!matcher.matches()) {
+                continue;
+            }
+            String leftAlias = normalizeIdentifierKey(matcher.group(1));
+            String leftColumn = normalizeIdentifierKey(matcher.group(2));
+            String rightAlias = normalizeIdentifierKey(matcher.group(3));
+            String rightColumn = normalizeIdentifierKey(matcher.group(4));
+            String secondaryExpression;
+            if (leftAlias.equals(primaryAlias)
+                    && leftColumn.equals(primaryColumn)
+                    && rightAlias.equals(secondaryAlias)) {
+                secondaryExpression = matcher.group(3) + "." + matcher.group(4);
+            } else if (rightAlias.equals(primaryAlias)
+                    && rightColumn.equals(primaryColumn)
+                    && leftAlias.equals(secondaryAlias)) {
+                secondaryExpression = matcher.group(1) + "." + matcher.group(2);
+            } else {
+                continue;
+            }
+            AliasJoinBinding candidate = new AliasJoinBinding(secondaryExpression, predicate);
+            if (found != null && !found.equals(candidate)) {
+                return null;
+            }
+            found = candidate;
+        }
+        return found;
+    }
+
+    private boolean referencesAlias(String value, String aliasKey) {
+        if (value == null || value.isBlank() || aliasKey == null || aliasKey.isBlank()) {
+            return false;
+        }
+        return Pattern.compile(
+                "(?i)(?<![A-Za-z0-9_$])" + Pattern.quote(aliasKey) + "\\s*\\."
+        ).matcher(value).find();
+    }
+
+    private boolean isLikelyIdentityColumn(String columnKey) {
+        return "ID".equals(columnKey) || columnKey.endsWith("_ID");
     }
 
     private UpdateJoinChain updateJoinChain(String target, String joinSource) {
@@ -8348,6 +8655,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record UpdateSetAssignment(String aliasKey, String columnKey, String text) {
+    }
+
+    private record BoundAliasValue(String columnKey, String boundValue, String originalPredicate) {
+    }
+
+    private record AliasJoinBinding(String secondaryExpression, String originalPredicate) {
     }
 
     private record AssignmentParts(String columnKey, boolean simpleLiteralValue) {

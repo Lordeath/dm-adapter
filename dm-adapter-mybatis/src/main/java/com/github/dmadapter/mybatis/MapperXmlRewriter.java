@@ -985,7 +985,7 @@ public class MapperXmlRewriter {
             if (generatedKeyBatch.changed()) {
                 appliedRules.add(MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE);
                 appliedRules.add(MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE);
-                converted = generatedKeyBatch.text();
+                converted = collapseAdjacentDuplicateStandalonePlaceholders(generatedKeyBatch.text());
                 generatedKeyBatchChanged = true;
             }
         }
@@ -3827,6 +3827,7 @@ public class MapperXmlRewriter {
         List<String> values = splitTopLevelComma(tupleBody).stream()
                 .map(String::trim)
                 .filter(value -> !value.isBlank())
+                .map(this::collapseDuplicateStandalonePlaceholderValue)
                 .toList();
         if (foreach == null || columns.isEmpty() || values.size() != columns.size()) {
             return null;
@@ -5359,6 +5360,20 @@ public class MapperXmlRewriter {
                 + "</if>"
                 + matcher.group("trailing");
         return new TextRewrite(converted, !converted.equals(body));
+    }
+
+    private String collapseDuplicateStandalonePlaceholderValue(String value) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*(?<placeholder>[#$]\\{[^}]+})\\s+\\k<placeholder>\\s*$"
+        ).matcher(value);
+        return matcher.matches() ? matcher.group("placeholder") : value;
+    }
+
+    private String collapseAdjacentDuplicateStandalonePlaceholders(String value) {
+        return Pattern.compile(
+                "(?is)(?<placeholder>[#$]\\{[^}]+})(?<space>[ \\t]*(?:\\r\\n|\\r|\\n)[ \\t]*)"
+                        + "\\k<placeholder>"
+        ).matcher(value).replaceAll("${placeholder}${space}");
     }
 
     private TextRewrite wrapIdentityInsert(String sql, String tableName) {
