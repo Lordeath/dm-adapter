@@ -148,6 +148,9 @@ class SqlScriptMigrator {
             "原始 SQL 语法缺陷：INSERT ... VALUES 的最后一个值元组后面仍然是逗号，后续直接进入 END/END IF；"
                     + "这不是达梦语法转换问题。建议修原始脚本：把最后一个 values 元组后的逗号改成分号，"
                     + "或补齐缺失的 values 元组。";
+    static final String ORIGINAL_SQL_UNBALANCED_IF_REASON =
+            "原始 SQL 语法缺陷：存储过程中的 IF ... THEN 与 END IF 数量不匹配（IF=%d，END IF=%d）；"
+                    + "这不是达梦语法转换问题。请先在原始脚本中补齐或删除对应的 END IF。";
 
     private static final String SUSPICIOUS_LENGTH_MODIFY_REASON =
             "可疑字段长度修改：当前 SQL 把字段改为 varchar(%s)，但前置判断没有使用“字符类型且长度小于 %s”的安全加长条件；"
@@ -9990,10 +9993,75 @@ class SqlScriptMigrator {
         if (!cursorHandlerConflictReason.isBlank()) {
             return cursorHandlerConflictReason;
         }
+        String unbalancedIfReason = mysqlProcedureUnbalancedIfReason(sql);
+        if (!unbalancedIfReason.isBlank()) {
+            return unbalancedIfReason;
+        }
         if (hasDanglingInsertValuesCommaBeforeBlockEnd(sql)) {
             return ORIGINAL_SQL_DANGLING_INSERT_VALUES_REASON;
         }
         return "";
+    }
+
+    private String mysqlProcedureUnbalancedIfReason(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return "";
+        }
+        String searchable = replaceIgnoredSqlWithSpaces(sql == null ? "" : sql);
+        int ifCount = 0;
+        int endIfCount = 0;
+        int index = 0;
+        while (index < searchable.length()) {
+            if (startsKeyword(searchable, index, "END")) {
+                int ifIndex = skipWhitespace(searchable, index + "END".length());
+                if (startsKeyword(searchable, ifIndex, "IF")) {
+                    endIfCount++;
+                    index = ifIndex + "IF".length();
+                    continue;
+                }
+            }
+            if (startsKeyword(searchable, index, "IF")
+                    && isMysqlProcedureIfStart(searchable, index)) {
+                ifCount++;
+                index += "IF".length();
+            } else {
+                index++;
+            }
+        }
+        if (ifCount == endIfCount) {
+            return "";
+        }
+        return ORIGINAL_SQL_UNBALANCED_IF_REASON.formatted(ifCount, endIfCount);
+    }
+
+    private boolean isMysqlProcedureIfStart(String sql, int ifIndex) {
+        if (previousWordIsKeyword(sql, ifIndex, "END")) {
+            return false;
+        }
+        int cursor = skipWhitespace(sql, ifIndex + "IF".length());
+        if (cursor >= sql.length()) {
+            return false;
+        }
+        if (sql.charAt(cursor) == '(') {
+            int closeParen = findMatchingParen(sql, cursor);
+            return closeParen > cursor
+                    && startsKeyword(sql, skipWhitespace(sql, closeParen + 1), "THEN");
+        }
+        int depth = 0;
+        while (cursor < sql.length()) {
+            char current = sql.charAt(cursor);
+            if (current == '(') {
+                depth++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+            } else if (depth == 0 && current == ';') {
+                return false;
+            } else if (depth == 0 && startsKeyword(sql, cursor, "THEN")) {
+                return true;
+            }
+            cursor++;
+        }
+        return false;
     }
 
     private String mysqlCursorHandlerSelectIntoConflictReason(String sql) {

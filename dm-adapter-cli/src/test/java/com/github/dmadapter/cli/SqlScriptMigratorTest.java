@@ -722,6 +722,58 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void reportsOriginalProcedureWithMissingEndIfAndSkipsDependentCall() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        RecordingValidator validator = new RecordingValidator();
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE create_budget_view()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.views
+                        WHERE table_schema = database()
+                          AND table_name = 'ns_budget_view'
+                    ) THEN
+                        CREATE VIEW ns_budget_view AS
+                        SELECT IF(state = 1, '启用', '停用') AS state_name
+                        FROM ns_budget;
+                END$$
+                DELIMITER ;
+                CALL create_budget_view();
+                """);
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-budget",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(2);
+        assertThat(report.manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::reason)
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("原始 SQL 语法缺陷")
+                        .contains("IF ... THEN 与 END IF 数量不匹配")
+                        .contains("IF=1，END IF=0"))
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("依赖需要人工确认的存储过程 `create_budget_view`"));
+        assertThat(validator.files)
+                .singleElement()
+                .satisfies(file -> assertThat(file.manualReviewStatementIndexes())
+                        .containsExactlyInAnyOrder(1, 2));
+        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("procedure.sql")))
+                .contains("CREATE PROCEDURE create_budget_view()")
+                .contains("SELECT IF(state = 1, '启用', '停用')")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE create_budget_view()");
+    }
+
+    @Test
     void clearsManualProcedureDependencyAfterSuccessfulRecreation() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
