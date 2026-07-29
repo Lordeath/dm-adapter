@@ -91,6 +91,7 @@
    - 参数无法推断：补 `sql-rewrite.yml` 入参回放；无法自动化时标记人工配置。
    - 外部存储过程依赖：联网验证以过程编译结果和 `ALL_OBJECTS.STATUS` 为准；离线报告中的汇总警告不等同于失败。
    - `VALIDATION_TIMEOUT`：属于验证运行环境/执行时限问题，不是 SQL 兼容失败。SQL 脚本单条语句达到 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS` 后，工具必须主动取消并停止本轮脚本验证；不能只依赖可能被驱动忽略的 JDBC `setQueryTimeout`，也不能继续复用仍有语句运行的连接。
+   - SQL 脚本单条语句默认硬超时为 300 秒。该值需要覆盖已观测到约 187 秒的合法数据初始化过程；项目确有更长过程时应显式配置 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS`，不能把合法慢过程误分为 SQL 兼容失败。
 4. 每次 dm-adapter 代码变更后执行 `mvn test`，通过后提交并推送 `main`。
 5. 同步 Windows 镜像，执行 Windows Maven 构建，再用 Windows CLI 对业务项目回归验证。
 

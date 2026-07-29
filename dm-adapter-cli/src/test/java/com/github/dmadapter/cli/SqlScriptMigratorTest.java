@@ -2395,7 +2395,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void marksMysqlPrefixIndexAsManualReviewAndSkipsDependentCallValidation() throws Exception {
+    void convertsMysqlPrefixIndexToDamengFunctionIndex() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("procedure.sql"), """
@@ -2427,16 +2427,16 @@ class SqlScriptMigratorTest {
         ));
 
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
-        assertThat(report.manualReviewSqlCount()).isEqualTo(2);
-        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(report.manualReviewItems()).isEmpty();
+        assertThat(report.validationSuccessCount()).isEqualTo(2);
         assertThat(report.validationFailureCount()).isZero();
         assertThat(converted)
-                .contains("ADD INDEX idx_item_code (dictionary_id, item_code(254))")
-                .doesNotContain("CREATE OR REPLACE PROCEDURE");
-        assertThat(report.manualReviewItems())
-                .extracting(item -> item.reason())
-                .anySatisfy(reason -> assertThat(reason).contains("MySQL 前缀索引"))
-                .anySatisfy(reason -> assertThat(reason).contains("依赖需要人工确认的存储过程"));
+                .contains("CREATE OR REPLACE PROCEDURE add_prefix_index() AS")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX sample_dictionaryitem_idx_item_code"
+                        + " ON sample_dictionaryitem (dictionary_id,"
+                        + " CAST(SUBSTR(item_code, 1, 254) AS VARCHAR(254)))'")
+                .doesNotContain("ADD INDEX")
+                .doesNotContain("item_code(254)");
     }
 
     @Test
@@ -2478,7 +2478,7 @@ class SqlScriptMigratorTest {
         ));
 
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
-        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.manualReviewItems()).isEmpty();
         assertThat(converted)
                 .contains("CREATE OR REPLACE PROCEDURE add_prefix_index() AS")
                 .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
@@ -2488,7 +2488,9 @@ class SqlScriptMigratorTest {
                 .contains("ALL_TAB_COLUMNS")
                 .contains("UPPER(DATA_TYPE) IN ('CHAR', 'VARCHAR')")
                 .contains("IF dm_adapter_exists = 0 AND dm_adapter_exists_2 > 0 THEN")
-                .contains("EXECUTE IMMEDIATE 'CREATE INDEX sample_dictionaryitem_idx_item_code ON sample_dictionaryitem (dictionary_id, item_code)'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX sample_dictionaryitem_idx_item_code"
+                        + " ON sample_dictionaryitem (dictionary_id,"
+                        + " CAST(SUBSTR(item_code, 1, 254) AS VARCHAR(254)))'")
                 .doesNotContain("information_schema")
                 .doesNotContain("item_code(254)");
     }
@@ -3160,8 +3162,10 @@ class SqlScriptMigratorTest {
                 .contains("IF dm_adapter_exists = 0 THEN")
                 .contains("IF dm_adapter_exists_5 > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'alter table demo add code varchar(128) null'")
-                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_code ON demo (code)'")
-                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title ON demo (title)'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_code"
+                        + " ON demo (CAST(SUBSTR(code, 1, 32) AS VARCHAR(32)))'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title"
+                        + " ON demo (CAST(SUBSTR(title, 1, 20) AS VARCHAR(20)))'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_amount ON demo (amount)'")
                 .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code varchar(256)'")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")

@@ -29,7 +29,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 class SqlScriptValidator implements SqlScriptMigrator.Validator {
-    private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 180;
+    private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 300;
     private static final long DEFAULT_SLOW_OPERATION_LOG_MILLIS = 5_000L;
     private static final long SLOW_OPERATION_REPEAT_MILLIS = 30_000L;
     private static final int CONNECTION_CLOSE_TIMEOUT_SECONDS = 5;
