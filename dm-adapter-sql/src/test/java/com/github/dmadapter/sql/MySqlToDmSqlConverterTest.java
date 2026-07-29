@@ -1612,6 +1612,40 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlHelpTopicStringSplitToCorrelatedCrossApply() {
+        SqlConversionResult result = converter.convert("""
+                select distinct ss.companyId
+                from (
+                    select s.companyId,
+                           substring_index(
+                               substring_index(s.serviceCategoryIds, ',', b.help_topic_id + 1),
+                               ',',
+                               -1
+                           ) as serviceCategoryId
+                    from ns_city_store s
+                    join mysql.help_topic b
+                      on b.help_topic_id < (
+                          length(s.serviceCategoryIds)
+                          - length(replace(s.serviceCategoryIds, ',', ''))
+                          + 1
+                      )
+                ) ss
+                where ss.serviceCategoryId = '1'
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("REGEXP_SUBSTR(s.serviceCategoryIds, '[^,]+', 1, b.help_topic_id + 1)")
+                .contains("CROSS APPLY (SELECT LEVEL - 1 AS help_topic_id FROM dual CONNECT BY LEVEL <= "
+                        + "LENGTH(s.serviceCategoryIds) - LENGTH(REPLACE(s.serviceCategoryIds, ',', '')) + 1) b")
+                .doesNotContainIgnoringCase("mysql.help_topic")
+                .doesNotContainIgnoringCase("substring_index");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_HELP_TOPIC_SPLIT_TO_CROSS_APPLY_RULE);
+    }
+
+    @Test
     void convertsDistinctGroupConcatWithMultipleTopLevelExpressions() {
         SqlConversionResult result = converter.convert("select GROUP_CONCAT(DISTINCT first_name, last_name) from user");
 

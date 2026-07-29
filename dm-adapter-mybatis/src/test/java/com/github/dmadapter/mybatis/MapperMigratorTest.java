@@ -3808,6 +3808,68 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicMysqlHelpTopicStringSplitBecomesDamengCrossApply() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CityCompanyMapper">
+                    <select id="getCompanyIdsByServiceCategoryIds">
+                        select distinct ss.companyId
+                        from (
+                            select s.companyId,
+                                   substring_index(
+                                       substring_index(s.serviceCategoryIds, ',', b.help_topic_id + 1),
+                                       ',',
+                                       -1
+                                   ) as serviceCategoryId
+                            from ns_city_store s
+                            join mysql.help_topic b
+                              on b.help_topic_id &lt; (
+                                  length(s.serviceCategoryIds)
+                                  - length(replace(s.serviceCategoryIds, ',', ''))
+                                  + 1
+                              )
+                        ) ss
+                        where ss.serviceCategoryId in
+                        <foreach collection="categoryIdList" item="item" separator="," open="(" close=")">
+                            #{item}
+                        </foreach>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CityCompanyMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CityCompanyMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "src/main/resources/mapper-dm/CityCompanyMapper.xml"
+        ));
+        assertThat(rewritten)
+                .contains("REGEXP_SUBSTR(s.serviceCategoryIds, '[^,]+', 1, b.help_topic_id + 1)")
+                .contains("CROSS APPLY (SELECT LEVEL - 1 AS help_topic_id FROM dual CONNECT BY LEVEL &lt;= "
+                        + "LENGTH(s.serviceCategoryIds) - LENGTH(REPLACE(s.serviceCategoryIds, ',', '')) + 1) b")
+                .doesNotContainIgnoringCase("mysql.help_topic")
+                .doesNotContainIgnoringCase("substring_index");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_HELP_TOPIC_SPLIT_TO_CROSS_APPLY_RULE);
+    }
+
+    @Test
     void dynamicUngroupedHavingAliasBecomesWhereExpression() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
