@@ -71,8 +71,10 @@
 - 原始 mapper XML 不由 dm-adapter 迁移流程覆盖；自动迁移输出保持在 `src/main/resources/mapper-dm`。
 - 原始 SQL 明显错误时，可以修原始业务 SQL。例如列名写错、insert 列和值数量不一致、`set` 末尾多逗号。若问题来自 Java mapper 方法签名，如多个参数复用同一个 `@Param` 名称，或多个简单参数缺少必要 `@Param`，应修 Java mapper 方法签名，不应为了绕过绑定错误去改 XML 参数名。
 - Java 注解里的 SQL 如果包含复杂动态 SQL、MySQL 专有语法或需要达梦改写，应优先迁移到 mapper XML，再由 dm-adapter 生成 `mapper-dm`；自动迁移也应把可识别的 `@Select`、`@Insert`、`@Update`、`@Delete` SQL 提取到 `mapper-dm` XML 后再执行达梦改写和验证。
+- mapper XML 可能带 UTF-8 BOM。解析器必须按字节流交给 XML 解析器识别 BOM；不能把 BOM 作为正文字符传入 `Reader`，否则整份文件会退化为“无法安全解析”，后续动态 SQL 结构转换将被跳过。
 - 参数推测失败时，先增强 dm-adapter 的参数推测或 `sql-rewrite.yml` 回放能力；如果参数本身是业务枚举、动态表名、动态列名或 SQL 片段，必须写入配置或标记为人工确认。
 - 参数类型不匹配不能按 mapper 方法加入忽略名单。应利用表字段类型和长度元数据修正自动测试参数，日期时间列不能沿用普通字符串，单字符状态列不能沿用月份等超长占位值；`validationArgs` 中与实际列类型或长度明显不兼容的旧生成值也应在运行时纠正。真正的业务枚举或无法推断的入参仍需提供正确示例，不能靠 `typeMismatchMethods` 制造全绿。
+- 动态 INSERT 的列和值按逗号配对时，`#{property, jdbcType=...}`、`${...}` 占位符内部的逗号不属于 SQL 列表分隔符；若不跳过，会让后半段字段与参数错位，并生成错误的类型和长度元数据。
 - `${}` 动态 SQL 需要区分三类值：
   - 动态标识符，如表名、列名、schema，需要白名单配置，验证参数不能来自任意字符串。
   - SQL 片段，如排序、条件、函数表达式，只能通过 `sql-rewrite.yml` 或安全枚举回放，不能自动拼接用户输入。

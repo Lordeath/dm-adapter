@@ -551,6 +551,12 @@ class DmAdapterCliTest {
                 .contains("REWRITE_CONFIG_PATH")
                 .contains("validationArgs")
                 .contains("configuredValueIncompatibleWithColumn")
+                .contains("int placeholderDepth = 0")
+                .contains("text.charAt(i + 1) == '{'")
+                .contains("if (configuredValueIncompatibleWithColumn(\n"
+                        + "                            field.getName(),\n"
+                        + "                            configured,\n"
+                        + "                            statement")
                 .contains("data_length as column_length")
                 .contains("defaultColumnLength")
                 .contains("primaryDmlTable")
