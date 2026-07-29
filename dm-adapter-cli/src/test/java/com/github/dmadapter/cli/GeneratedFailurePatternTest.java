@@ -522,6 +522,26 @@ class GeneratedFailurePatternTest {
             Field isMonthClosing = paymentClass.getDeclaredField("isMonthClosing");
             assertThat(String.valueOf(isMonthClosing.get(payment))).hasSizeLessThanOrEqualTo(2);
 
+            Method convertConfiguredValue = validationClass.getDeclaredMethod(
+                    "convertConfiguredValue",
+                    Object.class,
+                    Class.class,
+                    java.lang.reflect.Type.class,
+                    statement.getClass(),
+                    String.class
+            );
+            convertConfiguredValue.setAccessible(true);
+            Object nullPojoResult = convertConfiguredValue.invoke(
+                    validation,
+                    null,
+                    paymentClass,
+                    paymentClass,
+                    statement,
+                    ""
+            );
+            Object generatedPayment = valueField.get(nullPojoResult);
+            assertThat(generatedPayment).isInstanceOf(paymentClass);
+
             Path bomMapper = tempDir.resolve("bom-mapper.xml");
             Files.writeString(
                     bomMapper,
