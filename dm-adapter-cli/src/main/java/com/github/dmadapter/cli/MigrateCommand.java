@@ -752,16 +752,27 @@ public class MigrateCommand implements Callable<Integer> {
                                 TimeUnit.SECONDS,
                                 "Dameng target capability lookup"
                         ),
-                        DEFAULT_METADATA_READ_ATTEMPTS,
+                        targetCapabilityReadAttempts(targetLengthSemantics),
                         DEFAULT_METADATA_RETRY_DELAY_MILLIS
                 );
             } catch (Exception e) {
-                throw new DmAdapterException(
-                        "Dameng target capability preflight failed before SQL execution. "
-                                + "Verify the validation connection and V$DM_INI read permission. "
-                                + "Cause: " + redactedMetadataFailure(e, environment),
-                        e
+                if (targetLengthSemantics == null) {
+                    throw new DmAdapterException(
+                            "Dameng target capability preflight failed before SQL execution. "
+                                    + "Verify the validation connection and V$DM_INI read permission, "
+                                    + "or explicitly pass --target-length-semantics. "
+                                    + "Cause: " + redactedMetadataFailure(e, environment),
+                            e
+                    );
+                }
+                CliLogger.info(
+                        "Dameng target capability lookup failed; continuing with explicit "
+                                + "--target-length-semantics="
+                                + targetLengthSemantics
+                                + ". Other target capabilities remain unknown. Cause: "
+                                + redactedMetadataFailure(e, environment)
                 );
+                detected = DamengTargetCapabilities.offline(targetLengthSemantics);
             }
         }
         if (detected.lengthSemantics() != null
@@ -780,6 +791,10 @@ public class MigrateCommand implements Callable<Integer> {
             return DamengTargetCapabilities.offline(targetLengthSemantics);
         }
         return detected;
+    }
+
+    static int targetCapabilityReadAttempts(TargetLengthSemantics explicitLengthSemantics) {
+        return explicitLengthSemantics == null ? DEFAULT_METADATA_READ_ATTEMPTS : 1;
     }
 
     static <T> T runWithMetadataRetries(

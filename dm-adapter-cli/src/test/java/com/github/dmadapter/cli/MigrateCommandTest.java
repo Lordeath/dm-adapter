@@ -1,6 +1,7 @@
 package com.github.dmadapter.cli;
 
 import com.github.dmadapter.core.SqlScriptValidationFailure;
+import com.github.dmadapter.core.TargetLengthSemantics;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -11,6 +12,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MigrateCommandTest {
+    @Test
+    void explicitLengthSemanticsLimitsCapabilityLookupToOneAttempt() {
+        assertThat(MigrateCommand.targetCapabilityReadAttempts(TargetLengthSemantics.BYTE)).isEqualTo(1);
+        assertThat(MigrateCommand.targetCapabilityReadAttempts(TargetLengthSemantics.CHAR)).isEqualTo(1);
+        assertThat(MigrateCommand.targetCapabilityReadAttempts(null)).isEqualTo(5);
+    }
+
     @Test
     void runWithMetadataTimeoutInterruptsSlowMetadataLookup() {
         assertThatThrownBy(() -> MigrateCommand.runWithMetadataTimeout(
