@@ -2515,14 +2515,14 @@ class DmSqlValidationTestGenerator {
                         return null;
                     }
                     Matcher leftLiteral = Pattern.compile(
-                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*'([^']+)'\\\\s*==\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)",
+                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*'([^']*)'\\\\s*==\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)",
                             Pattern.CASE_INSENSITIVE
                     ).matcher(test);
                     if (leftLiteral.find()) {
                         return new BranchCondition(leftLiteral.group(2), leftLiteral.group(1), leftLiteral.group(1));
                     }
                     Matcher rightLiteral = Pattern.compile(
-                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*==\\\\s*'([^']+)'",
+                            "(?:^|\\\\b(?:and|or)\\\\b)\\\\s*([A-Za-z_][A-Za-z0-9_.$]*)\\\\s*==\\\\s*'([^']*)'",
                             Pattern.CASE_INSENSITIVE
                     ).matcher(test);
                     if (rightLiteral.find()) {
@@ -5455,9 +5455,14 @@ class DmSqlValidationTestGenerator {
                         Object existingDefault,
                         MapperStatement statement
                 ) {
-                    if (statement == null
-                            || existingDefault == null
-                            || (!statement.setDefaultValue(valueName) && !statement.hasSetDefaultUnder(valueName))) {
+                    if (statement == null || existingDefault == null) {
+                        return false;
+                    }
+                    if (statement.hasDefaultValue(valueName)
+                            && statement.defaultValue(valueName) != null) {
+                        return true;
+                    }
+                    if (!statement.setDefaultValue(valueName) && !statement.hasSetDefaultUnder(valueName)) {
                         return false;
                     }
                     if (existingDefault instanceof Map) {
