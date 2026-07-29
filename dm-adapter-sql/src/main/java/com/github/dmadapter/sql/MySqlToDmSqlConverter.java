@@ -759,6 +759,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(DamengReservedColumnRenamer.RULE_NAME);
         }
 
+        GenericConversion targetOnlyOuterJoinConversion = convertMysqlTargetOnlyOuterJoin(converted);
+        if (targetOnlyOuterJoinConversion.changed()) {
+            converted = targetOnlyOuterJoinConversion.convertedSql();
+            rules.add(MYSQL_UPDATE_JOIN_RULE);
+        }
+
         GenericConversion keywordQuoteConversion = quoteDamengKeywordIdentifiers(converted);
         if (keywordQuoteConversion.changed()) {
             converted = keywordQuoteConversion.convertedSql();
@@ -5756,6 +5762,168 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertMysqlTargetOnlyOuterJoin(String sql) {
+        List<StatementSegment> statements = splitTopLevelStatements(sql);
+        if (statements.size() > 1) {
+            StringBuilder converted = new StringBuilder(sql.length());
+            boolean changed = false;
+            for (StatementSegment statement : statements) {
+                GenericConversion conversion = convertSingleTargetOnlyOuterJoin(statement.sql());
+                converted.append(conversion.convertedSql()).append(statement.separator());
+                changed = changed || conversion.changed();
+            }
+            return changed ? new GenericConversion(converted.toString(), true) : GenericConversion.unchanged(sql);
+        }
+        return convertSingleTargetOnlyOuterJoin(sql);
+    }
+
+    private GenericConversion convertSingleTargetOnlyOuterJoin(String sql) {
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int joinIndex = findTopLevelKeyword(sql, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int setIndex = findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length());
+        if (setIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int joinTypeStart = joinTypeStart(sql, joinIndex);
+        String target = sql.substring(updateIndex + "UPDATE".length(), joinTypeStart).trim();
+        String joinSource = sql.substring(joinIndex + "JOIN".length(), setIndex).trim();
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
+        int statementEnd = stripTrailingSemicolon(sql);
+        String setClause = sql.substring(setIndex + "SET".length(), whereIndex < 0 ? statementEnd : whereIndex).trim();
+        String whereClause = whereIndex < 0 ? "" : sql.substring(whereIndex + "WHERE".length(), statementEnd).trim();
+        if (target.isBlank() || joinSource.isBlank() || setClause.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        return convertTargetOnlyOuterJoinToMerge(
+                sql,
+                updateIndex,
+                target,
+                joinSource,
+                setClause,
+                whereClause,
+                setIndex,
+                statementEnd
+        );
+    }
+
+    private GenericConversion convertTargetOnlyOuterJoinToMerge(
+            String sql,
+            int updateIndex,
+            String target,
+            String joinSource,
+            String setClause,
+            String whereClause,
+            int setIndex,
+            int statementEnd
+    ) {
+        String updateJoinClause = sql.substring(updateIndex, setIndex);
+        if (!containsTopLevelOuterOrCrossJoin(updateJoinClause)) {
+            return GenericConversion.unchanged(sql);
+        }
+        UpdateJoinChain chain = updateJoinChain(target, joinSource, true);
+        if (chain == null || chain.tables().size() < 2) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String assignmentAlias = null;
+        String assignmentAliasSql = null;
+        for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
+            Matcher matcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
+            if (!matcher.find()) {
+                return GenericConversion.unchanged(sql);
+            }
+            String alias = normalizeIdentifierKey(matcher.group("alias"));
+            if (assignmentAlias != null && !assignmentAlias.equals(alias)) {
+                return GenericConversion.unchanged(sql);
+            }
+            assignmentAlias = alias;
+            assignmentAliasSql = matcher.group("alias");
+        }
+        UpdateJoinTable updateTable = tableByAlias(chain.tables(), assignmentAlias);
+        if (updateTable == null || updateTable.tableSql().startsWith("(") || assignmentAliasSql == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
+            String rightSide = assignmentRightSide(assignment.text());
+            for (UpdateJoinTable table : chain.tables()) {
+                if (!table.aliasKey().equals(assignmentAlias)
+                        && referencesAliasOutsideIgnoredText(rightSide, table.aliasKey())) {
+                    return GenericConversion.unchanged(sql);
+                }
+            }
+        }
+
+        String originalJoinSql = sql.substring(
+                updateIndex + "UPDATE".length(),
+                setIndex
+        ).strip();
+        String sourceAlias = "dm_update_source";
+        String rowIdAlias = "dm_target_rowid";
+        StringBuilder converted = new StringBuilder(sql.length() + 160);
+        converted.append(sql, 0, updateIndex)
+                .append("MERGE INTO ")
+                .append(updateTable.tableSql())
+                .append(" USING (SELECT DISTINCT ")
+                .append(assignmentAliasSql)
+                .append(".ROWID AS ")
+                .append(rowIdAlias)
+                .append(" FROM ")
+                .append(originalJoinSql);
+        if (!whereClause.isBlank()) {
+            converted.append(" WHERE ").append(whereClause);
+        }
+        converted.append(") ")
+                .append(sourceAlias)
+                .append(" ON (")
+                .append(assignmentAliasSql)
+                .append(".ROWID = ")
+                .append(sourceAlias)
+                .append(".")
+                .append(rowIdAlias)
+                .append(") WHEN MATCHED THEN UPDATE SET ")
+                .append(setClause)
+                .append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private boolean referencesAliasOutsideIgnoredText(String expression, String aliasKey) {
+        if (expression == null || expression.isBlank() || aliasKey == null || aliasKey.isBlank()) {
+            return false;
+        }
+        int index = 0;
+        while (index < expression.length()) {
+            if (expression.charAt(index) == '\'') {
+                index = skipSingleQuotedString(expression, index);
+            } else if (startsMyBatisPlaceholder(expression, index)) {
+                index = skipMyBatisPlaceholder(expression, index);
+            } else if (startsLineComment(expression, index)) {
+                index = skipUntilLineEnd(expression, index);
+            } else if (startsBlockComment(expression, index)) {
+                index = skipUntilBlockCommentEnd(expression, index);
+            } else {
+                IdentifierToken identifier = readIdentifierToken(expression, index);
+                if (identifier == null) {
+                    index++;
+                    continue;
+                }
+                int dotIndex = skipWhitespace(expression, identifier.endIndex());
+                if (normalizeIdentifierKey(unquoteIdentifier(identifier.text())).equals(aliasKey)
+                        && dotIndex < expression.length()
+                        && expression.charAt(dotIndex) == '.') {
+                    return true;
+                }
+                index = identifier.endIndex();
+            }
+        }
+        return false;
     }
 
     private GenericConversion convertSingleAssignedJoinedTableMysqlUpdateJoin(

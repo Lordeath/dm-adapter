@@ -739,7 +739,7 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        isDynamicWhereTag(nextTagName(rawBody, cdataEnd + "]]>".length()))
+                        nextTagName(rawBody, cdataEnd + "]]>".length())
                 );
                 convertedBody.append(toCdata(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -771,7 +771,7 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        isDynamicWhereTag(nextTagName(rawBody, textEnd))
+                        nextTagName(rawBody, textEnd)
                 );
                 convertedBody.append(escapeBareXmlLessThan(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -813,7 +813,7 @@ public class MapperXmlRewriter {
             manualReviewReasons.removeIf(this::isMysqlInsertIgnoreManualReviewReason);
         }
         if (appliedRules.contains(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE)) {
-            manualReviewReasons.removeIf(DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON::equals);
+            manualReviewReasons.removeIf(this::isMysqlUpdateJoinManualReviewReason);
         }
         return new DynamicBodyConversion(
                 rawBody,
@@ -919,6 +919,15 @@ public class MapperXmlRewriter {
         }
 
         if (!"insert".equals(statementTagName)) {
+            DynamicBodyConversion dynamicOuterJoinMerge = convertDynamicTargetOnlyOuterJoinToMerge(
+                    converted,
+                    sqlConverter
+            );
+            if (dynamicOuterJoinMerge.changed()) {
+                converted = dynamicOuterJoinMerge.convertedBody();
+                addAppliedRules(appliedRules, dynamicOuterJoinMerge.appliedRules());
+                addManualReviewReasons(manualReviewReasons, dynamicOuterJoinMerge.manualReviewReasons());
+            }
             DynamicBodyConversion dynamicWhereUpdateJoin = convertDynamicUpdateJoinWithWhereTag(
                     converted,
                     statementKey,
@@ -1720,6 +1729,11 @@ public class MapperXmlRewriter {
 
     private boolean isMysqlOnDuplicateKeyUpdateManualReviewReason(String reason) {
         return reason != null && reason.contains("ON DUPLICATE KEY UPDATE");
+    }
+
+    private boolean isMysqlUpdateJoinManualReviewReason(String reason) {
+        return DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON.equals(reason)
+                || (reason != null && reason.contains("MySQL UPDATE JOIN"));
     }
 
     private boolean containsMysqlInsertIgnore(String value) {
@@ -4900,6 +4914,68 @@ public class MapperXmlRewriter {
         );
     }
 
+    private DynamicBodyConversion convertDynamicTargetOnlyOuterJoinToMerge(
+            String body,
+            SqlConverter sqlConverter
+    ) {
+        int statementEnd = body.length();
+        while (statementEnd > 0 && Character.isWhitespace(body.charAt(statementEnd - 1))) {
+            statementEnd--;
+        }
+        String trailing = body.substring(statementEnd);
+        if (statementEnd > 0 && body.charAt(statementEnd - 1) == ';') {
+            statementEnd--;
+            trailing = body.substring(statementEnd);
+        }
+        String statement = body.substring(0, statementEnd);
+        int updateIndex = leadingWhitespaceLength(statement);
+        if (!isKeywordAt(statement, updateIndex, "UPDATE")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int joinIndex = findTopLevelKeywordSkippingXml(statement, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int setIndex = findTopLevelKeywordSkippingXml(statement, "SET", joinIndex + "JOIN".length());
+        int whereIndex = setIndex < 0
+                ? -1
+                : findTopLevelKeywordSkippingXml(statement, "WHERE", setIndex + "SET".length());
+        if (setIndex < 0 || whereIndex < 0 || containsXmlMarkup(statement.substring(0, whereIndex))) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        String whereClause = statement.substring(whereIndex + "WHERE".length()).strip();
+        String sentinel = "DM_ADAPTER_DYNAMIC_OUTER_JOIN_PREDICATE = 1";
+        if (whereClause.isBlank() || statement.contains(sentinel)) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String probeSql = statement.substring(0, whereIndex + "WHERE".length())
+                + " "
+                + sentinel;
+        SqlConversionResult probeConversion = sqlConverter.convert(probeSql);
+        if (!probeConversion.changed()
+                || probeConversion.manualReviewRequired()
+                || !probeConversion.appliedRules().contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE)
+                || !probeConversion.convertedSql().stripLeading().toUpperCase(Locale.ROOT).startsWith("MERGE INTO ")) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+
+        String convertedProbe = probeConversion.convertedSql();
+        int sentinelIndex = convertedProbe.indexOf(sentinel);
+        if (sentinelIndex < 0
+                || convertedProbe.indexOf(sentinel, sentinelIndex + sentinel.length()) >= 0) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String converted = convertedProbe.substring(0, sentinelIndex)
+                + whereClause
+                + convertedProbe.substring(sentinelIndex + sentinel.length())
+                + trailing;
+        List<String> appliedRules = new ArrayList<>();
+        appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
+        addAppliedRules(appliedRules, probeConversion.appliedRules());
+        return new DynamicBodyConversion(body, converted, appliedRules, List.of(), true);
+    }
+
     private DynamicBodyConversion convertDynamicMultiJoinUpdateWithWhereTag(
             String body,
             String statement,
@@ -5095,7 +5171,7 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        false
+                        ""
                 );
                 converted.append(toCdata(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -5127,7 +5203,7 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        false
+                        ""
                 );
                 converted.append(conversion.convertedText());
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -7718,8 +7794,9 @@ public class MapperXmlRewriter {
             String statementKey,
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig,
-            boolean followedByDynamicWhere
+            String followingTagName
     ) {
+        boolean followedByDynamicWhere = isDynamicWhereTag(followingTagName);
         if (isUpdateJoinWithoutWhere(text)) {
             if (!followedByDynamicWhere) {
                 return convertUpdateJoinPrefixTextSegment(text, sqlConverter);
@@ -7728,6 +7805,16 @@ public class MapperXmlRewriter {
                     text,
                     List.of(),
                     List.of(DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON),
+                    false
+            );
+        }
+        if (!followingTagName.isBlank()
+                && isUpdateJoinWithWhere(text)
+                && containsOuterUpdateJoin(text)) {
+            return new TextSegmentConversion(
+                    text,
+                    List.of(),
+                    List.of("MySQL UPDATE JOIN continues across dynamic MyBatis XML elements."),
                     false
             );
         }
@@ -7853,6 +7940,30 @@ public class MapperXmlRewriter {
         }
         int setIndex = findTopLevelKeywordSkippingXml(text, "SET", joinIndex + "JOIN".length());
         return setIndex >= 0 && findTopLevelKeywordSkippingXml(text, "WHERE", setIndex + "SET".length()) < 0;
+    }
+
+    private boolean isUpdateJoinWithWhere(String text) {
+        int updateIndex = leadingWhitespaceLength(text);
+        if (!isKeywordAt(text, updateIndex, "UPDATE")) {
+            return false;
+        }
+        int joinIndex = findTopLevelKeywordSkippingXml(text, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return false;
+        }
+        int setIndex = findTopLevelKeywordSkippingXml(text, "SET", joinIndex + "JOIN".length());
+        return setIndex >= 0 && findTopLevelKeywordSkippingXml(text, "WHERE", setIndex + "SET".length()) >= 0;
+    }
+
+    private boolean containsOuterUpdateJoin(String text) {
+        int updateIndex = leadingWhitespaceLength(text);
+        int setIndex = findTopLevelKeywordSkippingXml(text, "SET", updateIndex + "UPDATE".length());
+        if (setIndex < 0) {
+            return false;
+        }
+        return Pattern.compile(
+                "(?is)\\b(?:LEFT|RIGHT|FULL|CROSS)(?:\\s+OUTER)?\\s+JOIN\\b"
+        ).matcher(text.substring(updateIndex, setIndex)).find();
     }
 
     private void addAppliedRules(List<String> appliedRules, List<String> rulesToAdd) {
