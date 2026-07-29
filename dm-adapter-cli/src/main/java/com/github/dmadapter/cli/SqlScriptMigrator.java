@@ -45,8 +45,8 @@ class SqlScriptMigrator {
     static final String MYSQL_SCRIPT_METADATA_TO_DM_RULE = "MYSQL_SCRIPT_METADATA_TO_DM";
     static final String MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVAL_RULE = "MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVED";
     static final String MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE = "MYSQL_SCHEMA_SCOPED_INDEX_NAME";
-    static final String MYSQL_PREFIX_INDEX_MANUAL_REVIEW_RULE =
-            "MYSQL_PREFIX_INDEX_MANUAL_REVIEW";
+    static final String MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE =
+            "MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX";
     static final String MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE =
             "MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE =
@@ -215,10 +215,14 @@ class SqlScriptMigrator {
                     + "|\\bDATA_TYPE\\s+IN\\s*\\(\\s*'char'\\s*,\\s*'varchar'\\s*\\)"
                     + "|\\bDATA_TYPE\\s+IN\\s*\\(\\s*'varchar'\\s*,\\s*'char'\\s*\\)"
     );
+    private static final Pattern DM_PREFIX_FUNCTION_INDEX_PATTERN = Pattern.compile(
+            "(?is)\\bCAST\\s*\\(\\s*SUBSTR\\s*\\(\\s*"
+                    + "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")"
+                    + "\\s*,\\s*1\\s*,\\s*\\d+\\s*\\)\\s+AS\\s+VARCHAR\\s*\\(\\s*\\d+\\s*\\)\\s*\\)"
+    );
     private static final String MYSQL_PREFIX_INDEX_MANUAL_REVIEW_REASON =
-            "MySQL 前缀索引长度较大（如 column(254)）时，无法可靠自动转换为达梦索引。"
-                    + "如果目标字段是 TEXT/CLOB，达梦不能直接建普通索引；"
-                    + "请按业务确认是否改字段类型、改为函数/虚拟列索引，或移除该索引。";
+            "MySQL 前缀索引长度较大（如 column(254)），但未能转换为达梦 SUBSTR 函数索引。"
+                    + "请检查索引列表达式是否超出当前工具支持范围。";
     private static final int MYSQL_LONG_PREFIX_INDEX_LENGTH_THRESHOLD = 128;
     private static final String SQL_WS_OR_COMMENT_TOKEN =
             "(?:(?:\\s+)|(?:--[^\\r\\n]*(?:\\r?\\n|\\r|$))|(?:#[^\\r\\n]*(?:\\r?\\n|\\r|$))|(?:/\\*.*?\\*/))*";
@@ -2436,6 +2440,10 @@ class SqlScriptMigrator {
         rules.addAll(safeRuleConversion.appliedRules());
         rules.addAll(sqlConversion.appliedRules());
         String convertedBody = sqlConversion.convertedSql();
+        if (MYSQL_PREFIX_INDEX_DDL_PATTERN.matcher(sqlBody).find()
+                && DM_PREFIX_FUNCTION_INDEX_PATTERN.matcher(convertedBody).find()) {
+            rules.add(MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE);
+        }
         String normalizedDropProcedureSql = normalizeDuplicateDropProcedureIfExists(convertedBody);
         if (!normalizedDropProcedureSql.equals(convertedBody)) {
             convertedBody = normalizedDropProcedureSql;
@@ -9073,7 +9081,7 @@ class SqlScriptMigrator {
                 + " ON "
                 + table
                 + " ("
-                + stripMysqlIndexPrefixLengths(addIndex.group("columns").strip())
+                + convertMysqlIndexPrefixLengths(addIndex.group("columns").strip())
                 + ")";
     }
 
@@ -9147,7 +9155,7 @@ class SqlScriptMigrator {
                 + " ON "
                 + matcher.group("table")
                 + " ("
-                + stripMysqlIndexPrefixLengths(matcher.group("columns").strip())
+                + convertMysqlIndexPrefixLengths(matcher.group("columns").strip())
                 + ")";
     }
 
@@ -9166,17 +9174,30 @@ class SqlScriptMigrator {
                 + matcher.group("middle")
                 + matcher.group("table")
                 + " ("
-                + stripMysqlIndexPrefixLengths(matcher.group("columns").strip())
+                + convertMysqlIndexPrefixLengths(matcher.group("columns").strip())
                 + matcher.group("close");
     }
 
-    private String stripMysqlIndexPrefixLengths(String columns) {
+    private String convertMysqlIndexPrefixLengths(String columns) {
         List<String> parts = splitTopLevelComma(columns);
         List<String> converted = new ArrayList<>(parts.size());
         for (String part : parts) {
-            converted.add(stripMysqlIndexPrefixLength(part.strip()));
+            converted.add(convertMysqlIndexPrefixLength(part.strip()));
         }
         return String.join(", ", converted);
+    }
+
+    private String convertMysqlIndexPrefixLength(String column) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^(?<column>(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))"
+                        + "\\s*\\(\\s*(?<length>\\d+)\\s*\\)(?<order>\\s+(?:ASC|DESC))?\\s*$"
+        ).matcher(column);
+        if (!matcher.matches()) {
+            return column;
+        }
+        String length = matcher.group("length");
+        return "CAST(SUBSTR(" + matcher.group("column") + ", 1, " + length + ") AS VARCHAR(" + length + "))"
+                + (matcher.group("order") == null ? "" : matcher.group("order"));
     }
 
     private String stripMysqlIndexPrefixLength(String column) {
@@ -9912,6 +9933,9 @@ class SqlScriptMigrator {
             }
         }
         if (!longPrefixIndex) {
+            return "";
+        }
+        if (DM_PREFIX_FUNCTION_INDEX_PATTERN.matcher(convertedSql).find()) {
             return "";
         }
         if (MYSQL_PREFIX_INDEX_VARCHAR_GUARD_PATTERN.matcher(originalSql).find()
