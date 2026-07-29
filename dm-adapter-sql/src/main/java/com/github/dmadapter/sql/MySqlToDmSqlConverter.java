@@ -5599,6 +5599,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (multiTarget.changed()) {
             return multiTarget;
         }
+        GenericConversion joinedTarget = convertSingleAssignedJoinedTableMysqlUpdateJoin(
+                sql,
+                updateIndex,
+                target,
+                joinSource,
+                setClause,
+                whereClause,
+                setIndex,
+                statementEnd
+        );
+        if (joinedTarget.changed()) {
+            return joinedTarget;
+        }
         GenericConversion singleTargetChain = convertSingleTargetMysqlUpdateJoinChain(
                 sql,
                 updateIndex,
@@ -5648,6 +5661,66 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(converted.toString(), true);
     }
 
+    private GenericConversion convertSingleAssignedJoinedTableMysqlUpdateJoin(
+            String sql,
+            int updateIndex,
+            String target,
+            String joinSource,
+            String setClause,
+            String whereClause,
+            int setIndex,
+            int statementEnd
+    ) {
+        UpdateJoinChain chain = updateJoinChain(target, joinSource, true);
+        if (chain == null
+                || chain.tables().size() < 2
+                || containsTopLevelOuterOrCrossJoin(sql.substring(updateIndex, setIndex))) {
+            return GenericConversion.unchanged(sql);
+        }
+        String assignmentAlias = null;
+        for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
+            Matcher matcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
+            if (!matcher.find()) {
+                return GenericConversion.unchanged(sql);
+            }
+            String alias = normalizeIdentifierKey(matcher.group("alias"));
+            if (assignmentAlias != null && !assignmentAlias.equals(alias)) {
+                return GenericConversion.unchanged(sql);
+            }
+            assignmentAlias = alias;
+        }
+        if (assignmentAlias == null || assignmentAlias.equals(chain.tables().get(0).aliasKey())) {
+            return GenericConversion.unchanged(sql);
+        }
+        UpdateJoinTable updateTable = tableByAlias(chain.tables(), assignmentAlias);
+        if (updateTable == null || updateTable.tableSql().startsWith("(")) {
+            return GenericConversion.unchanged(sql);
+        }
+        String updateAlias = assignmentAlias;
+        List<String> sources = chain.tables().stream()
+                .filter(table -> !table.aliasKey().equals(updateAlias))
+                .map(UpdateJoinTable::tableSql)
+                .toList();
+        if (sources.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String convertedSetClause = stripTargetAliasFromUpdateSetClause(updateTable.tableSql(), setClause);
+        List<String> whereParts = updateJoinPredicates(chain.conditions(), whereClause);
+        StringBuilder converted = new StringBuilder(sql.length() + 32);
+        converted.append(sql, 0, updateIndex)
+                .append("update ")
+                .append(updateTable.tableSql())
+                .append(" set ")
+                .append(convertedSetClause)
+                .append(" from ")
+                .append(String.join(", ", sources));
+        if (!whereParts.isEmpty()) {
+            converted.append(" where ").append(String.join(" and ", whereParts));
+        }
+        converted.append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
     private GenericConversion convertSingleTargetMysqlUpdateJoinChain(
             String sql,
             int updateIndex,
@@ -5658,13 +5731,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             int setIndex,
             int statementEnd
     ) {
-        UpdateJoinChain chain = updateJoinChain(target, joinSource);
+        UpdateJoinChain chain = updateJoinChain(target, joinSource, true);
         if (chain == null
                 || chain.tables().size() < 2
                 || updatesJoinedTableAlias(target, setClause)
-                || Pattern.compile(
-                "(?is)\\b(?:LEFT|RIGHT|FULL|CROSS)\\s+(?:OUTER\\s+)?JOIN\\b"
-        ).matcher(sql.substring(updateIndex, setIndex)).find()) {
+                || containsTopLevelOuterOrCrossJoin(sql.substring(updateIndex, setIndex))) {
             return GenericConversion.unchanged(sql);
         }
         List<String> sources = chain.tables().subList(1, chain.tables().size()).stream()
@@ -5688,6 +5759,25 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private boolean containsTopLevelOuterOrCrossJoin(String updateJoinClause) {
+        int searchFrom = 0;
+        while (searchFrom < updateJoinClause.length()) {
+            int joinIndex = findTopLevelKeyword(updateJoinClause, "JOIN", searchFrom);
+            if (joinIndex < 0) {
+                return false;
+            }
+            int typeStart = joinTypeStart(updateJoinClause, joinIndex);
+            String joinType = updateJoinClause.substring(typeStart, joinIndex).strip();
+            if (Pattern.compile("(?is)^(?:LEFT|RIGHT|FULL|CROSS)(?:\\s+OUTER)?$")
+                    .matcher(joinType)
+                    .matches()) {
+                return true;
+            }
+            searchFrom = joinIndex + "JOIN".length();
+        }
+        return false;
     }
 
     private String stripTargetAliasFromUpdateSetClause(String target, String setClause) {
@@ -6079,6 +6169,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private UpdateJoinChain updateJoinChain(String target, String joinSource) {
+        return updateJoinChain(target, joinSource, false);
+    }
+
+    private UpdateJoinChain updateJoinChain(String target, String joinSource, boolean allowDerivedTable) {
         List<UpdateJoinTable> tables = new ArrayList<>();
         List<String> conditions = new ArrayList<>();
         UpdateJoinTable targetTable = updateJoinTable(target);
@@ -6094,6 +6188,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 return null;
             }
             UpdateJoinTable sourceTable = updateJoinTable(remaining.substring(0, onIndex).strip());
+            if (sourceTable == null && allowDerivedTable) {
+                sourceTable = derivedUpdateJoinTable(remaining.substring(0, onIndex).strip());
+            }
             if (sourceTable == null) {
                 return null;
             }
@@ -6113,6 +6210,30 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             remaining = remaining.substring(nextJoinIndex + "JOIN".length()).strip();
         }
         return new UpdateJoinChain(tables, conditions);
+    }
+
+    private UpdateJoinTable derivedUpdateJoinTable(String tableSql) {
+        String trimmed = tableSql == null ? "" : tableSql.strip();
+        if (!trimmed.startsWith("(")) {
+            return null;
+        }
+        int closeParen = findMatchingParen(trimmed, 0);
+        if (closeParen < 0) {
+            return null;
+        }
+        String query = trimmed.substring(1, closeParen).stripLeading();
+        if (!startsKeyword(query, 0, "SELECT") && !startsKeyword(query, 0, "WITH")) {
+            return null;
+        }
+        String aliasText = trimmed.substring(closeParen + 1).strip();
+        if (startsKeyword(aliasText, 0, "AS")) {
+            aliasText = aliasText.substring("AS".length()).strip();
+        }
+        IdentifierToken alias = readIdentifierToken(aliasText, 0);
+        if (alias == null || skipWhitespace(aliasText, alias.endIndex()) != aliasText.length()) {
+            return null;
+        }
+        return new UpdateJoinTable(trimmed, normalizeIdentifierKey(alias.text()));
     }
 
     private UpdateJoinTable updateJoinTable(String tableSql) {
@@ -7213,6 +7334,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return joinIndex;
         }
         String upper = word.text().toUpperCase(Locale.ROOT);
+        if ("OUTER".equals(upper)) {
+            WordToken outerType = previousWord(sql, word.startIndex());
+            if (outerType != null
+                    && isOnlyWhitespace(sql, outerType.endIndex(), word.startIndex())
+                    && Set.of("LEFT", "RIGHT", "FULL").contains(outerType.text().toUpperCase(Locale.ROOT))) {
+                return outerType.startIndex();
+            }
+        }
         return Set.of("INNER", "LEFT", "RIGHT", "FULL", "CROSS").contains(upper) ? word.startIndex() : joinIndex;
     }
 

@@ -2367,7 +2367,22 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void keepsUnconvertedDerivedTableUpdateJoinInManualReview() {
+    void leavesSingleTargetMysqlUpdateWithExplicitOuterJoinForManualHandling() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_target target
+                LEFT OUTER JOIN sample_source source ON target.source_id = source.id
+                SET target.label = source.label
+                WHERE target.is_deleted = 0
+                """);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("UPDATE JOIN");
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void convertsDerivedTableFollowedByAnotherMysqlUpdateJoin() {
         SqlConversionResult result = converter.convert("""
                 UPDATE sample_task target
                 JOIN (
@@ -2382,10 +2397,51 @@ class MySqlToDmSqlConverterTest {
                 WHERE transfer.id = #{transferId}
                 """);
 
-        assertThat(result.changed()).isFalse();
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.reason()).contains("UPDATE JOIN");
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update sample_task target set owner_id = transfer.new_owner_id from (
+                    SELECT candidate.id
+                    FROM sample_task candidate
+                    JOIN sample_transfer transfer ON transfer.owner_id = candidate.owner_id
+                    WHERE transfer.id = #{transferId}
+                    LIMIT #{rowCount}
+                ) selected, sample_transfer transfer where target.id = selected.id and transfer.owner_id = target.owner_id and transfer.id = #{transferId}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void convertsUpdateOfSingleJoinedAliasAfterLimitedDerivedSelection() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_task target
+                JOIN (
+                    SELECT candidate.id
+                    FROM sample_task candidate
+                    JOIN sample_transfer filter_transfer ON filter_transfer.owner_id = candidate.owner_id
+                    WHERE filter_transfer.id = #{transferId}
+                    LIMIT #{rowCount}
+                ) selected ON target.id = selected.id
+                JOIN sample_transfer transfer ON transfer.scope_id = target.scope_id
+                JOIN sample_task_assignee assignee ON assignee.task_id = target.id
+                SET assignee.owner_id = transfer.new_owner_id,
+                    assignee.updated_by = #{operatorId}
+                WHERE transfer.id = #{transferId}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update sample_task_assignee assignee set owner_id = transfer.new_owner_id,
+                    updated_by = #{operatorId} from sample_task target, (
+                    SELECT candidate.id
+                    FROM sample_task candidate
+                    JOIN sample_transfer filter_transfer ON filter_transfer.owner_id = candidate.owner_id
+                    WHERE filter_transfer.id = #{transferId}
+                    LIMIT #{rowCount}
+                ) selected, sample_transfer transfer where target.id = selected.id and transfer.scope_id = target.scope_id and assignee.task_id = target.id and transfer.id = #{transferId}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
     }
 
     @Test
