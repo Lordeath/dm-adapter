@@ -8,6 +8,7 @@ import com.github.dmadapter.core.MapperMigrationResult;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
+import com.github.dmadapter.core.SqlScriptValidationFailure;
 import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.maven.PomModifier;
@@ -311,7 +312,7 @@ public class MigrateCommand implements Callable<Integer> {
             boolean mapperValidationBlocked = mapperValidationBlockedByScript(sqlScriptReportResult);
             if (mapperValidationBlocked) {
                 summaryTracker.skipMapperValidation(
-                        "SQL 脚本验证的 schema 前置检查失败或总时限已耗尽，未执行 Mapper 数据库验证。"
+                        "SQL 脚本验证的 schema 前置检查失败，未执行 Mapper 数据库验证。"
                 );
             } else {
                 summaryTracker.startMapperValidation(validationTestGenerationRequested());
@@ -330,7 +331,7 @@ public class MigrateCommand implements Callable<Integer> {
                 );
                 GenerateValidationTestCommand.printResult(validationResult);
                 if (mapperValidationBlocked) {
-                    CliLogger.info("Mapper database validation skipped because SQL script validation preflight failed or timed out.");
+                    CliLogger.info("Mapper database validation skipped because SQL script schema preflight failed.");
                 } else {
                     CliLogger.info("Running Dameng SQL validation test if configured...");
                     validationRunResult = validationTestRunner.runIfConfigured(validationResult, validationEnvironment);
@@ -873,10 +874,12 @@ public class MigrateCommand implements Callable<Integer> {
         if (result == null) {
             return false;
         }
-        return result.report().validationFailures().stream().anyMatch(failure ->
-                "INVALID_SCHEMA".equals(failure.category())
-                        || "VALIDATION_TIMEOUT".equals(failure.category())
-                        || "OBJECT_STATUS_VALIDATION_FAILED".equals(failure.category()));
+        return mapperValidationBlockedByScriptFailures(result.report().validationFailures());
+    }
+
+    static boolean mapperValidationBlockedByScriptFailures(List<SqlScriptValidationFailure> failures) {
+        return failures != null && failures.stream().anyMatch(failure ->
+                failure != null && "(schema-preflight)".equals(failure.sourceFile()));
     }
 
     private record MetadataLookupResult(

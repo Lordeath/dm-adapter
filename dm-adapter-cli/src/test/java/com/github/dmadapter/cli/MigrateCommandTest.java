@@ -1,7 +1,9 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.core.SqlScriptValidationFailure;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,5 +37,39 @@ class MigrateCommandTest {
                 TimeUnit.SECONDS,
                 "metadata lookup"
         )).isEqualTo("done");
+    }
+
+    @Test
+    void mapperValidationContinuesAfterIndividualScriptTimeoutOrObjectStatusFailure() {
+        assertThat(MigrateCommand.mapperValidationBlockedByScriptFailures(List.of(
+                failure("20260205_system.sql", 8, "VALIDATION_TIMEOUT"),
+                failure("20260205.sql", 12, "OBJECT_STATUS_VALIDATION_FAILED")
+        ))).isFalse();
+    }
+
+    @Test
+    void mapperValidationContinuesAfterSqlScriptTotalTimeout() {
+        assertThat(MigrateCommand.mapperValidationBlockedByScriptFailures(List.of(
+                failure("(validation)", 0, "VALIDATION_TIMEOUT")
+        ))).isFalse();
+    }
+
+    @Test
+    void mapperValidationStopsWhenSqlScriptSchemaPreflightFails() {
+        assertThat(MigrateCommand.mapperValidationBlockedByScriptFailures(List.of(
+                failure("(schema-preflight)", 0, "INVALID_SCHEMA")
+        ))).isTrue();
+    }
+
+    private SqlScriptValidationFailure failure(String sourceFile, int statementIndex, String category) {
+        return new SqlScriptValidationFailure(
+                sourceFile,
+                "",
+                "sample-schema",
+                statementIndex,
+                category,
+                "test failure",
+                ""
+        );
     }
 }
