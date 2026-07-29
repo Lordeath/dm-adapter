@@ -32,6 +32,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 180;
     private static final long DEFAULT_SLOW_OPERATION_LOG_MILLIS = 5_000L;
     private static final long SLOW_OPERATION_REPEAT_MILLIS = 30_000L;
+    private static final int CONNECTION_CLOSE_TIMEOUT_SECONDS = 5;
     private static final int STATEMENT_PROGRESS_INTERVAL = 100;
     private static final String STATEMENT_TIMEOUT_PROPERTY = "dm.adapter.sqlScriptStatementTimeoutSeconds";
     private static final String STATEMENT_TIMEOUT_ENV = "DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS";
@@ -114,7 +115,10 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 "Opening Dameng validation connection",
                 connectionStartedAt
         );
-        try (Connection connection = openConnection(environment)) {
+        ExecutorService statementExecutor = statementExecutor();
+        Connection connection = null;
+        try {
+            connection = openConnection(environment);
             cancel(connectionWarning);
             progress("Dameng validation connection opened: elapsedMs=" + elapsedMillis(connectionStartedAt));
             try {
@@ -148,6 +152,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         file,
                         environment,
                         diagnostics,
+                        statementExecutor,
                         failedCreatedObjects,
                         recentObjectDdl,
                         fileIndex + 1,
@@ -174,6 +179,8 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                     List.of("Dameng SQL script validation was skipped because the connection could not be opened.")
             );
         } finally {
+            closeConnection(connection);
+            statementExecutor.shutdownNow();
             if (diagnostics != null) {
                 diagnostics.shutdownNow();
             }
@@ -219,6 +226,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             SqlScriptMigrator.PlannedSqlScriptFile file,
             DmValidationEnvironment environment,
             ScheduledExecutorService diagnostics,
+            ExecutorService statementExecutor,
             Map<String, Integer> failedCreatedObjects,
             Map<String, DdlLocation> recentObjectDdl,
             int fileIndex,
@@ -277,9 +285,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             );
             CreatedObject createdObject = createdObject(sql);
             String alteredObject = alteredObject(sql);
-            try (Statement statement = connection.createStatement()) {
+            Statement statement = null;
+            boolean statementTimedOut = false;
+            try {
+                statement = connection.createStatement();
                 configureStatement(statement, environment);
-                statement.execute(sql);
+                executeStatement(statementExecutor, connection, statement, sql, environment);
                 if (createdObject != null) {
                     String warningSummary = warningSummary(statement);
                     CreatedObjectStatus objectStatus;
@@ -316,8 +327,11 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 }
                 successCount++;
             } catch (Exception e) {
+                statementTimedOut = e instanceof StatementValidationTimeoutException;
                 String blockedObject = blockedObject(sql, failedCreatedObjects.keySet());
-                String category = blockedObject.isBlank() ? classify(e, sql) : "BLOCKED_BY_PRIOR_FAILURE";
+                String category = statementTimedOut
+                        ? "VALIDATION_TIMEOUT"
+                        : blockedObject.isBlank() ? classify(e, sql) : "BLOCKED_BY_PRIOR_FAILURE";
                 String errorSummary = compact(redact(safeMessage(e), environment));
                 if ("ORIGINAL_SQL".equals(category) && containsDuplicateColumnDefault(sql)) {
                     errorSummary = compact(
@@ -342,7 +356,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         errorSummary,
                         compact(sql)
                 ));
-                if (createdObject != null) {
+                if (!statementTimedOut && createdObject != null) {
                     failedCreatedObjects.putIfAbsent(createdObject.key(), statementIndex);
                 }
                 progress("SQL script statement failed: file=" + file.sourceDisplay()
@@ -353,6 +367,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         + ", errorType=" + e.getClass().getSimpleName());
             } finally {
                 cancel(slowWarning);
+                if (!statementTimedOut) {
+                    closeStatement(statement);
+                }
+            }
+            if (statementTimedOut) {
+                break;
             }
             if (attemptedCount % STATEMENT_PROGRESS_INTERVAL == 0) {
                 progress("SQL script statement progress: file=" + file.sourceDisplay()
@@ -369,6 +389,71 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 + ", failed=" + failures.size()
                 + ", elapsedMs=" + elapsedMillis(fileStartedAt));
         return new SqlScriptFileValidation(file.outputDisplay(), successCount, failures);
+    }
+
+    private void executeStatement(
+            ExecutorService executor,
+            Connection connection,
+            Statement statement,
+            String sql,
+            DmValidationEnvironment environment
+    ) throws Exception {
+        int timeoutSeconds = effectiveStatementTimeoutSeconds(environment);
+        Future<Boolean> execution = executor.submit(() -> statement.execute(sql));
+        try {
+            execution.get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            execution.cancel(true);
+            cancelTimedOutStatement(connection, statement);
+            throw new StatementValidationTimeoutException(
+                    "Dameng SQL statement exceeded the adapter hard timeout of "
+                            + timeoutSeconds
+                            + " seconds; cancellation was requested and validation stopped.",
+                    e
+            );
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            throw new IllegalStateException(cause);
+        } catch (InterruptedException e) {
+            execution.cancel(true);
+            cancelTimedOutStatement(connection, statement);
+            Thread.currentThread().interrupt();
+            throw new StatementValidationTimeoutException(
+                    "Dameng SQL statement validation was interrupted; cancellation was requested.",
+                    e
+            );
+        }
+    }
+
+    private void cancelTimedOutStatement(Connection connection, Statement statement) {
+        startDaemon("dm-sql-validation-statement-cancel", () -> {
+            try {
+                statement.cancel();
+            } catch (SQLException ignored) {
+                // The hard timeout must return even if the driver cannot cancel the statement.
+            }
+        });
+        startDaemon("dm-sql-validation-connection-abort", () -> {
+            try {
+                connection.abort(command -> startDaemon("dm-sql-validation-abort-worker", command));
+            } catch (SQLException | RuntimeException ignored) {
+                // Closing the validation connection remains best-effort after a hard timeout.
+            }
+        });
+    }
+
+    private void closeStatement(Statement statement) {
+        if (statement == null) {
+            return;
+        }
+        try {
+            statement.close();
+        } catch (SQLException ignored) {
+            // Statement cleanup must not replace the validation result.
+        }
     }
 
     private SqlScriptValidationFailure preflightSchemas(
@@ -679,6 +764,50 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             thread.setDaemon(true);
             return thread;
         });
+    }
+
+    private ExecutorService statementExecutor() {
+        return Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "dm-sql-validation-statement");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    private void closeConnection(Connection connection) {
+        if (connection == null) {
+            return;
+        }
+        ExecutorService closer = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "dm-sql-validation-connection-close");
+            thread.setDaemon(true);
+            return thread;
+        });
+        Future<?> close = closer.submit(() -> {
+            try {
+                connection.close();
+            } catch (SQLException ignored) {
+                // Validation has already finished; connection cleanup is best-effort.
+            }
+        });
+        try {
+            close.get(CONNECTION_CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException | ExecutionException ignored) {
+            close.cancel(true);
+            progress("Dameng validation connection close did not finish within "
+                    + CONNECTION_CLOSE_TIMEOUT_SECONDS + " seconds.");
+        } catch (InterruptedException e) {
+            close.cancel(true);
+            Thread.currentThread().interrupt();
+        } finally {
+            closer.shutdownNow();
+        }
+    }
+
+    private void startDaemon(String name, Runnable runnable) {
+        Thread thread = new Thread(runnable, name);
+        thread.setDaemon(true);
+        thread.start();
     }
 
     private ScheduledFuture<?> scheduleSlowOperation(
@@ -1030,6 +1159,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         }
 
         private ObjectStatusValidationException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    private static final class StatementValidationTimeoutException extends SQLException {
+        private StatementValidationTimeoutException(String message, Throwable cause) {
             super(message, cause);
         }
     }

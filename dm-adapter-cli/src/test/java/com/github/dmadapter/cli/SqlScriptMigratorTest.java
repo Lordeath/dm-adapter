@@ -22,7 +22,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -4124,6 +4126,65 @@ class SqlScriptMigratorTest {
         assertThat(result.successCount()).isEqualTo(1);
         assertThat(result.failureCount()).isZero();
         assertThat(statusQueryCount).hasValue(0);
+    }
+
+    @Test
+    void stopsValidationAtAdapterHardTimeoutWhenJdbcDriverIgnoresInterrupts() {
+        String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
+        String previous = System.getProperty(property);
+        CountDownLatch releaseStatement = new CountDownLatch(1);
+        AtomicInteger businessStatementCount = new AtomicInteger();
+        try {
+            System.setProperty(property, "1");
+            Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+                if (method.getName().equals("execute")) {
+                    String sql = (String) args[0];
+                    if (!sql.startsWith("set schema")) {
+                        businessStatementCount.incrementAndGet();
+                        while (releaseStatement.getCount() > 0) {
+                            try {
+                                releaseStatement.await(50, TimeUnit.MILLISECONDS);
+                            } catch (InterruptedException ignoredInterrupt) {
+                                // Simulate a JDBC driver that ignores thread interruption.
+                            }
+                        }
+                    }
+                }
+                return defaultValue(method.getReturnType());
+            });
+            Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                    method.getName().equals("createStatement")
+                            ? statement
+                            : defaultValue(method.getReturnType()));
+
+            SqlScriptValidationRun result = assertTimeout(
+                    Duration.ofSeconds(3),
+                    () -> new SqlScriptValidator(env -> connection).validate(
+                            List.of(plannedValidationFile(
+                                    "blocking.sql",
+                                    "sample-bill",
+                                    List.of("CALL blocking_proc()", "select 1 from dual")
+                            )),
+                            validationEnvironment()
+                    )
+            );
+
+            assertThat(result.status()).contains("timed out");
+            assertThat(result.successCount()).isZero();
+            assertThat(result.failures()).singleElement().satisfies(failure -> {
+                assertThat(failure.category()).isEqualTo("VALIDATION_TIMEOUT");
+                assertThat(failure.statementIndex()).isEqualTo(1);
+                assertThat(failure.errorSummary()).contains("hard timeout of 1 seconds");
+            });
+            assertThat(businessStatementCount).hasValue(1);
+        } finally {
+            releaseStatement.countDown();
+            if (previous == null) {
+                System.clearProperty(property);
+            } else {
+                System.setProperty(property, previous);
+            }
+        }
     }
 
     @Test
