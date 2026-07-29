@@ -90,6 +90,8 @@ class SqlScriptMigrator {
             "MYSQL_TEMPORARY_INDEX_NOOP";
     static final String MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP_RULE =
             "MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP";
+    static final String MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE =
+            "MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK";
     static final String MYSQL_PROCEDURE_DYNAMIC_PREPARE_TO_EXECUTE_IMMEDIATE_RULE =
             "MYSQL_PROCEDURE_DYNAMIC_PREPARE_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_PROCEDURE_SIGNAL_TO_RAISE_APPLICATION_ERROR_RULE =
@@ -5434,6 +5436,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_GROUP_BY_ALIAS_RULE);
         }
 
+        String sqlExceptionHandlerSql = convertMysqlSqlExceptionContinueHandler(converted);
+        if (!sqlExceptionHandlerSql.equals(converted)) {
+            converted = sqlExceptionHandlerSql;
+            rules.add(MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE);
+        }
+
         return new SafeRuleConversion(
                 converted,
                 !rules.isEmpty(),
@@ -6921,6 +6929,91 @@ class SqlScriptMigrator {
                 )
         ));
         return converted;
+    }
+
+    private String convertMysqlSqlExceptionContinueHandler(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        Pattern handlerPattern = Pattern.compile(
+                "(?is)\\s*DECLARE\\s+CONTINUE\\s+HANDLER\\s+FOR\\s+SQLEXCEPTION\\s*"
+                        + "BEGIN\\s*"
+                        + "GET\\s+DIAGNOSTICS\\s+CONDITION\\s+1\\s+"
+                        + "(?<code>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*=\\s*RETURNED_SQLSTATE\\s*,\\s*"
+                        + "(?<message>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*=\\s*MESSAGE_TEXT\\s*;\\s*"
+                        + "END\\s*;"
+        );
+        Matcher handler = handlerPattern.matcher(sql);
+        if (!handler.find()) {
+            return sql;
+        }
+        int handlerStart = handler.start();
+        int handlerEnd = handler.end();
+        String codeVariable = unquoteIdentifier(handler.group("code"));
+        String messageVariable = unquoteIdentifier(handler.group("message"));
+        if (handler.find()) {
+            return sql;
+        }
+        Map<String, String> variables = procedureVariableNamesByLowercase(sql);
+        if (!variables.containsKey(codeVariable.toLowerCase(Locale.ROOT))
+                || !variables.containsKey(messageVariable.toLowerCase(Locale.ROOT))) {
+            return sql;
+        }
+
+        String withoutHandler = sql.substring(0, handlerStart) + sql.substring(handlerEnd);
+        String convertedDiagnostics = replaceOutsideIgnoredText(
+                withoutHandler,
+                Pattern.compile(
+                        "(?is)GET\\s+DIAGNOSTICS\\s+("
+                                + SQL_SIMPLE_IDENTIFIER_TOKEN
+                                + ")\\s*=\\s*ROW_COUNT"
+                ),
+                matcher -> unquoteIdentifier(matcher.group(1)) + " := SQL%ROWCOUNT"
+        );
+        if (containsKeywordOutsideIgnoredText(convertedDiagnostics, "GET")) {
+            String searchable = replaceIgnoredSqlWithSpaces(convertedDiagnostics);
+            if (Pattern.compile("(?is)\\bGET\\s+DIAGNOSTICS\\b").matcher(searchable).find()) {
+                return sql;
+            }
+        }
+        for (String unsupported : List.of(
+                "CALL",
+                "EXECUTE",
+                "LOOP",
+                "WHILE",
+                "FOR",
+                "GOTO",
+                "RETURN",
+                "RAISE",
+                "COMMIT",
+                "ROLLBACK"
+        )) {
+            if (containsKeywordOutsideIgnoredText(convertedDiagnostics, unsupported)) {
+                return sql;
+            }
+        }
+
+        List<RoutineSqlStatement> statements = routineSqlStatements(convertedDiagnostics);
+        if (statements.isEmpty()) {
+            return sql;
+        }
+        StringBuilder converted = new StringBuilder(convertedDiagnostics);
+        for (int index = statements.size() - 1; index >= 0; index--) {
+            RoutineSqlStatement statement = statements.get(index);
+            String indent = lineIndentBefore(convertedDiagnostics, statement.start());
+            String innerIndent = indent + "    ";
+            String body = convertedDiagnostics.substring(statement.start(), statement.end()).strip();
+            body = body.replaceAll("\\R[\\t ]*", "\n" + Matcher.quoteReplacement(innerIndent));
+            String replacement = "BEGIN\n"
+                    + innerIndent + body + ";\n"
+                    + indent + "EXCEPTION\n"
+                    + innerIndent + "WHEN OTHERS THEN\n"
+                    + innerIndent + "    " + codeVariable + " := 'HY000';\n"
+                    + innerIndent + "    " + messageVariable + " := SQLERRM;\n"
+                    + indent + "END";
+            converted.replace(statement.start(), statement.end(), replacement);
+        }
+        return converted.toString();
     }
 
     private String convertMysqlCursorHandlerLoops(String sql) {
