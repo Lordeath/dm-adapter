@@ -66,6 +66,7 @@
 - SQL 脚本中的存储过程依赖必须按目标 schema 判断。当前迁移队列内尚未创建就被引用属于脚本顺序问题；当前队列未定义的过程可能是系统库预置的共享依赖，不能仅凭当前项目缺少其 `CREATE PROCEDURE` 就判定对象缺失。
 - 升级脚本可能由 Windows 工具保存为带 BOM 的 UTF-16LE/UTF-16BE，而不只是 UTF-8。读取时应按 BOM 解码，迁移输出统一写为 UTF-8；不能因固定按 UTF-8 读取而在全量执行中途抛出 `MalformedInputException`。
 - 脚本级 `SET @变量`、`FOREIGN_KEY_CHECKS`、`PREPARE` 等 MySQL 控制语句被安全消解为审计注释时，写盘 SQL 必须同时生成可执行的达梦匿名 `NULL` 空操作块，使迁移结果、输出脚本和严格验证计划仍保持逐条对应。不能因解析器忽略纯注释而产生语句计数漂移，也不能因此跳过数据库验证。
+- MyBatis 语句包含 `<if>`、`<foreach>`、`<include>`、`<where>` 等 XML 节点本身不是人工确认理由。只有转换后仍检测到明确的未解决兼容风险（例如未改写的 `ON DUPLICATE KEY UPDATE`、无法安全拼接的动态 `UPDATE JOIN` 或未支持的函数）才进入人工确认；成功改写后还必须移除由原始片段产生、但在最终 SQL 中已不存在的过期风险项。
 - 临时迁移过程中的元数据检查不能把 CLI `--schema` 固化到输出脚本，也不能在过程内部用 `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` 推断。达梦执行存储过程时该上下文可能变为过程定义者的默认 schema；应以 `CURRENT_SCHID` 作为当前模式的运行时依据。仅含当前模式、表名和列名的列存在性检查，可改写为 `SYS.SYSOBJECTS` 与 `SYS.SYSCOLUMNS` 的窄查询，并用原始名称与其大写形式的等值候选匹配，避免在字典列上调用 `UPPER()` 导致全量扫描；含类型、长度、可空性等附加条件的复杂检查仍使用 `SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)` 配合 `ALL_TAB_COLUMNS`。两种输出都不得固化 CLI schema。
 - 存储过程通过动态 DDL 修改对象后，后续静态 SQL 继续访问同一对象可能因编译期对象不存在、列定义变化或执行计划版本失效而报对象无效或 `-7184`。应按执行顺序判断：静态访问全部发生在最终 DDL 之前时无需改写；DDL 后无输入变量的 `UPDATE`、`INSERT`、`DELETE`、`MERGE` 和 `SELECT ... INTO` 可整体改为 `EXECUTE IMMEDIATE`。涉及过程参数、局部变量输入、动态对象名、循环或无法可靠解析的控制流时保留原 SQL 并进入人工确认，不能只改写其中一部分。
 - 扫描 `EXECUTE IMMEDIATE` 内的长 SQL 字面量时不能使用逐字符递归回溯的正则表达式；真实升级脚本可能在较小 JVM 线程栈上触发 `StackOverflowError`。应按引号和注释边界线性扫描，再对提取出的 DDL 做精确匹配。
