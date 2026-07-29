@@ -340,6 +340,39 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void removesMysqlNumericAttributesBeforeWrappingProcedureAlterDdl() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260423.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE add_direction()
+                BEGIN
+                    IF 1 = 1 THEN
+                        ALTER TABLE ns_ipaas_interface
+                            ADD COLUMN direction tinyint(1) unsigned zerofill DEFAULT '0';
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-center-pay",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(Files.readString(sqlRootOut.resolve("20260423.sql")))
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_ipaas_interface")
+                .contains("ADD direction tinyint DEFAULT ''0'''")
+                .doesNotContainIgnoringCase("unsigned")
+                .doesNotContainIgnoringCase("zerofill");
+    }
+
+    @Test
     void writesExecutableNoOpsForConsumedMysqlStatementsInStrictValidationPlan() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
