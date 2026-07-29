@@ -277,6 +277,36 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsMysqlUseToDamengSetSchemaWithoutHardcodedProjectSchema() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205.sql"), """
+                USE newsee-center-pay;
+                USE `tenant-database`;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "configured-schema-must-not-be-substituted",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260205.sql"));
+        assertThat(converted)
+                .contains("SET SCHEMA \"newsee-center-pay\";")
+                .contains("SET SCHEMA \"tenant-database\";")
+                .doesNotContainIgnoringCase("USE ");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_USE_SCHEMA_TO_DM_RULE));
+    }
+
+    @Test
     void writesExecutableNoOpsForConsumedMysqlStatementsInStrictValidationPlan() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");

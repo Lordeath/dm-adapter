@@ -684,6 +684,31 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesMysqlZerofillNumericAttributeFromCreateAndAlterTable() {
+        SqlConversionResult createResult = converter.convert("""
+                CREATE TABLE ns_ipaas_interface_type (
+                  direction tinyint(1) unsigned zerofill DEFAULT '0'
+                )
+                """);
+        SqlConversionResult alterResult = converter.convert(
+                "ALTER TABLE ns_ipaas_interface ADD COLUMN direction tinyint(1) zerofill unsigned DEFAULT '0'"
+        );
+
+        assertThat(createResult.convertedSql())
+                .contains("direction tinyint DEFAULT '0'")
+                .doesNotContainIgnoringCase("unsigned")
+                .doesNotContainIgnoringCase("zerofill");
+        assertThat(alterResult.convertedSql())
+                .contains("direction tinyint DEFAULT '0'")
+                .doesNotContainIgnoringCase("unsigned")
+                .doesNotContainIgnoringCase("zerofill");
+        assertThat(createResult.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE);
+        assertThat(alterResult.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE);
+    }
+
+    @Test
     void movesInlinePrimaryKeyFromIdentityColumnToTableConstraint() {
         SqlConversionResult result = converter.convert("""
                 CREATE TABLE IF NOT EXISTS ns_core_role_del (

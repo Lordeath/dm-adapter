@@ -66,6 +66,8 @@ class SqlScriptMigrator {
             "MYSQL_SQL_STRING_JSON_ESCAPE_TO_DM";
     static final String MYSQL_FOREIGN_KEY_CHECKS_NOOP_RULE =
             "MYSQL_FOREIGN_KEY_CHECKS_NOOP";
+    static final String MYSQL_USE_SCHEMA_TO_DM_RULE =
+            "MYSQL_USE_SCHEMA_TO_DM";
     static final String MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE =
             "MYSQL_SCRIPT_USER_VARIABLE_LITERAL";
     static final String MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE =
@@ -2465,6 +2467,9 @@ class SqlScriptMigrator {
         rules.addAll(safeRuleConversion.appliedRules());
         rules.addAll(sqlConversion.appliedRules());
         String convertedBody = sqlConversion.convertedSql();
+        if (rules.contains(MYSQL_USE_SCHEMA_TO_DM_RULE)) {
+            convertedBody = normalizeDamengSetSchemaIdentifier(convertedBody);
+        }
         if (MYSQL_PREFIX_INDEX_DDL_PATTERN.matcher(sqlBody).find()
                 && DM_PREFIX_FUNCTION_INDEX_PATTERN.matcher(convertedBody).find()) {
             rules.add(MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE);
@@ -4127,6 +4132,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_FOREIGN_KEY_CHECKS_NOOP_RULE);
         }
 
+        String useSchemaSql = convertMysqlUseSchemaToDm(converted);
+        if (!useSchemaSql.equals(converted)) {
+            converted = useSchemaSql;
+            rules.add(MYSQL_USE_SCHEMA_TO_DM_RULE);
+        }
+
         String dropProcedureSql = addDropProcedureIfExists(converted);
         if (!dropProcedureSql.equals(converted)) {
             converted = dropProcedureSql;
@@ -4779,6 +4790,34 @@ class SqlScriptMigrator {
             return sql;
         }
         return "-- DM_ADAPTER: ignored MySQL FOREIGN_KEY_CHECKS = " + matcher.group(1);
+    }
+
+    private String convertMysqlUseSchemaToDm(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*USE\\s+(?<schema>`(?:``|[^`])+`|\"(?:\"\"|[^\"])+\"|[A-Za-z0-9_$-]+)\\s*$"
+        ).matcher(sql);
+        if (!matcher.matches()) {
+            return sql;
+        }
+        String schema = unquoteIdentifier(matcher.group("schema"));
+        if (Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*").matcher(schema).matches()) {
+            return "SET SCHEMA " + schema;
+        }
+        return "SET SCHEMA `" + schema.replace("`", "``") + "`";
+    }
+
+    private String normalizeDamengSetSchemaIdentifier(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+SCHEMA\\s+`(?<schema>(?:``|[^`])+)`\\s*$"
+        ).matcher(sql);
+        if (!matcher.matches()) {
+            return sql;
+        }
+        String schema = matcher.group("schema").replace("``", "`");
+        return "SET SCHEMA \"" + schema.replace("\"", "\"\"") + "\"";
     }
 
     private String convertSystemMetadataScalarIdSubqueries(String sql) {
