@@ -3095,6 +3095,40 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlInformationSchemaTableExistsForDifferentRuntimeSchemas() {
+        for (String schema : List.of("tenant_alpha", "tenant_beta")) {
+            SqlConversionResult result = converter.convert("""
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = '%s' AND table_name = #{tableName}
+                    """.formatted(schema));
+
+            assertThat(result.changed()).isTrue();
+            assertThat(result.manualReviewRequired()).isFalse();
+            assertThat(result.convertedSql())
+                    .isEqualTo("SELECT 1 FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})"
+                            + " AND OWNER = UPPER('" + schema + "')");
+            assertThat(result.appliedRules())
+                    .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+        }
+    }
+
+    @Test
+    void convertsMysqlInformationSchemaTableExistsForCurrentRuntimeSchema() {
+        SqlConversionResult result = converter.convert("""
+                select 1 from information_schema.tables
+                where table_schema=(select database()) and table_name = #{tableName}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .isEqualTo("SELECT 1 FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})"
+                        + " AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+    }
+
+    @Test
     void convertsMysqlInformationSchemaTablesListQueryToAllTables() {
         SqlConversionResult result = converter.convert("""
                 SELECT table_name FROM information_schema.tables

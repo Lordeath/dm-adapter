@@ -1777,6 +1777,39 @@ class MapperMigratorTest {
     }
 
     @Test
+    void tableExistenceMetadataQueryIsRewrittenWithoutManualReview() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/NoticeMapper.xml", """
+                select 1 from information_schema.tables
+                where table_schema=(select database()) and table_name = #{tableName}
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/NoticeMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/NoticeMapper.xml"));
+        assertThat(rewritten)
+                .contains("SELECT 1 FROM ALL_TABLES")
+                .contains("TABLE_NAME = UPPER(#{tableName})")
+                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .doesNotContain("information_schema")
+                .doesNotContain("database()");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicInformationSchemaColumnsWithIncludeIsRewrittenToDamengMetadataViews() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
