@@ -4668,7 +4668,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void marksRoutineThatMutatesItsStaticDependencyForManualReview() throws Exception {
+    void keepsStaticDependencyBeforeFinalDdlWithoutManualReview() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE PROCEDURE unsafe_demo()
                 BEGIN
@@ -4679,10 +4679,109 @@ class SqlScriptMigratorTest {
                 CALL unsafe_demo();
                 """);
 
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT COUNT(*) FROM demo")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ADD status INT'")
+                .doesNotContain("EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM demo'");
+    }
+
+    @Test
+    void rewritesStaticUpdateJoinAfterDynamicDdl() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE change_demo()
+                BEGIN
+                    ALTER TABLE demo ADD status VARCHAR(20);
+                    UPDATE demo
+                    INNER JOIN demo_source ON demo.id = demo_source.id
+                    SET demo.status = 'ready';
+                END;
+                /
+                CALL change_demo();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ADD status VARCHAR(20)'")
+                .contains("EXECUTE IMMEDIATE 'UPDATE demo")
+                .contains("INNER JOIN demo_source ON demo.id = demo_source.id")
+                .contains("SET demo.status = ''ready'''")
+                .doesNotContain("newsee-system.");
+        assertThat(converted.report().files()).singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE));
+    }
+
+    @Test
+    void rewritesSelectIntoAndInsertAfterConditionalCreate() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE add_menu_version()
+                BEGIN
+                    DECLARE dm_adapter_exists INT DEFAULT 0;
+                    CREATE TABLE IF NOT EXISTS ns_menu_version (
+                        ver INT PRIMARY KEY
+                    );
+                    SELECT COUNT(*) INTO dm_adapter_exists FROM (
+                        SELECT 1 FROM ns_menu_version
+                    ) dm_adapter_exists_check;
+                    IF dm_adapter_exists = 0 THEN
+                        INSERT INTO ns_menu_version(ver) VALUES (1);
+                    END IF;
+                END;
+                /
+                CALL add_menu_version();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ns_menu_version")
+                .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM (")
+                .contains("SELECT 1 FROM ns_menu_version")
+                .contains("' INTO dm_adapter_exists")
+                .contains("EXECUTE IMMEDIATE 'INSERT INTO ns_menu_version(ver) VALUES (1)'");
+    }
+
+    @Test
+    void keepsPostDdlDmlWithProcedureInputForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE change_demo(new_status VARCHAR(20))
+                BEGIN
+                    ALTER TABLE demo ADD status VARCHAR(20);
+                    UPDATE demo SET status = new_status;
+                END;
+                /
+                CALL change_demo('ready');
+                """);
+
         assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
         assertThat(converted.report().manualReviewItems())
                 .extracting(SqlScriptManualReviewItem::reason)
-                .anySatisfy(reason -> assertThat(reason).contains("-7184"));
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("第一版不自动生成 USING 绑定")
+                        .contains("`demo`"));
+        assertThat(converted.sql())
+                .contains("UPDATE demo SET status = new_status")
+                .doesNotContain("EXECUTE IMMEDIATE 'UPDATE demo SET status = new_status'");
+    }
+
+    @Test
+    void keepsLoopWithSameObjectDdlForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE change_demo()
+                BEGIN
+                    WHILE 1 = 0 DO
+                        ALTER TABLE demo ADD status INT;
+                        UPDATE demo SET status = 1;
+                    END WHILE;
+                END;
+                /
+                CALL change_demo();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
+        assertThat(converted.report().manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::reason)
+                .anySatisfy(reason -> assertThat(reason).contains("循环"));
     }
 
     @Test

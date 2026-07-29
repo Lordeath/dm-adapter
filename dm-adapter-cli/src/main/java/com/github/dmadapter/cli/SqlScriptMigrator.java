@@ -107,6 +107,8 @@ class SqlScriptMigrator {
             "MYSQL_VARCHAR_LENGTH_SEMANTICS_TO_DM";
     static final String DM_PROCEDURE_RECOMPILE_AFTER_DDL_RULE =
             "DM_PROCEDURE_RECOMPILE_AFTER_DDL";
+    static final String DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE =
+            "DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC";
     static final String MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE_RULE =
             "MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE";
     static final String MYSQL_CREATE_TABLE_INLINE_KEY_REMOVAL_RULE =
@@ -710,37 +712,46 @@ class SqlScriptMigrator {
             LinkedHashSet<Integer> manualIndexes = new LinkedHashSet<>();
             LinkedHashSet<String> rules = new LinkedHashSet<>(file.appliedRules());
             int insertedRecompileCount = 0;
+            int rewrittenRoutineCount = 0;
             for (int oldIndex = 0; oldIndex < file.statements().size(); oldIndex++) {
                 String statement = file.statements().get(oldIndex);
                 int oldStatementIndex = oldIndex + 1;
                 ProcedureReference created = procedureReferenceFromCreateProcedure(statement, file.schema());
                 if (created != null) {
-                    Set<TableKey> staticDependencies = staticRoutineTableDependencies(statement, file.schema());
+                    RoutineSameObjectRewrite sameObjectRewrite = rewritePostDdlStaticSql(
+                            statement,
+                            file.schema(),
+                            knownExistingTables
+                    );
+                    String convertedStatement = sameObjectRewrite.sql();
+                    if (sameObjectRewrite.changed()) {
+                        rewrittenRoutineCount++;
+                        rules.add(DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE);
+                    }
+                    Set<TableKey> staticDependencies =
+                            staticRoutineTableDependencies(convertedStatement, file.schema());
                     DynamicDdlDependencies dynamicDependencies =
-                            dynamicRoutineDdlDependencies(statement, file.schema());
-                    Set<TableKey> unsafeDynamicTables = new LinkedHashSet<>(
-                            intersection(staticDependencies, dynamicDependencies.tables())
-                    );
-                    unsafeDynamicTables.removeAll(
-                            intersection(dynamicDependencies.conditionalCreates(), knownExistingTables)
-                    );
+                            dynamicRoutineDdlDependencies(convertedStatement, file.schema());
                     boolean unsafe = dynamicDependencies.unresolved()
-                            || !unsafeDynamicTables.isEmpty();
+                            || !sameObjectRewrite.unsafeTables().isEmpty();
                     int newIndex = statements.size() + 1;
-                    statements.add(statement);
+                    statements.add(convertedStatement);
                     boolean alreadyManual = file.manualReviewStatementIndexes().contains(oldStatementIndex);
                     if (alreadyManual || unsafe) {
                         manualIndexes.add(newIndex);
                     }
                     if (unsafe && !alreadyManual) {
+                        String reason = sameObjectRoutineManualReason(
+                                dynamicDependencies.unresolved(),
+                                sameObjectRewrite
+                        );
                         manualReviewItems.add(new SqlScriptManualReviewItem(
                                 file.sourceDisplay(),
                                 file.outputDisplay(),
                                 newIndex,
-                                "存储过程同时静态访问并动态修改同一对象，或动态 DDL 对象名无法静态解析；"
-                                        + "为避免达梦 -7184 对象版本变化，不自动改写，请人工拆分 DDL/DML 或改为可审计的动态 SQL。",
+                                reason,
                                 statement,
-                                statement
+                                convertedStatement
                         ));
                     }
                     procedures.put(
@@ -821,9 +832,9 @@ class SqlScriptMigrator {
                     file.schema(),
                     file.systemScript(),
                     file.written(),
-                    file.converted() || insertedRecompileCount > 0,
+                    file.converted() || insertedRecompileCount > 0 || rewrittenRoutineCount > 0,
                     file.originalStatementCount(),
-                    file.convertedStatementCount() + insertedRecompileCount,
+                    file.convertedStatementCount() + insertedRecompileCount + rewrittenRoutineCount,
                     manualIndexes.size(),
                     manualIndexes,
                     List.copyOf(rules),
@@ -855,25 +866,343 @@ class SqlScriptMigrator {
         return matcher.find() ? procedureReference(matcher.group("name"), defaultSchema) : null;
     }
 
+    private RoutineSameObjectRewrite rewritePostDdlStaticSql(
+            String sql,
+            String defaultSchema,
+            Set<TableKey> knownExistingTables
+    ) {
+        DynamicDdlScan dynamicDdl = scanDynamicRoutineDdl(sql, defaultSchema);
+        List<RoutineTableReference> staticReferences = staticRoutineTableReferences(sql, defaultSchema);
+        LinkedHashSet<Integer> riskyReferenceIndexes = new LinkedHashSet<>();
+        LinkedHashSet<TableKey> riskyTables = new LinkedHashSet<>();
+        for (int index = 0; index < staticReferences.size(); index++) {
+            RoutineTableReference reference = staticReferences.get(index);
+            if (hasPrecedingDynamicDdl(reference, dynamicDdl.events(), knownExistingTables)) {
+                riskyReferenceIndexes.add(index);
+                riskyTables.add(reference.table());
+            }
+        }
+        if (riskyReferenceIndexes.isEmpty()) {
+            return RoutineSameObjectRewrite.unchanged(sql);
+        }
+        if (dynamicDdl.unresolved()) {
+            return RoutineSameObjectRewrite.unsafe(
+                    sql,
+                    riskyTables,
+                    "动态 DDL 对象名无法静态解析"
+            );
+        }
+        if (containsUnsupportedRoutineVersionControlFlow(sql)) {
+            return RoutineSameObjectRewrite.unsafe(
+                    sql,
+                    riskyTables,
+                    "过程包含循环、GOTO 或异常跳转，无法可靠确定 DDL 与后续 SQL 的执行顺序"
+            );
+        }
+
+        Map<String, String> variableNames = procedureVariableNamesByLowercase(sql);
+        List<RoutineSqlStatement> routineStatements = routineSqlStatements(sql);
+        List<RoutineTextReplacement> replacements = new ArrayList<>();
+        LinkedHashSet<Integer> coveredReferences = new LinkedHashSet<>();
+        for (RoutineSqlStatement routineStatement : routineStatements) {
+            LinkedHashSet<Integer> statementRiskyReferences = new LinkedHashSet<>();
+            for (int referenceIndex : riskyReferenceIndexes) {
+                int position = staticReferences.get(referenceIndex).index();
+                if (position >= routineStatement.start() && position < routineStatement.end()) {
+                    statementRiskyReferences.add(referenceIndex);
+                }
+            }
+            if (statementRiskyReferences.isEmpty()) {
+                continue;
+            }
+            String staticSql = sql.substring(routineStatement.start(), routineStatement.end());
+            RoutineStaticSqlConversion conversion = convertRoutineStaticSqlToDynamic(
+                    staticSql,
+                    variableNames
+            );
+            if (!conversion.supported()) {
+                return RoutineSameObjectRewrite.unsafe(sql, riskyTables, conversion.reason());
+            }
+            replacements.add(new RoutineTextReplacement(
+                    routineStatement.start(),
+                    routineStatement.end(),
+                    conversion.sql()
+            ));
+            coveredReferences.addAll(statementRiskyReferences);
+        }
+        if (!coveredReferences.containsAll(riskyReferenceIndexes)) {
+            return RoutineSameObjectRewrite.unsafe(
+                    sql,
+                    riskyTables,
+                    "DDL 后的同表静态 SQL 不是可独立动态化的 DML 或 SELECT ... INTO 语句"
+            );
+        }
+
+        StringBuilder converted = new StringBuilder(sql);
+        for (int index = replacements.size() - 1; index >= 0; index--) {
+            RoutineTextReplacement replacement = replacements.get(index);
+            converted.replace(replacement.start(), replacement.end(), replacement.replacement());
+        }
+        return new RoutineSameObjectRewrite(
+                converted.toString(),
+                !replacements.isEmpty(),
+                Set.of(),
+                ""
+        );
+    }
+
+    private boolean hasPrecedingDynamicDdl(
+            RoutineTableReference reference,
+            List<DynamicDdlEvent> events,
+            Set<TableKey> knownExistingTables
+    ) {
+        for (DynamicDdlEvent event : events) {
+            if (event.index() >= reference.index() || !event.table().equals(reference.table())) {
+                continue;
+            }
+            if (event.conditionalCreate() && knownExistingTables.contains(event.table())) {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private boolean containsUnsupportedRoutineVersionControlFlow(String sql) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        return Pattern.compile("(?is)\\b(?:LOOP|GOTO|EXCEPTION)\\b").matcher(searchable).find();
+    }
+
+    private List<RoutineSqlStatement> routineSqlStatements(String sql) {
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0) {
+            return List.of();
+        }
+        List<RoutineSqlStatement> statements = new ArrayList<>();
+        int parenthesisDepth = 0;
+        int index = beginIndex + "BEGIN".length();
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                parenthesisDepth++;
+                index++;
+            } else if (current == ')') {
+                parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+                index++;
+            } else if (parenthesisDepth == 0 && startsRoutineStaticSql(sql, index)) {
+                int end = findStatementTerminator(sql, index);
+                if (end >= sql.length()) {
+                    return List.of();
+                }
+                statements.add(new RoutineSqlStatement(index, end));
+                index = end + 1;
+            } else {
+                index++;
+            }
+        }
+        return List.copyOf(statements);
+    }
+
+    private boolean startsRoutineStaticSql(String sql, int index) {
+        return startsKeyword(sql, index, "SELECT")
+                || startsKeyword(sql, index, "INSERT")
+                || startsKeyword(sql, index, "UPDATE")
+                || startsKeyword(sql, index, "DELETE")
+                || startsKeyword(sql, index, "MERGE");
+    }
+
+    private RoutineStaticSqlConversion convertRoutineStaticSqlToDynamic(
+            String sql,
+            Map<String, String> variableNames
+    ) {
+        String stripped = sql.strip();
+        if (startsKeyword(stripped, 0, "SELECT")) {
+            int intoIndex = topLevelKeywordIndex(stripped, "INTO");
+            if (intoIndex < 0) {
+                return RoutineStaticSqlConversion.unsupported(
+                        "DDL 后的 SELECT 没有可转换的 INTO 输出变量"
+                );
+            }
+            int fromRelative = topLevelKeywordIndex(
+                    stripped.substring(intoIndex + "INTO".length()),
+                    "FROM"
+            );
+            if (fromRelative < 0) {
+                return RoutineStaticSqlConversion.unsupported(
+                        "无法从 DDL 后的 SELECT ... INTO 中确定 FROM 子句"
+                );
+            }
+            int fromIndex = intoIndex + "INTO".length() + fromRelative;
+            String outputVariables = stripped.substring(intoIndex + "INTO".length(), fromIndex).strip();
+            if (!areKnownProcedureOutputVariables(outputVariables, variableNames)) {
+                return RoutineStaticSqlConversion.unsupported(
+                        "SELECT ... INTO 的输出目标不是已声明的简单过程变量"
+                );
+            }
+            String dynamicSelect = (stripped.substring(0, intoIndex).stripTrailing()
+                    + " "
+                    + stripped.substring(fromIndex).stripLeading()).strip();
+            if (containsProcedureInputVariable(dynamicSelect, variableNames.keySet())) {
+                return RoutineStaticSqlConversion.unsupported(
+                        "DDL 后的 SELECT 引用了过程参数或局部变量作为输入，第一版不自动生成 USING 绑定"
+                );
+            }
+            return RoutineStaticSqlConversion.supported(
+                    "EXECUTE IMMEDIATE "
+                            + sqlStringLiteral(dynamicSelect)
+                            + " INTO "
+                            + outputVariables
+            );
+        }
+        if (!startsKeyword(stripped, 0, "INSERT")
+                && !startsKeyword(stripped, 0, "UPDATE")
+                && !startsKeyword(stripped, 0, "DELETE")
+                && !startsKeyword(stripped, 0, "MERGE")) {
+            return RoutineStaticSqlConversion.unsupported(
+                    "DDL 后的静态 SQL 类型不在安全自动转换范围内"
+            );
+        }
+        if (containsProcedureInputVariable(stripped, variableNames.keySet())) {
+            return RoutineStaticSqlConversion.unsupported(
+                    "DDL 后的 DML 引用了过程参数或局部变量作为输入，第一版不自动生成 USING 绑定"
+            );
+        }
+        return RoutineStaticSqlConversion.supported(
+                "EXECUTE IMMEDIATE " + sqlStringLiteral(stripped)
+        );
+    }
+
+    private boolean areKnownProcedureOutputVariables(
+            String value,
+            Map<String, String> variableNames
+    ) {
+        List<String> outputs = splitTopLevelComma(value);
+        if (outputs.isEmpty()) {
+            return false;
+        }
+        for (String output : outputs) {
+            String stripped = output.strip();
+            if (!Pattern.compile("(?is)^" + SQL_SIMPLE_IDENTIFIER_TOKEN + "$").matcher(stripped).matches()
+                    || !variableNames.containsKey(normalizedProcedureVariableName(stripped))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean containsProcedureInputVariable(String sql, Set<String> variableNames) {
+        if (variableNames.isEmpty()) {
+            return false;
+        }
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (Character.isLetter(current) || current == '_') {
+                int end = index + 1;
+                while (end < sql.length() && isIdentifierPart(sql.charAt(end))) {
+                    end++;
+                }
+                if (variableNames.contains(sql.substring(index, end).toLowerCase(Locale.ROOT))) {
+                    return true;
+                }
+                index = end;
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private String sameObjectRoutineManualReason(
+            boolean unresolvedDynamicDdl,
+            RoutineSameObjectRewrite rewrite
+    ) {
+        List<String> causes = new ArrayList<>();
+        if (unresolvedDynamicDdl) {
+            causes.add("动态 DDL 对象名无法静态解析");
+        }
+        if (!rewrite.unsafeTables().isEmpty()) {
+            String objects = rewrite.unsafeTables().stream()
+                    .map(TableKey::name)
+                    .sorted()
+                    .map(name -> "`" + name + "`")
+                    .collect(Collectors.joining("、"));
+            causes.add("对象 " + objects + " 在动态 DDL 后仍有无法安全动态化的静态 SQL");
+        }
+        if (!rewrite.failureReason().isBlank()
+                && causes.stream().noneMatch(cause -> cause.contains(rewrite.failureReason()))) {
+            causes.add(rewrite.failureReason());
+        }
+        if (causes.isEmpty()) {
+            causes.add("存储过程存在无法安全处理的同对象版本依赖");
+        }
+        return String.join("；", causes)
+                + "；为避免达梦 -7184 对象版本变化，请人工拆分 DDL/DML 或改为可审计的动态 SQL。";
+    }
+
     private Set<TableKey> staticRoutineTableDependencies(String sql, String defaultSchema) {
+        LinkedHashSet<TableKey> tables = new LinkedHashSet<>();
+        for (RoutineTableReference reference : staticRoutineTableReferences(sql, defaultSchema)) {
+            tables.add(reference.table());
+        }
+        return Set.copyOf(tables);
+    }
+
+    private List<RoutineTableReference> staticRoutineTableReferences(String sql, String defaultSchema) {
         String searchable = replaceIgnoredSqlWithSpaces(sql);
         Matcher matcher = Pattern.compile(
                 "(?is)\\b(?:FROM|JOIN|UPDATE|INTO|DELETE\\s+FROM)\\s+(?<table>"
                         + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
         ).matcher(searchable);
-        LinkedHashSet<TableKey> tables = new LinkedHashSet<>();
+        List<RoutineTableReference> references = new ArrayList<>();
         while (matcher.find()) {
             TableKey table = tableKey(matcher.group("table"), defaultSchema);
             if (table != null && !table.name().startsWith("all_") && !table.name().startsWith("v$")) {
-                tables.add(table);
+                references.add(new RoutineTableReference(table, matcher.start()));
             }
         }
-        return Set.copyOf(tables);
+        return List.copyOf(references);
     }
 
     private DynamicDdlDependencies dynamicRoutineDdlDependencies(String sql, String defaultSchema) {
+        DynamicDdlScan scan = scanDynamicRoutineDdl(sql, defaultSchema);
         LinkedHashSet<TableKey> tables = new LinkedHashSet<>();
         LinkedHashSet<TableKey> conditionalCreates = new LinkedHashSet<>();
+        for (DynamicDdlEvent event : scan.events()) {
+            tables.add(event.table());
+            if (event.conditionalCreate()) {
+                conditionalCreates.add(event.table());
+            }
+        }
+        return new DynamicDdlDependencies(
+                Set.copyOf(tables),
+                Set.copyOf(conditionalCreates),
+                scan.unresolved()
+        );
+    }
+
+    private DynamicDdlScan scanDynamicRoutineDdl(String sql, String defaultSchema) {
+        List<DynamicDdlEvent> events = new ArrayList<>();
         boolean unresolved = false;
         Matcher execute = Pattern.compile("(?is)\\bEXECUTE\\s+IMMEDIATE\\b").matcher(sql == null ? "" : sql);
         while (execute.find()) {
@@ -885,23 +1214,17 @@ class SqlScriptMigrator {
             String dynamicSql = decodeMysqlBackslashEscapedString(literal.rawContent());
             TableKey table = alteredTable(dynamicSql, defaultSchema);
             if (table != null) {
-                tables.add(table);
-                if (Pattern.compile("(?is)^\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\b")
-                        .matcher(dynamicSql)
-                        .find()) {
-                    conditionalCreates.add(table);
-                }
+                boolean conditionalCreate = Pattern.compile(
+                        "(?is)^\\s*CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\b"
+                ).matcher(dynamicSql).find();
+                events.add(new DynamicDdlEvent(table, execute.start(), conditionalCreate));
             } else if (Pattern.compile(
                     "(?is)\\b(?:ALTER|CREATE(?:\\s+GLOBAL)?(?:\\s+TEMPORARY)?|DROP|TRUNCATE)\\s+TABLE\\b"
             ).matcher(dynamicSql).find()) {
                 unresolved = true;
             }
         }
-        return new DynamicDdlDependencies(
-                Set.copyOf(tables),
-                Set.copyOf(conditionalCreates),
-                unresolved
-        );
+        return new DynamicDdlScan(List.copyOf(events), unresolved);
     }
 
     private TableKey alteredTable(String sql, String defaultSchema) {
@@ -9496,6 +9819,62 @@ class SqlScriptMigrator {
             conditionalCreates = Set.copyOf(
                     conditionalCreates == null ? Set.of() : conditionalCreates
             );
+        }
+    }
+
+    private record DynamicDdlEvent(TableKey table, int index, boolean conditionalCreate) {
+    }
+
+    private record DynamicDdlScan(List<DynamicDdlEvent> events, boolean unresolved) {
+        private DynamicDdlScan {
+            events = List.copyOf(events == null ? List.of() : events);
+        }
+    }
+
+    private record RoutineTableReference(TableKey table, int index) {
+    }
+
+    private record RoutineSqlStatement(int start, int end) {
+    }
+
+    private record RoutineTextReplacement(int start, int end, String replacement) {
+    }
+
+    private record RoutineSameObjectRewrite(
+            String sql,
+            boolean changed,
+            Set<TableKey> unsafeTables,
+            String failureReason
+    ) {
+        private RoutineSameObjectRewrite {
+            unsafeTables = Set.copyOf(unsafeTables == null ? Set.of() : unsafeTables);
+            failureReason = failureReason == null ? "" : failureReason;
+        }
+
+        static RoutineSameObjectRewrite unchanged(String sql) {
+            return new RoutineSameObjectRewrite(sql, false, Set.of(), "");
+        }
+
+        static RoutineSameObjectRewrite unsafe(
+                String sql,
+                Set<TableKey> unsafeTables,
+                String failureReason
+        ) {
+            return new RoutineSameObjectRewrite(sql, false, unsafeTables, failureReason);
+        }
+    }
+
+    private record RoutineStaticSqlConversion(String sql, boolean supported, String reason) {
+        private RoutineStaticSqlConversion {
+            reason = reason == null ? "" : reason;
+        }
+
+        static RoutineStaticSqlConversion supported(String sql) {
+            return new RoutineStaticSqlConversion(sql, true, "");
+        }
+
+        static RoutineStaticSqlConversion unsupported(String reason) {
+            return new RoutineStaticSqlConversion("", false, reason);
         }
     }
 
