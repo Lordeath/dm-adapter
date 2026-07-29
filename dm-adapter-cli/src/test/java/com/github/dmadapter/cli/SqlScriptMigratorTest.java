@@ -2925,16 +2925,19 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("DROP PROCEDURE IF EXISTS dm_adapter_proc_sample_dictionary_item;")
-                .contains("CREATE OR REPLACE PROCEDURE dm_adapter_proc_sample_dictionary_item() AS")
-                .contains("CALL dm_adapter_proc_sample_dictionary_item();")
+                .contains("DECLARE")
                 .contains("FROM sample_dictionary_item")
                 .contains("INSERT INTO sample_dictionary_item")
-                .doesNotContain("CREATE OR REPLACE PROCEDURE sample_dictionary_item");
+                .doesNotContain("CREATE OR REPLACE PROCEDURE")
+                .doesNotContain("CALL dm_adapter_proc_sample_dictionary_item")
+                .doesNotContain("DROP PROCEDURE IF EXISTS");
         assertThat(report.files())
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
-                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE));
+                        .contains(
+                                SqlScriptMigrator.MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE,
+                                SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE
+                        ));
     }
 
     @Test
@@ -5197,14 +5200,16 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl() AS")
+                .contains("DECLARE")
                 .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("OWNER = dm_adapter_schema")
                 .contains("UPPER(TABLE_NAME) = UPPER('ns_contract_bpm')")
                 .contains("UPPER(COLUMN_NAME) = UPPER('bpmUrl')")
                 .contains("UPPER(DATA_TYPE) IN ('CHAR', 'VARCHAR', 'VARCHAR2') AND CHAR_LENGTH < 300")
                 .contains("IF dm_adapter_exists > 0 THEN")
-                .contains("CALL change_col_ns_contract_bpm_bpmurl()")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE")
+                .doesNotContain("CALL change_col_ns_contract_bpm_bpmurl")
+                .doesNotContain("DROP PROCEDURE IF EXISTS")
                 .doesNotContain("dm_adapter_schema IN VARCHAR")
                 .doesNotContain("SYS_CONTEXT")
                 .doesNotContain("'sample-app'");
@@ -5243,9 +5248,11 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("CREATE OR REPLACE PROCEDURE change_col_ns_contract_bpm_bpmurl () AS")
+                .contains("DECLARE")
                 .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
-                .contains("CALL change_col_ns_contract_bpm_bpmurl ()")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE")
+                .doesNotContain("CALL change_col_ns_contract_bpm_bpmurl")
+                .doesNotContain("DROP PROCEDURE IF EXISTS")
                 .doesNotContain("dm_adapter_schema IN VARCHAR")
                 .doesNotContain("SYS_CONTEXT")
                 .doesNotContain("'sample-app'");
@@ -5276,10 +5283,12 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("CREATE OR REPLACE PROCEDURE add_column_organization_no() AS")
+                .contains("DECLARE")
                 .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("OWNER = dm_adapter_schema")
-                .contains("CALL add_column_organization_no()")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE")
+                .doesNotContain("CALL add_column_organization_no")
+                .doesNotContain("DROP PROCEDURE IF EXISTS")
                 .doesNotContain("INFORMATION_SCHEMA")
                 .doesNotContain("DATABASE()")
                 .doesNotContain("SYS_CONTEXT")
@@ -5579,7 +5588,9 @@ class SqlScriptMigratorTest {
                 .contains("UPPER(COLUMN_NAME) = UPPER('paramName')")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_wms_parameter_setting")
                 .contains("ADD `paramName` varchar(255) DEFAULT NULL'")
-                .contains("CALL add_clo_ns_wms_parameter_setting_paramName()")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE")
+                .doesNotContain("CALL add_clo_ns_wms_parameter_setting_paramName")
+                .doesNotContain("DROP PROCEDURE IF EXISTS")
                 .doesNotContain("dm_adapter_schema IN VARCHAR");
     }
 
@@ -5792,6 +5803,70 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewItems())
                 .extracting(SqlScriptManualReviewItem::reason)
                 .anySatisfy(reason -> assertThat(reason).contains("动态 DDL 对象名无法静态解析"));
+    }
+
+    @Test
+    void collapsesSingleUseDisposableProcedureIntoAnonymousBlock() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                /* demo_table 添加 status 字段 */
+                DROP PROCEDURE IF EXISTS add_demo_status;
+                DELIMITER $$
+                CREATE PROCEDURE add_demo_status()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database())
+                          AND table_name = 'demo_table'
+                          AND column_name = 'status'
+                    ) THEN
+                        ALTER TABLE demo_table ADD status varchar(20) DEFAULT NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL add_demo_status();
+                DROP PROCEDURE IF EXISTS add_demo_status;
+                SELECT 1 FROM dual;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("/* demo_table 添加 status 字段 */")
+                .contains("DECLARE")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo_table ADD status varchar(20) DEFAULT NULL'")
+                .contains("SELECT 1 FROM dual")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE add_demo_status")
+                .doesNotContain("CALL add_demo_status")
+                .doesNotContain("DROP PROCEDURE IF EXISTS add_demo_status");
+        assertThat(SqlScriptParser.statements(converted.sql())).hasSize(2);
+        assertThat(converted.report().files()).singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE));
+    }
+
+    @Test
+    void keepsProcedureObjectWhenItIsCalledMoreThanOnce() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS refresh_demo;
+                DELIMITER $$
+                CREATE PROCEDURE refresh_demo()
+                BEGIN
+                    UPDATE demo_table SET status = 1;
+                END$$
+                DELIMITER ;
+                CALL refresh_demo();
+                DROP PROCEDURE IF EXISTS refresh_demo;
+                CALL refresh_demo();
+                """);
+
+        assertThat(converted.sql())
+                .contains("CREATE OR REPLACE PROCEDURE refresh_demo() AS")
+                .contains("CALL refresh_demo()")
+                .contains("DROP PROCEDURE IF EXISTS refresh_demo");
+        assertThat(converted.report().files()).singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE));
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {
