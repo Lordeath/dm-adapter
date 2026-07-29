@@ -4893,6 +4893,88 @@ class MapperMigratorTest {
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
+    @Test
+    void convertsPeriodDiffWithYearMonthParameterInsideDynamicXml() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/TaskMapper.xml", """
+                select t.id
+                from sample_task t
+                <where>
+                    t.deleted = 0
+                    <if test="criteria.statisticsType != null and criteria.statisticsType == 2">
+                        and PERIOD_DIFF(DATE_FORMAT(t.finished_at, '%Y%m'), #{criteria.yearMonth}) = 0
+                    </if>
+                </where>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TaskMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml"));
+        assertThat(rewritten)
+                .contains("(YEAR(t.finished_at) * 12 + MONTH(t.finished_at))")
+                .contains("CAST(#{criteria.yearMonth} AS DECIMAL(38, 0))")
+                .doesNotContainIgnoringCase("PERIOD_DIFF")
+                .doesNotContainIgnoringCase("DATE_FORMAT");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void convertsNestedDateSubInsideDynamicXml() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/ReportMapper.xml", """
+                select
+                <if test="rangeType == 1">
+                    DATE_FORMAT(
+                        DATE_SUB(
+                            DATE_SUB(#{rangeStart}, INTERVAL WEEKDAY(#{rangeStart}) DAY),
+                            INTERVAL 1 WEEK
+                        ),
+                        '%Y-%m-%d 00:00:00'
+                    )
+                </if>
+                rangeStart
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ReportMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReportMapper.xml"));
+        assertThat(rewritten)
+                .contains("DATEADD(WEEK, -1,")
+                .contains("DATEADD(DAY, (0 - WEEKDAY(#{rangeStart})), #{rangeStart})")
+                .doesNotContainIgnoringCase("DATE_SUB");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
     private int countMatches(String value, String needle) {
         int count = 0;
         int index = 0;

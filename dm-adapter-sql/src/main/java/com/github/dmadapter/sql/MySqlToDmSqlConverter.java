@@ -3154,6 +3154,20 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertDateSubInterval(String sql) {
+        String converted = sql;
+        boolean changed = false;
+        for (int pass = 0; pass < 8; pass++) {
+            GenericConversion conversion = convertDateSubFunctionInterval(converted);
+            if (!conversion.changed()) {
+                break;
+            }
+            converted = conversion.convertedSql();
+            changed = true;
+        }
+        return new GenericConversion(converted, changed);
+    }
+
+    private GenericConversion convertDateSubFunctionInterval(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -3832,10 +3846,45 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         String left = yearMonthExtractExpression(arguments.get(0).text());
         String right = yearMonthExtractExpression(arguments.get(1).text());
-        if (left == null || right == null) {
+        if (left != null && right != null) {
+            return "DATEDIFF(MONTH, " + right + ", " + left + ")";
+        }
+        String leftIndex = yearMonthIndexExpression(arguments.get(0).text(), left);
+        String rightIndex = yearMonthIndexExpression(arguments.get(1).text(), right);
+        if (leftIndex == null || rightIndex == null) {
             return null;
         }
-        return "DATEDIFF(MONTH, " + right + ", " + left + ")";
+        return "(" + leftIndex + " - " + rightIndex + ")";
+    }
+
+    private String yearMonthIndexExpression(String expression, String dateExpression) {
+        if (dateExpression != null) {
+            return "(YEAR(" + dateExpression + ") * 12 + MONTH(" + dateExpression + "))";
+        }
+        String periodExpression = simpleYearMonthPeriodExpression(expression);
+        if (periodExpression == null) {
+            return null;
+        }
+        String numericPeriod = "CAST(" + periodExpression + " AS DECIMAL(38, 0))";
+        String periodYear = "TRUNC(" + numericPeriod + " / 100, 0)";
+        String normalizedYear = "(" + periodYear
+                + " + CASE WHEN " + periodYear + " < 70 THEN 2000"
+                + " WHEN " + periodYear + " < 100 THEN 1900 ELSE 0 END)";
+        return "(" + normalizedYear + " * 12 + MOD(" + numericPeriod + ", 100))";
+    }
+
+    private String simpleYearMonthPeriodExpression(String expression) {
+        String trimmed = expression.trim();
+        if (startsHashMyBatisPlaceholder(trimmed, 0)
+                && skipMyBatisPlaceholder(trimmed, 0) == trimmed.length()) {
+            return trimmed;
+        }
+        if (trimmed.matches("(?:\\d{4}|\\d{6})")
+                || trimmed.matches("'(?:\\d{4}|\\d{6})'")
+                || isSimpleQualifiedIdentifier(trimmed)) {
+            return trimmed;
+        }
+        return null;
     }
 
     private String yearMonthExtractExpression(String expression) {

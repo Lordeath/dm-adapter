@@ -2096,6 +2096,27 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsNestedDateSubIntervalsFromInsideOut() {
+        SqlConversionResult result = converter.convert("""
+                select DATE_FORMAT(
+                    DATE_SUB(
+                        DATE_SUB(#{rangeStart}, INTERVAL WEEKDAY(#{rangeStart}) DAY),
+                        INTERVAL 1 WEEK
+                    ),
+                    '%Y-%m-%d 00:00:00'
+                )
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("DATEADD(WEEK, -1,")
+                .contains("DATEADD(DAY, (0 - WEEKDAY(#{rangeStart})), #{rangeStart})")
+                .doesNotContainIgnoringCase("DATE_SUB");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE);
+    }
+
+    @Test
     void convertsMysqlRegexpOperatorsToRegexpLike() {
         SqlConversionResult result = converter.convert("""
                 update ys_organization y
@@ -3453,6 +3474,52 @@ class MySqlToDmSqlConverterTest {
                 from ns_contract_info
                 """);
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
+    }
+
+    @Test
+    void convertsPeriodDiffBetweenDateAndMyBatisYearMonthParameter() {
+        SqlConversionResult result = converter.convert("""
+                select *
+                from sample_task t
+                where PERIOD_DIFF(DATE_FORMAT(t.finished_at, '%Y%m'), #{criteria.yearMonth}) = 0
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("(YEAR(t.finished_at) * 12 + MONTH(t.finished_at))")
+                .contains("CAST(#{criteria.yearMonth} AS DECIMAL(38, 0))")
+                .contains("THEN 2000")
+                .contains("THEN 1900")
+                .doesNotContainIgnoringCase("PERIOD_DIFF")
+                .doesNotContainIgnoringCase("DATE_FORMAT");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
+    }
+
+    @Test
+    void convertsPeriodDiffWithFourDigitYearMonthLiteral() {
+        SqlConversionResult result = converter.convert("select PERIOD_DIFF(9912, '0001') from dual");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("CAST(9912 AS DECIMAL(38, 0))")
+                .contains("CAST('0001' AS DECIMAL(38, 0))")
+                .contains("THEN 2000")
+                .contains("THEN 1900")
+                .doesNotContainIgnoringCase("PERIOD_DIFF");
+    }
+
+    @Test
+    void keepsComplexPeriodDiffValueExpressionForManualReview() {
+        String sql = "select PERIOD_DIFF(DATE_FORMAT(CURDATE(), '%Y%m'), CONCAT(year_code, month_code)) from dual";
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+        assertThat(result.reason()).contains("PERIOD_DIFF");
     }
 
     @Test
