@@ -1158,25 +1158,26 @@ class SqlScriptMigrator {
                         "DDL 后的 SELECT 没有可转换的 INTO 输出变量"
                 );
             }
-            int fromRelative = topLevelKeywordIndex(
-                    stripped.substring(intoIndex + "INTO".length()),
-                    "FROM"
-            );
-            if (fromRelative < 0) {
+            int fromIndex = topLevelKeywordIndex(stripped, "FROM");
+            if (fromIndex < 0) {
                 return RoutineStaticSqlConversion.unsupported(
                         "无法从 DDL 后的 SELECT ... INTO 中确定 FROM 子句"
                 );
             }
-            int fromIndex = intoIndex + "INTO".length() + fromRelative;
-            String outputVariables = stripped.substring(intoIndex + "INTO".length(), fromIndex).strip();
+            boolean trailingInto = intoIndex > fromIndex;
+            String outputVariables = trailingInto
+                    ? stripped.substring(intoIndex + "INTO".length()).strip()
+                    : stripped.substring(intoIndex + "INTO".length(), fromIndex).strip();
             if (!areKnownProcedureOutputVariables(outputVariables, variableNames)) {
                 return RoutineStaticSqlConversion.unsupported(
                         "SELECT ... INTO 的输出目标不是已声明的简单过程变量"
                 );
             }
-            String dynamicSelect = (stripped.substring(0, intoIndex).stripTrailing()
-                    + " "
-                    + stripped.substring(fromIndex).stripLeading()).strip();
+            String dynamicSelect = trailingInto
+                    ? stripped.substring(0, intoIndex).strip()
+                    : (stripped.substring(0, intoIndex).stripTrailing()
+                            + " "
+                            + stripped.substring(fromIndex).stripLeading()).strip();
             RoutineDynamicBindings bindings = bindRoutineInputVariables(dynamicSelect, variableNames);
             if (!bindings.supported()) {
                 return RoutineStaticSqlConversion.unsupported(
