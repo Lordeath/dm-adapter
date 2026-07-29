@@ -684,8 +684,11 @@ class SqlScriptMigrator {
                     projectRoot,
                     List.copyOf(sourceTables)
             ));
-            if (sqlRoot != null && !sqlRoot.startsWith(projectRoot)) {
-                projectDdlKeyMetadataReader.readTableKeys(sqlRoot, List.copyOf(sourceTables))
+            Path sqlMetadataRoot = sqlRoot == null || sqlRoot.getParent() == null
+                    ? sqlRoot
+                    : sqlRoot.getParent();
+            if (sqlMetadataRoot != null && !sqlMetadataRoot.startsWith(projectRoot)) {
+                projectDdlKeyMetadataReader.readTableKeys(sqlMetadataRoot, List.copyOf(sourceTables))
                         .forEach(metadata::putIfAbsent);
             }
         } catch (IOException e) {
