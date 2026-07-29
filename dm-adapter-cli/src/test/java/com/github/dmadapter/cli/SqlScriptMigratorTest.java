@@ -4219,6 +4219,43 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void classifiesContradictoryColumnNullabilityAsOriginalSql() {
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")
+                    && ((String) args[0]).contains("CREATE TABLE")) {
+                throw new SQLException("第 3 行, 第 65 列[NOT]附近出现错误: 语法分析出错");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "contradictory-nullability.sql",
+                        "sample-city",
+                        List.of("""
+                                CREATE TABLE ns_city_station_message (
+                                    id BIGINT NOT NULL,
+                                    createTime datetime(0) NULL DEFAULT CURRENT_TIMESTAMP(0) NOT NULL,
+                                    note VARCHAR(64) DEFAULT 'NULL and NOT NULL are text'
+                                )
+                                """)
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("ORIGINAL_SQL");
+            assertThat(failure.errorSummary())
+                    .contains("both NULL and NOT NULL")
+                    .contains("fix the source SQL");
+        });
+    }
+
+    @Test
     void schemaPreflightStopsAllSqlStatementsAndReportsOneRootFailure() {
         AtomicInteger businessStatementCount = new AtomicInteger();
         Statement statement = proxy(Statement.class, (ignored, method, args) -> {

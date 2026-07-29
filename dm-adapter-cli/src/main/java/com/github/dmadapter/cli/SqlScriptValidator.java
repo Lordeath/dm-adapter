@@ -333,11 +333,18 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                         ? "VALIDATION_TIMEOUT"
                         : blockedObject.isBlank() ? classify(e, sql) : "BLOCKED_BY_PRIOR_FAILURE";
                 String errorSummary = compact(redact(safeMessage(e), environment));
-                if ("ORIGINAL_SQL".equals(category) && containsDuplicateColumnDefault(sql)) {
-                    errorSummary = compact(
-                            "Original SQL defines multiple DEFAULT clauses for one column; "
-                                    + "fix the source SQL before migration. " + errorSummary
-                    );
+                if ("ORIGINAL_SQL".equals(category)) {
+                    if (containsDuplicateColumnDefault(sql)) {
+                        errorSummary = compact(
+                                "Original SQL defines multiple DEFAULT clauses for one column; "
+                                        + "fix the source SQL before migration. " + errorSummary
+                        );
+                    } else if (containsContradictoryColumnNullability(sql)) {
+                        errorSummary = compact(
+                                "Original SQL defines both NULL and NOT NULL for one column; "
+                                        + "fix the source SQL before migration. " + errorSummary
+                        );
+                    }
                 }
                 if ("OBJECT_DEFINITION_CHANGED".equals(category)) {
                     errorSummary = objectDefinitionChangedSummary(errorSummary, e, recentObjectDdl);
@@ -924,7 +931,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             return "TEST_SCHEMA_FUNCTION";
         }
         if (message.contains("语法") || message.contains("syntax")) {
-            if (containsDuplicateColumnDefault(sql)) {
+            if (containsDuplicateColumnDefault(sql) || containsContradictoryColumnNullability(sql)) {
                 return "ORIGINAL_SQL";
             }
             return "SQL_SYNTAX";
@@ -954,6 +961,80 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                     return true;
                 }
             }
+        }
+        return false;
+    }
+
+    private boolean containsContradictoryColumnNullability(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return false;
+        }
+        String uncommentedSql = sqlWithoutComments(sql);
+        Matcher createTable = Pattern.compile(
+                "(?is)\\bCREATE\\s+(?:(?:GLOBAL\\s+)?TEMPORARY\\s+)?TABLE\\b"
+        ).matcher(uncommentedSql);
+        while (createTable.find()) {
+            int openIndex = nextUnquotedCharacter(uncommentedSql, createTable.end(), '(');
+            if (openIndex < 0) {
+                continue;
+            }
+            int closeIndex = matchingParenthesis(uncommentedSql, openIndex);
+            if (closeIndex < 0) {
+                continue;
+            }
+            for (String definition : splitTopLevelComma(uncommentedSql.substring(openIndex + 1, closeIndex))) {
+                if (hasContradictoryNullability(definition)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasContradictoryNullability(String definition) {
+        boolean explicitNull = false;
+        boolean notNull = false;
+        String previousWord = "";
+        char quote = '\0';
+        for (int index = 0; index < definition.length();) {
+            char current = definition.charAt(index);
+            if (quote != '\0') {
+                if (current == quote) {
+                    if (index + 1 < definition.length() && definition.charAt(index + 1) == quote) {
+                        index += 2;
+                        continue;
+                    }
+                    quote = '\0';
+                }
+                index++;
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                quote = current;
+                index++;
+                continue;
+            }
+            if (!isSqlWordCharacter(current)) {
+                index++;
+                continue;
+            }
+            int end = index + 1;
+            while (end < definition.length() && isSqlWordCharacter(definition.charAt(end))) {
+                end++;
+            }
+            String word = definition.substring(index, end).toUpperCase(Locale.ROOT);
+            if ("NULL".equals(word)) {
+                if ("NOT".equals(previousWord)) {
+                    notNull = true;
+                } else if (!"DEFAULT".equals(previousWord) && !"IS".equals(previousWord)) {
+                    explicitNull = true;
+                }
+            }
+            if (explicitNull && notNull) {
+                return true;
+            }
+            previousWord = word;
+            index = end;
         }
         return false;
     }
