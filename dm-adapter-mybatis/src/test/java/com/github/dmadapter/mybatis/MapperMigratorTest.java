@@ -1290,6 +1290,35 @@ class MapperMigratorTest {
     }
 
     @Test
+    void decimalRatioWithScalarSubqueryDoesNotRequireManualReview() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/RatioMapper.xml", """
+                SELECT ROUND(COUNT(DISTINCT companyId) * 100.0 /
+                    (SELECT COUNT(DISTINCT companyId)
+                     FROM member_charge
+                     WHERE feeYear = #{feeYear}), 2) AS ratio
+                FROM member_charge
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/RatioMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(true).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicOnDuplicateKeyUpdateIsNotRewrittenToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
