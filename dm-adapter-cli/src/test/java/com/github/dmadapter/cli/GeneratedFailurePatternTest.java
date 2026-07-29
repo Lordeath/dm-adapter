@@ -157,6 +157,22 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("ORIGINAL_SQL");
             assertThat(shouldSuggestValidationArguments(validationClass, validation, missingWhereRecord))
                     .isFalse();
+
+            String updateFrom = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: update from ns_meter_divide_area
+                    "set" deleteFlag = 1
+                    where ID in (?, ?)
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object updateFromRecord = failedRecord(validationClass, updateFrom);
+            assertThat(failurePattern(validationClass, validation, updateFromRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, updateFromRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, updateFromRecord))
+                    .isFalse();
         }
     }
 
