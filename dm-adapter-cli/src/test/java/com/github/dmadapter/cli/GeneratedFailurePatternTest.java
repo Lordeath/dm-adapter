@@ -71,6 +71,18 @@ class GeneratedFailurePatternTest {
                     failedRecord(validationClass, missingColumn)
             )).isFalse();
 
+            String missingSchema = """
+                    java.lang.IllegalStateException: Failed to set Dameng schema: example-association
+                    Caused by: dm.jdbc.driver.DMException: 无效的模式名[example-association]
+                    """;
+            Object missingSchemaRecord = failedRecord(validationClass, missingSchema);
+            assertThat(failurePattern(validationClass, validation, missingSchemaRecord))
+                    .isEqualTo("TEST_SCHEMA_OBJECT");
+            assertThat(category(validationClass, validation, missingSchemaRecord))
+                    .isEqualTo("TEST_SCHEMA");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, missingSchemaRecord))
+                    .isFalse();
+
             addDatabaseColumn(
                     validationClass,
                     validation,
