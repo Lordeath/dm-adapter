@@ -89,6 +89,42 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsScriptLeftJoinUpdateWhenProjectDdlProvesSourceKeyUnique() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(tempDir.resolve("sql/00_Create.sql"), """
+                CREATE TABLE sample_header (
+                    id BIGINT NOT NULL,
+                    document_type VARCHAR(40),
+                    PRIMARY KEY (id)
+                );
+                CREATE TABLE sample_detail (
+                    id BIGINT NOT NULL,
+                    header_id BIGINT,
+                    document_type VARCHAR(40),
+                    PRIMARY KEY (id)
+                );
+                """);
+        write(sqlRoot.resolve("20260729.sql"), """
+                UPDATE sample_detail detail
+                LEFT JOIN sample_header header ON detail.header_id = header.id
+                SET detail.document_type = header.document_type;
+                """);
+
+        SqlScriptMigrationReport report = migrateScriptRoot(sqlRoot, sqlRootOut);
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("20260729.sql")))
+                .contains("update sample_detail detail set document_type = "
+                        + "(SELECT header.document_type FROM sample_header header "
+                        + "WHERE detail.header_id = header.id)")
+                .doesNotContain("LEFT JOIN");
+        assertThat(report.files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE));
+    }
+
+    @Test
     void validatesOutputOnlySqlFilesFromOutputRootInRelativePathOrder() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -783,6 +819,43 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void inlinesStableSetAndMultiColumnSelectIntoScriptVariables() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT tenant_id, org_id INTO @tenantId, @unusedOrgId
+                FROM tenant_registry
+                ORDER BY tenant_id ASC
+                LIMIT 1;
+                SET @orgId = (
+                    SELECT MIN(org_id)
+                    FROM tenant_org
+                    WHERE tenant_id = @tenantId
+                );
+                SELECT role_id INTO @unusedRoleId
+                FROM tenant_role
+                WHERE tenant_id = @tenantId
+                ORDER BY role_id
+                LIMIT 1;
+                INSERT INTO tenant_audit(tenant_id, org_id)
+                VALUES (@tenantId, @orgId);
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("query-backed script variables @tenantId, @unusedOrgId")
+                .contains("query-backed script variable @orgId was inlined")
+                .contains("query-backed script variable @unusedRoleId was inlined")
+                .contains("SELECT tenant_id FROM tenant_registry")
+                .contains("SELECT MIN(org_id)")
+                .contains("INSERT INTO tenant_audit(tenant_id, org_id)")
+                .doesNotContain("INTO @")
+                .doesNotContain("SET @")
+                .doesNotContain("VALUES (@");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE));
+    }
+
+    @Test
     void stopsStableQueryVariableInliningBeforeRoutineReassignment() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SELECT id INTO @typeId
@@ -836,7 +909,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void doesNotGroupQueryBackedScriptVariableAcrossStoredRoutine() throws Exception {
+    void inlinesSetQueryBackedScriptVariableAcrossStoredRoutine() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SET @tenant_id := (
                     SELECT MIN(id) FROM tenant
@@ -847,12 +920,14 @@ class SqlScriptMigratorTest {
                 END;
                 """);
 
-        assertThat(converted.report().manualReviewSqlCount()).isGreaterThan(0);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("SET @tenant_id")
-                .doesNotContain("dm_adapter_snapshot_tenant_id");
+                .contains("query-backed script variable @tenant_id was inlined")
+                .contains("VALUES ((SELECT MIN(id) FROM tenant))")
+                .doesNotContain("SET @tenant_id");
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE)
                         .doesNotContain(SqlScriptMigrator.MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE));
     }
 

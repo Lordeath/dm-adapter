@@ -4,6 +4,7 @@ import com.github.dmadapter.core.SqlConversionResult;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -2397,6 +2398,35 @@ class MySqlToDmSqlConverterTest {
                 .contains("at most one source row")
                 .contains("real uniqueness guarantee");
         assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void convertsLeftJoinUpdateToCorrelatedScalarWhenSourceKeyIsProvenUnique() {
+        SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
+                UPDATE sample_detail detail
+                LEFT JOIN sample_header header ON detail.header_id = header.id
+                SET detail.document_type = header.document_type
+                """, Map.of("sample_header", List.of("id")));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update sample_detail detail set document_type = (SELECT header.document_type FROM sample_header header WHERE detail.header_id = header.id)
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE);
+    }
+
+    @Test
+    void keepsLeftJoinUpdateManualWhenJoinDoesNotBindProvenUniqueKey() {
+        SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
+                UPDATE sample_detail detail
+                LEFT JOIN sample_header header ON detail.batch_code = header.batch_code
+                SET detail.document_type = header.document_type
+                """, Map.of("sample_header", List.of("id")));
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("real uniqueness guarantee");
     }
 
     @Test
