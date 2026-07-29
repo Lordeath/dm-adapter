@@ -523,7 +523,10 @@ public class MapperXmlRewriter {
                         convertedSql,
                         staticRules,
                         true,
-                        conversionResult.reason()
+                        rewriteConfig.resolveUpsertManualReviewReason(
+                                statementKey,
+                                conversionResult.reason()
+                        )
                 ));
             }
         }
@@ -7954,7 +7957,10 @@ public class MapperXmlRewriter {
                         rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(plainInsert.text()))
                 );
         List<String> manualReviewReasons = conversionResult.manualReviewRequired()
-                ? List.of(conversionResult.reason())
+                ? List.of(rewriteConfig.resolveUpsertManualReviewReason(
+                        statementKey,
+                        conversionResult.reason()
+                ))
                 : List.of();
         if (!plainInsert.changed() && !conversionResult.changed()) {
             return new TextSegmentConversion(text, List.of(), manualReviewReasons, false);

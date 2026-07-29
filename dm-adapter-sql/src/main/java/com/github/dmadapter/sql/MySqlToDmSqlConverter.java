@@ -1559,6 +1559,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private String unsupportedReason(String sql) {
         if (containsMysqlUpdateJoin(sql)) {
+            if (containsUnresolvedOuterOrCrossUpdateJoin(sql)) {
+                return "MySQL outer/cross UPDATE JOIN could not be converted safely: an equivalent "
+                        + "Dameng rewrite requires proof that each target row receives values from at "
+                        + "most one source row. That cardinality cannot be proven from this SQL; fix "
+                        + "the original join/deduplication or provide a real uniqueness guarantee "
+                        + "instead of choosing an arbitrary source row.";
+            }
             return "MySQL UPDATE JOIN shape could not be converted safely to Dameng UPDATE FROM.";
         }
         if (containsPatternOutsideIgnoredText(sql, Pattern.compile("<=>"))) {
@@ -6953,6 +6960,17 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return false;
         }
         return findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length()) >= 0;
+    }
+
+    private boolean containsUnresolvedOuterOrCrossUpdateJoin(String sql) {
+        int updateIndex = leadingWhitespaceLength(sql);
+        int joinIndex = findTopLevelKeyword(sql, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return false;
+        }
+        int setIndex = findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length());
+        return setIndex > updateIndex
+                && containsTopLevelOuterOrCrossJoin(sql.substring(updateIndex, setIndex));
     }
 
     private GenericConversion convertMysqlUpdateOrderLimitOne(String sql) {

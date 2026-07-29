@@ -352,7 +352,10 @@ public class MapperAnnotationMigrator {
                             conversion.convertedSql(),
                             withAnnotationRule(conversion.appliedRules()),
                             true,
-                            conversion.reason()
+                            rewriteConfig.resolveUpsertManualReviewReason(
+                                    statement.key(),
+                                    conversion.reason()
+                            )
                     ));
                 }
             }

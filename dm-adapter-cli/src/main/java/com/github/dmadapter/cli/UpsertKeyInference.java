@@ -1,5 +1,7 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.mybatis.SqlRewriteConfig;
+
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -9,13 +11,13 @@ import java.util.Set;
 
 final class UpsertKeyInference {
     static final String RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY =
-            "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
+            SqlRewriteConfig.ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY;
     static final String RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT =
             "INSERT_IGNORE_AS_PLAIN_INSERT";
     static final String RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED =
-            "MANUAL_KEY_COLUMNS_REQUIRED";
+            SqlRewriteConfig.MANUAL_KEY_COLUMNS_REQUIRED;
     static final String RESOLUTION_METADATA_UNAVAILABLE =
-            "KEY_METADATA_UNAVAILABLE";
+            SqlRewriteConfig.KEY_METADATA_UNAVAILABLE;
 
     Optional<InferenceResult> infer(RewriteConfigCandidate candidate, TableKeyMetadata metadata) {
         if (metadata == null || !metadata.tableFound()) {
