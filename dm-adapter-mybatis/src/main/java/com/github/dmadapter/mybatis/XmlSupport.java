@@ -1,12 +1,10 @@
 package com.github.dmadapter.mybatis;
 
 import org.w3c.dom.Document;
-import org.xml.sax.InputSource;
 
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
-import java.io.Reader;
-import java.nio.charset.StandardCharsets;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -23,8 +21,8 @@ final class XmlSupport {
         enableFeature(factory, "http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
         enableFeature(factory, "http://xml.org/sax/features/external-general-entities", false);
         enableFeature(factory, "http://xml.org/sax/features/external-parameter-entities", false);
-        try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
-            return factory.newDocumentBuilder().parse(new InputSource(reader));
+        try (InputStream input = Files.newInputStream(path)) {
+            return factory.newDocumentBuilder().parse(input);
         }
     }
 

@@ -2311,6 +2311,7 @@ class DmSqlValidationTestGenerator {
                 private List<String> splitTopLevelComma(String text) {
                     List<String> parts = new ArrayList<>();
                     int depth = 0;
+                    int placeholderDepth = 0;
                     boolean inSingleQuote = false;
                     boolean inDoubleQuote = false;
                     int start = 0;
@@ -2325,7 +2326,14 @@ class DmSqlValidationTestGenerator {
                                 depth++;
                             } else if (ch == ')') {
                                 depth--;
-                            } else if (ch == ',' && depth == 0) {
+                            } else if ((ch == '#' || ch == '$')
+                                    && i + 1 < text.length()
+                                    && text.charAt(i + 1) == '{') {
+                                placeholderDepth++;
+                                i++;
+                            } else if (ch == '}' && placeholderDepth > 0) {
+                                placeholderDepth--;
+                            } else if (ch == ',' && depth == 0 && placeholderDepth == 0) {
                                 parts.add(text.substring(start, i).trim());
                                 start = i + 1;
                             }
@@ -5357,6 +5365,13 @@ class DmSqlValidationTestGenerator {
                                         field.getName(),
                                         existingDefault
                                 );
+                                if (configuredValueIncompatibleWithColumn(
+                                        field.getName(),
+                                        configured,
+                                        statement
+                                )) {
+                                    continue;
+                                }
                                 Object nestedCollection = nestedConfiguredCollectionValue(
                                         existingDefault,
                                         configured,
