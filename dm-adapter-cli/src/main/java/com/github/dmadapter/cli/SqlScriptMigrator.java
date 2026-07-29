@@ -2355,7 +2355,21 @@ class SqlScriptMigrator {
         List<UserVariableReference> references = mysqlUserVariableReferences(statement).stream()
                 .filter(reference -> reference.name().equalsIgnoreCase(variableName))
                 .toList();
-        return !references.isEmpty() && hasUnsafeUserVariableAssignment(statement, references);
+        for (UserVariableReference reference : references) {
+            int cursor = skipWhitespace(statement, reference.end());
+            boolean assignmentOperator = cursor < statement.length()
+                    && (statement.charAt(cursor) == '='
+                    || (cursor + 1 < statement.length()
+                    && statement.charAt(cursor) == ':'
+                    && statement.charAt(cursor + 1) == '='));
+            if (previousWordIsKeyword(statement, reference.start(), "INTO")
+                    || (assignmentOperator
+                    && (previousWordIsKeyword(statement, reference.start(), "SET")
+                    || statementStartsWithKeyword(statement, reference.start(), "SET")))) {
+                return true;
+            }
+        }
+        return hasUnsafeUserVariableAssignment(statement, references);
     }
 
     private boolean queryUserVariableSourceChanges(
