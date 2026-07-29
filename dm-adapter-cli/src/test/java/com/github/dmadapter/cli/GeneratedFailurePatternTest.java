@@ -392,6 +392,7 @@ class GeneratedFailurePatternTest {
 
                 public class SamplePayment {
                     public String isMonthClosing;
+                    public String roleIds;
                 }
                 """, StandardCharsets.UTF_8);
         Path classes = tempDir.resolve("classes");
@@ -541,6 +542,35 @@ class GeneratedFailurePatternTest {
             );
             Object generatedPayment = valueField.get(nullPojoResult);
             assertThat(generatedPayment).isInstanceOf(paymentClass);
+
+            Object branchMetadata = dynamicIdentifierMetadata(
+                    validationClass,
+                    validation,
+                    """
+                            <select id="byRole">
+                                select a.id from payment a
+                                where
+                                <if test="roleIds == ''">
+                                    a.user_id = #{userId}
+                                </if>
+                                <if test="roleIds != null and roleIds != ''">
+                                    (a.user_id = #{userId} or a.role_id in (${roleIds}))
+                                </if>
+                                and a.delete_flag = 0
+                            </select>
+                            """
+            );
+            Object branchStatement = mapperStatement(validationClass, branchMetadata);
+            Object configuredBranchPojo = configuredPojoValue.invoke(
+                    validation,
+                    paymentClass,
+                    paymentClass,
+                    java.util.Collections.singletonMap("roleIds", null),
+                    branchStatement
+            );
+            Object branchPayment = valueField.get(configuredBranchPojo);
+            Field roleIds = paymentClass.getDeclaredField("roleIds");
+            assertThat(roleIds.get(branchPayment)).isEqualTo("");
 
             Path bomMapper = tempDir.resolve("bom-mapper.xml");
             Files.writeString(
