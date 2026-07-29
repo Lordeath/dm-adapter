@@ -271,6 +271,40 @@ class GeneratedFailurePatternTest {
                     validation,
                     boundValueAsPredicateRecord
             )).isFalse();
+
+            String missingPojoProperty = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: org.apache.ibatis.reflection.ReflectionException:
+                    There is no getter for property named 'zipCode' in 'class com.newsee.city.entity.base.Regions'
+                    ### The error may exist in mapper-dm/base/RegionsMapper.xml
+                    ### The error may involve com.newsee.city.dao.base.RegionsMapper.insert
+                    ### SQL: insert into ns_city_regions(cityCode) values (?)
+                    """;
+            Object missingPojoPropertyRecord = failedRecord(validationClass, missingPojoProperty);
+            assertThat(failurePattern(validationClass, validation, missingPojoPropertyRecord))
+                    .isEqualTo("ORIGINAL_MAPPER_PROPERTY_NAME_MISMATCH");
+            assertThat(category(validationClass, validation, missingPojoPropertyRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    missingPojoPropertyRecord
+            )).isFalse();
+
+            String genericObjectProperty = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    There is no getter for property named 'zipCode' in 'class java.lang.Object'
+                    """;
+            Object genericObjectPropertyRecord = failedRecord(validationClass, genericObjectProperty);
+            assertThat(failurePattern(validationClass, validation, genericObjectPropertyRecord))
+                    .isEqualTo("MAPPER_PROPERTY_NAME");
+            assertThat(category(validationClass, validation, genericObjectPropertyRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    genericObjectPropertyRecord
+            )).isTrue();
         }
     }
 
