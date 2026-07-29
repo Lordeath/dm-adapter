@@ -68,6 +68,8 @@ class SqlScriptMigrator {
             "MYSQL_FOREIGN_KEY_CHECKS_NOOP";
     static final String MYSQL_USE_SCHEMA_TO_DM_RULE =
             "MYSQL_USE_SCHEMA_TO_DM";
+    static final String MYSQL_SET_NAMES_NOOP_RULE =
+            "MYSQL_SET_NAMES_NOOP";
     static final String MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE =
             "MYSQL_SCRIPT_USER_VARIABLE_LITERAL";
     static final String MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE =
@@ -4138,6 +4140,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_USE_SCHEMA_TO_DM_RULE);
         }
 
+        String setNamesSql = convertMysqlSetNamesToNoop(converted);
+        if (!setNamesSql.equals(converted)) {
+            converted = setNamesSql;
+            rules.add(MYSQL_SET_NAMES_NOOP_RULE);
+        }
+
         String dropProcedureSql = addDropProcedureIfExists(converted);
         if (!dropProcedureSql.equals(converted)) {
             converted = dropProcedureSql;
@@ -4818,6 +4826,21 @@ class SqlScriptMigrator {
         }
         String schema = matcher.group("schema").replace("``", "`");
         return "SET SCHEMA \"" + schema.replace("\"", "\"\"") + "\"";
+    }
+
+    private String convertMysqlSetNamesToNoop(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*SET\\s+NAMES\\s+(?<charset>'[^']+'|\"[^\"]+\"|[A-Za-z0-9_-]+)"
+                        + "(?:\\s+COLLATE\\s+(?:'[^']+'|\"[^\"]+\"|[A-Za-z0-9_-]+))?\\s*$"
+        ).matcher(sql);
+        if (!matcher.matches()) {
+            return sql;
+        }
+        return "-- DM_ADAPTER: ignored MySQL SET NAMES " + matcher.group("charset")
+                + "; JDBC/DM driver controls the client character encoding";
     }
 
     private String convertSystemMetadataScalarIdSubqueries(String sql) {
