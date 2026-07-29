@@ -70,6 +70,8 @@ class SqlScriptMigrator {
             "MYSQL_FOREIGN_KEY_CHECKS_NOOP";
     static final String MYSQL_USE_SCHEMA_TO_DM_RULE =
             "MYSQL_USE_SCHEMA_TO_DM";
+    static final String MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVAL_RULE =
+            "MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVED";
     static final String MYSQL_SET_NAMES_NOOP_RULE =
             "MYSQL_SET_NAMES_NOOP";
     static final String MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE =
@@ -4803,6 +4805,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_USE_SCHEMA_TO_DM_RULE);
         }
 
+        String unqualifiedTargetSchemaSql = removeConfiguredTargetSchemaQualifiers(converted, targetSchema);
+        if (!unqualifiedTargetSchemaSql.equals(converted)) {
+            converted = unqualifiedTargetSchemaSql;
+            rules.add(MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVAL_RULE);
+        }
+
         String setNamesSql = convertMysqlSetNamesToNoop(converted);
         if (!setNamesSql.equals(converted)) {
             converted = setNamesSql;
@@ -5485,6 +5493,38 @@ class SqlScriptMigrator {
             return sql;
         }
         return "-- DM_ADAPTER: ignored MySQL USE; target schema is selected externally";
+    }
+
+    private String removeConfiguredTargetSchemaQualifiers(String sql, String targetSchema) {
+        String configuredSchema = unquoteIdentifier(targetSchema == null ? "" : targetSchema.trim());
+        if (sql == null || sql.isBlank() || configuredSchema.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        Pattern threePartName = Pattern.compile(
+                "(?is)(?<schema>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*\\.\\s*"
+                        + "(?<object>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*\\.\\s*"
+                        + "(?<member>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")"
+        );
+        String converted = replaceOutsideIgnoredText(sql, threePartName, matcher -> {
+            if (!configuredSchema.equalsIgnoreCase(unquoteIdentifier(matcher.group("schema")))) {
+                return matcher.group();
+            }
+            return matcher.group("object") + "." + matcher.group("member");
+        });
+        Pattern objectName = Pattern.compile(
+                "(?is)(?<prefix>\\b(?:"
+                        + "(?:DELETE\\s+)?FROM|JOIN|UPDATE|INTO|TABLE|REFERENCES|CALL|"
+                        + "PROCEDURE|FUNCTION|TRIGGER|VIEW|SEQUENCE"
+                        + ")\\s+)"
+                        + "(?<schema>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*\\.\\s*"
+                        + "(?<object>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")"
+        );
+        return replaceOutsideIgnoredText(converted, objectName, matcher -> {
+            if (!configuredSchema.equalsIgnoreCase(unquoteIdentifier(matcher.group("schema")))) {
+                return matcher.group();
+            }
+            return matcher.group("prefix") + matcher.group("object");
+        });
     }
 
     private String convertMysqlSetNamesToNoop(String sql) {

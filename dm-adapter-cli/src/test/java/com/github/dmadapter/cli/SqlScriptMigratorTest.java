@@ -6069,6 +6069,54 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void removesOnlyExplicitlyConfiguredSourceSchemaQualifiersWithoutEmbeddingSchema() throws Exception {
+        List<String> outputs = new ArrayList<>();
+        for (String schema : List.of("tenant_alpha", "tenant_beta")) {
+            Path projectRoot = tempDir.resolve("qualified-" + schema);
+            Path sqlRoot = projectRoot.resolve("sql/v2");
+            Path sqlRootOut = projectRoot.resolve("sql/v2-dm");
+            write(sqlRoot.resolve("procedure.sql"), """
+                    DELIMITER $$
+                    CREATE PROCEDURE seed_demo()
+                    BEGIN
+                        INSERT INTO `%1$s`.`demo`(`id`, `status`) VALUES (1, 'ready');
+                        UPDATE `%1$s`.`demo` SET status = 'done' WHERE id = 1;
+                        INSERT INTO audit_log(demo_id)
+                        SELECT d.id FROM `%1$s`.`demo` d WHERE d.status = 'done';
+                    END$$
+                    DELIMITER ;
+                    CALL seed_demo();
+                    """.formatted(schema));
+
+            SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                    new SqlScriptMigrationRequest(
+                            projectRoot,
+                            sqlRoot,
+                            sqlRootOut,
+                            false,
+                            schema,
+                            "",
+                            DmValidationEnvironment.from(Map.of())
+                    )
+            );
+            assertThat(report.manualReviewSqlCount()).isZero();
+            assertThat(report.files()).singleElement().satisfies(file ->
+                    assertThat(file.appliedRules())
+                            .contains(SqlScriptMigrator.MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVAL_RULE));
+            outputs.add(Files.readString(sqlRootOut.resolve("procedure.sql")));
+        }
+
+        assertThat(outputs).hasSize(2);
+        assertThat(outputs.get(0)).isEqualTo(outputs.get(1));
+        assertThat(outputs).allSatisfy(output -> assertThat(output)
+                .contains("INSERT INTO `demo`(`id`, `status`)")
+                .contains("UPDATE `demo` SET status = 'done'")
+                .contains("SELECT d.id FROM `demo` d")
+                .doesNotContain("tenant_alpha")
+                .doesNotContain("tenant_beta"));
+    }
+
+    @Test
     void keepsProcedureObjectWhenItIsCalledMoreThanOnce() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DROP PROCEDURE IF EXISTS refresh_demo;
