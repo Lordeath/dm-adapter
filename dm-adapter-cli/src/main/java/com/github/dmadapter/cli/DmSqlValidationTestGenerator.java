@@ -1549,6 +1549,7 @@ class DmSqlValidationTestGenerator {
                 ) {
                     DynamicIdentifierMetadata metadata = new DynamicIdentifierMetadata();
                     SqlStatementContext sqlContext = sqlStatementContext(statement);
+                    metadata.addReferencedTableNames(sqlContext.tableNames());
                     collectDynamicIdentifierMetadata(
                             statement,
                             new LinkedHashMap<>(),
@@ -2771,7 +2772,7 @@ class DmSqlValidationTestGenerator {
                     String sql = compactSql(statement.getTextContent());
                     String identifier = sqlIdentifierPattern();
                     Matcher matcher = Pattern.compile(
-                            "(?i)\\\\b(?:from|join)\\\\s+(" + identifier + "(?:\\\\s*\\\\.\\\\s*" + identifier + ")?)"
+                            "(?i)\\\\b(?:from|join|update|into)\\\\s+(" + identifier + "(?:\\\\s*\\\\.\\\\s*" + identifier + ")?)"
                                     + "(?:\\\\s+(?:as\\\\s+)?(" + identifier + "))?"
                     ).matcher(sql);
                     while (matcher.find()) {
@@ -11653,6 +11654,10 @@ class DmSqlValidationTestGenerator {
                         }
                         return tableAliases.getOrDefault(normalizeSqlIdentifier(qualifier), "");
                     }
+
+                    private Set<String> tableNames() {
+                        return copySet(new LinkedHashSet<>(tableAliases.values()));
+                    }
                 }
 
                 private static final class DbColumnMetadata {
@@ -12069,6 +12074,18 @@ class DmSqlValidationTestGenerator {
                     private final Map<String, Object> namedDefaultValues = new LinkedHashMap<>();
                     private final Set<String> setDefaultValueNames = new LinkedHashSet<>();
                     private final Set<String> valueExpressionNames = new LinkedHashSet<>();
+                    private final Set<String> referencedTableNames = new LinkedHashSet<>();
+
+                    private void addReferencedTableNames(Collection<String> tableNames) {
+                        if (tableNames == null) {
+                            return;
+                        }
+                        for (String tableName : tableNames) {
+                            if (!isBlank(tableName)) {
+                                referencedTableNames.add(tableName);
+                            }
+                        }
+                    }
 
                     private void addDynamicIdentifierName(String valueName) {
                         String normalized = normalizeMetadataName(valueName);
@@ -12377,7 +12394,7 @@ class DmSqlValidationTestGenerator {
                     }
 
                     private Set<String> referencedTableNames() {
-                        LinkedHashSet<String> tableNames = new LinkedHashSet<>();
+                        LinkedHashSet<String> tableNames = new LinkedHashSet<>(referencedTableNames);
                         addReferencedTableNames(tableNames, collectionColumnReferences.values());
                         for (Map<String, ColumnReference> references : collectionElementColumnReferences.values()) {
                             addReferencedTableNames(tableNames, references.values());
