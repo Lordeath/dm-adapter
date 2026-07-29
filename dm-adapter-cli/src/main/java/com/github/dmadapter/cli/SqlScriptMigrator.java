@@ -7904,8 +7904,10 @@ class SqlScriptMigrator {
             return sql;
         }
         return Pattern.compile(
-                        "(?is)\\bPREPARE\\s+([A-Za-z_][A-Za-z0-9_$]*)\\s+FROM\\s+(@?[A-Za-z_][A-Za-z0-9_$]*)\\s*;\\s*"
-                                + "EXECUTE\\s+\\1\\s*;\\s*"
+                        "(?is)\\bPREPARE\\s+([A-Za-z_][A-Za-z0-9_$]*)\\s+FROM\\s+(@?[A-Za-z_][A-Za-z0-9_$]*)\\s*;"
+                                + SQL_WS_OR_COMMENT_TOKEN
+                                + "EXECUTE\\s+\\1\\s*;"
+                                + SQL_WS_OR_COMMENT_TOKEN
                                 + "DEALLOCATE\\s+PREPARE\\s+\\1\\s*;"
                 )
                 .matcher(sql)
