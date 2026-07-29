@@ -122,6 +122,27 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlHashLineCommentsWithoutChangingMybatisPlaceholdersOrLiterals() {
+        SqlConversionResult result = converter.convert("""
+                SELECT id
+                FROM ns_message_warehouse
+                WHERE enterpriseId = #{enterpriseId}
+                # 防止 OOM
+                AND tag = '# keep literal'
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("WHERE enterpriseId = #{enterpriseId}")
+                .contains("-- 防止 OOM")
+                .contains("AND tag = '# keep literal'")
+                .doesNotContain("\n# 防止 OOM");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_HASH_LINE_COMMENT_RULE);
+    }
+
+    @Test
     void ignoresMysqlMetadataReferencesInsideCommentsAndStrings() {
         SqlConversionResult result = converter.convert("""
                 select 1 as ok

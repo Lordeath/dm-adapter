@@ -173,6 +173,44 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("ORIGINAL_SQL");
             assertThat(shouldSuggestValidationArguments(validationClass, validation, updateFromRecord))
                     .isFalse();
+
+            String missingInsertColumnComma = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: insert into ns_document_center
+                    (`enterpriseId`, `allowDepartment` `allowDepartmentName`, `allowPersonEdit`)
+                    values (?, ?, ?, ?)
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object missingInsertColumnCommaRecord = failedRecord(
+                    validationClass,
+                    missingInsertColumnComma
+            );
+            assertThat(failurePattern(validationClass, validation, missingInsertColumnCommaRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, missingInsertColumnCommaRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    missingInsertColumnCommaRecord
+            )).isFalse();
+
+            String trailingSelectComma = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: SELECT sum(ChargeSum) thisPeriodShould,
+                    sum(tax) thisPeriodShouldTaxAmount,
+                    FROM charge_account_change
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object trailingSelectCommaRecord = failedRecord(validationClass, trailingSelectComma);
+            assertThat(failurePattern(validationClass, validation, trailingSelectCommaRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, trailingSelectCommaRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, trailingSelectCommaRecord))
+                    .isFalse();
         }
     }
 

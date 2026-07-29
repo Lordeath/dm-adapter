@@ -75,6 +75,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE =
             "MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_REMOVED";
     public static final String MYSQL_TRAILING_SEMICOLON_REMOVAL_RULE = "MYSQL_TRAILING_SEMICOLON_REMOVED";
+    public static final String MYSQL_HASH_LINE_COMMENT_RULE = "MYSQL_HASH_LINE_COMMENT_TO_DM";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
     public static final String MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE = "MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY";
@@ -345,6 +346,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String converted = original;
         List<String> rules = new ArrayList<>();
 
+        GenericConversion hashLineCommentConversion = convertMysqlHashLineComments(converted);
+        if (hashLineCommentConversion.changed()) {
+            converted = hashLineCommentConversion.convertedSql();
+            rules.add(MYSQL_HASH_LINE_COMMENT_RULE);
+        }
+
         DoubleQuotedStringConversion doubleQuotedStringConversion = convertDoubleQuotedStringLiterals(converted);
         if (doubleQuotedStringConversion.changed()) {
             converted = doubleQuotedStringConversion.convertedSql();
@@ -372,6 +379,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String original = sql;
         String converted = original;
         List<String> rules = new ArrayList<>();
+
+        GenericConversion hashLineCommentConversion = convertMysqlHashLineComments(converted);
+        if (hashLineCommentConversion.changed()) {
+            converted = hashLineCommentConversion.convertedSql();
+            rules.add(MYSQL_HASH_LINE_COMMENT_RULE);
+        }
 
         DoubleQuotedStringConversion doubleQuotedStringConversion = convertDoubleQuotedStringLiterals(converted);
         if (doubleQuotedStringConversion.changed()) {
@@ -8585,6 +8598,34 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         converted.append('\'');
+    }
+
+    private GenericConversion convertMysqlHashLineComments(String sql) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (sql.startsWith("--", index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '#') {
+                replacements.add(new TextReplacement(index, index + 1, "--"));
+                index = skipUntilLineEnd(sql, index);
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(sql, replacements);
     }
 
     private boolean startsLineComment(String sql, int index) {
