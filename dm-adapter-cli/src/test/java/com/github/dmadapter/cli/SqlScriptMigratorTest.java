@@ -6214,6 +6214,65 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsCompleteSqlPayloadStoredInInsertStringLiteral() throws Exception {
+        Path sqlRoot = tempDir.resolve("embedded/sql/v2");
+        Path sqlRootOut = tempDir.resolve("embedded/sql/v2-dm");
+        write(sqlRoot.resolve("rules.sql"), """
+                INSERT INTO tenant_rule (rule_id, rule_sql)
+                SELECT 1,
+                       'SELECT event_id FROM `tenant_alpha`.`tenant_event` WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)'
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM tenant_rule WHERE rule_id = 1
+                );
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir.resolve("embedded"),
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "tenant_alpha",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        String output = Files.readString(sqlRootOut.resolve("rules.sql"));
+        assertThat(output)
+                .contains("'SELECT event_id FROM `tenant_event` "
+                        + "WHERE created_at >= DATEADD(DAY, -30, CURDATE())'")
+                .doesNotContain("tenant_alpha")
+                .doesNotContain("DATE_SUB");
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE,
+                        SqlScriptMigrator.MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVAL_RULE,
+                        MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE
+                ));
+    }
+
+    @Test
+    void keepsUnsafeEmbeddedSqlPayloadForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                INSERT INTO tenant_rule (rule_id, rule_sql)
+                SELECT 2,
+                       'SELECT TIMESTAMPDIFF(SECOND, started_at, finished_at)/60 FROM tenant_event'
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM tenant_rule WHERE rule_id = 2
+                );
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.sql())
+                .contains("TIMESTAMPDIFF(SECOND, started_at, finished_at)/60");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE));
+    }
+
+    @Test
     void keepsProcedureObjectWhenItIsCalledMoreThanOnce() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DROP PROCEDURE IF EXISTS refresh_demo;

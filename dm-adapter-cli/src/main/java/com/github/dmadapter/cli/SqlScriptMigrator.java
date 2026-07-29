@@ -66,6 +66,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER";
     static final String MYSQL_SQL_STRING_JSON_ESCAPE_TO_DM_RULE =
             "MYSQL_SQL_STRING_JSON_ESCAPE_TO_DM";
+    static final String MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE =
+            "MYSQL_EMBEDDED_SQL_LITERAL_TO_DM";
     static final String MYSQL_FOREIGN_KEY_CHECKS_NOOP_RULE =
             "MYSQL_FOREIGN_KEY_CHECKS_NOOP";
     static final String MYSQL_USE_SCHEMA_TO_DM_RULE =
@@ -2817,7 +2819,9 @@ class SqlScriptMigrator {
         String convertedSql = leadingSqlPrefix.prefix() + convertedBody;
         boolean changed = !convertedSql.equals(originalStatement);
         String manualReason;
-        if (sqlConversion.manualReviewRequired()) {
+        if (!safeRuleConversion.manualReviewReason().isBlank()) {
+            manualReason = safeRuleConversion.manualReviewReason();
+        } else if (sqlConversion.manualReviewRequired()) {
             manualReason = sqlConversion.reason();
         } else {
             long manualCheckStartedAt = System.nanoTime();
@@ -4890,7 +4894,7 @@ class SqlScriptMigrator {
             String targetSchema
     ) {
         if (sql == null || sql.isBlank()) {
-            return new SafeRuleConversion(sql == null ? "" : sql, false, List.of());
+            return new SafeRuleConversion(sql == null ? "" : sql, false, List.of(), "");
         }
         String converted = sql;
         List<String> rules = new ArrayList<>();
@@ -4911,6 +4915,13 @@ class SqlScriptMigrator {
         if (!unqualifiedTargetSchemaSql.equals(converted)) {
             converted = unqualifiedTargetSchemaSql;
             rules.add(MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVAL_RULE);
+        }
+
+        SafeRuleConversion embeddedSqlLiteralConversion =
+                convertEmbeddedSqlLiterals(converted, targetSchema);
+        if (embeddedSqlLiteralConversion.changed()) {
+            converted = embeddedSqlLiteralConversion.sql();
+            rules.addAll(embeddedSqlLiteralConversion.appliedRules());
         }
 
         String setNamesSql = convertMysqlSetNamesToNoop(converted);
@@ -5208,7 +5219,103 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_GROUP_BY_ALIAS_RULE);
         }
 
-        return new SafeRuleConversion(converted, !rules.isEmpty(), rules);
+        return new SafeRuleConversion(
+                converted,
+                !rules.isEmpty(),
+                rules,
+                embeddedSqlLiteralConversion.manualReviewReason()
+        );
+    }
+
+    private SafeRuleConversion convertEmbeddedSqlLiterals(String sql, String targetSchema) {
+        String body = splitLeadingSqlPrefix(sql).body().stripLeading();
+        if (!(startsKeyword(body, 0, "INSERT") || startsKeyword(body, 0, "UPDATE"))) {
+            return new SafeRuleConversion(sql, false, List.of(), "");
+        }
+        StringBuilder rewritten = new StringBuilder(sql.length());
+        LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
+        int index = 0;
+        boolean changed = false;
+        String manualReviewReason = "";
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                SingleQuotedStringContent literal = readSingleQuotedStringContent(sql, index);
+                if (!literal.closed()) {
+                    rewritten.append(sql.substring(index));
+                    break;
+                }
+                String decoded = decodeMysqlBackslashEscapedString(literal.rawContent());
+                if (!startsWithSqlPayloadKeyword(decoded)) {
+                    rewritten.append(sql, index, literal.endIndex());
+                    index = literal.endIndex();
+                    continue;
+                }
+                String payload = removeConfiguredTargetSchemaQualifiers(decoded, targetSchema);
+                SqlConversionResult conversion = converter.convert(payload);
+                if (conversion.manualReviewRequired()) {
+                    if (manualReviewReason.isBlank()) {
+                        manualReviewReason = "作为字段值保存的 SQL 文本需要人工确认："
+                                + conversion.reason();
+                    }
+                    rewritten.append(sql, index, literal.endIndex());
+                    index = literal.endIndex();
+                    continue;
+                }
+                String convertedPayload = conversion.convertedSql();
+                if (convertedPayload.equals(decoded)) {
+                    rewritten.append(sql, index, literal.endIndex());
+                    index = literal.endIndex();
+                    continue;
+                }
+                rewritten.append(sqlStringLiteral(convertedPayload));
+                changed = true;
+                appliedRules.add(MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE);
+                if (!payload.equals(decoded)) {
+                    appliedRules.add(MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVAL_RULE);
+                }
+                appliedRules.addAll(conversion.appliedRules());
+                index = literal.endIndex();
+            } else if (current == '"') {
+                int end = skipDoubleQuotedText(sql, index);
+                rewritten.append(sql, index, end);
+                index = end;
+            } else if (current == '`') {
+                int end = skipBacktickIdentifier(sql, index);
+                rewritten.append(sql, index, end);
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                int end = skipUntilLineEnd(sql, index);
+                rewritten.append(sql, index, end);
+                index = end;
+            } else if (startsBlockComment(sql, index)) {
+                int end = skipUntilBlockCommentEnd(sql, index);
+                rewritten.append(sql, index, end);
+                index = end;
+            } else {
+                rewritten.append(current);
+                index++;
+            }
+        }
+        if (!changed) {
+            return new SafeRuleConversion(sql, false, List.of(), manualReviewReason);
+        }
+        return new SafeRuleConversion(
+                rewritten.toString(),
+                true,
+                List.copyOf(appliedRules),
+                manualReviewReason
+        );
+    }
+
+    private boolean startsWithSqlPayloadKeyword(String value) {
+        String stripped = value == null ? "" : value.stripLeading();
+        return startsKeyword(stripped, 0, "SELECT")
+                || startsKeyword(stripped, 0, "WITH")
+                || startsKeyword(stripped, 0, "INSERT")
+                || startsKeyword(stripped, 0, "UPDATE")
+                || startsKeyword(stripped, 0, "DELETE")
+                || startsKeyword(stripped, 0, "MERGE");
     }
 
     private String convertMysqlSimpleDateEndTrigger(String sql) {
@@ -11414,9 +11521,15 @@ class SqlScriptMigrator {
         }
     }
 
-    private record SafeRuleConversion(String sql, boolean changed, List<String> appliedRules) {
+    private record SafeRuleConversion(
+            String sql,
+            boolean changed,
+            List<String> appliedRules,
+            String manualReviewReason
+    ) {
         private SafeRuleConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+            manualReviewReason = manualReviewReason == null ? "" : manualReviewReason;
         }
     }
 
