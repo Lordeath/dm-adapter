@@ -7,6 +7,7 @@ import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
 import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.TargetLengthSemantics;
+import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import com.github.dmadapter.sql.SqlConverter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -447,6 +448,8 @@ class SqlScriptMigrator {
         List<Path> sqlFiles = discoveredSqlFiles.stream()
                 .filter(file -> !preservedPaths.contains(sqlRoot.relativize(file).normalize()))
                 .toList();
+        Map<String, List<String>> outerJoinSourceUniqueKeys =
+                outerJoinSourceUniqueKeys(projectRoot, sqlRoot, sqlFiles, warnings);
         for (Path preservedPath : preservedPaths) {
             Path sourceFile = sqlRoot.resolve(preservedPath);
             Path outputFile = sqlRootOut.resolve(preservedPath);
@@ -484,6 +487,7 @@ class SqlScriptMigrator {
                     systemSchema,
                     request.dryRun(),
                     request.targetCapabilities(),
+                    outerJoinSourceUniqueKeys,
                     manualReviewItems,
                     warnings
             );
@@ -641,6 +645,69 @@ class SqlScriptMigrator {
             paths.add(normalized);
         }
         return Set.copyOf(paths);
+    }
+
+    private Map<String, List<String>> outerJoinSourceUniqueKeys(
+            Path projectRoot,
+            Path sqlRoot,
+            List<Path> sqlFiles,
+            List<String> warnings
+    ) throws IOException {
+        Pattern sourcePattern = Pattern.compile(
+                "(?is)\\bLEFT(?:\\s+OUTER)?\\s+JOIN\\s+(?<table>"
+                        + SQL_OBJECT_IDENTIFIER_TOKEN
+                        + ")"
+        );
+        LinkedHashSet<String> sourceTables = new LinkedHashSet<>();
+        for (Path sqlFile : sqlFiles == null ? List.<Path>of() : sqlFiles) {
+            for (String statement : SqlScriptParser.statements(readSqlScriptContent(sqlFile))) {
+                String body = splitLeadingSqlPrefix(statement).body();
+                if (!Pattern.compile("(?is)^\\s*UPDATE\\b").matcher(body).find()) {
+                    continue;
+                }
+                Matcher matcher = sourcePattern.matcher(body);
+                while (matcher.find()) {
+                    String table = DamengMetadataReader.normalizeTableName(matcher.group("table"));
+                    if (!table.isBlank()) {
+                        sourceTables.add(table);
+                    }
+                }
+            }
+        }
+        if (sourceTables.isEmpty()) {
+            return Map.of();
+        }
+
+        LinkedHashMap<String, TableKeyMetadata> metadata = new LinkedHashMap<>();
+        try {
+            metadata.putAll(projectDdlKeyMetadataReader.readTableKeys(
+                    projectRoot,
+                    List.copyOf(sourceTables)
+            ));
+            if (sqlRoot != null && !sqlRoot.startsWith(projectRoot)) {
+                projectDdlKeyMetadataReader.readTableKeys(sqlRoot, List.copyOf(sourceTables))
+                        .forEach(metadata::putIfAbsent);
+            }
+        } catch (IOException e) {
+            warnings.add("Project DDL metadata inference for outer UPDATE JOIN was skipped: "
+                    + e.getMessage());
+            return Map.of();
+        }
+
+        LinkedHashMap<String, List<String>> keys = new LinkedHashMap<>();
+        for (String table : sourceTables) {
+            TableKeyMetadata tableMetadata = metadata.get(table);
+            if (tableMetadata == null) {
+                continue;
+            }
+            TableConstraint constraint = tableMetadata.primaryKeys().stream()
+                    .findFirst()
+                    .orElseGet(() -> tableMetadata.uniqueKeys().stream().findFirst().orElse(null));
+            if (constraint != null && !constraint.columns().isEmpty()) {
+                keys.put(table, constraint.columns());
+            }
+        }
+        return Map.copyOf(keys);
     }
 
     private void refineOriginalUpsertKeyConflicts(
@@ -1925,7 +1992,8 @@ class SqlScriptMigrator {
             Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptIdentityFirstColumns,
             Map<String, String> scriptProcedureRenames,
-            String targetSchema
+            String targetSchema,
+            Map<String, List<String>> outerJoinSourceUniqueKeys
     ) {
         long startedAt = System.nanoTime();
         boolean largeStatement = originalStatement.length() >= 100_000;
@@ -1944,6 +2012,7 @@ class SqlScriptMigrator {
                 scriptIdentityFirstColumns,
                 scriptProcedureRenames,
                 targetSchema,
+                outerJoinSourceUniqueKeys,
                 timings
         );
         long elapsedMillis = elapsedMillis(startedAt);
@@ -2158,58 +2227,81 @@ class SqlScriptMigrator {
                 continue;
             }
 
-            QueryBackedUserVariableAssignment assignment =
-                    queryBackedUserVariableAssignment(statement, knownExpressions);
-            if (assignment == null) {
-                String assignedName = topLevelAssignedUserVariableName(statement);
-                if (!assignedName.isBlank()) {
+            List<QueryBackedUserVariableAssignment> assignments =
+                    queryBackedUserVariableAssignments(statement, knownExpressions);
+            if (assignments.isEmpty()) {
+                for (String assignedName : topLevelAssignedUserVariableNames(statement)) {
                     knownExpressions.remove(assignedName.toLowerCase(Locale.ROOT));
                 }
                 continue;
             }
-            int lastReference = queryUserVariableLastReference(
-                    converted,
-                    index,
-                    assignment.name()
-            );
-            if (lastReference <= index
-                    || queryUserVariableSourceChanges(
-                    converted,
-                    index,
-                    lastReference,
-                    assignment.sourceTables()
-            )) {
-                knownExpressions.remove(assignment.name().toLowerCase(Locale.ROOT));
+
+            LinkedHashMap<QueryBackedUserVariableAssignment, Integer> lastReferences =
+                    new LinkedHashMap<>();
+            boolean unsafeInlining = false;
+            for (QueryBackedUserVariableAssignment assignment : assignments) {
+                int lastReference = queryUserVariableLastReference(
+                        converted,
+                        index,
+                        assignment.name()
+                );
+                lastReferences.put(assignment, lastReference);
+                if (lastReference > index
+                        && queryUserVariableSourceChanges(
+                        converted,
+                        index,
+                        lastReference,
+                        assignment.sourceTables()
+                )) {
+                    unsafeInlining = true;
+                    break;
+                }
+            }
+            if (unsafeInlining) {
+                for (QueryBackedUserVariableAssignment assignment : assignments) {
+                    knownExpressions.remove(assignment.name().toLowerCase(Locale.ROOT));
+                }
                 continue;
             }
 
             LeadingSqlPrefix prefix = splitLeadingSqlPrefix(statement);
+            String variableNames = assignments.stream()
+                    .map(assignment -> "@" + assignment.name())
+                    .collect(Collectors.joining(", "));
             converted.set(
                     index,
                     prefix.prefix()
-                            + "-- DM_ADAPTER: query-backed script variable @"
-                            + assignment.name()
+                            + (assignments.size() == 1
+                            ? "-- DM_ADAPTER: query-backed script variable "
+                            + variableNames
                             + " was inlined from a stable scalar query"
+                            : "-- DM_ADAPTER: query-backed script variables "
+                            + variableNames
+                            + " were inlined or discarded after stable scalar-query analysis")
             );
-            for (int referenceIndex = index + 1;
-                 referenceIndex <= lastReference;
-                 referenceIndex++) {
-                converted.set(
-                        referenceIndex,
-                        replaceScriptUserVariable(
-                                converted.get(referenceIndex),
-                                assignment.name(),
-                                assignment.scalarExpression()
-                        )
+            for (Map.Entry<QueryBackedUserVariableAssignment, Integer> entry : lastReferences.entrySet()) {
+                QueryBackedUserVariableAssignment assignment = entry.getKey();
+                int lastReference = entry.getValue();
+                for (int referenceIndex = index + 1;
+                     referenceIndex <= lastReference;
+                     referenceIndex++) {
+                    converted.set(
+                            referenceIndex,
+                            replaceScriptUserVariable(
+                                    converted.get(referenceIndex),
+                                    assignment.name(),
+                                    assignment.scalarExpression()
+                            )
+                    );
+                }
+                knownExpressions.put(
+                        assignment.name().toLowerCase(Locale.ROOT),
+                        assignment.scalarExpression()
                 );
+                appliedRules.addAll(assignment.appliedRules());
             }
-            knownExpressions.put(
-                    assignment.name().toLowerCase(Locale.ROOT),
-                    assignment.scalarExpression()
-            );
             appliedRules.add(MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE);
-            appliedRules.addAll(assignment.appliedRules());
-            inlineCount++;
+            inlineCount += assignments.size();
         }
         return new QueryUserVariableInlining(
                 List.copyOf(converted),
@@ -2219,33 +2311,86 @@ class SqlScriptMigrator {
         );
     }
 
-    private QueryBackedUserVariableAssignment queryBackedUserVariableAssignment(
+    private List<QueryBackedUserVariableAssignment> queryBackedUserVariableAssignments(
             String statement,
             Map<String, String> knownExpressions
     ) {
         LeadingSqlPrefix prefix = splitLeadingSqlPrefix(statement);
         String body = prefix.body().strip();
         int selectIndex = skipWhitespace(body, 0);
-        if (!startsKeyword(body, selectIndex, "SELECT")) {
-            return null;
+        if (startsKeyword(body, selectIndex, "SELECT")) {
+            return selectIntoQueryBackedUserVariableAssignments(body, selectIndex, knownExpressions);
         }
+        if (startsKeyword(body, selectIndex, "SET")) {
+            QueryBackedUserVariableAssignment assignment =
+                    setQueryBackedUserVariableAssignment(body, selectIndex, knownExpressions);
+            return assignment == null ? List.of() : List.of(assignment);
+        }
+        return List.of();
+    }
+
+    private List<QueryBackedUserVariableAssignment> selectIntoQueryBackedUserVariableAssignments(
+            String body,
+            int selectIndex,
+            Map<String, String> knownExpressions
+    ) {
         int intoIndex = topLevelKeywordIndexAfter(
                 body,
                 "INTO",
                 selectIndex + "SELECT".length()
         );
         if (intoIndex < 0) {
-            return null;
+            return List.of();
         }
         String projection = body.substring(
                 selectIndex + "SELECT".length(),
                 intoIndex
         ).strip();
-        if (projection.isBlank() || splitTopLevelComma(projection).size() != 1) {
-            return null;
+        List<String> projections = splitTopLevelComma(projection);
+        if (projection.isBlank() || projections.isEmpty()) {
+            return List.of();
         }
 
-        int cursor = skipWhitespace(body, intoIndex + "INTO".length());
+        int fromIndex = topLevelKeywordIndexAfter(
+                body,
+                "FROM",
+                intoIndex + "INTO".length()
+        );
+        if (fromIndex < 0) {
+            return List.of();
+        }
+        List<String> targets = splitTopLevelComma(
+                body.substring(intoIndex + "INTO".length(), fromIndex).strip()
+        );
+        if (targets.size() != projections.size()) {
+            return List.of();
+        }
+        String fromClause = body.substring(fromIndex).strip();
+        List<QueryBackedUserVariableAssignment> assignments = new ArrayList<>();
+        for (int index = 0; index < projections.size(); index++) {
+            String name = standaloneUserVariableName(targets.get(index));
+            if (name.isBlank()) {
+                return List.of();
+            }
+            QueryBackedUserVariableAssignment assignment = queryBackedUserVariableAssignment(
+                    name,
+                    "SELECT " + projections.get(index).strip() + " " + fromClause,
+                    knownExpressions
+            );
+            if (assignment == null) {
+                return List.of();
+            }
+            assignments.add(assignment);
+        }
+        return List.copyOf(assignments);
+    }
+
+    private QueryBackedUserVariableAssignment setQueryBackedUserVariableAssignment(
+            String body,
+            int setIndex,
+            Map<String, String> knownExpressions
+    ) {
+        int cursor = skipWhitespace(body, setIndex + "SET".length());
         if (cursor >= body.length() || body.charAt(cursor) != '@') {
             return null;
         }
@@ -2259,11 +2404,36 @@ class SqlScriptMigrator {
         }
         String name = body.substring(nameStart, nameEnd);
         cursor = skipWhitespace(body, nameEnd);
-        if (!startsKeyword(body, cursor, "FROM")) {
+        if (cursor < body.length() && body.charAt(cursor) == ':') {
+            cursor++;
+        }
+        if (cursor >= body.length() || body.charAt(cursor) != '=') {
+            return null;
+        }
+        cursor = skipWhitespace(body, cursor + 1);
+        if (cursor >= body.length() || body.charAt(cursor) != '(') {
+            return null;
+        }
+        int closeParen = findMatchingParen(body, cursor);
+        if (closeParen < 0 || skipWhitespace(body, closeParen + 1) != body.length()) {
+            return null;
+        }
+        String query = body.substring(cursor + 1, closeParen).strip();
+        if (!startsKeyword(query, skipWhitespace(query, 0), "SELECT")) {
+            return null;
+        }
+        return queryBackedUserVariableAssignment(name, query, knownExpressions);
+    }
+
+    private QueryBackedUserVariableAssignment queryBackedUserVariableAssignment(
+            String name,
+            String query,
+            Map<String, String> knownExpressions
+    ) {
+        if (name == null || name.isBlank() || query == null || query.isBlank()) {
             return null;
         }
 
-        String query = "SELECT " + projection + " " + body.substring(cursor).strip();
         ScriptUserVariableInline dependencyInline =
                 inlineScriptUserVariables(query, new LinkedHashMap<>(knownExpressions));
         if (!mysqlUserVariableReferences(dependencyInline.sql()).isEmpty()) {
@@ -2293,6 +2463,19 @@ class SqlScriptMigrator {
         );
     }
 
+    private String standaloneUserVariableName(String value) {
+        String target = value == null ? "" : value.strip();
+        if (target.length() < 2 || target.charAt(0) != '@'
+                || !isUserVariableStart(target.charAt(1))) {
+            return "";
+        }
+        int cursor = 2;
+        while (cursor < target.length() && isUserVariablePart(target.charAt(cursor))) {
+            cursor++;
+        }
+        return cursor == target.length() ? target.substring(1) : "";
+    }
+
     private int queryUserVariableLastReference(
             List<String> statements,
             int assignmentIndex,
@@ -2301,8 +2484,8 @@ class SqlScriptMigrator {
         int lastReference = -1;
         for (int index = assignmentIndex + 1; index < statements.size(); index++) {
             String statement = statements.get(index);
-            String assignedName = topLevelAssignedUserVariableName(statement);
-            if (assignedName.equalsIgnoreCase(variableName)
+            if (topLevelAssignedUserVariableNames(statement).stream()
+                    .anyMatch(name -> name.equalsIgnoreCase(variableName))
                     || assignsUserVariableOutsideSetOrSelectInto(statement, variableName)) {
                 break;
             }
@@ -2313,17 +2496,17 @@ class SqlScriptMigrator {
         return lastReference;
     }
 
-    private String topLevelAssignedUserVariableName(String statement) {
+    private Set<String> topLevelAssignedUserVariableNames(String statement) {
         String body = splitLeadingSqlPrefix(statement).body().strip();
         Matcher setMatcher = Pattern.compile(
                 "(?is)^SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)"
         ).matcher(body);
         if (setMatcher.find()) {
-            return setMatcher.group("name");
+            return Set.of(setMatcher.group("name"));
         }
         int selectIndex = skipWhitespace(body, 0);
         if (!startsKeyword(body, selectIndex, "SELECT")) {
-            return "";
+            return Set.of();
         }
         int intoIndex = topLevelKeywordIndexAfter(
                 body,
@@ -2331,21 +2514,27 @@ class SqlScriptMigrator {
                 selectIndex + "SELECT".length()
         );
         if (intoIndex < 0) {
-            return "";
+            return Set.of();
         }
-        int cursor = skipWhitespace(body, intoIndex + "INTO".length());
-        if (cursor >= body.length() || body.charAt(cursor) != '@') {
-            return "";
+        int fromIndex = topLevelKeywordIndexAfter(
+                body,
+                "FROM",
+                intoIndex + "INTO".length()
+        );
+        if (fromIndex < 0) {
+            return Set.of();
         }
-        int start = cursor + 1;
-        if (start >= body.length() || !isUserVariableStart(body.charAt(start))) {
-            return "";
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        for (String target : splitTopLevelComma(
+                body.substring(intoIndex + "INTO".length(), fromIndex).strip()
+        )) {
+            String name = standaloneUserVariableName(target);
+            if (name.isBlank()) {
+                return Set.of();
+            }
+            names.add(name);
         }
-        int end = start + 1;
-        while (end < body.length() && isUserVariablePart(body.charAt(end))) {
-            end++;
-        }
-        return body.substring(start, end);
+        return Set.copyOf(names);
     }
 
     private boolean assignsUserVariableOutsideSetOrSelectInto(
@@ -2646,6 +2835,7 @@ class SqlScriptMigrator {
             String systemSchema,
             boolean dryRun,
             DamengTargetCapabilities targetCapabilities,
+            Map<String, List<String>> outerJoinSourceUniqueKeys,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -2727,7 +2917,8 @@ class SqlScriptMigrator {
                                     tableColumnsSnapshot,
                                     identityFirstColumnsSnapshot,
                                     scriptProcedureRenames,
-                                    targetSchema
+                                    targetSchema,
+                                    outerJoinSourceUniqueKeys
                             ),
                             conversionExecutor
                     );
@@ -2742,7 +2933,8 @@ class SqlScriptMigrator {
                             scriptTableColumns,
                             scriptIdentityFirstColumns,
                             scriptProcedureRenames,
-                            targetSchema
+                            targetSchema,
+                            outerJoinSourceUniqueKeys
                     ));
                 }
                 conversionPlans.add(new StatementConversionPlan(statementIndex, originalStatement, conversion));
@@ -3404,6 +3596,7 @@ class SqlScriptMigrator {
             Map<String, String> scriptIdentityFirstColumns,
             Map<String, String> scriptProcedureRenames,
             String targetSchema,
+            Map<String, List<String>> outerJoinSourceUniqueKeys,
             ConversionTimings timings
     ) {
         long preparationStartedAt = System.nanoTime();
@@ -3475,9 +3668,19 @@ class SqlScriptMigrator {
         );
         timings.safeRulesNanos += System.nanoTime() - safeRulesStartedAt;
         long genericConverterStartedAt = System.nanoTime();
-        SqlConversionResult sqlConversion = isConvertedSimpleDateEndTrigger(safeRuleConversion.sql())
-                ? SqlConversionResult.unchanged(safeRuleConversion.sql())
-                : converter.convert(safeRuleConversion.sql());
+        SqlConversionResult sqlConversion;
+        if (isConvertedSimpleDateEndTrigger(safeRuleConversion.sql())) {
+            sqlConversion = SqlConversionResult.unchanged(safeRuleConversion.sql());
+        } else if (converter instanceof MySqlToDmSqlConverter mySqlConverter
+                && outerJoinSourceUniqueKeys != null
+                && !outerJoinSourceUniqueKeys.isEmpty()) {
+            sqlConversion = mySqlConverter.convertOuterJoinWithUniqueSourceKeys(
+                    safeRuleConversion.sql(),
+                    outerJoinSourceUniqueKeys
+            );
+        } else {
+            sqlConversion = converter.convert(safeRuleConversion.sql());
+        }
         timings.genericConverterNanos += System.nanoTime() - genericConverterStartedAt;
         long postProcessStartedAt = System.nanoTime();
         rules.addAll(safeRuleConversion.appliedRules());
