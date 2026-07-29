@@ -6085,18 +6085,66 @@ class SqlScriptMigrator {
     }
 
     private boolean containsSelectIntoThatCanRaiseNotFound(String sql) {
-        String searchable = replaceIgnoredSqlWithSpaces(sql);
-        Matcher selectIntoMatcher = Pattern.compile(
-                "(?is)\\bSELECT\\s+[^;]*?\\s+INTO\\b"
-        ).matcher(searchable);
-        while (selectIntoMatcher.find()) {
-            int statementEnd = searchable.indexOf(';', selectIntoMatcher.start());
-            String statement = searchable.substring(
-                    selectIntoMatcher.start(),
-                    statementEnd < 0 ? searchable.length() : statementEnd
-            );
-            if (!isGuaranteedRowAggregateSelectInto(statement)) {
-                return true;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "SELECT")) {
+                int cursor = index + "SELECT".length();
+                int depth = 0;
+                boolean selectInto = false;
+                while (cursor < sql.length()) {
+                    char candidate = sql.charAt(cursor);
+                    if (candidate == '\'') {
+                        cursor = skipSingleQuotedString(sql, cursor);
+                    } else if (candidate == '"') {
+                        cursor = skipDoubleQuotedText(sql, cursor);
+                    } else if (candidate == '`') {
+                        cursor = skipBacktickIdentifier(sql, cursor);
+                    } else if (startsLineComment(sql, cursor)) {
+                        cursor = skipUntilLineEnd(sql, cursor);
+                    } else if (startsBlockComment(sql, cursor)) {
+                        cursor = skipUntilBlockCommentEnd(sql, cursor);
+                    } else if (candidate == '(') {
+                        depth++;
+                        cursor++;
+                    } else if (candidate == ')') {
+                        if (depth == 0) {
+                            break;
+                        }
+                        depth--;
+                        cursor++;
+                    } else if (depth == 0 && startsKeyword(sql, cursor, "INTO")) {
+                        selectInto = true;
+                        break;
+                    } else if (depth == 0
+                            && (startsKeyword(sql, cursor, "FROM") || candidate == ';')) {
+                        break;
+                    } else {
+                        cursor++;
+                    }
+                }
+                if (selectInto) {
+                    int statementEnd = findStatementTerminator(sql, index);
+                    String statement = sql.substring(index, Math.min(statementEnd, sql.length()));
+                    if (!isGuaranteedRowAggregateSelectInto(statement)) {
+                        return true;
+                    }
+                    index = statementEnd < sql.length() ? statementEnd + 1 : sql.length();
+                } else {
+                    index = Math.max(index + 1, cursor);
+                }
+            } else {
+                index++;
             }
         }
         return false;
