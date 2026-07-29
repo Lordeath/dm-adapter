@@ -2099,8 +2099,35 @@ public class MapperXmlRewriter {
             );
         }
 
-        if (findMyBatisWhereBlock(body, scope.fromIndex(), scope.havingIndex()) != null) {
-            return ScopeHavingConversion.unchanged(body);
+        MyBatisWhereBlock whereBlock = findMyBatisWhereBlock(
+                body,
+                scope.fromIndex(),
+                scope.havingIndex()
+        );
+        List<String> rules = new ArrayList<>();
+        if (selectAliasRewrite.changed()) {
+            rules.add(MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE);
+        }
+        rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        if (whereBlock != null) {
+            String closingIndent = indentationOfLastLine(body.substring(0, whereBlock.closingStart()));
+            String conditionIndent = closingIndent + "    ";
+            String condition = "and " + removeLeadingBooleanConnector(
+                    selectAliasRewrite.text().strip()
+            );
+            String insertion = "\n"
+                    + conditionIndent
+                    + indentBlock(condition, conditionIndent)
+                    + "\n"
+                    + closingIndent;
+            return new ScopeHavingConversion(
+                    body.substring(0, whereBlock.closingStart())
+                            + insertion
+                            + body.substring(whereBlock.closingStart(), scope.havingIndex())
+                            + body.substring(scope.havingEnd()),
+                    rules,
+                    true
+            );
         }
         int whereIndex = findTopLevelKeyword(
                 view,
@@ -2110,11 +2137,6 @@ public class MapperXmlRewriter {
                 scope.depth()
         );
         String connector = whereIndex >= 0 ? "AND" : "WHERE";
-        List<String> rules = new ArrayList<>();
-        if (selectAliasRewrite.changed()) {
-            rules.add(MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE);
-        }
-        rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
         return new ScopeHavingConversion(
                 body.substring(0, scope.havingIndex())
                         + connector
