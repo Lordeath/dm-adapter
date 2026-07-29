@@ -89,7 +89,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar validate-sql \
 `CALL procedure_name()`。不能在过程内部使用 `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` 推断目标 schema：
 过程执行期间该值可能切换为过程定义者的默认 schema，导致存在性检查查错对象。反引号字段名用于保留源字段大小写，因此包含反引号的脚本要求目标达梦实例 `COMPATIBLE_MODE=4`。
 
-数据库验证的总时限由 `DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS` 控制，默认 `7200` 秒（2 小时），SQL 脚本验证和 Mapper 验证共享同一时限。SQL 脚本单条语句时限由 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS` 控制，默认 `600` 秒；工具除设置 JDBC 查询超时外还会执行自身的硬超时，主动取消语句并停止当前验证，避免驱动忽略 `setQueryTimeout` 后无限挂起。默认值覆盖了真实全量脚本中随测试库数据量增长而超过 300 秒的数据同步过程；若项目存在更长的合法过程，可用环境变量按项目覆盖。Mapper 验证每累计 50 条记录会原子更新报告；超时或进程中断后可读取已完成部分。新一轮运行开始前，上一轮报告会保留为 `sql-validation-report.previous.md/json`。
+数据库验证的总时限由 `DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS` 控制，默认 `7200` 秒（2 小时），SQL 脚本验证和 Mapper 验证共享同一时限。SQL 脚本单条语句时限由 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS` 控制，默认 `600` 秒；工具除设置 JDBC 查询超时外还会执行自身的硬超时，主动取消语句并停止当前验证，避免驱动忽略 `setQueryTimeout` 后无限挂起。默认值覆盖了真实全量脚本中随测试库数据量增长而超过 300 秒的数据同步过程；若项目存在更长的合法过程，可用环境变量按项目覆盖。Mapper 单条语句的 JDBC 超时默认 `120` 秒，可用 `dm.sql.validation.statementTimeoutSeconds` 覆盖，避免合法慢查询被旧的 30 秒默认值误判。Mapper 验证每累计 50 条记录会原子更新报告；超时或进程中断后可读取已完成部分。新一轮运行开始前，上一轮报告会保留为 `sql-validation-report.previous.md/json`。
 
 每次 `migrate` 还会在应用工作目录生成 `dm-adapter-summary.md` 和 `dm-adapter-summary.json`，汇总迁移、SQL 脚本验证、Mapper 验证三阶段状态、根因/级联阻塞数、人工确认降噪统计和详细报告链接。`report` 命令优先读取该摘要，旧工作目录则回退到原迁移报告。
 

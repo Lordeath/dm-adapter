@@ -43,6 +43,8 @@ public class MapperXmlRewriter {
             "MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE";
     public static final String MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE =
             "MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL";
+    public static final String MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE =
+            "MYBATIS_IDENTITY_INSERT_REPLACE_NULL";
     public static final String MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE =
@@ -433,6 +435,15 @@ public class MapperXmlRewriter {
                     ? conversionResult.convertedSql()
                     : commentSafeSql;
             addAppliedRules(staticRules, conversionResult.appliedRules());
+            if ("insert".equals(tagName)
+                    && !"true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys"))
+                    && rewriteConfig.requiresIdentityInsert(tableName)) {
+                TextRewrite identityInsert = wrapIdentityInsert(convertedSql, tableName);
+                if (identityInsert.changed()) {
+                    convertedSql = identityInsert.text();
+                    staticRules.add(MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE);
+                }
+            }
             TextRewrite duplicateBlockSemicolon = removeDuplicateDamengBlockSemicolons(convertedSql);
             if (duplicateBlockSemicolon.changed()) {
                 convertedSql = duplicateBlockSemicolon.text();
@@ -932,18 +943,6 @@ public class MapperXmlRewriter {
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
 
-        if (useGeneratedKeys && generatedKeyProperty != null && !generatedKeyProperty.isBlank()) {
-            TextRewrite generatedKeyBatch = conditionalizeGeneratedKeyBatchInsert(
-                    converted,
-                    generatedKeyProperty,
-                    generatedKeyColumn
-            );
-            if (generatedKeyBatch.changed()) {
-                appliedRules.add(MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE);
-                converted = generatedKeyBatch.text();
-            }
-        }
-
         String withMissingValues = addMissingBatchInsertValues(converted);
         if (!withMissingValues.equals(converted)) {
             appliedRules.add(MYBATIS_BATCH_INSERT_ADD_VALUES_RULE);
@@ -973,6 +972,32 @@ public class MapperXmlRewriter {
             appliedRules.add(MYBATIS_FOREACH_TRAILING_COMMA_RULE);
         }
         converted = withoutTrailingCommas;
+
+        String insertTable = extractInsertTableNameLenient(converted);
+        boolean generatedKeyBatchChanged = false;
+        if (useGeneratedKeys && generatedKeyProperty != null && !generatedKeyProperty.isBlank()) {
+            TextRewrite generatedKeyBatch = conditionalizeGeneratedKeyBatchInsert(
+                    converted,
+                    generatedKeyProperty,
+                    generatedKeyColumn,
+                    insertTable
+            );
+            if (generatedKeyBatch.changed()) {
+                appliedRules.add(MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE);
+                appliedRules.add(MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE);
+                converted = generatedKeyBatch.text();
+                generatedKeyBatchChanged = true;
+            }
+        }
+        if (!generatedKeyBatchChanged
+                && !useGeneratedKeys
+                && rewriteConfig.requiresIdentityInsert(insertTable)) {
+            TextRewrite identityInsert = wrapIdentityInsert(converted, insertTable);
+            if (identityInsert.changed()) {
+                appliedRules.add(MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE);
+                converted = identityInsert.text();
+            }
+        }
         TextRewrite duplicateBlockSemicolon = removeDuplicateDamengBlockSemicolons(converted);
         if (duplicateBlockSemicolon.changed()) {
             appliedRules.add(DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE);
@@ -1960,8 +1985,7 @@ public class MapperXmlRewriter {
                 aggregateAliasRewrite.text(),
                 aggregateAliases,
                 dynamicAggregateAliases.keySet(),
-                selectAliases,
-                simpleGroupByColumnReferences(groupByContent)
+                selectAliases
         );
         TextRewrite selectAliasRewrite = replaceSelectAliases(havingRewrite.remainingHaving(), selectAliases);
         boolean aggregateAliasChanged = aggregateAliasRewrite.changed();
@@ -2055,8 +2079,7 @@ public class MapperXmlRewriter {
             String rewrittenHavingContent,
             Map<String, SelectAlias> aggregateAliases,
             Set<String> dynamicAggregateAliases,
-            Map<String, SelectAlias> selectAliases,
-            Set<String> simpleGroupByColumns
+            Map<String, SelectAlias> selectAliases
     ) {
         List<ConditionPart> rewrittenParts = splitTopLevelAndConditions(rewrittenHavingContent);
         if (rewrittenParts.isEmpty()) {
@@ -2073,8 +2096,7 @@ public class MapperXmlRewriter {
                     conditionForMoveCheck,
                     aggregateAliases,
                     dynamicAggregateAliases,
-                    selectAliases,
-                    simpleGroupByColumns
+                    selectAliases
             )) {
                 moved.add(rewrittenCondition);
             } else {
@@ -2145,8 +2167,7 @@ public class MapperXmlRewriter {
             String condition,
             Map<String, SelectAlias> aggregateAliases,
             Set<String> dynamicAggregateAliases,
-            Map<String, SelectAlias> selectAliases,
-            Set<String> simpleGroupByColumns
+            Map<String, SelectAlias> selectAliases
     ) {
         String normalized = stripXmlMarkup(condition);
         if (normalized.isBlank()) {
@@ -2182,7 +2203,7 @@ public class MapperXmlRewriter {
             return false;
         }
         Set<String> conditionColumns = conditionColumnReferences(normalized);
-        return !conditionColumns.isEmpty() && simpleGroupByColumns.containsAll(conditionColumns);
+        return !conditionColumns.isEmpty();
     }
 
     private DynamicHavingAliasRewrite rewriteDynamicAggregateHavingAlias(
@@ -3030,45 +3051,6 @@ public class MapperXmlRewriter {
             }
         }
         return false;
-    }
-
-    private Set<String> simpleGroupByColumnReferences(String groupByContent) {
-        Set<String> references = new LinkedHashSet<>();
-        for (String item : splitTopLevelComma(groupByContent)) {
-            String reference = simpleColumnReference(stripXmlMarkup(item));
-            if (!reference.isBlank()) {
-                references.add(reference);
-            }
-        }
-        return references;
-    }
-
-    private String simpleColumnReference(String value) {
-        String normalized = stripTrailingSqlTerminator(value == null ? "" : value.strip());
-        if (normalized.isBlank()) {
-            return "";
-        }
-        int index = skipWhitespace(normalized, 0);
-        IdentifierToken first = readIdentifierToken(normalized, index);
-        if (first == null) {
-            return "";
-        }
-        List<String> parts = new ArrayList<>();
-        parts.add(identifierKey(first.text()));
-        index = skipWhitespace(normalized, first.endIndex());
-        while (index < normalized.length() && normalized.charAt(index) == '.') {
-            index = skipWhitespace(normalized, index + 1);
-            IdentifierToken part = readIdentifierToken(normalized, index);
-            if (part == null) {
-                return "";
-            }
-            parts.add(identifierKey(part.text()));
-            index = skipWhitespace(normalized, part.endIndex());
-        }
-        if (skipWhitespace(normalized, index) != normalized.length()) {
-            return "";
-        }
-        return String.join(".", parts);
     }
 
     private Set<String> conditionColumnReferences(String condition) {
@@ -5301,12 +5283,15 @@ public class MapperXmlRewriter {
     private TextRewrite conditionalizeGeneratedKeyBatchInsert(
             String body,
             String generatedKeyProperty,
-            String generatedKeyColumn
+            String generatedKeyColumn,
+            String tableName
     ) {
         Matcher matcher = GENERATED_KEY_BATCH_INSERT_PATTERN.matcher(body);
         if (!matcher.matches()
                 || generatedKeyProperty.contains(",")
-                || (generatedKeyColumn != null && generatedKeyColumn.contains(","))) {
+                || (generatedKeyColumn != null && generatedKeyColumn.contains(","))
+                || tableName == null
+                || tableName.isBlank()) {
             return new TextRewrite(body, false);
         }
         String property = leafProperty(generatedKeyProperty);
@@ -5340,9 +5325,13 @@ public class MapperXmlRewriter {
             return new TextRewrite(body, false);
         }
 
-        String condition = foreach.collection() + " != null and !"
+        String explicitKeyFlag = "_dmAdapterHasExplicit"
+                + Character.toUpperCase(property.charAt(0))
+                + property.substring(1);
+        String flagExpression = foreach.collection() + " != null and !"
                 + foreach.collection() + ".isEmpty() and "
-                + foreach.collection() + "[0]." + property + " != null";
+                + foreach.collection() + ".{? #this." + property + " != null}.size() > 0";
+        String condition = explicitKeyFlag;
         String columnsTrim = conditionalGeneratedKeyColumns(
                 matcher.group("columnsTrim"),
                 columns,
@@ -5357,12 +5346,47 @@ public class MapperXmlRewriter {
         if (columnsTrim == null || foreachXml == null) {
             return new TextRewrite(body, false);
         }
-        String converted = matcher.group("leading")
+        String converted = "<bind name=\"" + explicitKeyFlag + "\" value=\"" + flagExpression + "\"/>\n"
+                + "<if test=\"" + explicitKeyFlag + "\">\n"
+                + "    SET IDENTITY_INSERT " + tableName + " ON WITH REPLACE NULL;\n"
+                + "</if>\n"
+                + matcher.group("leading")
                 + columnsTrim
                 + matcher.group("valuesKeyword")
                 + foreachXml
+                + "\n<if test=\"" + explicitKeyFlag + "\">\n"
+                + "    ; SET IDENTITY_INSERT " + tableName + " OFF\n"
+                + "</if>"
                 + matcher.group("trailing");
         return new TextRewrite(converted, !converted.equals(body));
+    }
+
+    private TextRewrite wrapIdentityInsert(String sql, String tableName) {
+        if (sql == null
+                || sql.isBlank()
+                || tableName == null
+                || tableName.isBlank()
+                || Pattern.compile("(?is)\\bSET\\s+IDENTITY_INSERT\\b").matcher(sql).find()) {
+            return new TextRewrite(sql, false);
+        }
+        int leadingEnd = 0;
+        while (leadingEnd < sql.length() && Character.isWhitespace(sql.charAt(leadingEnd))) {
+            leadingEnd++;
+        }
+        int trailingStart = sql.length();
+        while (trailingStart > leadingEnd && Character.isWhitespace(sql.charAt(trailingStart - 1))) {
+            trailingStart--;
+        }
+        String core = sql.substring(leadingEnd, trailingStart).stripTrailing();
+        if (core.endsWith(";")) {
+            core = core.substring(0, core.length() - 1).stripTrailing();
+        }
+        String converted = sql.substring(0, leadingEnd)
+                + "SET IDENTITY_INSERT " + tableName + " ON WITH REPLACE NULL;\n"
+                + core
+                + ";\nSET IDENTITY_INSERT " + tableName + " OFF"
+                + sql.substring(trailingStart);
+        return new TextRewrite(converted, !converted.equals(sql));
     }
 
     private String conditionalGeneratedKeyColumns(
