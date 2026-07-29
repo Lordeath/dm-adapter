@@ -342,6 +342,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     + "(?:\\s+(?:as\\s+)?(?<alias>[A-Za-z_][A-Za-z0-9_]*|\"[^\"]+\"))?"
                     + "\\s+from\\s+information_schema\\s*\\.\\s*tables\\s+where\\s+(?<where>.+?)\\s*;?\\s*$"
     );
+    private static final Pattern INFORMATION_SCHEMA_TABLES_EXISTS_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+1\\s+from\\s+information_schema\\s*\\.\\s*tables\\s+"
+                    + "where\\s+(?<where>.+?)\\s*;?\\s*$"
+    );
     private static final Pattern INFORMATION_SCHEMA_TABLES_LIST_PATTERN = Pattern.compile(
             "(?is)^\\s*select\\s+table_name\\s+from\\s+information_schema\\s*\\.\\s*tables\\s+where\\s+"
                     + "(?<where>.+?)\\s+group\\s+by\\s+table_name"
@@ -4790,6 +4794,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (tableDetailConversion.changed()) {
             return tableDetailConversion;
         }
+        GenericConversion tableExistsConversion = convertInformationSchemaTableExists(sql);
+        if (tableExistsConversion.changed()) {
+            return tableExistsConversion;
+        }
         GenericConversion simpleTableListConversion = convertInformationSchemaSimpleTableList(sql);
         if (simpleTableListConversion.changed()) {
             return simpleTableListConversion;
@@ -4821,6 +4829,33 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String converted = "SELECT COUNT(*)"
                 + (alias == null || alias.isBlank() ? "" : " AS " + alias)
                 + " FROM ALL_TABLES WHERE TABLE_NAME = UPPER("
+                + tableName
+                + ")"
+                + metadataOwnerCondition(tableSchema);
+        return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaTableExists(String sql) {
+        Matcher matcher = INFORMATION_SCHEMA_TABLES_EXISTS_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String whereClause = matcher.group("where");
+        Matcher tableNameMatcher = METADATA_TABLE_NAME_CONDITION.matcher(whereClause);
+        if (!tableNameMatcher.find()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String tableName = tableNameMatcher.group("value").trim();
+        Matcher tableSchemaMatcher = METADATA_TABLE_SCHEMA_CONDITION.matcher(whereClause);
+        String tableSchema = tableSchemaMatcher.find() ? tableSchemaMatcher.group("value").trim() : "";
+        String residual = tableNameMatcher.replaceAll("");
+        residual = METADATA_TABLE_SCHEMA_CONDITION.matcher(residual).replaceAll("");
+        residual = residual.replaceAll("(?i)\\bAND\\b", "")
+                .replaceAll("[()\\s]", "");
+        if (!residual.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = "SELECT 1 FROM ALL_TABLES WHERE TABLE_NAME = UPPER("
                 + tableName
                 + ")"
                 + metadataOwnerCondition(tableSchema);
