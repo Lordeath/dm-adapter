@@ -2,9 +2,13 @@ package com.github.dmadapter.cli;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.w3c.dom.Element;
+import org.xml.sax.InputSource;
 
 import javax.tools.JavaCompiler;
 import javax.tools.ToolProvider;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.StringReader;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.URL;
@@ -13,6 +17,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -34,6 +40,21 @@ class GeneratedFailurePatternTest {
         )) {
             Class<?> validationClass = classLoader.loadClass("com.example.DmSqlValidationTest");
             Object validation = validationClass.getDeclaredConstructor().newInstance();
+            assertThat(referencedTables(
+                    validationClass,
+                    validation,
+                    "<update id=\"update\">update ns_bid_supplier_bid_info set deleteFlag = 1 where id = #{id}</update>"
+            )).containsExactly("ns_bid_supplier_bid_info");
+            assertThat(referencedTables(
+                    validationClass,
+                    validation,
+                    "<insert id=\"insert\">insert into ns_bid_supplier_bid_info(id) values (#{id})</insert>"
+            )).containsExactly("ns_bid_supplier_bid_info");
+            assertThat(referencedTables(
+                    validationClass,
+                    validation,
+                    "<select id=\"select\">select id from ns_bid_supplier_bid_info where id = #{id}</select>"
+            )).containsExactly("ns_bid_supplier_bid_info");
 
             String missingColumn = """
                     org.apache.ibatis.exceptions.PersistenceException:
@@ -276,6 +297,29 @@ class GeneratedFailurePatternTest {
         Field dbColumnMetadata = validationClass.getDeclaredField("dbColumnMetadata");
         dbColumnMetadata.setAccessible(true);
         dbColumnMetadata.set(validation, metadata);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Set<String> referencedTables(
+            Class<?> validationClass,
+            Object validation,
+            String statementXml
+    ) throws Exception {
+        Element statement = DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder()
+                .parse(new InputSource(new StringReader(statementXml)))
+                .getDocumentElement();
+        Method metadataMethod = validationClass.getDeclaredMethod(
+                "dynamicIdentifierMetadata",
+                Element.class,
+                Map.class,
+                String.class
+        );
+        metadataMethod.setAccessible(true);
+        Object metadata = metadataMethod.invoke(validation, statement, Map.of(), "com.example.Mapper");
+        Method referencedTableNames = metadata.getClass().getDeclaredMethod("referencedTableNames");
+        referencedTableNames.setAccessible(true);
+        return (Set<String>) referencedTableNames.invoke(metadata);
     }
 
     private String generatedTestSource() throws Exception {
