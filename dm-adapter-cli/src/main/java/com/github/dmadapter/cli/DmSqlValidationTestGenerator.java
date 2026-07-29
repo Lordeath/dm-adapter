@@ -9285,6 +9285,8 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\blike\\\\s+\\\\?\\\\s*'").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\band[A-Za-z_][A-Za-z0-9_$]*\\\\s+(?:in|=|<>|!=|>|<|like)\\\\b").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\binsert\\\\s+into\\\\b[\\\\s\\\\S]*?\\\\([^)]*(?:`[^`]+`|\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)\\\\s+(?:`[^`]+`|\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)\\\\s*(?:,|\\\\))").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?,\\\\s*from\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*(?:=|<>|!=|>=|<=|>|<|like)\\\\s*(?:\\\\?|\\\\d+|'[^']*'|\\\\([^)]*\\\\))\\\\s+" + identifier + "\\\\s+(?:in\\\\s*\\\\(|=|<>|!=|>=|<=|>|<|like\\\\b|is\\\\b)").matcher(value).find()

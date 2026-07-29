@@ -4145,6 +4145,45 @@ class MapperMigratorTest {
     }
 
     @Test
+    void convertsMysqlHashLineCommentInDynamicMapperSql() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/MessageWarehouseMapper.xml", """
+                SELECT id, enterpriseId
+                FROM ns_message_warehouse
+                WHERE 1 = 1
+                <if test="enterpriseId != null">
+                    AND enterpriseId = #{enterpriseId}
+                </if>
+                # 防止ooM
+                limit 2000
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/MessageWarehouseMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/MessageWarehouseMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("-- 防止ooM")
+                .doesNotContain("# 防止ooM");
+        assertThat(result.automaticConversions())
+                .anySatisfy(change -> assertThat(change.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_HASH_LINE_COMMENT_RULE));
+    }
+
+    @Test
     void quotesDynamicKeywordAliasReferencesSplitAcrossXmlNodes() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/OwnerHouseResultMapper.xml", """
                 select base.house_id,
