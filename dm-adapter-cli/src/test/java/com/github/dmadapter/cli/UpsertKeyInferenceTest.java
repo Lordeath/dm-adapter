@@ -110,4 +110,56 @@ class UpsertKeyInferenceTest {
                 .isEqualTo(UpsertKeyInference.RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY);
         assertThat(result.reason()).contains("No primary key or unique key columns are fully present");
     }
+
+    @Test
+    void convertsInsertIgnoreToPlainInsertWhenOnlyUninsertedKeyIsGenerated() {
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.BankFileMapper.insertIgnore",
+                "ns_bank_file",
+                List.of("file_id", "file_name"),
+                RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata(
+                "ns_bank_file",
+                List.of(new TableConstraint(
+                        "PK_NS_BANK_FILE",
+                        TableConstraint.ConstraintType.PRIMARY_KEY,
+                        List.of("id")
+                )),
+                true,
+                java.util.Set.of("ID")
+        );
+
+        UpsertKeyInference.InferenceResult result = inference.infer(candidate, metadata).orElseThrow();
+
+        assertThat(result.inferred()).isFalse();
+        assertThat(result.resolutionCode())
+                .isEqualTo(UpsertKeyInference.RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT);
+        assertThat(result.reason()).contains("plain INSERT");
+    }
+
+    @Test
+    void keepsInsertIgnoreUnresolvedWhenOmittedUniqueColumnIsNotGenerated() {
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.EventMapper.insertIgnore",
+                "event",
+                List.of("payload"),
+                RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata(
+                "event",
+                List.of(new TableConstraint(
+                        "UK_EVENT_CODE",
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        List.of("event_code")
+                )),
+                true,
+                java.util.Set.of()
+        );
+
+        UpsertKeyInference.InferenceResult result = inference.infer(candidate, metadata).orElseThrow();
+
+        assertThat(result.resolutionCode())
+                .isEqualTo(UpsertKeyInference.RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY);
+    }
 }

@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -331,20 +332,24 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
-    void persistsOriginalSqlResolutionWhenNoConflictKeyIsInserted() throws Exception {
+    void persistsPlainInsertResolutionWhenInsertIgnoreOnlyOmitsGeneratedKey() throws Exception {
         Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
                 "com.example.BankFileMapper.insertIgnore",
                 "ns_bank_file",
-                List.of("file_id", "file_name")
+                List.of("file_id", "file_name"),
+                RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
         );
-        TableKeyMetadata metadata = new TableKeyMetadata("ns_bank_file", List.of(
-                new TableConstraint(
+        TableKeyMetadata metadata = new TableKeyMetadata(
+                "ns_bank_file",
+                List.of(new TableConstraint(
                         "PK_NS_BANK_FILE",
                         TableConstraint.ConstraintType.PRIMARY_KEY,
                         List.of("id")
-                )
-        ));
+                )),
+                true,
+                Set.of("id")
+        );
 
         SqlRewriteConfigUpdate update = updater.update(
                 AdapterContext.builder(tempDir).build(),
@@ -356,9 +361,14 @@ class SqlRewriteConfigUpdaterTest {
         );
 
         assertThat(update.rewriteConfig().keyColumnsFor(candidate.methodKey(), candidate.tableName())).isEmpty();
+        assertThat(update.rewriteConfig().convertsInsertIgnoreToPlainInsert(candidate.methodKey())).isTrue();
+        assertThat(update.warnings())
+                .anySatisfy(warning -> assertThat(warning)
+                        .contains("Resolved")
+                        .contains("plain INSERT"));
         assertThat(Files.readString(config))
                 .contains("upsertKeyResolutions:")
                 .contains("\"com.example.BankFileMapper.insertIgnore\": "
-                        + "\"ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY\"");
+                        + "\"INSERT_IGNORE_AS_PLAIN_INSERT\"");
     }
 }

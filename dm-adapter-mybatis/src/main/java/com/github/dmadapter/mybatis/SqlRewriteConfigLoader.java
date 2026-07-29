@@ -30,6 +30,7 @@ public class SqlRewriteConfigLoader {
         Set<String> ignoredMissingColumns = new LinkedHashSet<>();
         Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
         Set<String> identityInsertTables = new LinkedHashSet<>();
+        Map<String, String> upsertKeyResolutions = new LinkedHashMap<>();
         String section = "";
         String currentName = "";
         for (String line : lines) {
@@ -41,6 +42,11 @@ public class SqlRewriteConfigLoader {
             int indent = leadingSpaces(withoutComment);
             if (indent == 0 && "upsertKeys:".equals(trimmed)) {
                 section = "upsertKeys";
+                currentName = "";
+                continue;
+            }
+            if (indent == 0 && "upsertKeyResolutions:".equals(trimmed)) {
+                section = "upsertKeyResolutions";
                 currentName = "";
                 continue;
             }
@@ -79,6 +85,25 @@ public class SqlRewriteConfigLoader {
                     && "methods:".equals(trimmed)) {
                 section = "methods";
                 currentName = "";
+                continue;
+            }
+            if (indent == 2
+                    && ("upsertKeyResolutions".equals(section)
+                    || "upsertKeyResolutionMethods".equals(section))
+                    && "methods:".equals(trimmed)) {
+                section = "upsertKeyResolutionMethods";
+                currentName = "";
+                continue;
+            }
+            if ("upsertKeyResolutionMethods".equals(section) && indent == 4) {
+                int colon = trimmed.lastIndexOf(':');
+                if (colon > 0) {
+                    String method = unquote(trimmed.substring(0, colon).trim());
+                    String resolution = unquote(trimmed.substring(colon + 1).trim());
+                    if (!method.isBlank() && !resolution.isBlank()) {
+                        upsertKeyResolutions.put(method, resolution);
+                    }
+                }
                 continue;
             }
             if (indent == 4 && ("tables".equals(section) || "methods".equals(section)) && trimmed.endsWith(":")) {
@@ -145,7 +170,8 @@ public class SqlRewriteConfigLoader {
                 ignoredMissingTables,
                 ignoredMissingColumns,
                 ignoredMissingSchemas,
-                identityInsertTables
+                identityInsertTables,
+                upsertKeyResolutions
         );
     }
 

@@ -13,8 +13,28 @@ public record SqlRewriteConfig(
         Set<String> ignoredMissingTables,
         Set<String> ignoredMissingColumns,
         Set<String> ignoredMissingSchemas,
-        Set<String> identityInsertTables
+        Set<String> identityInsertTables,
+        Map<String, String> upsertKeyResolutions
 ) {
+    public SqlRewriteConfig(
+            Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Set<String> ignoredMissingTables,
+            Set<String> ignoredMissingColumns,
+            Set<String> ignoredMissingSchemas,
+            Set<String> identityInsertTables
+    ) {
+        this(
+                tableKeyColumns,
+                methodKeyColumns,
+                ignoredMissingTables,
+                ignoredMissingColumns,
+                ignoredMissingSchemas,
+                identityInsertTables,
+                Map.of()
+        );
+    }
+
     public SqlRewriteConfig(Map<String, List<String>> tableKeyColumns, Map<String, List<String>> methodKeyColumns) {
         this(tableKeyColumns, methodKeyColumns, Set.of(), Set.of(), Set.of(), Set.of());
     }
@@ -53,10 +73,11 @@ public record SqlRewriteConfig(
         ignoredMissingColumns = normalizeColumns(ignoredMissingColumns);
         ignoredMissingSchemas = normalizeSchemas(ignoredMissingSchemas);
         identityInsertTables = normalizeTables(identityInsertTables);
+        upsertKeyResolutions = normalizeMethodResolutions(upsertKeyResolutions);
     }
 
     public static SqlRewriteConfig empty() {
-        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), Set.of());
+        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), Set.of(), Map.of());
     }
 
     public boolean isEmpty() {
@@ -65,7 +86,8 @@ public record SqlRewriteConfig(
                 && ignoredMissingTables.isEmpty()
                 && ignoredMissingColumns.isEmpty()
                 && ignoredMissingSchemas.isEmpty()
-                && identityInsertTables.isEmpty();
+                && identityInsertTables.isEmpty()
+                && upsertKeyResolutions.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {
@@ -102,6 +124,13 @@ public record SqlRewriteConfig(
         return false;
     }
 
+    public boolean convertsInsertIgnoreToPlainInsert(String methodKey) {
+        if (methodKey == null || methodKey.isBlank()) {
+            return false;
+        }
+        return "INSERT_IGNORE_AS_PLAIN_INSERT".equals(upsertKeyResolutions.get(methodKey.trim()));
+    }
+
     static String normalizeTableName(String tableName) {
         String normalized = tableName.trim()
                 .replace("\"", "")
@@ -132,6 +161,22 @@ public record SqlRewriteConfig(
             List<String> cleanColumns = cleanColumns(columns);
             if (method != null && !method.isBlank() && !cleanColumns.isEmpty()) {
                 normalized.put(method.trim(), cleanColumns);
+            }
+        });
+        return Map.copyOf(normalized);
+    }
+
+    private static Map<String, String> normalizeMethodResolutions(Map<String, String> resolutions) {
+        if (resolutions == null || resolutions.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, String> normalized = new LinkedHashMap<>();
+        resolutions.forEach((method, resolution) -> {
+            if (method != null
+                    && !method.isBlank()
+                    && resolution != null
+                    && !resolution.isBlank()) {
+                normalized.put(method.trim(), resolution.trim());
             }
         });
         return Map.copyOf(normalized);

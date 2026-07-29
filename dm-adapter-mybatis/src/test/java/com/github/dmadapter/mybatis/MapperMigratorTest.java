@@ -700,6 +700,65 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationDropsInsertIgnoreWhenOnlyConflictKeyIsGenerated() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.BankFileMapper">
+                    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+                        insert ignore into ns_bank_file
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="fileId != null">fileId,</if>
+                            <if test="fileName != null">fileName,</if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="fileId != null">#{fileId},</if>
+                            <if test="fileName != null">#{fileName},</if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/BankFileMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BankFileMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Map.of(
+                                "com.example.BankFileMapper.insert",
+                                "INSERT_IGNORE_AS_PLAIN_INSERT"
+                        )
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/BankFileMapper.xml"));
+        assertThat(rewritten)
+                .contains("insert into ns_bank_file")
+                .doesNotContain("insert ignore")
+                .doesNotContain("MERGE INTO");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT_RULE);
+    }
+
+    @Test
     void migrationRewritesBatchOnDuplicateKeySelfAssignmentToInsertOnlyMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
