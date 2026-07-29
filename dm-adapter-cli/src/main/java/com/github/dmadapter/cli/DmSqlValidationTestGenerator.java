@@ -4397,6 +4397,9 @@ class DmSqlValidationTestGenerator {
                         String valueName,
                         boolean nestedProperty
                 ) {
+                    if (!nestedProperty && shouldUsePojoCollectionElement(targetType)) {
+                        return defaultValue(valueName, targetType, genericType, 0, statement);
+                    }
                     String collectionValueName = requiredCollectionValueName(valueName, statement);
                     if (isBlank(collectionValueName)) {
                         return null;
