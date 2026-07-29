@@ -1171,16 +1171,18 @@ class SqlScriptMigrator {
             String dynamicSelect = (stripped.substring(0, intoIndex).stripTrailing()
                     + " "
                     + stripped.substring(fromIndex).stripLeading()).strip();
-            if (containsProcedureInputVariable(dynamicSelect, variableNames.keySet())) {
+            RoutineDynamicBindings bindings = bindRoutineInputVariables(dynamicSelect, variableNames);
+            if (!bindings.supported()) {
                 return RoutineStaticSqlConversion.unsupported(
-                        "DDL 后的 SELECT 引用了过程参数或局部变量作为输入，第一版不自动生成 USING 绑定"
+                        bindings.reason()
                 );
             }
             return RoutineStaticSqlConversion.supported(
                     "EXECUTE IMMEDIATE "
-                            + sqlStringLiteral(dynamicSelect)
+                            + sqlStringLiteral(bindings.sql())
                             + " INTO "
                             + outputVariables
+                            + routineUsingClause(bindings.inputVariables())
             );
         }
         if (!startsKeyword(stripped, 0, "INSERT")
@@ -1191,38 +1193,29 @@ class SqlScriptMigrator {
                     "DDL 后的静态 SQL 类型不在安全自动转换范围内"
             );
         }
-        if (containsProcedureInputVariable(stripped, variableNames.keySet())) {
+        RoutineDynamicBindings bindings = bindRoutineInputVariables(stripped, variableNames);
+        if (!bindings.supported()) {
             return RoutineStaticSqlConversion.unsupported(
-                    "DDL 后的 DML 引用了过程参数或局部变量作为输入，第一版不自动生成 USING 绑定"
+                    bindings.reason()
             );
         }
         return RoutineStaticSqlConversion.supported(
-                "EXECUTE IMMEDIATE " + sqlStringLiteral(stripped)
+                "EXECUTE IMMEDIATE "
+                        + sqlStringLiteral(bindings.sql())
+                        + routineUsingClause(bindings.inputVariables())
         );
     }
 
-    private boolean areKnownProcedureOutputVariables(
-            String value,
+    private RoutineDynamicBindings bindRoutineInputVariables(
+            String sql,
             Map<String, String> variableNames
     ) {
-        List<String> outputs = splitTopLevelComma(value);
-        if (outputs.isEmpty()) {
-            return false;
-        }
-        for (String output : outputs) {
-            String stripped = output.strip();
-            if (!Pattern.compile("(?is)^" + SQL_SIMPLE_IDENTIFIER_TOKEN + "$").matcher(stripped).matches()
-                    || !variableNames.containsKey(normalizedProcedureVariableName(stripped))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private boolean containsProcedureInputVariable(String sql, Set<String> variableNames) {
         if (variableNames.isEmpty()) {
-            return false;
+            return RoutineDynamicBindings.supported(sql, List.of());
         }
+        StringBuilder dynamicSql = new StringBuilder(sql.length());
+        List<String> inputVariables = new ArrayList<>();
+        int copyStart = 0;
         int index = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
@@ -1241,15 +1234,157 @@ class SqlScriptMigrator {
                 while (end < sql.length() && isIdentifierPart(sql.charAt(end))) {
                     end++;
                 }
-                if (variableNames.contains(sql.substring(index, end).toLowerCase(Locale.ROOT))) {
-                    return true;
+                String normalized = sql.substring(index, end).toLowerCase(Locale.ROOT);
+                String variableName = variableNames.get(normalized);
+                if (variableName == null) {
+                    index = end;
+                    continue;
                 }
+                if (isRoutineDmlTargetColumn(sql, index, end)) {
+                    index = end;
+                    continue;
+                }
+                if (isRoutineDynamicIdentifierPosition(sql, index, end)) {
+                    return RoutineDynamicBindings.unsupported(
+                            "DDL 后的静态 SQL 将过程参数或局部变量用作对象名，无法通过 USING 安全绑定"
+                    );
+                }
+                dynamicSql.append(sql, copyStart, index).append('?');
+                inputVariables.add(variableName);
+                copyStart = end;
                 index = end;
             } else {
                 index++;
             }
         }
-        return false;
+        if (inputVariables.isEmpty()) {
+            return RoutineDynamicBindings.supported(sql, List.of());
+        }
+        dynamicSql.append(sql.substring(copyStart));
+        return RoutineDynamicBindings.supported(dynamicSql.toString(), inputVariables);
+    }
+
+    private boolean isRoutineDmlTargetColumn(String sql, int start, int end) {
+        int previous = previousNonWhitespace(sql, start - 1);
+        if (previous >= 0 && sql.charAt(previous) == '.') {
+            return true;
+        }
+        if (isInsertColumnListPosition(sql, start)) {
+            return true;
+        }
+        int setIndex = topLevelKeywordIndex(sql, "SET");
+        if (setIndex < 0 || start < setIndex + "SET".length()) {
+            return false;
+        }
+        int clauseEnd = firstPositive(
+                topLevelKeywordIndexAfter(sql, "WHERE", setIndex + "SET".length()),
+                topLevelKeywordIndexAfter(sql, "RETURNING", setIndex + "SET".length()),
+                sql.length()
+        );
+        if (start >= clauseEnd) {
+            return false;
+        }
+        int assignmentStart = setIndex + "SET".length();
+        int depth = 0;
+        int index = assignmentStart;
+        while (index < start) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (depth == 0 && current == ',') {
+                assignmentStart = index + 1;
+                index++;
+            } else {
+                index++;
+            }
+        }
+        int targetStart = skipWhitespace(sql, assignmentStart);
+        int after = skipWhitespace(sql, end);
+        return targetStart == start && after < sql.length() && sql.charAt(after) == '=';
+    }
+
+    private boolean isInsertColumnListPosition(String sql, int position) {
+        if (!startsKeyword(sql, skipWhitespace(sql, 0), "INSERT")) {
+            return false;
+        }
+        int intoIndex = topLevelKeywordIndex(sql, "INTO");
+        if (intoIndex < 0) {
+            return false;
+        }
+        int valuesIndex = topLevelKeywordIndexAfter(sql, "VALUES", intoIndex + "INTO".length());
+        int selectIndex = topLevelKeywordIndexAfter(sql, "SELECT", intoIndex + "INTO".length());
+        int statementBody = firstPositive(valuesIndex, selectIndex, sql.length());
+        int openParen = sql.indexOf('(', intoIndex + "INTO".length());
+        if (openParen < 0 || openParen >= statementBody) {
+            return false;
+        }
+        int closeParen = findMatchingParen(sql, openParen);
+        return closeParen > openParen && position > openParen && position < closeParen;
+    }
+
+    private boolean isRoutineDynamicIdentifierPosition(String sql, int start, int end) {
+        int next = skipWhitespace(sql, end);
+        if (next < sql.length() && (sql.charAt(next) == '.' || sql.charAt(next) == '(')) {
+            return true;
+        }
+        return previousWordIsKeyword(sql, start, "FROM")
+                || previousWordIsKeyword(sql, start, "JOIN")
+                || previousWordIsKeyword(sql, start, "UPDATE")
+                || previousWordIsKeyword(sql, start, "INTO")
+                || previousWordIsKeyword(sql, start, "MERGE")
+                || previousWordIsKeyword(sql, start, "TABLE");
+    }
+
+    private int topLevelKeywordIndexAfter(String sql, String keyword, int fromIndex) {
+        int relative = topLevelKeywordIndex(sql.substring(Math.max(0, fromIndex)), keyword);
+        return relative < 0 ? -1 : Math.max(0, fromIndex) + relative;
+    }
+
+    private int firstPositive(int first, int second, int fallback) {
+        int result = fallback;
+        if (first >= 0) {
+            result = Math.min(result, first);
+        }
+        if (second >= 0) {
+            result = Math.min(result, second);
+        }
+        return result;
+    }
+
+    private String routineUsingClause(List<String> inputVariables) {
+        return inputVariables.isEmpty() ? "" : " USING " + String.join(", ", inputVariables);
+    }
+
+    private boolean areKnownProcedureOutputVariables(
+            String value,
+            Map<String, String> variableNames
+    ) {
+        List<String> outputs = splitTopLevelComma(value);
+        if (outputs.isEmpty()) {
+            return false;
+        }
+        for (String output : outputs) {
+            String stripped = output.strip();
+            if (!Pattern.compile("(?is)^" + SQL_SIMPLE_IDENTIFIER_TOKEN + "$").matcher(stripped).matches()
+                    || !variableNames.containsKey(normalizedProcedureVariableName(stripped))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private String sameObjectRoutineManualReason(
@@ -10551,17 +10686,12 @@ class SqlScriptMigrator {
     }
 
     private boolean isMysqlProcedureIfStart(String sql, int ifIndex) {
-        if (previousWordIsKeyword(sql, ifIndex, "END")) {
+        if (!isMysqlProcedureIfControlFlowPosition(sql, ifIndex)) {
             return false;
         }
         int cursor = skipWhitespace(sql, ifIndex + "IF".length());
         if (cursor >= sql.length()) {
             return false;
-        }
-        if (sql.charAt(cursor) == '(') {
-            int closeParen = findMatchingParen(sql, cursor);
-            return closeParen > cursor
-                    && startsKeyword(sql, skipWhitespace(sql, closeParen + 1), "THEN");
         }
         int depth = 0;
         while (cursor < sql.length()) {
@@ -10578,6 +10708,19 @@ class SqlScriptMigrator {
             cursor++;
         }
         return false;
+    }
+
+    private boolean isMysqlProcedureIfControlFlowPosition(String sql, int ifIndex) {
+        int previous = previousNonWhitespace(sql, ifIndex - 1);
+        if (previous < 0 || sql.charAt(previous) == ';' || sql.charAt(previous) == ':') {
+            return true;
+        }
+        return previousWordIsKeyword(sql, ifIndex, "BEGIN")
+                || previousWordIsKeyword(sql, ifIndex, "THEN")
+                || previousWordIsKeyword(sql, ifIndex, "ELSE")
+                || previousWordIsKeyword(sql, ifIndex, "DO")
+                || previousWordIsKeyword(sql, ifIndex, "LOOP")
+                || previousWordIsKeyword(sql, ifIndex, "REPEAT");
     }
 
     private String mysqlCursorHandlerSelectIntoConflictReason(String sql) {
@@ -11089,6 +11232,26 @@ class SqlScriptMigrator {
 
         static RoutineStaticSqlConversion unsupported(String reason) {
             return new RoutineStaticSqlConversion("", false, reason);
+        }
+    }
+
+    private record RoutineDynamicBindings(
+            String sql,
+            List<String> inputVariables,
+            boolean supported,
+            String reason
+    ) {
+        private RoutineDynamicBindings {
+            inputVariables = List.copyOf(inputVariables == null ? List.of() : inputVariables);
+            reason = reason == null ? "" : reason;
+        }
+
+        static RoutineDynamicBindings supported(String sql, List<String> inputVariables) {
+            return new RoutineDynamicBindings(sql, inputVariables, true, "");
+        }
+
+        static RoutineDynamicBindings unsupported(String reason) {
+            return new RoutineDynamicBindings("", List.of(), false, reason);
         }
     }
 
