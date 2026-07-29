@@ -1402,6 +1402,32 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void dynamicallyExecutesPermanentTableDmlAfterTruncateWithLocalTemporarySource() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE daily_result(id BIGINT, amount DECIMAL(18, 2));
+                DELIMITER $$
+                CREATE PROCEDURE rebuild_daily_result()
+                BEGIN
+                    CREATE TEMPORARY TABLE daily_result_bak AS
+                    SELECT id, amount FROM source_result;
+                    TRUNCATE TABLE daily_result;
+                    INSERT INTO daily_result(id, amount)
+                    SELECT id, amount FROM daily_result_bak;
+                    DROP TABLE daily_result_bak;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+        assertThat(converted.sql())
+                .contains("CREATE TABLE #daily_result_bak AS")
+                .contains("EXECUTE IMMEDIATE 'TRUNCATE TABLE daily_result'")
+                .contains("EXECUTE IMMEDIATE 'INSERT INTO daily_result(id, amount)"
+                        + System.lineSeparator()
+                        + "    SELECT id, amount FROM #daily_result_bak'");
+    }
+
+    @Test
     void keepsExplainedNoopWhenOmittedTemporaryIndexWouldEmptyNestedBlock() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
