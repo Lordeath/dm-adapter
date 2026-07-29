@@ -71,6 +71,22 @@ class GeneratedFailurePatternTest {
                     failedRecord(validationClass, missingColumn)
             )).isFalse();
 
+            String havingSelectAlias = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 无效的列名[isFollowUp]
+                    ### SQL: select t1.*,
+                    IF(t2.houseId is not null, 1, 0) as isFollowUp
+                    from arrears_house t1
+                    left join follow_record t2 on t1.houseId = t2.houseId
+                    having 1 = 1 and isFollowUp = ?
+                    ### Cause: dm.jdbc.driver.DMException: 无效的列名[isFollowUp]
+                    """;
+            Object havingSelectAliasRecord = failedRecord(validationClass, havingSelectAlias);
+            assertThat(failurePattern(validationClass, validation, havingSelectAliasRecord))
+                    .isEqualTo("DAMENG_HAVING_SELECT_ALIAS");
+            assertThat(category(validationClass, validation, havingSelectAliasRecord))
+                    .isEqualTo("SQL_SYNTAX");
+
             String missingSchema = """
                     java.lang.IllegalStateException: Failed to set Dameng schema: newsee-association
                     Caused by: dm.jdbc.driver.DMException: 无效的模式名[newsee-association]

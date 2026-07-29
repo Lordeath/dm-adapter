@@ -8914,6 +8914,9 @@ class DmSqlValidationTestGenerator {
                     if (hasOriginalSqlConflictKeyIssue(record, message)) {
                         return "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
                     }
+                    if (hasDamengHavingSelectAliasFailure(message)) {
+                        return "DAMENG_HAVING_SELECT_ALIAS";
+                    }
                     if (hasLikelyOriginalColumnNameMismatch(message)) {
                         return "ORIGINAL_SQL_COLUMN_NAME_MISMATCH";
                     }
@@ -9515,6 +9518,33 @@ class DmSqlValidationTestGenerator {
                     return false;
                 }
 
+                private boolean hasDamengHavingSelectAliasFailure(String message) {
+                    List<String> invalidColumns = bracketedValuesAfterMarker(message, "无效的列名");
+                    if (invalidColumns.isEmpty()) {
+                        return false;
+                    }
+                    String sql = sqlFromMessage(message);
+                    if (isBlank(sql)) {
+                        return false;
+                    }
+                    for (String invalidColumn : invalidColumns) {
+                        Pattern selectAlias = Pattern.compile(
+                                "\\\\bas\\\\s+" + Pattern.quote(invalidColumn) + "\\\\b",
+                                Pattern.CASE_INSENSITIVE
+                        );
+                        Pattern havingReference = Pattern.compile(
+                                "\\\\bhaving\\\\b[\\\\s\\\\S]*?(?<![A-Za-z0-9_$.])"
+                                        + Pattern.quote(invalidColumn)
+                                        + "(?![A-Za-z0-9_$])",
+                                Pattern.CASE_INSENSITIVE
+                        );
+                        if (selectAlias.matcher(sql).find() && havingReference.matcher(sql).find()) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
                 private boolean hasJavaMapperParamAnnotationIssue(String message) {
                     String lower = message == null ? "" : message.toLowerCase(Locale.ROOT);
                     return lower.contains("java mapper signature has duplicate @param")
@@ -9560,6 +9590,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasOriginalSqlConflictKeyIssue(record, message)) {
                         return "ORIGINAL_SQL";
+                    }
+                    if (hasDamengHavingSelectAliasFailure(message)) {
+                        return "SQL_SYNTAX";
                     }
                     if (hasLikelyOriginalColumnNameMismatch(message)) {
                         return "ORIGINAL_SQL";

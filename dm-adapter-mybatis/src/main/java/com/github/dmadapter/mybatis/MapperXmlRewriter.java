@@ -1966,8 +1966,11 @@ public class MapperXmlRewriter {
     }
 
     private ScopeHavingConversion convertRegularHavingInScope(String body, String view, SelectScope scope) {
-        if (scope.havingIndex() < 0 || scope.groupIndex() < 0) {
+        if (scope.havingIndex() < 0) {
             return ScopeHavingConversion.unchanged(body);
+        }
+        if (scope.groupIndex() < 0) {
+            return convertUngroupedHavingInScope(body, view, scope);
         }
         String selectList = body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex());
         Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(selectList);
@@ -2057,6 +2060,69 @@ public class MapperXmlRewriter {
             rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
         }
         return new ScopeHavingConversion(converted, rules, true);
+    }
+
+    private ScopeHavingConversion convertUngroupedHavingInScope(
+            String body,
+            String view,
+            SelectScope scope
+    ) {
+        String selectList = body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex());
+        Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(selectList);
+        Map<String, DynamicAggregateAlias> dynamicAggregateAliases = dynamicAggregateSelectAliases(selectList);
+        Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(selectList);
+        int havingStart = scope.havingIndex() + "HAVING".length();
+        String havingContent = body.substring(havingStart, scope.havingEnd());
+        TextRewrite aggregateAliasRewrite = replaceAggregateAliases(havingContent, aggregateAliases);
+        TextRewrite selectAliasRewrite = replaceSelectAliases(aggregateAliasRewrite.text(), selectAliases);
+
+        boolean aggregateQuery = !aggregateAliases.isEmpty()
+                || !dynamicAggregateAliases.isEmpty()
+                || containsAggregateFunction(havingContent);
+        if (aggregateQuery) {
+            if (!aggregateAliasRewrite.changed() && !selectAliasRewrite.changed()) {
+                return ScopeHavingConversion.unchanged(body);
+            }
+            List<String> rules = new ArrayList<>();
+            if (aggregateAliasRewrite.changed()) {
+                rules.add(MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+            }
+            if (selectAliasRewrite.changed()) {
+                rules.add(MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE);
+            }
+            return new ScopeHavingConversion(
+                    body.substring(0, havingStart)
+                            + selectAliasRewrite.text()
+                            + body.substring(scope.havingEnd()),
+                    rules,
+                    true
+            );
+        }
+
+        if (findMyBatisWhereBlock(body, scope.fromIndex(), scope.havingIndex()) != null) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        int whereIndex = findTopLevelKeyword(
+                view,
+                "WHERE",
+                scope.fromIndex() + "FROM".length(),
+                scope.havingIndex(),
+                scope.depth()
+        );
+        String connector = whereIndex >= 0 ? "AND" : "WHERE";
+        List<String> rules = new ArrayList<>();
+        if (selectAliasRewrite.changed()) {
+            rules.add(MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION_RULE);
+        }
+        rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        return new ScopeHavingConversion(
+                body.substring(0, scope.havingIndex())
+                        + connector
+                        + selectAliasRewrite.text()
+                        + body.substring(scope.havingEnd()),
+                rules,
+                true
+        );
     }
 
     private ScopeHavingConversion convertTrimHavingInScope(String body, SelectScope scope) {
@@ -3158,9 +3224,10 @@ public class MapperXmlRewriter {
                 if (fromIndex >= 0) {
                     int scopeEnd = findSelectEnd(view, fromIndex + "FROM".length(), depth);
                     int groupIndex = findTopLevelGroupBy(view, fromIndex + "FROM".length(), scopeEnd, depth);
-                    int havingIndex = groupIndex < 0
-                            ? -1
-                            : findTopLevelKeyword(view, "HAVING", groupIndex + "GROUP".length(), scopeEnd, depth);
+                    int havingSearchStart = groupIndex < 0
+                            ? fromIndex + "FROM".length()
+                            : groupIndex + "GROUP BY".length();
+                    int havingIndex = findTopLevelKeyword(view, "HAVING", havingSearchStart, scopeEnd, depth);
                     int havingEnd = havingIndex < 0
                             ? -1
                             : findClauseEnd(view, havingIndex + "HAVING".length(), scopeEnd, depth);
