@@ -41,6 +41,8 @@ public class MapperXmlRewriter {
             "MYBATIS_STATIC_WHERE_MISSING_AND";
     public static final String MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE_RULE =
             "MYBATIS_BATCH_INSERT_LIST_ITEM_REFERENCE";
+    public static final String MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE =
+            "MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL";
     public static final String MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE =
@@ -138,6 +140,17 @@ public class MapperXmlRewriter {
     );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`|\\$\\{[^}]+})";
+    private static final Pattern GENERATED_KEY_BATCH_INSERT_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*insert\\s+into\\s+"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?\\s*)"
+                    + "(?<columnsTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)"
+                    + "(?<valuesKeyword>\\s*values\\s*)"
+                    + "(?<foreach><foreach\\b[^>]*>[\\s\\S]*?</foreach>)"
+                    + "(?<trailing>;?\\s*)$"
+    );
     private static final Pattern WRAPPING_IF_PATTERN = Pattern.compile(
             "(?is)^(?<leading>\\s*)(?<opening><if\\b[^>]*>)(?<body>[\\s\\S]*)(?<closing></if\\s*>)(?<trailing>\\s*)$"
     );
@@ -374,7 +387,10 @@ public class MapperXmlRewriter {
                                 statementBody.rawBody(),
                                 sqlConverter,
                                 rewriteConfig,
-                                resultMapColumnByProperty
+                                resultMapColumnByProperty,
+                                "true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys")),
+                                statement.getAttribute("keyProperty"),
+                                statement.getAttribute("keyColumn")
                         );
                 manualReviewItems.add(new SqlChange(
                         reportPath,
@@ -676,7 +692,10 @@ public class MapperXmlRewriter {
             String rawBody,
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig,
-            Map<String, String> resultMapColumnByProperty
+            Map<String, String> resultMapColumnByProperty,
+            boolean useGeneratedKeys,
+            String generatedKeyProperty,
+            String generatedKeyColumn
     ) {
         StringBuilder convertedBody = new StringBuilder(rawBody.length());
         List<String> appliedRules = new ArrayList<>();
@@ -744,7 +763,10 @@ public class MapperXmlRewriter {
                 rewrittenBody,
                 sqlConverter,
                 rewriteConfig,
-                resultMapColumnByProperty
+                resultMapColumnByProperty,
+                useGeneratedKeys,
+                generatedKeyProperty,
+                generatedKeyColumn
         );
         if (structuralConversion.changed()) {
             rewrittenBody = structuralConversion.convertedBody();
@@ -775,7 +797,10 @@ public class MapperXmlRewriter {
             String body,
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig,
-            Map<String, String> resultMapColumnByProperty
+            Map<String, String> resultMapColumnByProperty,
+            boolean useGeneratedKeys,
+            String generatedKeyProperty,
+            String generatedKeyColumn
     ) {
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
@@ -905,6 +930,18 @@ public class MapperXmlRewriter {
                 converted = duplicateBlockSemicolon.text();
             }
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
+        }
+
+        if (useGeneratedKeys && generatedKeyProperty != null && !generatedKeyProperty.isBlank()) {
+            TextRewrite generatedKeyBatch = conditionalizeGeneratedKeyBatchInsert(
+                    converted,
+                    generatedKeyProperty,
+                    generatedKeyColumn
+            );
+            if (generatedKeyBatch.changed()) {
+                appliedRules.add(MYBATIS_BATCH_GENERATED_KEY_CONDITIONAL_RULE);
+                converted = generatedKeyBatch.text();
+            }
         }
 
         String withMissingValues = addMissingBatchInsertValues(converted);
@@ -5259,6 +5296,194 @@ public class MapperXmlRewriter {
         }
         matcher.appendTail(converted);
         return changed ? converted.toString() : body;
+    }
+
+    private TextRewrite conditionalizeGeneratedKeyBatchInsert(
+            String body,
+            String generatedKeyProperty,
+            String generatedKeyColumn
+    ) {
+        Matcher matcher = GENERATED_KEY_BATCH_INSERT_PATTERN.matcher(body);
+        if (!matcher.matches()
+                || generatedKeyProperty.contains(",")
+                || (generatedKeyColumn != null && generatedKeyColumn.contains(","))) {
+            return new TextRewrite(body, false);
+        }
+        String property = leafProperty(generatedKeyProperty);
+        ForeachBlock foreach = readForeach(matcher.group("foreach"));
+        String columnsBody = trimColumnList(matcher.group("columnsTrim"));
+        String tupleBody = foreach == null ? "" : outerParenthesizedContent(foreach.body());
+        List<String> columns = splitTopLevelComma(columnsBody).stream()
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .toList();
+        List<String> values = splitTopLevelComma(tupleBody).stream()
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .toList();
+        if (foreach == null
+                || !isSimplePropertyPath(foreach.collection())
+                || !isSimplePropertyPath(foreach.item())
+                || property.isBlank()
+                || columns.size() < 2
+                || columns.size() != values.size()) {
+            return new TextRewrite(body, false);
+        }
+
+        String configuredColumn = generatedKeyColumn == null ? "" : generatedKeyColumn.trim();
+        String expectedColumn = configuredColumn.isBlank() ? property : configuredColumn;
+        if (!sameGeneratedKeyColumn(columns.get(0), expectedColumn, property)) {
+            return new TextRewrite(body, false);
+        }
+        String parameterName = simpleMyBatisParameterName(values.get(0));
+        if (!parameterName.equals(foreach.item() + "." + property)) {
+            return new TextRewrite(body, false);
+        }
+
+        String condition = foreach.collection() + " != null and !"
+                + foreach.collection() + ".isEmpty() and "
+                + foreach.collection() + "[0]." + property + " != null";
+        String columnsTrim = conditionalGeneratedKeyColumns(
+                matcher.group("columnsTrim"),
+                columns,
+                condition
+        );
+        String foreachXml = conditionalGeneratedKeyValues(
+                matcher.group("foreach"),
+                foreach,
+                values,
+                condition
+        );
+        if (columnsTrim == null || foreachXml == null) {
+            return new TextRewrite(body, false);
+        }
+        String converted = matcher.group("leading")
+                + columnsTrim
+                + matcher.group("valuesKeyword")
+                + foreachXml
+                + matcher.group("trailing");
+        return new TextRewrite(converted, !converted.equals(body));
+    }
+
+    private String conditionalGeneratedKeyColumns(
+            String trimXml,
+            List<String> columns,
+            String condition
+    ) {
+        Matcher trimMatcher = TRIM_TAG_PATTERN.matcher(trimXml);
+        if (!trimMatcher.matches()) {
+            return null;
+        }
+        String body = trimMatcher.group("body");
+        String itemIndent = firstContentIndent(body);
+        String closingIndent = trailingIndent(body);
+        StringBuilder converted = new StringBuilder(trimXml.length() + 120);
+        converted.append(trimMatcher.group("opening"))
+                .append("\n")
+                .append(itemIndent)
+                .append("<if test=\"")
+                .append(condition)
+                .append("\">\n")
+                .append(itemIndent)
+                .append("    ")
+                .append(columns.get(0))
+                .append(",\n")
+                .append(itemIndent)
+                .append("</if>\n");
+        for (int i = 1; i < columns.size(); i++) {
+            converted.append(itemIndent)
+                    .append(columns.get(i))
+                    .append(",\n");
+        }
+        converted.append(closingIndent).append("</trim>");
+        return converted.toString();
+    }
+
+    private String conditionalGeneratedKeyValues(
+            String foreachXml,
+            ForeachBlock foreach,
+            List<String> values,
+            String condition
+    ) {
+        String rawForeachBody = foreach.body();
+        String trimmed = rawForeachBody.trim();
+        if (!trimmed.startsWith("(")) {
+            return null;
+        }
+        int rawOpen = rawForeachBody.indexOf('(');
+        int rawClose = findMatchingParen(rawForeachBody, rawOpen);
+        if (rawOpen < 0 || rawClose < 0) {
+            return null;
+        }
+        String inside = rawForeachBody.substring(rawOpen + 1, rawClose);
+        String itemIndent = firstContentIndent(inside);
+        String closingIndent = trailingIndent(inside);
+        StringBuilder convertedInside = new StringBuilder(inside.length() + 120);
+        convertedInside.append("\n")
+                .append(itemIndent)
+                .append("<if test=\"")
+                .append(condition)
+                .append("\">\n")
+                .append(itemIndent)
+                .append("    ")
+                .append(values.get(0))
+                .append(",\n")
+                .append(itemIndent)
+                .append("</if>\n");
+        for (int i = 1; i < values.size(); i++) {
+            convertedInside.append(itemIndent)
+                    .append(values.get(i));
+            if (i + 1 < values.size()) {
+                convertedInside.append(",");
+            }
+            convertedInside.append("\n");
+        }
+        convertedInside.append(closingIndent);
+        String convertedBody = rawForeachBody.substring(0, rawOpen + 1)
+                + convertedInside
+                + rawForeachBody.substring(rawClose);
+        return foreach.withBody(convertedBody).toXml();
+    }
+
+    private String firstContentIndent(String body) {
+        int first = 0;
+        while (first < body.length() && Character.isWhitespace(body.charAt(first))) {
+            first++;
+        }
+        int newline = first <= 0 ? -1 : Math.max(
+                body.lastIndexOf('\n', first - 1),
+                body.lastIndexOf('\r', first - 1)
+        );
+        return newline < 0 ? "    " : body.substring(newline + 1, first);
+    }
+
+    private String trailingIndent(String body) {
+        int last = body.length();
+        while (last > 0 && Character.isWhitespace(body.charAt(last - 1))) {
+            last--;
+        }
+        int newline = Math.max(body.lastIndexOf('\n', last), body.lastIndexOf('\r', last));
+        return newline < 0 ? "" : body.substring(newline + 1);
+    }
+
+    private String leafProperty(String property) {
+        String trimmed = property == null ? "" : property.trim();
+        int dot = trimmed.lastIndexOf('.');
+        return dot < 0 ? trimmed : trimmed.substring(dot + 1);
+    }
+
+    private boolean isSimplePropertyPath(String value) {
+        return value != null && value.matches("[A-Za-z_][A-Za-z0-9_.]*");
+    }
+
+    private boolean sameGeneratedKeyColumn(String column, String expectedColumn, String property) {
+        String normalizedColumn = normalizeIdentifier(column);
+        return normalizedColumn.equals(normalizeIdentifier(expectedColumn))
+                || normalizedColumn.equals(camelToSnake(property));
+    }
+
+    private String camelToSnake(String value) {
+        return value.replaceAll("([a-z0-9])([A-Z])", "$1_$2").toLowerCase(Locale.ROOT);
     }
 
     private TextRewrite qualifyBatchInsertListItemReferences(String body) {

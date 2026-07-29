@@ -682,6 +682,7 @@ class DmAdapterCliTest {
                 .contains("return \"2024-01-01 00:00:00\";")
                 .contains("isNumericTextParameterName")
                 .contains("isCompactEnumStringName")
+                .contains("normalizedName.endsWith(\"method\")")
                 .contains("normalizedName.startsWith(\"has\")")
                 .contains("normalizedName.startsWith(\"sync\")")
                 .contains("normalizedName.endsWith(\"period\")")
