@@ -2118,19 +2118,6 @@ class SqlScriptMigrator {
                     false
             );
         }
-        Map<String, Integer> createCounts = new LinkedHashMap<>();
-        Map<String, Integer> callCounts = new LinkedHashMap<>();
-        for (String statement : statements) {
-            String created = procedureNameFromCreateProcedure(statement);
-            if (!created.isBlank()) {
-                createCounts.merge(created.toLowerCase(Locale.ROOT), 1, Integer::sum);
-            }
-            String called = procedureNameFromCall(statement);
-            if (!called.isBlank()) {
-                callCounts.merge(called.toLowerCase(Locale.ROOT), 1, Integer::sum);
-            }
-        }
-
         Set<Integer> manualIndexes = manualReviewStatementIndexes == null
                 ? Set.of()
                 : manualReviewStatementIndexes;
@@ -2141,8 +2128,6 @@ class SqlScriptMigrator {
             TransientProcedureSequence sequence = transientProcedureSequenceAt(
                     statements,
                     manualIndexes,
-                    createCounts,
-                    callCounts,
                     index
             );
             if (sequence != null) {
@@ -2167,8 +2152,6 @@ class SqlScriptMigrator {
     private TransientProcedureSequence transientProcedureSequenceAt(
             List<String> statements,
             Set<Integer> manualReviewStatementIndexes,
-            Map<String, Integer> createCounts,
-            Map<String, Integer> callCounts,
             int index
     ) {
         if (index + 3 >= statements.size()) {
@@ -2196,10 +2179,7 @@ class SqlScriptMigrator {
                 || !calledName.equalsIgnoreCase(trailingDropName)) {
             return null;
         }
-        String normalizedName = createdName.toLowerCase(Locale.ROOT);
-        if (createCounts.getOrDefault(normalizedName, 0) != 1
-                || callCounts.getOrDefault(normalizedName, 0) != 1
-                || !hasEmptyProcedureParameters(create)
+        if (!hasEmptyProcedureParameters(create)
                 || !hasEmptyCallArguments(call)
                 || hasLeadingComment(call)
                 || hasLeadingComment(trailingDrop)) {
