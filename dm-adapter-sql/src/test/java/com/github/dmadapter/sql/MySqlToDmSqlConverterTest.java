@@ -275,6 +275,32 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsDatePartAndParenthesizedAmountDivisionToDecimalArithmetic() {
+        SqlConversionResult result = converter.convert("""
+                SELECT DAY(end_time) / DAY(LAST_DAY(end_time)) AS month_ratio,
+                       (paid_amount - IFNULL(delay_amount, 0)) / (1 + IFNULL(tax_rate, 0)) AS net_amount,
+                       SUM(CASE WHEN active = 1 THEN paid_amount ELSE 0 END) / 10000 AS ten_thousands
+                FROM sample_payment
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).contains(
+                "CAST(DAY(end_time) AS DECIMAL(38,10)) / "
+                        + "NULLIF(CAST(DAY(LAST_DAY(end_time)) AS DECIMAL(38,10)), 0)"
+        );
+        assertThat(result.convertedSql()).contains(
+                "CAST((paid_amount - IFNULL(delay_amount, 0)) AS DECIMAL(38,10)) / "
+                        + "NULLIF(CAST((1 + IFNULL(tax_rate, 0)) AS DECIMAL(38,10)), 0)"
+        );
+        assertThat(result.convertedSql()).contains(
+                "CAST(SUM(CASE WHEN active = 1 THEN paid_amount ELSE 0 END) AS DECIMAL(38,10)) / "
+                        + "NULLIF(CAST(10000 AS DECIMAL(38,10)), 0)"
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE);
+    }
+
+    @Test
     void convertsTimeToSecTimeDiffAndChainedIntegerDivision() {
         SqlConversionResult result = converter.convert(
                 "select TIME_TO_SEC(TIMEDIFF(NOW(), task.created_at))/60/task.complete_limit "
@@ -1235,6 +1261,44 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.SQLSERVER_STRING_PLUS_TO_DM_CONCAT_RULE,
                 MySqlToDmSqlConverter.SQLSERVER_CHARINDEX_TO_DM_INSTR_RULE
         );
+    }
+
+    @Test
+    void keepsNumericCastAndConvertAdditionAsArithmetic() {
+        SqlConversionResult result = converter.convert("""
+                SELECT CAST(unit_price AS DECIMAL(12, 2))
+                     + CONVERT(quantity * unit_price, DECIMAL(18, 4)) AS total_amount
+                FROM sample_charge
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT CAST(unit_price AS DECIMAL(12, 2))
+                     + CAST(quantity * unit_price AS DECIMAL(18, 4)) AS total_amount
+                FROM sample_charge
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_CONVERT_DECIMAL_RULE);
+    }
+
+    @Test
+    void convertsExplicitSqlServerStringFunctionAdditionToConcatenation() {
+        SqlConversionResult result = converter.convert("""
+                SELECT CAST(first_code AS VARCHAR(20))
+                     + CONVERT(NVARCHAR(20), second_code)
+                     + CONCAT('-', third_code) AS full_code
+                FROM sample_code
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT CAST(first_code AS VARCHAR(20))
+                     || CONVERT(NVARCHAR(20), second_code)
+                     || CONCAT('-', third_code) AS full_code
+                FROM sample_code
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.SQLSERVER_STRING_PLUS_TO_DM_CONCAT_RULE);
     }
 
     @Test

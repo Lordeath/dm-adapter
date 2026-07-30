@@ -209,6 +209,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "CEILING",
             "COALESCE",
             "COUNT",
+            "DAY",
             "FLOOR",
             "IF",
             "IFNULL",
@@ -8128,8 +8129,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return false;
         }
         int functionStart = readFunctionNameStartBeforeParen(sql, openParenIndex);
-        String functionName = sql.substring(functionStart, openParenIndex).trim();
-        return Set.of("CONVERT", "CAST", "CONCAT").contains(functionName.toUpperCase(Locale.ROOT));
+        return isSqlServerStringReturningFunction(
+                sql.substring(functionStart, end)
+        );
     }
 
     private boolean isSqlServerStringOperandAfter(String sql, int afterIndex) {
@@ -8140,9 +8142,45 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (sql.charAt(start) == '\'') {
             return true;
         }
-        return startsFunction(sql, start, "CONVERT")
-                || startsFunction(sql, start, "CAST")
-                || startsFunction(sql, start, "CONCAT");
+        for (String functionName : List.of("CONVERT", "CAST", "CONCAT")) {
+            if (!startsFunction(sql, start, functionName)) {
+                continue;
+            }
+            FunctionCall functionCall = readFunctionCall(sql, start, functionName);
+            return functionCall != null
+                    && isSqlServerStringReturningFunction(
+                    sql.substring(start, functionCall.endIndex())
+            );
+        }
+        return false;
+    }
+
+    private boolean isSqlServerStringReturningFunction(String expression) {
+        String trimmed = expression.trim();
+        if (startsFunction(trimmed, 0, "CONCAT")) {
+            FunctionCall functionCall = readFunctionCall(trimmed, 0, "CONCAT");
+            return functionCall != null && functionCall.endIndex() == trimmed.length();
+        }
+        if (startsFunction(trimmed, 0, "CAST")) {
+            FunctionCall functionCall = readFunctionCall(trimmed, 0, "CAST");
+            return functionCall != null
+                    && functionCall.endIndex() == trimmed.length()
+                    && Pattern.compile(
+                    "(?is)\\s+AS\\s+(?:N?CHAR|N?VARCHAR|VARCHAR2|TEXT|CLOB)\\b"
+            ).matcher(functionCall.body()).find();
+        }
+        if (startsFunction(trimmed, 0, "CONVERT")) {
+            FunctionCall functionCall = readFunctionCall(trimmed, 0, "CONVERT");
+            if (functionCall == null || functionCall.endIndex() != trimmed.length()) {
+                return false;
+            }
+            List<TopLevelArgument> arguments = splitTopLevelArguments(functionCall.body());
+            return arguments.size() >= 2
+                    && arguments.get(0).text().trim().matches(
+                    "(?is)(?:N?CHAR|N?VARCHAR|VARCHAR2|TEXT|CLOB)(?:\\s*\\([^)]*\\))?"
+            );
+        }
+        return false;
     }
 
     private GenericConversion convertSqlServerCharIndexFunctions(String sql) {
