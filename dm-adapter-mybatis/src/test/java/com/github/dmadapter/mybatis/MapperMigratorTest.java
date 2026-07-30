@@ -5159,6 +5159,57 @@ class MapperMigratorTest {
     }
 
     @Test
+    void rewritesUpdateJoinFollowedByOnlyDynamicWhereConditions() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/HouseMapper.xml", """
+                update sample_owner_house owner_row
+                inner join sample_house house_row
+                    on owner_row.house_id = house_row.house_id
+                   and owner_row.precinct_id = house_row.precinct_id
+                   and owner_row.house_name != house_row.house_name
+                   and owner_row.precinct_id = #{precinctId}
+                set owner_row.house_name = house_row.house_name
+                <where>
+                    <if test="houseIds != null and houseIds.size() > 0">
+                        AND owner_row.house_id in
+                        <foreach collection="houseIds" item="houseId" open="(" close=")" separator=",">
+                            #{houseId}
+                        </foreach>
+                    </if>
+                </where>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/HouseMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/HouseMapper.xml"));
+        assertThat(rewritten)
+                .contains("update sample_owner_house owner_row set house_name = house_row.house_name")
+                .contains("from sample_house house_row")
+                .contains("<where>")
+                .contains("owner_row.house_id = house_row.house_id")
+                .contains("and owner_row.precinct_id = house_row.precinct_id")
+                .contains("<if test=\"houseIds != null and houseIds.size() > 0\">")
+                .contains("AND owner_row.house_id in")
+                .doesNotContainIgnoringCase("inner join");
+        assertThat(result.automaticConversions()).singleElement()
+                .satisfies(change -> assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void neutralizesMybatisPlaceholdersInsideSqlLineComments() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
                 select count(*)
@@ -5610,6 +5661,49 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .contains(MySqlToDmSqlConverter.MYSQL_PERIOD_DIFF_YEARMONTH_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void convertsDecimalDivisionInsideDynamicReportSql() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/PaymentReportMapper.xml", """
+                SELECT
+                <if test="includeMonthRatio">
+                    DAY(end_time) / DAY(LAST_DAY(end_time)) AS month_ratio,
+                </if>
+                (paid_amount - IFNULL(delay_amount, 0)) / (1 + IFNULL(tax_rate, 0)) AS net_amount,
+                SUM(CASE WHEN active = 1 THEN paid_amount ELSE 0 END) / 10000 AS ten_thousands
+                FROM sample_payment
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentReportMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/PaymentReportMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("CAST(DAY(end_time) AS DECIMAL(38,10))")
+                .contains("NULLIF(CAST(DAY(LAST_DAY(end_time)) AS DECIMAL(38,10)), 0)")
+                .contains("CAST((paid_amount - IFNULL(delay_amount, 0)) AS DECIMAL(38,10))")
+                .contains("NULLIF(CAST((1 + IFNULL(tax_rate, 0)) AS DECIMAL(38,10)), 0)")
+                .contains("CAST(SUM(CASE WHEN active = 1 THEN paid_amount ELSE 0 END) AS DECIMAL(38,10))")
+                .doesNotContain("||");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE);
         assertThat(result.manualReviewItems()).isEmpty();
     }
 

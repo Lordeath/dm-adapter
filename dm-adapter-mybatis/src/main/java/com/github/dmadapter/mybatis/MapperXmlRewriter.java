@@ -4924,9 +4924,10 @@ public class MapperXmlRewriter {
             return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
         String whereClause = body.substring(whereBlock.openingEnd(), whereBlock.closingStart()).strip();
-        if (whereClause.isBlank() || whereClause.startsWith("<")) {
+        if (whereClause.isBlank()) {
             return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
+        boolean dynamicOnlyWhereClause = whereClause.startsWith("<");
 
         String statement = body.substring(0, whereBlock.openingStart());
         int updateIndex = leadingWhitespaceLength(statement);
@@ -4996,12 +4997,14 @@ public class MapperXmlRewriter {
                 sqlConverter,
                 rewriteConfig
         );
-        TextSegmentConversion whereConversion = convertSqlTextWithXmlTags(
-                removeLeadingBooleanConnector(whereClause),
-                statementKey,
-                sqlConverter,
-                rewriteConfig
-        );
+        TextSegmentConversion whereConversion = dynamicOnlyWhereClause
+                ? new TextSegmentConversion(whereClause, List.of(), List.of(), false)
+                : convertSqlTextWithXmlTags(
+                        removeLeadingBooleanConnector(whereClause),
+                        statementKey,
+                        sqlConverter,
+                        rewriteConfig
+                );
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
         appliedRules.add(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE);
@@ -5019,7 +5022,7 @@ public class MapperXmlRewriter {
                 + indentBlock(conditionConversion.convertedText().strip(), childIndent)
                 + "\n"
                 + childIndent
-                + "and "
+                + (dynamicOnlyWhereClause ? "" : "and ")
                 + indentBlock(whereConversion.convertedText().strip(), childIndent)
                 + "\n"
                 + baseIndent

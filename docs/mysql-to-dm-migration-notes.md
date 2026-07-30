@@ -46,6 +46,7 @@
 - MySQL `ON DUPLICATE KEY UPDATE` 不能直接在达梦执行，通常要改为 `MERGE INTO` 或业务侧先查后写。dm-adapter 不应在无法确认唯一键和更新列语义时强行转换。项目 DDL 已明确主键/唯一键、但 INSERT 列不包含任何一个完整冲突键时，原写法本身无法按预期触发冲突更新，应归为原始 SQL/键元数据冲突；普通非唯一索引不能冒充冲突键，也不能据此猜测 `keyColumns`。`column = column` 这类自赋值仅用于表达“冲突时不更新”，转换后的 `MERGE` 应省略 `WHEN MATCHED`，不能生成歧义的自赋值表达式。
 - MySQL `INSERT IGNORE`、`REPLACE INTO` 需要确认唯一键、忽略冲突和替换删除语义。达梦元数据存在多个可用唯一键、元数据不可用或工具无法解析 INSERT 列时，必须人工配置真实 `keyColumns`。如果 `INSERT IGNORE` 的所有主键/唯一键冲突都不可达（表没有主键/唯一键，或每个未显式插入的冲突键都依赖由数据库生成的自增列），`IGNORE` 对重复键语义没有作用，可安全转为普通 `INSERT`；其他 INSERT 未包含完整冲突键的情况仍归为原始 SQL/键约束冲突，不能猜测 `keyColumns`。
 - MySQL `UPDATE ... JOIN ... SET ...` 只更新一个表别名且目标达梦可执行时可以保留；同时更新多个别名时，达梦会报“多表更新时仅支持更新同一个表上的列”。拆分语句必须保持原 JOIN 匹配快照，不能让第一条 UPDATE 改掉后续语句仍依赖的谓词。若只有一个目标会修改匹配谓词且各目标右值不依赖其他目标被修改的列，可按“未改谓词的目标在前、改谓词的目标最后”生成达梦匿名块；若两个目标都会修改谓词，但能证明主表 `ID` 由方法参数唯一绑定、JOIN 将该 ID 映射到从表外键，则先更新主表，并用 `IF SQL%ROWCOUNT > 0 THEN` 和推导出的从表外键条件更新从表。表名、别名、列名和参数都必须从原 SQL 提取，不能写死项目值；无法证明等价时保留原 SQL 并报告，不能盲目顺序拆分。
+- `UPDATE ... JOIN` 后接 MyBatis `<where>` 时，应把 JOIN 谓词放进同一个 `<where>`，再保留原有静态或纯动态 `<if>/<foreach>` 条件，不能先生成普通 `WHERE` 再留下第二个动态 `WHERE`。即使所有原条件都位于动态标签内，JOIN 谓词也必须作为无条件首项保留，保证动态条件为空时仍不会扩大更新范围。
 - MySQL 用户变量和累加写法如 `@rownum := @rownum + 1` 不能直接迁移，通常改为达梦窗口函数 `ROW_NUMBER() OVER (...)`，或在存储过程/业务代码中显式声明变量。
 - 对 `GROUP_CONCAT`/`FIND_IN_SET` 配合用户变量累积父级或子级 ID 的 MyBatis 层级遍历，只有在游标变量、起点参数、ID/父 ID 列、三处来源表和输出过滤关系全部一致时，才可改写为达梦 `START WITH ... CONNECT BY NOCYCLE`。表名、列名、别名和参数必须从原 SQL 提取，不能写死项目库名或模式名；父级遍历须保留起点，子级遍历须按原语义决定是否包含起点，额外租户过滤和排序也必须保留。
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
@@ -54,7 +55,8 @@
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
 - MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。业务代码同时读取 `COLUMN_TYPE`、注释和默认值时，可从 `SYS.SYSCOLUMNS`、`SYS.SYSOBJECTS`、`SYS.SYSCOLUMNCOMMENTS` 按运行时 schema 和表名重建相同投影；不得把某个项目的 schema 固化到转换规则。
 - `AES_ENCRYPT`、`AES_DECRYPT`、`MD5`、`TO_BASE64` 等加密/编码函数要逐项确认。当前不再把 Base64 包裹 AES 密码场景改写为达梦 `SF_*` 函数，优先通过系统库兼容函数保持 MySQL 调用形态，避免修改业务 SQL。
-- MySQL 除法在分母为 0 时的容错和达梦参数相关。业务 SQL 如直接 `a / b`，应优先改为 `a / NULLIF(b, 0)` 或 `CASE WHEN b = 0 THEN ...`，不要依赖实例容错。
+- MySQL `/` 具有小数除法语义，达梦的整数/整数可能先截断；对可完整识别的数值、列、日期数值函数、聚合和无子查询括号表达式，应把分子转为 `DECIMAL(38,10)`，并把分母转为 `NULLIF(CAST(... AS DECIMAL(38,10)), 0)`。分母为 0 的容错和达梦参数相关，不能依赖实例容错；无法完整识别表达式边界时仍须人工确认。
+- SQL Server 风格 `+` 只能在一侧是字符串字面量、`CONCAT`，或 `CAST/CONVERT` 明确声明字符返回类型时改为达梦 `||`。`CAST(... AS DECIMAL)`、`CONVERT(..., DECIMAL)` 等数值结果之间的 `+` 必须保留算术加法，不能仅凭函数名推断为字符串拼接。
 - MySQL 中常见 `SUM(varchar_col)` 依赖隐式转换，达梦可能报类型转换失败。应优先修业务 SQL，显式 `CAST` 且清洗非数字数据。
 
 ## 存储过程、函数和触发器
