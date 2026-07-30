@@ -499,6 +499,16 @@ public class MapperXmlRewriter {
                     ? conversionResult.convertedSql()
                     : commentSafeSql;
             addAppliedRules(staticRules, conversionResult.appliedRules());
+            TextRewrite accumulatedHierarchy =
+                    convertAccumulatedHierarchyUserVariableTraversals(convertedSql);
+            if (accumulatedHierarchy.changed()) {
+                convertedSql = accumulatedHierarchy.text();
+                staticRules.remove(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+                addAppliedRules(
+                        staticRules,
+                        List.of(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE)
+                );
+            }
             if ("insert".equals(tagName)
                     && !"true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys"))
                     && rewriteConfig.requiresIdentityInsert(tableName)) {
@@ -530,7 +540,10 @@ public class MapperXmlRewriter {
                         ""
                 ));
             }
-            if (conversionResult.manualReviewRequired()) {
+            boolean resolvedUserVariableReview = accumulatedHierarchy.changed()
+                    && !containsMysqlUserVariable(convertedSql)
+                    && isMysqlUserVariableManualReviewReason(conversionResult.reason());
+            if (conversionResult.manualReviewRequired() && !resolvedUserVariableReview) {
                 manualReviewItems.add(new SqlChange(
                         reportPath,
                         statementKey,
@@ -847,6 +860,11 @@ public class MapperXmlRewriter {
             rewrittenBody = structuralConversion.convertedBody();
             addAppliedRules(appliedRules, structuralConversion.appliedRules());
             addManualReviewReasons(manualReviewReasons, structuralConversion.manualReviewReasons());
+            if (structuralConversion.appliedRules().contains(
+                    MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE
+            ) && !Pattern.compile("(?i)\\bLISTAGG\\s*\\(").matcher(rewrittenBody).find()) {
+                appliedRules.remove(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
+            }
             changed = true;
         }
         if ((appliedRules.contains(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE)
@@ -936,6 +954,12 @@ public class MapperXmlRewriter {
         TextRewrite descendantHierarchy = convertDynamicDescendantUserVariableTraversal(converted);
         if (descendantHierarchy.changed()) {
             converted = descendantHierarchy.text();
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
+        }
+        TextRewrite accumulatedHierarchy = convertAccumulatedHierarchyUserVariableTraversals(converted);
+        if (accumulatedHierarchy.changed()) {
+            converted = accumulatedHierarchy.text();
+            appliedRules.remove(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE);
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
         }
 
@@ -5056,6 +5080,277 @@ public class MapperXmlRewriter {
                 + ")"
                 + matcher.group("trailing");
         return new TextRewrite(converted, true);
+    }
+
+    private TextRewrite convertAccumulatedHierarchyUserVariableTraversals(String body) {
+        TextRewrite houseAncestor = convertHouseAncestorUserVariableTraversal(body);
+        TextRewrite houseDescendant = convertHouseDescendantUserVariableTraversal(houseAncestor.text());
+        TextRewrite organizationDescendant =
+                convertOrganizationDescendantUserVariableTraversal(houseDescendant.text());
+        TextRewrite organizationAncestor =
+                convertOrganizationAncestorUserVariableTraversal(organizationDescendant.text());
+        return new TextRewrite(
+                organizationAncestor.text(),
+                houseAncestor.changed()
+                        || houseDescendant.changed()
+                        || organizationDescendant.changed()
+                        || organizationAncestor.changed()
+        );
+    }
+
+    private TextRewrite convertHouseAncestorUserVariableTraversal(String body) {
+        String parameter = "#\\{[^}]+}";
+        Matcher matcher = Pattern.compile(
+                "(?is)^(?<leading>\\s*)SELECT\\s+"
+                        + "(?<projection><include\\b[^>]*?/?>)\\s+FROM\\s*\\(\\s*"
+                        + "SELECT\\s+@(?<cursorRead>" + SIMPLE_IDENTIFIER + ")\\s+"
+                        + "(?<idListAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                        + "\\(\\s*SELECT\\s+@(?<cursorWrite>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "(?:GROUP_CONCAT\\s*\\(\\s*|LISTAGG\\s*\\(\\s*)"
+                        + "(?<parent>" + DM_IDENTIFIER + ")"
+                        + "(?:\\s+SEPARATOR\\s+','\\s*\\)|\\s*,\\s*','\\s*\\)\\s+"
+                        + "WITHIN\\s+GROUP\\s*\\(\\s*ORDER\\s+BY\\s+"
+                        + "(?<aggregateOrder>" + DM_IDENTIFIER + ")\\s*\\))\\s+FROM\\s+"
+                        + "(?<walkTable>" + SIMPLE_RELATION + ")\\s+WHERE\\s+"
+                        + "FIND_IN_SET\\s*\\(\\s*(?<walkId>" + DM_IDENTIFIER + ")\\s*,\\s*@"
+                        + "(?<findCursor>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s*\\)\\s+"
+                        + "(?<subAlias>" + SIMPLE_IDENTIFIER + ")\\s+FROM\\s+"
+                        + "(?<driverTable>" + SIMPLE_RELATION + ")\\s*,\\s*"
+                        + "\\(\\s*SELECT\\s+@(?<seedCursor>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "(?<seed>" + parameter + ")\\s*\\)\\s+"
+                        + "(?<varsAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+@"
+                        + "(?<notNullCursor>" + SIMPLE_IDENTIFIER + ")\\s+IS\\s+NOT\\s+NULL\\s*\\)\\s+"
+                        + "(?<listAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                        + "(?<outputTable>" + SIMPLE_RELATION + ")\\s+"
+                        + "(?<outputAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+"
+                        + "FIND_IN_SET\\s*\\(\\s*(?<filterAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                        + "(?<outputId>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                        + "(?<listAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                        + "(?<idListAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s*;?\\s*$"
+        ).matcher(body);
+        if (!matcher.matches()
+                || !sameNormalizedValue(
+                        matcher,
+                        "cursorRead",
+                        "cursorWrite",
+                        "findCursor",
+                        "seedCursor",
+                        "notNullCursor"
+                )
+                || !sameNormalizedValue(matcher, "idListAlias", "idListAliasRef")
+                || !sameNormalizedValue(matcher, "listAlias", "listAliasRef")
+                || !sameNormalizedValue(matcher, "outputAlias", "filterAlias")
+                || !sameNormalizedValue(matcher, "walkId", "outputId")
+                || (matcher.group("aggregateOrder") != null
+                && !normalizeRelation(matcher.group("parent"))
+                .equals(normalizeRelation(matcher.group("aggregateOrder"))))
+                || !normalizeRelation(matcher.group("walkTable"))
+                .equals(normalizeRelation(matcher.group("driverTable")))
+                || !normalizeRelation(matcher.group("walkTable"))
+                .equals(normalizeRelation(matcher.group("outputTable")))) {
+            return new TextRewrite(body, false);
+        }
+
+        String alias = matcher.group("outputAlias");
+        String converted = matcher.group("leading")
+                + "SELECT " + matcher.group("projection") + "\n"
+                + "FROM (\n"
+                + "    SELECT " + alias + ".*\n"
+                + "    FROM " + matcher.group("outputTable") + " " + alias + "\n"
+                + "    START WITH " + alias + "." + matcher.group("outputId")
+                + " = " + matcher.group("seed") + "\n"
+                + "    CONNECT BY NOCYCLE PRIOR " + alias + "." + matcher.group("parent")
+                + " = " + alias + "." + matcher.group("outputId") + "\n"
+                + ") " + alias;
+        return new TextRewrite(converted, true);
+    }
+
+    private TextRewrite convertHouseDescendantUserVariableTraversal(String body) {
+        String parameter = "#\\{[^}]+}";
+        Matcher matcher = Pattern.compile(
+                "(?is)^(?<leading>\\s*)SELECT\\s+(?<projection>[\\s\\S]+?)\\s+FROM\\s*\\(\\s*"
+                        + "SELECT\\s+@(?<cursorRead>" + SIMPLE_IDENTIFIER + ")\\s+"
+                        + "(?<idListAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                        + "\\(\\s*SELECT\\s+@(?<cursorWrite>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "(?:GROUP_CONCAT\\s*\\(\\s*|LISTAGG\\s*\\(\\s*)"
+                        + "(?<childId>" + DM_IDENTIFIER + ")"
+                        + "(?:\\s+SEPARATOR\\s+','\\s*\\)|\\s*,\\s*','\\s*\\)\\s+"
+                        + "WITHIN\\s+GROUP\\s*\\(\\s*ORDER\\s+BY\\s+"
+                        + "(?<aggregateOrder>" + DM_IDENTIFIER + ")\\s*\\))\\s+FROM\\s+"
+                        + "(?<walkTable>" + SIMPLE_RELATION + ")\\s+WHERE\\s+"
+                        + "FIND_IN_SET\\s*\\(\\s*(?<walkParent>" + DM_IDENTIFIER + ")\\s*,\\s*@"
+                        + "(?<findCursor>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s*\\)\\s+"
+                        + "(?<subAlias>" + SIMPLE_IDENTIFIER + ")\\s+FROM\\s+"
+                        + "(?<driverTable>" + SIMPLE_RELATION + ")\\s*,\\s*"
+                        + "\\(\\s*SELECT\\s+@(?<seedCursor>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "(?<seed>" + parameter + ")\\s*\\)\\s+"
+                        + "(?<varsAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+@"
+                        + "(?<notNullCursor>" + SIMPLE_IDENTIFIER + ")\\s+IS\\s+NOT\\s+NULL\\s*\\)\\s+"
+                        + "(?<listAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                        + "(?<outputTable>" + SIMPLE_RELATION + ")\\s+"
+                        + "(?<outputAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+"
+                        + "FIND_IN_SET\\s*\\(\\s*(?<filterAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                        + "(?<outputParent>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                        + "(?<listAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                        + "(?<idListAliasRef>" + SIMPLE_IDENTIFIER + ")\\s*\\)"
+                        + "(?<tail>[\\s\\S]*?)(?:;\\s*|\\s*)$"
+        ).matcher(body);
+        if (!matcher.matches()
+                || !sameNormalizedValue(
+                        matcher,
+                        "cursorRead",
+                        "cursorWrite",
+                        "findCursor",
+                        "seedCursor",
+                        "notNullCursor"
+                )
+                || !sameNormalizedValue(matcher, "idListAlias", "idListAliasRef")
+                || !sameNormalizedValue(matcher, "listAlias", "listAliasRef")
+                || !sameNormalizedValue(matcher, "outputAlias", "filterAlias")
+                || !sameNormalizedValue(matcher, "walkParent", "outputParent")
+                || (matcher.group("aggregateOrder") != null
+                && !normalizeRelation(matcher.group("childId"))
+                .equals(normalizeRelation(matcher.group("aggregateOrder"))))
+                || !normalizeRelation(matcher.group("walkTable"))
+                .equals(normalizeRelation(matcher.group("driverTable")))
+                || !normalizeRelation(matcher.group("walkTable"))
+                .equals(normalizeRelation(matcher.group("outputTable")))) {
+            return new TextRewrite(body, false);
+        }
+
+        String tail = matcher.group("tail").strip();
+        int orderIndex = findTopLevelKeywordSkippingXml(tail, "ORDER", 0);
+        String filter = orderIndex < 0 ? tail : tail.substring(0, orderIndex).strip();
+        String order = orderIndex < 0 ? "" : tail.substring(orderIndex).strip();
+        if (!filter.isBlank() && !isKeywordAt(filter, 0, "AND")) {
+            return new TextRewrite(body, false);
+        }
+        String alias = matcher.group("outputAlias");
+        String converted = matcher.group("leading")
+                + "SELECT " + matcher.group("projection").strip() + "\n"
+                + "FROM (\n"
+                + "    SELECT " + alias + ".*\n"
+                + "    FROM " + matcher.group("outputTable") + " " + alias + "\n"
+                + "    START WITH " + alias + "." + matcher.group("outputParent")
+                + " = " + matcher.group("seed") + "\n"
+                + "    CONNECT BY NOCYCLE PRIOR " + alias + "." + matcher.group("childId")
+                + " = " + alias + "." + matcher.group("outputParent") + "\n"
+                + ") " + alias
+                + (filter.isBlank()
+                        ? ""
+                        : "\nWHERE " + filter.substring("AND".length()).strip())
+                + (order.isBlank() ? "" : "\n" + order);
+        return new TextRewrite(converted, true);
+    }
+
+    private TextRewrite convertOrganizationDescendantUserVariableTraversal(String body) {
+        String parameter = "#\\{[^}]+}";
+        Matcher matcher = Pattern.compile(
+                "(?is)SELECT\\s+(?<selectedId>" + DM_IDENTIFIER + ")\\s+FROM\\s*\\(\\s*"
+                        + "SELECT\\s+(?<rowAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*"
+                        + "(?<rowId>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                        + "IF\\s*\\(\\s*FIND_IN_SET\\s*\\(\\s*(?<parent>" + DM_IDENTIFIER + ")\\s*,\\s*@"
+                        + "(?<readVariable>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s*(?:>|&gt;)\\s*0\\s*,\\s*@"
+                        + "(?<writeVariable>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "CONCAT\\s*\\(\\s*@(?<concatVariable>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*','\\s*,\\s*"
+                        + "(?<concatId>" + DM_IDENTIFIER + ")\\s*\\)\\s*,\\s*0\\s*\\)\\s+AS\\s+"
+                        + "(?<childAlias>" + SIMPLE_IDENTIFIER + ")\\s+FROM\\s*\\(\\s*"
+                        + "SELECT\\s+(?<innerId>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                        + "(?<innerParent>" + DM_IDENTIFIER + ")\\s+FROM\\s+"
+                        + "(?<table>" + SIMPLE_RELATION + ")\\s+"
+                        + "(?<tableAlias>" + SIMPLE_IDENTIFIER + ")\\s+ORDER\\s+BY\\s+"
+                        + "(?<orderParent>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                        + "(?<orderId>" + DM_IDENTIFIER + ")\\s*\\)\\s+"
+                        + "(?<rowAliasDeclaration>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                        + "\\(\\s*SELECT\\s+@(?<seedVariable>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "(?<seed>" + parameter + ")\\s*\\)\\s+"
+                        + "(?<seedAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s+"
+                        + "(?<resultAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+"
+                        + "(?<childAliasReference>" + SIMPLE_IDENTIFIER + ")\\s*!=\\s*0\\s+OR\\s+"
+                        + "(?<filterId>" + DM_IDENTIFIER + ")\\s*=\\s*(?<filterSeed>" + parameter + ")"
+        ).matcher(body);
+        if (!matcher.find()
+                || !sameNormalizedValue(
+                        matcher,
+                        "readVariable",
+                        "writeVariable",
+                        "concatVariable",
+                        "seedVariable"
+                )
+                || !sameNormalizedValue(matcher, "rowAlias", "rowAliasDeclaration")
+                || !sameNormalizedValue(matcher, "childAlias", "childAliasReference")
+                || !sameNormalizedValue(
+                        matcher,
+                        "selectedId",
+                        "rowId",
+                        "concatId",
+                        "innerId",
+                        "orderId",
+                        "filterId"
+                )
+                || !sameNormalizedValue(matcher, "parent", "innerParent", "orderParent")
+                || !matcher.group("seed").equals(matcher.group("filterSeed"))) {
+            return new TextRewrite(body, false);
+        }
+
+        String replacement = "SELECT " + matcher.group("selectedId")
+                + " FROM " + matcher.group("table")
+                + " START WITH " + matcher.group("selectedId") + " = " + matcher.group("seed")
+                + " CONNECT BY NOCYCLE PRIOR " + matcher.group("selectedId")
+                + " = " + matcher.group("parent");
+        return new TextRewrite(
+                matcher.replaceFirst(Matcher.quoteReplacement(replacement)),
+                true
+        );
+    }
+
+    private TextRewrite convertOrganizationAncestorUserVariableTraversal(String body) {
+        String parameter = "#\\{[^}]+}";
+        Matcher matcher = Pattern.compile(
+                "(?is)SELECT\\s+(?<selectedAlias>" + SIMPLE_IDENTIFIER + ")\\s+FROM\\s*\\(\\s*"
+                        + "SELECT\\s+@(?<cursorRead>" + SIMPLE_IDENTIFIER + ")\\s+AS\\s+"
+                        + "(?<walkAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                        + "\\(\\s*SELECT\\s+@(?<cursorWrite>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "(?<parent>" + DM_IDENTIFIER + ")\\s+FROM\\s+"
+                        + "(?<table>" + SIMPLE_RELATION + ")\\s+WHERE\\s+"
+                        + "(?<id>" + DM_IDENTIFIER + ")\\s*=\\s*"
+                        + "(?<walkAliasReference>" + SIMPLE_IDENTIFIER + ")\\s*\\)\\s+AS\\s+"
+                        + "(?<scratchAlias>[A-Za-z0-9_$]+)\\s*,\\s*@"
+                        + "(?<levelWrite>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*@"
+                        + "(?<levelRead>" + SIMPLE_IDENTIFIER + ")\\s*\\+\\s*1\\s+AS\\s+"
+                        + "(?<levelAlias>" + SIMPLE_IDENTIFIER + ")\\s+FROM\\s*\\(\\s*"
+                        + "SELECT\\s+@(?<seedCursor>" + SIMPLE_IDENTIFIER + ")\\s*:=\\s*"
+                        + "(?<seed>" + parameter + ")\\s*\\)\\s+"
+                        + "(?<varsAlias>" + SIMPLE_IDENTIFIER + ")\\s*,\\s*"
+                        + "(?<driverTable>" + SIMPLE_RELATION + ")\\s+"
+                        + "(?<driverAlias>" + SIMPLE_IDENTIFIER + ")\\s+WHERE\\s+@"
+                        + "(?<notZeroCursor>" + SIMPLE_IDENTIFIER + ")\\s*!=\\s*0\\s*\\)\\s+"
+                        + "(?<resultAlias>" + SIMPLE_IDENTIFIER + ")"
+        ).matcher(body);
+        if (!matcher.find()
+                || !sameNormalizedValue(
+                        matcher,
+                        "cursorRead",
+                        "cursorWrite",
+                        "seedCursor",
+                        "notZeroCursor"
+                )
+                || !sameNormalizedValue(matcher, "walkAlias", "walkAliasReference", "selectedAlias")
+                || !sameNormalizedValue(matcher, "levelWrite", "levelRead")
+                || !normalizeRelation(matcher.group("table"))
+                .equals(normalizeRelation(matcher.group("driverTable")))) {
+            return new TextRewrite(body, false);
+        }
+
+        String replacement = "SELECT " + matcher.group("id")
+                + " FROM " + matcher.group("table")
+                + " START WITH " + matcher.group("id") + " = " + matcher.group("seed")
+                + " CONNECT BY NOCYCLE PRIOR " + matcher.group("parent")
+                + " = " + matcher.group("id");
+        return new TextRewrite(
+                matcher.replaceFirst(Matcher.quoteReplacement(replacement)),
+                true
+        );
     }
 
     private boolean sameNormalizedValue(Matcher matcher, String firstGroup, String... otherGroups) {

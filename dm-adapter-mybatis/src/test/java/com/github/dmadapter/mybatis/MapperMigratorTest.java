@@ -5370,6 +5370,204 @@ class MapperMigratorTest {
     }
 
     @Test
+    void convertsAccumulatedHouseAncestorTraversalToDamengHierarchyQuery() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/HouseMapper.xml", """
+                SELECT
+                <include refid="House_Column_List"/>
+                FROM (
+                    SELECT @node_ids idlist,
+                           (SELECT @node_ids := GROUP_CONCAT(parent_id SEPARATOR ',')
+                            FROM sample_house
+                            WHERE FIND_IN_SET(node_id, @node_ids)) sub
+                    FROM sample_house,
+                         (SELECT @node_ids := #{nodeId}) vars
+                    WHERE @node_ids IS NOT NULL
+                ) accumulated,
+                sample_house house_row
+                WHERE FIND_IN_SET(house_row.node_id, accumulated.idlist)
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/HouseMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/HouseMapper.xml"));
+        assertThat(rewritten)
+                .contains("<include refid=\"House_Column_List\"/>")
+                .contains("FROM (")
+                .contains("SELECT house_row.*")
+                .contains("FROM sample_house house_row")
+                .contains("START WITH house_row.node_id = #{nodeId}")
+                .contains("CONNECT BY NOCYCLE PRIOR house_row.parent_id = house_row.node_id")
+                .doesNotContain("@node_ids")
+                .doesNotContainIgnoringCase("find_in_set");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void convertsAccumulatedHouseDescendantTraversalToDamengHierarchyQuery() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/HouseMapper.xml", """
+                SELECT node_id, parent_id, node_level
+                FROM (
+                    SELECT @node_ids idlist,
+                           (SELECT @node_ids := GROUP_CONCAT(node_id SEPARATOR ',')
+                            FROM sample_house
+                            WHERE FIND_IN_SET(parent_id, @node_ids)) sub
+                    FROM sample_house,
+                         (SELECT @node_ids := #{nodeId}) vars
+                    WHERE @node_ids IS NOT NULL
+                ) accumulated,
+                sample_house house_row
+                WHERE FIND_IN_SET(house_row.parent_id, accumulated.idlist)
+                  AND tenant_id = #{tenantId}
+                ORDER BY node_id
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/HouseMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/HouseMapper.xml"));
+        assertThat(rewritten)
+                .contains("SELECT house_row.*")
+                .contains("FROM sample_house house_row")
+                .contains("START WITH house_row.parent_id = #{nodeId}")
+                .contains("CONNECT BY NOCYCLE PRIOR house_row.node_id = house_row.parent_id")
+                .contains("WHERE tenant_id = #{tenantId}")
+                .contains("ORDER BY node_id")
+                .doesNotContain("@node_ids")
+                .doesNotContainIgnoringCase("find_in_set");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void convertsAccumulatedOrganizationDescendantTraversalInsideDynamicWhere() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/PortalMapper.xml", """
+                select portal.id
+                from sample_portal portal
+                <where>
+                    portal.deleted = 0
+                    <if test="organizationId != null">
+                        and portal.organization_id in (
+                            select organization_id from (
+                                select ordered.organization_id,
+                                       if(find_in_set(parent_id, @organization_ids) > 0,
+                                          @organization_ids := concat(@organization_ids, ',', organization_id), 0) as is_child
+                                from (
+                                    select organization_id, parent_id
+                                    from sample_organization source_row
+                                    order by parent_id, organization_id
+                                ) ordered,
+                                (select @organization_ids := #{organizationId}) seed
+                            ) discovered
+                            where is_child != 0 or organization_id = #{organizationId}
+                        )
+                    </if>
+                </where>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PortalMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PortalMapper.xml"));
+        assertThat(rewritten)
+                .contains("SELECT organization_id FROM sample_organization")
+                .contains("START WITH organization_id = #{organizationId}")
+                .contains("CONNECT BY NOCYCLE PRIOR organization_id = parent_id")
+                .doesNotContain("@organization_ids")
+                .doesNotContainIgnoringCase("find_in_set");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void convertsCursorOrganizationAncestorTraversalInsideDynamicStatement() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/PortalMapper.xml", """
+                select portal.id
+                from sample_portal portal
+                where portal.organization_id in (
+                    select current_id from (
+                        SELECT @cursor AS current_id,
+                               (SELECT @cursor := parent_id
+                                FROM sample_organization
+                                WHERE organization_id = current_id) AS scratch,
+                               @depth := @depth + 1 AS hierarchy_level
+                        FROM (SELECT @cursor := #{organizationId}) vars,
+                             sample_organization organization_row
+                        WHERE @cursor != 0
+                    ) ancestors
+                )
+                <if test="active != null">
+                    and portal.active = #{active}
+                </if>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PortalMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PortalMapper.xml"));
+        assertThat(rewritten)
+                .contains("SELECT organization_id FROM sample_organization")
+                .contains("START WITH organization_id = #{organizationId}")
+                .contains("CONNECT BY NOCYCLE PRIOR parent_id = organization_id")
+                .contains("and portal.active = #{active}")
+                .doesNotContain("@cursor")
+                .doesNotContain("@depth");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void convertsPeriodDiffWithYearMonthParameterInsideDynamicXml() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/TaskMapper.xml", """
                 select t.id
