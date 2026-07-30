@@ -3384,6 +3384,11 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
+                .contains("SELECT COUNT(*) INTO dm_adapter_drop_index_exists")
+                .contains("FROM ALL_INDEXES")
+                .contains("OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("UPPER(INDEX_NAME) = UPPER('ns_message_idx_old')")
+                .contains("IF dm_adapter_drop_index_exists > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'DROP INDEX ns_message_idx_old'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX ns_message_idx_enter_org_seq")
                 .contains("ON `ns_message` (`enterpriseId`, `organizationId`, `seqNumber`)'")
