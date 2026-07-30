@@ -756,6 +756,76 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationWrapsGeneratedKeyInsertWhenIdentityColumnIsExplicit() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.IdentityItemMapper">
+                    <insert id="insert" parameterType="com.example.IdentityItem"
+                            useGeneratedKeys="true" keyProperty="id">
+                        insert into identity_item (id, item_name)
+                        values (#{id}, #{itemName})
+                    </insert>
+                    <insert id="insertSelective" parameterType="com.example.IdentityItem"
+                            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+                        insert into identity_item
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                id,
+                            </if>
+                            <if test="itemName != null">
+                                item_name,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                #{id},
+                            </if>
+                            <if test="itemName != null">
+                                #{itemName},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/IdentityItemMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/IdentityItemMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of("identity_item")
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/IdentityItemMapper.xml"));
+        assertThat(rewritten)
+                .contains("useGeneratedKeys=\"true\" keyProperty=\"id\"")
+                .contains("SET IDENTITY_INSERT identity_item ON WITH REPLACE NULL;")
+                .contains("SET IDENTITY_INSERT identity_item OFF");
+        assertThat(result.automaticConversions()).hasSize(2);
+        assertThat(result.automaticConversions())
+                .allSatisfy(change -> assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE));
+    }
+
+    @Test
     void migrationWrapsStaticInsertForConfiguredIdentityInsertTable() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

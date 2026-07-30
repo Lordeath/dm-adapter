@@ -188,6 +188,57 @@ class GeneratedFailurePatternTest {
             assertThat(shouldSuggestValidationArguments(validationClass, validation, missingAndRecord))
                     .isFalse();
 
+            String duplicatedAnd = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select owner.ID from o2o_customer_owner owner
+                    where owner.deleted = 0 and and owner.source = 3
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object duplicatedAndRecord = failedRecord(validationClass, duplicatedAnd);
+            assertThat(failurePattern(validationClass, validation, duplicatedAndRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, duplicatedAndRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+
+            String predicateTrailingComma = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select id from o2o_property_community_member
+                    where owner_id = ? and community_id = ?,
+                    and deleted = 0
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object predicateTrailingCommaRecord = failedRecord(validationClass, predicateTrailingComma);
+            assertThat(failurePattern(validationClass, validation, predicateTrailingCommaRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, predicateTrailingCommaRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+
+            String bareDynamicInsert = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: insert into o2o_flea_market
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object bareDynamicInsertRecord = failedRecord(validationClass, bareDynamicInsert);
+            assertThat(failurePattern(validationClass, validation, bareDynamicInsertRecord))
+                    .isEqualTo("BROKEN_DYNAMIC_SQL_OR_ARGS");
+            assertThat(category(validationClass, validation, bareDynamicInsertRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+
+            String bareDynamicUpdate = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: update o2o_property_houseinfo
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object bareDynamicUpdateRecord = failedRecord(validationClass, bareDynamicUpdate);
+            assertThat(failurePattern(validationClass, validation, bareDynamicUpdateRecord))
+                    .isEqualTo("BROKEN_DYNAMIC_SQL_OR_ARGS");
+            assertThat(category(validationClass, validation, bareDynamicUpdateRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+
             String missingWhere = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
