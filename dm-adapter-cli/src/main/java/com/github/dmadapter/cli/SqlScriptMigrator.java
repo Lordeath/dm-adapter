@@ -37,6 +37,9 @@ import java.util.stream.Stream;
 
 class SqlScriptMigrator {
     private static final Path DEFAULT_PRESERVED_SQL_PATH = Path.of("00000000.sql");
+    private static final Pattern SYSTEM_SCRIPT_FILE_NAME_PATTERN = Pattern.compile(
+            "(?i)(?:^|[._-])system(?:[._-]|$)"
+    );
     private static final int PARALLEL_PROCEDURE_MIN_CHARS = 50_000;
     private static final String CONVERSION_THREADS_PROPERTY = "dm.adapter.sqlScriptConversionThreads";
     private static final String DM_CURRENT_SCHEMA_EXPRESSION =
@@ -12727,8 +12730,8 @@ class SqlScriptMigrator {
     }
 
     private boolean isSystemScript(Path path) {
-        String fileName = path.getFileName().toString().toLowerCase(Locale.ROOT);
-        return fileName.endsWith("_system.sql");
+        String fileName = path.getFileName().toString();
+        return SYSTEM_SCRIPT_FILE_NAME_PATTERN.matcher(fileName).find();
     }
 
     private String primarySchema(String value, String option, List<String> warnings) {
