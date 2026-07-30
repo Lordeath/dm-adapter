@@ -109,6 +109,24 @@ class MigrateCommandTest {
     }
 
     @Test
+    void mapperValidationStopsWhenSqlScriptConnectionCannotBeOpened() {
+        assertThat(MigrateCommand.mapperValidationBlockReason(
+                false,
+                "Dameng SQL script validation connection failed: network communication error",
+                List.of()
+        )).contains("未重复执行 Mapper 数据库验证");
+    }
+
+    @Test
+    void mapperValidationContinuesWhenScriptValidationWasSkippedByConfiguration() {
+        assertThat(MigrateCommand.mapperValidationBlockReason(
+                false,
+                "DM_SQL_VALIDATION is not true; SQL script validation skipped.",
+                List.of()
+        )).isEmpty();
+    }
+
+    @Test
     void completeProjectDdlHistoryOverridesStaleDatabaseKeyMetadata() {
         TableKeyMetadata databaseMetadata = new TableKeyMetadata("sample_table", List.of(
                 new TableConstraint(
