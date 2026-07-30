@@ -4510,12 +4510,14 @@ class SqlScriptMigrator {
 
     private String normalizeDamengClobCharsetGuards(String sql) {
         if (sql == null || sql.isBlank()
-                || !Pattern.compile("(?is)\\bCOLLATION_NAME\\b").matcher(sql).find()
-                || !Pattern.compile(
-                        "(?is)\\b(?:MODIFY|ALTER\\s+COLUMN)\\b[^;]*\\b(?:CLOB|LONGTEXT)\\b"
-                ).matcher(sql).find()) {
+                || !Pattern.compile("(?is)\\bCOLLATION_NAME\\b").matcher(sql).find()) {
             return sql == null ? "" : sql;
         }
+        boolean verifiesClobTarget = Pattern.compile(
+                "(?is)\\b(?:MODIFY|ALTER\\s+COLUMN)\\b[^;]*\\b(?:CLOB|LONGTEXT)\\b"
+        ).matcher(sql).find();
+        // Dameng character set and collation are database-level properties. Without a
+        // type-changing CLOB action, the column existence predicates are sufficient.
         Pattern charsetAndCollation = Pattern.compile(
                 "(?is)\\bCHARACTER_SET_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN
                         + "\\s+AND\\s+COLLATION_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN
@@ -4523,7 +4525,9 @@ class SqlScriptMigrator {
         return replaceOutsideIgnoredText(
                 sql,
                 charsetAndCollation,
-                matcher -> "UPPER(DATA_TYPE) = 'CLOB'"
+                matcher -> verifiesClobTarget
+                        ? "UPPER(DATA_TYPE) = 'CLOB'"
+                        : "1 = 1"
         );
     }
 

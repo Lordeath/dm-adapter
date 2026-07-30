@@ -7083,6 +7083,39 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void removesMysqlOnlyCharsetPredicateWhenGuardHasNoTargetTypeChange() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS inspect_demo;
+                DELIMITER $$
+                CREATE PROCEDURE inspect_demo()
+                BEGIN
+                    DECLARE matched int DEFAULT 0;
+                    IF EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database())
+                          AND table_name = 'demo'
+                          AND column_name = 'content'
+                          AND CHARACTER_SET_NAME = 'utf8mb4'
+                          AND COLLATION_NAME = 'utf8mb4_unicode_ci'
+                    ) THEN
+                        SET matched = 1;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL inspect_demo();
+                DROP PROCEDURE IF EXISTS inspect_demo;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("FROM ALL_TAB_COLUMNS")
+                .contains("AND 1 = 1")
+                .doesNotContain("CHARACTER_SET_NAME")
+                .doesNotContain("COLLATION_NAME");
+    }
+
+    @Test
     void trimsIndexGuardLiteralBeforeSynchronizingSchemaScopedName() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DROP PROCEDURE IF EXISTS add_demo_index;
