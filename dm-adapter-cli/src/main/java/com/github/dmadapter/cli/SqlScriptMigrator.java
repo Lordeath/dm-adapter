@@ -134,6 +134,8 @@ class SqlScriptMigrator {
             "DM_PROCEDURE_RECOMPILE_AFTER_FORWARD_DEPENDENCY";
     static final String DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE =
             "DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK";
+    static final String DM_EMPTY_PROCEDURE_BODY_NOOP_RULE =
+            "DM_EMPTY_PROCEDURE_BODY_NOOP";
     static final String DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE =
             "DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC";
     static final String MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE_RULE =
@@ -3287,6 +3289,28 @@ class SqlScriptMigrator {
         return block.toString();
     }
 
+    private String addNoopToEmptyProcedureBody(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0) {
+            return sql;
+        }
+        Matcher endMatcher = Pattern.compile("(?is)\\bEND\\s*;?\\s*$").matcher(sql);
+        if (!endMatcher.find() || endMatcher.start() <= beginIndex + "BEGIN".length()) {
+            return sql;
+        }
+        String body = sql.substring(beginIndex + "BEGIN".length(), endMatcher.start());
+        if (SqlScriptParser.executable(body)) {
+            return sql;
+        }
+        return sql.substring(0, beginIndex + "BEGIN".length())
+                + body
+                + "\n    NULL;\n"
+                + sql.substring(endMatcher.start());
+    }
+
     private boolean containsCurrentSchemaContext(String sql) {
         return Pattern.compile(
                         "(?is)SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
@@ -4417,6 +4441,9 @@ class SqlScriptMigrator {
                 "(?is)\\bUPPER\\s*\\(\\s*COLUMN_NAME\\s*\\)\\s*=\\s*"
                         + "UPPER\\s*\\(\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")\\s*\\)"
         );
+        Pattern comment = Pattern.compile(
+                "(?is)\\bCOLUMN_COMMENT\\s*=\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")"
+        );
         Matcher matcher = guard.matcher(sql);
         StringBuffer converted = new StringBuffer(sql.length());
         boolean changed = false;
@@ -4425,6 +4452,7 @@ class SqlScriptMigrator {
             Matcher ownerMatcher = owner.matcher(predicates);
             Matcher tableMatcher = table.matcher(predicates);
             Matcher columnMatcher = column.matcher(predicates);
+            Matcher commentMatcher = comment.matcher(predicates);
             if (!ownerMatcher.find() || !tableMatcher.find() || !columnMatcher.find()) {
                 matcher.appendReplacement(converted, Matcher.quoteReplacement(matcher.group()));
                 continue;
@@ -4432,6 +4460,10 @@ class SqlScriptMigrator {
             String remaining = owner.matcher(predicates).replaceFirst("");
             remaining = table.matcher(remaining).replaceFirst("");
             remaining = column.matcher(remaining).replaceFirst("");
+            boolean hasCommentPredicate = commentMatcher.find();
+            if (hasCommentPredicate) {
+                remaining = comment.matcher(remaining).replaceFirst("");
+            }
             remaining = Pattern.compile("(?is)\\bAND\\b").matcher(remaining).replaceAll("");
             remaining = Pattern.compile("\\s+").matcher(remaining).replaceAll("");
             if (!remaining.isEmpty()) {
@@ -4443,19 +4475,56 @@ class SqlScriptMigrator {
                     : "1";
             String tableLiteral = tableMatcher.group("value");
             String columnLiteral = columnMatcher.group("value");
-            String replacement = "SELECT " + projection + "\n"
-                    + "FROM SYS.SYSOBJECTS T\n"
-                    + "JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID\n"
-                    + "WHERE T.SCHID = CURRENT_SCHID\n"
-                    + "  AND T.SUBTYPE$ = 'UTAB'\n"
-                    + "  AND T.NAME IN (" + tableLiteral + ", UPPER(" + tableLiteral + "))\n"
-                    + "  AND C.NAME IN (" + columnLiteral + ", UPPER(" + columnLiteral + "))"
-                    + matcher.group("suffix");
+            String replacement;
+            if (hasCommentPredicate) {
+                String commentProjection = "COLUMN_NAME".equalsIgnoreCase(matcher.group("projection"))
+                        ? "C.COLUMN_NAME"
+                        : "1";
+                replacement = "SELECT " + commentProjection + "\n"
+                        + "FROM ALL_TAB_COLUMNS C\n"
+                        + "JOIN ALL_COL_COMMENTS CC\n"
+                        + "  ON CC.OWNER = C.OWNER\n"
+                        + " AND CC.TABLE_NAME = C.TABLE_NAME\n"
+                        + " AND CC.COLUMN_NAME = C.COLUMN_NAME\n"
+                        + "WHERE C.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                        + "  AND UPPER(C.TABLE_NAME) = UPPER(" + tableLiteral + ")\n"
+                        + "  AND UPPER(C.COLUMN_NAME) = UPPER(" + columnLiteral + ")\n"
+                        + "  AND CC.COMMENTS = " + commentMatcher.group("value")
+                        + matcher.group("suffix");
+            } else {
+                replacement = "SELECT " + projection + "\n"
+                        + "FROM SYS.SYSOBJECTS T\n"
+                        + "JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID\n"
+                        + "WHERE T.SCHID = CURRENT_SCHID\n"
+                        + "  AND T.SUBTYPE$ = 'UTAB'\n"
+                        + "  AND T.NAME IN (" + tableLiteral + ", UPPER(" + tableLiteral + "))\n"
+                        + "  AND C.NAME IN (" + columnLiteral + ", UPPER(" + columnLiteral + "))"
+                        + matcher.group("suffix");
+            }
             matcher.appendReplacement(converted, Matcher.quoteReplacement(replacement));
             changed = true;
         }
         matcher.appendTail(converted);
         return changed ? converted.toString() : sql;
+    }
+
+    private String normalizeDamengClobCharsetGuards(String sql) {
+        if (sql == null || sql.isBlank()
+                || !Pattern.compile("(?is)\\bCOLLATION_NAME\\b").matcher(sql).find()
+                || !Pattern.compile(
+                        "(?is)\\b(?:MODIFY|ALTER\\s+COLUMN)\\b[^;]*\\b(?:CLOB|LONGTEXT)\\b"
+                ).matcher(sql).find()) {
+            return sql == null ? "" : sql;
+        }
+        Pattern charsetAndCollation = Pattern.compile(
+                "(?is)\\bCHARACTER_SET_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN
+                        + "\\s+AND\\s+COLLATION_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN
+        );
+        return replaceOutsideIgnoredText(
+                sql,
+                charsetAndCollation,
+                matcher -> "UPPER(DATA_TYPE) = 'CLOB'"
+        );
     }
 
     private String normalizeDamengMetadataNumericLengths(String sql) {
@@ -6095,6 +6164,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_SCRIPT_METADATA_TO_DM_RULE);
         }
 
+        String metadataCharsetSql = normalizeDamengClobCharsetGuards(converted);
+        if (!metadataCharsetSql.equals(converted)) {
+            converted = metadataCharsetSql;
+            rules.add(MYSQL_SCRIPT_METADATA_TO_DM_RULE);
+        }
+
         String safeVarcharModifySql = normalizeSafeVarcharModifyGuards(converted);
         if (!safeVarcharModifySql.equals(converted)) {
             converted = safeVarcharModifySql;
@@ -6244,6 +6319,12 @@ class SqlScriptMigrator {
         if (!procedureGroupBySql.equals(converted)) {
             converted = procedureGroupBySql;
             rules.add(MYSQL_PROCEDURE_GROUP_BY_ALIAS_RULE);
+        }
+
+        String nonEmptyProcedureSql = addNoopToEmptyProcedureBody(converted);
+        if (!nonEmptyProcedureSql.equals(converted)) {
+            converted = nonEmptyProcedureSql;
+            rules.add(DM_EMPTY_PROCEDURE_BODY_NOOP_RULE);
         }
 
         String sqlExceptionHandlerSql = convertMysqlSqlExceptionContinueHandler(converted);
@@ -11878,17 +11959,47 @@ class SqlScriptMigrator {
     }
 
     private String synchronizeSchemaScopedIndexNames(String sql) {
-        List<IndexRename> renames = findIndexRenames(sql);
+        String normalizedSql = trimIndexMetadataLiteralWhitespace(sql);
+        List<IndexRename> renames = findIndexRenames(normalizedSql);
         if (renames.isEmpty()) {
-            return sql;
+            return normalizedSql;
         }
-        String converted = sql;
+        String converted = normalizedSql;
         for (IndexRename rename : renames) {
             if (!rename.oldIndexName().equals(rename.newIndexName())) {
                 converted = replaceIndexExistenceCheck(converted, rename);
             }
         }
         return converted;
+    }
+
+    private String trimIndexMetadataLiteralWhitespace(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        Pattern comparison = Pattern.compile(
+                "(?is)(?<prefix>\\bINDEX_NAME\\s*=\\s*"
+                        + "|\\bUPPER\\s*\\(\\s*INDEX_NAME\\s*\\)\\s*=\\s*UPPER\\s*\\(\\s*)"
+                        + "(?<literal>" + SQL_STRING_LITERAL_TOKEN + ")"
+        );
+        Matcher matcher = comparison.matcher(sql);
+        StringBuffer converted = new StringBuffer(sql.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            String value = singleQuotedSqlLiteralValue(matcher.group("literal"));
+            String trimmed = value.strip();
+            if (trimmed.equals(value)) {
+                matcher.appendReplacement(converted, Matcher.quoteReplacement(matcher.group()));
+                continue;
+            }
+            matcher.appendReplacement(
+                    converted,
+                    Matcher.quoteReplacement(matcher.group("prefix") + sqlStringLiteral(trimmed))
+            );
+            changed = true;
+        }
+        matcher.appendTail(converted);
+        return changed ? converted.toString() : sql;
     }
 
     private List<IndexRename> findIndexRenames(String sql) {
@@ -12505,7 +12616,9 @@ class SqlScriptMigrator {
                 moved = true;
             }
         } while (moved && cursor < sql.length());
-        return new LeadingSqlPrefix(sql.substring(0, cursor), sql.substring(cursor));
+        String prefix = sql.substring(0, cursor)
+                .replaceAll("(?m)^([\\t ]*)#(?!\\{)", "$1--");
+        return new LeadingSqlPrefix(prefix, sql.substring(cursor));
     }
 
     private String manualReviewReason(String sql) {

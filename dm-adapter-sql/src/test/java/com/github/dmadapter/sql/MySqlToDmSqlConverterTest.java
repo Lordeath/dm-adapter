@@ -746,6 +746,55 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesRedundantUniqueFromIdentityColumnCoveredByTablePrimaryKey() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE IF NOT EXISTS `ns_finance_bpmApiLog` (
+                  `id` int NOT NULL AUTO_INCREMENT UNIQUE,
+                  `requestId` varchar(50) DEFAULT NULL,
+                  PRIMARY KEY (`id`)
+                )
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("`id` int NOT NULL IDENTITY(1,1),")
+                .contains("PRIMARY KEY (`id`)")
+                .doesNotContain("IDENTITY(1,1) UNIQUE");
+        assertThat(result.appliedRules()).contains(
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
+                MySqlToDmSqlConverter.MYSQL_IDENTITY_PRIMARY_KEY_REDUNDANT_UNIQUE_RULE
+        );
+    }
+
+    @Test
+    void preservesUniqueAttributesNotRedundantWithAnIdentityPrimaryKey() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE demo (
+                  id int NOT NULL AUTO_INCREMENT,
+                  external_id varchar(50) UNIQUE,
+                  PRIMARY KEY (id)
+                )
+                """);
+
+        assertThat(result.convertedSql())
+                .contains("id int NOT NULL IDENTITY(1,1)")
+                .contains("external_id varchar(50) UNIQUE");
+        assertThat(result.appliedRules())
+                .doesNotContain(MySqlToDmSqlConverter.MYSQL_IDENTITY_PRIMARY_KEY_REDUNDANT_UNIQUE_RULE);
+    }
+
+    @Test
+    void convertsMysqlBitLiteralsWithoutTouchingQuotedText() {
+        SqlConversionResult result = converter.convert(
+                "INSERT INTO system_paramvalue(IsShow, mask, note) VALUES (b'1', B'1010', 'b''1''')"
+        );
+
+        assertThat(result.convertedSql())
+                .isEqualTo("INSERT INTO system_paramvalue(IsShow, mask, note) VALUES (1, 10, 'b''1''')");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_BIT_LITERAL_RULE);
+    }
+
+    @Test
     void preservesMysqlCharacterColumnLengthsWhenRemovingCharacterSets() {
         SqlConversionResult result = converter.convert("""
                 create table tmp_charge_precinct (

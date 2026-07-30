@@ -2,6 +2,7 @@ package com.github.dmadapter.sql;
 
 import com.github.dmadapter.core.SqlConversionResult;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -92,9 +93,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_REMOVED";
     public static final String MYSQL_TRAILING_SEMICOLON_REMOVAL_RULE = "MYSQL_TRAILING_SEMICOLON_REMOVED";
     public static final String MYSQL_HASH_LINE_COMMENT_RULE = "MYSQL_HASH_LINE_COMMENT_TO_DM";
+    public static final String MYSQL_BIT_LITERAL_RULE = "MYSQL_BIT_LITERAL_TO_NUMERIC";
     public static final String MYSQL_COLLATE_CLAUSE_REMOVAL_RULE = "MYSQL_COLLATE_CLAUSE_REMOVED";
     public static final String MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE = "MYSQL_CHARACTER_SET_CLAUSE_REMOVED";
     public static final String MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE = "MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY";
+    public static final String MYSQL_IDENTITY_PRIMARY_KEY_REDUNDANT_UNIQUE_RULE =
+            "MYSQL_IDENTITY_PRIMARY_KEY_REDUNDANT_UNIQUE_REMOVED";
     public static final String MYSQL_IDENTITY_INLINE_PRIMARY_KEY_RULE =
             "MYSQL_IDENTITY_INLINE_PRIMARY_KEY_TO_TABLE_CONSTRAINT";
     public static final String MYSQL_ALTER_AUTO_INCREMENT_RESET_RULE = "MYSQL_ALTER_AUTO_INCREMENT_RESET_TO_DM";
@@ -478,6 +482,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_HASH_LINE_COMMENT_RULE);
         }
 
+        GenericConversion bitLiteralConversion = convertMysqlBitLiterals(converted);
+        if (bitLiteralConversion.changed()) {
+            converted = bitLiteralConversion.convertedSql();
+            rules.add(MYSQL_BIT_LITERAL_RULE);
+        }
+
         DoubleQuotedStringConversion doubleQuotedStringConversion = convertDoubleQuotedStringLiterals(converted);
         if (doubleQuotedStringConversion.changed()) {
             converted = doubleQuotedStringConversion.convertedSql();
@@ -527,6 +537,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_HASH_LINE_COMMENT_RULE);
         }
 
+        GenericConversion bitLiteralConversion = convertMysqlBitLiterals(converted);
+        if (bitLiteralConversion.changed()) {
+            converted = bitLiteralConversion.convertedSql();
+            rules.add(MYSQL_BIT_LITERAL_RULE);
+        }
+
         DoubleQuotedStringConversion doubleQuotedStringConversion = convertDoubleQuotedStringLiterals(converted);
         if (doubleQuotedStringConversion.changed()) {
             converted = doubleQuotedStringConversion.convertedSql();
@@ -573,6 +589,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (autoIncrementConversion.changed()) {
             converted = autoIncrementConversion.convertedSql();
             rules.add(MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE);
+        }
+
+        GenericConversion redundantIdentityUniqueConversion = removeRedundantIdentityPrimaryKeyUnique(converted);
+        if (redundantIdentityUniqueConversion.changed()) {
+            converted = redundantIdentityUniqueConversion.convertedSql();
+            rules.add(MYSQL_IDENTITY_PRIMARY_KEY_REDUNDANT_UNIQUE_RULE);
         }
 
         GenericConversion inlineIdentityPrimaryKeyConversion = normalizeIdentityInlinePrimaryKeys(converted);
@@ -2558,6 +2580,150 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion removeRedundantIdentityPrimaryKeyUnique(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<TopLevelArgument> definitions = splitTopLevelArguments(sql.substring(openParenIndex + 1, closeParenIndex));
+        Set<String> primaryKeyColumns = tablePrimaryKeyColumns(definitions);
+        if (primaryKeyColumns.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<String> convertedDefinitions = new ArrayList<>(definitions.size());
+        boolean changed = false;
+        for (TopLevelArgument definition : definitions) {
+            int cursor = skipWhitespace(definition.text(), 0);
+            IdentifierToken column = readIdentifierToken(definition.text(), cursor);
+            if (column == null
+                    || !primaryKeyColumns.contains(normalizeIdentifierKey(unquoteIdentifier(column.text())))) {
+                convertedDefinitions.add(definition.text());
+                continue;
+            }
+            String attributes = definition.text().substring(column.endIndex());
+            if (!Pattern.compile("(?is)\\bIDENTITY\\s*\\(").matcher(attributes).find()) {
+                convertedDefinitions.add(definition.text());
+                continue;
+            }
+            GenericConversion uniqueConversion = removeTopLevelUniqueAttribute(attributes);
+            convertedDefinitions.add(
+                    uniqueConversion.changed()
+                            ? definition.text().substring(0, column.endIndex()) + uniqueConversion.convertedSql()
+                            : definition.text()
+            );
+            changed |= uniqueConversion.changed();
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(
+                sql.substring(0, openParenIndex + 1)
+                        + String.join(",", convertedDefinitions)
+                        + sql.substring(closeParenIndex),
+                true
+        );
+    }
+
+    private Set<String> tablePrimaryKeyColumns(List<TopLevelArgument> definitions) {
+        Set<String> columns = new LinkedHashSet<>();
+        for (TopLevelArgument definition : definitions) {
+            String text = definition.text();
+            int cursor = skipWhitespace(text, 0);
+            if (startsKeyword(text, cursor, "CONSTRAINT")) {
+                cursor = skipWhitespace(text, cursor + "CONSTRAINT".length());
+                IdentifierToken constraintName = readIdentifierToken(text, cursor);
+                if (constraintName == null) {
+                    continue;
+                }
+                cursor = skipWhitespace(text, constraintName.endIndex());
+            }
+            if (!startsKeyword(text, cursor, "PRIMARY")) {
+                continue;
+            }
+            cursor = skipWhitespace(text, cursor + "PRIMARY".length());
+            if (!startsKeyword(text, cursor, "KEY")) {
+                continue;
+            }
+            int openParenIndex = findTopLevelChar(text, '(', cursor + "KEY".length());
+            if (openParenIndex < 0) {
+                continue;
+            }
+            int closeParenIndex = findMatchingParen(text, openParenIndex);
+            if (closeParenIndex < 0) {
+                continue;
+            }
+            for (TopLevelArgument columnArgument
+                    : splitTopLevelArguments(text.substring(openParenIndex + 1, closeParenIndex))) {
+                int columnStart = skipWhitespace(columnArgument.text(), 0);
+                IdentifierToken column = readIdentifierToken(columnArgument.text(), columnStart);
+                if (column != null
+                        && columnArgument.text().substring(column.endIndex()).isBlank()) {
+                    columns.add(normalizeIdentifierKey(unquoteIdentifier(column.text())));
+                }
+            }
+        }
+        return columns;
+    }
+
+    private GenericConversion removeTopLevelUniqueAttribute(String attributes) {
+        int depth = 0;
+        int index = 0;
+        while (index < attributes.length()) {
+            char current = attributes.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(attributes, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(attributes, index);
+            } else if (startsMyBatisPlaceholder(attributes, index)) {
+                index = skipMyBatisPlaceholder(attributes, index);
+            } else if (startsLineComment(attributes, index)) {
+                index = skipUntilLineEnd(attributes, index);
+            } else if (startsBlockComment(attributes, index)) {
+                index = skipUntilBlockCommentEnd(attributes, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == 0 && startsKeyword(attributes, index, "UNIQUE")) {
+                int removalStart = index;
+                while (removalStart > 0 && Character.isWhitespace(attributes.charAt(removalStart - 1))) {
+                    removalStart--;
+                }
+                int removalEnd = skipWhitespace(attributes, index + "UNIQUE".length());
+                if (startsKeyword(attributes, removalEnd, "KEY")) {
+                    removalEnd += "KEY".length();
+                } else {
+                    removalEnd = index + "UNIQUE".length();
+                }
+                return new GenericConversion(
+                        attributes.substring(0, removalStart) + attributes.substring(removalEnd),
+                        true
+                );
+            } else {
+                index++;
+            }
+        }
+        return GenericConversion.unchanged(attributes);
     }
 
     private GenericConversion normalizeIdentityInlinePrimaryKeys(String sql) {
@@ -11289,6 +11455,54 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return applyTextReplacements(sql, replacements);
+    }
+
+    private GenericConversion convertMysqlBitLiterals(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                int end = identifier.closed() ? identifier.nextIndex() : index + 1;
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if ((current == 'b' || current == 'B')
+                    && (index == 0 || !isIdentifierPart(sql.charAt(index - 1)))
+                    && index + 2 < sql.length()
+                    && sql.charAt(index + 1) == '\'') {
+                int cursor = index + 2;
+                while (cursor < sql.length()
+                        && (sql.charAt(cursor) == '0' || sql.charAt(cursor) == '1')) {
+                    cursor++;
+                }
+                if (cursor > index + 2
+                        && cursor < sql.length()
+                        && sql.charAt(cursor) == '\'') {
+                    converted.append(new BigInteger(sql.substring(index + 2, cursor), 2));
+                    index = cursor + 1;
+                    changed = true;
+                } else {
+                    converted.append(current);
+                    index++;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
     private boolean startsLineComment(String sql, int index) {
