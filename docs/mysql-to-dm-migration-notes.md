@@ -50,6 +50,7 @@
 - MySQL 用户变量和累加写法如 `@rownum := @rownum + 1` 不能直接迁移，通常改为达梦窗口函数 `ROW_NUMBER() OVER (...)`，或在存储过程/业务代码中显式声明变量。
 - 对 `GROUP_CONCAT`/`FIND_IN_SET` 配合用户变量累积父级或子级 ID 的 MyBatis 层级遍历，只有在游标变量、起点参数、ID/父 ID 列、三处来源表和输出过滤关系全部一致时，才可改写为达梦 `START WITH ... CONNECT BY NOCYCLE`。表名、列名、别名和参数必须从原 SQL 提取，不能写死项目库名或模式名；父级遍历须保留起点，子级遍历须按原语义决定是否包含起点，额外租户过滤和排序也必须保留。
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
+- `CREATE TABLE` 中普通/唯一的 MySQL 内联 `KEY` / `INDEX` 必须提取为带 `ALL_INDEXES` 存在性保护的达梦 `CREATE [UNIQUE] INDEX`，并按表名生成 schema 范围唯一的索引名；前缀索引转函数索引。`FULLTEXT`、`SPATIAL` 或无法确认等价性的表达式索引不得静默删除，必须保留原 SQL 并报告人工设计索引语义。
 - 同一列定义出现两个或更多 `DEFAULT` 子句时，原始 MySQL DDL 本身存在互相冲突的默认值，工具不能替业务选择保留哪一个。数据库验证应将其归为 `ORIGINAL_SQL`，保留转换结果并要求修正源脚本，不能误报为待补充的达梦转换规则。
 - MySQL `AUTO_INCREMENT` 和 `ALTER TABLE t AUTO_INCREMENT = n` 默认不再为了验证而改写。目标环境如果不支持或业务依赖重置序列语义，应按达梦身份列/序列方案人工确认，不能把 `AUTO_INCREMENT = n` 删除后留下半截 `ALTER TABLE`。
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
