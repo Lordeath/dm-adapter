@@ -2803,7 +2803,7 @@ class MapperMigratorTest {
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
                         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
                 <mapper namespace="com.example.DetailMapper">
-                    <update id="deleteSettlementDetails">
+                    <delete id="deleteSettlementDetails">
                         update sample_extension extension
                         left join sample_detail detail on detail.id = extension.detail_id
                         set detail.is_deleted = "1"
@@ -2812,7 +2812,7 @@ class MapperMigratorTest {
                         <foreach collection="ids" item="id" open="(" separator="," close=")">
                             #{id}
                         </foreach>
-                    </update>
+                    </delete>
                 </mapper>
                 """;
         Path mapper = writeFile("src/main/resources/mapper/DetailMapper.xml", originalXml);

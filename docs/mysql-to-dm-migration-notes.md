@@ -68,7 +68,7 @@
 - 升级脚本可能由 Windows 工具保存为带 BOM 的 UTF-16LE/UTF-16BE，而不只是 UTF-8。读取时应按 BOM 解码，迁移输出统一写为 UTF-8；不能因固定按 UTF-8 读取而在全量执行中途抛出 `MalformedInputException`。
 - 脚本级 `SET @变量`、`FOREIGN_KEY_CHECKS`、`PREPARE` 等 MySQL 控制语句被安全消解为审计注释时，写盘 SQL 必须同时生成可执行的达梦匿名 `NULL` 空操作块，使迁移结果、输出脚本和严格验证计划仍保持逐条对应。不能因解析器忽略纯注释而产生语句计数漂移，也不能因此跳过数据库验证。
 - 脚本级 `SELECT ... INTO @变量`、多列 `SELECT ... INTO @变量1,@变量2` 和 `SET @变量=(SELECT ...)` 若能证明查询来源表在最后一次引用前未被修改，可把查询转为达梦标量子查询并内联到后续普通 SQL 或临时过程中；未被使用的赋值可安全消解。来源表在引用区间内发生修改、查询仍依赖未解析用户变量或无法证明标量语义时必须保留人工确认，不能把“每次重新查询”冒充 MySQL 的赋值快照。
-- MyBatis 语句包含 `<if>`、`<foreach>`、`<include>`、`<where>` 等 XML 节点本身不是人工确认理由。只有转换后仍检测到明确的未解决兼容风险（例如未改写的 `ON DUPLICATE KEY UPDATE`、无法安全拼接的动态 `UPDATE JOIN` 或未支持的函数）才进入人工确认；成功改写后还必须移除由原始片段产生、但在最终 SQL 中已不存在的过期风险项。
+- MyBatis 语句包含 `<if>`、`<foreach>`、`<include>`、`<where>` 等 XML 节点本身不是人工确认理由。只有转换后仍检测到明确的未解决兼容风险（例如未改写的 `ON DUPLICATE KEY UPDATE`、无法安全拼接的动态 `UPDATE JOIN` 或未支持的函数）才进入人工确认；成功改写后还必须移除由原始片段产生、但在最终 SQL 中已不存在的过期风险项。不能只按 `<insert>`、`<update>`、`<delete>` 标签决定转换类型，历史 mapper 可能在 `<delete>` 中实际书写 `UPDATE`，必须以 SQL 首关键字为准。
 - 临时迁移过程中的元数据检查不能把 CLI `--schema` 固化到输出脚本，也不能在过程内部用 `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` 推断。达梦执行存储过程时该上下文可能变为过程定义者的默认 schema；应以 `CURRENT_SCHID` 作为当前模式的运行时依据。仅含当前模式、表名和列名的列存在性检查，可改写为 `SYS.SYSOBJECTS` 与 `SYS.SYSCOLUMNS` 的窄查询，并用原始名称与其大写形式的等值候选匹配，避免在字典列上调用 `UPPER()` 导致全量扫描；含类型、长度、可空性等附加条件的复杂检查仍使用 `SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)` 配合 `ALL_TAB_COLUMNS`。两种输出都不得固化 CLI schema。
 - 存储过程通过动态 DDL 修改对象后，后续静态 SQL 继续访问同一对象可能因编译期对象不存在、列定义变化或执行计划版本失效而报对象无效或 `-7184`。应按执行顺序判断：静态访问全部发生在最终 DDL 之前时无需改写；DDL 后的 `UPDATE`、`INSERT`、`DELETE`、`MERGE` 和 `SELECT ... INTO` 可整体改为 `EXECUTE IMMEDIATE`。其中可明确识别的过程参数和局部变量输入应改为 `?` 并按出现顺序生成 `USING` 绑定，重复引用同一变量时也要重复传入；DML 目标列和 `SELECT ... INTO` 输出变量不能误当输入绑定。动态对象名、循环或无法可靠解析的控制流仍保留原 SQL 并进入人工确认，不能只改写其中一部分。
 - 扫描 `EXECUTE IMMEDIATE` 内的长 SQL 字面量时不能使用逐字符递归回溯的正则表达式；真实升级脚本可能在较小 JVM 线程栈上触发 `StackOverflowError`。应按引号和注释边界线性扫描，再对提取出的 DDL 做精确匹配。
@@ -77,7 +77,7 @@
 ## MyBatis 迁移判断准则
 
 - 原始 mapper XML 不由 dm-adapter 迁移流程覆盖；自动迁移输出保持在 `src/main/resources/mapper-dm`。
-- MySQL `LEFT JOIN` 更新若右表列参与赋值，不能直接降级成达梦 `UPDATE ... FROM`，因为无匹配行和重复来源行的语义会变化。只有项目 DDL 的真实主键或唯一键被 `ON` 条件完整绑定，或右侧派生表按连接列 `GROUP BY` 已直接证明每个键最多一行，且赋值形态可等价表示时，才可把右表表达式改为相关标量子查询；`WHERE` 中引用右表的 `AND` 条件必须同时下推到标量子查询并在外层补等价 `EXISTS`，不能留下失效的右表别名。动态 `<foreach>` 只是外层过滤条件时应原样保留，不应阻止上述转换。赋值完全不依赖右表时，可用 `EXISTS` 保留匹配过滤语义，不需要唯一性证明。缺少必要的唯一性证明时应准确报告约束风险，不能任选一条来源记录。
+- MySQL `LEFT JOIN` 更新若右表列参与赋值，不能直接降级成达梦 `UPDATE ... FROM`，因为无匹配行和重复来源行的语义会变化。只有项目 DDL 的真实主键或唯一键被 `ON` 条件完整绑定，或右侧派生表按连接列 `GROUP BY` 已直接证明每个键最多一行，且赋值形态可等价表示时，才可把右表表达式改为相关标量子查询；`WHERE` 中引用右表的 `AND` 条件必须同时下推到标量子查询并在外层补等价 `EXISTS`，不能留下失效的右表别名。动态 `<foreach>` 只是外层过滤条件时应原样保留，不应阻止上述转换。赋值完全不依赖右表时，可用 `EXISTS` 保留匹配过滤语义，不需要唯一性证明。`IF(IFNULL(右表非空主键, 哨兵)=哨兵, 未匹配值, 匹配值)` 只表达右表是否存在时，即使连接列不唯一，也可按真实非空主键改为 `CASE WHEN EXISTS`，因为重复来源不会改变结果；不得把普通可空列误作存在性证明。缺少必要的唯一性证明时应准确报告约束风险，不能任选一条来源记录。
 - 原始 SQL 明显错误时，可以修原始业务 SQL。例如列名写错、insert 列和值数量不一致、`set` 末尾多逗号、把 `UPDATE table` 写成 `UPDATE FROM table`。这类错误即使后续通用规则引用了达梦关键字，也仍应按原始 XML 语法缺陷分类。若问题来自 Java mapper 方法签名，如多个参数复用同一个 `@Param` 名称，或多个简单参数缺少必要 `@Param`，应修 Java mapper 方法签名，不应为了绕过绑定错误去改 XML 参数名。
 - Java 注解里的 SQL 如果包含复杂动态 SQL、MySQL 专有语法或需要达梦改写，应优先迁移到 mapper XML，再由 dm-adapter 生成 `mapper-dm`；自动迁移也应把可识别的 `@Select`、`@Insert`、`@Update`、`@Delete` SQL 提取到 `mapper-dm` XML 后再执行达梦改写和验证。
 - mapper XML 可能带 UTF-8 BOM。解析器必须按字节流交给 XML 解析器识别 BOM；不能把 BOM 作为正文字符传入 `Reader`，否则整份文件会退化为“无法安全解析”，后续动态 SQL 结构转换将被跳过。

@@ -58,7 +58,7 @@ class SqlRewriteConfigUpdaterTest {
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
                 "com.example.UserMapper.updateOrganizationName",
                 "sample_organization",
-                List.of("id"),
+                List.of("parent_id"),
                 RewriteConfigCandidate.RewriteKind.OUTER_JOIN_SOURCE
         );
         TableKeyMetadata metadata = new TableKeyMetadata("sample_organization", List.of(

@@ -287,6 +287,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern LIMIT_SIZE_PATTERN = Pattern.compile(
             "(?is)^(?<base>.+?)\\s+LIMIT\\s+(?<size>" + TOKEN + ")\\s*;?\\s*$");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\")";
+    private static final String UPDATE_IDENTIFIER =
+            "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`)";
     private static final Pattern MYSQL_BOOLEAN_NULL_PROJECTION_PATTERN = Pattern.compile(
             "(?is)^\\s*(?<expression>"
                     + DM_IDENTIFIER
@@ -385,8 +387,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "(?is)\\btable_type\\s*=\\s*(?<value>'(?:''|[^'])*')"
     );
     private static final Pattern UPDATE_SET_QUALIFIED_ASSIGNMENT = Pattern.compile(
-            "(?is)^\\s*(?<alias>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\.\\s*"
-                    + "(?<column>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*="
+            "(?is)^\\s*(?<alias>" + UPDATE_IDENTIFIER + ")\\s*\\.\\s*"
+                    + "(?<column>" + UPDATE_IDENTIFIER + ")\\s*="
     );
     private static final String SIMPLE_IDENTIFIER = "[A-Za-z_][A-Za-z0-9_$]*";
     private static final String SIMPLE_QUALIFIED_IDENTIFIER =
@@ -6024,21 +6026,32 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             String rightSide = assignmentRightSide(assignment.text()).strip();
             String convertedRightSide = rightSide;
             if (referencesAliasOutsideIgnoredText(rightSide, sourceTable.aliasKey())) {
-                if (!uniqueSource
-                        || containsPatternOutsideIgnoredText(
+                String presenceExpression = sourcePresenceExpression(
                         rightSide,
-                        Pattern.compile("(?is)\\bSELECT\\b")
-                )) {
-                    return GenericConversion.unchanged(sql);
+                        sourceTable.aliasKey(),
+                        sourceKeys,
+                        sourceTable.tableSql(),
+                        sourceQueryPredicates
+                );
+                if (!presenceExpression.isBlank()) {
+                    convertedRightSide = presenceExpression;
+                } else {
+                    if (!uniqueSource
+                            || containsPatternOutsideIgnoredText(
+                            rightSide,
+                            Pattern.compile("(?is)\\bSELECT\\b")
+                    )) {
+                        return GenericConversion.unchanged(sql);
+                    }
+                    sourceDependentAssignment = true;
+                    convertedRightSide = "(SELECT "
+                            + rightSide
+                            + " FROM "
+                            + sourceTable.tableSql()
+                            + " WHERE "
+                            + String.join(" AND ", sourceQueryPredicates)
+                            + ")";
                 }
-                sourceDependentAssignment = true;
-                convertedRightSide = "(SELECT "
-                        + rightSide
-                        + " FROM "
-                        + sourceTable.tableSql()
-                        + " WHERE "
-                        + String.join(" AND ", sourceQueryPredicates)
-                        + ")";
             }
             assignments.add(
                     updateSetColumnWithoutTargetAlias(targetMatcher.group("column"))
@@ -6073,6 +6086,70 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         converted.append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private String sourcePresenceExpression(
+            String expression,
+            String sourceAlias,
+            List<String> sourceKeyColumns,
+            String sourceTable,
+            List<String> sourceQueryPredicates
+    ) {
+        FunctionCall ifCall = readOnlyFunctionCall(expression, "IF");
+        if (ifCall == null) {
+            return "";
+        }
+        List<TopLevelArgument> ifArguments = splitTopLevelArguments(ifCall.body());
+        if (ifArguments.size() != 3) {
+            return "";
+        }
+        String condition = ifArguments.get(0).text().strip();
+        int equalsIndex = findTopLevelChar(condition, '=', 0);
+        if (equalsIndex < 0
+                || findTopLevelChar(condition, '=', equalsIndex + 1) >= 0) {
+            return "";
+        }
+        String left = condition.substring(0, equalsIndex).strip();
+        String right = condition.substring(equalsIndex + 1).strip();
+        FunctionCall ifNullCall = readOnlyFunctionCall(left, "IFNULL");
+        if (ifNullCall == null) {
+            return "";
+        }
+        List<TopLevelArgument> ifNullArguments = splitTopLevelArguments(ifNullCall.body());
+        if (ifNullArguments.size() != 2
+                || !sameSqlToken(ifNullArguments.get(1).text(), right)) {
+            return "";
+        }
+        String presenceColumn = qualifiedColumnForAlias(
+                ifNullArguments.get(0).text(),
+                sourceAlias
+        );
+        boolean provenNotNull = sourceKeyColumns.stream()
+                .anyMatch(column -> normalizeIdentifierKey(column)
+                        .equals(normalizeIdentifierKey(presenceColumn)));
+        if (presenceColumn.isBlank()
+                || !provenNotNull
+                || referencesAliasOutsideIgnoredText(ifArguments.get(1).text(), sourceAlias)
+                || referencesAliasOutsideIgnoredText(ifArguments.get(2).text(), sourceAlias)) {
+            return "";
+        }
+        String missingValue = ifArguments.get(1).text().strip();
+        String matchedValue = ifArguments.get(2).text().strip();
+        return "CASE WHEN EXISTS (SELECT 1 FROM "
+                + sourceTable
+                + " WHERE "
+                + String.join(" AND ", sourceQueryPredicates)
+                + ") THEN "
+                + matchedValue
+                + " ELSE "
+                + missingValue
+                + " END";
+    }
+
+    private boolean sameSqlToken(String left, String right) {
+        return left != null
+                && right != null
+                && left.replaceAll("\\s+", "").equalsIgnoreCase(right.replaceAll("\\s+", ""));
     }
 
     private List<String> uniqueSourceKeyColumns(

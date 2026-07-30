@@ -65,7 +65,8 @@ class SqlRewriteConfigUpdater {
                 }
             } else if (metadataAvailable) {
                 TableKeyMetadata metadata = metadataByTable.get(DamengMetadataReader.normalizeTableName(candidate.tableName()));
-                Optional<UpsertKeyInference.InferenceResult> result = inference.infer(candidate, metadata);
+                Optional<UpsertKeyInference.InferenceResult> result =
+                        inferCandidateKey(candidate, metadata);
                 result.ifPresent(inferenceResult -> {
                     tableInferenceResults
                             .computeIfAbsent(DamengMetadataReader.normalizeTableName(candidate.tableName()), ignored -> new ArrayList<>())
@@ -119,6 +120,20 @@ class SqlRewriteConfigUpdater {
         SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, inferredMethodKeys);
         Optional<FileChange> fileChange = writeIfChanged(context, rewriteConfigPath, model);
         return new SqlRewriteConfigUpdate(rewriteConfig, fileChange, warnings);
+    }
+
+    private Optional<UpsertKeyInference.InferenceResult> inferCandidateKey(
+            RewriteConfigCandidate candidate,
+            TableKeyMetadata metadata
+    ) {
+        if (candidate.outerJoinSource() && metadata != null && metadata.primaryKeys().size() == 1) {
+            TableConstraint primaryKey = metadata.primaryKeys().get(0);
+            return Optional.of(UpsertKeyInference.InferenceResult.inferred(
+                    primaryKey.columns(),
+                    "primary key " + primaryKey.name()
+            ));
+        }
+        return inference.infer(candidate, metadata);
     }
 
     private boolean learnIdentityInsertTables(

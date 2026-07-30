@@ -2417,6 +2417,38 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsBacktickTargetAssignmentWithSourceFilterToExists() {
+        SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
+                update sample_sign sign_row
+                left join sample_person person on person.id = sign_row.person_id
+                set sign_row.`deleteFlag` = 1
+                where person.`memberId` = #{memberId}
+                """, Map.of("sample_person", List.of("id")));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("update sample_sign sign_row set `deleteFlag` = 1")
+                .contains("EXISTS (SELECT 1 FROM sample_person person")
+                .doesNotContainIgnoringCase("left join");
+    }
+
+    @Test
+    void convertsOuterJoinNullPresenceAssignmentWithoutJoinUniqueness() {
+        SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
+                update sample_category parent
+                left join sample_category child on parent.id = child.parent_id
+                set parent.is_leaf = if(ifnull(child.id, -1) = -1, 1, 0)
+                """, Map.of("sample_category", List.of("id")));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update sample_category parent set is_leaf = CASE WHEN EXISTS (SELECT 1 FROM sample_category child WHERE parent.id = child.parent_id) THEN 0 ELSE 1 END
+                """);
+    }
+
+    @Test
     void extractsLeftJoinSourceColumnsForMetadataLookup() {
         assertThat(converter.outerJoinSourceKeyCandidate("""
                 update sample_user user_row

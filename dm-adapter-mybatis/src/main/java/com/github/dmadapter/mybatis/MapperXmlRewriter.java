@@ -79,6 +79,12 @@ public class MapperXmlRewriter {
             "DAMENG_BLOCK_TRAILING_DYNAMIC_PREDICATE_ATTACHED";
     private static final String DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON =
             "MySQL UPDATE JOIN is followed by MyBatis <where>; automatic text-segment rewrite would create duplicate WHERE.";
+    private static final String DYNAMIC_OUTER_UPDATE_JOIN_CARDINALITY_REASON =
+            "MySQL outer/cross UPDATE JOIN could not be converted safely: an equivalent "
+                    + "Dameng rewrite requires proof that each target row receives values from at "
+                    + "most one source row. That cardinality cannot be proven from this SQL; fix "
+                    + "the original join/deduplication or provide a real uniqueness guarantee "
+                    + "instead of choosing an arbitrary source row.";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Set<String> DAMENG_IDENTIFIER_QUOTES = Set.of(
@@ -933,7 +939,12 @@ public class MapperXmlRewriter {
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE);
         }
 
-        if (!"insert".equals(statementTagName) && !"update".equals(statementTagName)) {
+        int sqlStart = leadingWhitespaceLength(converted);
+        boolean insertStatement = "insert".equals(statementTagName)
+                || isKeywordAt(converted, sqlStart, "INSERT");
+        boolean updateStatement = "update".equals(statementTagName)
+                || isKeywordAt(converted, sqlStart, "UPDATE");
+        if (!insertStatement && !updateStatement) {
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
 
@@ -972,7 +983,7 @@ public class MapperXmlRewriter {
             converted = dynamicMerge;
         }
 
-        if (!"insert".equals(statementTagName)) {
+        if (updateStatement) {
             DynamicBodyConversion uniqueSourceOuterJoin = convertDynamicUniqueSourceOuterJoin(
                     converted,
                     sqlConverter,
@@ -1829,6 +1840,7 @@ public class MapperXmlRewriter {
 
     private boolean isMysqlUpdateJoinManualReviewReason(String reason) {
         return DYNAMIC_UPDATE_JOIN_WITH_WHERE_REASON.equals(reason)
+                || DYNAMIC_OUTER_UPDATE_JOIN_CARDINALITY_REASON.equals(reason)
                 || (reason != null && reason.contains("MySQL UPDATE JOIN"));
     }
 
@@ -7965,7 +7977,7 @@ public class MapperXmlRewriter {
             return new TextSegmentConversion(
                     text,
                     List.of(),
-                    List.of("MySQL UPDATE JOIN continues across dynamic MyBatis XML elements."),
+                    List.of(DYNAMIC_OUTER_UPDATE_JOIN_CARDINALITY_REASON),
                     false
             );
         }
