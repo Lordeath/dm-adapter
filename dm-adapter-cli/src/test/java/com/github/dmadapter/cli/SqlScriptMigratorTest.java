@@ -4555,6 +4555,11 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("CREATE TABLE IF NOT EXISTS tmp_menu_copy (source_id BIGINT, enterprise_id BIGINT, organization_id BIGINT, target_ver BIGINT, menu_id VARCHAR(200));")
+                .contains("FROM SYS.SYSOBJECTS T")
+                .contains("T.SCHID = CURRENT_SCHID")
+                .contains("T.NAME IN ('tmp_menu_copy', UPPER('tmp_menu_copy'))")
+                .contains("C.NAME IN ('menu_id', UPPER('menu_id'))")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE tmp_menu_copy ADD menu_id VARCHAR(200)'")
                 .contains("DELETE FROM tmp_menu_copy /* DM_ADAPTER_TMP_COLUMN tmp_menu_copy source_id */")
                 .contains("MERGE INTO tmp_menu_copy t")
                 .contains("ON (t.source_id = s.source_id)")
@@ -4790,6 +4795,13 @@ class SqlScriptMigratorTest {
                 .contains("CREATE TABLE IF NOT EXISTS ns_demo_bak_20260521 LIKE ns_demo")
                 .contains("MERGE INTO ns_demo_bak_20260521 t")
                 .contains("ON (t.ID = s.ID)")
+                .contains("T.SCHID = CURRENT_SCHID")
+                .contains("T.NAME IN ('ns_demo_bak_20260521', UPPER('ns_demo_bak_20260521'))")
+                .contains("C.NAME IN ('ID', UPPER('ID'))")
+                .contains("MOD(C.INFO2, 2) = 1")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT ns_demo_bak_20260521 ON'")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT ns_demo_bak_20260521 OFF'")
+                .contains("WHEN OTHERS THEN NULL")
                 .doesNotContain("INSERT IGNORE");
         assertThat(converted.indexOf("CREATE TABLE IF NOT EXISTS ns_demo_bak_20260521 LIKE ns_demo"))
                 .isLessThan(converted.indexOf("CREATE OR REPLACE PROCEDURE demo_backup_insert_ignore"));

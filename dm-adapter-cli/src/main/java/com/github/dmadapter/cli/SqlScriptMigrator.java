@@ -4582,9 +4582,51 @@ class SqlScriptMigrator {
             }
             placeholders.add("CREATE TABLE IF NOT EXISTS " + entry.getKey()
                     + " (" + procedureTempTableColumnDefinitions(entry.getValue()) + ")");
+            placeholders.add(procedureTempTableColumnReconciliationBlock(
+                    entry.getKey(),
+                    entry.getValue()
+            ));
         }
         placeholders.addAll(procedureCreateTableLikeCompilePlaceholders(leadingSqlPrefix.body()));
         return List.copyOf(placeholders);
+    }
+
+    private String procedureTempTableColumnReconciliationBlock(
+            String tableToken,
+            LinkedHashSet<String> columns
+    ) {
+        String tableName = unquoteIdentifier(lastIdentifierPart(tableToken.strip()));
+        StringBuilder block = new StringBuilder();
+        block.append("DECLARE\n")
+                .append("    dm_adapter_column_count INT;\n")
+                .append("BEGIN\n");
+        for (String column : columns) {
+            String columnName = unquoteIdentifier(lastIdentifierPart(column.strip()));
+            String columnToken = dmSimpleIdentifier(columnName);
+            String alterTable = "ALTER TABLE " + tableToken
+                    + " ADD " + columnToken + " " + procedureTempTableColumnType(columnName);
+            block.append("    SELECT COUNT(*) INTO dm_adapter_column_count\n")
+                    .append("    FROM SYS.SYSOBJECTS T\n")
+                    .append("    JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID\n")
+                    .append("    WHERE T.SCHID = CURRENT_SCHID\n")
+                    .append("      AND T.SUBTYPE$ = 'UTAB'\n")
+                    .append("      AND T.NAME IN (")
+                    .append(sqlStringLiteral(tableName))
+                    .append(", UPPER(")
+                    .append(sqlStringLiteral(tableName))
+                    .append("))\n")
+                    .append("      AND C.NAME IN (")
+                    .append(sqlStringLiteral(columnName))
+                    .append(", UPPER(")
+                    .append(sqlStringLiteral(columnName))
+                    .append("));\n")
+                    .append("    IF dm_adapter_column_count = 0 THEN\n")
+                    .append("        EXECUTE IMMEDIATE ")
+                    .append(sqlStringLiteral(alterTable))
+                    .append(";\n")
+                    .append("    END IF;\n");
+        }
+        return block.append("END").toString();
     }
 
     private List<String> procedureCreateTableLikeCompilePlaceholders(String sql) {
@@ -5320,7 +5362,7 @@ class SqlScriptMigrator {
         if (!isCreateProcedureStatement(sql)) {
             return sql;
         }
-        Map<String, List<String>> keyColumnsByTable = temporaryTableKeyColumnsByLowercase(sql);
+        Map<String, TemporaryInsertTarget> keyColumnsByTable = temporaryTableKeyColumnsByLowercase(sql);
         if (keyColumnsByTable.isEmpty()) {
             return sql;
         }
@@ -5362,8 +5404,8 @@ class SqlScriptMigrator {
         return converted.toString();
     }
 
-    private Map<String, List<String>> temporaryTableKeyColumnsByLowercase(String sql) {
-        LinkedHashMap<String, List<String>> keys = new LinkedHashMap<>();
+    private Map<String, TemporaryInsertTarget> temporaryTableKeyColumnsByLowercase(String sql) {
+        LinkedHashMap<String, TemporaryInsertTarget> keys = new LinkedHashMap<>();
         int index = firstProcedureBegin(sql);
         while (index >= 0 && index < sql.length()) {
             char current = sql.charAt(index);
@@ -5385,7 +5427,13 @@ class SqlScriptMigrator {
                 if (tableKey == null) {
                     index++;
                 } else {
-                    keys.putIfAbsent(tableKey.tableKey(), tableKey.keyColumns());
+                    keys.putIfAbsent(
+                            tableKey.tableKey(),
+                            new TemporaryInsertTarget(
+                                    tableKey.keyColumns(),
+                                    tableKey.conditionalIdentityInsert()
+                            )
+                    );
                     index = tableKey.end();
                 }
             } else {
@@ -5431,7 +5479,12 @@ class SqlScriptMigrator {
         if (keyColumns.isEmpty()) {
             return null;
         }
-        return new TemporaryTableKey(normalizedTableKey(table.token()), keyColumns, closeParen + 1);
+        return new TemporaryTableKey(
+                normalizedTableKey(table.token()),
+                keyColumns,
+                closeParen + 1,
+                false
+        );
     }
 
     private TemporaryTableKey readProcedureCreateTableLikeKey(String sql, int createIndex) {
@@ -5449,7 +5502,8 @@ class SqlScriptMigrator {
         return new TemporaryTableKey(
                 normalizedTableKey(matcher.group("table")),
                 List.of("ID"),
-                createIndex + matcher.end()
+                createIndex + matcher.end(),
+                true
         );
     }
 
@@ -5507,7 +5561,7 @@ class SqlScriptMigrator {
     private TemporaryInsertIgnoreSelect readTemporaryInsertIgnoreSelect(
             String sql,
             int insertIndex,
-            Map<String, List<String>> keyColumnsByTable
+            Map<String, TemporaryInsertTarget> keyColumnsByTable
     ) {
         int cursor = skipWhitespace(sql, insertIndex + "INSERT".length());
         if (!startsKeyword(sql, cursor, "IGNORE")) {
@@ -5522,8 +5576,8 @@ class SqlScriptMigrator {
         if (table == null) {
             return null;
         }
-        List<String> keyColumns = keyColumnsByTable.get(normalizedTableKey(table.token()));
-        if (keyColumns == null || keyColumns.isEmpty()) {
+        TemporaryInsertTarget target = keyColumnsByTable.get(normalizedTableKey(table.token()));
+        if (target == null || target.keyColumns().isEmpty()) {
             return null;
         }
         int openParen = skipWhitespace(sql, table.end());
@@ -5553,7 +5607,13 @@ class SqlScriptMigrator {
             return null;
         }
         String fromTail = selectBody.substring(fromIndex).strip();
-        String mergeSql = temporaryInsertIgnoreMergeSql(table.token(), targetColumns, selectItems, fromTail, keyColumns);
+        String mergeSql = temporaryInsertIgnoreMergeSql(
+                table.token(),
+                targetColumns,
+                selectItems,
+                fromTail,
+                target
+        );
         return mergeSql.isBlank() ? null : new TemporaryInsertIgnoreSelect(insertIndex, statementEnd, mergeSql);
     }
 
@@ -5574,8 +5634,9 @@ class SqlScriptMigrator {
             List<String> targetColumns,
             List<String> selectItems,
             String fromTail,
-            List<String> keyColumns
+            TemporaryInsertTarget target
     ) {
+        List<String> keyColumns = target.keyColumns();
         List<String> normalizedTargetColumns = targetColumns.stream()
                 .map(this::normalizedIdentifierKey)
                 .toList();
@@ -5628,14 +5689,62 @@ class SqlScriptMigrator {
             merge.append("s.").append(dmSimpleIdentifier(targetColumns.get(i)));
         }
         merge.append(")");
-        return merge.toString();
+        if (!target.conditionalIdentityInsert()) {
+            return merge.toString();
+        }
+        return wrapConditionalIdentityInsert(
+                tableToken,
+                keyColumns.get(0),
+                merge.toString()
+        );
+    }
+
+    private String wrapConditionalIdentityInsert(
+            String tableToken,
+            String identityColumn,
+            String statement
+    ) {
+        String tableName = unquoteIdentifier(lastIdentifierPart(tableToken.strip()));
+        String columnName = unquoteIdentifier(lastIdentifierPart(identityColumn.strip()));
+        String identityInsertOff = "SET IDENTITY_INSERT " + tableToken + " OFF";
+        return "DECLARE\n"
+                + "    dm_adapter_identity_count INT;\n"
+                + "BEGIN\n"
+                + "    SELECT COUNT(*) INTO dm_adapter_identity_count\n"
+                + "    FROM SYS.SYSOBJECTS T\n"
+                + "    JOIN SYS.SYSCOLUMNS C ON C.ID = T.ID\n"
+                + "    WHERE T.SCHID = CURRENT_SCHID\n"
+                + "      AND T.SUBTYPE$ = 'UTAB'\n"
+                + "      AND T.NAME IN (" + sqlStringLiteral(tableName)
+                + ", UPPER(" + sqlStringLiteral(tableName) + "))\n"
+                + "      AND C.NAME IN (" + sqlStringLiteral(columnName)
+                + ", UPPER(" + sqlStringLiteral(columnName) + "))\n"
+                + "      AND MOD(C.INFO2, 2) = 1;\n"
+                + "    IF dm_adapter_identity_count > 0 THEN\n"
+                + "        EXECUTE IMMEDIATE "
+                + sqlStringLiteral("SET IDENTITY_INSERT " + tableToken + " ON")
+                + ";\n"
+                + "    END IF;\n"
+                + statement + ";\n"
+                + "    IF dm_adapter_identity_count > 0 THEN\n"
+                + "        EXECUTE IMMEDIATE " + sqlStringLiteral(identityInsertOff) + ";\n"
+                + "    END IF;\n"
+                + "EXCEPTION\n"
+                + "    WHEN OTHERS THEN\n"
+                + "        BEGIN\n"
+                + "            EXECUTE IMMEDIATE " + sqlStringLiteral(identityInsertOff) + ";\n"
+                + "        EXCEPTION\n"
+                + "            WHEN OTHERS THEN NULL;\n"
+                + "        END;\n"
+                + "        RAISE;\n"
+                + "END";
     }
 
     private String convertMysqlProcedureDynamicInsertIgnore(String sql) {
         if (!isCreateProcedureStatement(sql)) {
             return sql;
         }
-        Map<String, List<String>> keyColumnsByTable = temporaryTableKeyColumnsByLowercase(sql);
+        Map<String, TemporaryInsertTarget> keyColumnsByTable = temporaryTableKeyColumnsByLowercase(sql);
         if (keyColumnsByTable.isEmpty()) {
             return sql;
         }
@@ -5680,7 +5789,7 @@ class SqlScriptMigrator {
     private SingleQuotedStringRewrite convertDynamicInsertIgnoreStringLiteral(
             String sql,
             int start,
-            Map<String, List<String>> keyColumnsByTable
+            Map<String, TemporaryInsertTarget> keyColumnsByTable
     ) {
         SingleQuotedStringContent literal = readSingleQuotedStringContent(sql, start);
         if (!literal.closed()) {
@@ -13284,8 +13393,22 @@ class SqlScriptMigrator {
     private record ProcedureReferenceRename(String sql, boolean changed) {
     }
 
-    private record TemporaryTableKey(String tableKey, List<String> keyColumns, int end) {
+    private record TemporaryTableKey(
+            String tableKey,
+            List<String> keyColumns,
+            int end,
+            boolean conditionalIdentityInsert
+    ) {
         private TemporaryTableKey {
+            keyColumns = List.copyOf(keyColumns == null ? List.of() : keyColumns);
+        }
+    }
+
+    private record TemporaryInsertTarget(
+            List<String> keyColumns,
+            boolean conditionalIdentityInsert
+    ) {
+        private TemporaryInsertTarget {
             keyColumns = List.copyOf(keyColumns == null ? List.of() : keyColumns);
         }
     }
