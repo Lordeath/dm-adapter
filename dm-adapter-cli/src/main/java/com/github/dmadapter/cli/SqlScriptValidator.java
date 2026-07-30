@@ -31,12 +31,17 @@ import java.util.regex.Pattern;
 
 class SqlScriptValidator implements SqlScriptMigrator.Validator {
     private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 600;
+    private static final int DEFAULT_CONNECTION_ATTEMPTS = 3;
+    private static final long DEFAULT_CONNECTION_RETRY_DELAY_MILLIS = 2_000L;
     private static final long DEFAULT_SLOW_OPERATION_LOG_MILLIS = 5_000L;
     private static final long SLOW_OPERATION_REPEAT_MILLIS = 30_000L;
     private static final int CONNECTION_CLOSE_TIMEOUT_SECONDS = 5;
     private static final int STATEMENT_PROGRESS_INTERVAL = 100;
     private static final String STATEMENT_TIMEOUT_PROPERTY = "dm.adapter.sqlScriptStatementTimeoutSeconds";
     private static final String STATEMENT_TIMEOUT_ENV = "DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS";
+    private static final String CONNECTION_ATTEMPTS_PROPERTY = "dm.adapter.sqlScriptConnectionAttempts";
+    private static final String CONNECTION_RETRY_DELAY_PROPERTY =
+            "dm.adapter.sqlScriptConnectionRetryDelayMillis";
     private static final String SLOW_OPERATION_LOG_PROPERTY = "dm.adapter.sqlScriptSlowOperationLogMillis";
     private static final Pattern CREATE_ROUTINE_PATTERN = Pattern.compile(
             "(?is)\\bCREATE(?:\\s+OR\\s+REPLACE)?\\s+"
@@ -46,6 +51,8 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
 
     private final ConnectionProvider connectionProvider;
     private final Consumer<String> progressConsumer;
+    private final int connectionAttempts;
+    private final long connectionRetryDelayMillis;
 
     SqlScriptValidator() {
         this(defaultConnectionProvider(), null);
@@ -75,8 +82,27 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     }
 
     SqlScriptValidator(ConnectionProvider connectionProvider, Consumer<String> progressConsumer) {
+        this(
+                connectionProvider,
+                progressConsumer,
+                Math.max(1, Integer.getInteger(CONNECTION_ATTEMPTS_PROPERTY, DEFAULT_CONNECTION_ATTEMPTS)),
+                Math.max(0L, Long.getLong(
+                        CONNECTION_RETRY_DELAY_PROPERTY,
+                        DEFAULT_CONNECTION_RETRY_DELAY_MILLIS
+                ))
+        );
+    }
+
+    SqlScriptValidator(
+            ConnectionProvider connectionProvider,
+            Consumer<String> progressConsumer,
+            int connectionAttempts,
+            long connectionRetryDelayMillis
+    ) {
         this.connectionProvider = connectionProvider;
         this.progressConsumer = progressConsumer;
+        this.connectionAttempts = Math.max(1, connectionAttempts);
+        this.connectionRetryDelayMillis = Math.max(0L, connectionRetryDelayMillis);
     }
 
     @Override
@@ -202,6 +228,27 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
     }
 
     private Connection openConnection(DmValidationEnvironment environment) throws Exception {
+        Exception lastFailure = null;
+        for (int attempt = 1; attempt <= connectionAttempts; attempt++) {
+            try {
+                return openConnectionOnce(environment);
+            } catch (ValidationConnectionTimeoutException e) {
+                throw e;
+            } catch (Exception e) {
+                lastFailure = e;
+            }
+            if (attempt < connectionAttempts && !environment.deadline().expired()) {
+                progress("Dameng validation connection attempt " + attempt + "/" + connectionAttempts
+                        + " failed; retrying. Cause: " + redact(safeMessage(lastFailure), environment));
+                sleepBeforeConnectionRetry(environment);
+            }
+        }
+        throw lastFailure == null
+                ? new IllegalStateException("Dameng validation connection failed without a reported cause.")
+                : lastFailure;
+    }
+
+    private Connection openConnectionOnce(DmValidationEnvironment environment) throws Exception {
         long remainingSeconds = environment.deadline().remainingSeconds();
         if (remainingSeconds <= 0L) {
             throw new ValidationConnectionTimeoutException();
@@ -225,6 +272,23 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             throw new IllegalStateException(cause);
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    private void sleepBeforeConnectionRetry(DmValidationEnvironment environment)
+            throws ValidationConnectionTimeoutException {
+        if (connectionRetryDelayMillis <= 0L) {
+            return;
+        }
+        long remainingMillis = TimeUnit.SECONDS.toMillis(environment.deadline().remainingSeconds());
+        if (remainingMillis <= 0L) {
+            throw new ValidationConnectionTimeoutException();
+        }
+        try {
+            Thread.sleep(Math.min(connectionRetryDelayMillis, remainingMillis));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ValidationConnectionTimeoutException();
         }
     }
 
