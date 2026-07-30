@@ -2936,6 +2936,53 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsMysqlDeleteInnerJoinInsideProcedureToCorrelatedExists() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE cleanup_role_perm()
+                BEGIN
+                    DELETE FROM ns_core_role_perm x INNER JOIN (
+                        SELECT perid
+                        FROM ns_core_permission
+                        WHERE funcid = 'demo'
+                    ) p ON p.perid = x.perid
+                    WHERE (enterprise_id, organization_id) IN (
+                        SELECT enterprise_id, organization_id FROM tmp_enterprise_orgid
+                    );
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("DELETE FROM ns_core_role_perm x")
+                .contains("WHERE EXISTS (")
+                .contains("FROM (")
+                .contains("SELECT perid")
+                .contains(") p")
+                .contains("WHERE p.perid = x.perid")
+                .contains("AND ((enterprise_id, organization_id) IN (")
+                .doesNotContainIgnoringCase("INNER JOIN");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_DELETE_JOIN_TO_EXISTS_RULE));
+    }
+
+    @Test
     void convertsSimpleMysqlFunctionUserVariablesToDamengLocals() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -3303,6 +3350,47 @@ class SqlScriptMigratorTest {
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX owner_car_month_card_info_idx_card_id ON `owner_car_month_card_info` (`card_id`)'")
                 .doesNotContain("INDEX_NAME = 'owner_car_month_card_info_idx_card_id'")
                 .doesNotContain("ADD INDEX")
+                .doesNotContainIgnoringCase("USING BTREE");
+    }
+
+    @Test
+    void normalizesStandaloneMysqlIndexDdlAndPreservesQuotedTextColumnInsideProcedure() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE repair_message_indexes()
+                BEGIN
+                    DROP INDEX idx_old ON ns_message;
+                    CREATE INDEX `idx_enter_org_seq`
+                        ON `ns_message` (`enterpriseId`, `organizationId`, `seqNumber`) USING BTREE;
+                    CREATE INDEX idx_content
+                        ON ns_message (`content`(255));
+                    ALTER TABLE ns_message MODIFY COLUMN `text` longtext COMMENT 'text stays an identifier';
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-opinion",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("EXECUTE IMMEDIATE 'DROP INDEX ns_message_idx_old'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX ns_message_idx_enter_org_seq")
+                .contains("ON `ns_message` (`enterpriseId`, `organizationId`, `seqNumber`)'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX ns_message_idx_content")
+                .contains("ON ns_message (CAST(SUBSTR(`content`, 1, 255) AS VARCHAR(255)))'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_message MODIFY `text` CLOB'")
+                .doesNotContain("MODIFY `CLOB`")
                 .doesNotContainIgnoringCase("USING BTREE");
     }
 

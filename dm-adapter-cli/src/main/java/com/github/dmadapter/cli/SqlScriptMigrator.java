@@ -156,6 +156,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_MISSING_SYS_TIME";
     static final String MYSQL_PROCEDURE_DELETE_ALIAS_STAR_RULE =
             "MYSQL_PROCEDURE_DELETE_ALIAS_STAR_TO_DM";
+    static final String MYSQL_PROCEDURE_DELETE_JOIN_TO_EXISTS_RULE =
+            "MYSQL_PROCEDURE_DELETE_JOIN_TO_EXISTS";
     static final String MYSQL_PROCEDURE_RESERVED_CURSOR_RENAME_RULE =
             "MYSQL_PROCEDURE_RESERVED_CURSOR_RENAMED";
     static final String MYSQL_INSERT_VALUES_COLUMN_LIST_RULE =
@@ -6083,6 +6085,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_DELETE_ALIAS_STAR_RULE);
         }
 
+        String deleteJoinSql = convertMysqlProcedureDeleteJoin(converted);
+        if (!deleteJoinSql.equals(converted)) {
+            converted = deleteJoinSql;
+            rules.add(MYSQL_PROCEDURE_DELETE_JOIN_TO_EXISTS_RULE);
+        }
+
         String jsonEscapeSql = normalizeMysqlJsonEscapesInSqlStringLiterals(converted);
         if (!jsonEscapeSql.equals(converted)) {
             converted = jsonEscapeSql;
@@ -8649,6 +8657,132 @@ class SqlScriptMigrator {
         );
     }
 
+    private String convertMysqlProcedureDeleteJoin(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        int cursor = 0;
+        int index = firstProcedureBegin(sql);
+        boolean changed = false;
+        while (index >= 0 && index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "DELETE")) {
+                int end = findStatementTerminator(sql, index);
+                String replacement = convertMysqlDeleteJoinStatement(sql.substring(index, end));
+                if (replacement == null) {
+                    index++;
+                    continue;
+                }
+                converted.append(sql, cursor, index).append(replacement);
+                if (end < sql.length() && sql.charAt(end) == ';') {
+                    converted.append(';');
+                    end++;
+                }
+                cursor = end;
+                index = end;
+                changed = true;
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return sql;
+        }
+        converted.append(sql.substring(cursor));
+        return converted.toString();
+    }
+
+    private String convertMysqlDeleteJoinStatement(String statement) {
+        int cursor = skipWhitespace(statement, 0);
+        if (!startsKeyword(statement, cursor, "DELETE")) {
+            return null;
+        }
+        cursor = skipWhitespace(statement, cursor + "DELETE".length());
+        if (!startsKeyword(statement, cursor, "FROM")) {
+            return null;
+        }
+        cursor = skipWhitespace(statement, cursor + "FROM".length());
+        SqlIdentifierReference targetTable = sqlIdentifierReferenceAt(statement, cursor);
+        if (targetTable == null) {
+            return null;
+        }
+        cursor = skipWhitespace(statement, targetTable.end());
+        if (startsKeyword(statement, cursor, "AS")) {
+            cursor = skipWhitespace(statement, cursor + "AS".length());
+        }
+        int targetAliasEnd = simpleIdentifierEnd(statement, cursor);
+        if (targetAliasEnd <= cursor) {
+            return null;
+        }
+        String targetAlias = statement.substring(cursor, targetAliasEnd);
+        cursor = skipWhitespace(statement, targetAliasEnd);
+        if (!startsKeyword(statement, cursor, "INNER")) {
+            return null;
+        }
+        cursor = skipWhitespace(statement, cursor + "INNER".length());
+        if (!startsKeyword(statement, cursor, "JOIN")) {
+            return null;
+        }
+        cursor = skipWhitespace(statement, cursor + "JOIN".length());
+        int joinSourceStart = cursor;
+        if (cursor < statement.length() && statement.charAt(cursor) == '(') {
+            int closeParen = findMatchingParen(statement, cursor);
+            if (closeParen <= cursor) {
+                return null;
+            }
+            cursor = closeParen + 1;
+        } else {
+            SqlIdentifierReference joinTable = sqlIdentifierReferenceAt(statement, cursor);
+            if (joinTable == null) {
+                return null;
+            }
+            cursor = joinTable.end();
+        }
+        String joinSource = statement.substring(joinSourceStart, cursor).strip();
+        cursor = skipWhitespace(statement, cursor);
+        if (startsKeyword(statement, cursor, "AS")) {
+            cursor = skipWhitespace(statement, cursor + "AS".length());
+        }
+        int joinAliasEnd = simpleIdentifierEnd(statement, cursor);
+        if (joinAliasEnd <= cursor) {
+            return null;
+        }
+        String joinAlias = statement.substring(cursor, joinAliasEnd);
+        cursor = skipWhitespace(statement, joinAliasEnd);
+        if (!startsKeyword(statement, cursor, "ON")) {
+            return null;
+        }
+        int onStart = skipWhitespace(statement, cursor + "ON".length());
+        int whereIndex = topLevelKeywordIndex(statement.substring(onStart), "WHERE");
+        if (whereIndex < 0) {
+            return null;
+        }
+        whereIndex += onStart;
+        String joinCondition = statement.substring(onStart, whereIndex).strip();
+        String deleteCondition = statement.substring(whereIndex + "WHERE".length()).strip();
+        if (joinCondition.isBlank() || deleteCondition.isBlank()) {
+            return null;
+        }
+        return "DELETE FROM " + targetTable.token() + " " + targetAlias + "\n"
+                + "WHERE EXISTS (\n"
+                + "    SELECT 1\n"
+                + "    FROM " + joinSource + " " + joinAlias + "\n"
+                + "    WHERE " + joinCondition + "\n"
+                + ")\n"
+                + "  AND (" + deleteCondition + ")";
+    }
+
     private String convertMysqlProcedureLocalSetAssignments(String sql) {
         if (!isCreateRoutineStatement(sql)) {
             return sql;
@@ -10560,6 +10694,7 @@ class SqlScriptMigrator {
         converted = convertMysqlCreateTableSelect(converted);
         converted = convertMysqlAlterTableAddIndex(converted);
         converted = convertMysqlAlterTableDropForeignKey(converted);
+        converted = convertMysqlDropIndexOnTable(converted);
         ProcedureStatement temporaryIndexDdl = convertTemporaryIndexDdlToNoop(converted);
         if (temporaryIndexDdl != null) {
             return directProcedureBodyStatement ? List.of() : List.of(temporaryIndexDdl);
@@ -10602,18 +10737,26 @@ class SqlScriptMigrator {
     }
 
     private String normalizeMysqlDataTypes(String sql) {
-        String converted = Pattern.compile("(?is)\\bDOUBLE\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)")
-                .matcher(sql)
-                .replaceAll("DECIMAL($1, $2)");
-        converted = Pattern.compile("(?is)\\bFLOAT\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)")
-                .matcher(converted)
-                .replaceAll("DECIMAL($1, $2)");
-        converted = Pattern.compile("(?is)\\b(TINYTEXT|MEDIUMTEXT|LONGTEXT|TEXT)\\b")
-                .matcher(converted)
-                .replaceAll("CLOB");
-        return Pattern.compile("(?is)\\b(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)\\s*\\(\\s*\\d+\\s*\\)")
-                .matcher(converted)
-                .replaceAll("$1");
+        String converted = replaceOutsideIgnoredText(
+                sql,
+                Pattern.compile("(?is)\\bDOUBLE\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)"),
+                matcher -> "DECIMAL(" + matcher.group(1) + ", " + matcher.group(2) + ")"
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\bFLOAT\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)"),
+                matcher -> "DECIMAL(" + matcher.group(1) + ", " + matcher.group(2) + ")"
+        );
+        converted = replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\b(?:TINYTEXT|MEDIUMTEXT|LONGTEXT|TEXT)\\b"),
+                matcher -> "CLOB"
+        );
+        return replaceOutsideIgnoredText(
+                converted,
+                Pattern.compile("(?is)\\b(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)\\s*\\(\\s*\\d+\\s*\\)"),
+                matcher -> matcher.group(1)
+        );
     }
 
     private String removeMysqlCreateTableInlineKeyDefinitions(String ddl) {
@@ -11544,12 +11687,24 @@ class SqlScriptMigrator {
                 + ")";
     }
 
+    private String convertMysqlDropIndexOnTable(String ddl) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*DROP\\s+INDEX\\s+(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s+"
+                        + "ON\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*$"
+        ).matcher(ddl);
+        if (!matcher.matches()) {
+            return ddl;
+        }
+        return "DROP INDEX " + dmSchemaScopedIndexName(matcher.group("table"), matcher.group("index"));
+    }
+
     private String normalizeCreateIndexForDm(String ddl) {
         Matcher matcher = Pattern.compile(
                 "(?is)^(?<prefix>CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+)"
                         + "(?<index>" + SQL_IDENTIFIER_TOKEN + ")(?<middle>\\s+ON\\s+)"
                         + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")"
-                        + "(?<open>\\s*\\()(?<columns>.*)(?<close>\\)\\s*)$"
+                        + "(?<open>\\s*\\()(?<columns>.*)(?<close>\\))"
+                        + "\\s*(?:USING\\s+BTREE\\s*)?$"
         ).matcher(ddl);
         if (!matcher.matches()) {
             return ddl;
