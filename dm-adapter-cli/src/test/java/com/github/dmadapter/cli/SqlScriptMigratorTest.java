@@ -4882,6 +4882,38 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void validationSkipsRepeatedSchemaSelectionForEmptyFiles() {
+        AtomicInteger schemaSelections = new AtomicInteger();
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")
+                    && String.valueOf(args[0]).startsWith("set schema")) {
+                schemaSelections.incrementAndGet();
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(
+                        plannedValidationFile("empty-one.sql", "sample-bill", List.of()),
+                        plannedValidationFile("empty-two.sql", "sample-bill", List.of())
+                ),
+                validationEnvironment()
+        );
+
+        assertThat(result.attempted()).isTrue();
+        assertThat(result.successCount()).isZero();
+        assertThat(result.failures()).isEmpty();
+        assertThat(result.fileValidations()).hasSize(2);
+        assertThat(schemaSelections)
+                .as("schema preflight should run once; empty files should not select it again")
+                .hasValue(1);
+    }
+
+    @Test
     void classifiesObjectDefinitionVersionFailuresAndReportsRecentDdl() {
         Statement statement = proxy(Statement.class, (ignored, method, args) -> {
             if (method.getName().equals("execute")) {
