@@ -2769,6 +2769,52 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlUpdateLimitWithoutOrderToDamengRowidSubquery() {
+        SqlConversionResult result = converter.convert("""
+                update sample_contract
+                set `delete_flag` = 1
+                where contract_id = #{contractId} and customer_id = #{customerId} limit 1
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                update sample_contract set `delete_flag` = 1 where ROWID in (select ROWID from sample_contract where (contract_id = #{contractId} and customer_id = #{customerId}) and ROWNUM <= 1)
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_UPDATE_LIMIT_RULE
+        );
+    }
+
+    @Test
+    void convertsMysqlDeleteLimitWithoutWhereToDamengRowidSubquery() {
+        SqlConversionResult result = converter.convert("DELETE FROM sample_event LIMIT 1000");
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(
+                "delete from sample_event where ROWID in "
+                        + "(select ROWID from sample_event where ROWNUM <= 1000)"
+        );
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_DELETE_LIMIT_RULE
+        );
+    }
+
+    @Test
+    void leavesAliasedOrOffsetDmlLimitForManualReview() {
+        SqlConversionResult aliasResult = converter.convert(
+                "update sample_event event_row set deleted = 1 where event_row.id = #{id} limit 1"
+        );
+        SqlConversionResult offsetResult = converter.convert(
+                "delete from sample_event limit 10, 100"
+        );
+
+        assertThat(aliasResult.manualReviewRequired()).isTrue();
+        assertThat(offsetResult.manualReviewRequired()).isTrue();
+    }
+
+    @Test
     void doesNotConvertUnsafeMysqlDeleteOrderLimitShapes() {
         SqlConversionResult aliasResult = converter.convert(
                 "delete from tenant_event_log e where e.tenant_id = #{tenantId} order by e.event_id desc limit 1"
@@ -3392,6 +3438,57 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsRuntimeSchemaColumnDetailsIncludingMysqlColumnType() {
+        SqlConversionResult result = converter.convert("""
+                SELECT
+                    COLUMN_NAME as columnName,
+                    DATA_TYPE as columnType,
+                    COLUMN_TYPE as columnLength,
+                    COLUMN_COMMENT as columnComment,
+                    COLUMN_DEFAULT as columnDefault
+                FROM information_schema.COLUMNS
+                WHERE table_schema = #{tableSchema}
+                  AND table_name = #{tableName}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("sc.NAME AS \"columnName\"")
+                .contains("sc.TYPE$ AS \"columnType\"")
+                .contains("END AS \"columnLength\"")
+                .contains("scc.COMMENT$ AS \"columnComment\"")
+                .contains("sc.DEFVAL AS \"columnDefault\"")
+                .contains("WHERE sch.NAME = UPPER(#{tableSchema})")
+                .contains("AND obj.NAME = UPPER(#{tableName})")
+                .contains("ORDER BY sc.COLID")
+                .doesNotContain("information_schema");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
+    }
+
+    @Test
+    void convertsCurrentSchemaColumnDetailsWithoutDefaultProjection() {
+        SqlConversionResult result = converter.convert("""
+                SELECT COLUMN_NAME as columnName,
+                       DATA_TYPE as columnType,
+                       COLUMN_TYPE as columnLength,
+                       COLUMN_COMMENT as columnComment
+                FROM information_schema.COLUMNS
+                WHERE table_schema = (SELECT DATABASE())
+                  AND table_name = #{tableName}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("WHERE sch.NAME = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .contains("AND obj.NAME = UPPER(#{tableName})")
+                .doesNotContain("sc.DEFVAL")
+                .doesNotContain("information_schema");
+    }
+
+    @Test
     void convertsMysqlColumnDescriptorMetadataForDifferentRuntimeSchemas() {
         for (String schema : List.of("tenant_alpha", "tenant_beta")) {
             SqlConversionResult result = converter.convert("""
@@ -3515,6 +3612,26 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
                 .isEqualTo("SELECT COUNT(*) AS table_exists FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+    }
+
+    @Test
+    void convertsMysqlBaseTableCountForCurrentRuntimeSchema() {
+        SqlConversionResult result = converter.convert("""
+                SELECT count(1)
+                FROM information_schema.TABLES
+                WHERE table_schema = (SELECT DATABASE())
+                  AND table_name = #{tableName}
+                  AND table_type = 'BASE TABLE'
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(
+                "SELECT COUNT(*) FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})"
+                        + " AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+        );
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }

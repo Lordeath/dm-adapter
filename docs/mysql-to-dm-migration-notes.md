@@ -33,7 +33,7 @@
 - 以 2026-06-30 对 `192.168.1.53:5236` 的验证结果为基准，dm-adapter 默认不再改写达梦 53 兼容模式已可执行的 MySQL 语法。只有验证失败、语义明显不同、或无法安全推断的 SQL 才进入自动改写或人工确认。
 - MySQL 反引号标识符在达梦 53 兼容模式下可执行，默认保留。只有目标库实例参数、大小写策略或旧版本达梦验证失败时，才考虑改为达梦双引号或统一对象名大小写。动态 `${column}`、`${table}` 仍必须依赖白名单参数或 `sql-rewrite.yml`。
 - MySQL 用双引号表示字符串的写法应改为单引号；达梦双引号表示标识符。转换时必须区分字符串常量、对象名、动态 `${}` 片段，不能把未知业务字符串转成对象名。
-- MySQL 查询分页 `LIMIT offset,size`、`LIMIT size` 在达梦 53 兼容模式下可执行，默认保留。`UPDATE`/`DELETE` 等非查询 DML 上的 `LIMIT` 仍要人工确认；当前仅对已识别的 `UPDATE ... ORDER BY ... LIMIT 1` 做等价改写。
+- MySQL 查询分页 `LIMIT offset,size`、`LIMIT size` 在达梦 53 兼容模式下可执行，默认保留。简单单表 `UPDATE`/`DELETE` 的无排序 `LIMIT row_count` 可把候选行限制改写为 `ROWID` 子查询和 `ROWNUM <= row_count`，保留 MySQL 未指定顺序时“任取不超过 N 行”的语义；带 `ORDER BY ... LIMIT 1` 的形态必须把排序保留在内层候选查询。含表别名、多表目标、offset 或无法解析计数的 DML 仍要人工确认。
 - MySQL `LIKE #{name} '%'`、`LIKE '%' #{name}` 这类参数与字符串字面量相邻拼接在达梦 53 仍会失败，应改为 `#{name} || '%'` 形式。`#{}` 参数可以安全拼接，`${}` 动态片段必须保守处理。
 - `CONCAT`、`CONCAT_WS`、`IFNULL`、`IF`、`ISNULL`、`FIND_IN_SET`、`DATE_FORMAT`、`STR_TO_DATE`、`SUBSTRING_INDEX`、两参数 `DATEDIFF`、`UNIX_TIMESTAMP`、`FROM_UNIXTIME`、`TIMESTAMPDIFF`、常见 `JSON_*` 函数在达梦 53 验证可执行，默认保留 MySQL 函数形态。
 - MySQL 可在查询列中用 `(列 IS [NOT] NULL) AS 标志` 直接返回 0/1，达梦不接受这种布尔投影；工具应转换为 `CASE WHEN 列 IS [NOT] NULL THEN 1 ELSE 0 END AS 标志`，且不能改写 `WHERE` 中本来合法的空值判断。
@@ -51,7 +51,7 @@
 - 同一列定义出现两个或更多 `DEFAULT` 子句时，原始 MySQL DDL 本身存在互相冲突的默认值，工具不能替业务选择保留哪一个。数据库验证应将其归为 `ORIGINAL_SQL`，保留转换结果并要求修正源脚本，不能误报为待补充的达梦转换规则。
 - MySQL `AUTO_INCREMENT` 和 `ALTER TABLE t AUTO_INCREMENT = n` 默认不再为了验证而改写。目标环境如果不支持或业务依赖重置序列语义，应按达梦身份列/序列方案人工确认，不能把 `AUTO_INCREMENT = n` 删除后留下半截 `ALTER TABLE`。
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
-- MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。
+- MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。业务代码同时读取 `COLUMN_TYPE`、注释和默认值时，可从 `SYS.SYSCOLUMNS`、`SYS.SYSOBJECTS`、`SYS.SYSCOLUMNCOMMENTS` 按运行时 schema 和表名重建相同投影；不得把某个项目的 schema 固化到转换规则。
 - `AES_ENCRYPT`、`AES_DECRYPT`、`MD5`、`TO_BASE64` 等加密/编码函数要逐项确认。当前不再把 Base64 包裹 AES 密码场景改写为达梦 `SF_*` 函数，优先通过系统库兼容函数保持 MySQL 调用形态，避免修改业务 SQL。
 - MySQL 除法在分母为 0 时的容错和达梦参数相关。业务 SQL 如直接 `a / b`，应优先改为 `a / NULLIF(b, 0)` 或 `CASE WHEN b = 0 THEN ...`，不要依赖实例容错。
 - MySQL 中常见 `SUM(varchar_col)` 依赖隐式转换，达梦可能报类型转换失败。应优先修业务 SQL，显式 `CAST` 且清洗非数字数据。
