@@ -8598,7 +8598,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 }
                 converted.append(qualifiedIdentifier("t", assignment.column()))
                         .append(" = ")
-                        .append(qualifiedIdentifier("s", assignment.sourceColumn()));
+                        .append(assignment.valuesReference()
+                                ? "s." + dmIdentifier(assignment.sourceExpression())
+                                : assignment.sourceExpression());
             }
             converted.append("\n");
         }
@@ -8784,19 +8786,45 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
 
-        FunctionCall valuesCall = readOnlyFunctionCall(assignment.substring(equalsIndex + 1).trim(), "VALUES");
-        if (valuesCall == null) {
+        String source = assignment.substring(equalsIndex + 1).trim();
+        FunctionCall valuesCall = readOnlyFunctionCall(source, "VALUES");
+        if (valuesCall != null) {
+            List<TopLevelArgument> valuesArguments = splitTopLevelArguments(valuesCall.body());
+            if (valuesArguments.size() != 1) {
+                return null;
+            }
+            IdentifierName sourceColumn = readIdentifierName(valuesArguments.get(0).text(), false);
+            if (sourceColumn == null || !sourceColumn.key().equals(targetColumn.key())) {
+                return null;
+            }
+            return new UpdateAssignment(targetColumn, sourceColumn.text(), true);
+        }
+
+        if (source.matches(
+                "(?is)NULL|[-+]?\\d+(?:\\.\\d+)?|N?'(?:''|[^'])*'|"
+                        + "NOW\\s*\\(\\s*\\)|CURRENT_TIMESTAMP(?:\\s*\\(\\s*\\))?"
+        )) {
+            return new UpdateAssignment(targetColumn, source, false);
+        }
+
+        Matcher selfArithmetic = Pattern.compile(
+                "(?is)^(?<column>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*"
+                        + "(?<operator>[+-])\\s*(?<amount>\\d+(?:\\.\\d+)?)$"
+        ).matcher(source);
+        if (!selfArithmetic.matches()) {
             return null;
         }
-        List<TopLevelArgument> valuesArguments = splitTopLevelArguments(valuesCall.body());
-        if (valuesArguments.size() != 1) {
-            return null;
-        }
-        IdentifierName sourceColumn = readIdentifierName(valuesArguments.get(0).text(), false);
+        IdentifierName sourceColumn = readIdentifierName(selfArithmetic.group("column"), false);
         if (sourceColumn == null || !sourceColumn.key().equals(targetColumn.key())) {
             return null;
         }
-        return new UpdateAssignment(targetColumn, sourceColumn);
+        return new UpdateAssignment(
+                targetColumn,
+                "t." + dmIdentifier(sourceColumn.text())
+                        + " " + selfArithmetic.group("operator")
+                        + " " + selfArithmetic.group("amount"),
+                false
+        );
     }
 
     private IdentifierName readIdentifierName(String expression, boolean allowQualifier) {
@@ -10924,6 +10952,24 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         while (start > 0 && isIdentifierPart(sql.charAt(start - 1))) {
             start--;
         }
+        String candidate = sql.substring(start, end).toUpperCase(Locale.ROOT);
+        if (Set.of(
+                "AND",
+                "AS",
+                "BY",
+                "ELSE",
+                "IN",
+                "NOT",
+                "ON",
+                "OR",
+                "RETURN",
+                "SELECT",
+                "THEN",
+                "WHEN",
+                "WHERE"
+        ).contains(candidate)) {
+            return openParenIndex;
+        }
         return start;
     }
 
@@ -11205,7 +11251,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private record InsertColumn(IdentifierName name, String value) {
     }
 
-    private record UpdateAssignment(IdentifierName column, IdentifierName sourceColumn) {
+    private record UpdateAssignment(
+            IdentifierName column,
+            String sourceExpression,
+            boolean valuesReference
+    ) {
     }
 
     private record InsertValues(

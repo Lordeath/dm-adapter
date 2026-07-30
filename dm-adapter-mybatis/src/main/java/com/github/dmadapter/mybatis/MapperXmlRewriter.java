@@ -6102,6 +6102,27 @@ public class MapperXmlRewriter {
                 continue;
             }
 
+            Matcher selfArithmeticMatcher = Pattern.compile(
+                    "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*"
+                            + "(?<source>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*"
+                            + "(?<operator>[+-])\\s*(?<amount>\\d+(?:\\.\\d+)?)\\s*$"
+            ).matcher(assignment);
+            if (selfArithmeticMatcher.matches()) {
+                String target = selfArithmeticMatcher.group("target");
+                String source = selfArithmeticMatcher.group("source");
+                if (!normalizeIdentifier(target).equals(normalizeIdentifier(source))) {
+                    return null;
+                }
+                assignments.add(new BatchUpdateAssignment(
+                        target,
+                        "t." + dmIdentifier(source)
+                                + " " + selfArithmeticMatcher.group("operator")
+                                + " " + selfArithmeticMatcher.group("amount"),
+                        false
+                ));
+                continue;
+            }
+
             Matcher selfAssignmentMatcher = Pattern.compile(
                     "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*(?<source>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*$"
             ).matcher(assignment);

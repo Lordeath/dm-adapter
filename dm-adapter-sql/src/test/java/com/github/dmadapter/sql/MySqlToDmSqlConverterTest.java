@@ -279,6 +279,8 @@ class MySqlToDmSqlConverterTest {
         SqlConversionResult result = converter.convert("""
                 SELECT DAY(end_time) / DAY(LAST_DAY(end_time)) AS month_ratio,
                        (paid_amount - IFNULL(delay_amount, 0)) / (1 + IFNULL(tax_rate, 0)) AS net_amount,
+                       CASE WHEN quarter_no = 1 THEN (month_01 + month_02 + month_03) / 3
+                            ELSE 0 END AS quarter_average,
                        SUM(CASE WHEN active = 1 THEN paid_amount ELSE 0 END) / 10000 AS ten_thousands
                 FROM sample_payment
                 """);
@@ -291,6 +293,10 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).contains(
                 "CAST((paid_amount - IFNULL(delay_amount, 0)) AS DECIMAL(38,10)) / "
                         + "NULLIF(CAST((1 + IFNULL(tax_rate, 0)) AS DECIMAL(38,10)), 0)"
+        );
+        assertThat(result.convertedSql()).contains(
+                "THEN CAST((month_01 + month_02 + month_03) AS DECIMAL(38,10)) / "
+                        + "NULLIF(CAST(3 AS DECIMAL(38,10)), 0)"
         );
         assertThat(result.convertedSql()).contains(
                 "CAST(SUM(CASE WHEN active = 1 THEN paid_amount ELSE 0 END) AS DECIMAL(38,10)) / "
@@ -3241,6 +3247,33 @@ class MySqlToDmSqlConverterTest {
                 )
                 .doesNotContain("AS 'state'")
                 .doesNotContain("s.'state'");
+    }
+
+    @Test
+    void convertsOnDuplicateKeyUpdateWithSelfIncrementAndTimestamp() {
+        SqlConversionResult result = converter.convert("""
+                INSERT INTO sample_reminder (
+                    house_id, customer_id, remind_month, remind_count, update_time
+                )
+                VALUES (
+                    #{houseId}, #{customerId}, #{remindMonth}, 1, NOW()
+                )
+                ON DUPLICATE KEY UPDATE
+                    remind_count = remind_count + 1,
+                    update_time = NOW()
+                """, List.of("house_id", "customer_id", "remind_month"));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).contains(
+                "ON (t.house_id = s.house_id AND t.customer_id = s.customer_id "
+                        + "AND t.remind_month = s.remind_month)",
+                "WHEN MATCHED THEN UPDATE SET t.remind_count = t.remind_count + 1, "
+                        + "t.update_time = NOW()",
+                "WHEN NOT MATCHED THEN INSERT"
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
     }
 
     @Test
