@@ -14,7 +14,8 @@ public record SqlRewriteConfig(
         Set<String> ignoredMissingColumns,
         Set<String> ignoredMissingSchemas,
         Set<String> identityInsertTables,
-        Map<String, String> upsertKeyResolutions
+        Map<String, String> upsertKeyResolutions,
+        Map<String, List<List<String>>> methodConflictKeyGroups
 ) {
     public static final String ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY =
             "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
@@ -22,6 +23,27 @@ public record SqlRewriteConfig(
             "KEY_METADATA_UNAVAILABLE";
     public static final String MANUAL_KEY_COLUMNS_REQUIRED =
             "MANUAL_KEY_COLUMNS_REQUIRED";
+
+    public SqlRewriteConfig(
+            Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Set<String> ignoredMissingTables,
+            Set<String> ignoredMissingColumns,
+            Set<String> ignoredMissingSchemas,
+            Set<String> identityInsertTables,
+            Map<String, String> upsertKeyResolutions
+    ) {
+        this(
+                tableKeyColumns,
+                methodKeyColumns,
+                ignoredMissingTables,
+                ignoredMissingColumns,
+                ignoredMissingSchemas,
+                identityInsertTables,
+                upsertKeyResolutions,
+                Map.of()
+        );
+    }
 
     public SqlRewriteConfig(
             Map<String, List<String>> tableKeyColumns,
@@ -81,10 +103,11 @@ public record SqlRewriteConfig(
         ignoredMissingSchemas = normalizeSchemas(ignoredMissingSchemas);
         identityInsertTables = normalizeTables(identityInsertTables);
         upsertKeyResolutions = normalizeMethodResolutions(upsertKeyResolutions);
+        methodConflictKeyGroups = normalizeMethodConflictKeyGroups(methodConflictKeyGroups);
     }
 
     public static SqlRewriteConfig empty() {
-        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), Set.of(), Map.of());
+        return new SqlRewriteConfig(Map.of(), Map.of(), Set.of(), Set.of(), Set.of(), Set.of(), Map.of(), Map.of());
     }
 
     public boolean isEmpty() {
@@ -94,7 +117,8 @@ public record SqlRewriteConfig(
                 && ignoredMissingColumns.isEmpty()
                 && ignoredMissingSchemas.isEmpty()
                 && identityInsertTables.isEmpty()
-                && upsertKeyResolutions.isEmpty();
+                && upsertKeyResolutions.isEmpty()
+                && methodConflictKeyGroups.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {
@@ -112,6 +136,13 @@ public record SqlRewriteConfig(
 
     public List<String> methodKeyColumns(String methodKey) {
         return methodKeyColumns.getOrDefault(methodKey, List.of());
+    }
+
+    public List<List<String>> conflictKeyGroupsFor(String methodKey) {
+        if (methodKey == null || methodKey.isBlank()) {
+            return List.of();
+        }
+        return methodConflictKeyGroups.getOrDefault(methodKey.trim(), List.of());
     }
 
     public boolean requiresIdentityInsert(String tableName) {
@@ -212,6 +243,28 @@ public record SqlRewriteConfig(
                     && resolution != null
                     && !resolution.isBlank()) {
                 normalized.put(method.trim(), resolution.trim());
+            }
+        });
+        return Map.copyOf(normalized);
+    }
+
+    private static Map<String, List<List<String>>> normalizeMethodConflictKeyGroups(
+            Map<String, List<List<String>>> groupsByMethod
+    ) {
+        if (groupsByMethod == null || groupsByMethod.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, List<List<String>>> normalized = new LinkedHashMap<>();
+        groupsByMethod.forEach((method, groups) -> {
+            if (method == null || method.isBlank() || groups == null || groups.isEmpty()) {
+                return;
+            }
+            List<List<String>> cleanGroups = groups.stream()
+                    .map(SqlRewriteConfig::cleanColumns)
+                    .filter(group -> !group.isEmpty())
+                    .toList();
+            if (!cleanGroups.isEmpty()) {
+                normalized.put(method.trim(), List.copyOf(cleanGroups));
             }
         });
         return Map.copyOf(normalized);

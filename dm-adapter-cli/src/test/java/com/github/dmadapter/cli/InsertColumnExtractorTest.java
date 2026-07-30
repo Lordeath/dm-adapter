@@ -6,6 +6,22 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class InsertColumnExtractorTest {
     @Test
+    void extractsColumnsWhenInsertTableIsBacktickQuoted() {
+        String sql = """
+                INSERT ignore INTO `sample_table_config` (
+                    `job_id`, `logical_table_name`, `version`, `table_name`
+                )
+                VALUES (#{jobId}, #{logicalTableName}, #{version}, #{tableName})
+                """;
+
+        String tableName = InsertColumnExtractor.tableName(sql);
+
+        assertThat(tableName).isEqualTo("sample_table_config");
+        assertThat(InsertColumnExtractor.columns(sql, tableName))
+                .containsExactly("job_id", "logical_table_name", "version", "table_name");
+    }
+
+    @Test
     void extractsColumnsFromDynamicTrimInsertIgnore() {
         String sql = """
                 insert ignore into charge_customerchargedetail_ext

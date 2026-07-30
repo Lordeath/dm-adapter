@@ -486,6 +486,13 @@ public class MapperXmlRewriter {
             }
             SqlConversionResult conversionResult;
             if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                    && containsMysqlInsertIgnore(commentSafeSql)
+                    && !rewriteConfig.conflictKeyGroupsFor(statementKey).isEmpty()) {
+                conversionResult = mySqlToDmSqlConverter.convertInsertIgnoreWithConflictKeyGroups(
+                        commentSafeSql,
+                        rewriteConfig.conflictKeyGroupsFor(statementKey)
+                );
+            } else if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
                     && containsOuterUpdateJoin(commentSafeSql)) {
                 conversionResult = mySqlToDmSqlConverter.convertOuterJoinWithUniqueSourceKeys(
                         commentSafeSql,
@@ -8334,10 +8341,20 @@ public class MapperXmlRewriter {
                 rewriteConfig
         );
         SqlConversionResult conversionResult =
-                sqlConverter.convert(
-                        plainInsert.text(),
-                        rewriteConfig.keyColumnsFor(statementKey, extractInsertTableName(plainInsert.text()))
-                );
+                sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                        && containsMysqlInsertIgnore(plainInsert.text())
+                        && !rewriteConfig.conflictKeyGroupsFor(statementKey).isEmpty()
+                        ? mySqlToDmSqlConverter.convertInsertIgnoreWithConflictKeyGroups(
+                                plainInsert.text(),
+                                rewriteConfig.conflictKeyGroupsFor(statementKey)
+                        )
+                        : sqlConverter.convert(
+                                plainInsert.text(),
+                                rewriteConfig.keyColumnsFor(
+                                        statementKey,
+                                        extractInsertTableName(plainInsert.text())
+                                )
+                        );
         List<String> manualReviewReasons = conversionResult.manualReviewRequired()
                 ? List.of(rewriteConfig.resolveUpsertManualReviewReason(
                         statementKey,

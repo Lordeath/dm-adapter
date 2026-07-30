@@ -409,4 +409,49 @@ class SqlRewriteConfigUpdaterTest {
                 .contains("\"com.example.BankFileMapper.insertIgnore\": "
                         + "\"INSERT_IGNORE_AS_PLAIN_INSERT\"");
     }
+
+    @Test
+    void persistsAllReachableUniqueKeysForInsertIgnore() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.JobMapper.insert",
+                "sample_job_config",
+                List.of("logical_name", "version_no", "job_name"),
+                RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("sample_job_config", List.of(
+                new TableConstraint(
+                        "UK_LOGICAL_VERSION",
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        List.of("logical_name", "version_no")
+                ),
+                new TableConstraint(
+                        "UK_JOB_NAME",
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        List.of("job_name")
+                )
+        ));
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                SqlRewriteConfig.empty(),
+                List.of(candidate),
+                Map.of("sample_job_config", metadata),
+                true
+        );
+
+        assertThat(update.rewriteConfig().conflictKeyGroupsFor(candidate.methodKey()))
+                .containsExactly(
+                        List.of("logical_name", "version_no"),
+                        List.of("job_name")
+                );
+        assertThat(update.warnings()).anySatisfy(warning ->
+                assertThat(warning).contains("conflictKeyGroups", candidate.methodKey()));
+        assertThat(Files.readString(config))
+                .contains("keyColumns: []")
+                .contains("conflictKeyGroups: "
+                        + "[[\"logical_name\", \"version_no\"], [\"job_name\"]]")
+                .doesNotContain("MANUAL_KEY_COLUMNS_REQUIRED");
+    }
 }

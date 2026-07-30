@@ -73,6 +73,12 @@ final class UpsertKeyInference {
             ));
         }
         if (usableUniqueKeys.size() > 1) {
+            if (candidate.insertIgnore()) {
+                return Optional.of(InferenceResult.multipleConflictKeys(
+                        usableUniqueKeys.stream().map(TableConstraint::columns).toList(),
+                        "unique keys " + describe(usableUniqueKeys)
+                ));
+            }
             return Optional.of(InferenceResult.unresolved(
                     RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED,
                     "Multiple unique keys matched INSERT columns for table "
@@ -159,17 +165,40 @@ final class UpsertKeyInference {
     record InferenceResult(
             boolean inferred,
             List<String> keyColumns,
+            List<List<String>> conflictKeyGroups,
             String source,
             String resolutionCode,
             String reason
     ) {
         static InferenceResult inferred(List<String> keyColumns, String source) {
-            return new InferenceResult(true, keyColumns, source == null ? "" : source, "", "");
+            return new InferenceResult(
+                    true,
+                    keyColumns,
+                    List.of(),
+                    source == null ? "" : source,
+                    "",
+                    ""
+            );
+        }
+
+        static InferenceResult multipleConflictKeys(
+                List<List<String>> conflictKeyGroups,
+                String source
+        ) {
+            return new InferenceResult(
+                    false,
+                    List.of(),
+                    conflictKeyGroups,
+                    source == null ? "" : source,
+                    "",
+                    ""
+            );
         }
 
         static InferenceResult unresolved(String resolutionCode, String reason) {
             return new InferenceResult(
                     false,
+                    List.of(),
                     List.of(),
                     "",
                     resolutionCode == null ? "" : resolutionCode,
@@ -179,6 +208,15 @@ final class UpsertKeyInference {
 
         InferenceResult {
             keyColumns = List.copyOf(keyColumns == null ? List.of() : keyColumns);
+            conflictKeyGroups = List.copyOf(
+                    (conflictKeyGroups == null ? List.<List<String>>of() : conflictKeyGroups).stream()
+                            .map(group -> List.copyOf(group == null ? List.of() : group))
+                            .toList()
+            );
+        }
+
+        boolean hasMultipleConflictKeys() {
+            return !conflictKeyGroups.isEmpty();
         }
     }
 }

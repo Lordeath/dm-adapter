@@ -932,6 +932,69 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesInsertIgnoreSelectWithMultipleConflictKeyGroups() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.JobMapper">
+                    <insert id="insert">
+                        insert ignore into sample_job_config(
+                            logical_name, version_no, job_name, main_class
+                        )
+                        select #{logicalName}, #{version}, #{jobName}, #{mainClass};
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/JobMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/JobMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Set.of(),
+                        Map.of(),
+                        Map.of(
+                                "com.example.JobMapper.insert",
+                                List.of(
+                                        List.of("logical_name", "version_no"),
+                                        List.of("job_name")
+                                )
+                        )
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/JobMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO sample_job_config t")
+                .contains("(t.logical_name = s.logical_name"
+                        + " AND t.version_no = s.version_no)"
+                        + " OR (t.job_name = s.job_name)")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContainIgnoringCase("insert ignore")
+                .doesNotContain("WHEN MATCHED");
+        assertThat(result.manualReviewItems()).isEmpty();
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE));
+    }
+
+    @Test
     void migrationRewritesBatchOnDuplicateKeySelfAssignmentToInsertOnlyMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

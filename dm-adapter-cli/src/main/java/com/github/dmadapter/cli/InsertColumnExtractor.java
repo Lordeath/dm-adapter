@@ -25,10 +25,16 @@ final class InsertColumnExtractor {
         }
         Matcher matcher = Pattern.compile(
                 "(?is)\\binsert\\s+(?:ignore\\s+)?into\\s+"
-                        + Pattern.quote(tableName)
-                        + "\\s*(?<tail>[\\s\\S]*)"
+                        + "(?<table>[^\\s(<]+)\\s*(?<tail>[\\s\\S]*)"
         ).matcher(sql);
         if (!matcher.find()) {
+            return List.of();
+        }
+        String parsedTableName = matcher.group("table")
+                .replace("`", "")
+                .replace("\"", "")
+                .trim();
+        if (!parsedTableName.equalsIgnoreCase(tableName)) {
             return List.of();
         }
         String tail = matcher.group("tail");
