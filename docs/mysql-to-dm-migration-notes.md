@@ -116,6 +116,7 @@
    - 外部存储过程依赖：联网验证以过程编译结果和 `ALL_OBJECTS.STATUS` 为准；离线报告中的汇总警告不等同于失败。
    - `VALIDATION_TIMEOUT`：属于验证运行环境/执行时限问题，不是 SQL 兼容失败。SQL 脚本单条语句达到 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS` 后，工具必须主动取消并停止本轮脚本验证；不能只依赖可能被驱动忽略的 JDBC `setQueryTimeout`，也不能继续复用仍有语句运行的连接。
    - SQL 脚本单条语句默认硬超时为 600 秒。真实全量脚本中同一合法数据同步过程的耗时会随测试库数据量从约 187 秒增长到超过 300 秒；项目确有更长过程时应显式配置 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS`，不能把合法慢过程误分为 SQL 兼容失败。
+   - MyBatis mapper 验证同样不能只依赖驱动实现 `setQueryTimeout`。单条 mapper 达到 `dm.sql.validation.statementTimeoutSeconds`（默认 120 秒）后，生成的验证程序必须记录数据库语句超时、主动中止当前连接并结束本轮 mapper 验证；不得继续复用可能仍在执行 SQL 的连接。
    - Mapper 单条语句默认 JDBC 超时为 120 秒，可用 `dm.sql.validation.statementTimeoutSeconds` 覆盖。真实查询在 30 秒默认值下可能被误判为运行时超时；放宽后仍超时的项再按锁等待、数据库负载或执行计划问题分类。
 4. 每次 dm-adapter 代码变更后执行 `mvn test`，通过后提交并推送 `main`。
 5. 同步 Windows 镜像后先执行 Windows Maven `clean install`，再用 Windows CLI 对业务项目回归验证。同步保留源文件时间戳且目标目录残留旧 `target/` 时，单独执行 `install` 可能把旧 class 误判为最新，产生“部分模块用了新代码、部分模块仍是旧代码”的假回归结果。

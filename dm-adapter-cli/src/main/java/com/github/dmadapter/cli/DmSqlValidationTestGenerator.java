@@ -716,6 +716,14 @@ class DmSqlValidationTestGenerator {
             import java.util.Properties;
             import java.util.Set;
             import java.util.UUID;
+            import java.util.concurrent.ExecutionException;
+            import java.util.concurrent.ExecutorService;
+            import java.util.concurrent.Executors;
+            import java.util.concurrent.Future;
+            import java.util.concurrent.TimeUnit;
+            import java.util.concurrent.TimeoutException;
+            import java.util.concurrent.atomic.AtomicBoolean;
+            import java.util.concurrent.atomic.AtomicReference;
             import java.util.regex.Matcher;
             import java.util.regex.Pattern;
             import java.util.stream.Collectors;
@@ -771,6 +779,11 @@ class DmSqlValidationTestGenerator {
                 private ValidationConfig currentConfig = new ValidationConfig();
                 private DbColumnMetadata dbColumnMetadata = DbColumnMetadata.empty();
                 private ActualParameterTypeIndex actualParameterTypeIndex = ActualParameterTypeIndex.empty();
+                private final ExecutorService mapperValidationExecutor = Executors.newSingleThreadExecutor(task -> {
+                    Thread thread = new Thread(task, "dm-mapper-validation");
+                    thread.setDaemon(true);
+                    return thread;
+                });
 
                 @SafeVarargs
                 private static <T> List<T> listOf(T... values) {
@@ -897,6 +910,7 @@ class DmSqlValidationTestGenerator {
                                 log("Actual parameter type inference: " + actualParameterTypeIndex.summary());
                                 int index = 0;
                                 int total = mapperMethods.size();
+                                mapperLoop:
                                 for (MapperMethod mapperMethod : mapperMethods) {
                                     index++;
                                     if (config.excludes(mapperMethod.key())) {
@@ -954,7 +968,12 @@ class DmSqlValidationTestGenerator {
                                         log("RUN [" + index + "/" + total + "] " + recordKey
                                                 + " params=" + parameters.source);
                                         long startedAt = System.currentTimeMillis();
-                                        ValidationRecord record = invokeMapperMethod(sqlSessionFactory, mapperMethod, parameters, config);
+                                        ValidationRecord record = invokeMapperMethodWithinTimeout(
+                                                sqlSessionFactory,
+                                                mapperMethod,
+                                                parameters,
+                                                config
+                                        );
                                         record = skipMissingDynamicIdentifier(record);
                                         record = skipMissingDynamicSqlFragment(record);
                                         record = skipGeneratedDynamicSqlOrArgs(record);
@@ -967,6 +986,11 @@ class DmSqlValidationTestGenerator {
                                         records.add(record);
                                         logProgress(index, total, record, System.currentTimeMillis() - startedAt);
                                         checkpointReports(adapterDir, records, usageFilterReport);
+                                        if (isMapperStatementTimeoutRecord(record)) {
+                                            log("Stopping mapper validation after hard statement timeout; "
+                                                    + "the current connection will not be reused.");
+                                            break mapperLoop;
+                                        }
                                     }
                                 }
                                 }
@@ -978,6 +1002,7 @@ class DmSqlValidationTestGenerator {
                         log("FAILED bootstrap: " + record.message);
                     }
 
+                    mapperValidationExecutor.shutdownNow();
                     log("Writing reports...");
                     writeReports(adapterDir, records, usageFilterReport, "COMPLETE");
                     log("Finished. Passed: " + count(records, "PASSED")
@@ -3382,14 +3407,18 @@ class DmSqlValidationTestGenerator {
                         SqlSessionFactory sqlSessionFactory,
                         MapperMethod mapperMethod,
                         ParameterResolution parameters,
-                        ValidationConfig config
+                        ValidationConfig config,
+                        AtomicReference<Connection> activeConnection,
+                        AtomicBoolean timedOut
                 ) {
                     List<String> schemas = validationSchemas(config);
                     ValidationRecord primaryRecord = invokeMapperMethodWithSchema(
                             sqlSessionFactory,
                             mapperMethod,
                             parameters,
-                            schemas.get(0)
+                            schemas.get(0),
+                            activeConnection,
+                            timedOut
                     );
                     if (schemas.size() == 1
                             || "PASSED".equals(primaryRecord.status)
@@ -3401,10 +3430,20 @@ class DmSqlValidationTestGenerator {
                     ValidationRecord firstNonSchemaObjectFailure = null;
                     SchemaAttempt firstNonSchemaObjectAttempt = null;
                     for (int i = 1; i < schemas.size(); i++) {
+                        if (timedOut.get() || Thread.currentThread().isInterrupted()) {
+                            return mapperStatementTimeoutRecord(mapperMethod, parameters);
+                        }
                         String schema = schemas.get(i);
                         log("SCHEMA FALLBACK " + parameters.recordKey(mapperMethod.key())
                                 + " schema=" + schemaLabel(schema));
-                        ValidationRecord record = invokeMapperMethodWithSchema(sqlSessionFactory, mapperMethod, parameters, schema);
+                        ValidationRecord record = invokeMapperMethodWithSchema(
+                                sqlSessionFactory,
+                                mapperMethod,
+                                parameters,
+                                schema,
+                                activeConnection,
+                                timedOut
+                        );
                         SchemaAttempt attempt = new SchemaAttempt(schema, record);
                         attempts.add(attempt);
                         if ("PASSED".equals(record.status)) {
@@ -3464,11 +3503,21 @@ class DmSqlValidationTestGenerator {
                         SqlSessionFactory sqlSessionFactory,
                         MapperMethod mapperMethod,
                         ParameterResolution parameters,
-                        String schema
+                        String schema,
+                        AtomicReference<Connection> activeConnection,
+                        AtomicBoolean timedOut
                 ) {
+                    if (timedOut.get() || Thread.currentThread().isInterrupted()) {
+                        return mapperStatementTimeoutRecord(mapperMethod, parameters);
+                    }
                     try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
+                        Connection connection = sqlSession.getConnection();
+                        activeConnection.set(connection);
                         try {
-                            applySchema(sqlSession.getConnection(), schema);
+                            if (timedOut.get() || Thread.currentThread().isInterrupted()) {
+                                return mapperStatementTimeoutRecord(mapperMethod, parameters);
+                            }
+                            applySchema(connection, schema);
                             Object result = invokeMappedStatement(
                                     sqlSession,
                                     mapperMethod,
@@ -3548,6 +3597,8 @@ class DmSqlValidationTestGenerator {
                                     summary,
                                     parameters
                             );
+                        } finally {
+                            activeConnection.compareAndSet(connection, null);
                         }
                     } catch (Throwable e) {
                         String summary = throwableSummary(e);
@@ -3572,6 +3623,97 @@ class DmSqlValidationTestGenerator {
                                 parameters
                         );
                     }
+                }
+
+                private ValidationRecord invokeMapperMethodWithinTimeout(
+                        SqlSessionFactory sqlSessionFactory,
+                        MapperMethod mapperMethod,
+                        ParameterResolution parameters,
+                        ValidationConfig config
+                ) {
+                    AtomicReference<Connection> activeConnection = new AtomicReference<>();
+                    AtomicBoolean timedOut = new AtomicBoolean(false);
+                    Future<ValidationRecord> future = mapperValidationExecutor.submit(
+                            () -> invokeMapperMethod(
+                                    sqlSessionFactory,
+                                    mapperMethod,
+                                    parameters,
+                                    config,
+                                    activeConnection,
+                                    timedOut
+                            )
+                    );
+                    try {
+                        return future.get(MAPPER_STATEMENT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    } catch (TimeoutException e) {
+                        timedOut.set(true);
+                        future.cancel(true);
+                        abortConnectionAfterTimeout(activeConnection.getAndSet(null));
+                        return mapperStatementTimeoutRecord(mapperMethod, parameters);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        timedOut.set(true);
+                        future.cancel(true);
+                        abortConnectionAfterTimeout(activeConnection.getAndSet(null));
+                        return ValidationRecord.failed(
+                                parameters.recordKey(mapperMethod.key()),
+                                parameters.source,
+                                parametersSummary(parameters),
+                                "Mapper validation interrupted while waiting for statement completion.",
+                                parameters
+                        );
+                    } catch (ExecutionException e) {
+                        return ValidationRecord.failed(
+                                parameters.recordKey(mapperMethod.key()),
+                                parameters.source,
+                                parametersSummary(parameters),
+                                throwableSummary(e.getCause()),
+                                parameters
+                        );
+                    }
+                }
+
+                private ValidationRecord mapperStatementTimeoutRecord(
+                        MapperMethod mapperMethod,
+                        ParameterResolution parameters
+                ) {
+                    return ValidationRecord.failed(
+                            parameters.recordKey(mapperMethod.key()),
+                            parameters.source,
+                            parametersSummary(parameters),
+                            "Mapper statement timeout: exceeded hard limit of "
+                                    + MAPPER_STATEMENT_TIMEOUT_SECONDS
+                                    + " second(s). Validation stopped without reusing the active connection.",
+                            parameters
+                    );
+                }
+
+                private boolean isMapperStatementTimeoutRecord(ValidationRecord record) {
+                    return record != null
+                            && "FAILED".equals(record.status)
+                            && normalizeMessage(record.message)
+                                    .toLowerCase(Locale.ROOT)
+                                    .contains("mapper statement timeout:");
+                }
+
+                private void abortConnectionAfterTimeout(Connection connection) {
+                    if (connection == null) {
+                        return;
+                    }
+                    Thread closer = new Thread(() -> {
+                        try {
+                            connection.abort(Runnable::run);
+                        } catch (Throwable ignored) {
+                            // Some JDBC drivers do not implement abort.
+                        }
+                        try {
+                            connection.close();
+                        } catch (Throwable ignored) {
+                            // The validation process is stopping and must not wait for driver cleanup.
+                        }
+                    }, "dm-mapper-timeout-connection-abort");
+                    closer.setDaemon(true);
+                    closer.start();
                 }
 
                 private boolean isEmptyDynamicSqlFailure(String message) {
