@@ -634,8 +634,8 @@ class DmAdapterCliTest {
                 .contains("package com.example;")
                 .contains("public class DmSqlValidationTest")
                 .contains("public static void main(String[] args) throws Exception")
-                .contains("@Tag(\"dm-sql-validation\")")
-                .contains("@EnabledIfEnvironmentVariable")
+                .contains("private static void fail(String message)")
+                .doesNotContain("org.junit")
                 .contains("SqlSessionFactory")
                 .contains("PooledDataSource")
                 .contains("setPoolMaximumActiveConnections(1)")
@@ -1625,7 +1625,8 @@ class DmAdapterCliTest {
                 .doesNotContain("schema: \"custom\"");
         assertThat(Files.readString(test))
                 .contains("package com.example;")
-                .contains("@Tag(\"dm-sql-validation\")")
+                .contains("public static void main(String[] args) throws Exception")
+                .doesNotContain("org.junit")
                 .doesNotContain("stale generated test");
     }
 

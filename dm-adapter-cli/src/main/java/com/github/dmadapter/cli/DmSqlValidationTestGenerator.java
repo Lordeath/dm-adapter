@@ -76,7 +76,7 @@ class DmSqlValidationTestGenerator {
         writeGeneratedFile(
                 testTarget.path(),
                 javaTestSource(testTarget.packageName()),
-                "Generate Dameng SQL validation JUnit test",
+                "Generate framework-independent Dameng SQL validation runner",
                 fileChanges,
                 true
         );
@@ -656,9 +656,6 @@ class DmSqlValidationTestGenerator {
             import org.apache.ibatis.session.SqlSessionFactory;
             import org.apache.ibatis.session.SqlSessionFactoryBuilder;
             import org.apache.ibatis.transaction.jdbc.JdbcTransactionFactory;
-            import org.junit.jupiter.api.Tag;
-            import org.junit.jupiter.api.Test;
-            import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
             import org.w3c.dom.Document;
             import org.w3c.dom.Element;
             import org.w3c.dom.Node;
@@ -729,10 +726,6 @@ class DmSqlValidationTestGenerator {
             import java.util.stream.Collectors;
             import java.util.stream.Stream;
 
-            import static org.junit.jupiter.api.Assertions.fail;
-
-            @Tag("dm-sql-validation")
-            @EnabledIfEnvironmentVariable(named = "DM_SQL_VALIDATION", matches = "true")
             public class DmSqlValidationTest {
                 private static final String CONFIG_PATH = "sql-validation.yml";
                 private static final String REWRITE_CONFIG_PATH = "sql-rewrite.yml";
@@ -847,7 +840,6 @@ class DmSqlValidationTestGenerator {
                     new DmSqlValidationTest().validateMappedDaoSql();
                 }
 
-                @Test
                 void validateMappedDaoSql() throws Exception {
                     Path projectRoot = findProjectRoot();
                     Path adapterDir = findAdapterDir();
@@ -1019,6 +1011,10 @@ class DmSqlValidationTestGenerator {
                         fail("Dameng SQL validation failed for " + failed.size()
                                 + " mapper methods. See " + adapterDir.resolve(MARKDOWN_REPORT));
                     }
+                }
+
+                private static void fail(String message) {
+                    throw new AssertionError(message);
                 }
 
                 """,

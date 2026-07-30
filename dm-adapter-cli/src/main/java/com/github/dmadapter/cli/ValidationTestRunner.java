@@ -133,7 +133,7 @@ class ValidationTestRunner {
                     + environment.missingVariables());
         }
 
-        List<String> command = mavenCommand(generationResult);
+        List<String> command = mavenClasspathCommand(generationResult);
         Path workingDirectory = workingDirectory(generationResult);
         Path markdownReport = validationMarkdownReport(generationResult.workspaceDir());
         try {
@@ -151,39 +151,25 @@ class ValidationTestRunner {
         List<String> currentCommand = command;
         Path currentWorkingDirectory = workingDirectory;
         try {
-            ProcessExecutionResult mavenExecution = executeProcess(
+            ProcessExecutionResult classpathExecution = executeProcess(
                     command,
                     workingDirectory,
                     environment,
-                    "Running Maven validation test: "
+                    "Compiling validation runner and preparing its classpath with Maven: "
             );
-            executions.add(mavenExecution);
-            ProcessExecutionResult effectiveExecution = mavenExecution;
-            if (mavenExecution.exitCode() == 0 && mavenTestsWereSkipped(mavenExecution.output())) {
-                publishMavenOutput("Maven reported tests are skipped; running generated validation main directly.");
-                Files.createDirectories(generationResult.workspaceDir());
-                currentCommand = mavenClasspathCommand(generationResult);
-                currentWorkingDirectory = workingDirectory;
-                ProcessExecutionResult classpathExecution = executeProcess(
+            executions.add(classpathExecution);
+            ProcessExecutionResult effectiveExecution = classpathExecution;
+            if (classpathExecution.exitCode() == 0) {
+                currentCommand = javaValidationCommand(generationResult);
+                currentWorkingDirectory = generationResult.appModuleRoot();
+                ProcessExecutionResult javaExecution = executeProcess(
                         currentCommand,
                         currentWorkingDirectory,
                         environment,
-                        "Preparing validation classpath with Maven: "
+                        "Running generated validation main: "
                 );
-                executions.add(classpathExecution);
-                effectiveExecution = classpathExecution;
-                if (classpathExecution.exitCode() == 0) {
-                    currentCommand = javaValidationCommand(generationResult);
-                    currentWorkingDirectory = generationResult.appModuleRoot();
-                    ProcessExecutionResult javaExecution = executeProcess(
-                            currentCommand,
-                            currentWorkingDirectory,
-                            environment,
-                            "Running generated validation main: "
-                    );
-                    executions.add(javaExecution);
-                    effectiveExecution = javaExecution;
-                }
+                executions.add(javaExecution);
+                effectiveExecution = javaExecution;
             }
             int exitCode = effectiveExecution.exitCode();
             int reportFailureCount = validationReportFailureCount(generationResult.workspaceDir());
@@ -214,7 +200,7 @@ class ValidationTestRunner {
                             generationResult.workspaceDir()
                     );
             String message = executions.isEmpty()
-                    ? "Failed to start Maven validation test: " + e.getMessage()
+                    ? "Failed to start Maven validation runner compilation: " + e.getMessage()
                     : "Failed to continue validation test run: " + e.getMessage();
             return new ValidationTestRunResult(
                     true,
@@ -363,25 +349,6 @@ class ValidationTestRunner {
     private static final class ValidationProcessTimeoutException extends TimeoutException {
     }
 
-    List<String> mavenCommand(ValidationTestGenerationResult generationResult) {
-        Path projectRoot = generationResult.projectRoot();
-        Path moduleRoot = generationResult.appModuleRoot();
-        List<String> command = new ArrayList<>();
-        command.add(mavenExecutable(projectRoot));
-        if (!moduleRoot.equals(projectRoot) && rootPomListsModule(projectRoot, moduleRoot)) {
-            command.add("-pl");
-            command.add(projectRoot.relativize(moduleRoot).toString().replace('\\', '/'));
-            command.add("-am");
-        }
-        addValidationSystemProperties(command, generationResult);
-        command.add("-Dtest=" + validationMainClass(generationResult));
-        command.add("-DskipTests=false");
-        command.add("-Dmaven.test.skip=false");
-        command.add("-Dsurefire.failIfNoSpecifiedTests=false");
-        command.add("test");
-        return command;
-    }
-
     List<String> mavenClasspathCommand(ValidationTestGenerationResult generationResult) {
         Path projectRoot = generationResult.projectRoot();
         Path moduleRoot = generationResult.appModuleRoot();
@@ -399,16 +366,6 @@ class ValidationTestRunner {
         command.add("-Dmdep.includeScope=test");
         command.add("-Dmdep.outputFile=" + validationClasspathFile(generationResult.workspaceDir()));
         return command;
-    }
-
-    private void addValidationSystemProperties(
-            List<String> command,
-            ValidationTestGenerationResult generationResult
-    ) {
-        command.add(systemPropertyArgument(ADAPTER_DIR_PROPERTY, generationResult.workspaceDir()));
-        command.add(systemPropertyArgument(PROJECT_ROOT_PROPERTY, generationResult.projectRoot()));
-        command.add(systemPropertyArgument(CONFIG_PROPERTY, generationResult.configPath()));
-        command.add(systemPropertyArgument(REWRITE_CONFIG_PROPERTY, generationResult.rewriteConfigPath()));
     }
 
     private String systemPropertyArgument(String name, Path value) {
@@ -514,10 +471,6 @@ class ValidationTestRunner {
             relative = relative.substring(0, relative.length() - ".java".length());
         }
         return relative.replace('\\', '.').replace('/', '.');
-    }
-
-    private boolean mavenTestsWereSkipped(String output) {
-        return output != null && output.toLowerCase(Locale.ROOT).contains("tests are skipped");
     }
 
     private Thread registerShutdownHook(Process process) {

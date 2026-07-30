@@ -351,6 +351,8 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("20260205.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
+                .startsWith("-- 默认创建人和企业")
+                .doesNotContain("\n# 默认创建人和企业")
                 .contains("-- DM_ADAPTER: MySQL script variable @enterpriseID was inlined as 107")
                 .contains("-- DM_ADAPTER: MySQL script variable @adminUserName was inlined as '超级管理员'")
                 .contains("values (107, '超级管理员')")
@@ -826,6 +828,35 @@ class SqlScriptMigratorTest {
                         SqlScriptMigrator.MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE,
                         SqlScriptMigrator.MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE,
                         SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE,
+                        SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE
+                ));
+    }
+
+    @Test
+    void convertsBitLiteralsAndAddsNoopToEmptyTransientProcedure() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS add_index_door;
+                DELIMITER $$
+                CREATE PROCEDURE add_index_door ()
+                BEGIN
+                    -- reserved for future indexes
+                END$$
+                DELIMITER ;
+                CALL add_index_door ();
+                DROP PROCEDURE IF EXISTS add_index_door;
+
+                INSERT INTO system_paramvalue(IsShow) VALUES (b'1');
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("-- reserved for future indexes\n\n    NULL;")
+                .contains("INSERT INTO system_paramvalue(IsShow) VALUES (1)")
+                .doesNotContain("b'1'");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.DM_EMPTY_PROCEDURE_BODY_NOOP_RULE,
+                        MySqlToDmSqlConverter.MYSQL_BIT_LITERAL_RULE,
                         SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE
                 ));
     }
@@ -7002,6 +7033,82 @@ class SqlScriptMigratorTest {
                                 SqlScriptMigrator.DM_CURRENT_SCHEMA_COLUMN_GUARD_TO_SYSTEM_DICTIONARY_RULE,
                                 SqlScriptMigrator.DM_TRANSIENT_PROCEDURE_TO_ANONYMOUS_BLOCK_RULE
                         ));
+    }
+
+    @Test
+    void convertsColumnCommentAndClobCharsetMetadataGuards() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS update_demo;
+                DELIMITER $$
+                CREATE PROCEDURE update_demo()
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database())
+                          AND table_name = 'demo'
+                          AND column_name = 'status'
+                          AND COLUMN_COMMENT = '状态'
+                    ) THEN
+                        ALTER TABLE demo MODIFY COLUMN status tinyint DEFAULT 0 COMMENT '新状态';
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = (select database())
+                          AND table_name = 'demo'
+                          AND column_name = 'content'
+                          AND CHARACTER_SET_NAME = 'utf8mb4'
+                          AND COLLATION_NAME = 'utf8mb4_unicode_ci'
+                    ) THEN
+                        ALTER TABLE demo MODIFY COLUMN content longtext CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_unicode_ci;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL update_demo();
+                DROP PROCEDURE IF EXISTS update_demo;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("FROM ALL_TAB_COLUMNS C")
+                .contains("JOIN ALL_COL_COMMENTS CC")
+                .contains("CC.COMMENTS = '状态'")
+                .contains("UPPER(DATA_TYPE) = 'CLOB'")
+                .contains("MODIFY content CLOB")
+                .doesNotContain("COLUMN_COMMENT =")
+                .doesNotContain("CHARACTER_SET_NAME")
+                .doesNotContain("COLLATION_NAME");
+    }
+
+    @Test
+    void trimsIndexGuardLiteralBeforeSynchronizingSchemaScopedName() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS add_demo_index;
+                DELIMITER $$
+                CREATE PROCEDURE add_demo_index()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT INDEX_NAME
+                        FROM information_schema.statistics
+                        WHERE table_schema = (select database())
+                          AND table_name = 'demo'
+                          AND index_name = 'idx_status '
+                    ) THEN
+                        ALTER TABLE demo ADD INDEX idx_status (status) USING BTREE;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL add_demo_index();
+                DROP PROCEDURE IF EXISTS add_demo_index;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE INDEX demo_idx_status ON demo (status)")
+                .doesNotContain("'idx_status '")
+                .doesNotContain("INDEX_NAME) = UPPER('idx_status')");
     }
 
     @Test

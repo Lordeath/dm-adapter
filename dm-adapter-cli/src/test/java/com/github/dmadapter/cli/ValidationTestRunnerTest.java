@@ -53,7 +53,7 @@ class ValidationTestRunnerTest {
     void usesWindowsMavenCommandName() {
         ValidationTestRunner runner = new ValidationTestRunner(Map.of(), "Windows 11", ProcessBuilder::start);
 
-        assertThat(runner.mavenCommand(generationResult()).get(0)).isEqualTo("mvn.cmd");
+        assertThat(runner.mavenClasspathCommand(generationResult()).get(0)).isEqualTo("mvn.cmd");
     }
 
     @Test
@@ -61,31 +61,37 @@ class ValidationTestRunnerTest {
         Files.createFile(tempDir.resolve("mvnw.cmd"));
         ValidationTestRunner runner = new ValidationTestRunner(Map.of(), "Windows 11", ProcessBuilder::start);
 
-        assertThat(runner.mavenCommand(generationResult()).get(0))
+        assertThat(runner.mavenClasspathCommand(generationResult()).get(0))
                 .isEqualTo(tempDir.resolve("mvnw.cmd").toString());
     }
 
     @Test
-    void allowsReactorModulesWithoutGeneratedValidationTest() {
-        assertThat(new ValidationTestRunner().mavenCommand(generationResult()))
+    void compilesFrameworkIndependentRunnerAndBuildsItsClasspath() {
+        assertThat(new ValidationTestRunner().mavenClasspathCommand(generationResult()))
                 .contains(
-                        "-Ddm.adapter.dir=" + tempDir.resolve(".dm-adapter"),
-                        "-Ddm.adapter.projectRoot=" + tempDir,
                         "-DskipTests=false",
                         "-Dmaven.test.skip=false",
-                        "-Dsurefire.failIfNoSpecifiedTests=false"
+                        "test-compile",
+                        "dependency:build-classpath",
+                        "-Dmdep.includeScope=test"
                 )
-                .doesNotContain("-Dmaven.test.skip.exec=false");
+                .doesNotContain(
+                        "-Dmaven.test.skip.exec=false",
+                        "-Dsurefire.failIfNoSpecifiedTests=false"
+                );
     }
 
     @Test
-    void targetsGeneratedValidationTestByFullyQualifiedClassName() {
+    void targetsGeneratedValidationMainByFullyQualifiedClassName() throws IOException {
         ValidationTestGenerationResult result = generationResult(
                 tempDir.resolve("src/test/java/com/example/system/DmSqlValidationTest.java")
         );
 
-        assertThat(new ValidationTestRunner().mavenCommand(result))
-                .contains("-Dtest=com.example.system.DmSqlValidationTest");
+        List<String> command = new ValidationTestRunner().javaValidationCommand(result);
+
+        assertThat(command).hasSize(2);
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation-java.args")))
+                .contains("com.example.system.DmSqlValidationTest");
     }
 
     @Test
@@ -114,17 +120,17 @@ class ValidationTestRunnerTest {
                         .contains("Maven command: [mvn")
                         .contains("-DskipTests=false")
                         .contains("-Dmaven.test.skip=false")
-                        .contains("-Dsurefire.failIfNoSpecifiedTests=false"))
+                        .contains("test-compile")
+                        .contains("dependency:build-classpath"))
                 .anySatisfy(line -> assertThat(line).contains("Working directory: " + tempDir))
                 .anySatisfy(line -> assertThat(line).contains("maven output"));
         assertThat(shutdownHooks.addedHook).isSameAs(shutdownHooks.removedHook);
     }
 
     @Test
-    void runsGeneratedMainWhenSurefireSkipsTests() throws IOException {
+    void alwaysRunsFrameworkIndependentGeneratedMain() throws IOException {
         List<List<String>> commands = new ArrayList<>();
         List<Process> processes = new ArrayList<>();
-        processes.add(processWithOutput("[INFO] Tests are skipped.\n", 0));
         processes.add(processWithOutput("classpath ready\n", 0, () -> {
             try {
                 Files.createDirectories(tempDir.resolve(".dm-adapter"));
@@ -155,22 +161,19 @@ class ValidationTestRunnerTest {
         );
 
         assertThat(result.exitCode()).isEqualTo(1);
-        assertThat(commands).hasSize(3);
+        assertThat(commands).hasSize(2);
         assertThat(commands.get(0))
-                .contains("test")
-                .contains("-DskipTests=false")
-                .contains("-Dmaven.test.skip=false")
-                .doesNotContain("-Dmaven.test.skip.exec=false");
-        assertThat(commands.get(1))
                 .contains("test-compile")
                 .contains("dependency:build-classpath")
                 .contains("-Dmdep.includeScope=test")
+                .contains("-DskipTests=false")
+                .contains("-Dmaven.test.skip=false")
                 .doesNotContain("-Dmaven.test.skip.exec=false");
-        assertThat(commands.get(2)).hasSize(2);
-        assertThat(commands.get(2).get(1))
+        assertThat(commands.get(1)).hasSize(2);
+        assertThat(commands.get(1).get(1))
                 .startsWith("@")
                 .endsWith("sql-validation-java.args");
-        assertThat(commands.get(2))
+        assertThat(commands.get(1))
                 .noneSatisfy(argument -> assertThat(argument).contains("dependency with space.jar"));
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-validation-java.args")))
                 .contains("-Ddm.adapter.dir=" + tempDir.resolve(".dm-adapter"))
@@ -179,7 +182,7 @@ class ValidationTestRunnerTest {
                 .contains("dependency with space.jar")
                 .contains("DmSqlValidationTest");
         assertThat(result.outputTail())
-                .anySatisfy(line -> assertThat(line).contains("Maven fallback command: [mvn"))
+                .anySatisfy(line -> assertThat(line).contains("Maven command: [mvn"))
                 .anySatisfy(line -> assertThat(line).contains("Java validation command: ["))
                 .anySatisfy(line -> assertThat(line).contains("validation main output"));
     }
@@ -192,10 +195,13 @@ class ValidationTestRunnerTest {
                 "connecting jdbc:dm://localhost:5236 app_user secret\n",
                 redactedLineStreamed
         );
+        List<Process> processes = new ArrayList<>();
+        processes.add(process);
+        processes.add(processWithOutput("validation completed\n", 0));
         ValidationTestRunner runner = new ValidationTestRunner(
                 Map.of(),
                 "Linux",
-                processBuilder -> process,
+                processBuilder -> processes.remove(0),
                 new RecordingShutdownHookRegistry(),
                 line -> {
                     streamedLines.add(line);
@@ -218,7 +224,8 @@ class ValidationTestRunnerTest {
         assertThat(result.message()).contains("passed");
         assertThat(process.outputObservedBeforeExit).isTrue();
         assertThat(streamedLines)
-                .anySatisfy(line -> assertThat(line).contains("[mvn] Running Maven validation test: [mvn"))
+                .anySatisfy(line -> assertThat(line)
+                        .contains("[mvn] Compiling validation runner and preparing its classpath with Maven: [mvn"))
                 .anySatisfy(line -> assertThat(line).contains("[mvn] connecting ****** ****** ******"));
         assertThat(String.join("\n", streamedLines))
                 .doesNotContain("jdbc:dm://localhost:5236")
@@ -570,7 +577,7 @@ class ValidationTestRunnerTest {
         );
 
         assertThat(result.attempted()).isTrue();
-        assertThat(result.message()).contains("Failed to start Maven validation test");
+        assertThat(result.message()).contains("Failed to start Maven validation runner compilation");
         assertThat(result.outputTail())
                 .anySatisfy(line -> assertThat(line).contains("Maven validation diagnostics"))
                 .anySatisfy(line -> assertThat(line).contains("Start error: IOException: boom"))
