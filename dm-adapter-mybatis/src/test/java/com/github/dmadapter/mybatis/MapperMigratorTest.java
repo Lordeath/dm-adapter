@@ -310,6 +310,76 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRewritesSingleAndBatchUpsertSelfIncrementToMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ReminderMapper">
+                    <insert id="insertOrIncrement">
+                        INSERT INTO sample_reminder (
+                            house_id, customer_id, remind_month, remind_count, update_time
+                        )
+                        VALUES (
+                            #{houseId}, #{customerId}, #{remindMonth}, 1, NOW()
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            remind_count = remind_count + 1,
+                            update_time = NOW()
+                    </insert>
+                    <insert id="batchInsertOrIncrement">
+                        INSERT INTO sample_reminder (
+                            house_id, customer_id, remind_month, remind_count, update_time
+                        )
+                        VALUES
+                        <foreach collection="list" item="item" separator=",">
+                            (
+                                #{item.houseId}, #{item.customerId}, #{item.remindMonth}, 1, NOW()
+                            )
+                        </foreach>
+                        ON DUPLICATE KEY UPDATE
+                            remind_count = remind_count + 1,
+                            update_time = NOW()
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ReminderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ReminderMapper.xml")),
+                List.of()
+        );
+        List<String> keys = List.of("house_id", "customer_id", "remind_month");
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of("sample_reminder", keys),
+                        Map.of(
+                                "com.example.ReminderMapper.insertOrIncrement", keys,
+                                "com.example.ReminderMapper.batchInsertOrIncrement", keys
+                        )
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ReminderMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO sample_reminder t")
+                .contains("t.remind_count = t.remind_count + 1")
+                .contains("t.update_time = NOW()")
+                .contains("<foreach collection=\"list\" item=\"item\" separator=\";\">")
+                .doesNotContainIgnoringCase("ON DUPLICATE KEY UPDATE");
+        assertThat(result.automaticConversions()).hasSize(2);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void migrationRewritesForeachOnDuplicateKeyUpdateWithBacktickKeywordColumnsToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
