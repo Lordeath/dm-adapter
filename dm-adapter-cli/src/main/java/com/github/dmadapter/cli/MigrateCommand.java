@@ -537,7 +537,10 @@ public class MigrateCommand implements Callable<Integer> {
                     TimeUnit.SECONDS,
                     "Dameng metadata inference"
             );
-            Map<String, TableKeyMetadata> metadata = mergeMetadata(dmMetadata, ddlMetadata);
+            Map<String, TableKeyMetadata> metadata = mergeDatabaseAndProjectDdlMetadata(
+                    dmMetadata,
+                    ddlMetadata
+            );
             return new MetadataLookupResult(metadata, !metadata.isEmpty(), warnings);
         } catch (Exception e) {
             warnings.add("Dameng metadata inference was skipped: " + redact(e.getMessage(), environment));
@@ -604,6 +607,30 @@ public class MigrateCommand implements Callable<Integer> {
             secondary.forEach((table, metadata) -> {
                 String normalizedTable = DamengMetadataReader.normalizeTableName(table);
                 merged.merge(normalizedTable, metadata, this::mergeMetadata);
+            });
+        }
+        return merged;
+    }
+
+    Map<String, TableKeyMetadata> mergeDatabaseAndProjectDdlMetadata(
+            Map<String, TableKeyMetadata> databaseMetadata,
+            Map<String, TableKeyMetadata> projectDdlMetadata
+    ) {
+        Map<String, TableKeyMetadata> merged = new LinkedHashMap<>();
+        if (databaseMetadata != null) {
+            databaseMetadata.forEach((table, metadata) -> merged.put(
+                    DamengMetadataReader.normalizeTableName(table),
+                    metadata
+            ));
+        }
+        if (projectDdlMetadata != null) {
+            projectDdlMetadata.forEach((table, metadata) -> {
+                String normalizedTable = DamengMetadataReader.normalizeTableName(table);
+                if (metadata.tableFound()) {
+                    merged.put(normalizedTable, metadata);
+                } else {
+                    merged.merge(normalizedTable, metadata, this::mergeMetadata);
+                }
             });
         }
         return merged;

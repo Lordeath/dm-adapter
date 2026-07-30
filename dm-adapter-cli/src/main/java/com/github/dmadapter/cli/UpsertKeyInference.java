@@ -2,6 +2,7 @@ package com.github.dmadapter.cli;
 
 import com.github.dmadapter.mybatis.SqlRewriteConfig;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -51,6 +52,25 @@ final class UpsertKeyInference {
         }
 
         List<TableConstraint> usablePrimaryKeys = usableConstraints(candidate, metadata.primaryKeys());
+        List<TableConstraint> usableUniqueKeys = usableConstraints(candidate, metadata.uniqueKeys());
+        if (candidate.insertIgnore()) {
+            List<TableConstraint> reachableConflictKeys = new ArrayList<>();
+            reachableConflictKeys.addAll(usablePrimaryKeys);
+            reachableConflictKeys.addAll(usableUniqueKeys);
+            if (reachableConflictKeys.size() == 1) {
+                TableConstraint conflictKey = reachableConflictKeys.get(0);
+                return Optional.of(InferenceResult.inferred(
+                        conflictKey.columns(),
+                        describeConstraint(conflictKey)
+                ));
+            }
+            if (reachableConflictKeys.size() > 1) {
+                return Optional.of(InferenceResult.multipleConflictKeys(
+                        reachableConflictKeys.stream().map(TableConstraint::columns).toList(),
+                        "conflict keys " + describe(reachableConflictKeys)
+                ));
+            }
+        }
         if (usablePrimaryKeys.size() == 1) {
             return Optional.of(InferenceResult.inferred(
                     usablePrimaryKeys.get(0).columns(),
@@ -65,7 +85,6 @@ final class UpsertKeyInference {
             ));
         }
 
-        List<TableConstraint> usableUniqueKeys = usableConstraints(candidate, metadata.uniqueKeys());
         if (usableUniqueKeys.size() == 1) {
             return Optional.of(InferenceResult.inferred(
                     usableUniqueKeys.get(0).columns(),
@@ -160,6 +179,12 @@ final class UpsertKeyInference {
                 .map(constraint -> constraint.name() + constraint.columns())
                 .toList()
                 .toString();
+    }
+
+    private String describeConstraint(TableConstraint constraint) {
+        return (constraint.type() == TableConstraint.ConstraintType.PRIMARY_KEY
+                ? "primary key "
+                : "unique key ") + constraint.name();
     }
 
     record InferenceResult(
