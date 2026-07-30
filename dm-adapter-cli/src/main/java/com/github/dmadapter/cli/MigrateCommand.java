@@ -312,11 +312,10 @@ public class MigrateCommand implements Callable<Integer> {
             printSqlScriptSummary(sqlScriptReportResult);
             ValidationTestRunResult validationRunResult = null;
             MapperValidationAssessment mapperAssessment = null;
-            boolean mapperValidationBlocked = mapperValidationBlockedByScript(sqlScriptReportResult);
+            String mapperValidationBlockReason = mapperValidationBlockReason(sqlScriptReportResult);
+            boolean mapperValidationBlocked = !mapperValidationBlockReason.isBlank();
             if (mapperValidationBlocked) {
-                summaryTracker.skipMapperValidation(
-                        "SQL 脚本验证的 schema 前置检查失败，未执行 Mapper 数据库验证。"
-                );
+                summaryTracker.skipMapperValidation(mapperValidationBlockReason);
             } else {
                 summaryTracker.startMapperValidation(validationTestGenerationRequested());
             }
@@ -334,7 +333,7 @@ public class MigrateCommand implements Callable<Integer> {
                 );
                 GenerateValidationTestCommand.printResult(validationResult);
                 if (mapperValidationBlocked) {
-                    CliLogger.info("Mapper database validation skipped because SQL script schema preflight failed.");
+                    CliLogger.info("Mapper database validation skipped: " + mapperValidationBlockReason);
                 } else {
                     CliLogger.info("Running Dameng SQL validation test if configured...");
                     validationRunResult = validationTestRunner.runIfConfigured(validationResult, validationEnvironment);
@@ -1031,11 +1030,32 @@ public class MigrateCommand implements Callable<Integer> {
         return validationExitCode(context, environment, sqlScriptResult, null, null);
     }
 
-    private boolean mapperValidationBlockedByScript(SqlScriptReportResult result) {
+    private String mapperValidationBlockReason(SqlScriptReportResult result) {
         if (result == null) {
-            return false;
+            return "";
         }
-        return mapperValidationBlockedByScriptFailures(result.report().validationFailures());
+        SqlScriptMigrationReport report = result.report();
+        return mapperValidationBlockReason(
+                report.validationAttempted(),
+                report.validationStatus(),
+                report.validationFailures()
+        );
+    }
+
+    static String mapperValidationBlockReason(
+            boolean validationAttempted,
+            String validationStatus,
+            List<SqlScriptValidationFailure> failures
+    ) {
+        if (mapperValidationBlockedByScriptFailures(failures)) {
+            return "SQL 脚本验证的 schema 前置检查失败，未执行 Mapper 数据库验证。";
+        }
+        if (!validationAttempted
+                && validationStatus != null
+                && validationStatus.toLowerCase(java.util.Locale.ROOT).contains("connection failed")) {
+            return "SQL 脚本验证无法建立达梦连接，未重复执行 Mapper 数据库验证。";
+        }
+        return "";
     }
 
     static boolean mapperValidationBlockedByScriptFailures(List<SqlScriptValidationFailure> failures) {

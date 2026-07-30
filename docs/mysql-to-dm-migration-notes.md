@@ -116,7 +116,7 @@
    - 外部存储过程依赖：联网验证以过程编译结果和 `ALL_OBJECTS.STATUS` 为准；离线报告中的汇总警告不等同于失败。
    - `VALIDATION_TIMEOUT`：属于验证运行环境/执行时限问题，不是 SQL 兼容失败。SQL 脚本单条语句达到 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS` 后，工具必须主动取消并停止本轮脚本验证；不能只依赖可能被驱动忽略的 JDBC `setQueryTimeout`，也不能继续复用仍有语句运行的连接。
    - SQL 脚本单条语句默认硬超时为 600 秒。真实全量脚本中同一合法数据同步过程的耗时会随测试库数据量从约 187 秒增长到超过 300 秒；项目确有更长过程时应显式配置 `DM_SQL_SCRIPT_VALIDATION_TIMEOUT_SECONDS`，不能把合法慢过程误分为 SQL 兼容失败。
-   - SQL 脚本验证建立达梦连接时默认最多尝试 3 次，间隔 2 秒，并始终受本轮验证总时限约束；可用 `dm.adapter.sqlScriptConnectionAttempts` 和 `dm.adapter.sqlScriptConnectionRetryDelayMillis` 调整。短暂网络抖动不能让脚本阶段直接失败、而稍后的 Mapper 阶段又成功。
+   - SQL 脚本验证建立达梦连接时默认最多尝试 3 次，间隔 2 秒，并始终受本轮验证总时限约束；可用 `dm.adapter.sqlScriptConnectionAttempts` 和 `dm.adapter.sqlScriptConnectionRetryDelayMillis` 调整。短暂网络抖动不能让脚本阶段直接失败、而稍后的 Mapper 阶段又成功。脚本阶段重试耗尽、确认连接未建立时，本轮不再编译并启动 Mapper 数据库验证；项目仍以连接故障退出，数据库恢复后再重跑，避免对同一不可用连接重复等待。
    - 没有可执行语句的空脚本仍应写入逐文件验证结果，但不能为每个空文件重复切换 schema；所有 schema 已在预检阶段统一校验，空文件应直接记录为 `0/0`，避免大量占位脚本消耗总时限。
    - MyBatis mapper 验证同样不能只依赖驱动实现 `setQueryTimeout`。单条 mapper 达到 `dm.sql.validation.statementTimeoutSeconds`（默认 120 秒）后，生成的验证程序必须记录数据库语句超时、主动中止当前连接并结束本轮 mapper 验证；不得继续复用可能仍在执行 SQL 的连接。
    - mapper 参数推断所需的达梦列元数据应按 schema 批量读取 `SYS.SYSOBJECTS`/`SYS.SYSCOLUMNS`，通过 `CURRENT_SCHID()` 解析当前 schema；不要逐表扫描 `ALL_TAB_COLUMNS`，否则目录视图超时会让每轮验证固定等待并丢弃整批元数据。
