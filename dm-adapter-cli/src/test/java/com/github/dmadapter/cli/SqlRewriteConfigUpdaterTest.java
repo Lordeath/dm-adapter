@@ -454,4 +454,54 @@ class SqlRewriteConfigUpdaterTest {
                         + "[[\"logical_name\", \"version_no\"], [\"job_name\"]]")
                 .doesNotContain("MANUAL_KEY_COLUMNS_REQUIRED");
     }
+
+    @Test
+    void replacesStaleGeneratedConflictGroupsWhenLaterDdlDropsUniqueIndexes() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        Files.createDirectories(config.getParent());
+        Files.writeString(config, """
+                upsertKeys:
+                  tables:
+                    "flink_table_config":
+                      keyColumns: []
+                  methods:
+                    "com.example.FlinkMapper.insertTableStatus":
+                      keyColumns: []
+                      conflictKeyGroups: [["logical_table_name", "version"], ["table_name"]]
+                """);
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.FlinkMapper.insertTableStatus",
+                "flink_table_config",
+                List.of("logical_table_name", "version", "table_name"),
+                RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata(
+                "flink_table_config",
+                List.of(new TableConstraint(
+                        "PRIMARY",
+                        TableConstraint.ConstraintType.PRIMARY_KEY,
+                        List.of("id")
+                )),
+                true,
+                Set.of("id")
+        );
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                new SqlRewriteConfigLoader().load(config),
+                List.of(candidate),
+                Map.of("flink_table_config", metadata),
+                true
+        );
+
+        assertThat(update.rewriteConfig().conflictKeyGroupsFor(candidate.methodKey())).isEmpty();
+        assertThat(update.rewriteConfig().convertsInsertIgnoreToPlainInsert(candidate.methodKey())).isTrue();
+        assertThat(update.warnings()).anySatisfy(warning ->
+                assertThat(warning).contains("Discarded stale conflictKeyGroups"));
+        assertThat(Files.readString(config))
+                .doesNotContain("conflictKeyGroups:")
+                .contains("\"com.example.FlinkMapper.insertTableStatus\": "
+                        + "\"INSERT_IGNORE_AS_PLAIN_INSERT\"");
+    }
 }

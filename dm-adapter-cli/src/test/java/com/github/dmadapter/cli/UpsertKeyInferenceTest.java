@@ -122,6 +122,36 @@ class UpsertKeyInferenceTest {
     }
 
     @Test
+    void retainsReachablePrimaryAndUniqueKeysForInsertIgnore() {
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.SampleMapper.insertIgnore",
+                "sample_job_config",
+                List.of("id", "logical_name", "version_no"),
+                RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("sample_job_config", List.of(
+                new TableConstraint(
+                        "PRIMARY",
+                        TableConstraint.ConstraintType.PRIMARY_KEY,
+                        List.of("id")
+                ),
+                new TableConstraint(
+                        "uk_logical_version",
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        List.of("logical_name", "version_no")
+                )
+        ));
+
+        UpsertKeyInference.InferenceResult result = inference.infer(candidate, metadata).orElseThrow();
+
+        assertThat(result.hasMultipleConflictKeys()).isTrue();
+        assertThat(result.conflictKeyGroups()).containsExactly(
+                List.of("id"),
+                List.of("logical_name", "version_no")
+        );
+    }
+
+    @Test
     void marksMissingConflictConstraintAsOriginalSqlIssue() {
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
                 "com.example.BankFileMapper.insertIgnore",

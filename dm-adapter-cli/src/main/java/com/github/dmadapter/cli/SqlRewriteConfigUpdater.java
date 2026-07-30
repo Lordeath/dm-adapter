@@ -54,6 +54,17 @@ class SqlRewriteConfigUpdater {
 
         for (RewriteConfigCandidate candidate : candidates) {
             model.ensureTable(candidate.tableName(), List.of());
+            TableKeyMetadata metadata = metadataByTable.get(
+                    DamengMetadataReader.normalizeTableName(candidate.tableName())
+            );
+            boolean staleConflictKeyGroups = hasStaleConflictKeyGroups(candidate, model, metadata);
+            if (staleConflictKeyGroups) {
+                model.removeMethodConflictKeyGroups(candidate.methodKey());
+                model.removeMethodResolution(candidate.methodKey());
+                warnings.add("Discarded stale conflictKeyGroups for " + candidate.methodKey()
+                        + " because they no longer match the reachable primary/unique keys "
+                        + "in current project DDL metadata.");
+            }
             boolean configured = candidate.outerJoinSource()
                     ? hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()))
                     : hasConfiguredKeyColumns(model.methodColumns(candidate.methodKey()))
@@ -65,7 +76,6 @@ class SqlRewriteConfigUpdater {
                     model.removeMethodResolution(candidate.methodKey());
                 }
             } else if (metadataAvailable) {
-                TableKeyMetadata metadata = metadataByTable.get(DamengMetadataReader.normalizeTableName(candidate.tableName()));
                 Optional<UpsertKeyInference.InferenceResult> result =
                         inferCandidateKey(candidate, metadata);
                 result.ifPresent(inferenceResult -> {
@@ -134,6 +144,37 @@ class SqlRewriteConfigUpdater {
         SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, inferredMethodKeys);
         Optional<FileChange> fileChange = writeIfChanged(context, rewriteConfigPath, model);
         return new SqlRewriteConfigUpdate(rewriteConfig, fileChange, warnings);
+    }
+
+    private boolean hasStaleConflictKeyGroups(
+            RewriteConfigCandidate candidate,
+            RewriteConfigModel model,
+            TableKeyMetadata metadata
+    ) {
+        if (!candidate.insertIgnore() || metadata == null || !metadata.tableFound()) {
+            return false;
+        }
+        List<List<String>> configuredGroups = model.methodConflictKeyGroups(candidate.methodKey());
+        if (configuredGroups.isEmpty()) {
+            return false;
+        }
+        Set<String> insertedColumns = normalizedColumns(candidate.insertColumns());
+        Set<String> reachableKeys = new LinkedHashSet<>();
+        for (TableConstraint constraint : metadata.constraints()) {
+            List<String> columns = constraint.columns().stream()
+                    .map(DamengMetadataReader::normalizeIdentifier)
+                    .toList();
+            if (!columns.isEmpty() && insertedColumns.containsAll(columns)) {
+                reachableKeys.add(columns.toString());
+            }
+        }
+        Set<String> configuredKeys = configuredGroups.stream()
+                .map(group -> group.stream()
+                        .map(DamengMetadataReader::normalizeIdentifier)
+                        .toList()
+                        .toString())
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        return !configuredKeys.equals(reachableKeys);
     }
 
     private Optional<UpsertKeyInference.InferenceResult> inferCandidateKey(
@@ -226,8 +267,14 @@ class SqlRewriteConfigUpdater {
             Map<String, List<String>> inferredMethodKeys
     ) {
         Map<String, List<String>> tableKeys = new LinkedHashMap<>(loadedRewriteConfig.tableKeyColumns());
+        for (String table : model.tableNames()) {
+            tableKeys.remove(table);
+        }
         tableKeys.putAll(model.nonEmptyTableKeys());
         Map<String, List<String>> methodKeys = new LinkedHashMap<>(loadedRewriteConfig.methodKeyColumns());
+        for (String method : model.methodNames()) {
+            methodKeys.remove(method);
+        }
         for (Map.Entry<String, List<String>> entry : inferredMethodKeys.entrySet()) {
             methodKeys.putIfAbsent(entry.getKey(), entry.getValue());
         }
@@ -250,6 +297,9 @@ class SqlRewriteConfigUpdater {
     ) {
         Map<String, List<List<String>>> groups =
                 new LinkedHashMap<>(loadedRewriteConfig.methodConflictKeyGroups());
+        for (String method : model.methodNames()) {
+            groups.remove(method);
+        }
         groups.putAll(model.nonEmptyMethodConflictKeyGroups());
         return groups;
     }
@@ -415,6 +465,10 @@ class SqlRewriteConfigUpdater {
             return result;
         }
 
+        Set<String> tableNames() {
+            return Set.copyOf(tableKeys.keySet());
+        }
+
         Map<String, List<String>> nonEmptyMethodKeys() {
             Map<String, List<String>> result = new LinkedHashMap<>();
             methodKeys.forEach((method, columns) -> {
@@ -423,6 +477,10 @@ class SqlRewriteConfigUpdater {
                 }
             });
             return result;
+        }
+
+        Set<String> methodNames() {
+            return Set.copyOf(methodKeys.keySet());
         }
 
         Map<String, List<List<String>>> nonEmptyMethodConflictKeyGroups() {
