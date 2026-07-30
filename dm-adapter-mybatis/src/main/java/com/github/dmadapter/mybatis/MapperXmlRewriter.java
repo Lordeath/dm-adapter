@@ -516,9 +516,15 @@ public class MapperXmlRewriter {
                         List.of(MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE)
                 );
             }
+            boolean useGeneratedKeys =
+                    "true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys"));
             if ("insert".equals(tagName)
-                    && !"true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys"))
-                    && rewriteConfig.requiresIdentityInsert(tableName)) {
+                    && rewriteConfig.requiresIdentityInsert(tableName)
+                    && (!useGeneratedKeys || hasExplicitGeneratedKeyColumn(
+                            convertedSql,
+                            statement.getAttribute("keyProperty"),
+                            statement.getAttribute("keyColumn")
+                    ))) {
                 TextRewrite identityInsert = wrapIdentityInsert(convertedSql, tableName);
                 if (identityInsert.changed()) {
                     convertedSql = identityInsert.text();
@@ -1138,8 +1144,12 @@ public class MapperXmlRewriter {
             }
         }
         if (!generatedKeyBatchChanged
-                && !useGeneratedKeys
-                && rewriteConfig.requiresIdentityInsert(insertTable)) {
+                && rewriteConfig.requiresIdentityInsert(insertTable)
+                && (!useGeneratedKeys || hasExplicitGeneratedKeyColumn(
+                        converted,
+                        generatedKeyProperty,
+                        generatedKeyColumn
+                ))) {
             TextRewrite identityInsert = wrapIdentityInsert(converted, insertTable);
             if (identityInsert.changed()) {
                 appliedRules.add(MYBATIS_IDENTITY_INSERT_REPLACE_NULL_RULE);
@@ -6465,6 +6475,42 @@ public class MapperXmlRewriter {
         String normalizedColumn = normalizeIdentifier(column);
         return normalizedColumn.equals(normalizeIdentifier(expectedColumn))
                 || normalizedColumn.equals(camelToSnake(property));
+    }
+
+    private boolean hasExplicitGeneratedKeyColumn(
+            String sql,
+            String generatedKeyProperty,
+            String generatedKeyColumn
+    ) {
+        String property = leafProperty(generatedKeyProperty);
+        if (sql == null || sql.isBlank() || property.isBlank()) {
+            return false;
+        }
+        String withoutPlaceholders = Pattern.compile("[#$]\\{[^}]*}")
+                .matcher(sql)
+                .replaceAll(" ");
+        Matcher valuesKeyword = Pattern.compile("\\bvalues\\b", Pattern.CASE_INSENSITIVE)
+                .matcher(withoutPlaceholders);
+        String columnSection = valuesKeyword.find()
+                ? withoutPlaceholders.substring(0, valuesKeyword.start())
+                : withoutPlaceholders;
+        Set<String> candidates = new LinkedHashSet<>();
+        if (generatedKeyColumn != null && !generatedKeyColumn.isBlank()) {
+            candidates.add(generatedKeyColumn.trim());
+        }
+        candidates.add(property);
+        candidates.add(camelToSnake(property));
+        for (String candidate : candidates) {
+            String identifier = Pattern.quote(normalizeIdentifier(candidate));
+            Pattern columnPattern = Pattern.compile(
+                    "(?i)(?:`" + identifier + "`|\"" + identifier + "\"|\\b"
+                            + identifier + "\\b)\\s*(?:,|\\))"
+            );
+            if (columnPattern.matcher(columnSection).find()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String camelToSnake(String value) {

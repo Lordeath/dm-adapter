@@ -9484,6 +9484,11 @@ class DmSqlValidationTestGenerator {
                             || (lower.contains("methodfailedexception")
                                     && lower.contains("nosuchmethodexception")
                                     && lower.contains("dynamiccontext$contextmap"))
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:where|and|or)\\\\s+(?:and|or)\\\\b").matcher(value).find()
+                            || Pattern.compile(
+                                    "(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\?\\\\s*,\\\\s*"
+                                            + "(?:(?:and|or|group\\\\s+by|order\\\\s+by|having)\\\\b|### Cause:|$)"
+                            ).matcher(value).find()
                             || Pattern.compile("(?i)### SQL:\\\\s*update\\\\s+from\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:\\\\s*update\\\\s+(?!from\\\\b)[^\\\\s;]+\\\\s+where\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()
@@ -9643,7 +9648,15 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean hasBrokenDynamicSqlShape(String message) {
-                    return Pattern.compile("\\\\bselect\\\\s*,", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                    String sql = sqlFromMessage(message).trim();
+                    boolean bareInsertOrUpdate = Pattern.compile(
+                            "(?i)^(?:insert\\\\s+into|update)\\\\s+"
+                                    + "(?:[`\\\"][^`\\\"]+[`\\\"]|[A-Za-z_][A-Za-z0-9_$]*)"
+                                    + "(?:\\\\s*\\\\.\\\\s*(?:[`\\\"][^`\\\"]+[`\\\"]|[A-Za-z_][A-Za-z0-9_$]*))?"
+                                    + "\\\\s*;?$"
+                    ).matcher(sql).matches();
+                    return bareInsertOrUpdate
+                            || Pattern.compile("\\\\bselect\\\\s*,", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile(",\\\\s*from\\\\s+dual\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("\\\\bupdate\\\\s+[A-Za-z_][A-Za-z0-9_$]*(?:\\\\s+[A-Za-z_][A-Za-z0-9_$]*)?\\\\s+where\\\\b", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("(?i)(\\\\band\\\\s*\\\\(\\\\s*\\\\)|,\\\\s*where\\\\b|\\\\bwhere\\\\s+and\\\\b|\\\\bwhere\\\\s+where\\\\b|\\\\bfrom\\\\s+where\\\\b|\\\\bset\\\\s+where\\\\b|\\\\?\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\s*=|^### SQL:\\\\s*ID\\\\s+select\\\\b)").matcher(message).find()
@@ -9851,6 +9864,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasOriginalXmlSyntaxDefect(message)) {
                         return "ORIGINAL_SQL";
+                    }
+                    if (lower.contains("sql语句为null或空值") || hasBrokenDynamicSqlShape(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
                     }
                     if (hasTestDataOrConstraintIssue(message)
                             || containsAny(message, "数据类型不匹配", "NumberFormatException", "违反引用约束")) {
