@@ -1198,7 +1198,11 @@ class DmSqlValidationTestGenerator {
                     log("Loading database column metadata for " + tableNames.size() + " referenced table(s)...");
                     try (SqlSession sqlSession = sqlSessionFactory.openSession(false)) {
                         Connection connection = sqlSession.getConnection();
-                        DbColumnMetadata metadata = DbColumnMetadata.load(connection, config.schemas(), tableNames);
+                        DbColumnMetadata metadata = DbColumnMetadata.empty();
+                        for (String schema : validationSchemas(config)) {
+                            applySchema(connection, schema);
+                            metadata.readTableColumns(connection, tableNames);
+                        }
                         log("Database column metadata loaded: " + metadata.columnCount() + " columns.");
                         return metadata;
                     } catch (Throwable e) {
@@ -12044,7 +12048,7 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private static final class DbColumnMetadata {
-                    private static final int METADATA_QUERY_TIMEOUT_SECONDS = 8;
+                    private static final int METADATA_QUERY_TIMEOUT_SECONDS = 60;
                     private final Map<String, String> tableColumnTypes = new LinkedHashMap<>();
                     private final Map<String, Set<String>> columnTypes = new LinkedHashMap<>();
                     private final Map<String, Integer> tableColumnLengths = new LinkedHashMap<>();
@@ -12055,13 +12059,10 @@ class DmSqlValidationTestGenerator {
                         return new DbColumnMetadata();
                     }
 
-                    private static DbColumnMetadata load(
+                    private void readTableColumns(
                             Connection connection,
-                            List<String> schemas,
                             Collection<String> tableNames
                     ) throws Exception {
-                        DbColumnMetadata metadata = new DbColumnMetadata();
-                        List<String> targetSchemas = schemas == null ? listOf() : schemas;
                         LinkedHashSet<String> targetTables = new LinkedHashSet<>();
                         if (tableNames != null) {
                             for (String tableName : tableNames) {
@@ -12071,35 +12072,29 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         if (targetTables.isEmpty()) {
-                            return metadata;
-                        }
-                        for (String tableName : targetTables) {
-                            if (targetSchemas.isEmpty()) {
-                                metadata.readTableColumns(connection, "", tableName);
-                            } else {
-                                for (String schema : targetSchemas) {
-                                    metadata.readTableColumns(connection, schema, tableName);
-                                }
-                            }
-                        }
-                        return metadata;
-                    }
-
-                    private void readTableColumns(Connection connection, String schema, String tableName) throws Exception {
-                        if (isBlank(tableName)) {
                             return;
                         }
-                        boolean schemaQualified = schema != null && !isBlank(schema);
-                        try (PreparedStatement statement = connection.prepareStatement(columnTypeQuerySql(schemaQualified))) {
+                        LinkedHashSet<String> catalogNames = new LinkedHashSet<>();
+                        for (String tableName : targetTables) {
+                            catalogNames.add(tableName);
+                            catalogNames.add(tableName.toUpperCase(Locale.ROOT));
+                        }
+                        String placeholders = catalogNames.stream()
+                                .map(ignored -> "?")
+                                .collect(Collectors.joining(", "));
+                        String sql = "select o.NAME as table_name, c.NAME as column_name, "
+                                + "c.TYPE$ as data_type, c.LENGTH$ as column_length "
+                                + "from SYS.SYSOBJECTS o "
+                                + "join SYS.SYSCOLUMNS c on c.ID = o.ID "
+                                + "where o.SCHID = CURRENT_SCHID() "
+                                + "and o.SUBTYPE$ in ('UTAB', 'STAB', 'VIEW') "
+                                + "and o.NAME in (" + placeholders + ") "
+                                + "order by o.NAME, c.COLID";
+                        try (PreparedStatement statement = connection.prepareStatement(sql)) {
                             configureQueryTimeout(statement);
-                            if (schemaQualified) {
-                                statement.setString(1, schema);
-                                statement.setString(2, schema);
-                                statement.setString(3, tableName);
-                                statement.setString(4, tableName);
-                            } else {
-                                statement.setString(1, tableName);
-                                statement.setString(2, tableName);
+                            int parameterIndex = 1;
+                            for (String catalogName : catalogNames) {
+                                statement.setString(parameterIndex++, catalogName);
                             }
                             try (ResultSet resultSet = statement.executeQuery()) {
                                 while (resultSet.next()) {
@@ -12113,22 +12108,6 @@ class DmSqlValidationTestGenerator {
                                 }
                             }
                         }
-                    }
-
-                    private String columnTypeQuerySql(boolean schemaQualified) {
-                        if (schemaQualified) {
-                            return "select table_name, column_name, data_type, "
-                                    + "case when char_length > 0 then char_length else data_length end as column_length "
-                                    + "from all_tab_columns "
-                                    + "where (owner = ? or upper(owner) = upper(?)) "
-                                    + "and (table_name = ? or upper(table_name) = upper(?)) "
-                                    + "order by table_name, column_id";
-                        }
-                        return "select table_name, column_name, data_type, "
-                                + "case when char_length > 0 then char_length else data_length end as column_length "
-                                + "from user_tab_columns "
-                                + "where table_name = ? or upper(table_name) = upper(?) "
-                                + "order by table_name, column_id";
                     }
 
                     private void configureQueryTimeout(Statement statement) {
