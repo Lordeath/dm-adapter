@@ -10691,10 +10691,13 @@ class SqlScriptMigrator {
         if (!dropTables.isEmpty()) {
             return dropTables.stream().map(ProcedureStatement::dynamicSql).toList();
         }
+        ProcedureStatement guardedDropIndex = convertMysqlDropIndexOnTableToGuard(converted);
+        if (guardedDropIndex != null) {
+            return List.of(guardedDropIndex);
+        }
         converted = convertMysqlCreateTableSelect(converted);
         converted = convertMysqlAlterTableAddIndex(converted);
         converted = convertMysqlAlterTableDropForeignKey(converted);
-        converted = convertMysqlDropIndexOnTable(converted);
         ProcedureStatement temporaryIndexDdl = convertTemporaryIndexDdlToNoop(converted);
         if (temporaryIndexDdl != null) {
             return directProcedureBodyStatement ? List.of() : List.of(temporaryIndexDdl);
@@ -11687,15 +11690,29 @@ class SqlScriptMigrator {
                 + ")";
     }
 
-    private String convertMysqlDropIndexOnTable(String ddl) {
+    private ProcedureStatement convertMysqlDropIndexOnTableToGuard(String ddl) {
         Matcher matcher = Pattern.compile(
                 "(?is)^\\s*DROP\\s+INDEX\\s+(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s+"
                         + "ON\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*$"
         ).matcher(ddl);
         if (!matcher.matches()) {
-            return ddl;
+            return null;
         }
-        return "DROP INDEX " + dmSchemaScopedIndexName(matcher.group("table"), matcher.group("index"));
+        String indexName = dmSchemaScopedIndexName(matcher.group("table"), matcher.group("index"));
+        String escapedIndexName = indexName.replace("'", "''");
+        return ProcedureStatement.directSql(
+                "DECLARE\n"
+                        + "    dm_adapter_drop_index_exists INT;\n"
+                        + "BEGIN\n"
+                        + "    SELECT COUNT(*) INTO dm_adapter_drop_index_exists\n"
+                        + "    FROM ALL_INDEXES\n"
+                        + "    WHERE OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION + "\n"
+                        + "      AND UPPER(INDEX_NAME) = UPPER('" + escapedIndexName + "');\n"
+                        + "    IF dm_adapter_drop_index_exists > 0 THEN\n"
+                        + "        EXECUTE IMMEDIATE 'DROP INDEX " + escapedIndexName + "';\n"
+                        + "    END IF;\n"
+                        + "END"
+        );
     }
 
     private String normalizeCreateIndexForDm(String ddl) {
