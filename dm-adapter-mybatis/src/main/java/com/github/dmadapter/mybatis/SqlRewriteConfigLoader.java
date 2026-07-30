@@ -31,6 +31,7 @@ public class SqlRewriteConfigLoader {
         Set<String> ignoredMissingSchemas = new LinkedHashSet<>();
         Set<String> identityInsertTables = new LinkedHashSet<>();
         Map<String, String> upsertKeyResolutions = new LinkedHashMap<>();
+        Map<String, List<List<String>>> methodConflictKeyGroups = new LinkedHashMap<>();
         String section = "";
         String currentName = "";
         for (String line : lines) {
@@ -121,6 +122,17 @@ public class SqlRewriteConfigLoader {
                     methodKeys.put(currentName, keyColumns);
                 }
             }
+            if (indent == 6
+                    && "methods".equals(section)
+                    && !currentName.isBlank()
+                    && trimmed.startsWith("conflictKeyGroups:")) {
+                List<List<String>> conflictKeyGroups = parseNestedInlineLists(
+                        trimmed.substring("conflictKeyGroups:".length())
+                );
+                if (!conflictKeyGroups.isEmpty()) {
+                    methodConflictKeyGroups.put(currentName, conflictKeyGroups);
+                }
+            }
             if (isValidationIgnoresSection(section)
                     && indent == 2
                     && trimmed.startsWith("missingTables:")) {
@@ -171,7 +183,8 @@ public class SqlRewriteConfigLoader {
                 ignoredMissingColumns,
                 ignoredMissingSchemas,
                 identityInsertTables,
-                upsertKeyResolutions
+                upsertKeyResolutions,
+                methodConflictKeyGroups
         );
     }
 
@@ -224,6 +237,36 @@ public class SqlRewriteConfigLoader {
             }
         }
         return values;
+    }
+
+    private List<List<String>> parseNestedInlineLists(String value) {
+        String trimmed = value.trim();
+        if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+            return List.of();
+        }
+        String body = trimmed.substring(1, trimmed.length() - 1).trim();
+        List<List<String>> groups = new ArrayList<>();
+        int index = 0;
+        while (index < body.length()) {
+            while (index < body.length()
+                    && (Character.isWhitespace(body.charAt(index)) || body.charAt(index) == ',')) {
+                index++;
+            }
+            if (index >= body.length() || body.charAt(index) != '[') {
+                return List.of();
+            }
+            int close = body.indexOf(']', index + 1);
+            if (close < 0) {
+                return List.of();
+            }
+            List<String> group = parseInlineList(body.substring(index, close + 1));
+            if (group.isEmpty()) {
+                return List.of();
+            }
+            groups.add(group);
+            index = close + 1;
+        }
+        return List.copyOf(groups);
     }
 
     private String unquote(String value) {

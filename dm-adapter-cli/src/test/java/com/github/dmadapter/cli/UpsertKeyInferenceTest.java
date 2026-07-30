@@ -89,6 +89,39 @@ class UpsertKeyInferenceTest {
     }
 
     @Test
+    void retainsEveryMatchingUniqueKeyForInsertIgnore() {
+        RewriteConfigCandidate candidate = new RewriteConfigCandidate(
+                "com.example.JobMapper.insert",
+                "sample_job_config",
+                List.of("logical_name", "version_no", "job_name"),
+                RewriteConfigCandidate.RewriteKind.INSERT_IGNORE
+        );
+        TableKeyMetadata metadata = new TableKeyMetadata("sample_job_config", List.of(
+                new TableConstraint(
+                        "UK_LOGICAL_VERSION",
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        List.of("logical_name", "version_no")
+                ),
+                new TableConstraint(
+                        "UK_JOB_NAME",
+                        TableConstraint.ConstraintType.UNIQUE_KEY,
+                        List.of("job_name")
+                )
+        ));
+
+        UpsertKeyInference.InferenceResult result = inference.infer(candidate, metadata).orElseThrow();
+
+        assertThat(result.inferred()).isFalse();
+        assertThat(result.hasMultipleConflictKeys()).isTrue();
+        assertThat(result.conflictKeyGroups()).containsExactly(
+                List.of("logical_name", "version_no"),
+                List.of("job_name")
+        );
+        assertThat(result.source()).contains("UK_LOGICAL_VERSION", "UK_JOB_NAME");
+        assertThat(result.resolutionCode()).isEmpty();
+    }
+
+    @Test
     void marksMissingConflictConstraintAsOriginalSqlIssue() {
         RewriteConfigCandidate candidate = new RewriteConfigCandidate(
                 "com.example.BankFileMapper.insertIgnore",

@@ -3117,6 +3117,27 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void classifiesInterdependentUserVariableAssignmentsAsOriginalEvaluationOrderRisk() {
+        SqlConversionResult result = converter.convert("""
+                select
+                    @island := if(previous_date = current_date - 1 and @state = 1,
+                                  @island, @island + 1) as island_id,
+                    @state := if(previous_date is null or @state = -1, 1, 2) as state_id,
+                    current_date
+                from sample_daily_value,
+                     (select @island := 1, @state := -1) seed
+                group by island_id, current_date
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.changed()).isFalse();
+        assertThat(result.reason())
+                .contains("Original SQL", "evaluation order", "interdependent")
+                .contains("@island", "@state")
+                .contains("window/gaps-and-islands");
+    }
+
+    @Test
     void removesUnusedMysqlUserVariableInitializerFromDerivedSelect() {
         SqlConversionResult result = converter.convert("""
                 select wrapped.id
@@ -3998,6 +4019,37 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.changed()).isFalse();
         assertThat(result.reason()).contains("INSERT IGNORE");
+    }
+
+    @Test
+    void convertsInsertIgnoreSelectWithEveryReachableUniqueConflictKey() {
+        SqlConversionResult result = converter.convertInsertIgnoreWithConflictKeyGroups(
+                """
+                        insert ignore into sample_job_config(
+                            logical_job_name, version_no, job_name, main_class
+                        )
+                        select #{logicalJobName}, #{version}, #{jobName}, #{mainClass};
+                        """,
+                List.of(
+                        List.of("logical_job_name", "version_no"),
+                        List.of("job_name")
+                )
+        );
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("MERGE INTO sample_job_config t")
+                .contains("SELECT #{logicalJobName} AS logical_job_name")
+                .contains("(t.logical_job_name = s.logical_job_name"
+                        + " AND t.version_no = s.version_no)"
+                        + " OR (t.job_name = s.job_name)")
+                .contains("WHEN NOT MATCHED THEN INSERT"
+                        + " (logical_job_name, version_no, job_name, main_class)")
+                .doesNotContainIgnoringCase("INSERT IGNORE")
+                .doesNotContain("WHEN MATCHED");
+        assertThat(result.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE);
     }
 
     @Test

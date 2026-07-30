@@ -82,6 +82,25 @@ class SqlRewriteConfigLoaderTest {
     }
 
     @Test
+    void parsesMultipleInsertIgnoreConflictKeyGroups() {
+        SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
+                "upsertKeys:",
+                "  tables:",
+                "    {}",
+                "  methods:",
+                "    \"com.example.JobMapper.insert\":",
+                "      keyColumns: []",
+                "      conflictKeyGroups: [[logical_name, version_no], [job_name]]"
+        ));
+
+        assertThat(config.conflictKeyGroupsFor("com.example.JobMapper.insert"))
+                .containsExactly(
+                        List.of("logical_name", "version_no"),
+                        List.of("job_name")
+                );
+    }
+
+    @Test
     void resolvesUpsertManualReviewReasonFromMetadataDiagnosis() {
         SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
                 "upsertKeyResolutions:",

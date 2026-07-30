@@ -57,6 +57,7 @@ class SqlRewriteConfigUpdater {
             boolean configured = candidate.outerJoinSource()
                     ? hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()))
                     : hasConfiguredKeyColumns(model.methodColumns(candidate.methodKey()))
+                    || !model.methodConflictKeyGroups(candidate.methodKey()).isEmpty()
                     || hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()));
             if (configured) {
                 if (!candidate.outerJoinSource()) {
@@ -71,7 +72,18 @@ class SqlRewriteConfigUpdater {
                     tableInferenceResults
                             .computeIfAbsent(DamengMetadataReader.normalizeTableName(candidate.tableName()), ignored -> new ArrayList<>())
                             .add(inferenceResult);
-                    if (inferenceResult.inferred()) {
+                    if (inferenceResult.hasMultipleConflictKeys()) {
+                        model.ensureMethod(candidate.methodKey(), List.of());
+                        model.putMethodConflictKeyGroups(
+                                candidate.methodKey(),
+                                inferenceResult.conflictKeyGroups()
+                        );
+                        model.removeMethodResolution(candidate.methodKey());
+                        warnings.add("Inferred INSERT IGNORE conflictKeyGroups "
+                                + inferenceResult.conflictKeyGroups()
+                                + " for " + candidate.methodKey()
+                                + " from " + inferenceResult.source() + ".");
+                    } else if (inferenceResult.inferred()) {
                         if (candidate.outerJoinSource()) {
                             model.putTable(candidate.tableName(), inferenceResult.keyColumns());
                             warnings.add("Inferred source keyColumns " + inferenceResult.keyColumns()
@@ -80,6 +92,7 @@ class SqlRewriteConfigUpdater {
                         } else {
                             inferredMethodKeys.put(candidate.methodKey(), inferenceResult.keyColumns());
                             model.putMethod(candidate.methodKey(), inferenceResult.keyColumns());
+                            model.removeMethodConflictKeyGroups(candidate.methodKey());
                             model.removeMethodResolution(candidate.methodKey());
                             warnings.add("Inferred keyColumns " + inferenceResult.keyColumns()
                                     + " for " + candidate.methodKey()
@@ -91,6 +104,7 @@ class SqlRewriteConfigUpdater {
                                     + candidate.tableName() + ": " + inferenceResult.reason());
                         } else {
                             model.ensureMethod(candidate.methodKey(), List.of());
+                            model.removeMethodConflictKeyGroups(candidate.methodKey());
                             model.putMethodResolution(candidate.methodKey(), inferenceResult.resolutionCode());
                             if (UpsertKeyInference.RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT.equals(
                                     inferenceResult.resolutionCode()
@@ -225,8 +239,19 @@ class SqlRewriteConfigUpdater {
                 loadedRewriteConfig.ignoredMissingColumns(),
                 loadedRewriteConfig.ignoredMissingSchemas(),
                 mergedIdentityInsertTables(loadedRewriteConfig, model),
-                model.methodResolutions()
+                model.methodResolutions(),
+                mergedMethodConflictKeyGroups(loadedRewriteConfig, model)
         );
+    }
+
+    private Map<String, List<List<String>>> mergedMethodConflictKeyGroups(
+            SqlRewriteConfig loadedRewriteConfig,
+            RewriteConfigModel model
+    ) {
+        Map<String, List<List<String>>> groups =
+                new LinkedHashMap<>(loadedRewriteConfig.methodConflictKeyGroups());
+        groups.putAll(model.nonEmptyMethodConflictKeyGroups());
+        return groups;
     }
 
     private Set<String> mergedIdentityInsertTables(SqlRewriteConfig loadedRewriteConfig, RewriteConfigModel model) {
@@ -284,6 +309,8 @@ class SqlRewriteConfigUpdater {
     private static final class RewriteConfigModel {
         private final LinkedHashMap<String, List<String>> tableKeys = new LinkedHashMap<>();
         private final LinkedHashMap<String, List<String>> methodKeys = new LinkedHashMap<>();
+        private final LinkedHashMap<String, List<List<String>>> methodConflictKeyGroups =
+                new LinkedHashMap<>();
         private final LinkedHashMap<String, String> methodResolutions = new LinkedHashMap<>();
         private final List<String> identityInsertLines = new ArrayList<>();
         private final LinkedHashSet<String> identityInsertTables = new LinkedHashSet<>();
@@ -331,6 +358,27 @@ class SqlRewriteConfigUpdater {
             methodKeys.put(method.trim(), cleanColumns(columns));
         }
 
+        void putMethodConflictKeyGroups(String method, List<List<String>> conflictKeyGroups) {
+            if (method == null || method.isBlank()) {
+                return;
+            }
+            methodKeys.putIfAbsent(method.trim(), List.of());
+            List<List<String>> cleanGroups =
+                    (conflictKeyGroups == null ? List.<List<String>>of() : conflictKeyGroups).stream()
+                            .map(RewriteConfigModel::cleanColumns)
+                            .filter(group -> !group.isEmpty())
+                            .toList();
+            if (!cleanGroups.isEmpty()) {
+                methodConflictKeyGroups.put(method.trim(), List.copyOf(cleanGroups));
+            }
+        }
+
+        void removeMethodConflictKeyGroups(String method) {
+            if (method != null) {
+                methodConflictKeyGroups.remove(method.trim());
+            }
+        }
+
         void putMethodResolution(String method, String resolutionCode) {
             if (method == null || method.isBlank() || resolutionCode == null || resolutionCode.isBlank()) {
                 return;
@@ -353,6 +401,10 @@ class SqlRewriteConfigUpdater {
             return methodKeys.getOrDefault(method, List.of());
         }
 
+        List<List<String>> methodConflictKeyGroups(String method) {
+            return methodConflictKeyGroups.getOrDefault(method, List.of());
+        }
+
         Map<String, List<String>> nonEmptyTableKeys() {
             Map<String, List<String>> result = new LinkedHashMap<>();
             tableKeys.forEach((table, columns) -> {
@@ -371,6 +423,10 @@ class SqlRewriteConfigUpdater {
                 }
             });
             return result;
+        }
+
+        Map<String, List<List<String>>> nonEmptyMethodConflictKeyGroups() {
+            return Map.copyOf(methodConflictKeyGroups);
         }
 
         Map<String, String> methodResolutions() {
@@ -420,12 +476,21 @@ class SqlRewriteConfigUpdater {
             if (methodKeys.isEmpty()) {
                 yaml.append("    {}\n");
             } else {
-                methodKeys.forEach((method, columns) -> yaml.append("    \"")
-                        .append(escapeYaml(method))
-                        .append("\":\n")
-                        .append("      keyColumns: ")
-                        .append(inlineList(columns))
-                        .append("\n"));
+                methodKeys.forEach((method, columns) -> {
+                    yaml.append("    \"")
+                            .append(escapeYaml(method))
+                            .append("\":\n")
+                            .append("      keyColumns: ")
+                            .append(inlineList(columns))
+                            .append("\n");
+                    List<List<String>> conflictKeyGroups =
+                            methodConflictKeyGroups.getOrDefault(method, List.of());
+                    if (!conflictKeyGroups.isEmpty()) {
+                        yaml.append("      conflictKeyGroups: ")
+                                .append(nestedInlineList(conflictKeyGroups))
+                                .append("\n");
+                    }
+                });
             }
             if (!methodResolutions.isEmpty()) {
                 yaml.append("\n")
@@ -530,6 +595,17 @@ class SqlRewriteConfigUpdater {
                         methodKeys.put(currentName, keyColumns);
                     }
                 }
+                if (indent == 6
+                        && "methods".equals(section)
+                        && !currentName.isBlank()
+                        && trimmed.startsWith("conflictKeyGroups:")) {
+                    List<List<String>> conflictKeyGroups = parseNestedInlineLists(
+                            trimmed.substring("conflictKeyGroups:".length())
+                    );
+                    if (!conflictKeyGroups.isEmpty()) {
+                        methodConflictKeyGroups.put(currentName, conflictKeyGroups);
+                    }
+                }
             }
         }
 
@@ -616,6 +692,36 @@ class SqlRewriteConfigUpdater {
             return values;
         }
 
+        private static List<List<String>> parseNestedInlineLists(String value) {
+            String trimmed = value.trim();
+            if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+                return List.of();
+            }
+            String body = trimmed.substring(1, trimmed.length() - 1).trim();
+            List<List<String>> groups = new ArrayList<>();
+            int index = 0;
+            while (index < body.length()) {
+                while (index < body.length()
+                        && (Character.isWhitespace(body.charAt(index)) || body.charAt(index) == ',')) {
+                    index++;
+                }
+                if (index >= body.length() || body.charAt(index) != '[') {
+                    return List.of();
+                }
+                int close = body.indexOf(']', index + 1);
+                if (close < 0) {
+                    return List.of();
+                }
+                List<String> group = parseInlineList(body.substring(index, close + 1));
+                if (group.isEmpty()) {
+                    return List.of();
+                }
+                groups.add(group);
+                index = close + 1;
+            }
+            return List.copyOf(groups);
+        }
+
         private static List<String> cleanColumns(List<String> columns) {
             if (columns == null || columns.isEmpty()) {
                 return List.of();
@@ -631,6 +737,12 @@ class SqlRewriteConfigUpdater {
                 return "[]";
             }
             return "[" + String.join(", ", values.stream().map(RewriteConfigModel::quoteValue).toList()) + "]";
+        }
+
+        private static String nestedInlineList(List<List<String>> groups) {
+            return "[" + String.join(", ", groups.stream()
+                    .map(RewriteConfigModel::inlineList)
+                    .toList()) + "]";
         }
 
         private static String quoteValue(String value) {

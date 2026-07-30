@@ -4,6 +4,7 @@ import com.github.dmadapter.core.SqlConversionResult;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -498,6 +499,21 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     @Override
     public SqlConversionResult convert(String sql, List<String> upsertKeyColumns) {
+        return convert(sql, upsertKeyColumns, List.of());
+    }
+
+    public SqlConversionResult convertInsertIgnoreWithConflictKeyGroups(
+            String sql,
+            List<List<String>> conflictKeyGroups
+    ) {
+        return convert(sql, List.of(), conflictKeyGroups);
+    }
+
+    private SqlConversionResult convert(
+            String sql,
+            List<String> upsertKeyColumns,
+            List<List<String>> insertIgnoreConflictKeyGroups
+    ) {
         if (sql == null || sql.isBlank()) {
             return SqlConversionResult.unchanged(sql == null ? "" : sql);
         }
@@ -983,7 +999,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_INSERT_VALUE_TO_VALUES_RULE);
         }
 
-        GenericConversion insertIgnoreConversion = convertInsertIgnore(converted, upsertKeyColumns);
+        GenericConversion insertIgnoreConversion = insertIgnoreConflictKeyGroups == null
+                || insertIgnoreConflictKeyGroups.isEmpty()
+                ? convertInsertIgnore(converted, upsertKeyColumns)
+                : convertInsertIgnoreWithConflictKeyGroupsInternal(
+                        converted,
+                        insertIgnoreConflictKeyGroups
+                );
         if (insertIgnoreConversion.changed()) {
             converted = insertIgnoreConversion.convertedSql();
             rules.add(MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE);
@@ -1732,6 +1754,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (containsPatternOutsideIgnoredText(sql, INSERT_IGNORE_PATTERN)) {
             return "INSERT IGNORE requires configured keyColumns for safe Dameng MERGE rewrite.";
         }
+        String statefulUserVariableReason = interdependentUserVariableAssignmentReason(sql);
+        if (!statefulUserVariableReason.isBlank()) {
+            return statefulUserVariableReason;
+        }
         if (containsMysqlUserVariable(sql)) {
             return "MySQL user variables such as @var require ROW_NUMBER, explicit variables, or procedure-level rewrite for Dameng.";
         }
@@ -1810,6 +1836,92 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return false;
+    }
+
+    private String interdependentUserVariableAssignmentReason(String sql) {
+        String source = sql == null ? "" : sql;
+        List<UserVariableAssignmentPosition> assignments = mysqlUserVariableAssignments(source);
+        LinkedHashSet<String> assignedNames = new LinkedHashSet<>();
+        for (UserVariableAssignmentPosition assignment : assignments) {
+            assignedNames.add(assignment.name());
+        }
+        if (assignedNames.size() < 2) {
+            return "";
+        }
+        boolean interdependent = false;
+        for (int index = 0; index < assignments.size() && !interdependent; index++) {
+            UserVariableAssignmentPosition assignment = assignments.get(index);
+            int expressionEnd = index + 1 < assignments.size()
+                    ? assignments.get(index + 1).startIndex()
+                    : source.length();
+            String expression = source.substring(assignment.expressionStartIndex(), expressionEnd);
+            for (String assignedName : assignedNames) {
+                if (assignedName.equals(assignment.name())) {
+                    continue;
+                }
+                if (containsMysqlUserVariableReference(expression, assignedName, 0, 0)) {
+                    interdependent = true;
+                    break;
+                }
+            }
+        }
+        if (!interdependent) {
+            return "";
+        }
+        List<String> displayNames = assignedNames.stream()
+                .map(name -> "@" + name)
+                .toList();
+        return "Original SQL depends on the evaluation order of interdependent MySQL user-variable "
+                + "assignments (" + String.join(", ", displayNames) + ") within one statement. "
+                + "MySQL does not provide a stable SQL evaluation-order semantic for this pattern, "
+                + "so an automatic Dameng rewrite would guess business intent. Fix the original SQL "
+                + "with an explicit window/gaps-and-islands query, or provide the intended row order "
+                + "and grouping semantics.";
+    }
+
+    private List<UserVariableAssignmentPosition> mysqlUserVariableAssignments(String sql) {
+        List<UserVariableAssignmentPosition> assignments = new ArrayList<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '@' && (index + 1 >= sql.length() || sql.charAt(index + 1) != '@')) {
+                int nameStart = index + 1;
+                int nameEnd = nameStart;
+                while (nameEnd < sql.length() && isMysqlUserVariableNamePart(sql.charAt(nameEnd))) {
+                    nameEnd++;
+                }
+                int assignmentOperator = skipWhitespace(sql, nameEnd);
+                if (nameEnd > nameStart
+                        && assignmentOperator + 1 < sql.length()
+                        && sql.charAt(assignmentOperator) == ':'
+                        && sql.charAt(assignmentOperator + 1) == '=') {
+                    assignments.add(new UserVariableAssignmentPosition(
+                            sql.substring(nameStart, nameEnd).toLowerCase(Locale.ROOT),
+                            index,
+                            assignmentOperator + 2
+                    ));
+                    index = assignmentOperator + 2;
+                } else {
+                    index = nameEnd > nameStart ? nameEnd : index + 1;
+                }
+            } else {
+                index++;
+            }
+        }
+        return assignments;
     }
 
     private boolean isMysqlUserVariablePart(char value) {
@@ -8506,12 +8618,29 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertInsertIgnore(String sql, List<String> keyColumns) {
-        InsertValues insert = readInsertValues(sql, true);
+        InsertValues insert = readInsertIgnoreSingleSource(sql);
         if (insert == null || normalizedKeyColumns(keyColumns).isEmpty()) {
             return GenericConversion.unchanged(sql);
         }
         String converted = mergeSql(insert, List.of(), keyColumns);
         return converted == null ? GenericConversion.unchanged(sql) : new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInsertIgnoreWithConflictKeyGroupsInternal(
+            String sql,
+            List<List<String>> conflictKeyGroups
+    ) {
+        InsertValues insert = readInsertIgnoreSingleSource(sql);
+        if (insert == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        String converted = mergeSqlWithConflictKeyGroups(insert, List.of(), conflictKeyGroups);
+        return converted == null ? GenericConversion.unchanged(sql) : new GenericConversion(converted, true);
+    }
+
+    private InsertValues readInsertIgnoreSingleSource(String sql) {
+        InsertValues valuesInsert = readInsertValues(sql, true);
+        return valuesInsert == null ? readInsertIgnoreSelectWithoutFrom(sql) : valuesInsert;
     }
 
     private GenericConversion convertOnDuplicateKeyUpdate(String sql, List<String> keyColumns) {
@@ -8541,19 +8670,45 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (normalizedKeys.isEmpty()) {
             return null;
         }
-        List<InsertColumn> matchColumns = new ArrayList<>();
-        for (String keyColumn : normalizedKeys) {
-            InsertColumn matchColumn = insert.columns().stream()
-                    .filter(column -> column.name().key().equals(keyColumn))
-                    .findFirst()
-                    .orElse(null);
-            if (matchColumn == null) {
+        return mergeSqlWithConflictKeyGroups(insert, updateAssignments, List.of(keyColumns));
+    }
+
+    private String mergeSqlWithConflictKeyGroups(
+            InsertValues insert,
+            List<UpdateAssignment> updateAssignments,
+            List<List<String>> conflictKeyGroups
+    ) {
+        List<List<String>> normalizedGroups = new ArrayList<>();
+        for (List<String> keyGroup : conflictKeyGroups == null ? List.<List<String>>of() : conflictKeyGroups) {
+            List<String> normalizedGroup = normalizedKeyColumns(keyGroup);
+            if (normalizedGroup.isEmpty()) {
                 return null;
             }
-            matchColumns.add(matchColumn);
+            normalizedGroups.add(normalizedGroup);
         }
+        if (normalizedGroups.isEmpty()) {
+            return null;
+        }
+        List<List<InsertColumn>> matchColumnGroups = new ArrayList<>();
+        for (List<String> normalizedGroup : normalizedGroups) {
+            List<InsertColumn> matchColumns = new ArrayList<>();
+            for (String keyColumn : normalizedGroup) {
+                InsertColumn matchColumn = insert.columns().stream()
+                        .filter(column -> column.name().key().equals(keyColumn))
+                        .findFirst()
+                        .orElse(null);
+                if (matchColumn == null) {
+                    return null;
+                }
+                matchColumns.add(matchColumn);
+            }
+            matchColumnGroups.add(matchColumns);
+        }
+        Set<String> normalizedKeys = normalizedGroups.stream()
+                .flatMap(List::stream)
+                .collect(java.util.stream.Collectors.toSet());
         List<UpdateAssignment> effectiveAssignments = updateAssignments.stream()
-                .filter(assignment -> normalizedKeys.stream().noneMatch(key -> key.equals(assignment.column().key())))
+                .filter(assignment -> !normalizedKeys.contains(assignment.column().key()))
                 .toList();
         if (effectiveAssignments.stream().anyMatch(assignment -> insert.columns().stream()
                 .noneMatch(column -> column.name().key().equals(assignment.column().key())))) {
@@ -8579,14 +8734,26 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         converted.append(" FROM dual\n")
                 .append(") s\n");
         converted.append("ON (");
-        for (int i = 0; i < matchColumns.size(); i++) {
-            InsertColumn matchColumn = matchColumns.get(i);
-            if (i > 0) {
-                converted.append(" AND ");
+        for (int groupIndex = 0; groupIndex < matchColumnGroups.size(); groupIndex++) {
+            List<InsertColumn> matchColumns = matchColumnGroups.get(groupIndex);
+            if (groupIndex > 0) {
+                converted.append(" OR ");
             }
-            converted.append(qualifiedIdentifier("t", matchColumn.name()))
-                    .append(" = ")
-                    .append(qualifiedIdentifier("s", matchColumn.name()));
+            if (matchColumnGroups.size() > 1) {
+                converted.append("(");
+            }
+            for (int columnIndex = 0; columnIndex < matchColumns.size(); columnIndex++) {
+                InsertColumn matchColumn = matchColumns.get(columnIndex);
+                if (columnIndex > 0) {
+                    converted.append(" AND ");
+                }
+                converted.append(qualifiedIdentifier("t", matchColumn.name()))
+                        .append(" = ")
+                        .append(qualifiedIdentifier("s", matchColumn.name()));
+            }
+            if (matchColumnGroups.size() > 1) {
+                converted.append(")");
+            }
         }
         converted.append(")\n");
         if (!effectiveAssignments.isEmpty()) {
@@ -8673,6 +8840,74 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return new OnDuplicateKeyInsert(insert, sql.substring(index, statementEnd));
+    }
+
+    private InsertValues readInsertIgnoreSelectWithoutFrom(String sql) {
+        int insertIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, insertIndex, "INSERT")) {
+            return null;
+        }
+        int index = skipWhitespace(sql, insertIndex + "INSERT".length());
+        if (!startsKeyword(sql, index, "IGNORE")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "IGNORE".length());
+        if (!startsKeyword(sql, index, "INTO")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "INTO".length());
+        int columnOpenIndex = findTopLevelChar(sql, '(', index);
+        if (columnOpenIndex < 0) {
+            return null;
+        }
+        String tableName = sql.substring(index, columnOpenIndex).trim();
+        if (tableName.isBlank()
+                || containsMyBatisPlaceholder(tableName)
+                || containsWhitespaceOutsideQuotedText(tableName)) {
+            return null;
+        }
+        int columnCloseIndex = findMatchingParen(sql, columnOpenIndex);
+        if (columnCloseIndex < 0) {
+            return null;
+        }
+        List<IdentifierName> columnNames =
+                readInsertColumns(sql.substring(columnOpenIndex + 1, columnCloseIndex));
+        if (columnNames.isEmpty()) {
+            return null;
+        }
+        int selectIndex = skipWhitespace(sql, columnCloseIndex + 1);
+        if (!startsKeyword(sql, selectIndex, "SELECT")) {
+            return null;
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        int projectionStart = skipWhitespace(sql, selectIndex + "SELECT".length());
+        if (projectionStart >= statementEnd
+                || findTopLevelKeyword(sql.substring(0, statementEnd), "FROM", projectionStart) >= 0
+                || findTopLevelKeyword(sql.substring(0, statementEnd), "UNION", projectionStart) >= 0) {
+            return null;
+        }
+        List<TopLevelArgument> projections =
+                splitTopLevelArguments(sql.substring(projectionStart, statementEnd));
+        if (projections.size() != columnNames.size()) {
+            return null;
+        }
+        List<InsertColumn> columns = new ArrayList<>();
+        for (int projectionIndex = 0; projectionIndex < columnNames.size(); projectionIndex++) {
+            String value = projections.get(projectionIndex).text().trim();
+            if (value.isBlank()) {
+                return null;
+            }
+            columns.add(new InsertColumn(columnNames.get(projectionIndex), value));
+        }
+        return new InsertValues(
+                insertIndex,
+                statementEnd,
+                statementEnd,
+                sql.substring(0, insertIndex),
+                sql.substring(statementEnd),
+                tableName,
+                columns
+        );
     }
 
     private InsertValues readInsertValues(String sql, boolean requireIgnore) {
@@ -11307,6 +11542,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record UserVariableInitialization(String name) {
+    }
+
+    private record UserVariableAssignmentPosition(
+            String name,
+            int startIndex,
+            int expressionStartIndex
+    ) {
     }
 
     private record GroupConcatOrderBy(String orderBy, String separator) {
