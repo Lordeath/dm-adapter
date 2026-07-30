@@ -7753,6 +7753,9 @@ class DmSqlValidationTestGenerator {
                     }
                     if (parameters.args.length == 1) {
                         Object value = parameters.args[0];
+                        if (value == null) {
+                            return null;
+                        }
                         if (value instanceof Map<?, ?>) {
                             Map<String, Object> params = serializableMap((Map<?, ?>) value);
                             return params.isEmpty() ? null : MethodArgumentConfig.params(params);
@@ -9478,6 +9481,9 @@ class DmSqlValidationTestGenerator {
                     String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
+                            || (lower.contains("methodfailedexception")
+                                    && lower.contains("nosuchmethodexception")
+                                    && lower.contains("dynamiccontext$contextmap"))
                             || Pattern.compile("(?i)### SQL:\\\\s*update\\\\s+from\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:\\\\s*update\\\\s+(?!from\\\\b)[^\\\\s;]+\\\\s+where\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+(?:where|$)").matcher(value).find()

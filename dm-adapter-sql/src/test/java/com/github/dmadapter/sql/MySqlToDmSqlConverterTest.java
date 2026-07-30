@@ -2357,6 +2357,27 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void quotesDamengAuditKeywordInQualifiedAndBareColumnPositions() {
+        SqlConversionResult result = converter.convert("""
+                select relation.audit
+                from user_param_relation relation
+                where relation.audit = #{audit};
+                insert into user_param_relation(id, audit) values (#{id}, #{audit});
+                update user_param_relation set audit = #{audit} where id = #{id}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select relation."audit"
+                from user_param_relation relation
+                where relation."audit" = #{audit};
+                insert into user_param_relation(id, "audit") values (#{id}, #{audit});
+                update user_param_relation set "audit" = #{audit} where id = #{id}
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+    }
+
+    @Test
     void quotesDamengKeywordQualifiedColumnIdentifiers() {
         SqlConversionResult result = converter.convert("""
                 select id
