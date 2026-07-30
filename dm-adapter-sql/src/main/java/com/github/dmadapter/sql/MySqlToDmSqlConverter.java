@@ -115,6 +115,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE = "DAMENG_KEYWORD_IDENTIFIER_QUOTE";
     public static final String MYSQL_UPDATE_ORDER_LIMIT_ONE_RULE = "MYSQL_UPDATE_ORDER_LIMIT_ONE_TO_ROWID";
     public static final String MYSQL_DELETE_ORDER_LIMIT_ONE_RULE = "MYSQL_DELETE_ORDER_LIMIT_ONE_TO_ROWID";
+    public static final String MYSQL_UPDATE_LIMIT_RULE = "MYSQL_UPDATE_LIMIT_TO_ROWID";
+    public static final String MYSQL_DELETE_LIMIT_RULE = "MYSQL_DELETE_LIMIT_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYSQL_HOUR_SECOND_INTERVAL_RULE =
@@ -331,6 +333,17 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     + "column_type\\s+(?:as\\s+)?(?<typeAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
                     + "column_comment\\s+(?:as\\s+)?(?<commentAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s*,\\s*"
                     + "is_nullable\\s+(?:as\\s+)?(?<nullableAlias>[A-Za-z_][A-Za-z0-9_$]*)\\s+"
+                    + "from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
+                    + "(?<where>.+?)\\s*;?\\s*$"
+    );
+    private static final Pattern INFORMATION_SCHEMA_COLUMNS_RUNTIME_DETAIL_PATTERN = Pattern.compile(
+            "(?is)^\\s*select\\s+"
+                    + "column_name\\s+(?:as\\s+)?(?<columnAlias>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "data_type\\s+(?:as\\s+)?(?<dataTypeAlias>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "column_type\\s+(?:as\\s+)?(?<columnTypeAlias>" + DM_IDENTIFIER + ")\\s*,\\s*"
+                    + "column_comment\\s+(?:as\\s+)?(?<commentAlias>" + DM_IDENTIFIER + ")"
+                    + "(?:\\s*,\\s*column_default\\s+(?:as\\s+)?"
+                    + "(?<defaultAlias>" + DM_IDENTIFIER + "))?\\s+"
                     + "from\\s+information_schema\\s*\\.\\s*columns\\s+where\\s+"
                     + "(?<where>.+?)\\s*;?\\s*$"
     );
@@ -940,6 +953,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (deleteOrderLimitConversion.changed()) {
             converted = deleteOrderLimitConversion.convertedSql();
             rules.add(MYSQL_DELETE_ORDER_LIMIT_ONE_RULE);
+        }
+
+        GenericConversion updateLimitConversion = convertMysqlUpdateLimit(converted);
+        if (updateLimitConversion.changed()) {
+            converted = updateLimitConversion.convertedSql();
+            rules.add(MYSQL_UPDATE_LIMIT_RULE);
+        }
+
+        GenericConversion deleteLimitConversion = convertMysqlDeleteLimit(converted);
+        if (deleteLimitConversion.changed()) {
+            converted = deleteLimitConversion.convertedSql();
+            rules.add(MYSQL_DELETE_LIMIT_RULE);
         }
 
         LimitConversion limitConversion = convertLimit(converted);
@@ -4708,6 +4733,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (descriptorConversion.changed()) {
             return descriptorConversion;
         }
+        GenericConversion runtimeDetailConversion = convertInformationSchemaRuntimeColumnDetails(sql);
+        if (runtimeDetailConversion.changed()) {
+            return runtimeDetailConversion;
+        }
         GenericConversion detailConversion = convertInformationSchemaColumnsDetail(sql);
         if (detailConversion.changed()) {
             return detailConversion;
@@ -4747,6 +4776,61 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + " ORDER BY COLUMN_ID"
                 + (direction == null || direction.isBlank() ? "" : " " + direction.toUpperCase(Locale.ROOT));
         return new GenericConversion(converted, true);
+    }
+
+    private GenericConversion convertInformationSchemaRuntimeColumnDetails(String sql) {
+        Matcher matcher = INFORMATION_SCHEMA_COLUMNS_RUNTIME_DETAIL_PATTERN.matcher(sql);
+        if (!matcher.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        MetadataColumnFilter filter = parseMetadataColumnFilter(matcher.group("where"), false);
+        if (filter == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        String owner = metadataOwnerExpression(filter.tableSchema());
+        if (owner.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String defaultAlias = matcher.group("defaultAlias");
+        String converted = "SELECT\n"
+                + "    sc.NAME AS " + quotedMetadataAlias(matcher.group("columnAlias")) + ",\n"
+                + "    sc.TYPE$ AS " + quotedMetadataAlias(matcher.group("dataTypeAlias")) + ",\n"
+                + metadataColumnTypeProjection(matcher.group("columnTypeAlias"))
+                + ",\n"
+                + "    scc.COMMENT$ AS " + quotedMetadataAlias(matcher.group("commentAlias"))
+                + (defaultAlias == null || defaultAlias.isBlank()
+                        ? "\n"
+                        : ",\n    sc.DEFVAL AS " + quotedMetadataAlias(defaultAlias) + "\n")
+                + "FROM SYS.SYSCOLUMNS sc\n"
+                + "JOIN SYS.SYSOBJECTS obj\n"
+                + "    ON obj.ID = sc.ID\n"
+                + "    AND obj.TYPE$ = 'SCHOBJ'\n"
+                + "    AND obj.SUBTYPE$ = 'UTAB'\n"
+                + "JOIN SYS.SYSOBJECTS sch\n"
+                + "    ON sch.ID = obj.SCHID\n"
+                + "    AND sch.TYPE$ = 'SCH'\n"
+                + "LEFT JOIN SYS.SYSCOLUMNCOMMENTS scc\n"
+                + "    ON scc.SCHNAME = sch.NAME\n"
+                + "    AND scc.TVNAME = obj.NAME\n"
+                + "    AND scc.COLNAME = sc.NAME\n"
+                + "WHERE sch.NAME = " + owner + "\n"
+                + "    AND obj.NAME = UPPER(" + filter.tableName() + ")\n"
+                + "ORDER BY sc.COLID";
+        return new GenericConversion(converted, true);
+    }
+
+    private String metadataColumnTypeProjection(String alias) {
+        return "    CASE\n"
+                + "        WHEN sc.SCALE = 0\n"
+                + "            AND (REGEXP_LIKE(sc.TYPE$, 'INT|REAL|BIT|^DATE$|TIME|FLOAT|DOUBLE')\n"
+                + "                OR sc.LENGTH$ = 2147483647)\n"
+                + "            THEN sc.TYPE$\n"
+                + "        WHEN sc.SCALE <> 0 AND REGEXP_LIKE(sc.TYPE$, 'NUM|DEC')\n"
+                + "            THEN sc.TYPE$ || '(' || sc.LENGTH$ || ',' || sc.SCALE || ')'\n"
+                + "        WHEN sc.SCALE <> 0 AND REGEXP_LIKE(sc.TYPE$, 'TIME')\n"
+                + "            THEN sc.TYPE$ || '(' || sc.SCALE || ')'\n"
+                + "        ELSE sc.TYPE$ || '(' || sc.LENGTH$ || ')'\n"
+                + "    END AS " + quotedMetadataAlias(alias);
     }
 
     private GenericConversion convertInformationSchemaCommonColumnProjections(String sql) {
@@ -5139,8 +5223,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String tableName = tableNameMatcher.group("value").trim();
         Matcher tableSchemaMatcher = METADATA_TABLE_SCHEMA_CONDITION.matcher(whereClause);
         String tableSchema = tableSchemaMatcher.find() ? tableSchemaMatcher.group("value").trim() : "";
+        Matcher tableTypeMatcher = METADATA_TABLE_TYPE_CONDITION.matcher(whereClause);
+        String tableType = tableTypeMatcher.find() ? tableTypeMatcher.group("value") : "";
+        if (!tableType.isBlank() && !"'BASE TABLE'".equalsIgnoreCase(tableType)) {
+            return GenericConversion.unchanged(sql);
+        }
         String residual = tableNameMatcher.replaceAll("");
         residual = METADATA_TABLE_SCHEMA_CONDITION.matcher(residual).replaceAll("");
+        residual = METADATA_TABLE_TYPE_CONDITION.matcher(residual).replaceAll("");
         residual = residual.replaceAll("(?i)\\bAND\\b", "")
                 .replaceAll("[()\\s]", "");
         if (!residual.isBlank()) {
@@ -7525,6 +7615,127 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 .append(") where ROWNUM <= 1)")
                 .append(sql.substring(statementEnd));
         return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertMysqlUpdateLimit(String sql) {
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int setIndex = findTopLevelKeyword(sql, "SET", updateIndex + "UPDATE".length());
+        if (setIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int limitIndex = findTopLevelKeyword(sql, "LIMIT", setIndex + "SET".length());
+        if (limitIndex < 0
+                || findTopLevelKeyword(sql, "ORDER", setIndex + "SET".length()) >= 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        String limit = simpleLimitRowCount(sql.substring(limitIndex + "LIMIT".length(), statementEnd));
+        if (limit.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        int tableStart = skipWhitespace(sql, updateIndex + "UPDATE".length());
+        IdentifierToken table = readQualifiedIdentifierToken(sql, tableStart);
+        if (table == null || skipWhitespace(sql, table.endIndex()) != setIndex) {
+            return GenericConversion.unchanged(sql);
+        }
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
+        if (whereIndex >= limitIndex) {
+            return GenericConversion.unchanged(sql);
+        }
+        String setClause = sql.substring(
+                setIndex + "SET".length(),
+                whereIndex < 0 ? limitIndex : whereIndex
+        ).trim();
+        String whereClause = whereIndex < 0
+                ? ""
+                : sql.substring(whereIndex + "WHERE".length(), limitIndex).trim();
+        if (setClause.isBlank() || (whereIndex >= 0 && whereClause.isBlank())) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String tableName = table.text();
+        StringBuilder converted = new StringBuilder(sql.length() + whereClause.length() + 80);
+        converted.append(sql, 0, updateIndex)
+                .append("update ")
+                .append(tableName)
+                .append(" set ")
+                .append(setClause)
+                .append(" where ROWID in (select ROWID from ")
+                .append(tableName);
+        appendLimitedRowPredicate(converted, whereClause, limit);
+        converted.append(")").append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private GenericConversion convertMysqlDeleteLimit(String sql) {
+        int deleteIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, deleteIndex, "DELETE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int fromIndex = skipWhitespace(sql, deleteIndex + "DELETE".length());
+        if (!startsKeyword(sql, fromIndex, "FROM")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableStart = skipWhitespace(sql, fromIndex + "FROM".length());
+        IdentifierToken table = readQualifiedIdentifierToken(sql, tableStart);
+        if (table == null) {
+            return GenericConversion.unchanged(sql);
+        }
+        int limitIndex = findTopLevelKeyword(sql, "LIMIT", table.endIndex());
+        if (limitIndex < 0
+                || findTopLevelKeyword(sql, "ORDER", table.endIndex()) >= 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        String limit = simpleLimitRowCount(sql.substring(limitIndex + "LIMIT".length(), statementEnd));
+        if (limit.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", table.endIndex());
+        int tableEnd = skipWhitespace(sql, table.endIndex());
+        if ((whereIndex < 0 && tableEnd != limitIndex)
+                || whereIndex >= limitIndex
+                || (whereIndex >= 0 && tableEnd != whereIndex)) {
+            return GenericConversion.unchanged(sql);
+        }
+        String whereClause = whereIndex < 0
+                ? ""
+                : sql.substring(whereIndex + "WHERE".length(), limitIndex).trim();
+        if (whereIndex >= 0 && whereClause.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String tableName = table.text();
+        StringBuilder converted = new StringBuilder(sql.length() + whereClause.length() + 80);
+        converted.append(sql, 0, deleteIndex)
+                .append("delete from ")
+                .append(tableName)
+                .append(" where ROWID in (select ROWID from ")
+                .append(tableName);
+        appendLimitedRowPredicate(converted, whereClause, limit);
+        converted.append(")").append(sql.substring(statementEnd));
+        return new GenericConversion(converted.toString(), true);
+    }
+
+    private String simpleLimitRowCount(String limitTail) {
+        Matcher matcher = Pattern.compile("(?is)^\\s*(?<count>" + TOKEN + ")\\s*$")
+                .matcher(limitTail == null ? "" : limitTail);
+        return matcher.matches() ? matcher.group("count").trim() : "";
+    }
+
+    private void appendLimitedRowPredicate(StringBuilder converted, String whereClause, String limit) {
+        if (whereClause.isBlank()) {
+            converted.append(" where ROWNUM <= ").append(limit);
+        } else {
+            converted.append(" where (")
+                    .append(whereClause)
+                    .append(") and ROWNUM <= ")
+                    .append(limit);
+        }
     }
 
     private boolean isOnlyLimitOne(String limitTail) {
