@@ -19,6 +19,7 @@
 - MySQL 的 `database` 通常迁移为达梦的 `schema`。验证 SQL 时不能默认所有对象都在当前 schema，跨库 SQL 要么映射到多个 schema，要么明确跳过缺失库表。
 - SQL 脚本中的 `USE database` 只在它与对应的 `--schema`/`--system-schema` 一致时自动替换为不含库名的说明注释，实际目标 schema 由运行参数选择；不一致或未配置时保留原语句并要求显式 database-to-schema 映射，不能把来源库名或当前验证 schema 固化为 `SET SCHEMA` 输出。
 - SQL 对象名中显式书写的来源库限定符，仅在它与当前脚本对应的 `--schema`/`--system-schema` 明确相同时去除，由外部执行上下文选择目标 schema；规则和输出都不能固化该配置值。未匹配的限定符可能是跨库依赖，必须保留并通过显式 database-to-schema 映射确认，不能猜测为当前 schema。
+- system 脚本文件名既包括 `20260205_system.sql`，也包括历史仓库中的 `01_Update_System_Enterprise.sql`、`2024.system.sql` 等形式。只要 `system` 是由点、下划线或连字符分隔的独立文件名段，就应使用 `--system-schema`；`ecosystem.sql`、`systematic.sql` 等普通单词不能误判。
 - MySQL 允许的零日期、非法日期需要在迁移前清洗。达梦不接受 `0000-00-00`、`0000-00-00 00:00:00` 这类值。
 
 ## 类型和对象差异

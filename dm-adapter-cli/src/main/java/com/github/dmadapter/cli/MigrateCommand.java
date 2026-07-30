@@ -94,7 +94,10 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--sql-scripts-only", description = "Only migrate SQL scripts; do not scan or modify Maven, mapper, or application files.")
     private boolean sqlScriptsOnly;
 
-    @Option(names = {"--system-schema", "--system_schema"}, description = "Dameng schema for validating *_system.sql scripts.")
+    @Option(
+            names = {"--system-schema", "--system_schema"},
+            description = "Dameng schema for validating SQL files with a delimited 'system' filename token."
+    )
     private String systemSchema;
 
     @Option(

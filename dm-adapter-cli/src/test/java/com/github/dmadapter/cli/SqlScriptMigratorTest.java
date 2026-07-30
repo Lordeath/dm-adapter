@@ -89,6 +89,48 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void routesDelimitedLegacySystemFilenameTokensWithoutMatchingOrdinaryWords() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql");
+        Path sqlRootOut = tempDir.resolve("sql-dm");
+        write(sqlRoot.resolve("01_Update_System_Enterprise.sql"), "select 1 from dual;\n");
+        write(sqlRoot.resolve("2024.system.sql"), "select 2 from dual;\n");
+        write(sqlRoot.resolve("system.sql"), "select 3 from dual;\n");
+        write(sqlRoot.resolve("ecosystem.sql"), "select 4 from dual;\n");
+        write(sqlRoot.resolve("systematic.sql"), "select 5 from dual;\n");
+        RecordingValidator validator = new RecordingValidator();
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-enterprise",
+                "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.scannedFileCount()).isEqualTo(5);
+        assertThat(validator.files)
+                .filteredOn(SqlScriptMigrator.PlannedSqlScriptFile::systemScript)
+                .extracting(file -> Path.of(file.outputDisplay()).getFileName().toString())
+                .containsExactlyInAnyOrder(
+                        "01_Update_System_Enterprise.sql",
+                        "2024.system.sql",
+                        "system.sql"
+                );
+        assertThat(validator.files)
+                .filteredOn(file -> !file.systemScript())
+                .extracting(file -> Path.of(file.outputDisplay()).getFileName().toString())
+                .containsExactlyInAnyOrder("ecosystem.sql", "systematic.sql");
+        assertThat(validator.files)
+                .filteredOn(SqlScriptMigrator.PlannedSqlScriptFile::systemScript)
+                .allSatisfy(file -> assertThat(file.schema()).isEqualTo("sample-system"));
+        assertThat(validator.files)
+                .filteredOn(file -> !file.systemScript())
+                .allSatisfy(file -> assertThat(file.schema()).isEqualTo("sample-enterprise"));
+    }
+
+    @Test
     void convertsScriptLeftJoinUpdateWhenProjectDdlProvesSourceKeyUnique() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
