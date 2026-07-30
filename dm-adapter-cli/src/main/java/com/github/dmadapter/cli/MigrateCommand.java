@@ -419,11 +419,15 @@ public class MigrateCommand implements Callable<Integer> {
                         : context.projectRoot().resolve(rewriteConfig).toAbsolutePath().normalize());
     }
 
-    private List<RewriteConfigCandidate> rewriteConfigCandidates(MapperMigrationResult mapperMigrationResult) {
+    List<RewriteConfigCandidate> rewriteConfigCandidates(MapperMigrationResult mapperMigrationResult) {
         List<RewriteConfigCandidate> candidates = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
         MySqlToDmSqlConverter candidateExtractor = new MySqlToDmSqlConverter();
-        for (com.github.dmadapter.core.SqlChange sqlChange : mapperMigrationResult.manualReviewItems()) {
+        List<com.github.dmadapter.core.SqlChange> candidateChanges = new ArrayList<>(
+                mapperMigrationResult.manualReviewItems()
+        );
+        candidateChanges.addAll(mapperMigrationResult.automaticConversions());
+        for (com.github.dmadapter.core.SqlChange sqlChange : candidateChanges) {
             String sql = sqlChange.originalSql() == null ? "" : sqlChange.originalSql();
             String lower = sql.toLowerCase();
             String reason = sqlChange.reason() == null ? "" : sqlChange.reason().toLowerCase();
