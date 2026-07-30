@@ -4797,15 +4797,23 @@ class SqlScriptMigratorTest {
 
     @Test
     void validationConnectionFailureRedactsConnectionValues() {
+        AtomicInteger attempts = new AtomicInteger();
+        List<String> progress = new ArrayList<>();
         DmValidationEnvironment environment = DmValidationEnvironment.from(Map.of(
                 "DM_SQL_VALIDATION", "true",
                 "DM_JDBC_URL", "jdbc:dm://db-host:5236",
                 "DM_DB_USERNAME", "APP_USER",
                 "DM_DB_PASSWORD", "APP_SECRET"
         ));
-        SqlScriptValidator validator = new SqlScriptValidator(env -> {
-            throw new SQLException("Cannot connect jdbc:dm://db-host:5236 APP_USER APP_SECRET");
-        });
+        SqlScriptValidator validator = new SqlScriptValidator(
+                env -> {
+                    attempts.incrementAndGet();
+                    throw new SQLException("Cannot connect jdbc:dm://db-host:5236 APP_USER APP_SECRET");
+                },
+                progress::add,
+                3,
+                0L
+        );
 
         SqlScriptValidationRun result = validator.validate(List.of(new SqlScriptMigrator.PlannedSqlScriptFile(
                 "20260423.sql",
@@ -4823,11 +4831,54 @@ class SqlScriptMigratorTest {
         )), environment);
 
         assertThat(result.attempted()).isFalse();
+        assertThat(attempts).hasValue(3);
+        assertThat(progress)
+                .anySatisfy(message -> assertThat(message).contains("attempt 1/3", "retrying"))
+                .allSatisfy(message -> assertThat(message)
+                        .doesNotContain("jdbc:dm://db-host:5236")
+                        .doesNotContain("APP_USER")
+                        .doesNotContain("APP_SECRET"));
         assertThat(result.status())
                 .contains("******")
                 .doesNotContain("jdbc:dm://db-host:5236")
                 .doesNotContain("APP_USER")
                 .doesNotContain("APP_SECRET");
+    }
+
+    @Test
+    void validationConnectionRetriesTransientFailures() {
+        AtomicInteger attempts = new AtomicInteger();
+        Statement statement = proxy(Statement.class, (ignored, method, args) ->
+                defaultValue(method.getReturnType()));
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+        SqlScriptValidator validator = new SqlScriptValidator(
+                env -> {
+                    if (attempts.incrementAndGet() < 3) {
+                        throw new SQLException("database is temporarily unavailable");
+                    }
+                    return connection;
+                },
+                null,
+                3,
+                0L
+        );
+
+        SqlScriptValidationRun result = validator.validate(
+                List.of(plannedValidationFile(
+                        "retry.sql",
+                        "",
+                        List.of("select 1 from dual")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(attempts).hasValue(3);
+        assertThat(result.attempted()).isTrue();
+        assertThat(result.failures()).isEmpty();
+        assertThat(result.successCount()).isOne();
     }
 
     @Test
