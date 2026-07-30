@@ -313,6 +313,13 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 + ", statements=" + file.statements().size()
                 + ", executable=" + executableCount
                 + ", manualReview=" + file.manualReviewStatementIndexes().size());
+        if (executableCount == 0) {
+            progress("Validated SQL script [" + fileIndex + "/" + fileCount + "]: "
+                    + file.sourceDisplay()
+                    + ", attempted=0, succeeded=0, failed=0, elapsedMs="
+                    + elapsedMillis(fileStartedAt));
+            return new SqlScriptFileValidation(file.outputDisplay(), 0, List.of());
+        }
         try {
             applySchema(
                     connection,
