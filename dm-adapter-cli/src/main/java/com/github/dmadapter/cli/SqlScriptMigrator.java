@@ -135,8 +135,8 @@ class SqlScriptMigrator {
             "DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC";
     static final String MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE_RULE =
             "MYSQL_PROCEDURE_INSERT_IGNORE_TEMP_TO_MERGE";
-    static final String MYSQL_CREATE_TABLE_INLINE_KEY_REMOVAL_RULE =
-            "MYSQL_CREATE_TABLE_INLINE_KEY_REMOVED";
+    static final String MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM_RULE =
+            "MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM";
     static final String MYSQL_PROCEDURE_ASSIGNED_IN_PARAM_TO_LOCAL_RULE =
             "MYSQL_PROCEDURE_ASSIGNED_IN_PARAM_TO_LOCAL";
     static final String MYSQL_PROCEDURE_DYNAMIC_INSERT_IGNORE_TO_MERGE_RULE =
@@ -2956,7 +2956,7 @@ class SqlScriptMigrator {
                         sourceTableCharsets,
                         targetCapabilities
                 );
-                List<String> outputStatements = expandConvertedOutputStatements(conversion.outputSql());
+                List<String> outputStatements = expandConvertedOutputStatements(conversion);
                 String calledProcedureName = procedureNameFromCall(originalStatement);
                 boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
                         && manualReviewProcedureNames.contains(calledProcedureName.toLowerCase(Locale.ROOT));
@@ -2991,7 +2991,8 @@ class SqlScriptMigrator {
                     convertedStatementCount++;
                     appliedRules.addAll(conversion.appliedRules());
                 }
-                if (outputStatements.size() > 1 && !manualReviewRequired) {
+                if (!procedureTempTableCompilePlaceholders(conversion.outputSql()).isEmpty()
+                        && !manualReviewRequired) {
                     appliedRules.add(MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE);
                 }
                 convertedStatements.addAll(outputStatements);
@@ -3669,6 +3670,8 @@ class SqlScriptMigrator {
                 scriptIdentityFirstColumns,
                 targetSchema
         );
+        InlineCreateTableIndexConversion inlineCreateTableIndexes =
+                convertMysqlCreateTableInlineIndexes(safeRuleConversion.sql());
         timings.safeRulesNanos += System.nanoTime() - safeRulesStartedAt;
         long genericConverterStartedAt = System.nanoTime();
         SqlConversionResult sqlConversion;
@@ -3688,6 +3691,7 @@ class SqlScriptMigrator {
         long postProcessStartedAt = System.nanoTime();
         rules.addAll(safeRuleConversion.appliedRules());
         rules.addAll(sqlConversion.appliedRules());
+        rules.addAll(inlineCreateTableIndexes.appliedRules());
         String convertedBody = sqlConversion.convertedSql();
         if (safeRuleConversion.appliedRules()
                 .contains(MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE)) {
@@ -3703,12 +3707,15 @@ class SqlScriptMigrator {
             rules.add(MYSQL_DROP_PROCEDURE_IF_EXISTS_RULE);
         }
         String convertedSql = leadingSqlPrefix.prefix() + convertedBody;
-        boolean changed = !convertedSql.equals(originalStatement);
+        boolean changed = !convertedSql.equals(originalStatement)
+                || !inlineCreateTableIndexes.outputStatements().isEmpty();
         String manualReason;
         if (!safeRuleConversion.manualReviewReason().isBlank()) {
             manualReason = safeRuleConversion.manualReviewReason();
         } else if (sqlConversion.manualReviewRequired()) {
             manualReason = sqlConversion.reason();
+        } else if (!inlineCreateTableIndexes.manualReviewReason().isBlank()) {
+            manualReason = inlineCreateTableIndexes.manualReviewReason();
         } else {
             long manualCheckStartedAt = System.nanoTime();
             manualReason = originalSqlSyntaxManualReviewReason(sqlBody);
@@ -3744,7 +3751,8 @@ class SqlScriptMigrator {
                 changed,
                 false,
                 "",
-                rules
+                rules,
+                inlineCreateTableIndexes.outputStatements()
         );
     }
 
@@ -4537,17 +4545,21 @@ class SqlScriptMigrator {
         return new ScriptUserVariableInline(converted.toString(), true);
     }
 
-    private List<String> expandConvertedOutputStatements(String outputSql) {
+    private List<String> expandConvertedOutputStatements(ScriptStatementConversion conversion) {
+        String outputSql = conversion.outputSql();
         if (outputSql == null || outputSql.isBlank()) {
             return List.of(outputSql == null ? "" : outputSql);
         }
         List<String> placeholders = procedureTempTableCompilePlaceholders(outputSql);
-        if (placeholders.isEmpty()) {
+        if (placeholders.isEmpty() && conversion.additionalOutputStatements().isEmpty()) {
             return List.of(outputSql);
         }
-        List<String> statements = new ArrayList<>(placeholders.size() + 1);
+        List<String> statements = new ArrayList<>(
+                placeholders.size() + conversion.additionalOutputStatements().size() + 1
+        );
         statements.addAll(placeholders);
         statements.add(outputSql);
+        statements.addAll(conversion.additionalOutputStatements());
         return statements;
     }
 
@@ -10648,6 +10660,137 @@ class SqlScriptMigrator {
                 + ddl.substring(closeParen);
     }
 
+    private InlineCreateTableIndexConversion convertMysqlCreateTableInlineIndexes(String ddl) {
+        if (ddl == null || ddl.isBlank()) {
+            return InlineCreateTableIndexConversion.unchanged();
+        }
+        int cursor = skipWhitespace(ddl, 0);
+        if (!startsKeyword(ddl, cursor, "CREATE")) {
+            return InlineCreateTableIndexConversion.unchanged();
+        }
+        cursor = skipWhitespace(ddl, cursor + "CREATE".length());
+        if (startsKeyword(ddl, cursor, "TEMPORARY")) {
+            cursor = skipWhitespace(ddl, cursor + "TEMPORARY".length());
+        }
+        if (!startsKeyword(ddl, cursor, "TABLE")) {
+            return InlineCreateTableIndexConversion.unchanged();
+        }
+        cursor = skipWhitespace(ddl, cursor + "TABLE".length());
+        if (startsKeyword(ddl, cursor, "IF")) {
+            cursor = skipWhitespace(ddl, cursor + "IF".length());
+            if (!startsKeyword(ddl, cursor, "NOT")) {
+                return InlineCreateTableIndexConversion.unchanged();
+            }
+            cursor = skipWhitespace(ddl, cursor + "NOT".length());
+            if (!startsKeyword(ddl, cursor, "EXISTS")) {
+                return InlineCreateTableIndexConversion.unchanged();
+            }
+            cursor = skipWhitespace(ddl, cursor + "EXISTS".length());
+        }
+        SqlIdentifierReference table = sqlIdentifierReferenceAt(ddl, cursor);
+        if (table == null) {
+            return InlineCreateTableIndexConversion.unchanged();
+        }
+        int openParen = skipWhitespace(ddl, table.end());
+        if (openParen >= ddl.length() || ddl.charAt(openParen) != '(') {
+            return InlineCreateTableIndexConversion.unchanged();
+        }
+        int closeParen = findMatchingParen(ddl, openParen);
+        if (closeParen <= openParen) {
+            return InlineCreateTableIndexConversion.unchanged();
+        }
+
+        List<String> outputStatements = new ArrayList<>();
+        LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
+        for (String rawDefinition : splitTopLevelComma(ddl.substring(openParen + 1, closeParen))) {
+            String definition = splitLeadingSqlPrefix(rawDefinition).body().strip();
+            if (!isMysqlCreateTableInlineSecondaryKey(definition)) {
+                continue;
+            }
+            if (startsKeyword(definition, 0, "FULLTEXT")
+                    || startsKeyword(definition, 0, "SPATIAL")) {
+                return InlineCreateTableIndexConversion.manual(
+                        "CREATE TABLE 包含 MySQL "
+                                + (startsKeyword(definition, 0, "FULLTEXT") ? "FULLTEXT" : "SPATIAL")
+                                + " 索引；达梦索引类型与其语义不等价，已保留原 SQL，需按实际检索或空间语义人工设计。"
+                );
+            }
+            Matcher matcher = Pattern.compile(
+                    "(?is)^(?<unique>UNIQUE\\s+)?(?:INDEX|KEY)\\s+"
+                            + "(?:(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s*)?"
+                            + "(?:USING\\s+BTREE\\s*)?"
+                            + "\\((?<columns>.*)\\)\\s*"
+                            + "(?:USING\\s+BTREE\\s*)?"
+                            + "(?:COMMENT\\s+'(?:''|[^'])*'\\s*)?"
+                            + "(?:VISIBLE\\s*)?$"
+            ).matcher(definition);
+            if (!matcher.matches()) {
+                return InlineCreateTableIndexConversion.manual(
+                        "CREATE TABLE 包含无法安全等价转换的 MySQL 内联索引定义："
+                                + definition + "。已保留原 SQL，不能静默丢弃索引。"
+                );
+            }
+            String columns = matcher.group("columns").strip();
+            List<String> columnNames = indexColumnNames(columns);
+            if (columnNames.isEmpty()) {
+                return InlineCreateTableIndexConversion.manual(
+                        "CREATE TABLE 的内联索引包含无法确认达梦等价语义的表达式列："
+                                + definition + "。已保留原 SQL，不能猜测索引定义。"
+                );
+            }
+            String indexToken = matcher.group("index");
+            if (indexToken == null || indexToken.isBlank()) {
+                indexToken = columnNames.get(0);
+            }
+            String scopedIndexName = dmSchemaScopedIndexName(table.token(), indexToken);
+            String convertedColumns = convertMysqlIndexPrefixLengths(columns);
+            String createIndexSql = (matcher.group("unique") == null
+                    ? "CREATE INDEX "
+                    : "CREATE UNIQUE INDEX ")
+                    + scopedIndexName
+                    + " ON "
+                    + table.token()
+                    + " ("
+                    + convertedColumns
+                    + ")";
+            outputStatements.add(guardCreateIndexForDameng(
+                    table.token(),
+                    scopedIndexName,
+                    createIndexSql
+            ));
+            appliedRules.add(MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM_RULE);
+            if (!scopedIndexName.equalsIgnoreCase(unquoteIdentifier(lastIdentifierPart(indexToken)))) {
+                appliedRules.add(MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE);
+            }
+            if (!convertedColumns.equals(columns)) {
+                appliedRules.add(MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE);
+            }
+        }
+        return outputStatements.isEmpty()
+                ? InlineCreateTableIndexConversion.unchanged()
+                : InlineCreateTableIndexConversion.converted(outputStatements, List.copyOf(appliedRules));
+    }
+
+    private String guardCreateIndexForDameng(
+            String tableToken,
+            String indexName,
+            String createIndexSql
+    ) {
+        String tableName = unquoteIdentifier(lastIdentifierPart(tableToken));
+        return "DECLARE\n"
+                + "    dm_existing_count INT;\n"
+                + "BEGIN\n"
+                + "    SELECT COUNT(*) INTO dm_existing_count\n"
+                + "    FROM ALL_INDEXES\n"
+                + "    WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                + "      AND TABLE_NAME = UPPER(" + sqlStringLiteral(tableName) + ")\n"
+                + "      AND INDEX_NAME = UPPER(" + sqlStringLiteral(indexName) + ");\n\n"
+                + "    IF dm_existing_count = 0 THEN\n"
+                + "        EXECUTE IMMEDIATE " + sqlStringLiteral(createIndexSql) + ";\n"
+                + "    END IF;\n"
+                + "END";
+    }
+
     private boolean isMysqlCreateTableInlineSecondaryKey(String part) {
         int cursor = skipWhitespace(part, 0);
         if (startsKeyword(part, cursor, "KEY") || startsKeyword(part, cursor, "INDEX")) {
@@ -12421,7 +12564,8 @@ class SqlScriptMigrator {
                 true,
                 conversion.manualReviewRequired(),
                 conversion.reason(),
-                rules
+                rules,
+                conversion.additionalOutputStatements()
         );
     }
 
@@ -12761,6 +12905,33 @@ class SqlScriptMigrator {
         }
     }
 
+    private record InlineCreateTableIndexConversion(
+            List<String> outputStatements,
+            List<String> appliedRules,
+            String manualReviewReason
+    ) {
+        private InlineCreateTableIndexConversion {
+            outputStatements = List.copyOf(outputStatements == null ? List.of() : outputStatements);
+            appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+            manualReviewReason = manualReviewReason == null ? "" : manualReviewReason;
+        }
+
+        static InlineCreateTableIndexConversion unchanged() {
+            return new InlineCreateTableIndexConversion(List.of(), List.of(), "");
+        }
+
+        static InlineCreateTableIndexConversion converted(
+                List<String> outputStatements,
+                List<String> appliedRules
+        ) {
+            return new InlineCreateTableIndexConversion(outputStatements, appliedRules, "");
+        }
+
+        static InlineCreateTableIndexConversion manual(String reason) {
+            return new InlineCreateTableIndexConversion(List.of(), List.of(), reason);
+        }
+    }
+
     private record QueryBackedUserVariableAssignment(
             String name,
             String scalarExpression,
@@ -13003,10 +13174,35 @@ class SqlScriptMigrator {
             boolean changed,
             boolean manualReviewRequired,
             String reason,
-            List<String> appliedRules
+            List<String> appliedRules,
+            List<String> additionalOutputStatements
     ) {
+        private ScriptStatementConversion(
+                String originalSql,
+                String convertedSql,
+                String outputSql,
+                boolean changed,
+                boolean manualReviewRequired,
+                String reason,
+                List<String> appliedRules
+        ) {
+            this(
+                    originalSql,
+                    convertedSql,
+                    outputSql,
+                    changed,
+                    manualReviewRequired,
+                    reason,
+                    appliedRules,
+                    List.of()
+            );
+        }
+
         private ScriptStatementConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+            additionalOutputStatements = List.copyOf(
+                    additionalOutputStatements == null ? List.of() : additionalOutputStatements
+            );
         }
     }
 }

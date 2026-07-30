@@ -4714,8 +4714,67 @@ class SqlScriptMigratorTest {
                     `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT 'id',
                     `code` varchar(64) CHARACTER SET utf8 DEFAULT NULL COMMENT 'code',
                     PRIMARY KEY (`id`) USING BTREE,
-                    KEY `idx_demo_code` (`code`) USING BTREE
+                    UNIQUE KEY `uk_demo_code` (`code`) USING BTREE,
+                    -- supports code-prefix lookup
+                    KEY `idx_demo_code` (`code`(16)) USING BTREE COMMENT 'lookup'
                 ) ENGINE=InnoDB DEFAULT COLLATE=utf8mb4_0900_ai_ci;
+                """);
+
+        RecordingValidator validator = new RecordingValidator();
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-bill",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("table.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.validationSuccessCount()).isEqualTo(3);
+        assertThat(report.files().get(0).appliedRules())
+                .contains(
+                        SqlScriptMigrator.MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM_RULE,
+                        SqlScriptMigrator.MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE,
+                        SqlScriptMigrator.MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE
+                )
+                .doesNotContain(SqlScriptMigrator.MYSQL_PROCEDURE_TEMP_TABLE_COMPILE_PLACEHOLDER_RULE);
+        assertThat(validator.files).singleElement().satisfies(file -> {
+            assertThat(file.statements()).hasSize(3);
+            assertThat(file.statements().get(0)).contains("CREATE TABLE IF NOT EXISTS demo_table");
+            assertThat(file.statements().get(1))
+                    .contains("EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX demo_table_uk_demo_code"
+                            + " ON demo_table (`code`)'");
+            assertThat(file.statements().get(2))
+                    .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_table_idx_demo_code"
+                            + " ON demo_table (CAST(SUBSTR(`code`, 1, 16) AS VARCHAR(16)))'");
+        });
+        assertThat(converted)
+                .startsWith("-- business note")
+                .contains("`id` bigint NOT NULL IDENTITY(1,1)")
+                .contains("`code` varchar(64) DEFAULT NULL")
+                .contains("FROM ALL_INDEXES")
+                .contains("INDEX_NAME = UPPER('demo_table_uk_demo_code')")
+                .contains("INDEX_NAME = UPPER('demo_table_idx_demo_code')")
+                .doesNotContain("KEY `idx_demo_code`")
+                .doesNotContainIgnoringCase("USING BTREE")
+                .doesNotContainIgnoringCase("ENGINE")
+                .doesNotContainIgnoringCase("COMMENT");
+    }
+
+    @Test
+    void retainsCreateTableWithUnsupportedInlineFulltextIndexForManualReview() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("fulltext.sql"), """
+                CREATE TABLE sample_article (
+                    id BIGINT NOT NULL,
+                    body TEXT,
+                    PRIMARY KEY (id),
+                    FULLTEXT KEY ft_article_body (body)
+                );
                 """);
 
         SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
@@ -4728,16 +4787,12 @@ class SqlScriptMigratorTest {
                 DmValidationEnvironment.from(Map.of())
         ));
 
-        String converted = Files.readString(sqlRootOut.resolve("table.sql"));
-        assertThat(report.manualReviewSqlCount()).isZero();
-        assertThat(converted)
-                .startsWith("-- business note")
-                .contains("`id` bigint NOT NULL IDENTITY(1,1)")
-                .contains("`code` varchar(64) DEFAULT NULL")
-                .doesNotContain("KEY `idx_demo_code`")
-                .doesNotContainIgnoringCase("USING BTREE")
-                .doesNotContainIgnoringCase("ENGINE")
-                .doesNotContainIgnoringCase("COMMENT");
+        assertThat(report.manualReviewSqlCount()).isOne();
+        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("FULLTEXT", "已保留原 SQL"));
+        assertThat(Files.readString(sqlRootOut.resolve("fulltext.sql")))
+                .contains("FULLTEXT KEY ft_article_body (body)");
     }
 
     @Test
