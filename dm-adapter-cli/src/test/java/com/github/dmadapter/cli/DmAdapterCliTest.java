@@ -758,6 +758,10 @@ class DmAdapterCliTest {
                 .contains("java.sql.Timestamp.valueOf(\"2024-01-01 00:00:00\")")
                 .contains("convertConfiguredValue")
                 .contains("suggestedArgumentConfig")
+                .contains("Object value = parameters.args[0];\n"
+                        + "            if (value == null) {\n"
+                        + "                return null;\n"
+                        + "            }")
                 .contains("Updated validation args in")
                 .contains("参数")
                 .contains("\\\"parameterSummary\\\"")

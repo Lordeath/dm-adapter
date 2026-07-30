@@ -9361,6 +9361,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private String quoteDamengKeywordIdentifierIfNeeded(String sql, int startIndex, String identifier) {
         String upper = identifier.toUpperCase(Locale.ROOT);
+        if ("AUDIT".equals(upper)) {
+            return quoteDamengIdentifier(identifier);
+        }
         if ("DIMENSION".equals(upper)) {
             return "\"DIMENSION\"";
         }

@@ -256,6 +256,26 @@ class GeneratedFailurePatternTest {
                     missingInsertColumnCommaRecord
             )).isFalse();
 
+            String invalidOgnlMethodCall = """
+                    org.mybatis.spring.MyBatisSystemException:
+                    nested exception is org.apache.ibatis.builder.BuilderException:
+                    Error evaluating expression 'ownerUUIDList != null and ownerUUIDList().size > 0'.
+                    Cause: org.apache.ibatis.ognl.MethodFailedException:
+                    Method "ownerUUIDList" failed for object org.apache.ibatis.scripting.xmltags.DynamicContext$ContextMap
+                    [java.lang.NoSuchMethodException:
+                    org.apache.ibatis.scripting.xmltags.DynamicContext$ContextMap.ownerUUIDList()]
+                    """;
+            Object invalidOgnlMethodCallRecord = failedRecord(validationClass, invalidOgnlMethodCall);
+            assertThat(failurePattern(validationClass, validation, invalidOgnlMethodCallRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, invalidOgnlMethodCallRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    invalidOgnlMethodCallRecord
+            )).isFalse();
+
             String trailingSelectComma = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
