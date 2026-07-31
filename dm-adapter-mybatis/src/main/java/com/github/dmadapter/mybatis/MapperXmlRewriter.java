@@ -1626,7 +1626,7 @@ public class MapperXmlRewriter {
         String trimmed = expression == null ? "" : expression.trim();
         String normalized = trimmed.replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
         if ("database()".equals(normalized) || "(selectdatabase())".equals(normalized)) {
-            return "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+            return "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)";
         }
         if (trimmed.startsWith("${") && trimmed.endsWith("}")) {
             return "UPPER('" + trimmed.replace("'", "''") + "')";

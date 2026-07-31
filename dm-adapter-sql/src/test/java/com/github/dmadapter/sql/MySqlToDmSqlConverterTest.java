@@ -35,8 +35,8 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo(
-                "select SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), "
-                        + "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA'), 'schema()' as raw"
+                "select SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID), "
+                        + "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID), 'schema()' as raw"
         );
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_CURRENT_SCHEMA_FUNCTION_RULE);
@@ -3505,7 +3505,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER('${taskTableName}') AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') ORDER BY COLUMN_ID");
+                .isEqualTo("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = UPPER('${taskTableName}') AND OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID) ORDER BY COLUMN_ID");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_COLUMNS_RULE);
     }
@@ -3548,7 +3548,7 @@ class MySqlToDmSqlConverterTest {
                 .isEqualTo("SELECT LISTAGG(COLUMN_NAME, ',') WITHIN GROUP (ORDER BY COLUMN_ID) AS result"
                         + " FROM ALL_TAB_COLUMNS"
                         + " WHERE TABLE_NAME = UPPER(#{tableName})"
-                        + " AND OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')");
+                        + " AND OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)");
         assertThat(result.appliedRules())
                 .containsExactly(
                         MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE,
@@ -3581,7 +3581,7 @@ class MySqlToDmSqlConverterTest {
                     ON cc.OWNER = c.OWNER
                     AND cc.TABLE_NAME = c.TABLE_NAME
                     AND cc.COLUMN_NAME = c.COLUMN_NAME
-                 WHERE c.TABLE_NAME = UPPER(#{tableName}) AND c.OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')
+                 WHERE c.TABLE_NAME = UPPER(#{tableName}) AND c.OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
                 ORDER BY c.COLUMN_ID
                 """.strip());
         assertThat(result.appliedRules())
@@ -3618,7 +3618,7 @@ class MySqlToDmSqlConverterTest {
                     ON cc.OWNER = c.OWNER
                     AND cc.TABLE_NAME = c.TABLE_NAME
                     AND cc.COLUMN_NAME = c.COLUMN_NAME
-                WHERE c.TABLE_NAME = UPPER(#{tableName}) AND c.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                WHERE c.TABLE_NAME = UPPER(#{tableName}) AND c.OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
                 ORDER BY c.COLUMN_ID
                 """.strip());
         assertThat(result.appliedRules())
@@ -3670,7 +3670,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .contains("WHERE sch.NAME = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .contains("WHERE sch.NAME = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .contains("AND obj.NAME = UPPER(#{tableName})")
                 .doesNotContain("sc.DEFVAL")
                 .doesNotContain("information_schema");
@@ -3725,7 +3725,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
                 .contains("FROM ALL_INDEXES i")
-                .contains("WHERE i.OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .contains("WHERE i.OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .contains("AND i.TABLE_NAME = UPPER('${tableName}')")
                 .contains("ac.CONSTRAINT_TYPE = 'P'")
                 .doesNotContain("information_schema")
@@ -3753,7 +3753,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).isEqualTo("""
                 SELECT TABLE_NAME
                 FROM ALL_TAB_COLUMNS
-                WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
                 AND TABLE_NAME LIKE UPPER(concat(#{tablePrefix},'%'))
                 AND COLUMN_NAME NOT IN
                 <foreach collection='columnNameList' item='item' open='(' close=')' separator=','>
@@ -3782,7 +3782,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql()).isEqualTo("""
                 SELECT TABLE_NAME
                 FROM ALL_TAB_COLUMNS
-                WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
                 AND TABLE_NAME LIKE UPPER(concat(#{tablePrefix},'%'))
                 AND COLUMN_NAME NOT IN""");
         assertThat(result.appliedRules())
@@ -3818,7 +3818,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql()).isEqualTo(
                 "SELECT COUNT(*) FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})"
-                        + " AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                        + " AND OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)"
         );
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
@@ -3853,7 +3853,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
                 .isEqualTo("SELECT 1 FROM ALL_TABLES WHERE TABLE_NAME = UPPER(#{tableName})"
-                        + " AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')");
+                        + " AND OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }
@@ -3869,7 +3869,7 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql())
-                .isEqualTo("SELECT TABLE_NAME FROM ALL_TABLES WHERE TABLE_NAME LIKE UPPER('${tablePrefix}%') AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') GROUP BY TABLE_NAME FETCH FIRST 500 ROWS ONLY");
+                .isEqualTo("SELECT TABLE_NAME FROM ALL_TABLES WHERE TABLE_NAME LIKE UPPER('${tablePrefix}%') AND OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID) GROUP BY TABLE_NAME FETCH FIRST 500 ROWS ONLY");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
     }
@@ -3894,12 +3894,12 @@ class MySqlToDmSqlConverterTest {
         assertThat(baseTableResult.manualReviewRequired()).isFalse();
         assertThat(baseTableResult.convertedSql())
                 .isEqualTo("SELECT TABLE_NAME FROM ALL_TABLES"
-                        + " WHERE OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')");
+                        + " WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)");
         assertThat(viewResult.changed()).isTrue();
         assertThat(viewResult.manualReviewRequired()).isFalse();
         assertThat(viewResult.convertedSql())
                 .isEqualTo("SELECT VIEW_NAME AS TABLE_NAME FROM ALL_VIEWS"
-                        + " WHERE OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')"
+                        + " WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)"
                         + " AND VIEW_NAME LIKE UPPER('vw_datacenter_%')");
         assertThat(baseTableResult.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
@@ -3926,7 +3926,7 @@ class MySqlToDmSqlConverterTest {
                 , OWNER AS tableSchema
                 FROM ALL_OBJECTS
                 WHERE OBJECT_TYPE = 'TABLE'
-                AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                AND OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
                 AND OBJECT_NAME LIKE UPPER('${tablePrefix}%')""");
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);

@@ -551,7 +551,7 @@ class SqlScriptMigratorTest {
         assertThat(report.validationPlan()).isEqualTo(validationPlan.toAbsolutePath().normalize().toString());
         assertThat(converted)
                 .contains("-- DM_ADAPTER: MySQL script variable @db_name uses "
-                        + "SYS_CONTEXT('USERENV','CURRENT_SCHEMA') in converted metadata checks")
+                        + "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID) in converted metadata checks")
                 .contains("BEGIN\n    NULL;\nEND;\n/")
                 .contains("SELECT 1;");
         assertThat(SqlScriptParser.statements(converted)).hasSize(2);
@@ -592,7 +592,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("FROM ALL_TAB_COLUMNS")
-                .contains("WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .contains("AND TABLE_NAME = 'sample_canal_config_item'")
                 .contains("AND COLUMN_NAME = 'targetDatabase'")
                 .contains("EXECUTE IMMEDIATE 'alter table sample_canal_config_item ADD `targetDatabase` varchar(128) null'")
@@ -647,9 +647,12 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("FROM ALL_INDEXES")
-                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
-                .contains("TABLE_NAME = UPPER('sample_mail_user')")
-                .contains("INDEX_NAME = UPPER('idx_mail_user_count')")
+                .contains("I.OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("UPPER(I.TABLE_NAME) = UPPER('sample_mail_user')")
+                .contains("I.UNIQUENESS = 'NONUNIQUE'")
+                .contains("HAVING COUNT(*) = 4")
+                .contains("C.COLUMN_POSITION = 1")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('user_id')")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX sample_mail_user_idx_mail_user_count"
                         + " ON `sample_mail_user` (`user_id`, `delete_flag`, `is_read`, `mail_id`)'")
                 .contains("MySQL PREPARE idx_mail_user_count_stmt is handled")
@@ -657,6 +660,7 @@ class SqlScriptMigratorTest {
                 .contains("MySQL DEALLOCATE PREPARE idx_mail_user_count_stmt is unnecessary")
                 .doesNotContain("SET @idx_mail_user_count_exists")
                 .doesNotContain("SET @idx_mail_user_count_sql")
+                .doesNotContain("INDEX_NAME = UPPER('idx_mail_user_count')")
                 .doesNotContain("ALTER TABLE `sample_mail_user` ADD INDEX")
                 .doesNotContain("PREPARE idx_mail_user_count_stmt FROM")
                 .doesNotContain("EXECUTE idx_mail_user_count_stmt;");
@@ -719,8 +723,10 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("20260522.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("TABLE_NAME = UPPER('tenant_alpha_event')")
-                .contains("INDEX_NAME = UPPER('idx_event_state')")
+                .contains("UPPER(I.TABLE_NAME) = UPPER('tenant_alpha_event')")
+                .contains("I.UNIQUENESS = 'NONUNIQUE'")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('state')")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('event_id')")
                 .contains("IF dm_existing_count = 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX tenant_alpha_event_idx_event_state"
                         + " ON `tenant_alpha_event` (`state`, `event_id`)'")
@@ -729,6 +735,7 @@ class SqlScriptMigratorTest {
                 .contains("IF dm_existing_count > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'DROP INDEX tenant_beta_event_idx_obsolete'")
                 .doesNotContain("SET @ddl")
+                .doesNotContain("INDEX_NAME = UPPER('idx_event_state')")
                 .doesNotContain("PREPARE stmt FROM @ddl")
                 .doesNotContain("EXECUTE stmt;");
         assertThat(report.files())
@@ -3338,7 +3345,16 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
+                .contains("JOIN ALL_IND_COLUMNS C")
+                .contains("LEFT JOIN ALL_IND_EXPRESSIONS E")
+                .contains("I.UNIQUENESS = 'UNIQUE'")
+                .contains("HAVING COUNT(*) = 2")
+                .contains("C.COLUMN_POSITION = 1")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('userId')")
+                .contains("C.COLUMN_POSITION = 2")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('workDate')")
                 .contains("EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX sample_table_uk_user_date ON sample_table (userId, workDate)'")
+                .doesNotContain("INDEX_NAME = 'sample_table_uk_user_date'")
                 .doesNotContain("ADD UNIQUE INDEX");
     }
 
@@ -3375,13 +3391,45 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("FROM ALL_IND_COLUMNS")
-                .contains("GROUP BY INDEX_NAME")
-                .contains("UPPER(COLUMN_NAME) = UPPER('card_id')")
+                .contains("JOIN ALL_IND_COLUMNS C")
+                .contains("LEFT JOIN ALL_IND_EXPRESSIONS E")
+                .contains("GROUP BY I.INDEX_NAME")
+                .contains("I.UNIQUENESS = 'NONUNIQUE'")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('card_id')")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX owner_car_month_card_info_idx_card_id ON `owner_car_month_card_info` (`card_id`)'")
                 .doesNotContain("INDEX_NAME = 'owner_car_month_card_info_idx_card_id'")
                 .doesNotContain("ADD INDEX")
                 .doesNotContainIgnoringCase("USING BTREE");
+    }
+
+    @Test
+    void replacesAlreadySchemaScopedProcedureIndexNameGuardWithDefinitionGuard() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE add_status_index()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT INDEX_NAME
+                        FROM information_schema.STATISTICS
+                        WHERE table_schema = database()
+                          AND table_name = 'demo'
+                          AND index_name = 'demo_idx_status'
+                    ) THEN
+                        ALTER TABLE demo ADD INDEX demo_idx_status (status DESC);
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("I.UNIQUENESS = 'NONUNIQUE'")
+                .contains("HAVING COUNT(*) = 1")
+                .contains("C.COLUMN_POSITION = 1")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('status')")
+                .contains("UPPER(C.DESCEND) = 'DESC'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_status ON demo (status DESC)'")
+                .doesNotContain("INDEX_NAME = 'demo_idx_status'");
     }
 
     @Test
@@ -3417,7 +3465,8 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .contains("SELECT COUNT(*) INTO dm_adapter_drop_index_exists")
                 .contains("FROM ALL_INDEXES")
-                .contains("OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
+                .contains("OWNER = dm_adapter_schema")
                 .contains("UPPER(INDEX_NAME) = UPPER('ns_message_idx_old')")
                 .contains("IF dm_adapter_drop_index_exists > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'DROP INDEX ns_message_idx_old'")
@@ -4185,10 +4234,11 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .contains("ALL_TAB_COLUMNS")
                 .contains("ALL_TABLES")
-                .contains("FROM ALL_IND_COLUMNS")
+                .contains("JOIN ALL_IND_COLUMNS C")
+                .contains("LEFT JOIN ALL_IND_EXPRESSIONS E")
                 .contains("CREATE OR REPLACE PROCEDURE add_col() AS")
                 .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
-                .contains("INDEX_OWNER = dm_adapter_schema")
+                .contains("I.OWNER = dm_adapter_schema")
                 .contains("OWNER = dm_adapter_schema")
                 .contains("CALL add_col()")
                 .contains("HAVING COUNT(*) = 1")
@@ -4934,12 +4984,75 @@ class SqlScriptMigratorTest {
                 .contains("`id` bigint NOT NULL IDENTITY(1,1)")
                 .contains("`code` varchar(64) DEFAULT NULL")
                 .contains("FROM ALL_INDEXES")
-                .contains("INDEX_NAME = UPPER('demo_table_uk_demo_code')")
-                .contains("INDEX_NAME = UPPER('demo_table_idx_demo_code')")
+                .contains("JOIN ALL_IND_COLUMNS C")
+                .contains("LEFT JOIN ALL_IND_EXPRESSIONS E")
+                .contains("I.UNIQUENESS = 'UNIQUE'")
+                .contains("I.UNIQUENESS = 'NONUNIQUE'")
+                .contains("C.COLUMN_POSITION = 1")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('code')")
+                .contains("E.COLUMN_EXPRESSION IS NOT NULL")
+                .contains("CAST(SUBSTR(CODE,1,16)ASVARCHAR(16))")
+                .doesNotContain("INDEX_NAME = UPPER('demo_table_uk_demo_code')")
+                .doesNotContain("INDEX_NAME = UPPER('demo_table_idx_demo_code')")
                 .doesNotContain("KEY `idx_demo_code`")
                 .doesNotContainIgnoringCase("USING BTREE")
                 .doesNotContainIgnoringCase("ENGINE")
                 .doesNotContainIgnoringCase("COMMENT");
+    }
+
+    @Test
+    void guardsInlineIndexesByCompleteEquivalentDefinitionInsteadOfIndexName() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("equivalent-index.sql"), """
+                CREATE TABLE IF NOT EXISTS demo_equivalent_index (
+                    id BIGINT NOT NULL,
+                    tenant_id BIGINT NOT NULL,
+                    business_code VARCHAR(64) NOT NULL,
+                    UNIQUE KEY old_unique_name (tenant_id DESC, business_code ASC),
+                    KEY old_lookup_name (business_code, tenant_id DESC)
+                );
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-index",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        String converted = Files.readString(sqlRootOut.resolve("equivalent-index.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.validationFailureCount()).isZero();
+        assertThat(converted)
+                .contains("I.OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("I.TABLE_OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("I.UNIQUENESS = 'UNIQUE'")
+                .contains("I.UNIQUENESS = 'NONUNIQUE'")
+                .contains("HAVING COUNT(*) = 2")
+                .contains("C.COLUMN_POSITION = 1"
+                        + " AND E.COLUMN_EXPRESSION IS NULL"
+                        + " AND UPPER(C.COLUMN_NAME) = UPPER('tenant_id')"
+                        + " AND UPPER(C.DESCEND) = 'DESC'")
+                .contains("C.COLUMN_POSITION = 2"
+                        + " AND E.COLUMN_EXPRESSION IS NULL"
+                        + " AND UPPER(C.COLUMN_NAME) = UPPER('business_code')"
+                        + " AND UPPER(C.DESCEND) = 'ASC'")
+                .contains("C.COLUMN_POSITION = 1"
+                        + " AND E.COLUMN_EXPRESSION IS NULL"
+                        + " AND UPPER(C.COLUMN_NAME) = UPPER('business_code')"
+                        + " AND UPPER(C.DESCEND) = 'ASC'")
+                .contains("C.COLUMN_POSITION = 2"
+                        + " AND E.COLUMN_EXPRESSION IS NULL"
+                        + " AND UPPER(C.COLUMN_NAME) = UPPER('tenant_id')"
+                        + " AND UPPER(C.DESCEND) = 'DESC'")
+                .doesNotContain("INDEX_NAME = UPPER('demo_equivalent_index_old_unique_name')")
+                .doesNotContain("INDEX_NAME = UPPER('demo_equivalent_index_old_lookup_name')");
     }
 
     @Test
@@ -5379,7 +5492,7 @@ class SqlScriptMigratorTest {
                 .contains("PROCEDURE demo_proc is INVALID")
                 .contains("创建的对象带有编译错误");
         assertThat(statusQueries).singleElement().satisfies(query -> assertThat(query)
-                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .doesNotContain("sample-system"));
     }
 

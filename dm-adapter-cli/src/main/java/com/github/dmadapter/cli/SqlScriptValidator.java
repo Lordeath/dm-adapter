@@ -699,7 +699,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             DmValidationEnvironment environment
     ) throws SQLException {
         String ownerPredicate = object.owner().isBlank()
-                ? "OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                ? "OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)"
                 : "UPPER(OWNER) = UPPER(?)";
         String sql = "SELECT STATUS FROM ALL_OBJECTS WHERE "
                 + ownerPredicate

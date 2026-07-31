@@ -133,7 +133,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL_RULE =
             "MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL";
 
-    private static final String DM_CURRENT_SCHEMA_EXPRESSION = "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')";
+    private static final String DM_CURRENT_SCHEMA_EXPRESSION =
+            "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)";
     private static final String DECIMAL_ARITHMETIC_TYPE = "DECIMAL(38,10)";
     private static final String INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON =
             "整数算术表达式风险：MySQL `/` 会产生小数，达梦整数/整数可能截断；"
@@ -5386,7 +5387,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String ownerCondition = tableSchema.isBlank()
                 ? ""
                 : isMysqlCurrentSchemaExpression(tableSchema)
-                        ? " AND c.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                        ? " AND c.OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION
                         : " AND c.OWNER = UPPER(" + tableSchema + ")";
         String converted = "SELECT\n"
                 + "    c.OWNER AS \"" + matcher.group("schemaAlias") + "\",\n"
@@ -5450,7 +5451,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
             String converted = "SELECT TABLE_NAME\n"
                     + "FROM ALL_TAB_COLUMNS\n"
-                    + "WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                    + "WHERE OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION + "\n"
                     + "AND TABLE_NAME LIKE UPPER(" + tableLike + ")\n"
                     + "AND COLUMN_NAME NOT IN\n"
                     + notIn
@@ -5467,7 +5468,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         String converted = "SELECT TABLE_NAME\n"
                 + "FROM ALL_TAB_COLUMNS\n"
-                + "WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                + "WHERE OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION + "\n"
                 + "AND TABLE_NAME LIKE UPPER(" + tableLike + ")\n"
                 + "AND COLUMN_NAME NOT IN";
         return new GenericConversion(converted, true);
@@ -5643,7 +5644,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + ", OWNER AS " + matcher.group("schemaAlias") + "\n"
                 + "FROM ALL_OBJECTS\n"
                 + "WHERE OBJECT_TYPE = 'TABLE'\n"
-                + "AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                + "AND OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION + "\n"
                 + "AND OBJECT_NAME LIKE UPPER(" + tableLike + ")";
         return new GenericConversion(converted, true);
     }
@@ -5689,7 +5690,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return "";
         }
         if (isMysqlCurrentSchemaExpression(tableSchema)) {
-            return " AND OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+            return " AND OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION;
         }
         return " AND OWNER = UPPER(" + tableSchema + ")";
     }
