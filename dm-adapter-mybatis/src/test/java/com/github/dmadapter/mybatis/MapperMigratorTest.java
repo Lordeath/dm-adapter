@@ -1876,7 +1876,7 @@ class MapperMigratorTest {
                 .contains("c.DATA_TYPE AS \"columnType\"")
                 .contains("cc.COMMENTS AS \"columnComment\"")
                 .contains("CASE c.NULLABLE WHEN 'Y' THEN 'YES' ELSE 'NO' END AS \"isNullAble\"")
-                .contains("c.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("c.OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .contains("c.TABLE_NAME = UPPER(#{tableName})")
                 .doesNotContain("information_schema")
                 .doesNotContain("database()");
@@ -1949,7 +1949,7 @@ class MapperMigratorTest {
         assertThat(rewritten)
                 .contains("FROM SYS.SYSCOLUMNS sc")
                 .contains("WHERE sch.NAME = UPPER('${schema}')")
-                .contains("WHERE sch.NAME = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .contains("WHERE sch.NAME = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .contains("AND obj.NAME = UPPER('${tableName}')")
                 .contains("FROM ALL_INDEXES i")
                 .contains("ac.CONSTRAINT_TYPE = 'P'")
@@ -2026,7 +2026,7 @@ class MapperMigratorTest {
                 .contains("LISTAGG(COLUMN_NAME, ',') WITHIN GROUP (ORDER BY COLUMN_ID) AS result")
                 .contains("cc.COMMENTS AS COLUMN_COMMENT")
                 .contains("c.CHAR_LENGTH AS CHARACTER_MAXIMUM_LENGTH")
-                .contains("SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')")
+                .contains("SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .doesNotContain("information_schema")
                 .doesNotContain("database()");
         assertThat(result.automaticConversions()).hasSize(5);
@@ -2059,7 +2059,7 @@ class MapperMigratorTest {
         assertThat(rewritten)
                 .contains("SELECT 1 FROM ALL_TABLES")
                 .contains("TABLE_NAME = UPPER(#{tableName})")
-                .contains("OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')")
+                .contains("OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
                 .doesNotContain("information_schema")
                 .doesNotContain("database()");
         assertThat(result.automaticConversions()).hasSize(1);

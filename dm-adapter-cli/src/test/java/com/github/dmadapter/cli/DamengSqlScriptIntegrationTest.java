@@ -1,21 +1,30 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @EnabledIfEnvironmentVariable(named = "DM_ADAPTER_RUN_INTEGRATION_TESTS", matches = "(?i)true")
 class DamengSqlScriptIntegrationTest {
+    @TempDir
+    Path tempDir;
+
     @Test
     void executesAnonymousConditionalDdlBlock() throws Exception {
         String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
@@ -54,7 +63,7 @@ class DamengSqlScriptIntegrationTest {
                 try (PreparedStatement metadata = connection.prepareStatement("""
                         SELECT COUNT(*)
                         FROM ALL_TAB_COLUMNS
-                        WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                        WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
                           AND UPPER(TABLE_NAME) = UPPER(?)
                           AND UPPER(COLUMN_NAME) = UPPER('status')
                         """)) {
@@ -107,7 +116,7 @@ class DamengSqlScriptIntegrationTest {
                 try (PreparedStatement metadata = connection.prepareStatement("""
                         SELECT COLUMN_NAME, CHAR_LENGTH, CHAR_USED
                         FROM ALL_TAB_COLUMNS
-                        WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')
+                        WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
                           AND UPPER(TABLE_NAME) = UPPER(?)
                           AND UPPER(COLUMN_NAME) = UPPER('paramName')
                         """)) {
@@ -137,6 +146,103 @@ class DamengSqlScriptIntegrationTest {
             } finally {
                 dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + procedure);
                 dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
+    void skipsDifferentlyNamedEquivalentIndexOnRepeatedExecutionButNotSameNameConflict() throws Exception {
+        String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
+        String username = requiredEnvironment("DM_DB_USERNAME");
+        String password = requiredEnvironment("DM_DB_PASSWORD");
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "DM_ADAPTER_IT_I_" + suffix;
+        String existingIndex = "DM_ADAPTER_IT_OLD_" + suffix;
+        String existingFunctionIndex = "DM_ADAPTER_IT_FUN_" + suffix;
+        String targetIndex = table + "_idx_code_tenant";
+        String targetFunctionIndex = table + "_idx_code_prefix";
+
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        Files.createDirectories(sqlRoot);
+        Files.writeString(sqlRoot.resolve("index.sql"), """
+                CREATE TABLE IF NOT EXISTS %s (
+                    ID INT,
+                    CODE VARCHAR(64),
+                    TENANT_ID INT,
+                    KEY idx_code_tenant (CODE ASC, TENANT_ID DESC),
+                    KEY idx_code_prefix (CODE(16))
+                );
+                """.formatted(table));
+        new SqlScriptMigrator(
+                new MySqlToDmSqlConverter(),
+                (files, environment) -> SqlScriptValidationRun.notAttempted("integration fixture", List.of())
+        ).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "dm-index-integration",
+                schema,
+                DmValidationEnvironment.from(Map.of())
+        ));
+        List<String> convertedStatements = SqlScriptParser.statements(
+                Files.readString(sqlRootOut.resolve("index.sql"))
+        ).stream().filter(SqlScriptParser::executable).toList();
+        assertThat(convertedStatements).hasSize(3);
+
+        Class.forName("dm.jdbc.driver.DmDriver");
+        try (Connection connection = DriverManager.getConnection(jdbcUrl, username, password);
+             Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute("CREATE TABLE " + table
+                        + " (ID INT, CODE VARCHAR(64), TENANT_ID INT)");
+                statement.execute("CREATE INDEX " + existingIndex
+                        + " ON " + table + " (CODE ASC, TENANT_ID DESC)");
+                statement.execute("CREATE INDEX " + existingFunctionIndex
+                        + " ON " + table + " (CAST(SUBSTR(CODE, 1, 16) AS VARCHAR(16)))");
+
+                executeStatements(statement, convertedStatements);
+                executeStatements(statement, convertedStatements);
+
+                assertThat(indexCount(connection, schema, table, existingIndex)).isEqualTo(1);
+                assertThat(indexCount(connection, schema, table, existingFunctionIndex)).isEqualTo(1);
+                assertThat(indexCount(connection, schema, table, targetIndex)).isZero();
+                assertThat(indexCount(connection, schema, table, targetFunctionIndex)).isZero();
+
+                statement.execute("DROP INDEX " + existingIndex);
+                statement.execute("CREATE INDEX " + targetIndex
+                        + " ON " + table + " (TENANT_ID DESC, CODE ASC)");
+                assertThatThrownBy(() -> statement.execute(convertedStatements.get(1)))
+                        .isInstanceOf(Exception.class);
+            } finally {
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    private void executeStatements(Statement statement, List<String> statements) throws Exception {
+        for (String sql : statements) {
+            statement.execute(sql);
+        }
+    }
+
+    private int indexCount(Connection connection, String schema, String table, String index) throws Exception {
+        try (PreparedStatement metadata = connection.prepareStatement("""
+                SELECT COUNT(*)
+                FROM ALL_INDEXES
+                WHERE UPPER(OWNER) = UPPER(?)
+                  AND UPPER(TABLE_NAME) = UPPER(?)
+                  AND UPPER(INDEX_NAME) = UPPER(?)
+                """)) {
+            metadata.setString(1, schema);
+            metadata.setString(2, table);
+            metadata.setString(3, index);
+            try (ResultSet resultSet = metadata.executeQuery()) {
+                assertThat(resultSet.next()).isTrue();
+                return resultSet.getInt(1);
             }
         }
     }

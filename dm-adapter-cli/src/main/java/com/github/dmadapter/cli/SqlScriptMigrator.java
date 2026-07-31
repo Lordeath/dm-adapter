@@ -44,6 +44,9 @@ class SqlScriptMigrator {
     private static final String CONVERSION_THREADS_PROPERTY = "dm.adapter.sqlScriptConversionThreads";
     private static final String DM_CURRENT_SCHEMA_EXPRESSION =
             "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)";
+    private static final String DM_CURRENT_SCHEMA_EXPRESSION_PATTERN =
+            "(?:SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
+                    + "|SF_GET_SCHEMA_NAME_BY_ID\\s*\\(\\s*CURRENT_SCHID\\s*\\))";
     static final String MYSQL_CREATE_DEFINER_REMOVAL_RULE = "MYSQL_CREATE_DEFINER_REMOVED";
     static final String MYSQL_CREATE_PROCEDURE_TO_DM_RULE = "MYSQL_CREATE_PROCEDURE_TO_DM";
     static final String MYSQL_CREATE_FUNCTION_TO_DM_RULE = "MYSQL_CREATE_FUNCTION_TO_DM";
@@ -298,11 +301,11 @@ class SqlScriptMigrator {
     private static final List<TextReplacement> SCRIPT_METADATA_REPLACEMENTS = List.of(
             new TextReplacement(
                     Pattern.compile("(?is)\\(\\s*select\\s+database\\s*\\(\\s*\\)\\s*\\)"),
-                    "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                    DM_CURRENT_SCHEMA_EXPRESSION
             ),
             new TextReplacement(
                     Pattern.compile("(?is)\\bdatabase\\s*\\(\\s*\\)"),
-                    "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
+                    DM_CURRENT_SCHEMA_EXPRESSION
             ),
             new TextReplacement(
                     Pattern.compile(
@@ -3312,9 +3315,7 @@ class SqlScriptMigrator {
     }
 
     private boolean containsCurrentSchemaContext(String sql) {
-        return Pattern.compile(
-                        "(?is)SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
-                )
+        return Pattern.compile("(?is)" + DM_CURRENT_SCHEMA_EXPRESSION_PATTERN)
                 .matcher(sql)
                 .find();
     }
@@ -3322,9 +3323,7 @@ class SqlScriptMigrator {
     private String addMetadataSchemaLocalVariable(String sql) {
         String schemaBoundSql = replaceOutsideIgnoredText(
                 sql,
-                Pattern.compile(
-                        "(?is)SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
-                ),
+                Pattern.compile("(?is)" + DM_CURRENT_SCHEMA_EXPRESSION_PATTERN),
                 matcher -> "dm_adapter_schema"
         );
         schemaBoundSql = removeLegacyMetadataSchemaProcedureParameter(schemaBoundSql);
@@ -3406,7 +3405,7 @@ class SqlScriptMigrator {
         }
         String arguments = sql.substring(openParen + 1, closeParen).strip();
         String boundArguments = arguments.replaceFirst(
-                "(?is)(?:,\\s*)?SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)\\s*$",
+                "(?is)(?:,\\s*)?" + DM_CURRENT_SCHEMA_EXPRESSION_PATTERN + "\\s*$",
                 ""
         ).strip();
         if (boundArguments.equals(arguments)) {
@@ -4146,19 +4145,47 @@ class SqlScriptMigrator {
         }
         scriptDynamicDdlState.dynamicDdlVariables.add(assignment.sqlVariable().toLowerCase(Locale.ROOT));
         ScriptIndexExistenceCheck check = assignment.existenceCheck();
-        String convertedSql = leadingSqlPrefix.prefix()
-                + "DECLARE\n"
-                + "    dm_existing_count INT;\n"
-                + "BEGIN\n"
-                + "    SELECT COUNT(*) INTO dm_existing_count\n"
-                + "    FROM ALL_INDEXES\n"
-                + "    WHERE " + check.ownerPredicate() + "\n"
-                + "      AND TABLE_NAME = UPPER(" + sqlStringLiteral(check.tableName()) + ")\n"
-                + "      AND INDEX_NAME = UPPER(" + sqlStringLiteral(check.indexName()) + ");\n\n"
-                + "    IF dm_existing_count " + (assignment.executeWhenMissing() ? "= 0" : "> 0") + " THEN\n"
-                + "        EXECUTE IMMEDIATE " + sqlStringLiteral(assignment.ddl()) + ";\n"
-                + "    END IF;\n"
-                + "END";
+        DamengCreateIndexDefinition indexDefinition = assignment.executeWhenMissing()
+                ? damengCreateIndexDefinition(assignment.ddl())
+                : null;
+        String convertedSql;
+        if (indexDefinition != null) {
+            String schemaExpression = metadataOwnerExpression(check.ownerPredicate());
+            if (schemaExpression.isBlank()) {
+                return null;
+            }
+            convertedSql = leadingSqlPrefix.prefix()
+                    + "DECLARE\n"
+                    + "    dm_existing_count INT;\n"
+                    + "BEGIN\n"
+                    + equivalentIndexCountSql(
+                            indexDefinition.tableName(),
+                            indexDefinition.unique(),
+                            indexDefinition.columns(),
+                            "dm_existing_count",
+                            schemaExpression,
+                            "    "
+                    )
+                    + ";\n\n"
+                    + "    IF dm_existing_count = 0 THEN\n"
+                    + "        EXECUTE IMMEDIATE " + sqlStringLiteral(assignment.ddl()) + ";\n"
+                    + "    END IF;\n"
+                    + "END";
+        } else {
+            convertedSql = leadingSqlPrefix.prefix()
+                    + "DECLARE\n"
+                    + "    dm_existing_count INT;\n"
+                    + "BEGIN\n"
+                    + "    SELECT COUNT(*) INTO dm_existing_count\n"
+                    + "    FROM ALL_INDEXES\n"
+                    + "    WHERE " + check.ownerPredicate() + "\n"
+                    + "      AND TABLE_NAME = UPPER(" + sqlStringLiteral(check.tableName()) + ")\n"
+                    + "      AND INDEX_NAME = UPPER(" + sqlStringLiteral(check.indexName()) + ");\n\n"
+                    + "    IF dm_existing_count " + (assignment.executeWhenMissing() ? "= 0" : "> 0") + " THEN\n"
+                    + "        EXECUTE IMMEDIATE " + sqlStringLiteral(assignment.ddl()) + ";\n"
+                    + "    END IF;\n"
+                    + "END";
+        }
         return new ScriptStatementConversion(
                 originalStatement,
                 convertedSql,
@@ -4183,7 +4210,7 @@ class SqlScriptMigrator {
         String convertedSql = leadingSqlPrefix.prefix()
                 + "-- DM_ADAPTER: MySQL script variable @"
                 + variableName
-                + " uses SYS_CONTEXT('USERENV','CURRENT_SCHEMA') in converted metadata checks";
+                + " uses SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID) in converted metadata checks";
         return new ScriptStatementConversion(
                 originalStatement,
                 convertedSql,
@@ -4350,14 +4377,14 @@ class SqlScriptMigrator {
         if (variableMatcher.find()) {
             String variableName = variableMatcher.group("name").toLowerCase(Locale.ROOT);
             if (scriptDynamicDdlState.currentSchemaVariables.contains(variableName)) {
-                return "OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+                return "OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION;
             }
             return "";
         }
         if (Pattern.compile(
                 "(?is)\\btable_schema\\b\\s*=\\s*(?:\\(\\s*SELECT\\s+)?DATABASE\\s*\\(\\s*\\)"
         ).matcher(whereClause).find()) {
-            return "OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')";
+            return "OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION;
         }
         Matcher literalMatcher = Pattern.compile(
                 "(?is)\\btable_schema\\b\\s*=\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")"
@@ -4366,6 +4393,12 @@ class SqlScriptMigrator {
             return "";
         }
         return "OWNER = " + sqlStringLiteral(singleQuotedSqlLiteralValue(literalMatcher.group("value")));
+    }
+
+    private String metadataOwnerExpression(String ownerPredicate) {
+        Matcher matcher = Pattern.compile("(?is)^\\s*OWNER\\s*=\\s*(?<expression>.+?)\\s*$")
+                .matcher(ownerPredicate == null ? "" : ownerPredicate);
+        return matcher.matches() ? matcher.group("expression") : "";
     }
 
     private String normalizeMysqlDynamicDdlForDameng(String ddl) {
@@ -4431,7 +4464,7 @@ class SqlScriptMigrator {
         );
         Pattern owner = Pattern.compile(
                 "(?is)\\bOWNER\\s*=\\s*"
-                        + "SYS_CONTEXT\\s*\\(\\s*'USERENV'\\s*,\\s*'CURRENT_SCHEMA'\\s*\\)"
+                        + DM_CURRENT_SCHEMA_EXPRESSION_PATTERN
         );
         Pattern table = Pattern.compile(
                 "(?is)\\bUPPER\\s*\\(\\s*TABLE_NAME\\s*\\)\\s*=\\s*"
@@ -4486,7 +4519,7 @@ class SqlScriptMigrator {
                         + "  ON CC.OWNER = C.OWNER\n"
                         + " AND CC.TABLE_NAME = C.TABLE_NAME\n"
                         + " AND CC.COLUMN_NAME = C.COLUMN_NAME\n"
-                        + "WHERE C.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
+                        + "WHERE C.OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION + "\n"
                         + "  AND UPPER(C.TABLE_NAME) = UPPER(" + tableLiteral + ")\n"
                         + "  AND UPPER(C.COLUMN_NAME) = UPPER(" + columnLiteral + ")\n"
                         + "  AND CC.COMMENTS = " + commentMatcher.group("value")
@@ -11099,7 +11132,9 @@ class SqlScriptMigrator {
             outputStatements.add(guardCreateIndexForDameng(
                     table.token(),
                     scopedIndexName,
-                    createIndexSql
+                    createIndexSql,
+                    convertedColumns,
+                    matcher.group("unique") != null
             ));
             appliedRules.add(MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM_RULE);
             if (!scopedIndexName.equalsIgnoreCase(unquoteIdentifier(lastIdentifierPart(indexToken)))) {
@@ -11117,21 +11152,182 @@ class SqlScriptMigrator {
     private String guardCreateIndexForDameng(
             String tableToken,
             String indexName,
-            String createIndexSql
+            String createIndexSql,
+            String convertedColumns,
+            boolean unique
     ) {
         String tableName = unquoteIdentifier(lastIdentifierPart(tableToken));
+        List<DamengIndexColumn> columns = damengIndexColumns(convertedColumns);
+        if (columns.isEmpty()) {
+            return guardCreateIndexByNameForDameng(tableName, indexName, createIndexSql);
+        }
+        return "DECLARE\n"
+                + "    dm_existing_count INT;\n"
+                + "BEGIN\n"
+                + equivalentIndexCountSql(tableName, unique, columns, "dm_existing_count", "    ")
+                + ";\n\n"
+                + "    IF dm_existing_count = 0 THEN\n"
+                + "        EXECUTE IMMEDIATE " + sqlStringLiteral(createIndexSql) + ";\n"
+                + "    END IF;\n"
+                + "END";
+    }
+
+    private String guardCreateIndexByNameForDameng(
+            String tableName,
+            String indexName,
+            String createIndexSql
+    ) {
         return "DECLARE\n"
                 + "    dm_existing_count INT;\n"
                 + "BEGIN\n"
                 + "    SELECT COUNT(*) INTO dm_existing_count\n"
                 + "    FROM ALL_INDEXES\n"
-                + "    WHERE OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
-                + "      AND TABLE_NAME = UPPER(" + sqlStringLiteral(tableName) + ")\n"
-                + "      AND INDEX_NAME = UPPER(" + sqlStringLiteral(indexName) + ");\n\n"
+                + "    WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)\n"
+                + "      AND UPPER(TABLE_NAME) = UPPER(" + sqlStringLiteral(tableName) + ")\n"
+                + "      AND UPPER(INDEX_NAME) = UPPER(" + sqlStringLiteral(indexName) + ");\n\n"
                 + "    IF dm_existing_count = 0 THEN\n"
                 + "        EXECUTE IMMEDIATE " + sqlStringLiteral(createIndexSql) + ";\n"
                 + "    END IF;\n"
                 + "END";
+    }
+
+    private String equivalentIndexCountSql(
+            String tableName,
+            boolean unique,
+            List<DamengIndexColumn> columns,
+            String targetVariable,
+            String indent
+    ) {
+        return equivalentIndexCountSql(
+                tableName,
+                unique,
+                columns,
+                targetVariable,
+                DM_CURRENT_SCHEMA_EXPRESSION,
+                indent
+        );
+    }
+
+    private String equivalentIndexCountSql(
+            String tableName,
+            boolean unique,
+            List<DamengIndexColumn> columns,
+            String targetVariable,
+            String schemaExpression,
+            String indent
+    ) {
+        StringBuilder sql = new StringBuilder();
+        sql.append(indent).append("SELECT COUNT(*) INTO ").append(targetVariable).append('\n')
+                .append(indent).append("FROM (\n")
+                .append(equivalentIndexSelectSql(
+                        tableName,
+                        unique,
+                        columns,
+                        schemaExpression,
+                        indent + "    "
+                ));
+        return sql.append('\n')
+                .append(indent).append(") dm_equivalent_indexes")
+                .toString();
+    }
+
+    private String equivalentIndexSelectSql(
+            String tableName,
+            boolean unique,
+            List<DamengIndexColumn> columns,
+            String schemaExpression,
+            String indent
+    ) {
+        StringBuilder sql = new StringBuilder();
+        sql.append(indent).append("SELECT I.INDEX_NAME\n")
+                .append(indent).append("FROM ALL_INDEXES I\n")
+                .append(indent).append("JOIN ALL_IND_COLUMNS C\n")
+                .append(indent).append("  ON C.INDEX_OWNER = I.OWNER\n")
+                .append(indent).append(" AND C.INDEX_NAME = I.INDEX_NAME\n")
+                .append(indent).append(" AND C.TABLE_OWNER = I.TABLE_OWNER\n")
+                .append(indent).append(" AND C.TABLE_NAME = I.TABLE_NAME\n")
+                .append(indent).append("LEFT JOIN ALL_IND_EXPRESSIONS E\n")
+                .append(indent).append("  ON E.INDEX_OWNER = C.INDEX_OWNER\n")
+                .append(indent).append(" AND E.INDEX_NAME = C.INDEX_NAME\n")
+                .append(indent).append(" AND E.TABLE_OWNER = C.TABLE_OWNER\n")
+                .append(indent).append(" AND E.TABLE_NAME = C.TABLE_NAME\n")
+                .append(indent).append(" AND E.COLUMN_POSITION = ABS(C.COLUMN_POSITION)\n")
+                .append(indent).append("WHERE I.OWNER = ").append(schemaExpression).append('\n')
+                .append(indent).append("  AND I.TABLE_OWNER = ").append(schemaExpression).append('\n')
+                .append(indent).append("  AND UPPER(I.TABLE_NAME) = UPPER(")
+                .append(sqlStringLiteral(tableName)).append(")\n")
+                .append(indent).append("  AND I.UNIQUENESS = '")
+                .append(unique ? "UNIQUE" : "NONUNIQUE").append("'\n")
+                .append(indent).append("GROUP BY I.INDEX_NAME\n")
+                .append(indent).append("HAVING COUNT(*) = ").append(columns.size());
+        for (int index = 0; index < columns.size(); index++) {
+            sql.append('\n')
+                    .append(indent).append("   AND MAX(CASE WHEN ")
+                    .append(indexColumnEquivalencePredicate(columns.get(index), index + 1))
+                    .append(" THEN 1 ELSE 0 END) = 1");
+        }
+        return sql.toString();
+    }
+
+    private String indexColumnEquivalencePredicate(DamengIndexColumn column, int position) {
+        if (!column.expression().isBlank()) {
+            return "ABS(C.COLUMN_POSITION) = " + position
+                    + " AND E.COLUMN_EXPRESSION IS NOT NULL"
+                    + " AND " + normalizedDamengIndexExpressionSql("E.COLUMN_EXPRESSION")
+                    + " = " + sqlStringLiteral(column.expression());
+        }
+        return "C.COLUMN_POSITION = " + position
+                + " AND E.COLUMN_EXPRESSION IS NULL"
+                + " AND UPPER(C.COLUMN_NAME) = UPPER(" + sqlStringLiteral(column.columnName()) + ")"
+                + " AND UPPER(C.DESCEND) = '" + column.direction() + "'";
+    }
+
+    private String normalizedDamengIndexExpressionSql(String expression) {
+        return "UPPER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE("
+                + expression
+                + ", ' ', ''), CHR(9), ''), CHR(10), ''), CHR(13), ''), '`', ''), '\"', ''))";
+    }
+
+    private List<DamengIndexColumn> damengIndexColumns(String columns) {
+        List<DamengIndexColumn> definitions = new ArrayList<>();
+        for (String rawColumn : splitTopLevelComma(columns)) {
+            String definition = rawColumn.strip();
+            if (definition.isBlank()) {
+                return List.of();
+            }
+            Matcher orderMatcher = Pattern.compile(
+                    "(?is)^(?<value>.+?)(?:\\s+(?<direction>ASC|DESC))?\\s*$"
+            ).matcher(definition);
+            if (!orderMatcher.matches()) {
+                return List.of();
+            }
+            String value = orderMatcher.group("value").strip();
+            String direction = orderMatcher.group("direction") == null
+                    ? "ASC"
+                    : orderMatcher.group("direction").toUpperCase(Locale.ROOT);
+            if (isSimpleIdentifier(value)) {
+                definitions.add(new DamengIndexColumn(unquoteIdentifier(value), "", direction));
+                continue;
+            }
+            if (!DM_PREFIX_FUNCTION_INDEX_PATTERN.matcher(value).matches()) {
+                return List.of();
+            }
+            String expression = value + ("DESC".equals(direction) ? " DESC" : "");
+            definitions.add(new DamengIndexColumn(
+                    "",
+                    normalizeDamengIndexExpression(expression),
+                    direction
+            ));
+        }
+        return List.copyOf(definitions);
+    }
+
+    private String normalizeDamengIndexExpression(String expression) {
+        return expression
+                .replaceAll("\\s+", "")
+                .replace("`", "")
+                .replace("\"", "")
+                .toUpperCase(Locale.ROOT);
     }
 
     private boolean isMysqlCreateTableInlineSecondaryKey(String part) {
@@ -11929,6 +12125,31 @@ class SqlScriptMigrator {
                 + matcher.group("close");
     }
 
+    private DamengCreateIndexDefinition damengCreateIndexDefinition(String ddl) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+(?<unique>UNIQUE\\s+)?INDEX\\s+"
+                        + "(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s+ON\\s+"
+                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\("
+        ).matcher(ddl == null ? "" : ddl);
+        if (!matcher.find()) {
+            return null;
+        }
+        int openParen = matcher.end() - 1;
+        int closeParen = findMatchingParen(ddl, openParen);
+        if (closeParen <= openParen || !ddl.substring(closeParen + 1).strip().isBlank()) {
+            return null;
+        }
+        List<DamengIndexColumn> columns = damengIndexColumns(ddl.substring(openParen + 1, closeParen));
+        if (columns.isEmpty()) {
+            return null;
+        }
+        return new DamengCreateIndexDefinition(
+                unquoteIdentifier(lastIdentifierPart(matcher.group("table"))),
+                matcher.group("unique") != null,
+                columns
+        );
+    }
+
     private String convertMysqlIndexPrefixLengths(String columns) {
         List<String> parts = splitTopLevelComma(columns);
         List<String> converted = new ArrayList<>(parts.size());
@@ -11970,9 +12191,7 @@ class SqlScriptMigrator {
         }
         String converted = normalizedSql;
         for (IndexRename rename : renames) {
-            if (!rename.oldIndexName().equals(rename.newIndexName())) {
-                converted = replaceIndexExistenceCheck(converted, rename);
-            }
+            converted = replaceIndexExistenceCheck(converted, rename);
         }
         return converted;
     }
@@ -12012,7 +12231,7 @@ class SqlScriptMigrator {
                 sql,
                 Pattern.compile(
                         "(?is)\\bALTER\\s+TABLE\\s+(?<table>`[^`]+`|\"[^\"]+\"|\\S+)\\s+"
-                                + "ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\s+"
+                                + "ADD\\s+(?<unique>UNIQUE\\s+)?(?:INDEX|KEY)\\s+"
                                 + "(?<index>`[^`]+`|\"[^\"]+\"|[^\\s(]+)\\s*\\("
                 ),
                 renames
@@ -12021,7 +12240,8 @@ class SqlScriptMigrator {
         collectIndexRenames(
                 sql,
                 Pattern.compile(
-                        "(?is)\\bCREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+(?<index>`[^`]+`|\"[^\"]+\"|\\S+)\\s+"
+                        "(?is)\\bCREATE\\s+(?<unique>UNIQUE\\s+)?INDEX\\s+"
+                                + "(?<index>`[^`]+`|\"[^\"]+\"|\\S+)\\s+"
                                 + "ON\\s+(?<table>`[^`]+`|\"[^\"]+\"|[^\\s(]+)\\s*\\("
                 ),
                 renames
@@ -12032,7 +12252,7 @@ class SqlScriptMigrator {
     private void collectAnonymousAlterTableIndexRenames(String sql, List<IndexRename> renames) {
         Matcher matcher = Pattern.compile(
                 "(?is)\\bALTER\\s+TABLE\\s+(?<table>`[^`]+`|\"[^\"]+\"|\\S+)\\s+"
-                        + "ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\s*\\("
+                        + "ADD\\s+(?<unique>UNIQUE\\s+)?(?:INDEX|KEY)\\s*\\("
         ).matcher(sql);
         while (matcher.find()) {
             int openParen = matcher.end() - 1;
@@ -12040,14 +12260,24 @@ class SqlScriptMigrator {
             if (closeParen <= openParen) {
                 continue;
             }
-            List<String> columns = indexColumnNames(sql.substring(openParen + 1, closeParen));
-            if (columns.isEmpty()) {
+            String convertedColumns = convertMysqlIndexPrefixLengths(
+                    sql.substring(openParen + 1, closeParen).strip()
+            );
+            List<DamengIndexColumn> columns = damengIndexColumns(convertedColumns);
+            List<String> columnNames = indexColumnNames(convertedColumns);
+            if (columns.isEmpty() || columnNames.isEmpty()) {
                 continue;
             }
             String tableName = unquoteIdentifier(lastIdentifierPart(matcher.group("table")));
-            String oldIndexName = columns.get(0);
+            String oldIndexName = columnNames.get(0);
             String newIndexName = dmSchemaScopedIndexName(matcher.group("table"), oldIndexName);
-            renames.add(new IndexRename(tableName, oldIndexName, newIndexName, columns));
+            renames.add(new IndexRename(
+                    tableName,
+                    oldIndexName,
+                    newIndexName,
+                    matcher.group("unique") != null,
+                    columns
+            ));
         }
     }
 
@@ -12058,11 +12288,19 @@ class SqlScriptMigrator {
             String tableName = unquoteIdentifier(lastIdentifierPart(matcher.group("table")));
             int openParen = matcher.end() - 1;
             int closeParen = findMatchingParen(sql, openParen);
-            List<String> columns = closeParen > openParen
-                    ? indexColumnNames(sql.substring(openParen + 1, closeParen))
+            List<DamengIndexColumn> columns = closeParen > openParen
+                    ? damengIndexColumns(convertMysqlIndexPrefixLengths(
+                            sql.substring(openParen + 1, closeParen).strip()
+                    ))
                     : List.of();
             String newIndexName = dmSchemaScopedIndexName(matcher.group("table"), matcher.group("index"));
-            renames.add(new IndexRename(tableName, oldIndexName, newIndexName, columns));
+            renames.add(new IndexRename(
+                    tableName,
+                    oldIndexName,
+                    newIndexName,
+                    matcher.group("unique") != null,
+                    columns
+            ));
         }
     }
 
@@ -12102,7 +12340,7 @@ class SqlScriptMigrator {
     }
 
     private String replaceIndexNameCheckWithColumnCheck(String sql, IndexRename rename) {
-        if (rename.columnNames().isEmpty()) {
+        if (rename.columns().isEmpty()) {
             return sql;
         }
         Pattern pattern = Pattern.compile("(?is)\\bIF\\s+NOT\\s+EXISTS\\s*\\(");
@@ -12157,27 +12395,18 @@ class SqlScriptMigrator {
     }
 
     private String indexColumnExistenceCheck(IndexRename rename) {
-        StringBuilder columnPositionChecks = new StringBuilder();
-        List<String> columnNames = rename.columnNames();
-        for (int i = 0; i < columnNames.size(); i++) {
-            columnPositionChecks.append("\n")
-                    .append("               AND MAX(CASE WHEN COLUMN_POSITION = ")
-                    .append(i + 1)
-                        .append(" AND UPPER(COLUMN_NAME) = UPPER('")
-                        .append(columnNames.get(i).replace("'", "''"))
-                        .append("') THEN 1 ELSE 0 END) = 1");
-        }
         return "IF NOT EXISTS (\n"
                 + "        SELECT 1\n"
                 + "        FROM (\n"
-                + "            SELECT INDEX_NAME\n"
-                + "            FROM ALL_IND_COLUMNS\n"
-                + "            WHERE INDEX_OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA')\n"
-                + "              AND UPPER(TABLE_NAME) = UPPER('"
-                + rename.tableName().replace("'", "''") + "')\n"
-                + "            GROUP BY INDEX_NAME\n"
-                + "            HAVING COUNT(*) = " + columnNames.size() + columnPositionChecks + "\n"
-                + "        )\n"
+                + equivalentIndexSelectSql(
+                        rename.tableName(),
+                        rename.unique(),
+                        rename.columns(),
+                        DM_CURRENT_SCHEMA_EXPRESSION,
+                        "            "
+                )
+                + "\n"
+                + "        ) dm_equivalent_indexes\n"
                 + "    ) THEN";
     }
 
@@ -13576,9 +13805,28 @@ class SqlScriptMigrator {
     private record UserVariableReference(int start, int end, String name) {
     }
 
-    private record IndexRename(String tableName, String oldIndexName, String newIndexName, List<String> columnNames) {
+    private record DamengIndexColumn(String columnName, String expression, String direction) {
+    }
+
+    private record DamengCreateIndexDefinition(
+            String tableName,
+            boolean unique,
+            List<DamengIndexColumn> columns
+    ) {
+        private DamengCreateIndexDefinition {
+            columns = List.copyOf(columns == null ? List.of() : columns);
+        }
+    }
+
+    private record IndexRename(
+            String tableName,
+            String oldIndexName,
+            String newIndexName,
+            boolean unique,
+            List<DamengIndexColumn> columns
+    ) {
         private IndexRename {
-            columnNames = List.copyOf(columnNames == null ? List.of() : columnNames);
+            columns = List.copyOf(columns == null ? List.of() : columns);
         }
     }
 
