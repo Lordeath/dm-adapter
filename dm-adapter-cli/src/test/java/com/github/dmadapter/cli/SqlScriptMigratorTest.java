@@ -1693,6 +1693,26 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsVariadicProcedureConcatToNestedBinaryCalls() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE build_dynamic_sql(IN endDate DATE, IN userIds VARCHAR(8000))
+                BEGIN
+                    DECLARE dm_sql VARCHAR(4000);
+                    SET dm_sql = CONCAT('prefix-', endDate, '-users-', userIds, '-suffix');
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("dm_sql := CONCAT(CONCAT(CONCAT(CONCAT('prefix-', endDate), '-users-'), userIds), '-suffix');");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE));
+    }
+
+    @Test
     void dynamicallyExecutesPermanentTableDmlAfterTruncateWithLocalTemporarySource() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE TABLE daily_result(id BIGINT, amount DECIMAL(18, 2));
