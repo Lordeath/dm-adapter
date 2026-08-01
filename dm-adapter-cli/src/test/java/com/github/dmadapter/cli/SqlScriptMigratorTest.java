@@ -1748,6 +1748,53 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void countsSimpleProcedureExistsDirectlyAndKeepsComplexExistsWrapped() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE build_report(IN enterpriseId BIGINT)
+                BEGIN
+                    DECLARE dm_sql VARCHAR(4000);
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM ns_setting_of_reporting_items
+                        WHERE deleteFlag = 0 AND enterpriseId = enterpriseId
+                    ) THEN
+                        RETURN;
+                    END IF;
+                    IF EXISTS (
+                        SELECT 1
+                        FROM ns_setting_of_reporting_items
+                        GROUP BY enterpriseId
+                        HAVING COUNT(*) > 1
+                    ) THEN
+                        SET dm_sql = CONCAT('SELECT ', dm_sql, ' FROM ns_reporting_management_item');
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT COUNT(*) INTO dm_adapter_exists\n"
+                        + "FROM ns_setting_of_reporting_items\n"
+                        + "        WHERE deleteFlag = 0 AND enterpriseId = enterpriseId;")
+                .contains("SELECT COUNT(*) INTO dm_adapter_exists_2 FROM (\n"
+                        + "SELECT 1\n"
+                        + "        FROM ns_setting_of_reporting_items\n"
+                        + "        GROUP BY enterpriseId\n"
+                        + "        HAVING COUNT(*) > 1\n"
+                        + ") dm_adapter_exists_check;")
+                .contains("dm_sql := CONCAT(dm_sql, ' FROM ns_reporting_management_item');")
+                .contains("dm_sql := CONCAT('SELECT ', dm_sql);");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(
+                                SqlScriptMigrator.MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE,
+                                SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE
+                        ));
+    }
+
+    @Test
     void preservesProcedureConcatLineBreaksWithoutMultilineStringLiterals() throws Exception {
         String source = """
                 DELIMITER $$
