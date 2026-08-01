@@ -1672,6 +1672,7 @@ class SqlScriptMigratorTest {
                 CREATE PROCEDURE social_detail()
                 BEGIN
                     DROP TABLE IF EXISTS salaywell_social_temp;
+                    -- 创建中间表
                     CREATE TEMPORARY TABLE salayWell_social_Temp (
                         systemUserId BIGINT,
                         money DECIMAL(18, 4)
@@ -1690,6 +1691,10 @@ class SqlScriptMigratorTest {
                 .contains("FROM #salayWell_social_Temp")
                 .doesNotContain("DELETE FROM #salayWell_social_Temp")
                 .doesNotContain("DROP TABLE IF EXISTS #salayWell_social_Temp");
+        assertThat(converted.sql().indexOf("CREATE TABLE #salayWell_social_Temp"))
+                .isLessThan(converted.sql().indexOf("-- 创建中间表"));
+        assertThat(converted.sql().indexOf("-- 创建中间表"))
+                .isLessThan(converted.sql().indexOf("INSERT INTO #salayWell_social_Temp"));
     }
 
     @Test

@@ -12118,7 +12118,31 @@ class SqlScriptMigrator {
                 index++;
             }
         }
-        return changed ? converted.toString() : sql;
+        return changed ? relocateCommentsAfterProcedureLocalTemporaryTableCreate(converted.toString()) : sql;
+    }
+
+    private String relocateCommentsAfterProcedureLocalTemporaryTableCreate(String sql) {
+        Matcher matcher = Pattern.compile(
+                "(?ms)(?<comments>(?:^[\\t ]*--[^\\r\\n]*(?:\\r?\\n))+)(?<ddlIndent>^[\\t ]*)"
+                        + "(?<ddl>CREATE\\s+TABLE\\s+DM_ADAPTER_LOCAL_TEMP_[A-Za-z_][A-Za-z0-9_$]*"
+                        + "\\s*\\(.*?\\)\\s*;)"
+        ).matcher(sql);
+        StringBuilder converted = new StringBuilder(sql.length());
+        int copyStart = 0;
+        while (matcher.find()) {
+            converted.append(sql, copyStart, matcher.start());
+            String comments = matcher.group("comments");
+            String lineBreak = comments.contains("\r\n") ? "\r\n" : "\n";
+            converted.append(matcher.group("ddlIndent"))
+                    .append(matcher.group("ddl"))
+                    .append(lineBreak)
+                    .append(comments.stripTrailing());
+            copyStart = matcher.end();
+        }
+        if (copyStart == 0) {
+            return sql;
+        }
+        return converted.append(sql, copyStart, sql.length()).toString();
     }
 
     private String normalizeDmLocalTemporaryTableCreate(String ddl, String table, int prefixEnd) {
