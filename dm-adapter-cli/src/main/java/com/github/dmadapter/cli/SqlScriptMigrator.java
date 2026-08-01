@@ -11852,7 +11852,7 @@ class SqlScriptMigrator {
                 int end = findStatementTerminator(sql, index);
                 String ddl = sql.substring(index, end);
                 Matcher matcher = Pattern.compile(
-                        "(?is)^DROP\\s+TEMPORARY\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?<tables>.+)$"
+                        "(?is)^DROP\\s+(?:TEMPORARY\\s+)?TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?<tables>.+)$"
                 ).matcher(ddl.strip());
                 if (!matcher.matches()
                         || splitTopLevelComma(matcher.group("tables")).stream()

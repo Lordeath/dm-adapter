@@ -1624,7 +1624,7 @@ class SqlScriptMigratorTest {
                 DELIMITER $$
                 CREATE PROCEDURE calculate_formula(IN targetId BIGINT)
                 BEGIN
-                    DROP TEMPORARY TABLE IF EXISTS temp_target, spilt_target;
+                    DROP TABLE IF EXISTS temp_target, spilt_target;
                     CREATE TEMPORARY TABLE IF NOT EXISTS temp_target (
                         id BIGINT(0) NOT NULL AUTO_INCREMENT,
                         targetId BIGINT,
@@ -1654,6 +1654,8 @@ class SqlScriptMigratorTest {
                 .contains("INSERT INTO #spilt_target(targetId)")
                 .contains("SELECT targetId FROM #temp_target")
                 .contains("DELETE FROM #spilt_target")
+                .contains("NULL /* DM_ADAPTER: local temporary tables start empty and are released ")
+                .doesNotContain("DELETE FROM #temp_target")
                 .doesNotContain("CREATE TEMPORARY TABLE")
                 .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE #")
                 .doesNotContain("CAST(targetId AS VARCHAR")
@@ -1661,6 +1663,33 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE));
+    }
+
+    @Test
+    void treatsProcedureDropWithoutTemporaryKeywordAsLocalTempInitializationNoop() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE social_detail()
+                BEGIN
+                    DROP TABLE IF EXISTS salaywell_social_temp;
+                    CREATE TEMPORARY TABLE salayWell_social_Temp (
+                        systemUserId BIGINT,
+                        money DECIMAL(18, 4)
+                    );
+                    INSERT INTO salayWell_social_Temp(systemUserId, money) VALUES (1, 2);
+                    SELECT systemUserId, money FROM salayWell_social_Temp;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("NULL /* DM_ADAPTER: local temporary tables start empty and are released ")
+                .contains("CREATE TABLE #salayWell_social_Temp")
+                .contains("INSERT INTO #salayWell_social_Temp(systemUserId, money)")
+                .contains("FROM #salayWell_social_Temp")
+                .doesNotContain("DELETE FROM #salayWell_social_Temp")
+                .doesNotContain("DROP TABLE IF EXISTS #salayWell_social_Temp");
     }
 
     @Test
