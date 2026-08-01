@@ -9491,6 +9491,7 @@ class SqlScriptMigrator {
                 List<String> rewrittenArguments = arguments.stream()
                         .map(String::strip)
                         .map(this::rewriteVariadicConcatCalls)
+                        .map(this::rewriteMultilineProcedureConcatLiteral)
                         .toList();
                 boolean nestedChanged = !rewrittenArguments.equals(arguments.stream()
                         .map(String::strip)
@@ -9518,6 +9519,48 @@ class SqlScriptMigrator {
             }
         }
         return changed ? converted.toString() : sql;
+    }
+
+    private String rewriteMultilineProcedureConcatLiteral(String expression) {
+        if (expression.length() < 2
+                || expression.charAt(0) != '\''
+                || expression.charAt(expression.length() - 1) != '\''
+                || (!expression.contains("\r") && !expression.contains("\n"))
+                || skipSingleQuotedString(expression, 0) != expression.length()) {
+            return expression;
+        }
+
+        List<String> parts = new ArrayList<>();
+        int contentEnd = expression.length() - 1;
+        int segmentStart = 1;
+        int index = segmentStart;
+        while (index < contentEnd) {
+            char current = expression.charAt(index);
+            if (current != '\r' && current != '\n') {
+                index++;
+                continue;
+            }
+            parts.add("'" + expression.substring(segmentStart, index) + "'");
+            if (current == '\r') {
+                parts.add("CHR(13)");
+                index++;
+                if (index < contentEnd && expression.charAt(index) == '\n') {
+                    parts.add("CHR(10)");
+                    index++;
+                }
+            } else {
+                parts.add("CHR(10)");
+                index++;
+            }
+            segmentStart = index;
+        }
+        parts.add("'" + expression.substring(segmentStart, contentEnd) + "'");
+
+        String nested = parts.get(0);
+        for (int partIndex = 1; partIndex < parts.size(); partIndex++) {
+            nested = "CONCAT(" + nested + ", " + parts.get(partIndex) + ")";
+        }
+        return nested;
     }
 
     private String convertMysqlDateConcatCall(String call) {
