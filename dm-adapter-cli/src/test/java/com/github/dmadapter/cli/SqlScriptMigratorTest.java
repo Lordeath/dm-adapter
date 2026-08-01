@@ -1693,7 +1693,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void convertsVariadicProcedureConcatToNestedBinaryCalls() throws Exception {
+    void convertsVariadicProcedureConcatToSequentialBinaryCalls() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DELIMITER $$
                 CREATE PROCEDURE build_dynamic_sql(IN endDate DATE, IN userIds VARCHAR(8000))
@@ -1706,7 +1706,11 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("dm_sql := CONCAT(CONCAT('prefix-', endDate), CONCAT('-users-', CONCAT(userIds, '-suffix')));");
+                .contains("dm_sql := 'prefix-';")
+                .contains("dm_sql := CONCAT(dm_sql, endDate);")
+                .contains("dm_sql := CONCAT(dm_sql, '-users-');")
+                .contains("dm_sql := CONCAT(dm_sql, userIds);")
+                .contains("dm_sql := CONCAT(dm_sql, '-suffix');");
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE));
@@ -1729,7 +1733,10 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("CONCAT(CONCAT('prefix-', CHR(13)), CONCAT(CHR(10), 'line-'))")
+                .contains("dm_sql := 'prefix-';")
+                .contains("dm_sql := CONCAT(dm_sql, CHR(13));")
+                .contains("dm_sql := CONCAT(dm_sql, CHR(10));")
+                .contains("dm_sql := CONCAT(dm_sql, 'line-');")
                 .contains("CHR(13)")
                 .contains("CHR(10)")
                 .doesNotContain("'prefix-\r\nline-'");
