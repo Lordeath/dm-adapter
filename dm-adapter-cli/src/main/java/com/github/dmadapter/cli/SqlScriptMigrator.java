@@ -9506,29 +9506,51 @@ class SqlScriptMigrator {
                     terms.addAll(literalParts.isEmpty() ? List.of(argument.strip()) : literalParts);
                 }
                 String variable = sql.substring(index, variableEnd);
+                int targetTermIndex = uniqueSequentialConcatTargetIndex(terms, variable);
                 if (terms.size() <= 2
                         || terms.stream().anyMatch(term -> !isSafeSequentialConcatTerm(term))
-                        || referencesSequentialConcatTargetAfterFirstTerm(terms, variable)) {
+                        || targetTermIndex == -2) {
                     index = variableEnd;
                     continue;
                 }
 
                 String indentation = lineIndentationBefore(sql, index);
-                converted.append(sql, copyStart, index)
-                        .append(variable)
-                        .append(" := ")
-                        .append(terms.get(0))
-                        .append(';');
-                for (int termIndex = 1; termIndex < terms.size(); termIndex++) {
-                    converted.append('\n')
-                            .append(indentation)
-                            .append(variable)
-                            .append(" := CONCAT(")
-                            .append(variable)
-                            .append(", ")
-                            .append(terms.get(termIndex))
-                            .append(");");
+                StringBuilder replacement = new StringBuilder();
+                if (targetTermIndex >= 0) {
+                    for (int termIndex = targetTermIndex + 1; termIndex < terms.size(); termIndex++) {
+                        appendSequentialConcatAssignment(
+                                replacement,
+                                indentation,
+                                variable,
+                                variable,
+                                terms.get(termIndex)
+                        );
+                    }
+                    for (int termIndex = targetTermIndex - 1; termIndex >= 0; termIndex--) {
+                        appendSequentialConcatAssignment(
+                                replacement,
+                                indentation,
+                                variable,
+                                terms.get(termIndex),
+                                variable
+                        );
+                    }
+                } else {
+                    replacement.append(variable)
+                            .append(" := ")
+                            .append(terms.get(0))
+                            .append(';');
+                    for (int termIndex = 1; termIndex < terms.size(); termIndex++) {
+                        appendSequentialConcatAssignment(
+                                replacement,
+                                indentation,
+                                variable,
+                                variable,
+                                terms.get(termIndex)
+                        );
+                    }
                 }
+                converted.append(sql, copyStart, index).append(replacement);
                 copyStart = terminator + 1;
                 index = copyStart;
                 changed = true;
@@ -9543,13 +9565,35 @@ class SqlScriptMigrator {
         return converted.toString();
     }
 
-    private boolean referencesSequentialConcatTargetAfterFirstTerm(List<String> terms, String target) {
-        for (int index = 1; index < terms.size(); index++) {
+    private int uniqueSequentialConcatTargetIndex(List<String> terms, String target) {
+        int targetIndex = -1;
+        for (int index = 0; index < terms.size(); index++) {
             if (terms.get(index).strip().equalsIgnoreCase(target)) {
-                return true;
+                if (targetIndex >= 0) {
+                    return -2;
+                }
+                targetIndex = index;
             }
         }
-        return false;
+        return targetIndex;
+    }
+
+    private void appendSequentialConcatAssignment(
+            StringBuilder replacement,
+            String indentation,
+            String target,
+            String left,
+            String right
+    ) {
+        if (replacement.length() > 0) {
+            replacement.append('\n').append(indentation);
+        }
+        replacement.append(target)
+                .append(" := CONCAT(")
+                .append(left)
+                .append(", ")
+                .append(right)
+                .append(");");
     }
 
     private boolean isSafeSequentialConcatTerm(String term) {

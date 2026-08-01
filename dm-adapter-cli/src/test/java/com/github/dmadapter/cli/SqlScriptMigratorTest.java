@@ -1736,9 +1736,12 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("dm_sql := CONCAT('SELECT ', CONCAT(dm_sql, ' FROM demo'));")
+                .contains("dm_sql := CONCAT(dm_sql, ' FROM demo');")
+                .contains("dm_sql := CONCAT('SELECT ', dm_sql);")
                 .doesNotContain("dm_sql := 'SELECT ';\n")
                 .doesNotContain("dm_sql := CONCAT(dm_sql, dm_sql);");
+        assertThat(converted.sql().indexOf("dm_sql := CONCAT(dm_sql, ' FROM demo');"))
+                .isLessThan(converted.sql().indexOf("dm_sql := CONCAT('SELECT ', dm_sql);"));
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE));
