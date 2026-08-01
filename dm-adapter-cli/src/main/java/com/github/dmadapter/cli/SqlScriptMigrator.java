@@ -63,6 +63,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL";
     static final String MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE =
             "MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT";
+    static final String MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE =
+            "MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM";
     static final String MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE =
             "MYSQL_PROCEDURE_JSON_TEXT_TYPE";
     static final String DM_METADATA_IDENTIFIER_CASE_RULE = "DM_METADATA_IDENTIFIER_CASE";
@@ -6282,6 +6284,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_DATE_TIME_TO_DM_RULE);
         }
 
+        String procedureVariadicConcatSql = convertMysqlProcedureVariadicConcat(converted);
+        if (!procedureVariadicConcatSql.equals(converted)) {
+            converted = procedureVariadicConcatSql;
+            rules.add(MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE);
+        }
+
         String localTemporaryTableSql = convertMysqlProcedureLocalTemporaryTables(converted);
         if (!localTemporaryTableSql.equals(converted)) {
             converted = localTemporaryTableSql;
@@ -9427,6 +9435,83 @@ class SqlScriptMigrator {
                     converted.append(current);
                     index++;
                 }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return changed ? converted.toString() : sql;
+    }
+
+    private String convertMysqlProcedureVariadicConcat(String sql) {
+        if (!isCreateProcedureStatement(sql)
+                || !Pattern.compile("(?is)\\bCONCAT\\s*\\(").matcher(sql).find()) {
+            return sql;
+        }
+        return rewriteVariadicConcatCalls(sql);
+    }
+
+    private String rewriteVariadicConcatCalls(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                int end = skipSingleQuotedString(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '"') {
+                int end = skipDoubleQuotedText(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '`') {
+                int end = skipBacktickIdentifier(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                int end = skipUntilLineEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsBlockComment(sql, index)) {
+                int end = skipUntilBlockCommentEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsKeyword(sql, index, "CONCAT") && !isSchemaQualifiedFunctionName(sql, index)) {
+                int openParen = skipWhitespace(sql, index + "CONCAT".length());
+                int closeParen = openParen < sql.length() && sql.charAt(openParen) == '('
+                        ? findMatchingParen(sql, openParen)
+                        : -1;
+                if (closeParen < 0) {
+                    converted.append(current);
+                    index++;
+                    continue;
+                }
+                List<String> arguments = splitTopLevelComma(sql.substring(openParen + 1, closeParen));
+                List<String> rewrittenArguments = arguments.stream()
+                        .map(String::strip)
+                        .map(this::rewriteVariadicConcatCalls)
+                        .toList();
+                boolean nestedChanged = !rewrittenArguments.equals(arguments.stream()
+                        .map(String::strip)
+                        .toList());
+                if (arguments.size() > 2) {
+                    String nested = "CONCAT(" + rewrittenArguments.get(0)
+                            + ", " + rewrittenArguments.get(1) + ")";
+                    for (int argumentIndex = 2; argumentIndex < rewrittenArguments.size(); argumentIndex++) {
+                        nested = "CONCAT(" + nested + ", " + rewrittenArguments.get(argumentIndex) + ")";
+                    }
+                    converted.append(nested);
+                    changed = true;
+                } else if (nestedChanged) {
+                    converted.append("CONCAT(")
+                            .append(String.join(", ", rewrittenArguments))
+                            .append(')');
+                    changed = true;
+                } else {
+                    converted.append(sql, index, closeParen + 1);
+                }
+                index = closeParen + 1;
             } else {
                 converted.append(current);
                 index++;
