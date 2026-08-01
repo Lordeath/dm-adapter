@@ -9497,12 +9497,7 @@ class SqlScriptMigrator {
                         .map(String::strip)
                         .toList());
                 if (arguments.size() > 2) {
-                    String nested = "CONCAT(" + rewrittenArguments.get(0)
-                            + ", " + rewrittenArguments.get(1) + ")";
-                    for (int argumentIndex = 2; argumentIndex < rewrittenArguments.size(); argumentIndex++) {
-                        nested = "CONCAT(" + nested + ", " + rewrittenArguments.get(argumentIndex) + ")";
-                    }
-                    converted.append(nested);
+                    converted.append(buildBalancedBinaryConcat(rewrittenArguments, 0, rewrittenArguments.size()));
                     changed = true;
                 } else if (nestedChanged) {
                     converted.append("CONCAT(")
@@ -9555,12 +9550,16 @@ class SqlScriptMigrator {
             segmentStart = index;
         }
         parts.add("'" + expression.substring(segmentStart, contentEnd) + "'");
+        return buildBalancedBinaryConcat(parts, 0, parts.size());
+    }
 
-        String nested = parts.get(0);
-        for (int partIndex = 1; partIndex < parts.size(); partIndex++) {
-            nested = "CONCAT(" + nested + ", " + parts.get(partIndex) + ")";
+    private String buildBalancedBinaryConcat(List<String> parts, int start, int end) {
+        if (end - start == 1) {
+            return parts.get(start);
         }
-        return nested;
+        int middle = start + (end - start) / 2;
+        return "CONCAT(" + buildBalancedBinaryConcat(parts, start, middle)
+                + ", " + buildBalancedBinaryConcat(parts, middle, end) + ")";
     }
 
     private String convertMysqlDateConcatCall(String call) {
