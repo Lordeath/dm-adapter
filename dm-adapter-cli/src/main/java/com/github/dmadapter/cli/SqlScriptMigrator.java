@@ -9505,12 +9505,14 @@ class SqlScriptMigrator {
                     List<String> literalParts = multilineProcedureConcatLiteralParts(argument.strip());
                     terms.addAll(literalParts.isEmpty() ? List.of(argument.strip()) : literalParts);
                 }
-                if (terms.size() <= 2 || terms.stream().anyMatch(term -> !isSafeSequentialConcatTerm(term))) {
+                String variable = sql.substring(index, variableEnd);
+                if (terms.size() <= 2
+                        || terms.stream().anyMatch(term -> !isSafeSequentialConcatTerm(term))
+                        || referencesSequentialConcatTargetAfterFirstTerm(terms, variable)) {
                     index = variableEnd;
                     continue;
                 }
 
-                String variable = sql.substring(index, variableEnd);
                 String indentation = lineIndentationBefore(sql, index);
                 converted.append(sql, copyStart, index)
                         .append(variable)
@@ -9539,6 +9541,15 @@ class SqlScriptMigrator {
         }
         converted.append(sql, copyStart, sql.length());
         return converted.toString();
+    }
+
+    private boolean referencesSequentialConcatTargetAfterFirstTerm(List<String> terms, String target) {
+        for (int index = 1; index < terms.size(); index++) {
+            if (terms.get(index).strip().equalsIgnoreCase(target)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean isSafeSequentialConcatTerm(String term) {

@@ -1722,6 +1722,29 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void preservesPriorTargetValueWhenVariadicConcatReferencesItAfterPrefix() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE build_dynamic_sql()
+                BEGIN
+                    DECLARE dm_sql VARCHAR(4000);
+                    SET dm_sql = 'dynamic-columns';
+                    SET dm_sql = CONCAT('SELECT ', dm_sql, ' FROM demo');
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("dm_sql := CONCAT('SELECT ', CONCAT(dm_sql, ' FROM demo'));")
+                .doesNotContain("dm_sql := 'SELECT ';\n")
+                .doesNotContain("dm_sql := CONCAT(dm_sql, dm_sql);");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE));
+    }
+
+    @Test
     void preservesProcedureConcatLineBreaksWithoutMultilineStringLiterals() throws Exception {
         String source = """
                 DELIMITER $$
