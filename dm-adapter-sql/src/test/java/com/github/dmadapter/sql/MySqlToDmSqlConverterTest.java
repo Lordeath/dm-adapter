@@ -1067,7 +1067,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void quotesKeywordAliasesConvertedFromBackticksAndBareDistinctColumns() {
+    void preservesBacktickKeywordAliasesAndQuotesBareDistinctColumns() {
         SqlConversionResult result = converter.convert("""
                 select cluster.house_id as clusterId,
                        distinct
@@ -1077,10 +1077,10 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                select "cluster".house_id as clusterId,
+                select `cluster`.house_id as clusterId,
                        "distinct"
-                from owner_house_cluster_info "cluster"
-                join owner_house_base_info stat on stat.house_id = "cluster".house_id
+                from owner_house_cluster_info `cluster`
+                join owner_house_base_info stat on stat.house_id = `cluster`.house_id
                 """);
         assertThat(result.appliedRules()).containsExactly(
                 MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
@@ -2128,6 +2128,25 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void leavesQualifiedBacktickIdentifiersFromHrMapperNative() {
+        String sql = """
+                SELECT count(0)
+                FROM ns_user_baseinfo a
+                LEFT JOIN ns_user_order b ON a.id = b.user_id
+                WHERE a.`deleteFlag` = 0
+                  AND a.`enterpriseId` = ?
+                  AND a.`department` IN (?, ?, ?)
+                  AND (FIND_IN_SET(?, `status`) OR FIND_IN_SET(?, `status`))
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
     }
 
     @Test

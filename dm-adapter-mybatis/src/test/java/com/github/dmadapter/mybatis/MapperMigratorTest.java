@@ -5711,6 +5711,47 @@ class MapperMigratorTest {
     }
 
     @Test
+    void preservesBacktickKeywordAliasAcrossDynamicXmlNodes() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/OwnerHouseResultMapper.xml", """
+                select cluster.house_id as clusterId
+                <if test="includeBuilder != null">
+                   ,cluster.builder
+                </if>
+                from owner_house_cluster_info `cluster`
+                where cluster.house_id = #{houseId}
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/OwnerHouseResultMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/OwnerHouseResultMapper.xml"));
+        assertThat(rewritten)
+                .contains("select `cluster`.house_id as clusterId")
+                .contains(",`cluster`.builder")
+                .contains("from owner_house_cluster_info `cluster`")
+                .contains("where `cluster`.house_id = #{houseId}")
+                .doesNotContain("\"cluster\"");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MySqlToDmSqlConverter.DAMENG_KEYWORD_TABLE_ALIAS_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE
+                );
+    }
+
+    @Test
     void removesUnusedMysqlUserVariableInitializerSplitAcrossDynamicXmlNodes() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", """
                 select wrapped.id

@@ -7565,7 +7565,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private GenericConversion quoteDamengKeywordTableAliases(String sql) {
         List<TextReplacement> replacements = new ArrayList<>();
-        Set<String> aliases = new java.util.LinkedHashSet<>();
+        Map<String, String> aliases = new LinkedHashMap<>();
         collectDamengKeywordTableAliases(sql, replacements, aliases);
         if (aliases.isEmpty()) {
             return GenericConversion.unchanged(sql);
@@ -7577,7 +7577,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private void collectDamengKeywordTableAliases(
             String sql,
             List<TextReplacement> replacements,
-            Set<String> aliases
+            Map<String, String> aliases
     ) {
         int index = 0;
         while (index < sql.length()) {
@@ -7599,9 +7599,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 } else {
                     String unquotedAlias = unquoteIdentifier(alias.text());
                     if (isDamengKeywordRequiringQuotes(unquotedAlias)) {
-                        aliases.add(unquotedAlias.toUpperCase(Locale.ROOT));
+                        String quotedAlias = alias.text().startsWith("`") || alias.text().startsWith("\"")
+                                ? alias.text()
+                                : quoteDamengIdentifier(unquotedAlias);
+                        aliases.putIfAbsent(unquotedAlias.toUpperCase(Locale.ROOT), quotedAlias);
                     }
-                    if (!alias.text().startsWith("\"") && isDamengKeywordRequiringQuotes(unquotedAlias)) {
+                    if (!alias.text().startsWith("\"")
+                            && !alias.text().startsWith("`")
+                            && isDamengKeywordRequiringQuotes(unquotedAlias)) {
                         replacements.add(new TextReplacement(
                                 alias.startIndex(),
                                 alias.endIndex(),
@@ -7646,7 +7651,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private void collectDamengKeywordAliasReferences(
             String sql,
             List<TextReplacement> replacements,
-            Set<String> aliases
+            Map<String, String> aliases
     ) {
         int index = 0;
         while (index < sql.length()) {
@@ -7670,13 +7675,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 String unquoted = unquoteIdentifier(identifier.text());
                 int afterIdentifier = skipWhitespace(sql, identifier.endIndex());
                 if (!identifier.text().startsWith("\"")
-                        && aliases.contains(unquoted.toUpperCase(Locale.ROOT))
+                        && !identifier.text().startsWith("`")
+                        && aliases.containsKey(unquoted.toUpperCase(Locale.ROOT))
                         && afterIdentifier < sql.length()
                         && sql.charAt(afterIdentifier) == '.') {
                     replacements.add(new TextReplacement(
                             index,
                             identifier.endIndex(),
-                            quoteDamengIdentifier(unquoted)
+                            aliases.get(unquoted.toUpperCase(Locale.ROOT))
                     ));
                 }
                 index = identifier.endIndex();
