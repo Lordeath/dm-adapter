@@ -1713,6 +1713,32 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void preservesProcedureConcatLineBreaksWithoutMultilineStringLiterals() throws Exception {
+        String source = """
+                DELIMITER $$
+                CREATE PROCEDURE build_dynamic_sql(IN endDate DATE, IN userIds VARCHAR(8000))
+                BEGIN
+                    DECLARE dm_sql VARCHAR(4000);
+                    SET dm_sql = CONCAT('prefix-
+                line-', endDate, '-users-', userIds);
+                END$$
+                DELIMITER ;
+                """.replace("\n", "\r\n");
+
+        ConvertedScript converted = migrateSingleScript(source);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CONCAT(CONCAT(CONCAT('prefix-', CHR(13)), CHR(10)), 'line-')")
+                .contains("CHR(13)")
+                .contains("CHR(10)")
+                .doesNotContain("'prefix-\r\nline-'");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE));
+    }
+
+    @Test
     void dynamicallyExecutesPermanentTableDmlAfterTruncateWithLocalTemporarySource() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE TABLE daily_result(id BIGINT, amount DECIMAL(18, 2));
