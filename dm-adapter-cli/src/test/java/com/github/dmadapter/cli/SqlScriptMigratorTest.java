@@ -1706,7 +1706,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("dm_sql := CONCAT(CONCAT(CONCAT(CONCAT('prefix-', endDate), '-users-'), userIds), '-suffix');");
+                .contains("dm_sql := CONCAT(CONCAT('prefix-', endDate), CONCAT('-users-', CONCAT(userIds, '-suffix')));");
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE));
@@ -1729,7 +1729,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("CONCAT(CONCAT(CONCAT('prefix-', CHR(13)), CHR(10)), 'line-')")
+                .contains("CONCAT(CONCAT('prefix-', CHR(13)), CONCAT(CHR(10), 'line-'))")
                 .contains("CHR(13)")
                 .contains("CHR(10)")
                 .doesNotContain("'prefix-\r\nline-'");
