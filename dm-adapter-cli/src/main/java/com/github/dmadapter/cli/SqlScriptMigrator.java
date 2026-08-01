@@ -10125,11 +10125,18 @@ class SqlScriptMigrator {
         List<String> checks = new ArrayList<>();
         List<String> variableNames = new ArrayList<>();
         for (ProcedureExistsTerm term : terms) {
+            String directFromClause = simpleExistsCountFromClause(term.existsSelect());
             replacement.append("SELECT COUNT(*) INTO ")
-                    .append(term.variableName())
-                    .append(" FROM (\n")
-                    .append(term.existsSelect())
-                    .append("\n) dm_adapter_exists_check;\n")
+                    .append(term.variableName());
+            if (directFromClause == null) {
+                replacement.append(" FROM (\n")
+                        .append(term.existsSelect())
+                        .append("\n) dm_adapter_exists_check");
+            } else {
+                replacement.append('\n')
+                        .append(directFromClause);
+            }
+            replacement.append(";\n")
                     .append(indent);
             checks.add(term.variableName() + (term.negated() ? " = 0" : " > 0"));
             variableNames.add(term.variableName());
@@ -10143,6 +10150,53 @@ class SqlScriptMigrator {
                 variableNames,
                 replacement.toString()
         );
+    }
+
+    private String simpleExistsCountFromClause(String existsSelect) {
+        String query = existsSelect == null ? "" : existsSelect.strip();
+        if (!startsKeyword(query, 0, "SELECT")
+                || containsSqlComment(query)
+                || Pattern.compile("(?is)\\bALL_TAB_COLUMNS\\b").matcher(query).find()) {
+            return null;
+        }
+        int projectionStart = skipWhitespace(query, "SELECT".length());
+        int fromIndex = topLevelKeywordIndex(query, "FROM");
+        if (fromIndex < projectionStart || !"1".equals(query.substring(projectionStart, fromIndex).strip())) {
+            return null;
+        }
+        String fromClause = query.substring(fromIndex).strip();
+        if (fromClause.length() <= "FROM".length()) {
+            return null;
+        }
+        for (String unsupportedClause : List.of(
+                "GROUP", "HAVING", "UNION", "INTERSECT", "MINUS", "EXCEPT",
+                "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "LOCK", "PROCEDURE",
+                "INTO", "WINDOW", "QUALIFY"
+        )) {
+            if (topLevelKeywordIndex(fromClause, unsupportedClause) >= 0) {
+                return null;
+            }
+        }
+        return fromClause;
+    }
+
+    private boolean containsSqlComment(String value) {
+        int index = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(value, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(value, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(value, index);
+            } else if (startsLineComment(value, index) || startsBlockComment(value, index)) {
+                return true;
+            } else {
+                index++;
+            }
+        }
+        return false;
     }
 
     private String uniqueProcedureLocalName(String base, LinkedHashSet<String> existingNames) {
