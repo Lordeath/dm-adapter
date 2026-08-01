@@ -10177,7 +10177,40 @@ class SqlScriptMigrator {
                 return null;
             }
         }
-        return fromClause;
+        return collapseSqlWhitespaceOutsideQuotedText(fromClause);
+    }
+
+    private String collapseSqlWhitespaceOutsideQuotedText(String value) {
+        StringBuilder collapsed = new StringBuilder(value.length());
+        int index = 0;
+        boolean pendingSpace = false;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (Character.isWhitespace(current)) {
+                pendingSpace = !collapsed.isEmpty();
+                index++;
+                continue;
+            }
+            if (pendingSpace) {
+                collapsed.append(' ');
+                pendingSpace = false;
+            }
+            int tokenEnd;
+            if (current == '\'') {
+                tokenEnd = skipSingleQuotedString(value, index);
+            } else if (current == '"') {
+                tokenEnd = skipDoubleQuotedText(value, index);
+            } else if (current == '`') {
+                tokenEnd = skipBacktickIdentifier(value, index);
+            } else {
+                collapsed.append(current);
+                index++;
+                continue;
+            }
+            collapsed.append(value, index, tokenEnd);
+            index = tokenEnd;
+        }
+        return collapsed.toString();
     }
 
     private boolean containsSqlComment(String value) {
