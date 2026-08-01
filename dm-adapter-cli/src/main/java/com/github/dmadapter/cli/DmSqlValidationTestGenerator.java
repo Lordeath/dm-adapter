@@ -592,7 +592,13 @@ class DmSqlValidationTestGenerator {
             statements.sort(Comparator.naturalOrder());
             return statements;
         } catch (Exception e) {
-            return List.of();
+            throw new DmAdapterException(
+                    "Failed to parse mapper XML while generating Dameng validation test: "
+                            + mapperPath.toAbsolutePath().normalize()
+                            + ": "
+                            + e.getMessage(),
+                    e
+            );
         }
     }
 
