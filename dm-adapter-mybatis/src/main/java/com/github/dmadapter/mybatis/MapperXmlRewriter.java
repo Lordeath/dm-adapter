@@ -1395,9 +1395,11 @@ public class MapperXmlRewriter {
                     aliasStart = skipWhitespace(text, aliasStart + "AS".length());
                 }
                 IdentifierToken alias = readIdentifierToken(text, aliasStart);
-                if (alias != null && alias.text().startsWith("\"") && !isSqlClauseKeyword(alias.text())) {
+                if (alias != null
+                        && (alias.text().startsWith("\"") || alias.text().startsWith("`"))
+                        && !isSqlClauseKeyword(alias.text())) {
                     String unquoted = unquoteIdentifier(alias.text());
-                    aliases.putIfAbsent(unquoted.toUpperCase(Locale.ROOT), unquoted);
+                    aliases.putIfAbsent(unquoted.toUpperCase(Locale.ROOT), alias.text());
                     index = alias.endIndex();
                 } else {
                     index = relationEnd;
@@ -1480,7 +1482,7 @@ public class MapperXmlRewriter {
                     replacements.add(new TextReplacement(
                             baseOffset + index,
                             baseOffset + identifier.endIndex(),
-                            quoteDynamicAliasIdentifier(alias)
+                            alias
                     ));
                 }
                 index = identifier.endIndex();
@@ -6412,10 +6414,6 @@ public class MapperXmlRewriter {
             return unquoted;
         }
         return "\"" + unquoted.replace("\"", "\"\"") + "\"";
-    }
-
-    private String quoteDynamicAliasIdentifier(String identifier) {
-        return "\"" + identifier.replace("\"", "\"\"") + "\"";
     }
 
     private String unquoteIdentifier(String identifier) {
