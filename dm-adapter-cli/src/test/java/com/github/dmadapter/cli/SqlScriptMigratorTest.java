@@ -1775,8 +1775,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("SELECT COUNT(*) INTO dm_adapter_exists\n"
-                        + "FROM ns_setting_of_reporting_items\n"
+                .contains("SELECT COUNT(*) INTO dm_adapter_exists FROM ns_setting_of_reporting_items\n"
                         + "        WHERE deleteFlag = 0 AND enterpriseId = enterpriseId;")
                 .contains("SELECT COUNT(*) INTO dm_adapter_exists_2 FROM (\n"
                         + "SELECT 1\n"

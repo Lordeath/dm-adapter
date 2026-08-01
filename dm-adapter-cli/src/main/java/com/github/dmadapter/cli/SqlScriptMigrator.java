@@ -10133,7 +10133,7 @@ class SqlScriptMigrator {
                         .append(term.existsSelect())
                         .append("\n) dm_adapter_exists_check");
             } else {
-                replacement.append('\n')
+                replacement.append(' ')
                         .append(directFromClause);
             }
             replacement.append(";\n")
