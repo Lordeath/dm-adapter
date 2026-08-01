@@ -9448,7 +9448,118 @@ class SqlScriptMigrator {
                 || !Pattern.compile("(?is)\\bCONCAT\\s*\\(").matcher(sql).find()) {
             return sql;
         }
-        return rewriteVariadicConcatCalls(sql);
+        return rewriteVariadicConcatCalls(rewriteSafeProcedureConcatAssignments(sql));
+    }
+
+    private String rewriteSafeProcedureConcatAssignments(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int copyStart = 0;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (Character.isLetter(current) || current == '_') {
+                int variableEnd = index + 1;
+                while (variableEnd < sql.length() && isIdentifierPart(sql.charAt(variableEnd))) {
+                    variableEnd++;
+                }
+                int assignment = skipWhitespace(sql, variableEnd);
+                if (assignment + 1 >= sql.length()
+                        || sql.charAt(assignment) != ':'
+                        || sql.charAt(assignment + 1) != '=') {
+                    index = variableEnd;
+                    continue;
+                }
+                int function = skipWhitespace(sql, assignment + 2);
+                if (!startsKeyword(sql, function, "CONCAT") || isSchemaQualifiedFunctionName(sql, function)) {
+                    index = variableEnd;
+                    continue;
+                }
+                int openParen = skipWhitespace(sql, function + "CONCAT".length());
+                int closeParen = openParen < sql.length() && sql.charAt(openParen) == '('
+                        ? findMatchingParen(sql, openParen)
+                        : -1;
+                if (closeParen < 0) {
+                    index = variableEnd;
+                    continue;
+                }
+                int terminator = skipWhitespace(sql, closeParen + 1);
+                if (terminator >= sql.length() || sql.charAt(terminator) != ';') {
+                    index = variableEnd;
+                    continue;
+                }
+
+                List<String> arguments = splitTopLevelComma(sql.substring(openParen + 1, closeParen));
+                List<String> terms = new ArrayList<>();
+                for (String argument : arguments) {
+                    List<String> literalParts = multilineProcedureConcatLiteralParts(argument.strip());
+                    terms.addAll(literalParts.isEmpty() ? List.of(argument.strip()) : literalParts);
+                }
+                if (terms.size() <= 2 || terms.stream().anyMatch(term -> !isSafeSequentialConcatTerm(term))) {
+                    index = variableEnd;
+                    continue;
+                }
+
+                String variable = sql.substring(index, variableEnd);
+                String indentation = lineIndentationBefore(sql, index);
+                converted.append(sql, copyStart, index)
+                        .append(variable)
+                        .append(" := ")
+                        .append(terms.get(0))
+                        .append(';');
+                for (int termIndex = 1; termIndex < terms.size(); termIndex++) {
+                    converted.append('\n')
+                            .append(indentation)
+                            .append(variable)
+                            .append(" := CONCAT(")
+                            .append(variable)
+                            .append(", ")
+                            .append(terms.get(termIndex))
+                            .append(");");
+                }
+                copyStart = terminator + 1;
+                index = copyStart;
+                changed = true;
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return sql;
+        }
+        converted.append(sql, copyStart, sql.length());
+        return converted.toString();
+    }
+
+    private boolean isSafeSequentialConcatTerm(String term) {
+        if (term.length() >= 2
+                && term.charAt(0) == '\''
+                && term.charAt(term.length() - 1) == '\''
+                && skipSingleQuotedString(term, 0) == term.length()) {
+            return true;
+        }
+        return Pattern.compile("(?i)^[A-Z_][A-Z0-9_$#]*$").matcher(term).matches()
+                || Pattern.compile("(?i)^CHR\\(\\d+\\)$").matcher(term).matches()
+                || Pattern.compile("^[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)$").matcher(term).matches();
+    }
+
+    private String lineIndentationBefore(String sql, int index) {
+        int lineStart = index;
+        while (lineStart > 0 && sql.charAt(lineStart - 1) != '\n' && sql.charAt(lineStart - 1) != '\r') {
+            lineStart--;
+        }
+        String indentation = sql.substring(lineStart, index);
+        return indentation.chars().allMatch(Character::isWhitespace) ? indentation : "";
     }
 
     private String rewriteVariadicConcatCalls(String sql) {
@@ -9517,14 +9628,21 @@ class SqlScriptMigrator {
     }
 
     private String rewriteMultilineProcedureConcatLiteral(String expression) {
+        List<String> parts = multilineProcedureConcatLiteralParts(expression);
+        if (parts.isEmpty()) {
+            return expression;
+        }
+        return buildBalancedBinaryConcat(parts, 0, parts.size());
+    }
+
+    private List<String> multilineProcedureConcatLiteralParts(String expression) {
         if (expression.length() < 2
                 || expression.charAt(0) != '\''
                 || expression.charAt(expression.length() - 1) != '\''
                 || (!expression.contains("\r") && !expression.contains("\n"))
                 || skipSingleQuotedString(expression, 0) != expression.length()) {
-            return expression;
+            return List.of();
         }
-
         List<String> parts = new ArrayList<>();
         int contentEnd = expression.length() - 1;
         int segmentStart = 1;
@@ -9550,7 +9668,7 @@ class SqlScriptMigrator {
             segmentStart = index;
         }
         parts.add("'" + expression.substring(segmentStart, contentEnd) + "'");
-        return buildBalancedBinaryConcat(parts, 0, parts.size());
+        return parts;
     }
 
     private String buildBalancedBinaryConcat(List<String> parts, int start, int end) {
