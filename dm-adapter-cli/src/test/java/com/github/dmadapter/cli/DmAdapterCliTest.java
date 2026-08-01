@@ -1635,6 +1635,45 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void generateValidationTestFailsWhenMapperDmXmlIsMalformed() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+        Path malformedMapper = writeFile("src/main/resources/mapper-dm/BrokenMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.BrokenMapper">
+                    <select id="selectBroken">
+                        <when test="enabled == true">
+                            select 1
+                    </select>
+                </mapper>
+                """);
+
+        PrintStream originalErr = System.err;
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        int exitCode;
+        try (PrintStream capturedErr = new PrintStream(stderr, true, StandardCharsets.UTF_8)) {
+            System.setErr(capturedErr);
+            exitCode = execute(
+                    "generate-validation-test",
+                    "--project",
+                    tempDir.toString(),
+                    "--schema",
+                    "sample-system"
+            );
+        } finally {
+            System.setErr(originalErr);
+        }
+
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(stderr.toString(StandardCharsets.UTF_8))
+                .contains("Failed to parse mapper XML while generating Dameng validation test")
+                .contains(malformedMapper.toAbsolutePath().normalize().toString());
+        assertThat(Files.exists(tempDir.resolve(".dm-adapter/sql-validation.yml"))).isFalse();
+        assertThat(Files.exists(tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java"))).isFalse();
+        assertThat(malformedMapper).exists();
+    }
+
+    @Test
     void generateValidationTestPrintsTimestampedConsoleOutput() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");

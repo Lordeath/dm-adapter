@@ -709,9 +709,10 @@ public class MapperXmlRewriter {
     }
 
     private void writeReplacements(Path path, List<StatementReplacement> replacements) {
+        String xml;
         try {
             Files.createDirectories(path.getParent());
-            String xml = Files.readString(path, StandardCharsets.UTF_8);
+            xml = Files.readString(path, StandardCharsets.UTF_8);
             for (StatementReplacement replacement : replacements) {
                 StatementBody statementBody = findStatementBody(
                         xml,
@@ -724,6 +725,22 @@ public class MapperXmlRewriter {
                         : replacement.convertedBody();
                 xml = xml.substring(0, statementBody.start()) + rewrittenBody + xml.substring(statementBody.end());
             }
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to write mapper XML: " + path, e);
+        }
+        writeWellFormedXml(path, xml);
+    }
+
+    void writeWellFormedXml(Path path, String xml) {
+        try {
+            XmlSupport.parse(xml);
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Refusing to write malformed mapper XML after rewrite: " + path + ": " + e.getMessage(),
+                    e
+            );
+        }
+        try {
             Files.writeString(path, xml, StandardCharsets.UTF_8);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to write mapper XML: " + path, e);
@@ -872,7 +889,6 @@ public class MapperXmlRewriter {
         if (structuralConversion.changed()) {
             rewrittenBody = structuralConversion.convertedBody();
             addAppliedRules(appliedRules, structuralConversion.appliedRules());
-            addManualReviewReasons(manualReviewReasons, structuralConversion.manualReviewReasons());
             if (structuralConversion.appliedRules().contains(
                     MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE
             ) && !Pattern.compile("(?i)\\bLISTAGG\\s*\\(").matcher(rewrittenBody).find()) {
@@ -880,6 +896,7 @@ public class MapperXmlRewriter {
             }
             changed = true;
         }
+        addManualReviewReasons(manualReviewReasons, structuralConversion.manualReviewReasons());
         if ((appliedRules.contains(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE)
                 || appliedRules.contains(
                         MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE
@@ -935,6 +952,7 @@ public class MapperXmlRewriter {
             converted = havingConversion.convertedBody();
             addAppliedRules(appliedRules, havingConversion.appliedRules());
         }
+        addManualReviewReasons(manualReviewReasons, havingConversion.manualReviewReasons());
 
         TextRewrite unusedUserVariableSelectItem = removeUnusedUserVariableSelectItems(converted);
         if (unusedUserVariableSelectItem.changed()) {
@@ -1683,10 +1701,12 @@ public class MapperXmlRewriter {
     private DynamicHavingConversion convertDynamicHavingClauses(String body) {
         String converted = body;
         List<String> appliedRules = new ArrayList<>();
+        List<String> manualReviewReasons = new ArrayList<>();
         boolean changed = false;
         int guard = 0;
         while (guard < 100) {
             ScopeHavingConversion scopeConversion = convertFirstDynamicHavingScope(converted);
+            addManualReviewReasons(manualReviewReasons, scopeConversion.manualReviewReasons());
             if (!scopeConversion.changed()) {
                 break;
             }
@@ -1695,7 +1715,7 @@ public class MapperXmlRewriter {
             changed = true;
             guard++;
         }
-        return new DynamicHavingConversion(body, converted, appliedRules, changed);
+        return new DynamicHavingConversion(body, converted, appliedRules, manualReviewReasons, changed);
     }
 
     private TextRewrite removeUnusedUserVariableSelectItems(String body) {
@@ -2162,7 +2182,7 @@ public class MapperXmlRewriter {
         for (int i = scopes.size() - 1; i >= 0; i--) {
             SelectScope scope = scopes.get(i);
             ScopeHavingConversion havingConversion = convertRegularHavingInScope(body, view.text(), scope);
-            if (havingConversion.changed()) {
+            if (havingConversion.changed() || !havingConversion.manualReviewReasons().isEmpty()) {
                 return havingConversion;
             }
             ScopeHavingConversion trimConversion = convertTrimHavingInScope(body, scope);
@@ -2184,6 +2204,27 @@ public class MapperXmlRewriter {
         Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(selectList);
         Map<String, DynamicAggregateAlias> dynamicAggregateAliases = dynamicAggregateSelectAliases(selectList);
         Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(selectList);
+        XmlBlock enclosingHavingIf = enclosingXmlBlock(body, scope.havingIndex(), "if");
+        boolean havingStartsEnclosingIf = enclosingHavingIf != null
+                && sqlView(body.substring(enclosingHavingIf.openingEnd(), scope.havingIndex())).text().isBlank();
+        if (havingStartsEnclosingIf) {
+            ScopeHavingConversion enclosedConversion = moveEnclosedHavingIfBeforeGroupBy(
+                    body,
+                    scope,
+                    enclosingHavingIf,
+                    aggregateAliases,
+                    dynamicAggregateAliases.keySet(),
+                    selectAliases
+            );
+            if (enclosedConversion.changed()) {
+                return enclosedConversion;
+            }
+            return ScopeHavingConversion.manualReview(
+                    body,
+                    "HAVING is enclosed by a MyBatis <if> block that cannot be moved before dynamic GROUP BY "
+                            + "without proving complete XML-tag and query-branch equivalence. The original XML was retained."
+            );
+        }
         int havingStart = scope.havingIndex() + "HAVING".length();
         String havingContent = body.substring(havingStart, scope.havingEnd());
         int groupStart = scope.groupIndex() + "GROUP BY".length();
@@ -2268,6 +2309,179 @@ public class MapperXmlRewriter {
             rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
         }
         return new ScopeHavingConversion(converted, rules, true);
+    }
+
+    private ScopeHavingConversion moveEnclosedHavingIfBeforeGroupBy(
+            String body,
+            SelectScope scope,
+            XmlBlock havingIf,
+            Map<String, SelectAlias> aggregateAliases,
+            Set<String> dynamicAggregateAliases,
+            Map<String, SelectAlias> selectAliases
+    ) {
+        if (!sqlView(body.substring(havingIf.openingEnd(), scope.havingIndex())).text().isBlank()
+                || havingIf.closingStart() <= scope.havingIndex()
+                || havingIf.closingEnd() > scope.havingEnd()
+                || !sqlView(body.substring(havingIf.closingEnd(), scope.havingEnd())).text().isBlank()) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+
+        int havingStart = scope.havingIndex() + "HAVING".length();
+        String havingContent = body.substring(havingStart, havingIf.closingStart());
+        TextRewrite aggregateAliasRewrite = replaceAggregateAliases(havingContent, aggregateAliases);
+        HavingRewrite havingRewrite = rewriteHavingContent(
+                havingContent,
+                aggregateAliasRewrite.text(),
+                aggregateAliases,
+                dynamicAggregateAliases,
+                selectAliases
+        );
+        if (havingRewrite.movedConditions().isBlank() || !havingRewrite.remainingHaving().isBlank()) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+
+        List<OpenXmlTag> havingOpenTags = openXmlTagsAt(body, scope.havingIndex());
+        for (OpenXmlTag openTag : havingOpenTags) {
+            if (openTag.startIndex() > scope.fromIndex()
+                    && openTag.startIndex() < havingIf.openingStart()) {
+                return ScopeHavingConversion.unchanged(body);
+            }
+        }
+
+        int insertionIndex = dynamicGroupByContainerStart(body, scope);
+        if (insertionIndex < 0 || insertionIndex >= havingIf.openingStart()) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+
+        String movedBlock = body.substring(havingIf.openingStart(), havingIf.openingEnd())
+                + body.substring(havingIf.openingEnd(), scope.havingIndex())
+                + "and "
+                + havingRewrite.movedConditions().strip()
+                + trailingWhitespace(havingContent)
+                + body.substring(havingIf.closingStart(), havingIf.closingEnd());
+        String withoutHavingBlock = body.substring(0, havingIf.openingStart())
+                + body.substring(havingIf.closingEnd());
+
+        MyBatisWhereBlock whereBlock = findMyBatisWhereBlock(
+                withoutHavingBlock,
+                scope.fromIndex(),
+                insertionIndex
+        );
+        String converted;
+        if (whereBlock != null) {
+            String indent = indentationOfLastLine(withoutHavingBlock.substring(0, whereBlock.closingStart()));
+            converted = withoutHavingBlock.substring(0, whereBlock.closingStart())
+                    + movedBlock
+                    + "\n"
+                    + indent
+                    + withoutHavingBlock.substring(whereBlock.closingStart());
+        } else {
+            SqlView withoutView = sqlView(withoutHavingBlock);
+            int whereIndex = findTopLevelKeyword(
+                    withoutView.text(),
+                    "WHERE",
+                    scope.fromIndex(),
+                    insertionIndex,
+                    scope.depth()
+            );
+            String indent = indentationOfLastLine(withoutHavingBlock.substring(0, insertionIndex));
+            if (whereIndex >= 0) {
+                converted = withoutHavingBlock.substring(0, insertionIndex)
+                        + movedBlock
+                        + "\n"
+                        + indent
+                        + withoutHavingBlock.substring(insertionIndex);
+            } else {
+                String innerIndent = indent + "    ";
+                converted = withoutHavingBlock.substring(0, insertionIndex)
+                        + "<where>\n"
+                        + innerIndent
+                        + movedBlock
+                        + "\n"
+                        + indent
+                        + "</where>\n"
+                        + indent
+                        + withoutHavingBlock.substring(insertionIndex);
+            }
+        }
+        List<String> rules = new ArrayList<>();
+        if (aggregateAliasRewrite.changed()) {
+            rules.add(MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        }
+        rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        return new ScopeHavingConversion(converted, rules, true);
+    }
+
+    private int dynamicGroupByContainerStart(String body, SelectScope scope) {
+        List<OpenXmlTag> openTags = openXmlTagsAt(body, scope.groupIndex());
+        for (OpenXmlTag openTag : openTags) {
+            if (openTag.startIndex() > scope.fromIndex()) {
+                return openTag.startIndex();
+            }
+        }
+        return scope.groupIndex();
+    }
+
+    private XmlBlock enclosingXmlBlock(String body, int position, String tagName) {
+        List<OpenXmlTag> openTags = openXmlTagsAt(body, position);
+        for (int i = openTags.size() - 1; i >= 0; i--) {
+            OpenXmlTag openTag = openTags.get(i);
+            if (!tagName.equalsIgnoreCase(openTag.name())) {
+                continue;
+            }
+            int closingStart = findClosingTag(body, openTag.endIndex(), openTag.name(), body.length());
+            if (closingStart < position) {
+                continue;
+            }
+            XmlTag closingTag = readXmlTag(body, closingStart);
+            if (closingTag != null) {
+                return new XmlBlock(
+                        openTag.startIndex(),
+                        openTag.endIndex(),
+                        closingStart,
+                        closingTag.endIndex()
+                );
+            }
+        }
+        return null;
+    }
+
+    private List<OpenXmlTag> openXmlTagsAt(String body, int position) {
+        List<OpenXmlTag> openTags = new ArrayList<>();
+        int index = 0;
+        while (index < position) {
+            if (body.startsWith("<!--", index)) {
+                int commentEnd = body.indexOf("-->", index + "<!--".length());
+                index = commentEnd < 0 ? position : Math.min(position, commentEnd + "-->".length());
+                continue;
+            }
+            if (body.startsWith("<![CDATA[", index)) {
+                int cdataEnd = body.indexOf("]]>", index + "<![CDATA[".length());
+                index = cdataEnd < 0 ? position : Math.min(position, cdataEnd + "]]>".length());
+                continue;
+            }
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= position) {
+                break;
+            }
+            XmlTag tag = readXmlTag(body, tagStart);
+            if (tag == null) {
+                index = tagStart + 1;
+                continue;
+            }
+            if (tag.closing()) {
+                for (int i = openTags.size() - 1; i >= 0; i--) {
+                    if (tag.name().equalsIgnoreCase(openTags.get(i).name())) {
+                        openTags.subList(i, openTags.size()).clear();
+                        break;
+                    }
+                }
+            } else if (!tag.selfClosing()) {
+                openTags.add(new OpenXmlTag(tag.name(), tagStart, tag.endIndex()));
+            }
+            index = tag.endIndex();
+        }
+        return openTags;
     }
 
     private ScopeHavingConversion convertUngroupedHavingInScope(
@@ -8648,20 +8862,36 @@ public class MapperXmlRewriter {
             String originalBody,
             String convertedBody,
             List<String> appliedRules,
+            List<String> manualReviewReasons,
             boolean changed
     ) {
         DynamicHavingConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+            manualReviewReasons = List.copyOf(manualReviewReasons == null ? List.of() : manualReviewReasons);
         }
     }
 
-    private record ScopeHavingConversion(String convertedBody, List<String> appliedRules, boolean changed) {
+    private record ScopeHavingConversion(
+            String convertedBody,
+            List<String> appliedRules,
+            List<String> manualReviewReasons,
+            boolean changed
+    ) {
         ScopeHavingConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
+            manualReviewReasons = List.copyOf(manualReviewReasons == null ? List.of() : manualReviewReasons);
+        }
+
+        private ScopeHavingConversion(String convertedBody, List<String> appliedRules, boolean changed) {
+            this(convertedBody, appliedRules, List.of(), changed);
         }
 
         private static ScopeHavingConversion unchanged(String body) {
-            return new ScopeHavingConversion(body, List.of(), false);
+            return new ScopeHavingConversion(body, List.of(), List.of(), false);
+        }
+
+        private static ScopeHavingConversion manualReview(String body, String reason) {
+            return new ScopeHavingConversion(body, List.of(), List.of(reason), false);
         }
     }
 
@@ -8689,6 +8919,12 @@ public class MapperXmlRewriter {
     }
 
     private record MyBatisWhereBlock(int openingStart, int openingEnd, int closingStart, int closingEnd) {
+    }
+
+    private record OpenXmlTag(String name, int startIndex, int endIndex) {
+    }
+
+    private record XmlBlock(int openingStart, int openingEnd, int closingStart, int closingEnd) {
     }
 
     private record HavingRewrite(String remainingHaving, String movedConditions, boolean changed) {

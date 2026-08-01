@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MapperMigratorTest {
     @TempDir
@@ -31,6 +32,27 @@ class MapperMigratorTest {
         assertThat(files)
                 .extracting(MapperXmlFile::path)
                 .containsExactly(mapper.toAbsolutePath().normalize().toString());
+    }
+
+    @Test
+    void malformedRewriteIsRejectedBeforeExistingMapperDmIsOverwritten() throws Exception {
+        Path mapperDm = writeFile("src/main/resources/mapper-dm/UserMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.UserMapper">
+                    <select id="selectUser">select 1</select>
+                </mapper>
+                """);
+        String original = Files.readString(mapperDm);
+        String malformed = original.replace(
+                "select 1",
+                "<when test=\"enabled == true\">select 1"
+        );
+
+        assertThatThrownBy(() -> new MapperXmlRewriter().writeWellFormedXml(mapperDm, malformed))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Refusing to write malformed mapper XML after rewrite")
+                .hasMessageContaining(mapperDm.toString());
+        assertThat(Files.readString(mapperDm)).isEqualTo(original);
     }
 
     @Test
@@ -4787,6 +4809,162 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicHavingInsideIfMovesWholeBlockBeforeAllGroupByBranches() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="getArrearsReport">
+                        select d.precinct_id, d.house_id, sum(d.charge_sum) charge_sum
+                        from charge_detail d
+                        where d.is_delete = 0
+                        <choose>
+                            <when test="type != null and type == 2">
+                                group by d.precinct_id, d.house_id
+                            </when>
+                            <when test="type != null and type == 3">
+                                group by d.precinct_id, d.house_id, year(d.calc_start_date)
+                            </when>
+                        </choose>
+                        <if test="groupByReason == true">
+                            ,d.arrearage_reason
+                        </if>
+                        <if test="houseIdList != null and houseIdList.size() > 0">
+                            having d.house_id in
+                            <foreach collection="houseIdList" item="item" open="(" separator="," close=")">
+                                #{item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml");
+        String rewritten = Files.readString(output);
+        String houseFilter = "<if test=\"houseIdList != null and houseIdList.size() > 0\">";
+        assertThat(rewritten.indexOf(houseFilter)).isLessThan(rewritten.indexOf("<choose>"));
+        assertThat(rewritten)
+                .contains("and d.house_id in")
+                .contains("group by d.precinct_id, d.house_id")
+                .contains("group by d.precinct_id, d.house_id, year(d.calc_start_date)")
+                .contains("<if test=\"groupByReason == true\">")
+                .doesNotContainIgnoringCase("having d.house_id")
+                .doesNotContain("</if>\n                                group by");
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicHavingInsideIfIsRetainedForReviewWhenAggregateAndPlainConditionsAreMixed() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="getArrearsReport">
+                        select d.house_id, sum(d.charge_sum) charge_sum
+                        from charge_detail d
+                        group by d.house_id
+                        <if test="minimum != null">
+                            having d.house_id = #{houseId}
+                            and sum(d.charge_sum) &gt;= #{minimum}
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml");
+        assertThat(Files.readString(output)).isEqualTo(originalXml);
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("complete XML-tag and query-branch equivalence"));
+    }
+
+    @Test
+    void dynamicHavingInsideIfCreatesMyBatisWhereWhenNoWhereExists() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="listCharges">
+                        select d.house_id, sum(d.charge_sum)
+                        from charge_detail d
+                        group by d.house_id
+                        <if test="houseId != null">
+                            having d.house_id = #{houseId}
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml");
+        String rewritten = Files.readString(output);
+        assertThat(rewritten)
+                .contains("<where>")
+                .contains("and d.house_id = #{houseId}")
+                .contains("</where>")
+                .contains("group by d.house_id")
+                .doesNotContainIgnoringCase("having d.house_id");
+        assertThat(rewritten.indexOf("<where>")).isLessThan(rewritten.indexOf("group by d.house_id"));
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
