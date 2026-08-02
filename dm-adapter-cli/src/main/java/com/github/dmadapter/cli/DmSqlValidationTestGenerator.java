@@ -4069,7 +4069,12 @@ class DmSqlValidationTestGenerator {
                     if (config == null) {
                         return null;
                     }
-                    for (String marker : listOf("无效的表或视图名", "无效的表名")) {
+                    for (String marker : listOf(
+                            "无效的表或视图名",
+                            "无效的表名",
+                            "Invalid table or view name",
+                            "Invalid table name"
+                    )) {
                         for (String table : bracketedValuesAfterMarker(message, marker)) {
                             if (config.ignoresMissingTable(table)) {
                                 return table;
@@ -4101,7 +4106,14 @@ class DmSqlValidationTestGenerator {
                     if (config == null) {
                         return null;
                     }
-                    for (String marker : listOf("无效的列名", "无效的变量名", "无法解析的成员访问表达式")) {
+                    for (String marker : listOf(
+                            "无效的列名",
+                            "无效的变量名",
+                            "无法解析的成员访问表达式",
+                            "Invalid column name",
+                            "Invalid variable name",
+                            "Unable to resolve member access expression"
+                    )) {
                         for (String column : bracketedValuesAfterMarker(message, marker)) {
                             if (config.ignoresMissingColumn(column)) {
                                 return column;
@@ -4133,9 +4145,11 @@ class DmSqlValidationTestGenerator {
                     if (config == null) {
                         return null;
                     }
-                    for (String schema : bracketedValuesAfterMarker(message, "无效的模式名")) {
-                        if (config.ignoresMissingSchema(schema)) {
-                            return schema;
+                    for (String marker : listOf("无效的模式名", "Invalid schema name")) {
+                        for (String schema : bracketedValuesAfterMarker(message, marker)) {
+                            if (config.ignoresMissingSchema(schema)) {
+                                return schema;
+                            }
                         }
                     }
                     return null;
@@ -8539,14 +8553,26 @@ class DmSqlValidationTestGenerator {
                     Map<String, String> suggestedTables = new LinkedHashMap<>();
                     Map<String, String> suggestedColumns = new LinkedHashMap<>();
                     for (ValidationRecord record : failedRecords) {
-                        for (String marker : listOf("无效的表或视图名", "无效的表名")) {
+                        for (String marker : listOf(
+                                "无效的表或视图名",
+                                "无效的表名",
+                                "Invalid table or view name",
+                                "Invalid table name"
+                        )) {
                             for (String table : bracketedValuesAfterMarker(record.message, marker)) {
                                 if (!config.ignoresMissingTable(table)) {
                                     suggestedTables.putIfAbsent(normalizeMissingTableName(table), table);
                                 }
                             }
                         }
-                        for (String marker : listOf("无效的列名", "无效的变量名", "无法解析的成员访问表达式")) {
+                        for (String marker : listOf(
+                                "无效的列名",
+                                "无效的变量名",
+                                "无法解析的成员访问表达式",
+                                "Invalid column name",
+                                "Invalid variable name",
+                                "Unable to resolve member access expression"
+                        )) {
                             for (String column : bracketedValuesAfterMarker(record.message, marker)) {
                                 if (!config.ignoresMissingColumn(column)) {
                                     suggestedColumns.putIfAbsent(normalizeMissingColumnName(column), column);
@@ -8672,9 +8698,27 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private void appendSchemaObjectSummary(StringBuilder markdown, List<ValidationRecord> records) {
-                    Map<String, Long> missingTables = schemaIssueCounts(records, "无效的表或视图名", "无效的表名");
-                    Map<String, Long> missingColumns = schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式");
-                    Map<String, Long> missingSchemas = schemaIssueCounts(records, "无效的模式名");
+                    Map<String, Long> missingTables = schemaIssueCounts(
+                            records,
+                            "无效的表或视图名",
+                            "无效的表名",
+                            "Invalid table or view name",
+                            "Invalid table name"
+                    );
+                    Map<String, Long> missingColumns = schemaIssueCounts(
+                            records,
+                            "无效的列名",
+                            "无效的变量名",
+                            "无法解析的成员访问表达式",
+                            "Invalid column name",
+                            "Invalid variable name",
+                            "Unable to resolve member access expression"
+                    );
+                    Map<String, Long> missingSchemas = schemaIssueCounts(
+                            records,
+                            "无效的模式名",
+                            "Invalid schema name"
+                    );
                     if (missingTables.isEmpty() && missingColumns.isEmpty() && missingSchemas.isEmpty()) {
                         return;
                     }
@@ -8713,8 +8757,10 @@ class DmSqlValidationTestGenerator {
                     }
                     List<String> values = new ArrayList<>();
                     int searchFrom = 0;
+                    String lowerMessage = message.toLowerCase(Locale.ROOT);
+                    String lowerMarker = marker.toLowerCase(Locale.ROOT);
                     while (searchFrom < message.length()) {
-                        int markerIndex = message.indexOf(marker, searchFrom);
+                        int markerIndex = lowerMessage.indexOf(lowerMarker, searchFrom);
                         if (markerIndex < 0) {
                             break;
                         }
@@ -9196,11 +9242,29 @@ class DmSqlValidationTestGenerator {
 
                 private void appendSchemaObjectHotspotsJson(StringBuilder json, List<ValidationRecord> records) {
                     json.append("  \\"schemaObjectHotspots\\": {");
-                    appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(records, "无效的表或视图名", "无效的表名"));
+                    appendJsonCountArray(json, "missingTablesOrViews", schemaIssueCounts(
+                            records,
+                            "无效的表或视图名",
+                            "无效的表名",
+                            "Invalid table or view name",
+                            "Invalid table name"
+                    ));
                     json.append(", ");
-                    appendJsonCountArray(json, "missingColumns", schemaIssueCounts(records, "无效的列名", "无效的变量名", "无法解析的成员访问表达式"));
+                    appendJsonCountArray(json, "missingColumns", schemaIssueCounts(
+                            records,
+                            "无效的列名",
+                            "无效的变量名",
+                            "无法解析的成员访问表达式",
+                            "Invalid column name",
+                            "Invalid variable name",
+                            "Unable to resolve member access expression"
+                    ));
                     json.append(", ");
-                    appendJsonCountArray(json, "missingSchemas", schemaIssueCounts(records, "无效的模式名"));
+                    appendJsonCountArray(json, "missingSchemas", schemaIssueCounts(
+                            records,
+                            "无效的模式名",
+                            "Invalid schema name"
+                    ));
                     json.append("}");
                 }
 
@@ -9503,7 +9567,13 @@ class DmSqlValidationTestGenerator {
                             || lowerMessage.contains("无效的列名")
                             || lowerMessage.contains("无效的变量名")
                             || lowerMessage.contains("无效的模式名")
-                            || lowerMessage.contains("无法解析的成员访问表达式");
+                            || lowerMessage.contains("无法解析的成员访问表达式")
+                            || lowerMessage.contains("invalid table or view name")
+                            || lowerMessage.contains("invalid table name")
+                            || lowerMessage.contains("invalid column name")
+                            || lowerMessage.contains("invalid variable name")
+                            || lowerMessage.contains("invalid schema name")
+                            || lowerMessage.contains("unable to resolve member access expression");
                 }
 
                 private boolean hasOriginalMapperPropertyNameMismatch(String message) {
@@ -9883,7 +9953,9 @@ class DmSqlValidationTestGenerator {
                     if (dbColumnMetadata == null || isBlank(message)) {
                         return false;
                     }
-                    List<String> invalidColumns = bracketedValuesAfterMarker(message, "无效的列名");
+                    List<String> invalidColumns = new ArrayList<>();
+                    invalidColumns.addAll(bracketedValuesAfterMarker(message, "无效的列名"));
+                    invalidColumns.addAll(bracketedValuesAfterMarker(message, "Invalid column name"));
                     if (invalidColumns.isEmpty()) {
                         return false;
                     }
@@ -9910,7 +9982,9 @@ class DmSqlValidationTestGenerator {
                 }
 
                 private boolean hasDamengHavingSelectAliasFailure(String message) {
-                    List<String> invalidColumns = bracketedValuesAfterMarker(message, "无效的列名");
+                    List<String> invalidColumns = new ArrayList<>();
+                    invalidColumns.addAll(bracketedValuesAfterMarker(message, "无效的列名"));
+                    invalidColumns.addAll(bracketedValuesAfterMarker(message, "Invalid column name"));
                     if (invalidColumns.isEmpty()) {
                         return false;
                     }
@@ -10069,7 +10143,7 @@ class DmSqlValidationTestGenerator {
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
-                    if (containsAny(message, "无效的表或视图名", "无效的表名", "无效的列名", "无效的变量名", "无效的模式名", "无法解析的成员访问表达式")) {
+                    if (isSchemaObjectFailure(lower)) {
                         return "TEST_SCHEMA";
                     }
                     if (hasRequiredInsertColumnOmission(message)) {
