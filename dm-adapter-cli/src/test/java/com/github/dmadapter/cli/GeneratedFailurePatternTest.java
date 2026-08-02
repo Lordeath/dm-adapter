@@ -111,6 +111,23 @@ class GeneratedFailurePatternTest {
                     failedRecord(validationClass, missingColumn)
             )).isFalse();
 
+            String englishMissingColumn = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: Invalid column name [update_first_isdelay]
+                    ### SQL: select update_first_isdelay from ns_sr_services_detail_report
+                    ### Cause: dm.jdbc.driver.DMException: Invalid column name [update_first_isdelay]
+                    """;
+            Object englishMissingColumnRecord = failedRecord(validationClass, englishMissingColumn);
+            assertThat(failurePattern(validationClass, validation, englishMissingColumnRecord))
+                    .isEqualTo("TEST_SCHEMA_OBJECT");
+            assertThat(category(validationClass, validation, englishMissingColumnRecord))
+                    .isEqualTo("TEST_SCHEMA");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    englishMissingColumnRecord
+            )).isFalse();
+
             String havingSelectAlias = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error querying database. Cause: dm.jdbc.driver.DMException: 无效的列名[isFollowUp]
