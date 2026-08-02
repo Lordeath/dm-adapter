@@ -17,6 +17,27 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MigrateCommandTest {
     @Test
+    void metadataTimeoutScalesForLargeMapperSetsAndHonorsExplicitOverride() {
+        String propertyName = "dm.adapter.metadataReadTimeoutSeconds";
+        String original = System.getProperty(propertyName);
+        try {
+            System.clearProperty(propertyName);
+            assertThat(MigrateCommand.metadataReadTimeoutSeconds(0)).isEqualTo(12L);
+            assertThat(MigrateCommand.metadataReadTimeoutSeconds(122)).isEqualTo(134L);
+            assertThat(MigrateCommand.metadataReadTimeoutSeconds(1_000)).isEqualTo(300L);
+
+            System.setProperty(propertyName, "45");
+            assertThat(MigrateCommand.metadataReadTimeoutSeconds(1_000)).isEqualTo(45L);
+        } finally {
+            if (original == null) {
+                System.clearProperty(propertyName);
+            } else {
+                System.setProperty(propertyName, original);
+            }
+        }
+    }
+
+    @Test
     void explicitLengthSemanticsLimitsCapabilityLookupToOneAttempt() {
         assertThat(MigrateCommand.targetCapabilityReadAttempts(TargetLengthSemantics.BYTE)).isEqualTo(1);
         assertThat(MigrateCommand.targetCapabilityReadAttempts(TargetLengthSemantics.CHAR)).isEqualTo(1);

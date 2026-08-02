@@ -42,6 +42,7 @@ import java.util.concurrent.TimeoutException;
 @Command(name = "migrate", description = "Create a low-intrusion Dameng migration plan or apply it.")
 public class MigrateCommand implements Callable<Integer> {
     private static final long DEFAULT_METADATA_READ_TIMEOUT_SECONDS = 12L;
+    private static final long MAX_METADATA_READ_TIMEOUT_SECONDS = 300L;
     private static final int DEFAULT_METADATA_READ_ATTEMPTS = 5;
     private static final long DEFAULT_METADATA_RETRY_DELAY_MILLIS = 5_000L;
     private static final long MAX_METADATA_RETRY_DELAY_MILLIS = 30_000L;
@@ -540,13 +541,17 @@ public class MigrateCommand implements Callable<Integer> {
         }
         try {
             Optional<String> configuredSchema = configuredSchema(context);
+            List<String> candidateTables = candidates.stream()
+                    .map(RewriteConfigCandidate::tableName)
+                    .distinct()
+                    .toList();
             Map<String, TableKeyMetadata> dmMetadata = runWithMetadataTimeout(
                     () -> damengMetadataReader.readTableKeys(
                             environment,
                             configuredSchema,
-                            candidates.stream().map(RewriteConfigCandidate::tableName).distinct().toList()
+                            candidateTables
                     ),
-                    metadataReadTimeoutSeconds(),
+                    metadataReadTimeoutSeconds(candidateTables.size()),
                     TimeUnit.SECONDS,
                     "Dameng metadata inference"
             );
@@ -701,7 +706,7 @@ public class MigrateCommand implements Callable<Integer> {
                             configuredSchema(context),
                             tableNames
                     ),
-                    metadataReadTimeoutSeconds(),
+                    metadataReadTimeoutSeconds(tableNames.size()),
                     TimeUnit.SECONDS,
                     "Dameng mapper jdbcType metadata lookup"
             );
@@ -721,7 +726,16 @@ public class MigrateCommand implements Callable<Integer> {
     }
 
     static long metadataReadTimeoutSeconds() {
-        return Long.getLong("dm.adapter.metadataReadTimeoutSeconds", DEFAULT_METADATA_READ_TIMEOUT_SECONDS);
+        return metadataReadTimeoutSeconds(0);
+    }
+
+    static long metadataReadTimeoutSeconds(int tableCount) {
+        Long configured = Long.getLong("dm.adapter.metadataReadTimeoutSeconds");
+        if (configured != null && configured > 0L) {
+            return configured;
+        }
+        long scaled = DEFAULT_METADATA_READ_TIMEOUT_SECONDS + Math.max(0, tableCount);
+        return Math.min(MAX_METADATA_READ_TIMEOUT_SECONDS, scaled);
     }
 
     static <T> T runWithMetadataTimeout(
