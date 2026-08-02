@@ -19,7 +19,9 @@ import java.util.Optional;
 import java.util.Set;
 
 class DamengMetadataReader {
-    private static final int METADATA_QUERY_TIMEOUT_SECONDS = 60;
+    private static final int METADATA_QUERY_TIMEOUT_SECONDS = 15;
+    private static final int METADATA_CONNECT_TIMEOUT_MILLIS = 5_000;
+    private static final int METADATA_SOCKET_TIMEOUT_MILLIS = 20_000;
 
     Map<String, TableKeyMetadata> readTableKeys(
             DmValidationEnvironment environment,
@@ -36,7 +38,7 @@ class DamengMetadataReader {
         }
 
         try (Connection connection = DriverManager.getConnection(
-                environment.jdbcUrl(),
+                metadataJdbcUrl(environment.jdbcUrl()),
                 environment.username(),
                 environment.password()
         )) {
@@ -76,7 +78,7 @@ class DamengMetadataReader {
         }
 
         try (Connection connection = DriverManager.getConnection(
-                environment.jdbcUrl(),
+                metadataJdbcUrl(environment.jdbcUrl()),
                 environment.username(),
                 environment.password()
         )) {
@@ -166,6 +168,40 @@ class DamengMetadataReader {
             }
         }
         return Optional.empty();
+    }
+
+    static String metadataJdbcUrl(String jdbcUrl) {
+        if (jdbcUrl == null || jdbcUrl.isBlank()) {
+            return jdbcUrl;
+        }
+        String result = jdbcUrl;
+        if (!hasJdbcProperty(result, "connectTimeout")) {
+            result = appendJdbcProperty(result, "connectTimeout", METADATA_CONNECT_TIMEOUT_MILLIS);
+        }
+        if (!hasJdbcProperty(result, "socketTimeout")) {
+            result = appendJdbcProperty(result, "socketTimeout", METADATA_SOCKET_TIMEOUT_MILLIS);
+        }
+        return result;
+    }
+
+    private static boolean hasJdbcProperty(String jdbcUrl, String propertyName) {
+        int question = jdbcUrl.indexOf('?');
+        if (question < 0 || question == jdbcUrl.length() - 1) {
+            return false;
+        }
+        for (String part : jdbcUrl.substring(question + 1).split("[;&]")) {
+            int equals = part.indexOf('=');
+            String name = equals < 0 ? part.trim() : part.substring(0, equals).trim();
+            if (propertyName.equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String appendJdbcProperty(String jdbcUrl, String name, int value) {
+        String delimiter = jdbcUrl.contains("?") ? "&" : "?";
+        return jdbcUrl + delimiter + name + "=" + value;
     }
 
     private String decodeUrlValue(String value) {
