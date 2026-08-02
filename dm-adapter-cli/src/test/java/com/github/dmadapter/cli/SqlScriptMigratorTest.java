@@ -1780,6 +1780,33 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void unwrapsParenthesizedProcedureLocalTemporaryTableCreatedFromSelect() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE initialize_daily_sum()
+                BEGIN
+                    CREATE TEMPORARY TABLE daily_sum_bak AS (
+                        SELECT precinct_id, SUM(paid_amount) AS paid_amount
+                        FROM charge_paid
+                        GROUP BY precinct_id
+                    );
+                    INSERT INTO daily_sum(precinct_id, paid_amount)
+                    SELECT precinct_id, paid_amount FROM daily_sum_bak;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS daily_sum_bak")
+                .contains("DELETE FROM daily_sum_bak")
+                .contains("INSERT INTO daily_sum_bak (precinct_id, paid_amount) SELECT")
+                .contains("FROM charge_paid")
+                .doesNotContain("CREATE TABLE daily_sum_bak AS (")
+                .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE daily_sum_bak");
+    }
+
+    @Test
     void usesSessionScopedGlobalTemporaryTableForCrossProcedureReferences() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DELIMITER $$
@@ -6512,6 +6539,44 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void classifiesSelectEndWithoutCaseAsOriginalSql() {
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")
+                    && ((String) args[0]).contains("CREATE OR REPLACE PROCEDURE")) {
+                throw new SQLException("第 7 行, 第 38 列[END]附近出现错误: 语法分析出错");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "original-procedure.sql",
+                        "sample-datacenter",
+                        List.of("""
+                                CREATE OR REPLACE PROCEDURE check_formula() AS
+                                    month_value VARCHAR(10);
+                                BEGIN
+                                    SELECT DATE_FORMAT(NOW(), '%Y-%m') END INTO month_value;
+                                END
+                                """)
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("ORIGINAL_SQL");
+            assertThat(failure.errorSummary())
+                    .contains("END before INTO")
+                    .contains("without a matching CASE")
+                    .contains("fix the source stored routine");
+        });
+    }
+
+    @Test
     void classifiesBareInsertValueCountMismatchAsOriginalSql() {
         Statement statement = proxy(Statement.class, (ignored, method, args) -> {
             if (method.getName().equals("execute")
@@ -8586,6 +8651,38 @@ class SqlScriptMigratorTest {
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_target_index_target_id ON demo_target (id)'")
                 .doesNotContain("DROP PRIMARY KEY,")
                 .doesNotContain("ADD INDEX index_target_id");
+    }
+
+    @Test
+    void collapsesMysqlIdentityRemovalSequenceWhenTheColumnIsImmediatelyDropped() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE drop_demo_id()
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_schema = DATABASE()
+                                 AND table_name = 'demo_target'
+                                 AND column_name = 'id') THEN
+                        ALTER TABLE `demo_target`
+                            DROP PRIMARY KEY,
+                            ADD INDEX `index_target_id` (`id`);
+                        ALTER TABLE `demo_target`
+                            MODIFY `id` BIGINT NOT NULL;
+                        ALTER TABLE `demo_target`
+                            DROP COLUMN `id`;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL drop_demo_id();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo_target`")
+                .contains("DROP COLUMN `id`'")
+                .doesNotContain("DROP PRIMARY KEY")
+                .doesNotContain("CREATE INDEX demo_target_index_target_id")
+                .doesNotContain("MODIFY id BIGINT NOT NULL");
     }
 
     @Test

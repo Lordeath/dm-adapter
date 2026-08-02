@@ -12211,6 +12211,7 @@ class SqlScriptMigrator {
             return sql;
         }
 
+        sql = collapseMysqlIdentityColumnRemovalSequences(sql);
         Map<String, String> variableNames = procedureVariableNamesByLowercase(sql);
         LinkedHashMap<String, LinkedHashSet<String>> temporaryTableColumns = temporaryProcedureTableDefinitions(sql);
         StringBuilder converted = new StringBuilder(sql.length());
@@ -12282,6 +12283,137 @@ class SqlScriptMigrator {
         }
         String convertedSql = changed ? converted.toString() : sql;
         return addTemporaryInsertSelectColumnLists(convertedSql, temporaryTableColumns);
+    }
+
+    private String collapseMysqlIdentityColumnRemovalSequences(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        int copyStart = 0;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "ALTER")) {
+                IdentityColumnRemovalSequence sequence = identityColumnRemovalSequence(sql, index);
+                if (sequence == null) {
+                    index++;
+                    continue;
+                }
+                converted.append(sql, copyStart, index)
+                        .append(sequence.dropColumnSql());
+                copyStart = sequence.end();
+                index = sequence.end();
+            } else {
+                index++;
+            }
+        }
+        if (copyStart == 0) {
+            return sql;
+        }
+        return converted.append(sql, copyStart, sql.length()).toString();
+    }
+
+    private IdentityColumnRemovalSequence identityColumnRemovalSequence(String sql, int start) {
+        int firstEnd = findStatementTerminator(sql, start);
+        if (firstEnd >= sql.length() || sql.charAt(firstEnd) != ';') {
+            return null;
+        }
+        DropPrimaryKeyForColumn first = dropPrimaryKeyForColumn(sql.substring(start, firstEnd));
+        if (first == null) {
+            return null;
+        }
+
+        int secondStart = skipWhitespace(sql, firstEnd + 1);
+        if (!startsKeyword(sql, secondStart, "ALTER")) {
+            return null;
+        }
+        int secondEnd = findStatementTerminator(sql, secondStart);
+        if (secondEnd >= sql.length() || sql.charAt(secondEnd) != ';') {
+            return null;
+        }
+        AlterTableColumn second = alterTableColumn(
+                sql.substring(secondStart, secondEnd),
+                "MODIFY(?:\\s+COLUMN)?"
+        );
+        if (second == null) {
+            return null;
+        }
+
+        int thirdStart = skipWhitespace(sql, secondEnd + 1);
+        if (!startsKeyword(sql, thirdStart, "ALTER")) {
+            return null;
+        }
+        int thirdEnd = findStatementTerminator(sql, thirdStart);
+        AlterTableColumn third = alterTableColumn(
+                sql.substring(thirdStart, thirdEnd),
+                "DROP\\s+COLUMN"
+        );
+        if (third == null
+                || !sameSqlIdentifier(first.table(), second.table())
+                || !sameSqlIdentifier(first.table(), third.table())
+                || !sameSqlIdentifier(first.column(), second.column())
+                || !sameSqlIdentifier(first.column(), third.column())) {
+            return null;
+        }
+        int end = thirdEnd < sql.length() && sql.charAt(thirdEnd) == ';'
+                ? thirdEnd + 1
+                : thirdEnd;
+        return new IdentityColumnRemovalSequence(sql.substring(thirdStart, end), end);
+    }
+
+    private DropPrimaryKeyForColumn dropPrimaryKeyForColumn(String ddl) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+(?<body>.+)$"
+        ).matcher(ddl.strip());
+        if (!matcher.matches()) {
+            return null;
+        }
+        List<String> parts = splitTopLevelComma(matcher.group("body"));
+        if (parts.size() != 2
+                || parts.stream().noneMatch(part -> Pattern.compile(
+                        "(?is)^DROP\\s+PRIMARY\\s+KEY$"
+                ).matcher(part.strip()).matches())) {
+            return null;
+        }
+        for (String part : parts) {
+            Matcher addIndex = Pattern.compile(
+                    "(?is)^ADD\\s+(?:INDEX|KEY)\\s+"
+                            + "(?:" + SQL_IDENTIFIER_TOKEN + "\\s*)?"
+                            + "\\((?<columns>.*)\\)\\s*(?:USING\\s+BTREE)?$"
+            ).matcher(part.strip());
+            if (!addIndex.matches()) {
+                continue;
+            }
+            List<String> columns = indexColumnNames(addIndex.group("columns"));
+            if (columns.size() == 1) {
+                return new DropPrimaryKeyForColumn(matcher.group("table"), columns.get(0));
+            }
+        }
+        return null;
+    }
+
+    private AlterTableColumn alterTableColumn(String ddl, String operation) {
+        Matcher matcher = Pattern.compile(
+                "(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+"
+                        + operation + "\\s+(?<column>" + SQL_IDENTIFIER_TOKEN + ")"
+                        + (operation.startsWith("MODIFY") ? "\\s+.+" : "") + "\\s*$"
+        ).matcher(ddl.strip());
+        return matcher.matches()
+                ? new AlterTableColumn(matcher.group("table"), matcher.group("column"))
+                : null;
+    }
+
+    private boolean sameSqlIdentifier(String left, String right) {
+        return unquoteIdentifier(lastIdentifierPart(left))
+                .equalsIgnoreCase(unquoteIdentifier(lastIdentifierPart(right)));
     }
 
     private boolean isAlreadyEquivalentIndexGuarded(String sql, int ddlIndex) {
@@ -13771,7 +13903,7 @@ class SqlScriptMigrator {
 
     private String normalizeDmLocalTemporaryTableCreate(String ddl, String table, int prefixEnd) {
         String placeholder = "dm_adapter_local_temp_table";
-        String suffix = ddl.substring(prefixEnd);
+        String suffix = unwrapParenthesizedCreateTableSelect(ddl.substring(prefixEnd));
         if (startsKeyword(suffix, skipWhitespace(suffix, 0), "SELECT")) {
             suffix = " AS " + suffix.stripLeading();
         }
@@ -13809,6 +13941,26 @@ class SqlScriptMigrator {
             }
         }
         return delete + ";\n" + select.sql();
+    }
+
+    private String unwrapParenthesizedCreateTableSelect(String suffix) {
+        String stripped = suffix.strip();
+        int cursor = 0;
+        if (startsKeyword(stripped, cursor, "AS")) {
+            cursor = skipWhitespace(stripped, cursor + "AS".length());
+        }
+        if (cursor >= stripped.length() || stripped.charAt(cursor) != '(') {
+            return suffix;
+        }
+        int closeParen = findMatchingParen(stripped, cursor);
+        if (closeParen != stripped.length() - 1) {
+            return suffix;
+        }
+        String select = stripped.substring(cursor + 1, closeParen).strip();
+        if (!startsKeyword(select, 0, "SELECT")) {
+            return suffix;
+        }
+        return " AS " + select;
     }
 
     private String globalTemporaryTableDdlMarker(String createTable, String markerTable) {
@@ -16236,6 +16388,15 @@ class SqlScriptMigrator {
         static ProcedureStatement directSql(String sql) {
             return new ProcedureStatement(sql, false);
         }
+    }
+
+    private record IdentityColumnRemovalSequence(String dropColumnSql, int end) {
+    }
+
+    private record DropPrimaryKeyForColumn(String table, String column) {
+    }
+
+    private record AlterTableColumn(String table, String column) {
     }
 
     private record VariableDeclarationParts(List<String> names, String type, String defaultValue) {
