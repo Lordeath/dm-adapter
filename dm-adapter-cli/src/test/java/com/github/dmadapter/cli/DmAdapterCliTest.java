@@ -1303,6 +1303,9 @@ class DmAdapterCliTest {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
         writeFile(".dm-adapter/sql-validation.yml", """
+                schema: "preserved-schema"
+                mapperXmlLocations:
+                  - "custom/mapper-dm/SelectedMapper.xml"
                 typeAliasesPackages:
                   - com.example.domain
                 typeHandlersPackages:
@@ -1330,6 +1333,8 @@ class DmAdapterCliTest {
         String config = Files.readString(tempDir.resolve(".dm-adapter/sql-validation.yml"));
         assertThat(exitCode).isZero();
         assertThat(config)
+                .contains("schema: \"preserved-schema\"")
+                .contains("  - \"custom/mapper-dm/SelectedMapper.xml\"")
                 .contains("""
                         typeAliasesPackages:
                           - "com.example.domain"
