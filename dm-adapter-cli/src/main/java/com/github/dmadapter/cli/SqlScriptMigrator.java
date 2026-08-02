@@ -481,6 +481,12 @@ class SqlScriptMigrator {
                 + ", output=" + sqlRootOut);
         String schema = primarySchema(request.schema(), "--schema", warnings);
         String systemSchema = primarySchema(request.systemSchema(), "--system-schema", warnings);
+        Map<String, String> projectIdentityColumns = projectIdentityColumns(
+                projectRoot,
+                sqlRoot,
+                sqlRootOut,
+                warnings
+        );
         List<SqlScriptManualReviewItem> manualReviewItems = new ArrayList<>();
         List<PlannedSqlScriptFile> plannedFiles = new ArrayList<>();
         int convertedFileCount = 0;
@@ -500,6 +506,7 @@ class SqlScriptMigrator {
                     request.dryRun(),
                     request.targetCapabilities(),
                     outerJoinSourceUniqueKeys,
+                    projectIdentityColumns,
                     manualReviewItems,
                     warnings
             );
@@ -1094,13 +1101,30 @@ class SqlScriptMigrator {
                     continue;
                 }
 
+                boolean originalManualStatement =
+                        file.manualReviewStatementIndexes().contains(oldStatementIndex);
+                RoutineSameObjectRewrite anonymousBlockRewrite = rewritePostDdlStaticSql(
+                        statement,
+                        file.schema(),
+                        knownExistingTables
+                );
+                DynamicDdlDependencies anonymousDynamicDependencies =
+                        dynamicRoutineDdlDependencies(statement, file.schema());
+                boolean unsafeAnonymousBlock = anonymousDynamicDependencies.unresolved()
+                        || !anonymousBlockRewrite.unsafeTables().isEmpty();
+                if (anonymousBlockRewrite.changed()) {
+                    statement = anonymousBlockRewrite.sql();
+                    rewrittenRoutineCount++;
+                    rules.add(DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE);
+                }
+
                 TableKey alteredTable = alteredTable(statement, file.schema());
                 if (alteredTable != null) {
                     procedures.replaceAll((key, state) -> state.dependencies().contains(alteredTable)
                             ? state.withDirty(true)
                             : state);
                 }
-                boolean manualStatement = file.manualReviewStatementIndexes().contains(oldStatementIndex);
+                boolean manualStatement = originalManualStatement || unsafeAnonymousBlock;
                 TableKey createdTable = tableForDdlVerb(statement, file.schema(), "CREATE");
                 if (!manualStatement && createdTable != null) {
                     knownExistingTables.add(createdTable);
@@ -1124,8 +1148,21 @@ class SqlScriptMigrator {
 
                 int newIndex = statements.size() + 1;
                 statements.add(statement);
-                if (file.manualReviewStatementIndexes().contains(oldStatementIndex)) {
+                if (manualStatement) {
                     manualIndexes.add(newIndex);
+                    if (unsafeAnonymousBlock && !originalManualStatement) {
+                        manualReviewItems.add(new SqlScriptManualReviewItem(
+                                file.sourceDisplay(),
+                                file.outputDisplay(),
+                                newIndex,
+                                sameObjectRoutineManualReason(
+                                        anonymousDynamicDependencies.unresolved(),
+                                        anonymousBlockRewrite
+                                ),
+                                file.statements().get(oldIndex),
+                                statement
+                        ));
+                    }
                 } else if (state != null && state.manualReview()) {
                     manualIndexes.add(newIndex);
                     manualReviewItems.add(new SqlScriptManualReviewItem(
@@ -1144,6 +1181,15 @@ class SqlScriptMigrator {
                                             candidate.dependencies(),
                                             state.dynamicDdlTables()
                                     ).isEmpty()
+                                    ? candidate.withDirty(true)
+                                    : candidate);
+                }
+                if (!anonymousDynamicDependencies.tables().isEmpty()) {
+                    procedures.replaceAll((key, candidate) ->
+                            !intersection(
+                                    candidate.dependencies(),
+                                    anonymousDynamicDependencies.tables()
+                            ).isEmpty()
                                     ? candidate.withDirty(true)
                                     : candidate);
                 }
@@ -2005,7 +2051,7 @@ class SqlScriptMigrator {
             LinkedHashMap<String, String> scriptUserVariables,
             ScriptDynamicDdlState scriptDynamicDdlState,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
-            Map<String, String> scriptIdentityFirstColumns,
+            Map<String, String> scriptIdentityColumns,
             Map<String, String> scriptProcedureRenames,
             String targetSchema,
             Map<String, List<String>> outerJoinSourceUniqueKeys
@@ -2024,7 +2070,7 @@ class SqlScriptMigrator {
                 scriptUserVariables,
                 scriptDynamicDdlState,
                 scriptTableColumns,
-                scriptIdentityFirstColumns,
+                scriptIdentityColumns,
                 scriptProcedureRenames,
                 targetSchema,
                 outerJoinSourceUniqueKeys,
@@ -2851,6 +2897,7 @@ class SqlScriptMigrator {
             boolean dryRun,
             DamengTargetCapabilities targetCapabilities,
             Map<String, List<String>> outerJoinSourceUniqueKeys,
+            Map<String, String> projectIdentityColumns,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -2879,7 +2926,8 @@ class SqlScriptMigrator {
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
         ScriptDynamicDdlState scriptDynamicDdlState = scriptDynamicDdlState(originalStatements);
         LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns = new LinkedHashMap<>();
-        LinkedHashMap<String, String> scriptIdentityFirstColumns = new LinkedHashMap<>();
+        LinkedHashMap<String, String> scriptIdentityColumns =
+                new LinkedHashMap<>(projectIdentityColumns);
         Map<String, Set<String>> sourceTableCharsets = sourceTableCharsets(originalStatements);
         long preparationStartedAt = System.nanoTime();
         LinkedHashMap<String, String> scriptProcedureRenames = procedureObjectNameConflictRenames(originalStatements);
@@ -2919,8 +2967,8 @@ class SqlScriptMigrator {
                     ScriptDynamicDdlState dynamicDdlStateSnapshot = copyScriptDynamicDdlState(scriptDynamicDdlState);
                     LinkedHashMap<String, LinkedHashSet<String>> tableColumnsSnapshot =
                             copyScriptTableColumns(scriptTableColumns);
-                    LinkedHashMap<String, String> identityFirstColumnsSnapshot =
-                            new LinkedHashMap<>(scriptIdentityFirstColumns);
+                    LinkedHashMap<String, String> identityColumnsSnapshot =
+                            new LinkedHashMap<>(scriptIdentityColumns);
                     conversion = CompletableFuture.supplyAsync(
                             () -> convertStatementWithProgress(
                                     relative,
@@ -2930,7 +2978,7 @@ class SqlScriptMigrator {
                                     userVariablesSnapshot,
                                     dynamicDdlStateSnapshot,
                                     tableColumnsSnapshot,
-                                    identityFirstColumnsSnapshot,
+                                    identityColumnsSnapshot,
                                     scriptProcedureRenames,
                                     targetSchema,
                                     outerJoinSourceUniqueKeys
@@ -2946,7 +2994,7 @@ class SqlScriptMigrator {
                             scriptUserVariables,
                             scriptDynamicDdlState,
                             scriptTableColumns,
-                            scriptIdentityFirstColumns,
+                            scriptIdentityColumns,
                             scriptProcedureRenames,
                             targetSchema,
                             outerJoinSourceUniqueKeys
@@ -2956,7 +3004,7 @@ class SqlScriptMigrator {
                 collectScriptCreateTableDefinitionColumns(
                         originalStatement,
                         scriptTableColumns,
-                        scriptIdentityFirstColumns
+                        scriptIdentityColumns
                 );
                 collectScriptAlterTableAddColumns(originalStatement, scriptTableColumns);
             }
@@ -3627,7 +3675,7 @@ class SqlScriptMigrator {
             LinkedHashMap<String, String> scriptUserVariables,
             ScriptDynamicDdlState scriptDynamicDdlState,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
-            Map<String, String> scriptIdentityFirstColumns,
+            Map<String, String> scriptIdentityColumns,
             Map<String, String> scriptProcedureRenames,
             String targetSchema,
             Map<String, List<String>> outerJoinSourceUniqueKeys,
@@ -3697,7 +3745,7 @@ class SqlScriptMigrator {
         SafeRuleConversion safeRuleConversion = applyScriptSafeRules(
                 sqlBody,
                 scriptTableColumns,
-                scriptIdentityFirstColumns,
+                scriptIdentityColumns,
                 targetSchema
         );
         InlineCreateTableIndexConversion inlineCreateTableIndexes =
@@ -4819,7 +4867,7 @@ class SqlScriptMigrator {
     private void collectScriptCreateTableDefinitionColumns(
             String sql,
             LinkedHashMap<String, LinkedHashSet<String>> tableColumns,
-            LinkedHashMap<String, String> identityFirstColumns
+            LinkedHashMap<String, String> identityColumns
     ) {
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
         String body = leadingSqlPrefix.body();
@@ -4837,20 +4885,55 @@ class SqlScriptMigrator {
         }
         String tableName = matcher.group("table").strip();
         LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
-        String firstColumnName = "";
         for (String part : splitTopLevelComma(body.substring(openParen + 1, closeParen))) {
             String definition = part.strip();
             String columnName = createTableColumnDefinitionName(definition);
             if (!columnName.isBlank()) {
-                if (firstColumnName.isBlank()) {
-                    firstColumnName = columnName;
-                    if (isAutoGeneratedIdentityColumnDefinition(definition)) {
-                        identityFirstColumns.put(normalizedTableKey(tableName), columnName);
-                    }
+                if (isAutoGeneratedIdentityColumnDefinition(definition)) {
+                    identityColumns.put(normalizedTableKey(tableName), columnName);
                 }
                 addColumnIfAbsentIgnoreCase(targetColumns, columnName);
             }
         }
+    }
+
+    private Map<String, String> projectIdentityColumns(
+            Path projectRoot,
+            Path sqlRoot,
+            Path sqlRootOut,
+            List<String> warnings
+    ) {
+        Path metadataRoot = sqlRoot.getParent();
+        if (metadataRoot == null || !metadataRoot.startsWith(projectRoot)) {
+            metadataRoot = sqlRoot;
+        }
+        LinkedHashMap<String, String> identityColumns = new LinkedHashMap<>();
+        List<Path> metadataFiles;
+        try {
+            metadataFiles = sqlFiles(metadataRoot).stream()
+                    .filter(path -> !path.startsWith(sqlRootOut))
+                    .toList();
+        } catch (IOException exception) {
+            warnings.add("Unable to scan project SQL definitions for identity columns: "
+                    + exception.getMessage());
+            return identityColumns;
+        }
+        for (Path metadataFile : metadataFiles) {
+            try {
+                LinkedHashMap<String, LinkedHashSet<String>> ignoredTableColumns = new LinkedHashMap<>();
+                for (String statement : SqlScriptParser.statements(readSqlScriptContent(metadataFile))) {
+                    collectScriptCreateTableDefinitionColumns(
+                            statement,
+                            ignoredTableColumns,
+                            identityColumns
+                    );
+                }
+            } catch (IOException | RuntimeException exception) {
+                warnings.add("Unable to inspect SQL definitions for identity columns: "
+                        + metadataRoot.relativize(metadataFile) + " (" + exception.getMessage() + ")");
+            }
+        }
+        return identityColumns;
     }
 
     private void collectScriptAlterTableAddColumns(
@@ -5209,9 +5292,10 @@ class SqlScriptMigrator {
     private InsertValuesColumnListRewrite addKnownInsertValuesColumnLists(
             String sql,
             Map<String, LinkedHashSet<String>> tableColumns,
-            Map<String, String> identityFirstColumns
+            Map<String, String> identityColumns
     ) {
-        if (tableColumns == null || tableColumns.isEmpty()) {
+        if ((tableColumns == null || tableColumns.isEmpty())
+                && (identityColumns == null || identityColumns.isEmpty())) {
             return InsertValuesColumnListRewrite.unchanged(sql);
         }
         StringBuilder converted = new StringBuilder(sql.length());
@@ -5243,7 +5327,7 @@ class SqlScriptMigrator {
                 int end = findStatementTerminator(sql, index);
                 String statement = sql.substring(index, end);
                 InsertValuesColumnListRewrite rewritten =
-                        addKnownInsertValuesColumnList(statement, tableColumns, identityFirstColumns);
+                        addKnownInsertValuesColumnList(statement, tableColumns, identityColumns);
                 converted.append(rewritten.sql());
                 appliedRules.addAll(rewritten.appliedRules());
                 index = end;
@@ -5260,7 +5344,7 @@ class SqlScriptMigrator {
     private InsertValuesColumnListRewrite addKnownInsertValuesColumnList(
             String statement,
             Map<String, LinkedHashSet<String>> tableColumns,
-            Map<String, String> identityFirstColumns
+            Map<String, String> identityColumns
     ) {
         int start = skipWhitespace(statement, 0);
         if (!startsKeyword(statement, start, "INSERT")) {
@@ -5275,13 +5359,19 @@ class SqlScriptMigrator {
         if (table == null) {
             return InsertValuesColumnListRewrite.unchanged(statement);
         }
-        LinkedHashSet<String> columns = temporaryTableColumns(tableColumns, table.token());
-        if (columns == null || columns.isEmpty()) {
-            return InsertValuesColumnListRewrite.unchanged(statement);
-        }
         cursor = skipWhitespace(statement, table.end());
+        int targetColumnListClose = -1;
+        List<String> targetColumns = List.of();
         if (cursor < statement.length() && statement.charAt(cursor) == '(') {
-            return InsertValuesColumnListRewrite.unchanged(statement);
+            targetColumnListClose = findMatchingParen(statement, cursor);
+            if (targetColumnListClose <= cursor) {
+                return InsertValuesColumnListRewrite.unchanged(statement);
+            }
+            targetColumns = insertTargetColumns(statement.substring(cursor + 1, targetColumnListClose));
+            if (targetColumns.isEmpty()) {
+                return InsertValuesColumnListRewrite.unchanged(statement);
+            }
+            cursor = skipWhitespace(statement, targetColumnListClose + 1);
         }
         boolean valueKeyword;
         if (startsKeyword(statement, cursor, "VALUES")) {
@@ -5301,38 +5391,106 @@ class SqlScriptMigrator {
         if (valueCount == null) {
             return InsertValuesColumnListRewrite.unchanged(statement);
         }
-        List<String> columnList = new ArrayList<>(columns);
-        String identityFirstColumn = identityFirstColumn(identityFirstColumns, table.token());
-        if (identityFirstColumn != null && identifiersEqual(columnList.get(0), identityFirstColumn)) {
-            if (valueCount > columnList.size()) {
+        String identityColumn = identityColumn(identityColumns, table.token());
+        if (!targetColumns.isEmpty()) {
+            if (valueCount != targetColumns.size() || identityColumn == null) {
                 return InsertValuesColumnListRewrite.unchanged(statement);
             }
-            if (valueCount > 1 && allTuplesStartWithGeneratedIdentityPlaceholder(tuples)) {
+            int identityIndex = identifierIndex(targetColumns, identityColumn);
+            if (identityIndex < 0) {
+                return InsertValuesColumnListRewrite.unchanged(statement);
+            }
+            if (targetColumns.size() > 1
+                    && allTuplesHaveGeneratedIdentityPlaceholder(tuples, identityIndex)) {
+                List<String> columnsWithoutIdentity = withoutIndex(targetColumns, identityIndex);
                 return new InsertValuesColumnListRewrite(
-                        rewriteInsertValuesWithColumnList(
+                        rewriteInsertValues(
                                 statement,
                                 table.end(),
-                                columnList.subList(1, valueCount),
+                                targetColumnListClose,
+                                columnsWithoutIdentity,
                                 tuples,
-                                1
+                                identityIndex,
+                                -1
                         ),
                         List.of(MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE)
                 );
             }
-            if (allTuplesStartWithExplicitIdentityValue(tuples)) {
-                String rewritten = rewriteInsertValuesWithColumnList(
-                        statement,
-                        table.end(),
-                        columnList.subList(0, valueCount),
-                        tuples,
-                        0
-                );
+            if (allTuplesHaveExplicitIdentityValue(tuples, identityIndex)) {
                 return new InsertValuesColumnListRewrite(
-                        wrapExplicitIdentityInsert(table.token(), rewritten),
+                        wrapExplicitIdentityInsert(table.token(), statement, false),
                         List.of(MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE)
                 );
             }
+            String rewritten = rewriteInsertValues(
+                    statement,
+                    table.end(),
+                    targetColumnListClose,
+                    targetColumns,
+                    tuples,
+                    -1,
+                    identityIndex
+            );
+            return new InsertValuesColumnListRewrite(
+                    wrapExplicitIdentityInsert(table.token(), rewritten, true),
+                    List.of(MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE)
+            );
+        }
+
+        LinkedHashSet<String> columns = temporaryTableColumns(tableColumns, table.token());
+        if (columns == null || columns.isEmpty()) {
             return InsertValuesColumnListRewrite.unchanged(statement);
+        }
+        List<String> columnList = new ArrayList<>(columns);
+        if (valueCount > columnList.size()) {
+            return InsertValuesColumnListRewrite.unchanged(statement);
+        }
+        List<String> insertedColumns = new ArrayList<>(columnList.subList(0, valueCount));
+        int identityIndex = identityColumn == null ? -1 : identifierIndex(insertedColumns, identityColumn);
+        if (identityIndex >= 0) {
+            if (insertedColumns.size() > 1
+                    && allTuplesHaveGeneratedIdentityPlaceholder(tuples, identityIndex)) {
+                return new InsertValuesColumnListRewrite(
+                        rewriteInsertValues(
+                                statement,
+                                table.end(),
+                                -1,
+                                withoutIndex(insertedColumns, identityIndex),
+                                tuples,
+                                identityIndex,
+                                -1
+                        ),
+                        List.of(MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE)
+                );
+            }
+            if (allTuplesHaveExplicitIdentityValue(tuples, identityIndex)) {
+                String rewritten = rewriteInsertValues(
+                        statement,
+                        table.end(),
+                        -1,
+                        insertedColumns,
+                        tuples,
+                        -1,
+                        -1
+                );
+                return new InsertValuesColumnListRewrite(
+                        wrapExplicitIdentityInsert(table.token(), rewritten, false),
+                        List.of(MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE)
+                );
+            }
+            String rewritten = rewriteInsertValues(
+                    statement,
+                    table.end(),
+                    -1,
+                    insertedColumns,
+                    tuples,
+                    -1,
+                    identityIndex
+            );
+            return new InsertValuesColumnListRewrite(
+                    wrapExplicitIdentityInsert(table.token(), rewritten, true),
+                    List.of(MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE)
+            );
         }
         if (valueCount != columns.size()) {
             return InsertValuesColumnListRewrite.unchanged(statement);
@@ -5343,35 +5501,62 @@ class SqlScriptMigrator {
         return new InsertValuesColumnListRewrite(rewritten, List.of(MYSQL_INSERT_VALUES_COLUMN_LIST_RULE));
     }
 
-    private String identityFirstColumn(Map<String, String> identityFirstColumns, String tableToken) {
-        if (identityFirstColumns == null || identityFirstColumns.isEmpty()) {
+    private String identityColumn(Map<String, String> identityColumns, String tableToken) {
+        if (identityColumns == null || identityColumns.isEmpty()) {
             return null;
         }
-        return identityFirstColumns.get(normalizedTableKey(tableToken));
+        return identityColumns.get(normalizedTableKey(tableToken));
     }
 
     private boolean identifiersEqual(String left, String right) {
         return normalizedIdentifierKey(left).equals(normalizedIdentifierKey(right));
     }
 
-    private boolean allTuplesStartWithGeneratedIdentityPlaceholder(List<InsertValuesTuple> tuples) {
+    private int identifierIndex(List<String> columns, String expected) {
+        for (int index = 0; index < columns.size(); index++) {
+            if (identifiersEqual(columns.get(index), expected)) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    private List<String> withoutIndex(List<String> values, int excludedIndex) {
+        List<String> remaining = new ArrayList<>(values.size() - 1);
+        for (int index = 0; index < values.size(); index++) {
+            if (index != excludedIndex) {
+                remaining.add(values.get(index));
+            }
+        }
+        return remaining;
+    }
+
+    private boolean allTuplesHaveGeneratedIdentityPlaceholder(
+            List<InsertValuesTuple> tuples,
+            int identityIndex
+    ) {
         if (tuples.isEmpty()) {
             return false;
         }
         for (InsertValuesTuple tuple : tuples) {
-            if (tuple.values().isEmpty() || !isGeneratedIdentityPlaceholder(tuple.values().get(0))) {
+            if (identityIndex >= tuple.values().size()
+                    || !isGeneratedIdentityPlaceholder(tuple.values().get(identityIndex))) {
                 return false;
             }
         }
         return true;
     }
 
-    private boolean allTuplesStartWithExplicitIdentityValue(List<InsertValuesTuple> tuples) {
+    private boolean allTuplesHaveExplicitIdentityValue(
+            List<InsertValuesTuple> tuples,
+            int identityIndex
+    ) {
         if (tuples.isEmpty()) {
             return false;
         }
         for (InsertValuesTuple tuple : tuples) {
-            if (tuple.values().isEmpty() || isGeneratedIdentityPlaceholder(tuple.values().get(0))) {
+            if (identityIndex >= tuple.values().size()
+                    || isGeneratedIdentityPlaceholder(tuple.values().get(identityIndex))) {
                 return false;
             }
         }
@@ -5384,12 +5569,14 @@ class SqlScriptMigrator {
                 .matches();
     }
 
-    private String rewriteInsertValuesWithColumnList(
+    private String rewriteInsertValues(
             String statement,
             int tableEnd,
+            int targetColumnListClose,
             List<String> columns,
             List<InsertValuesTuple> tuples,
-            int valueOffset
+            int removedValueIndex,
+            int normalizedIdentityIndex
     ) {
         if (columns.isEmpty() || tuples.isEmpty()) {
             return statement;
@@ -5399,13 +5586,22 @@ class SqlScriptMigrator {
                 .append(" (")
                 .append(String.join(", ", columns))
                 .append(")");
-        int cursor = tableEnd;
+        int cursor = targetColumnListClose >= 0 ? targetColumnListClose + 1 : tableEnd;
         for (InsertValuesTuple tuple : tuples) {
             rewritten.append(statement, cursor, tuple.openParen());
+            List<String> values = new ArrayList<>(tuple.values().size());
+            for (int valueIndex = 0; valueIndex < tuple.values().size(); valueIndex++) {
+                if (valueIndex == removedValueIndex) {
+                    continue;
+                }
+                String value = tuple.values().get(valueIndex).strip();
+                if (valueIndex == normalizedIdentityIndex && isGeneratedIdentityPlaceholder(value)) {
+                    value = "NULL";
+                }
+                values.add(value);
+            }
             rewritten.append("(")
-                    .append(String.join(", ", tuple.values().subList(valueOffset, tuple.values().size()).stream()
-                            .map(String::strip)
-                            .toList()))
+                    .append(String.join(", ", values))
                     .append(")");
             cursor = tuple.closeParen() + 1;
         }
@@ -5413,10 +5609,31 @@ class SqlScriptMigrator {
         return rewritten.toString();
     }
 
-    private String wrapExplicitIdentityInsert(String tableToken, String statement) {
-        return "SET IDENTITY_INSERT " + tableToken + " ON;\n"
-                + statement + ";\n"
-                + "SET IDENTITY_INSERT " + tableToken + " OFF";
+    private String wrapExplicitIdentityInsert(
+            String tableToken,
+            String statement,
+            boolean replaceNull
+    ) {
+        String identityInsertOff = "SET IDENTITY_INSERT " + tableToken + " OFF";
+        String identityInsertOn = "SET IDENTITY_INSERT " + tableToken + " ON"
+                + (replaceNull ? " WITH REPLACE NULL" : "");
+        return "BEGIN\n"
+                + "    EXECUTE IMMEDIATE " + sqlStringLiteral(identityInsertOn) + ";\n"
+                + indentSql(statement, "    ") + ";\n"
+                + "    EXECUTE IMMEDIATE " + sqlStringLiteral(identityInsertOff) + ";\n"
+                + "EXCEPTION\n"
+                + "    WHEN OTHERS THEN\n"
+                + "        BEGIN\n"
+                + "            EXECUTE IMMEDIATE " + sqlStringLiteral(identityInsertOff) + ";\n"
+                + "        EXCEPTION\n"
+                + "            WHEN OTHERS THEN NULL;\n"
+                + "        END;\n"
+                + "        RAISE;\n"
+                + "END";
+    }
+
+    private String indentSql(String sql, String indentation) {
+        return indentation + sql.replace("\n", "\n" + indentation);
     }
 
     private Integer insertValuesColumnCount(String statement, int valuesIndex) {
@@ -6018,7 +6235,7 @@ class SqlScriptMigrator {
     private SafeRuleConversion applyScriptSafeRules(
             String sql,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
-            Map<String, String> scriptIdentityFirstColumns,
+            Map<String, String> scriptIdentityColumns,
             String targetSchema
     ) {
         if (sql == null || sql.isBlank()) {
@@ -6352,7 +6569,7 @@ class SqlScriptMigrator {
         InsertValuesColumnListRewrite insertValuesColumnListSql = addKnownInsertValuesColumnLists(
                 converted,
                 scriptTableColumns,
-                scriptIdentityFirstColumns
+                scriptIdentityColumns
         );
         if (!insertValuesColumnListSql.appliedRules().isEmpty()) {
             converted = insertValuesColumnListSql.sql();
