@@ -87,6 +87,11 @@ final class ProjectSummaryTracker {
         write();
     }
 
+    void skipMigration(String message) throws IOException {
+        skipStage("migration", message);
+        write();
+    }
+
     void invalidProject(MigrationReport report, ReportPaths paths) throws IOException {
         migrationCompleted(report, paths);
         replaceStageStatus("migration", StageStatus.FAILED, "项目根目录不是 Maven 项目，未执行迁移。");

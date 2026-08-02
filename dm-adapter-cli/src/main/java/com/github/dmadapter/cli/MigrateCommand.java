@@ -144,7 +144,7 @@ public class MigrateCommand implements Callable<Integer> {
                     context,
                     reportWriter,
                     sqlScriptMigrationRequested(),
-                    validationTestGenerationRequested(),
+                    !sqlScriptsOnly && validationTestGenerationRequested(),
                     validationEnvironment
             );
             CliLogger.info("Migration started. Project: " + context.projectRoot());
@@ -156,10 +156,17 @@ public class MigrateCommand implements Callable<Integer> {
                 if (!sqlScriptMigrationRequested()) {
                     throw new DmAdapterException("--sql-scripts-only requires --sql-root and --sql-root-out.");
                 }
+                summaryTracker.skipMigration("--sql-scripts-only 模式未执行 Maven、Mapper 和应用文件迁移。");
+                summaryTracker.startSqlScriptValidation(true);
                 SqlScriptReportResult sqlScriptResult = migrateSqlScripts(context, validationEnvironment);
                 CliLogger.info("SQL script migration report written: " + sqlScriptResult.reportPaths().markdownPath());
+                summaryTracker.sqlScriptCompleted(sqlScriptResult.report(), sqlScriptResult.reportPaths());
+                summaryTracker.skipMapperValidation("--sql-scripts-only 模式未请求 Mapper 数据库验证。");
                 printSqlScriptSummary(sqlScriptResult);
-                return sqlScriptOnlyExitCode(context, validationEnvironment, sqlScriptResult);
+                int exitCode = sqlScriptOnlyExitCode(context, validationEnvironment, sqlScriptResult);
+                summaryTracker.finish(exitCode);
+                CliLogger.info("Project summary: " + context.reportDir().resolve(ReportWriter.SUMMARY_MARKDOWN));
+                return exitCode;
             }
             List<String> workspaceWarnings = legacyWorkspaceMigrator.migrateDefaults(
                     context.projectRoot(),
