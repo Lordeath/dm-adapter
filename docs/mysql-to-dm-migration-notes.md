@@ -56,6 +56,9 @@
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
 - `CREATE TABLE` 中普通/唯一的 MySQL 内联 `KEY` / `INDEX` 必须提取为带存在性保护的达梦 `CREATE [UNIQUE] INDEX`，并按表名生成 schema 范围唯一的索引名；前缀索引转函数索引。达梦会拒绝在同一表上创建异名但列定义相同的索引，因此保护条件不能只查目标索引名，必须通过 `ALL_INDEXES`、`ALL_IND_COLUMNS` 和 `ALL_IND_EXPRESSIONS` 比较目标 schema、表、唯一性、列数、列/表达式顺序及升降序。异名等价索引应视为已满足；同名但定义不同不能静默跳过，应让部署准确暴露名称冲突。过程内 `ALTER TABLE ... DROP INDEX` 不能原样放入动态 SQL：达梦索引名是 schema 级对象，且 MySQL 唯一索引可能对应达梦唯一约束，必须同时兼容原始名与表作用域名，先尝试 `DROP CONSTRAINT`，再按存在性执行 `DROP INDEX`。`FULLTEXT`、`SPATIAL` 或无法确认等价性的表达式索引不得静默删除，必须保留原 SQL 并报告人工设计索引语义。
 - 同一列定义出现两个或更多 `DEFAULT` 子句时，原始 MySQL DDL 本身存在互相冲突的默认值，工具不能替业务选择保留哪一个。数据库验证应将其归为 `ORIGINAL_SQL`，保留转换结果并要求修正源脚本，不能误报为待补充的达梦转换规则。
+- 存储过程中出现 `SELECT ... END INTO ...` 且对应表达式中没有 `CASE` 时，多出的 `END` 是原始 SQL 语法缺陷。验证应归为 `ORIGINAL_SQL`，不能由转换器猜测删除；合法的 `SELECT CASE ... END INTO ...` 不属于此类。
+- MySQL 为删除自增主键列而连续执行“删除主键并补普通索引 → 去掉自增属性 → 删除该列”时，达梦会在第一个中间态拒绝没有唯一约束的自增列。若三个 DDL 紧邻、表名和列名一致且新增索引只包含该列，可直接收敛为 `DROP COLUMN`，最终结构等价且避免无效中间态。
+- 存储过程中的 `CREATE TEMPORARY TABLE name AS (SELECT ...)` 需要去掉包裹整个查询的单层括号，再按会话级全局临时表加 `DELETE + INSERT ... SELECT` 转换；否则过程编译时会把临时表误当成运行期普通表，形成“无效的表”假失败。
 - MySQL `AUTO_INCREMENT` 和 `ALTER TABLE t AUTO_INCREMENT = n` 默认不再为了验证而改写。目标环境如果不支持或业务依赖重置序列语义，应按达梦身份列/序列方案人工确认，不能把 `AUTO_INCREMENT = n` 删除后留下半截 `ALTER TABLE`。
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；带精度的 `CURRENT_TIMESTAMP(n)` 必须对应为 `NOW(n)`，否则 `TIMESTAMP(n)` 会因表达式精度不匹配报“ON UPDATE 表达式错误”。只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
 - MySQL 允许在一条 `ALTER TABLE` 中连续写多个 `MODIFY COLUMN`，达梦需要把它们拆成按原顺序执行的独立 `ALTER TABLE ... MODIFY ...`。脚本转换必须保留第一条语句前的注释，并把每个字段修改作为独立验证单元。

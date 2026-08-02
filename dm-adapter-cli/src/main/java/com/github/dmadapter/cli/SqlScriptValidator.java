@@ -499,6 +499,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                                         + "the value count no longer matches the upgraded table definition. "
                                         + "Fix the source SQL by naming the intended columns. " + errorSummary
                         );
+                    } else if (containsStraySelectEndBeforeInto(sql)) {
+                        errorSummary = compact(
+                                "Original SQL contains END before INTO in a SELECT without a matching CASE; "
+                                        + "fix the source stored routine instead of guessing the intended expression. "
+                                        + errorSummary
+                        );
                     }
                 }
                 if ("OBJECT_DEFINITION_CHANGED".equals(category)) {
@@ -1204,7 +1210,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
             return "ORIGINAL_SQL";
         }
         if (message.contains("语法") || message.contains("syntax")) {
-            if (containsDuplicateColumnDefault(sql) || containsContradictoryColumnNullability(sql)) {
+            if (containsDuplicateColumnDefault(sql)
+                    || containsContradictoryColumnNullability(sql)
+                    || containsStraySelectEndBeforeInto(sql)) {
                 return "ORIGINAL_SQL";
             }
             return "SQL_SYNTAX";
@@ -1345,6 +1353,22 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                 if (hasContradictoryNullability(definition)) {
                     return true;
                 }
+            }
+        }
+        return false;
+    }
+
+    private boolean containsStraySelectEndBeforeInto(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return false;
+        }
+        String uncommentedSql = sqlWithoutComments(sql);
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bSELECT\\b(?<expression>[^;]*?)\\bEND\\s+INTO\\b"
+        ).matcher(uncommentedSql);
+        while (matcher.find()) {
+            if (keywordCount(matcher.group("expression"), "CASE") == 0) {
+                return true;
             }
         }
         return false;
