@@ -5015,6 +5015,121 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicHavingInsideIfExpandsAggregateAliasWithoutMovingTheXmlBlock() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.QualityMapper">
+                    <select id="listSecurityInspectionPlan">
+                        select a.id,
+                               case
+                                   when sum(case when p.status = 1 then 1 else 0 end) &gt; 0 then 2
+                                   else 1
+                               end taskStatus
+                        from inspection_schedule a
+                        left join inspection_project p on p.schedule_id = a.id
+                        <where>
+                            a.is_delete = 0
+                        </where>
+                        group by a.id
+                        <if test="source != null">
+                            having taskStatus = #{source}
+                        </if>
+                        order by a.id
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/QualityMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/QualityMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/QualityMapper.xml");
+        String rewritten = Files.readString(output);
+        assertThat(rewritten)
+                .contains("having (case")
+                .contains("when sum(case when p.status = 1 then 1 else 0 end) &gt; 0 then 2")
+                .contains("end) = #{source}")
+                .contains("<if test=\"source != null\">")
+                .doesNotContain("having taskStatus = #{source}");
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicChooseExpandsAggregateAliasInEveryHavingBranch() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentMapper">
+                    <select id="listAllocationData">
+                        select p.house_id, p.charge_item, sum(p.amount) totalAmount
+                        from payment_detail p
+                        where p.is_delete = 0
+                        <choose>
+                            <when test="summaryType == 1">
+                                group by p.house_id
+                                having totalAmount &lt;&gt; 0
+                                order by p.house_id
+                            </when>
+                            <otherwise>
+                                group by p.charge_item
+                                having totalAmount &lt;&gt; 0
+                                order by p.charge_item
+                            </otherwise>
+                        </choose>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/PaymentMapper.xml");
+        String rewritten = Files.readString(output);
+        String expandedHaving = "having (sum(p.amount)) &lt;&gt; 0";
+        assertThat(rewritten)
+                .contains(expandedHaving)
+                .doesNotContain("having totalAmount &lt;&gt; 0");
+        assertThat(rewritten.indexOf(expandedHaving)).isNotEqualTo(rewritten.lastIndexOf(expandedHaving));
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicHavingInsideIfCreatesMyBatisWhereWhenNoWhereExists() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
