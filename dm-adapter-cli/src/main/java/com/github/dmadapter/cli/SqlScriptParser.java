@@ -29,8 +29,10 @@ final class SqlScriptParser {
             Matcher delimiterMatcher = DELIMITER_DIRECTIVE.matcher(line.strip());
             if (!slashTerminatedBlock
                     && delimiterMatcher.matches()
-                    && !scanState.pendingExecutable()
                     && !scanState.insideLexicalContext()) {
+                if (scanState.pendingExecutable()) {
+                    scanState.completeDirectiveBoundaryStatement(buffer, statements);
+                }
                 delimiter = delimiterMatcher.group(1);
                 continue;
             }
@@ -327,6 +329,13 @@ final class SqlScriptParser {
         }
 
         void completeSlashTerminatedStatement(StringBuilder sql, List<String> statements) {
+            addStatement(statements, sql.substring(statementStart));
+            statementStart = sql.length();
+            scanIndex = sql.length();
+            resetStatementState();
+        }
+
+        void completeDirectiveBoundaryStatement(StringBuilder sql, List<String> statements) {
             addStatement(statements, sql.substring(statementStart));
             statementStart = sql.length();
             scanIndex = sql.length();

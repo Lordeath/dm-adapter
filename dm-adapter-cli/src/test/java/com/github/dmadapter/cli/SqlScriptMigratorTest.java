@@ -269,6 +269,51 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void parserDoesNotMergePendingSqlWithFollowingDelimiterDirective() {
+        String content = """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc()
+                BEGIN
+                    SELECT 1;
+                END$$
+                DELIMITER ;
+                END$$
+                DELIMITER ;
+                SELECT 2;
+                """;
+
+        List<String> statements = SqlScriptParser.statements(content);
+
+        assertThat(statements).hasSize(3);
+        assertThat(statements.get(0)).contains("CREATE PROCEDURE demo_proc()").endsWith("END");
+        assertThat(statements.get(1)).isEqualTo("END$$");
+        assertThat(statements.get(2)).isEqualTo("SELECT 2");
+        assertThat(statements).noneMatch(statement -> statement.contains("DELIMITER"));
+    }
+
+    @Test
+    void replacesOrphanMysqlRoutineTerminatorWithSafeManualReviewBlock() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT 1;
+                END$$
+                DELIMITER ;
+                SELECT 2;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.report().manualReviewItems())
+                .singleElement()
+                .satisfies(item -> {
+                    assertThat(item.originalSql()).isEqualTo("END$$");
+                    assertThat(item.reason()).contains("孤立过程结束符");
+                });
+        assertThat(converted.sql())
+                .contains("NULL /* DM_ADAPTER: omitted orphan MySQL routine terminator */;")
+                .doesNotContain("END$$")
+                .doesNotContain("DELIMITER");
+    }
+
+    @Test
     void dryRunDoesNotWriteOutputOrRunValidation() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -1665,6 +1710,43 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE));
+    }
+
+    @Test
+    void opensCursorDynamicallyAfterItsLocalTemporaryTableHasBeenCreated() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE initialize_enterprises()
+                BEGIN
+                    DECLARE enterprise_id BIGINT;
+                    DECLARE finished INT DEFAULT 0;
+                    DECLARE ENTERPRISE CURSOR FOR
+                        SELECT enterprise_id FROM temp_enterprise_ids;
+                    DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+
+                    CREATE TEMPORARY TABLE IF NOT EXISTS temp_enterprise_ids (
+                        enterprise_id BIGINT(20)
+                    );
+                    INSERT INTO temp_enterprise_ids(enterprise_id) VALUES (1);
+                    OPEN ENTERPRISE;
+                    enterprise_loop: LOOP
+                        FETCH ENTERPRISE INTO enterprise_id;
+                        IF finished = 1 THEN
+                            LEAVE enterprise_loop;
+                        END IF;
+                    END LOOP;
+                    CLOSE ENTERPRISE;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("ENTERPRISE CURSOR;")
+                .contains("CREATE TABLE #temp_enterprise_ids")
+                .contains("OPEN ENTERPRISE FOR SELECT enterprise_id FROM #temp_enterprise_ids;")
+                .doesNotContain("ENTERPRISE CURSOR FOR")
+                .doesNotContain("OPEN ENTERPRISE;");
     }
 
     @Test
