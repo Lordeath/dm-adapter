@@ -502,6 +502,26 @@ public class MapperXmlRewriter {
                 conversionResult =
                         sqlConverter.convert(commentSafeSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
             }
+            if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter) {
+                List<String> recursiveColumns = recursiveCteFallbackColumns(document, statement);
+                SqlConversionResult recursiveConversion =
+                        mySqlToDmSqlConverter.convertRecursiveCteWithFallbackColumns(
+                                conversionResult.convertedSql(),
+                                recursiveColumns
+                        );
+                if (recursiveConversion.changed()) {
+                    List<String> mergedRules = new ArrayList<>(conversionResult.appliedRules());
+                    addAppliedRules(mergedRules, recursiveConversion.appliedRules());
+                    conversionResult = new SqlConversionResult(
+                            commentSafeSql,
+                            recursiveConversion.convertedSql(),
+                            true,
+                            conversionResult.manualReviewRequired(),
+                            conversionResult.reason(),
+                            mergedRules
+                    );
+                }
+            }
             String convertedSql = conversionResult.changed()
                     ? conversionResult.convertedSql()
                     : commentSafeSql;
@@ -696,6 +716,58 @@ public class MapperXmlRewriter {
         }
         ambiguousProperties.forEach(columnsByProperty::remove);
         return columnsByProperty;
+    }
+
+    private List<String> recursiveCteFallbackColumns(Document document, Element statement) {
+        String resultMapId = statement.getAttribute("resultMap").strip();
+        String resultType = statement.getAttribute("resultType").strip();
+        if (resultMapId.isBlank() && resultType.isBlank()) {
+            return List.of();
+        }
+        String localResultMapId = resultMapId.contains(".")
+                ? resultMapId.substring(resultMapId.lastIndexOf('.') + 1)
+                : resultMapId;
+        List<List<String>> candidates = new ArrayList<>();
+        NodeList resultMaps = document.getElementsByTagName("resultMap");
+        for (int i = 0; i < resultMaps.getLength(); i++) {
+            if (!(resultMaps.item(i) instanceof Element resultMap)) {
+                continue;
+            }
+            boolean matches = !localResultMapId.isBlank()
+                    ? localResultMapId.equals(resultMap.getAttribute("id"))
+                    : resultType.equals(resultMap.getAttribute("type"));
+            if (!matches) {
+                continue;
+            }
+            List<String> columns = orderedResultMapColumns(resultMap);
+            if (columns.isEmpty()) {
+                return List.of();
+            }
+            candidates.add(columns);
+        }
+        if (candidates.isEmpty()) {
+            return List.of();
+        }
+        List<String> expected = candidates.get(0);
+        return candidates.stream().allMatch(expected::equals) ? expected : List.of();
+    }
+
+    private List<String> orderedResultMapColumns(Element resultMap) {
+        List<String> columns = new ArrayList<>();
+        Set<String> normalizedColumns = new LinkedHashSet<>();
+        NodeList children = resultMap.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            if (!(children.item(i) instanceof Element element)
+                    || (!"id".equals(element.getTagName()) && !"result".equals(element.getTagName()))) {
+                continue;
+            }
+            String column = element.getAttribute("column").strip();
+            if (!isSimpleBareIdentifier(column) || !normalizedColumns.add(normalizeIdentifier(column))) {
+                return List.of();
+            }
+            columns.add(column);
+        }
+        return List.copyOf(columns);
     }
 
     private boolean hasElementChild(Element statement) {
@@ -945,6 +1017,17 @@ public class MapperXmlRewriter {
         if (!commentSafe.equals(converted)) {
             converted = commentSafe;
             appliedRules.add(MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
+        }
+
+        if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter) {
+            TextRewrite dynamicGbkOrder = convertDynamicGbkOrderExpressions(
+                    converted,
+                    mySqlToDmSqlConverter
+            );
+            if (dynamicGbkOrder.changed()) {
+                converted = dynamicGbkOrder.text();
+                appliedRules.add(MySqlToDmSqlConverter.MYSQL_CONVERT_GBK_ORDER_RULE);
+            }
         }
 
         DynamicHavingConversion havingConversion = convertDynamicHavingClauses(converted);
@@ -3954,6 +4037,70 @@ public class MapperXmlRewriter {
             }
         }
         return false;
+    }
+
+    private TextRewrite convertDynamicGbkOrderExpressions(
+            String body,
+            MySqlToDmSqlConverter converter
+    ) {
+        StringBuilder rewritten = new StringBuilder(body.length());
+        int copiedUntil = 0;
+        int index = 0;
+        boolean orderBySeen = false;
+        boolean changed = false;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (current == '\'' || current == '"') {
+                index = skipQuoted(body, index, current);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + 4);
+                index = end < 0 ? body.length() : end + 3;
+            } else if (body.startsWith("--", index)) {
+                int end = body.indexOf('\n', index + 2);
+                index = end < 0 ? body.length() : end + 1;
+            } else if (body.startsWith("/*", index)) {
+                int end = body.indexOf("*/", index + 2);
+                index = end < 0 ? body.length() : end + 2;
+            } else if (current == '<') {
+                int tagEnd = findXmlTagEnd(body, index);
+                index = tagEnd < 0 ? body.length() : tagEnd + 1;
+            } else if (isKeywordAt(body, index, "ORDER")) {
+                int byIndex = skipWhitespace(body, index + "ORDER".length());
+                orderBySeen = isKeywordAt(body, byIndex, "BY");
+                index = orderBySeen ? byIndex + "BY".length() : index + 1;
+            } else if (orderBySeen && isKeywordAt(body, index, "CONVERT")) {
+                int openParen = skipWhitespace(body, index + "CONVERT".length());
+                if (openParen >= body.length() || body.charAt(openParen) != '(') {
+                    index++;
+                    continue;
+                }
+                int closeParen = findMatchingParen(body, openParen);
+                if (closeParen < 0) {
+                    index++;
+                    continue;
+                }
+                String expression = body.substring(index, closeParen + 1);
+                SqlConversionResult conversion = converter.convertGbkOrderExpression(expression);
+                if (!conversion.changed()) {
+                    index = closeParen + 1;
+                    continue;
+                }
+                rewritten.append(body, copiedUntil, index);
+                rewritten.append(conversion.convertedSql());
+                copiedUntil = closeParen + 1;
+                index = closeParen + 1;
+                changed = true;
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return new TextRewrite(body, false);
+        }
+        rewritten.append(body, copiedUntil, body.length());
+        return new TextRewrite(rewritten.toString(), true);
     }
 
     private boolean startsWithKeyword(String value, String keyword) {

@@ -6053,6 +6053,37 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void classifiesBareInsertValueCountMismatchAsOriginalSql() {
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")
+                    && ((String) args[0]).contains("INSERT INTO")) {
+                throw new SQLException("第11 行附近出现错误: 列表不匹配");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "bare-insert.sql",
+                        "sample-association",
+                        List.of("INSERT INTO ns_site VALUES (1, 'demo')")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("ORIGINAL_SQL");
+            assertThat(failure.errorSummary())
+                    .contains("without a target column list")
+                    .contains("Fix the source SQL");
+        });
+    }
+
+    @Test
     void schemaPreflightStopsAllSqlStatementsAndReportsOneRootFailure() {
         AtomicInteger businessStatementCount = new AtomicInteger();
         Statement statement = proxy(Statement.class, (ignored, method, args) -> {
@@ -8100,6 +8131,108 @@ class SqlScriptMigratorTest {
                 .doesNotContain("COLUMN_COMMENT =")
                 .doesNotContain("CHARACTER_SET_NAME")
                 .doesNotContain("COLLATION_NAME");
+    }
+
+    @Test
+    void inlinesCurrentSchemaScriptVariableInsideRoutineAndConvertsCommentLikeGuard() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @db_name = DATABASE();
+                DROP PROCEDURE IF EXISTS inspect_client_type;
+                DELIMITER $$
+                CREATE PROCEDURE inspect_client_type()
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = @db_name
+                          AND table_name = 'demo'
+                          AND column_name = 'clientType'
+                          AND COLUMN_COMMENT NOT LIKE '%H5%'
+                    ) THEN
+                        ALTER TABLE demo MODIFY COLUMN clientType varchar(20) NOT NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL inspect_client_type();
+                DROP PROCEDURE IF EXISTS inspect_client_type;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("FROM ALL_TAB_COLUMNS C")
+                .contains("JOIN ALL_COL_COMMENTS CC")
+                .contains("CC.COMMENTS NOT LIKE '%H5%'")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("C.OWNER = dm_adapter_schema")
+                .doesNotContain("dm_db_name")
+                .doesNotContain("COLUMN_COMMENT");
+    }
+
+    @Test
+    void quotesKnownMixedCaseColumnsInProcedureStaticSql() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE ns_component (
+                    `id` BIGINT NOT NULL AUTO_INCREMENT,
+                    `siteId` BIGINT,
+                    `componentCode` VARCHAR(50),
+                    `deleteFlag` INT,
+                    PRIMARY KEY (`id`)
+                );
+                DELIMITER $$
+                CREATE PROCEDURE inspect_component()
+                BEGIN
+                    DECLARE matched INT DEFAULT 0;
+                    SELECT COUNT(*) INTO matched
+                    FROM ns_component
+                    WHERE siteId = 1 AND componentCode = 'home' AND deleteFlag = 0;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("WHERE `siteId` = 1 AND `componentCode` = 'home' AND `deleteFlag` = 0")
+                .contains("SELECT COUNT(*) INTO matched")
+                .doesNotContain("WHERE siteId =");
+    }
+
+    @Test
+    void preservesInlineIndexesForCreateTableInsideProcedureAndRemovesDefaultCharset() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS create_demo;
+                DELIMITER $$
+                CREATE PROCEDURE create_demo()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = DATABASE() AND table_name = 'demo'
+                    ) THEN
+                        CREATE TABLE demo (
+                            `id` BIGINT NOT NULL AUTO_INCREMENT,
+                            `status` INT NOT NULL DEFAULT 0,
+                            PRIMARY KEY (`id`) USING BTREE,
+                            KEY `idx_status` (`status`) USING BTREE
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL create_demo();
+                DROP PROCEDURE IF EXISTS create_demo;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'CREATE TABLE demo")
+                .contains("dm_equivalent_indexes")
+                .contains("CREATE INDEX demo_idx_status ON demo (`status`)")
+                .doesNotContainIgnoringCase("CHARSET")
+                .doesNotContainIgnoringCase("ROW_FORMAT")
+                .doesNotContain("DEFAULT ';" );
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM_RULE,
+                        SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE
+                ));
     }
 
     @Test

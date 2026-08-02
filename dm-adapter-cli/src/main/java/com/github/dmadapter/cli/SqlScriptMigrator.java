@@ -3772,9 +3772,14 @@ class SqlScriptMigrator {
                     List.of(MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE)
             );
         }
-        ScriptUserVariableInline userVariableInline =
-                inlineScriptUserVariables(leadingSqlPrefix.body(), scriptUserVariables);
         List<String> rules = new ArrayList<>();
+        ScriptUserVariableInline currentSchemaVariableInline =
+                inlineScriptCurrentSchemaVariables(leadingSqlPrefix.body(), scriptDynamicDdlState);
+        if (currentSchemaVariableInline.changed()) {
+            rules.add(MYSQL_SCRIPT_METADATA_TO_DM_RULE);
+        }
+        ScriptUserVariableInline userVariableInline =
+                inlineScriptUserVariables(currentSchemaVariableInline.sql(), scriptUserVariables);
         if (userVariableInline.changed()) {
             rules.add(MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE);
         }
@@ -3942,7 +3947,7 @@ class SqlScriptMigrator {
 
     private ScriptDynamicDdlState scriptDynamicDdlState(List<String> statements) {
         ScriptDynamicDdlState state = new ScriptDynamicDdlState();
-        if (statements == null || statements.size() < 5) {
+        if (statements == null || statements.isEmpty()) {
             return state;
         }
         ScriptDynamicDdlState analysisState = new ScriptDynamicDdlState();
@@ -4600,7 +4605,8 @@ class SqlScriptMigrator {
                         + "UPPER\\s*\\(\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")\\s*\\)"
         );
         Pattern comment = Pattern.compile(
-                "(?is)\\bCOLUMN_COMMENT\\s*=\\s*(?<value>" + SQL_STRING_LITERAL_TOKEN + ")"
+                "(?is)\\bCOLUMN_COMMENT\\s*(?<operator>=|NOT\\s+LIKE|LIKE)\\s*"
+                        + "(?<value>" + SQL_STRING_LITERAL_TOKEN + ")"
         );
         Matcher matcher = guard.matcher(sql);
         StringBuffer converted = new StringBuffer(sql.length());
@@ -4647,7 +4653,9 @@ class SqlScriptMigrator {
                         + "WHERE C.OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION + "\n"
                         + "  AND UPPER(C.TABLE_NAME) = UPPER(" + tableLiteral + ")\n"
                         + "  AND UPPER(C.COLUMN_NAME) = UPPER(" + columnLiteral + ")\n"
-                        + "  AND CC.COMMENTS = " + commentMatcher.group("value")
+                        + "  AND CC.COMMENTS "
+                        + commentMatcher.group("operator").replaceAll("\\s+", " ").toUpperCase(Locale.ROOT)
+                        + " " + commentMatcher.group("value")
                         + matcher.group("suffix");
             } else {
                 replacement = "SELECT " + projection + "\n"
@@ -4771,6 +4779,36 @@ class SqlScriptMigrator {
             }
             converted.append(sql, cursor, reference.start());
             converted.append(literal);
+            cursor = reference.end();
+            changed = true;
+        }
+        if (!changed) {
+            return new ScriptUserVariableInline(sql, false);
+        }
+        converted.append(sql, cursor, sql.length());
+        return new ScriptUserVariableInline(converted.toString(), true);
+    }
+
+    private ScriptUserVariableInline inlineScriptCurrentSchemaVariables(
+            String sql,
+            ScriptDynamicDdlState state
+    ) {
+        if (sql == null || sql.isBlank() || state == null || state.currentSchemaVariables.isEmpty()) {
+            return new ScriptUserVariableInline(sql == null ? "" : sql, false);
+        }
+        List<UserVariableReference> references = mysqlUserVariableReferences(sql);
+        if (references.isEmpty()) {
+            return new ScriptUserVariableInline(sql, false);
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        int cursor = 0;
+        boolean changed = false;
+        for (UserVariableReference reference : references) {
+            if (!state.currentSchemaVariables.contains(reference.name().toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            converted.append(sql, cursor, reference.start());
+            converted.append(DM_CURRENT_SCHEMA_EXPRESSION);
             cursor = reference.end();
             changed = true;
         }
@@ -6429,6 +6467,15 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_IDENTIFIER_TO_DM_RULE);
         }
 
+        String knownProcedureColumnSql = quoteKnownMixedCaseProcedureColumns(
+                converted,
+                scriptTableColumns
+        );
+        if (!knownProcedureColumnSql.equals(converted)) {
+            converted = knownProcedureColumnSql;
+            rules.add(MYSQL_PROCEDURE_IDENTIFIER_TO_DM_RULE);
+        }
+
         String reservedCursorSql = renameReservedProcedureCursorNames(converted);
         if (!reservedCursorSql.equals(converted)) {
             converted = reservedCursorSql;
@@ -6644,6 +6691,11 @@ class SqlScriptMigrator {
 
         String procedureDdlSql = wrapProcedureDdlStatements(converted);
         if (!procedureDdlSql.equals(converted)) {
+            if (!converted.contains("dm_equivalent_indexes")
+                    && procedureDdlSql.contains("dm_equivalent_indexes")) {
+                rules.add(MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM_RULE);
+                rules.add(MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE);
+            }
             converted = procedureDdlSql;
             rules.add(MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE);
         }
@@ -7373,6 +7425,56 @@ class SqlScriptMigrator {
                 Pattern.compile("(?is)(\\bCALL\\s+)(`([^`]+)`)(?=\\s*\\()"),
                 matcher -> matcher.group(1) + dmRoutineIdentifier(matcher.group(3), matcher.group(2))
         );
+        return converted;
+    }
+
+    private String quoteKnownMixedCaseProcedureColumns(
+            String sql,
+            Map<String, LinkedHashSet<String>> scriptTableColumns
+    ) {
+        if (!isCreateProcedureStatement(sql)
+                || scriptTableColumns == null
+                || scriptTableColumns.isEmpty()) {
+            return sql;
+        }
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0) {
+            return sql;
+        }
+        LinkedHashMap<String, String> knownColumns = new LinkedHashMap<>();
+        for (RoutineTableReference reference : staticRoutineTableReferences(sql, "")) {
+            LinkedHashSet<String> columns = temporaryTableColumns(
+                    scriptTableColumns,
+                    reference.table().name()
+            );
+            if (columns == null) {
+                continue;
+            }
+            for (String column : columns) {
+                if (isSimpleIdentifier(column)
+                        && column.chars().anyMatch(Character::isUpperCase)) {
+                    knownColumns.putIfAbsent(column.toLowerCase(Locale.ROOT), column);
+                }
+            }
+        }
+        if (knownColumns.isEmpty()) {
+            return sql;
+        }
+        LinkedHashSet<String> scopedNames = procedureNamesInScope(sql, beginIndex);
+        scopedNames.addAll(procedureVariableNamesByLowercase(sql).keySet());
+        String converted = sql;
+        for (Map.Entry<String, String> entry : knownColumns.entrySet()) {
+            if (scopedNames.contains(entry.getKey())) {
+                continue;
+            }
+            String column = entry.getValue();
+            converted = replaceOutsideIgnoredText(
+                    converted,
+                    Pattern.compile("(?i)(?<![A-Za-z0-9_$])" + Pattern.quote(column)
+                            + "(?![A-Za-z0-9_$])"),
+                    matcher -> "`" + column.replace("`", "``") + "`"
+            );
+        }
         return converted;
     }
 
@@ -11756,6 +11858,8 @@ class SqlScriptMigrator {
             boolean directProcedureBodyStatement
     ) {
         String converted = removeMysqlTemporaryKeyword(ddl);
+        InlineCreateTableIndexConversion inlineIndexes =
+                convertMysqlCreateTableInlineIndexes(converted);
         List<ProcedureStatement> temporaryDropTables = convertTemporaryDropTableToDml(converted);
         if (!temporaryDropTables.isEmpty()) {
             return temporaryDropTables;
@@ -11819,7 +11923,7 @@ class SqlScriptMigrator {
         }
         converted = replaceOutsideIgnoredText(converted, List.of(
                 new TextReplacement(
-                        Pattern.compile("(?is)\\s+CHARACTER\\s+SET\\s*=\\s*[A-Za-z0-9_]+"),
+                        Pattern.compile("(?is)\\s+(?:DEFAULT\\s+)?CHARACTER\\s+SET\\s*=\\s*[A-Za-z0-9_]+"),
                         ""
                 ),
                 new TextReplacement(
@@ -11827,7 +11931,7 @@ class SqlScriptMigrator {
                         ""
                 ),
                 new TextReplacement(
-                        Pattern.compile("(?is)\\s+CHARSET\\s*=\\s*[A-Za-z0-9_]+"),
+                        Pattern.compile("(?is)\\s+(?:DEFAULT\\s+)?CHARSET\\s*=\\s*[A-Za-z0-9_]+"),
                         ""
                 ),
                 new TextReplacement(
@@ -11840,7 +11944,16 @@ class SqlScriptMigrator {
         converted = convertProcedureCreateTableDdlSyntax(converted);
         converted = normalizeProcedureDynamicDdlSpacing(converted);
         converted = convertProcedureCreateViewDdlSyntax(converted);
-        return splitMultiModifyAlterTable(converted).stream().map(ProcedureStatement::dynamicSql).toList();
+        List<ProcedureStatement> statements = new ArrayList<>();
+        splitMultiModifyAlterTable(converted).stream()
+                .map(ProcedureStatement::dynamicSql)
+                .forEach(statements::add);
+        if (inlineIndexes.manualReviewReason().isBlank()) {
+            inlineIndexes.outputStatements().stream()
+                    .map(ProcedureStatement::directSql)
+                    .forEach(statements::add);
+        }
+        return List.copyOf(statements);
     }
 
     private String convertProcedureAlterTableDdlSyntax(String ddl) {
