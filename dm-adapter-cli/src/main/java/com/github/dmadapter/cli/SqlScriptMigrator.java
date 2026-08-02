@@ -61,6 +61,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM";
     static final String MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE =
             "MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL";
+    static final String MYSQL_PROCEDURE_TRAILING_SELECT_INTO_TO_DM_RULE =
+            "MYSQL_PROCEDURE_TRAILING_SELECT_INTO_TO_DM";
     static final String MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE =
             "MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT";
     static final String MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE =
@@ -6395,6 +6397,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE);
         }
 
+        String trailingSelectIntoSql = convertMysqlProcedureTrailingSelectInto(converted);
+        if (!trailingSelectIntoSql.equals(converted)) {
+            converted = trailingSelectIntoSql;
+            rules.add(MYSQL_PROCEDURE_TRAILING_SELECT_INTO_TO_DM_RULE);
+        }
+
         String assignedInParameterSql = convertAssignedMysqlInParametersToLocals(converted);
         if (!assignedInParameterSql.equals(converted)) {
             converted = assignedInParameterSql;
@@ -10219,6 +10227,43 @@ class SqlScriptMigrator {
         return replaced.substring(0, declarationInsertIndex)
                 + declarations
                 + replaced.substring(declarationInsertIndex);
+    }
+
+    private String convertMysqlProcedureTrailingSelectInto(String sql) {
+        if (!isCreateRoutineStatement(sql)) {
+            return sql;
+        }
+        Pattern pattern = Pattern.compile(
+                "(?im)^(?<indent>[\\t ]*)SELECT\\s+"
+                        + "(?<expression>[^;\\r\\n]+?)\\s+FROM\\s+"
+                        + "(?<from>[^;\\r\\n]+?)\\s+"
+                        + "(?:\"into\"|INTO)\\s+"
+                        + "(?<variables>[A-Za-z_][A-Za-z0-9_$]*"
+                        + "(?:\\s*,\\s*[A-Za-z_][A-Za-z0-9_$]*)*)\\s*(?=;)"
+        );
+        Matcher matcher = pattern.matcher(sql);
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        while (matcher.find()) {
+            matcher.appendReplacement(
+                    converted,
+                    Matcher.quoteReplacement(
+                            matcher.group("indent")
+                                    + "SELECT "
+                                    + matcher.group("expression").strip()
+                                    + " INTO "
+                                    + matcher.group("variables").strip()
+                                    + " FROM "
+                                    + matcher.group("from").strip()
+                    )
+            );
+            changed = true;
+        }
+        if (!changed) {
+            return sql;
+        }
+        matcher.appendTail(converted);
+        return converted.toString();
     }
 
     private int procedureUserVariableDeclarationInsertIndex(String sql, int beginIndex) {

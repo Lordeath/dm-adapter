@@ -2043,7 +2043,7 @@ class SqlScriptMigratorTest {
                 DELIMITER $$
                 CREATE PROCEDURE demo_proc()
                 BEGIN
-                    SELECT MAX(display_order) + 1 INTO @排序id FROM demo_attribute;
+                    SELECT MAX(`order`) + 1 FROM demo_attribute into @排序id;
                     INSERT INTO demo_attribute(id, display_order) VALUES('demo', @排序id);
                 END$$
                 DELIMITER ;
@@ -2063,10 +2063,15 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("dm_u6392_u5e8f_id BIGINT;")
-                .contains("INTO dm_u6392_u5e8f_id FROM demo_attribute")
+                .contains("SELECT MAX(`order`) + 1 INTO dm_u6392_u5e8f_id FROM demo_attribute;")
                 .contains("VALUES('demo', dm_u6392_u5e8f_id)")
                 .doesNotContain("@排序id")
-                .doesNotContain("dm_排序id");
+                .doesNotContain("dm_排序id")
+                .doesNotContain("\"into\"");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_TRAILING_SELECT_INTO_TO_DM_RULE));
     }
 
     @Test
