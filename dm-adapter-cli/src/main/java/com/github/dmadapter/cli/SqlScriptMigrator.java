@@ -3736,6 +3736,11 @@ class SqlScriptMigrator {
             convertedBody = normalizedDropProcedureSql;
             rules.add(MYSQL_DROP_PROCEDURE_IF_EXISTS_RULE);
         }
+        String guardedStandaloneIndexSql = guardStandaloneCreateIndexForDameng(convertedBody);
+        if (!guardedStandaloneIndexSql.equals(convertedBody)) {
+            convertedBody = guardedStandaloneIndexSql;
+            rules.add(MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE);
+        }
         String convertedSql = leadingSqlPrefix.prefix() + convertedBody;
         boolean changed = !convertedSql.equals(originalStatement)
                 || !inlineCreateTableIndexes.outputStatements().isEmpty();
@@ -6069,6 +6074,12 @@ class SqlScriptMigrator {
         if (!temporaryIndexSql.equals(converted)) {
             converted = temporaryIndexSql;
             rules.add(MYSQL_TEMPORARY_INDEX_NOOP_RULE);
+        }
+
+        String standaloneAddIndexSql = convertMysqlAlterTableAddIndex(converted);
+        if (!standaloneAddIndexSql.equals(converted)) {
+            converted = standaloneAddIndexSql;
+            rules.add(MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE);
         }
 
         String alterModifySql = normalizeMysqlAlterModifySyntax(converted);
@@ -11321,6 +11332,15 @@ class SqlScriptMigrator {
         if (temporaryIndexDdl != null) {
             return directProcedureBodyStatement ? List.of() : List.of(temporaryIndexDdl);
         }
+        DamengCreateIndexDefinition indexDefinition = damengCreateIndexDefinition(converted);
+        if (indexDefinition != null) {
+            return List.of(ProcedureStatement.directSql(guardCreateIndexForDameng(
+                    indexDefinition.tableName(),
+                    converted,
+                    indexDefinition.columns(),
+                    indexDefinition.unique()
+            )));
+        }
         converted = normalizeMysqlAlterModifySyntax(converted);
         converted = normalizeMysqlAlterChangeSyntax(converted);
         String withoutInlineKeys = removeMysqlCreateTableInlineKeyDefinitions(converted);
@@ -11548,6 +11568,15 @@ class SqlScriptMigrator {
         if (columns.isEmpty()) {
             return guardCreateIndexByNameForDameng(tableName, indexName, createIndexSql);
         }
+        return guardCreateIndexForDameng(tableName, createIndexSql, columns, unique);
+    }
+
+    private String guardCreateIndexForDameng(
+            String tableName,
+            String createIndexSql,
+            List<DamengIndexColumn> columns,
+            boolean unique
+    ) {
         return "DECLARE\n"
                 + "    dm_existing_count INT;\n"
                 + "BEGIN\n"
@@ -11557,6 +11586,20 @@ class SqlScriptMigrator {
                 + "        EXECUTE IMMEDIATE " + sqlStringLiteral(createIndexSql) + ";\n"
                 + "    END IF;\n"
                 + "END";
+    }
+
+    private String guardStandaloneCreateIndexForDameng(String ddl) {
+        String normalized = normalizeCreateIndexForDm(ddl);
+        DamengCreateIndexDefinition definition = damengCreateIndexDefinition(normalized);
+        if (definition == null) {
+            return ddl;
+        }
+        return guardCreateIndexForDameng(
+                definition.tableName(),
+                normalized,
+                definition.columns(),
+                definition.unique()
+        );
     }
 
     private String guardCreateIndexByNameForDameng(
@@ -11628,45 +11671,57 @@ class SqlScriptMigrator {
         StringBuilder sql = new StringBuilder();
         sql.append(indent).append("SELECT I.INDEX_NAME\n")
                 .append(indent).append("FROM ALL_INDEXES I\n")
-                .append(indent).append("JOIN ALL_IND_COLUMNS C\n")
-                .append(indent).append("  ON C.INDEX_OWNER = I.OWNER\n")
-                .append(indent).append(" AND C.INDEX_NAME = I.INDEX_NAME\n")
-                .append(indent).append(" AND C.TABLE_OWNER = I.TABLE_OWNER\n")
-                .append(indent).append(" AND C.TABLE_NAME = I.TABLE_NAME\n")
-                .append(indent).append("LEFT JOIN ALL_IND_EXPRESSIONS E\n")
-                .append(indent).append("  ON E.INDEX_OWNER = C.INDEX_OWNER\n")
-                .append(indent).append(" AND E.INDEX_NAME = C.INDEX_NAME\n")
-                .append(indent).append(" AND E.TABLE_OWNER = C.TABLE_OWNER\n")
-                .append(indent).append(" AND E.TABLE_NAME = C.TABLE_NAME\n")
-                .append(indent).append(" AND E.COLUMN_POSITION = ABS(C.COLUMN_POSITION)\n")
                 .append(indent).append("WHERE I.OWNER = ").append(schemaExpression).append('\n')
                 .append(indent).append("  AND I.TABLE_OWNER = ").append(schemaExpression).append('\n')
                 .append(indent).append("  AND UPPER(I.TABLE_NAME) = UPPER(")
                 .append(sqlStringLiteral(tableName)).append(")\n")
                 .append(indent).append("  AND I.UNIQUENESS = '")
                 .append(unique ? "UNIQUE" : "NONUNIQUE").append("'\n")
-                .append(indent).append("GROUP BY I.INDEX_NAME\n")
-                .append(indent).append("HAVING COUNT(*) = ").append(columns.size());
+                .append(indent).append("  AND (\n")
+                .append(indent).append("      SELECT COUNT(*)\n")
+                .append(indent).append("      FROM ALL_IND_COLUMNS C\n")
+                .append(indent).append("      WHERE C.INDEX_OWNER = I.OWNER\n")
+                .append(indent).append("        AND C.INDEX_NAME = I.INDEX_NAME\n")
+                .append(indent).append("        AND C.TABLE_OWNER = I.TABLE_OWNER\n")
+                .append(indent).append("        AND C.TABLE_NAME = I.TABLE_NAME\n")
+                .append(indent).append("  ) = ").append(columns.size());
         for (int index = 0; index < columns.size(); index++) {
             sql.append('\n')
-                    .append(indent).append("   AND MAX(CASE WHEN ")
-                    .append(indexColumnEquivalencePredicate(columns.get(index), index + 1))
-                    .append(" THEN 1 ELSE 0 END) = 1");
+                    .append(indexColumnEquivalenceExistsSql(columns.get(index), index + 1, indent));
         }
         return sql.toString();
     }
 
-    private String indexColumnEquivalencePredicate(DamengIndexColumn column, int position) {
+    private String indexColumnEquivalenceExistsSql(
+            DamengIndexColumn column,
+            int position,
+            String indent
+    ) {
         if (!column.expression().isBlank()) {
-            return "ABS(C.COLUMN_POSITION) = " + position
-                    + " AND E.COLUMN_EXPRESSION IS NOT NULL"
-                    + " AND " + normalizedDamengIndexExpressionSql("E.COLUMN_EXPRESSION")
-                    + " = " + sqlStringLiteral(column.expression());
+            return indent + "  AND EXISTS (\n"
+                    + indent + "      SELECT 1\n"
+                    + indent + "      FROM ALL_IND_EXPRESSIONS E\n"
+                    + indent + "      WHERE E.INDEX_OWNER = I.OWNER\n"
+                    + indent + "        AND E.INDEX_NAME = I.INDEX_NAME\n"
+                    + indent + "        AND E.TABLE_OWNER = I.TABLE_OWNER\n"
+                    + indent + "        AND E.TABLE_NAME = I.TABLE_NAME\n"
+                    + indent + "        AND E.COLUMN_POSITION = " + position + "\n"
+                    + indent + "        AND " + normalizedDamengIndexExpressionSql("E.COLUMN_EXPRESSION")
+                    + " = " + sqlStringLiteral(column.expression()) + "\n"
+                    + indent + "  )";
         }
-        return "C.COLUMN_POSITION = " + position
-                + " AND E.COLUMN_EXPRESSION IS NULL"
-                + " AND UPPER(C.COLUMN_NAME) = UPPER(" + sqlStringLiteral(column.columnName()) + ")"
-                + " AND UPPER(C.DESCEND) = '" + column.direction() + "'";
+        return indent + "  AND EXISTS (\n"
+                + indent + "      SELECT 1\n"
+                + indent + "      FROM ALL_IND_COLUMNS C\n"
+                + indent + "      WHERE C.INDEX_OWNER = I.OWNER\n"
+                + indent + "        AND C.INDEX_NAME = I.INDEX_NAME\n"
+                + indent + "        AND C.TABLE_OWNER = I.TABLE_OWNER\n"
+                + indent + "        AND C.TABLE_NAME = I.TABLE_NAME\n"
+                + indent + "        AND C.COLUMN_POSITION = " + position + "\n"
+                + indent + "        AND UPPER(C.COLUMN_NAME) = UPPER("
+                + sqlStringLiteral(column.columnName()) + ")\n"
+                + indent + "        AND UPPER(C.DESCEND) = '" + column.direction() + "'\n"
+                + indent + "  )";
     }
 
     private String normalizedDamengIndexExpressionSql(String expression) {
@@ -12600,11 +12655,142 @@ class SqlScriptMigrator {
         if (renames.isEmpty()) {
             return normalizedSql;
         }
-        String converted = normalizedSql;
+        String converted = splitMultiIndexExistenceGuards(normalizedSql);
         for (IndexRename rename : renames) {
             converted = replaceIndexExistenceCheck(converted, rename);
         }
         return converted;
+    }
+
+    private String splitMultiIndexExistenceGuards(String sql) {
+        Matcher matcher = Pattern.compile("(?is)\\bIF\\s+NOT\\s+EXISTS\\s*\\(").matcher(sql);
+        StringBuilder converted = new StringBuilder(sql.length());
+        int appendCursor = 0;
+        int searchCursor = 0;
+        boolean changed = false;
+        while (matcher.find(searchCursor)) {
+            int openParen = matcher.end() - 1;
+            int closeParen = findMatchingParen(sql, openParen);
+            if (closeParen <= openParen) {
+                searchCursor = matcher.end();
+                continue;
+            }
+            int thenIndex = skipWhitespace(sql, closeParen + 1);
+            if (!startsKeyword(sql, thenIndex, "THEN")) {
+                searchCursor = matcher.end();
+                continue;
+            }
+            ProcedureEndIf endIf = findMatchingProcedureEndIf(
+                    sql,
+                    thenIndex + "THEN".length()
+            );
+            if (endIf == null) {
+                searchCursor = matcher.end();
+                continue;
+            }
+            String check = sql.substring(matcher.start(), thenIndex + "THEN".length());
+            List<GuardedIndexStatement> statements = guardedIndexStatements(
+                    sql.substring(thenIndex + "THEN".length(), endIf.start()),
+                    check
+            );
+            if (statements.size() < 2) {
+                searchCursor = endIf.end();
+                continue;
+            }
+            String indent = lineIndentBefore(sql, matcher.start());
+            converted.append(sql, appendCursor, matcher.start());
+            for (int index = 0; index < statements.size(); index++) {
+                GuardedIndexStatement statement = statements.get(index);
+                if (index > 0) {
+                    converted.append('\n').append(indent);
+                }
+                converted.append(indexColumnExistenceCheck(statement.rename()))
+                        .append('\n')
+                        .append(indent).append("    ")
+                        .append(statement.sql()).append(";\n")
+                        .append(indent).append("END IF;");
+            }
+            appendCursor = endIf.end();
+            searchCursor = endIf.end();
+            changed = true;
+        }
+        if (!changed) {
+            return sql;
+        }
+        converted.append(sql.substring(appendCursor));
+        return converted.toString();
+    }
+
+    private List<GuardedIndexStatement> guardedIndexStatements(String body, String check) {
+        List<GuardedIndexStatement> statements = new ArrayList<>();
+        int cursor = 0;
+        while (cursor < body.length()) {
+            int statementEnd = findStatementTerminator(body, cursor);
+            if (statementEnd >= body.length()) {
+                String remaining = body.substring(cursor);
+                if (splitLeadingSqlPrefix(remaining).body().strip().isBlank()) {
+                    break;
+                }
+                return List.of();
+            }
+            String statement = body.substring(cursor, statementEnd);
+            LeadingSqlPrefix leading = splitLeadingSqlPrefix(statement);
+            String ddl = leading.body().strip();
+            if (ddl.isBlank()) {
+                cursor = statementEnd + 1;
+                continue;
+            }
+            List<IndexRename> renames = findIndexRenames(ddl);
+            if (renames.size() != 1 || !matchesIndexCheck(check, renames.get(0))) {
+                return List.of();
+            }
+            String statementSql = leading.prefix().strip().isBlank()
+                    ? ddl
+                    : leading.prefix().strip() + "\n" + ddl;
+            statements.add(new GuardedIndexStatement(statementSql, renames.get(0)));
+            cursor = statementEnd + 1;
+        }
+        return List.copyOf(statements);
+    }
+
+    private ProcedureEndIf findMatchingProcedureEndIf(String sql, int bodyStart) {
+        int depth = 1;
+        int index = bodyStart;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "END")) {
+                int ifIndex = skipWhitespace(sql, index + "END".length());
+                if (!startsKeyword(sql, ifIndex, "IF")) {
+                    index++;
+                    continue;
+                }
+                depth--;
+                if (depth == 0) {
+                    int end = skipWhitespace(sql, ifIndex + "IF".length());
+                    if (end < sql.length() && sql.charAt(end) == ';') {
+                        end++;
+                    }
+                    return new ProcedureEndIf(index, end);
+                }
+                index = ifIndex + "IF".length();
+            } else if (startsKeyword(sql, index, "IF")) {
+                depth++;
+                index += "IF".length();
+            } else {
+                index++;
+            }
+        }
+        return null;
     }
 
     private String trimIndexMetadataLiteralWhitespace(String sql) {
@@ -12798,7 +12984,9 @@ class SqlScriptMigrator {
                                 + oldIndexName + "|" + newIndexName + ")'"
                                 + "|UPPER\\s*\\(\\s*INDEX_NAME\\s*\\)\\s*=\\s*"
                                 + "UPPER\\s*\\(\\s*'(?:"
-                                + oldIndexName + "|" + newIndexName + ")'\\s*\\))"
+                                + oldIndexName + "|" + newIndexName + ")'\\s*\\)"
+                                + "|\\bINDEX_NAME\\s+IN\\s*\\((?:(?!\\)).)*?'(?:"
+                                + oldIndexName + "|" + newIndexName + ")'(?:(?!\\)).)*?\\))"
                 )
                 .matcher(check)
                 .find();
@@ -14239,6 +14427,12 @@ class SqlScriptMigrator {
         private IndexRename {
             columns = List.copyOf(columns == null ? List.of() : columns);
         }
+    }
+
+    private record GuardedIndexStatement(String sql, IndexRename rename) {
+    }
+
+    private record ProcedureEndIf(int start, int end) {
     }
 
     private record ScriptStatementConversion(
