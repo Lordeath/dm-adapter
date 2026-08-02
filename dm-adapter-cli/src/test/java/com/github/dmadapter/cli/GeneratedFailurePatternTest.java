@@ -67,6 +67,20 @@ class GeneratedFailurePatternTest {
             assertThat(defaultNameBasedString.invoke(validation, "repairCanCustomerEvalHour")).isEqualTo("1");
             assertThat(defaultNameBasedString.invoke(validation, "dispatchingOvertimeMinute")).isEqualTo("1");
 
+            Method shouldKeepConfiguredValue = validationClass.getDeclaredMethod(
+                    "shouldKeepConfiguredValue",
+                    String.class,
+                    Object.class,
+                    Object.class
+            );
+            shouldKeepConfiguredValue.setAccessible(true);
+            assertThat(shouldKeepConfiguredValue.invoke(
+                    validation,
+                    "repairCanCustomerEvalHour",
+                    "test",
+                    "1"
+            )).isEqualTo(false);
+
             assertThat(referencedTables(
                     validationClass,
                     validation,
