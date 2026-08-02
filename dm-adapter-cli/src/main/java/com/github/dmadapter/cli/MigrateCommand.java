@@ -684,44 +684,64 @@ public class MigrateCommand implements Callable<Integer> {
         if (context.dryRun()) {
             return MapperJdbcTypeAlignmentResult.empty();
         }
+        Map<String, FileChange> fileChanges = new LinkedHashMap<>();
+        List<String> warnings = new ArrayList<>();
+        Map<String, Map<String, String>> columnTypes = Map.of();
         DmValidationEnvironment environment = DmValidationEnvironment.fromSystem();
-        if (!environment.validationEnabled()) {
-            return MapperJdbcTypeAlignmentResult.empty();
-        }
-        if (!environment.ready()) {
-            return new MapperJdbcTypeAlignmentResult(
-                    List.of(),
-                    List.of("DM_SQL_VALIDATION is true but mapper jdbcType alignment was skipped because required variables are missing: "
-                            + environment.missingVariables())
-            );
-        }
-        Set<String> tableNames = mapperJdbcTypeAligner.referencedTables(scanResult, context);
-        if (tableNames.isEmpty()) {
-            return MapperJdbcTypeAlignmentResult.empty();
-        }
-        try {
-            Map<String, Map<String, String>> columnTypes = runWithMetadataTimeout(
-                    () -> damengMetadataReader.readColumnTypes(
-                            environment,
-                            configuredSchema(context),
-                            tableNames
-                    ),
-                    metadataReadTimeoutSeconds(tableNames.size()),
-                    TimeUnit.SECONDS,
-                    "Dameng mapper jdbcType metadata lookup"
-            );
-            MapperJdbcTypeAlignmentResult result = mapperJdbcTypeAligner.align(scanResult, context, columnTypes);
-            if (result.fileChanges().isEmpty()) {
-                return result;
+        if (environment.validationEnabled()) {
+            if (!environment.ready()) {
+                warnings.add("DM_SQL_VALIDATION is true but Dameng mapper jdbcType metadata lookup was skipped "
+                        + "because required variables are missing: " + environment.missingVariables());
+            } else {
+                Set<String> tableNames = mapperJdbcTypeAligner.referencedTables(scanResult, context);
+                if (!tableNames.isEmpty()) {
+                    try {
+                        columnTypes = runWithMetadataTimeout(
+                                () -> damengMetadataReader.readColumnTypes(
+                                        environment,
+                                        configuredSchema(context),
+                                        tableNames
+                                ),
+                                metadataReadTimeoutSeconds(tableNames.size()),
+                                TimeUnit.SECONDS,
+                                "Dameng mapper jdbcType metadata lookup"
+                        );
+                    } catch (Exception e) {
+                        warnings.add("Dameng mapper jdbcType metadata lookup failed: "
+                                + redact(e.getMessage(), environment));
+                    }
+                }
             }
-            List<String> warnings = new ArrayList<>(result.warnings());
-            warnings.add("Aligned MyBatis SQL type uses in mapper-dm with Dameng column metadata.");
-            return new MapperJdbcTypeAlignmentResult(result.fileChanges(), warnings);
-        } catch (Exception e) {
-            return new MapperJdbcTypeAlignmentResult(
-                    List.of(),
-                    List.of("Dameng mapper jdbcType alignment was skipped: " + redact(e.getMessage(), environment))
-            );
+        }
+        if (!columnTypes.isEmpty()) {
+            MapperJdbcTypeAlignmentResult result = mapperJdbcTypeAligner.align(scanResult, context, columnTypes);
+            addMapperJdbcTypeAlignment(fileChanges, warnings, result);
+            if (!result.fileChanges().isEmpty()) {
+                warnings.add("Aligned MyBatis SQL type uses in mapper-dm with Dameng column metadata.");
+            }
+        }
+        MapperJdbcTypeAlignmentResult fallbackResult = mapperJdbcTypeAligner.alignUsingResultMapFallback(
+                scanResult,
+                context,
+                columnTypes
+        );
+        addMapperJdbcTypeAlignment(fileChanges, warnings, fallbackResult);
+        return new MapperJdbcTypeAlignmentResult(new ArrayList<>(fileChanges.values()), warnings);
+    }
+
+    private void addMapperJdbcTypeAlignment(
+            Map<String, FileChange> fileChanges,
+            List<String> warnings,
+            MapperJdbcTypeAlignmentResult result
+    ) {
+        warnings.addAll(result.warnings());
+        for (FileChange change : result.fileChanges()) {
+            fileChanges.merge(change.path(), change, (existing, addition) -> new FileChange(
+                    existing.path(),
+                    existing.changeType(),
+                    existing.description() + " " + addition.description(),
+                    existing.applied() && addition.applied()
+            ));
         }
     }
 
