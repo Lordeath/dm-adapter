@@ -6291,12 +6291,12 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml"));
         assertThat(rewritten)
                 .contains("DATEADD(HOUR, CAST(#{customerEvalHour} AS BIGINT), f.begin_time)")
-                .contains("CAST(IFNULL(f.timeout_value,#{timeoutMinute,jdbcType=INTEGER}) AS BIGINT)");
+                .contains("TO_NUMBER(IFNULL(f.timeout_value,#{timeoutMinute,jdbcType=INTEGER}))");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .contains(
                         MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE,
-                        MySqlToDmSqlConverter.MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE
+                        MySqlToDmSqlConverter.MYSQL_NUMERIC_IFNULL_COMPARISON_TO_NUMBER_RULE
                 );
         assertThat(result.manualReviewItems()).isEmpty();
     }

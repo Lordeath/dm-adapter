@@ -1793,7 +1793,7 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo(
-                "select DATEADD(MINUTE, (0 - CAST(ifnull(c.accept_time,#{acceptOvertimeMinute}) AS BIGINT)), now())"
+                "select DATEADD(MINUTE, (0 - TO_NUMBER(ifnull(c.accept_time,#{acceptOvertimeMinute}))), now())"
         );
         assertThat(result.convertedSql()).doesNotContain("DATEADD(DAY, (DATEADD(");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE);
@@ -1820,10 +1820,10 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.convertedSql()).isEqualTo(
                 "select * from task where TIMESTAMPDIFF(MINUTE, start_time, now()) "
-                        + ">= CAST(IFNULL(config_value,#{timeout,jdbcType=INTEGER}) AS BIGINT)"
+                        + ">= TO_NUMBER(IFNULL(config_value,#{timeout,jdbcType=INTEGER}))"
         );
         assertThat(result.appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE);
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_NUMERIC_IFNULL_COMPARISON_TO_NUMBER_RULE);
     }
 
     @Test

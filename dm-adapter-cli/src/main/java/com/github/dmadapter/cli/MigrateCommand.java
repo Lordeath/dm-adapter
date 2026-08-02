@@ -710,7 +710,7 @@ public class MigrateCommand implements Callable<Integer> {
                 return result;
             }
             List<String> warnings = new ArrayList<>(result.warnings());
-            warnings.add("Aligned MyBatis jdbcType declarations in mapper-dm with Dameng column metadata.");
+            warnings.add("Aligned MyBatis SQL type uses in mapper-dm with Dameng column metadata.");
             return new MapperJdbcTypeAlignmentResult(result.fileChanges(), warnings);
         } catch (Exception e) {
             return new MapperJdbcTypeAlignmentResult(

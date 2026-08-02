@@ -26,8 +26,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CAST_SIGNED_RULE = "MYSQL_CAST_SIGNED_TO_BIGINT";
     public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_DATE_ADD_INTERVAL_RULE = "MYSQL_DATE_ADD_INTERVAL_TO_DATEADD";
+    public static final String MYSQL_NUMERIC_IFNULL_COMPARISON_TO_NUMBER_RULE =
+            "MYSQL_NUMERIC_IFNULL_COMPARISON_TO_NUMBER";
+    @Deprecated
     public static final String MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE =
-            "MYSQL_NUMERIC_IFNULL_COMPARISON_TO_BIGINT";
+            MYSQL_NUMERIC_IFNULL_COMPARISON_TO_NUMBER_RULE;
     public static final String MYSQL_SUBDATE_RULE = "MYSQL_SUBDATE_TO_DATEADD";
     public static final String MYSQL_LOCATE_NUMERIC_NEEDLE_RULE = "MYSQL_LOCATE_NUMERIC_NEEDLE_CAST";
     public static final String MYSQL_MAKEDATE_RULE = "MYSQL_MAKEDATE_TO_DATEADD";
@@ -743,7 +746,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         GenericConversion numericIfNullComparisonConversion = convertTimestampDiffNumericIfNullComparisons(converted);
         if (numericIfNullComparisonConversion.changed()) {
             converted = numericIfNullComparisonConversion.convertedSql();
-            rules.add(MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE);
+            rules.add(MYSQL_NUMERIC_IFNULL_COMPARISON_TO_NUMBER_RULE);
         }
 
         GenericConversion makeDateConversion = convertMakeDateFunctions(converted);
@@ -4184,9 +4187,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     index++;
                 } else {
                     converted.append(sql, index, comparison.ifNullStart());
-                    converted.append("CAST(")
+                    converted.append("TO_NUMBER(")
                             .append(sql, comparison.ifNullStart(), comparison.ifNullEnd())
-                            .append(" AS BIGINT)");
+                            .append(")");
                     index = comparison.ifNullEnd();
                     changed = true;
                 }
@@ -4839,6 +4842,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 || NUMERIC_INTERVAL_EXPRESSION_PATTERN.matcher(trimmed).find()
                 || NUMERIC_ARITHMETIC_INTERVAL_PATTERN.matcher(trimmed).matches()) {
             return trimmed;
+        }
+        if (readOnlyFunctionCall(trimmed, "IFNULL") != null
+                || readOnlyFunctionCall(trimmed, "COALESCE") != null) {
+            return "TO_NUMBER(" + trimmed + ")";
         }
         return "CAST(" + trimmed + " AS BIGINT)";
     }

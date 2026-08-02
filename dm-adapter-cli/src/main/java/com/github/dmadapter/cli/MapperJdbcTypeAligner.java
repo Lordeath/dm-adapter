@@ -45,6 +45,15 @@ class MapperJdbcTypeAligner {
             "(?is)(#\\{\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)})\\s*"
                     + "(=|<>|!=|>=|<=|>|<)\\s*(" + QUALIFIED_IDENTIFIER + ")"
     );
+    private static final String NUMERIC_LITERAL = "[+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)";
+    private static final Pattern COLUMN_NUMERIC_LITERAL_EQUALITY_PATTERN = Pattern.compile(
+            "(?is)(" + QUALIFIED_IDENTIFIER + ")\\s*(=|<>|!=)\\s*(" + NUMERIC_LITERAL + ")"
+                    + "(?![A-Za-z0-9_.$])"
+    );
+    private static final Pattern NUMERIC_LITERAL_COLUMN_EQUALITY_PATTERN = Pattern.compile(
+            "(?is)(?<![A-Za-z0-9_.$])(" + NUMERIC_LITERAL + ")\\s*(=|<>|!=)\\s*("
+                    + QUALIFIED_IDENTIFIER + ")"
+    );
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile(
             "#\\{\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)}"
     );
@@ -110,7 +119,7 @@ class MapperJdbcTypeAligner {
                             mapperPath.toString(),
                             "UPDATE",
                             "Aligned " + alignment.replacements()
-                                    + " MyBatis jdbcType declaration(s) with Dameng column metadata."
+                                    + " MyBatis SQL type use(s) with Dameng column metadata."
                     ));
                 }
             } catch (IOException e) {
@@ -202,13 +211,169 @@ class MapperJdbcTypeAligner {
         String parameterType = statementAttribute(statement, "parameterType");
         Alignment current = alignUpdatePlaceholders(statement, columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         Alignment comparisons = alignComparisonPlaceholders(current.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
-        Alignment simpleInsert = alignSimpleInsertPlaceholders(comparisons.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
+        Alignment literalComparisons = alignCharacterNumericLiteralComparisons(comparisons.text(), columnTypes);
+        Alignment simpleInsert = alignSimpleInsertPlaceholders(literalComparisons.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         Alignment structuredInsert = alignStructuredInsertPlaceholders(simpleInsert.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         return new Alignment(
                 structuredInsert.text(),
                 current.replacements() + comparisons.replacements() + simpleInsert.replacements()
-                        + structuredInsert.replacements()
+                        + structuredInsert.replacements() + literalComparisons.replacements()
         );
+    }
+
+    private Alignment alignCharacterNumericLiteralComparisons(
+            String statement,
+            Map<String, Map<String, String>> columnTypes
+    ) {
+        Map<String, String> statementTables = statementTables(statement);
+        if (statementTables.isEmpty()) {
+            return new Alignment(statement, 0);
+        }
+        Alignment rightLiteral = quoteCharacterColumnNumericLiteral(
+                statement,
+                COLUMN_NUMERIC_LITERAL_EQUALITY_PATTERN,
+                1,
+                3,
+                statementTables,
+                columnTypes
+        );
+        Alignment leftLiteral = quoteCharacterColumnNumericLiteral(
+                rightLiteral.text(),
+                NUMERIC_LITERAL_COLUMN_EQUALITY_PATTERN,
+                3,
+                1,
+                statementTables,
+                columnTypes
+        );
+        return new Alignment(leftLiteral.text(), rightLiteral.replacements() + leftLiteral.replacements());
+    }
+
+    private Alignment quoteCharacterColumnNumericLiteral(
+            String text,
+            Pattern pattern,
+            int columnGroup,
+            int literalGroup,
+            Map<String, String> statementTables,
+            Map<String, Map<String, String>> columnTypes
+    ) {
+        Matcher matcher = pattern.matcher(text);
+        StringBuffer output = new StringBuffer();
+        int replacements = 0;
+        while (matcher.find()) {
+            if (insideXmlMarkupOrComment(text, matcher.start())
+                    || insideSqlLiteralOrComment(text, matcher.start())) {
+                matcher.appendReplacement(output, Matcher.quoteReplacement(matcher.group()));
+                continue;
+            }
+            String columnType = columnTypeForColumnExpression(
+                    matcher.group(columnGroup),
+                    statementTables,
+                    columnTypes
+            );
+            if (!isCharacterColumnType(columnType)) {
+                matcher.appendReplacement(output, Matcher.quoteReplacement(matcher.group()));
+                continue;
+            }
+            int literalStart = matcher.start(literalGroup) - matcher.start();
+            int literalEnd = matcher.end(literalGroup) - matcher.start();
+            String replacement = matcher.group().substring(0, literalStart)
+                    + "'" + matcher.group(literalGroup) + "'"
+                    + matcher.group().substring(literalEnd);
+            matcher.appendReplacement(output, Matcher.quoteReplacement(replacement));
+            replacements++;
+        }
+        matcher.appendTail(output);
+        return new Alignment(output.toString(), replacements);
+    }
+
+    private boolean insideXmlMarkupOrComment(String text, int position) {
+        int commentStart = text.lastIndexOf("<!--", position);
+        int commentEnd = text.lastIndexOf("-->", position);
+        if (commentStart > commentEnd) {
+            return true;
+        }
+        int cdataStart = text.lastIndexOf("<![CDATA[", position);
+        int cdataEnd = text.lastIndexOf("]]>", position);
+        if (cdataStart > cdataEnd) {
+            return false;
+        }
+        return text.lastIndexOf('<', position) > text.lastIndexOf('>', position);
+    }
+
+    private boolean insideSqlLiteralOrComment(String text, int position) {
+        boolean singleQuoted = false;
+        boolean lineComment = false;
+        boolean blockComment = false;
+        boolean xmlTag = false;
+        boolean xmlComment = false;
+        boolean cdata = false;
+        for (int index = 0; index < position; index++) {
+            if (xmlComment) {
+                if (text.startsWith("-->", index)) {
+                    xmlComment = false;
+                    index += 2;
+                }
+                continue;
+            }
+            if (cdata) {
+                if (text.startsWith("]]>", index)) {
+                    cdata = false;
+                    index += 2;
+                    continue;
+                }
+            } else if (xmlTag) {
+                if (text.charAt(index) == '>') {
+                    xmlTag = false;
+                }
+                continue;
+            } else if (!singleQuoted && !lineComment && !blockComment) {
+                if (text.startsWith("<!--", index)) {
+                    xmlComment = true;
+                    index += 3;
+                    continue;
+                }
+                if (text.startsWith("<![CDATA[", index)) {
+                    cdata = true;
+                    index += 8;
+                    continue;
+                }
+                if (text.charAt(index) == '<') {
+                    xmlTag = true;
+                    continue;
+                }
+            }
+            if (lineComment) {
+                if (text.charAt(index) == '\n' || text.charAt(index) == '\r') {
+                    lineComment = false;
+                }
+                continue;
+            }
+            if (blockComment) {
+                if (text.startsWith("*/", index)) {
+                    blockComment = false;
+                    index++;
+                }
+                continue;
+            }
+            if (singleQuoted) {
+                if (text.charAt(index) == '\'' && index + 1 < position && text.charAt(index + 1) == '\'') {
+                    index++;
+                } else if (text.charAt(index) == '\'') {
+                    singleQuoted = false;
+                }
+                continue;
+            }
+            if (text.startsWith("--", index)) {
+                lineComment = true;
+                index++;
+            } else if (text.startsWith("/*", index)) {
+                blockComment = true;
+                index++;
+            } else if (text.charAt(index) == '\'') {
+                singleQuoted = true;
+            }
+        }
+        return singleQuoted || lineComment || blockComment;
     }
 
     private Alignment alignUpdatePlaceholders(
@@ -669,6 +834,15 @@ class MapperJdbcTypeAligner {
                 || type.contains("DOUBLE")
                 || type.contains("FLOAT")
                 || type.contains("REAL");
+    }
+
+    private boolean isCharacterColumnType(String columnType) {
+        String type = columnType == null ? "" : columnType.toUpperCase(Locale.ROOT);
+        return type.contains("CLOB")
+                || type.contains("TEXT")
+                || type.contains("CHAR")
+                || type.contains("VARCHAR")
+                || type.contains("JSON");
     }
 
     private boolean isTemporalColumnType(String columnType) {
