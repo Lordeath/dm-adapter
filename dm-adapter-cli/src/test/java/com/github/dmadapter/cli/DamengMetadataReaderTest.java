@@ -6,6 +6,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class DamengMetadataReaderTest {
     @Test
+    void metadataJdbcUrlAddsBoundedNetworkTimeoutsWithoutOverridingConfiguredValues() {
+        assertThat(DamengMetadataReader.metadataJdbcUrl("jdbc:dm://db.example:5236"))
+                .isEqualTo("jdbc:dm://db.example:5236?connectTimeout=5000&socketTimeout=20000");
+        assertThat(DamengMetadataReader.metadataJdbcUrl(
+                "jdbc:dm://db.example:5236?schema=sample&socketTimeout=45000&CONNECTTIMEOUT=9000"
+        )).isEqualTo(
+                "jdbc:dm://db.example:5236?schema=sample&socketTimeout=45000&CONNECTTIMEOUT=9000"
+        );
+    }
+
+    @Test
     void splitSchemaListTrimsSkipsBlanksAndKeepsOrder() {
         assertThat(DamengMetadataReader.splitSchemaList(" sample-charge-10, sample-bill-10,,sample-owner,sample-bill-10 "))
                 .containsExactly("sample-charge-10", "sample-bill-10", "sample-owner");
