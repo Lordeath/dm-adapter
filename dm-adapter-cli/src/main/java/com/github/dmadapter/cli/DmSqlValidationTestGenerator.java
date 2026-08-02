@@ -57,7 +57,7 @@ class DmSqlValidationTestGenerator {
         List<Path> mapperXmlFiles = validationMapperXmlFiles(normalizedRoot, mapperDir);
         List<String> mapperStatements = discoveredMapperStatements(mapperXmlFiles);
         GeneratedTestTarget testTarget = generatedTestTarget(applicationModule, mapperStatements);
-        MethodListConfig existingMethodListConfig = readExistingMethodListConfig(actualConfigPath);
+        ValidationConfigOverrides existingConfigOverrides = readExistingConfigOverrides(actualConfigPath);
 
         List<FileChange> fileChanges = new ArrayList<>();
         List<String> warnings = new ArrayList<>(initialWarnings == null ? List.of() : initialWarnings);
@@ -67,7 +67,7 @@ class DmSqlValidationTestGenerator {
                         mapperStatements,
                         mapperXmlLocationPatterns(normalizedRoot, mapperDir, mapperXmlFiles),
                         schema,
-                        existingMethodListConfig
+                        existingConfigOverrides
                 ),
                 "Generate Dameng SQL validation parameter configuration",
                 fileChanges,
@@ -226,9 +226,25 @@ class DmSqlValidationTestGenerator {
     private record GeneratedTestTarget(Path path, String packageName) {
     }
 
-    private record MethodListConfig(List<String> includedMethods, List<String> excludedMethods) {
-        private static MethodListConfig empty() {
-            return new MethodListConfig(List.of(), List.of());
+    private record ValidationConfigOverrides(
+            List<String> typeAliasesPackages,
+            List<String> typeHandlersPackages,
+            Boolean usageFilterEnabled,
+            List<String> usageClassDirectories,
+            List<String> methodSectionBody,
+            List<String> includedMethods,
+            List<String> excludedMethods
+    ) {
+        private static ValidationConfigOverrides empty() {
+            return new ValidationConfigOverrides(
+                    List.of(),
+                    List.of(),
+                    null,
+                    List.of(),
+                    List.of(),
+                    List.of(),
+                    List.of()
+            );
         }
     }
 
@@ -271,7 +287,7 @@ class DmSqlValidationTestGenerator {
             List<String> mapperStatements,
             List<String> mapperXmlLocations,
             String schema,
-            MethodListConfig methodListConfig
+            ValidationConfigOverrides configOverrides
     ) {
         StringBuilder content = new StringBuilder();
         content.append("""
@@ -313,33 +329,57 @@ class DmSqlValidationTestGenerator {
 
                 # Optional MyBatis packages needed by mapper XML resultType/resultMap/typeHandler declarations.
                 typeAliasesPackages:
-                  # - com.example.domain
+                """);
+        appendConfiguredList(content, configOverrides.typeAliasesPackages(), "com.example.domain");
+        content.append("""
                 typeHandlersPackages:
-                  # - com.example.mybatis.typehandler
+                """);
+        appendConfiguredList(content, configOverrides.typeHandlersPackages(), "com.example.mybatis.typehandler");
+        content.append("""
 
                 # Skip mapper methods that are not referenced by project target/classes bytecode.
                 # Actual parameter subtype inference scans production src/main/java sources only.
-                usageFilterEnabled: true
+                """);
+        content.append("usageFilterEnabled: ");
+        content.append(configOverrides.usageFilterEnabled() == null
+                ? "true"
+                : configOverrides.usageFilterEnabled());
+        content.append("""
+
                 usageClassDirectories:
-                  # - sample-system-base/target/classes
+                """);
+        appendConfiguredList(
+                content,
+                configOverrides.usageClassDirectories(),
+                "sample-system-base/target/classes"
+        );
+        content.append("""
 
                 # Configure sample method arguments by mapperClass.method.
                 # Missing methods are invoked with conservative generated parameters when possible.
                 methods:
-                  # com.example.UserMapper.selectById:
-                  #   args:
-                  #     - 1
+                """);
+        if (configOverrides.methodSectionBody().isEmpty()) {
+            content.append("  # com.example.UserMapper.selectById:\n");
+            content.append("  #   args:\n");
+            content.append("  #     - 1\n");
+        } else {
+            for (String line : configOverrides.methodSectionBody()) {
+                content.append(line).append('\n');
+            }
+        }
+        content.append("""
 
                 # Methods listed here are always executed even if usage filtering cannot find a bytecode reference.
                 includedMethods:
                 """);
-        appendMethodList(content, methodListConfig.includedMethods(), "com.example.UserMapper.selectById");
+        appendMethodList(content, configOverrides.includedMethods(), "com.example.UserMapper.selectById");
         content.append("""
 
                 # Methods listed here are skipped by the generated integration test.
                 excludedMethods:
                 """);
-        appendMethodList(content, methodListConfig.excludedMethods(), "com.example.UserMapper.deleteAll");
+        appendMethodList(content, configOverrides.excludedMethods(), "com.example.UserMapper.deleteAll");
         if (!mapperStatements.isEmpty()) {
             content.append("\n# Discovered mapper statements:\n");
             for (String mapperStatement : mapperStatements) {
@@ -361,18 +401,82 @@ class DmSqlValidationTestGenerator {
         }
     }
 
-    private MethodListConfig readExistingMethodListConfig(Path configPath) {
+    private void appendConfiguredList(StringBuilder content, List<String> values, String example) {
+        if (values == null || values.isEmpty()) {
+            content.append("  # - ").append(example).append("\n");
+            return;
+        }
+        for (String value : values) {
+            if (!value.isBlank()) {
+                content.append("  - ").append(quoteYaml(value)).append("\n");
+            }
+        }
+    }
+
+    private ValidationConfigOverrides readExistingConfigOverrides(Path configPath) {
         if (!Files.isRegularFile(configPath)) {
-            return MethodListConfig.empty();
+            return ValidationConfigOverrides.empty();
         }
         try {
-            return new MethodListConfig(
+            return new ValidationConfigOverrides(
+                    readExistingTopLevelList(configPath, "typeAliasesPackages"),
+                    readExistingTopLevelList(configPath, "typeHandlersPackages"),
+                    readExistingBoolean(configPath, "usageFilterEnabled"),
+                    readExistingTopLevelList(configPath, "usageClassDirectories"),
+                    readExistingTopLevelSectionBody(configPath, "methods"),
                     readExistingTopLevelList(configPath, "includedMethods"),
                     readExistingTopLevelList(configPath, "excludedMethods")
             );
         } catch (IOException e) {
             throw new DmAdapterException("Failed to read existing validation config: " + configPath, e);
         }
+    }
+
+    private Boolean readExistingBoolean(Path configPath, String propertyName) throws IOException {
+        for (String line : Files.readAllLines(configPath, StandardCharsets.UTF_8)) {
+            String trimmed = line.trim();
+            if (leadingSpaces(line) != 0 || !trimmed.startsWith(propertyName + ":")) {
+                continue;
+            }
+            String value = trimmed.substring((propertyName + ":").length()).trim();
+            if ("true".equalsIgnoreCase(value)) {
+                return true;
+            }
+            if ("false".equalsIgnoreCase(value)) {
+                return false;
+            }
+        }
+        return null;
+    }
+
+    private List<String> readExistingTopLevelSectionBody(Path configPath, String sectionName) throws IOException {
+        List<String> body = new ArrayList<>();
+        boolean inSection = false;
+        for (String line : Files.readAllLines(configPath, StandardCharsets.UTF_8)) {
+            String trimmed = line.trim();
+            int indent = leadingSpaces(line);
+            if (!inSection) {
+                if (indent == 0 && trimmed.equals(sectionName + ":")) {
+                    inSection = true;
+                }
+                continue;
+            }
+            if (indent == 0 && !trimmed.isEmpty() && !trimmed.startsWith("#")) {
+                break;
+            }
+            body.add(line);
+        }
+        while (!body.isEmpty()) {
+            String trimmed = body.get(body.size() - 1).trim();
+            if (!trimmed.isEmpty() && !trimmed.startsWith("#")) {
+                break;
+            }
+            body.remove(body.size() - 1);
+        }
+        boolean hasConfiguredContent = body.stream()
+                .map(String::trim)
+                .anyMatch(line -> !line.isEmpty() && !line.startsWith("#"));
+        return hasConfiguredContent ? List.copyOf(body) : List.of();
     }
 
     private List<String> readExistingTopLevelList(Path configPath, String sectionName) throws IOException {
