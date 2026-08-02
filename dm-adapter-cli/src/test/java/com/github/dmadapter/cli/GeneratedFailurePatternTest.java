@@ -49,6 +49,18 @@ class GeneratedFailurePatternTest {
             assertThat(failurePattern(validationClass, validation, duplicateStatementRecord))
                     .isEqualTo("ORIGINAL_MAPPER_DUPLICATE_STATEMENT_ID");
 
+            String mysqlUserVariable = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select @g := @g + 1 as group_no from charge_detail
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object mysqlUserVariableRecord = failedRecord(validationClass, mysqlUserVariable);
+            assertThat(failurePattern(validationClass, validation, mysqlUserVariableRecord))
+                    .isEqualTo("MYSQL_USER_VARIABLE");
+            assertThat(category(validationClass, validation, mysqlUserVariableRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+
             Method throwableSummary = validationClass.getDeclaredMethod("throwableSummary", Throwable.class);
             throwableSummary.setAccessible(true);
             Throwable nestedFailure = new IllegalStateException(

@@ -1045,6 +1045,8 @@ class DmAdapterCliTest {
                 .contains("ID\\\\s+select")
                 .contains("MYSQL_INDEX_HINT")
                 .contains("MYSQL_USER_VARIABLE")
+                .contains("hasMysqlUserVariableAssignment(message)")
+                .contains("if (hasMysqlUserVariableAssignment(message))")
                 .contains("isMysqlMetadataSql")
                 .contains("(?i)### SQL:[\\\\s\\\\S]*?\\\\bdescribe\\\\b")
                 .contains("MYSQL_COLLATE_CLAUSE")
@@ -1637,6 +1639,12 @@ class DmAdapterCliTest {
         assertThat(generatedTestSource)
                 .contains("quoteAwareDynamicSqlFragmentDefault")
                 .contains("dynamicPlaceholderInsideSqlLiteral(text, startIndex, endIndex)")
+                .contains("mixedLiteralContextTemporalDefault")
+                .contains("dynamicPlaceholderAppearsInBothLiteralContexts")
+                .contains("normalizedName.contains(\"firstdayofyear\")")
+                .contains("return \"202401\";")
+                .contains("normalizedName.contains(\"lastdayofyear\")")
+                .contains("return \"202412\";")
                 .contains("return stripSqlLiteralQuotes(value);")
                 .contains("previousNonWhitespaceIndex(text, startIndex - 1)")
                 .contains("nextNonWhitespaceIndex(text, endIndex)")
@@ -1649,6 +1657,51 @@ class DmAdapterCliTest {
                 .contains("!configuredText.equals(strippedConfigured)")
                 .contains("&& isGeneratedPlaceholderText(defaultText)")
                 .contains("return strippedConfigured;");
+    }
+
+    @Test
+    void generatedValidationTestUsesCompactPeriodForMixedLiteralContexts() throws Exception {
+        writeDemoProject();
+        writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
+
+        int exitCode = execute(
+                "generate-validation-test",
+                "--project",
+                tempDir.toString()
+        );
+
+        Path generatedTest = tempDir.resolve("src/test/java/com/example/DmSqlValidationTest.java");
+        assertThat(exitCode).isZero();
+        assertGeneratedTestCompilesForJava8(generatedTest);
+        Path classes = tempDir.resolve("generated-test-classes");
+        try (java.net.URLClassLoader loader = new java.net.URLClassLoader(
+                new java.net.URL[] {classes.toUri().toURL()},
+                getClass().getClassLoader()
+        )) {
+            Class<?> generatedClass = loader.loadClass("com.example.DmSqlValidationTest");
+            Object generatedInstance = generatedClass.getDeclaredConstructor().newInstance();
+            java.lang.reflect.Method method = generatedClass.getDeclaredMethod(
+                    "mixedLiteralContextTemporalDefault",
+                    String.class,
+                    String.class,
+                    String.class
+            );
+            method.setAccessible(true);
+            String mixedSql = "account_book >= ${firstDayOfYear} "
+                    + "and created_at >= concat('${firstDayOfYear}','01') "
+                    + "and account_book <= ${lastDayOfYear} "
+                    + "and created_at <= concat('${lastDayOfYear}','31')";
+            assertThat(method.invoke(generatedInstance, "firstDayOfYear", "firstdayofyear", mixedSql))
+                    .isEqualTo("202401");
+            assertThat(method.invoke(generatedInstance, "lastDayOfYear", "lastdayofyear", mixedSql))
+                    .isEqualTo("202412");
+            assertThat(method.invoke(
+                    generatedInstance,
+                    "firstDayOfYear",
+                    "firstdayofyear",
+                    "created_at >= '${firstDayOfYear}'"
+            )).isNull();
+        }
     }
 
     @Test
