@@ -99,6 +99,8 @@ class SqlScriptMigrator {
             "MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_DROP_PROCEDURE_IF_EXISTS_RULE =
             "MYSQL_DROP_PROCEDURE_IF_EXISTS";
+    static final String MYSQL_ORPHAN_ROUTINE_TERMINATOR_NOOP_RULE =
+            "MYSQL_ORPHAN_ROUTINE_TERMINATOR_NOOP";
     static final String MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE =
             "MYSQL_TEMPORARY_TABLE_AS_SELECT_TO_DM";
     static final String MYSQL_TEMPORARY_INDEX_NOOP_RULE =
@@ -3685,6 +3687,11 @@ class SqlScriptMigrator {
     ) {
         long preparationStartedAt = System.nanoTime();
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(originalStatement);
+        ScriptStatementConversion orphanRoutineTerminatorConversion =
+                convertOrphanMysqlRoutineTerminator(originalStatement, leadingSqlPrefix);
+        if (orphanRoutineTerminatorConversion != null) {
+            return orphanRoutineTerminatorConversion;
+        }
         ScriptStatementConversion indexExistenceConversion =
                 convertScriptIndexExistenceAssignment(originalStatement, leadingSqlPrefix, scriptDynamicDdlState);
         if (indexExistenceConversion != null) {
@@ -3838,6 +3845,31 @@ class SqlScriptMigrator {
                 "",
                 rules,
                 inlineCreateTableIndexes.outputStatements()
+        );
+    }
+
+    private ScriptStatementConversion convertOrphanMysqlRoutineTerminator(
+            String originalStatement,
+            LeadingSqlPrefix leadingSqlPrefix
+    ) {
+        if (!Pattern.compile("(?is)^\\s*END\\s*(?:\\$\\$|//)\\s*$")
+                .matcher(leadingSqlPrefix.body())
+                .matches()) {
+            return null;
+        }
+        String convertedSql = leadingSqlPrefix.prefix()
+                + "BEGIN\n"
+                + "    NULL /* DM_ADAPTER: omitted orphan MySQL routine terminator */;\n"
+                + "END";
+        return new ScriptStatementConversion(
+                originalStatement,
+                convertedSql,
+                convertedSql,
+                true,
+                true,
+                "原始 SQL 语法错误：发现没有对应 CREATE PROCEDURE/FUNCTION 的孤立过程结束符；"
+                        + "达梦输出已替换为安全空块，请删除源脚本中的重复 END。",
+                List.of(MYSQL_ORPHAN_ROUTINE_TERMINATOR_NOOP_RULE)
         );
     }
 
@@ -12566,7 +12598,67 @@ class SqlScriptMigrator {
             converted = identifier.matcher(converted)
                     .replaceAll(Matcher.quoteReplacement(entry.getValue()));
         }
-        return rewriteMysqlProcedureLocalTemporaryTableDdl(converted);
+        String localTemporaryTableSql = rewriteMysqlProcedureLocalTemporaryTableDdl(converted);
+        return convertLocalTemporaryTableCursorsToDynamicOpen(localTemporaryTableSql);
+    }
+
+    private String convertLocalTemporaryTableCursorsToDynamicOpen(String sql) {
+        Pattern cursorDeclaration = Pattern.compile(
+                "(?im)^(?<indent>[\\t ]*)(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN
+                        + ")\\s+CURSOR\\s+FOR\\b"
+        );
+        Matcher matcher = cursorDeclaration.matcher(sql);
+        List<LocalTemporaryCursorRewrite> rewrites = new ArrayList<>();
+        while (matcher.find()) {
+            int queryStart = skipWhitespace(sql, matcher.end());
+            int queryEnd = findStatementTerminator(sql, queryStart);
+            if (queryStart >= queryEnd || queryEnd >= sql.length()) {
+                continue;
+            }
+            String query = sql.substring(queryStart, queryEnd).strip();
+            String searchableQuery = replaceIgnoredSqlWithSpaces(query);
+            if (!Pattern.compile("(?i)\\bDM_ADAPTER_LOCAL_TEMP_[A-Za-z_][A-Za-z0-9_$]*\\b")
+                    .matcher(searchableQuery)
+                    .find()) {
+                continue;
+            }
+            rewrites.add(new LocalTemporaryCursorRewrite(
+                    matcher.start(),
+                    queryEnd,
+                    matcher.group("indent"),
+                    matcher.group("name"),
+                    query
+            ));
+        }
+        if (rewrites.isEmpty()) {
+            return sql;
+        }
+
+        StringBuilder declarationConverted = new StringBuilder(sql);
+        for (int index = rewrites.size() - 1; index >= 0; index--) {
+            LocalTemporaryCursorRewrite rewrite = rewrites.get(index);
+            declarationConverted.replace(
+                    rewrite.start(),
+                    rewrite.end(),
+                    rewrite.indent() + rewrite.name() + " CURSOR"
+            );
+        }
+
+        String converted = declarationConverted.toString();
+        for (LocalTemporaryCursorRewrite rewrite : rewrites) {
+            String normalizedName = unquoteIdentifier(rewrite.name());
+            Pattern openCursor = Pattern.compile(
+                    "(?is)\\bOPEN\\s+(?:`" + Pattern.quote(normalizedName) + "`|\""
+                            + Pattern.quote(normalizedName) + "\"|"
+                            + Pattern.quote(normalizedName) + ")\\s*;"
+            );
+            converted = replaceOutsideIgnoredText(
+                    converted,
+                    openCursor,
+                    ignored -> "OPEN " + rewrite.name() + " FOR " + rewrite.query() + ";"
+            );
+        }
+        return converted;
     }
 
     private String rewriteMysqlProcedureLocalTemporaryTableDdl(String sql) {
@@ -14708,6 +14800,15 @@ class SqlScriptMigrator {
     }
 
     private record ProcedureTempTableColumn(String name, String type) {
+    }
+
+    private record LocalTemporaryCursorRewrite(
+            int start,
+            int end,
+            String indent,
+            String name,
+            String query
+    ) {
     }
 
     private record ProcedureStatement(String sql, boolean dynamic) {
