@@ -7185,6 +7185,14 @@ class DmSqlValidationTestGenerator {
                     if (isRawSqlInjectionName(normalized)) {
                         return "";
                     }
+                    String mixedLiteralContextDefault = mixedLiteralContextTemporalDefault(
+                            expression,
+                            normalized,
+                            text
+                    );
+                    if (mixedLiteralContextDefault != null) {
+                        return mixedLiteralContextDefault;
+                    }
                     String nameBasedFragmentDefault = defaultSqlFragmentForName(normalized);
                     if (nameBasedFragmentDefault != null) {
                         return quoteAwareDynamicSqlFragmentDefault(nameBasedFragmentDefault, text, startIndex, endIndex);
@@ -7199,6 +7207,47 @@ class DmSqlValidationTestGenerator {
                         return defaultDynamicSqlFragmentValue(expression, "", text, startIndex, endIndex, sqlContext);
                     }
                     return null;
+                }
+
+                private String mixedLiteralContextTemporalDefault(
+                        String expression,
+                        String normalizedName,
+                        String text
+                ) {
+                    if (!dynamicPlaceholderAppearsInBothLiteralContexts(expression, text)) {
+                        return null;
+                    }
+                    if (normalizedName.contains("firstdayofyear")) {
+                        return "202401";
+                    }
+                    if (normalizedName.contains("lastdayofyear")) {
+                        return "202412";
+                    }
+                    return null;
+                }
+
+                private boolean dynamicPlaceholderAppearsInBothLiteralContexts(String expression, String text) {
+                    if (isBlank(expression) || isBlank(text)) {
+                        return false;
+                    }
+                    String normalizedExpression = normalizeName(expression);
+                    boolean insideLiteral = false;
+                    boolean outsideLiteral = false;
+                    Matcher matcher = Pattern.compile("\\\\$\\\\{\\\\s*([^}]+?)\\\\s*}").matcher(text);
+                    while (matcher.find()) {
+                        if (!normalizedExpression.equals(normalizeName(matcher.group(1)))) {
+                            continue;
+                        }
+                        if (dynamicPlaceholderInsideSqlLiteral(text, matcher.start(), matcher.end())) {
+                            insideLiteral = true;
+                        } else {
+                            outsideLiteral = true;
+                        }
+                        if (insideLiteral && outsideLiteral) {
+                            return true;
+                        }
+                    }
+                    return false;
                 }
 
                 private String defaultDynamicSqlFragmentValue(
@@ -9370,7 +9419,7 @@ class DmSqlValidationTestGenerator {
                             || (lower.contains("numberformatexception") && lower.contains("for input string"))) {
                         return "TEST_DATA_TYPE_MISMATCH";
                     }
-                    if (Pattern.compile("@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=", Pattern.CASE_INSENSITIVE).matcher(message).find()) {
+                    if (hasMysqlUserVariableAssignment(message)) {
                         return "MYSQL_USER_VARIABLE";
                     }
                     if (hasRequiredInsertColumnOmission(message)) {
@@ -10211,6 +10260,9 @@ class DmSqlValidationTestGenerator {
                     if (hasOriginalMapperPropertyNameMismatch(message)) {
                         return "ORIGINAL_SQL";
                     }
+                    if (hasMysqlUserVariableAssignment(message)) {
+                        return "ORIGINAL_SQL";
+                    }
                     if (hasUnresolvedFunctionObject(message) || isSchemaObjectFailure(lower)) {
                         return "TEST_SCHEMA";
                     }
@@ -10392,6 +10444,13 @@ class DmSqlValidationTestGenerator {
                             || lower.contains("正则表达式")
                             || lower.contains("regex")
                             || Pattern.compile("\\\\bregexp\\\\b", Pattern.CASE_INSENSITIVE).matcher(normalized).find();
+                }
+
+                private boolean hasMysqlUserVariableAssignment(String message) {
+                    return Pattern.compile(
+                            "@[A-Za-z_][A-Za-z0-9_]*\\\\s*:=",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(normalizeMessage(message)).find();
                 }
 
                 private String parametersSummary(ParameterResolution parameters) {
