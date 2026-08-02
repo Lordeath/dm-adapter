@@ -1165,7 +1165,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
         if (e instanceof InvalidCreatedObjectException) {
             String message = safeMessage(e).toLowerCase(Locale.ROOT);
             if (message.contains("无效的表") || message.contains("无效的视图")
-                    || message.contains("无效的列") || message.contains("无效的模式")) {
+                    || message.contains("无效的列") || message.contains("无效的变量")
+                    || message.contains("invalid column") || message.contains("invalid variable")
+                    || message.contains("无效的模式")) {
                 return "TEST_SCHEMA_OBJECT";
             }
             if (message.contains("无效的函数") || message.contains("无法解析的成员访问表达式")) {
@@ -1187,7 +1189,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
             return "OBJECT_DEFINITION_CHANGED";
         }
         if (message.contains("无效的表") || message.contains("无效的视图")
-                || message.contains("无效的列") || message.contains("无效的模式")) {
+                || message.contains("无效的列") || message.contains("无效的变量")
+                || message.contains("invalid column") || message.contains("invalid variable")
+                || message.contains("无效的模式")) {
             return "TEST_SCHEMA_OBJECT";
         }
         if (message.contains("无效的函数") || message.contains("无法解析的成员访问表达式")) {

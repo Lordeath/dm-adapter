@@ -6316,6 +6316,53 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void classifiesInvalidRoutineVariableDiagnosticAsMissingSchemaObject() {
+        AtomicInteger resultSetNextCount = new AtomicInteger();
+        ResultSet resultSet = proxy(ResultSet.class, (ignored, method, args) -> switch (method.getName()) {
+            case "next" -> resultSetNextCount.getAndIncrement() == 0;
+            case "getString" -> "INVALID";
+            default -> defaultValue(method.getReturnType());
+        });
+        PreparedStatement preparedStatement = proxy(PreparedStatement.class, (ignored, method, args) ->
+                method.getName().equals("executeQuery")
+                        ? resultSet
+                        : defaultValue(method.getReturnType()));
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")
+                    && ((String) args[0]).startsWith("ALTER PROCEDURE")) {
+                throw new SQLException("第 15 行附近出现错误: 无效的变量名[siteId]");
+            }
+            if (method.getName().equals("getWarnings")) {
+                return new SQLWarning("创建的对象带有编译错误");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) -> {
+            if (method.getName().equals("createStatement")) {
+                return statement;
+            }
+            if (method.getName().equals("prepareStatement")) {
+                return preparedStatement;
+            }
+            return defaultValue(method.getReturnType());
+        });
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "routine-invalid-variable.sql",
+                        "sample-system",
+                        List.of("CREATE OR REPLACE PROCEDURE demo_proc AS BEGIN NULL; END;")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("TEST_SCHEMA_OBJECT");
+            assertThat(failure.errorSummary()).contains("无效的变量名[siteId]");
+        });
+    }
+
+    @Test
     void failsClosedWhenCreatedObjectStatusCannotBeQueried() {
         PreparedStatement preparedStatement = proxy(PreparedStatement.class, (ignored, method, args) -> {
             if (method.getName().equals("executeQuery")) {
@@ -8169,12 +8216,46 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsMultipleColumnCommentPredicatesInOneMetadataGuard() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @db_name = (SELECT DATABASE());
+                DROP PROCEDURE IF EXISTS update_business_type;
+                DELIMITER $$
+                CREATE PROCEDURE update_business_type()
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = @db_name
+                          AND table_name = 'demo'
+                          AND column_name = 'businessType'
+                          AND COLUMN_COMMENT LIKE '%ARTICLE%'
+                          AND COLUMN_COMMENT NOT LIKE '%LEAD_GENERATION%'
+                    ) THEN
+                        ALTER TABLE demo MODIFY COLUMN `businessType` varchar(50) DEFAULT NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL update_business_type();
+                DROP PROCEDURE IF EXISTS update_business_type;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("JOIN ALL_COL_COMMENTS CC")
+                .contains("CC.COMMENTS LIKE '%ARTICLE%'")
+                .contains("CC.COMMENTS NOT LIKE '%LEAD_GENERATION%'")
+                .doesNotContain("COLUMN_COMMENT");
+    }
+
+    @Test
     void quotesKnownMixedCaseColumnsInProcedureStaticSql() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE TABLE ns_component (
                     `id` BIGINT NOT NULL AUTO_INCREMENT,
                     `siteId` BIGINT,
                     `componentCode` VARCHAR(50),
+                    `componentId` BIGINT,
                     `deleteFlag` INT,
                     PRIMARY KEY (`id`)
                 );
@@ -8182,9 +8263,11 @@ class SqlScriptMigratorTest {
                 CREATE PROCEDURE inspect_component()
                 BEGIN
                     DECLARE matched INT DEFAULT 0;
+                    DECLARE bannerComponentId BIGINT;
                     SELECT COUNT(*) INTO matched
                     FROM ns_component
                     WHERE siteId = 1 AND componentCode = 'home' AND deleteFlag = 0;
+                    SET bannerComponentId = LAST_INSERT_ID();
                 END$$
                 DELIMITER ;
                 """);
@@ -8193,7 +8276,75 @@ class SqlScriptMigratorTest {
         assertThat(converted.sql())
                 .contains("WHERE `siteId` = 1 AND `componentCode` = 'home' AND `deleteFlag` = 0")
                 .contains("SELECT COUNT(*) INTO matched")
+                .contains("bannerComponentId BIGINT")
+                .contains("bannerComponentId := LAST_INSERT_ID()")
+                .doesNotContain("banner `componentId`")
                 .doesNotContain("WHERE siteId =");
+    }
+
+    @Test
+    void quotesBareMixedCaseColumnsWhenTheSameExternalColumnsAreExplicitlyQuoted() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE inspect_external_component()
+                BEGIN
+                    DECLARE matched INT DEFAULT 0;
+                    SELECT COUNT(*) INTO matched
+                    FROM external_component
+                    WHERE siteId = 1 AND componentCode = 'home' AND deleteFlag = 0;
+                    INSERT INTO external_component (`siteId`, `componentCode`, `deleteFlag`)
+                    VALUES (1, 'home', 0);
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("WHERE `siteId` = 1 AND `componentCode` = 'home' AND `deleteFlag` = 0")
+                .contains("INSERT INTO external_component (`siteId`, `componentCode`, `deleteFlag`)");
+    }
+
+    @Test
+    void flagsColumnsAddedOnlyByARepeatedCreateTableIfNotExistsAcrossScriptFiles() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260101.sql"), """
+                CREATE TABLE IF NOT EXISTS ns_component (
+                    `id` BIGINT NOT NULL AUTO_INCREMENT,
+                    `componentCode` VARCHAR(50),
+                    PRIMARY KEY (`id`)
+                );
+                """);
+        write(sqlRoot.resolve("20260102.sql"), """
+                CREATE TABLE IF NOT EXISTS ns_component (
+                    `id` BIGINT NOT NULL AUTO_INCREMENT,
+                    `siteId` BIGINT,
+                    `componentCode` VARCHAR(50),
+                    PRIMARY KEY (`id`)
+                );
+                DELIMITER $$
+                CREATE PROCEDURE seed_component()
+                BEGIN
+                    INSERT INTO ns_component (`siteId`, `componentCode`) VALUES (1, 'home');
+                END$$
+                DELIMITER ;
+                CALL seed_component;
+                """);
+
+        SqlScriptMigrationReport report = migrateScriptRoot(sqlRoot, sqlRootOut);
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(3);
+        assertThat(report.manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::reason)
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("CREATE TABLE IF NOT EXISTS")
+                        .contains("siteId")
+                        .contains("ALTER TABLE ADD COLUMN"))
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("运行时不会存在")
+                        .contains("siteId"))
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("依赖需要人工确认的存储过程 `seed_component`"));
     }
 
     @Test

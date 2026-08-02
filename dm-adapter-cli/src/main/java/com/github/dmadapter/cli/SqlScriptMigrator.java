@@ -188,6 +188,13 @@ class SqlScriptMigrator {
     static final String ORIGINAL_SQL_UNBALANCED_IF_REASON =
             "原始 SQL 语法缺陷：存储过程中的 IF ... THEN 与 END IF 数量不匹配（IF=%d，END IF=%d）；"
                     + "这不是达梦语法转换问题。请先在原始脚本中补齐或删除对应的 END IF。";
+    static final String ORIGINAL_SQL_DUPLICATE_CREATE_TABLE_REASON =
+            "原始 SQL 结构缺陷：表 `%s` 已由前序 CREATE TABLE 创建，本条 CREATE TABLE IF NOT EXISTS "
+                    + "试图再新增列 %s，但 IF NOT EXISTS 在 MySQL 和达梦中都不会修改已存在的表；"
+                    + "请把新增字段改为带存在性判断的 ALTER TABLE ADD COLUMN。";
+    static final String ORIGINAL_SQL_IGNORED_CREATE_COLUMNS_REASON =
+            "原始 SQL 结构缺陷：表 `%s` 的列 %s 只出现在被前序同名 CREATE TABLE IF NOT EXISTS "
+                    + "跳过的定义中，运行时不会存在；当前语句依赖这些列。请先用 ALTER TABLE ADD COLUMN 正确补列。";
 
     private static final String SUSPICIOUS_LENGTH_MODIFY_REASON =
             "可疑字段长度修改：当前 SQL 把字段改为 varchar(%s)，但前置判断没有使用“字符类型且长度小于 %s”的安全加长条件；"
@@ -493,6 +500,7 @@ class SqlScriptMigrator {
         );
         List<SqlScriptManualReviewItem> manualReviewItems = new ArrayList<>();
         List<PlannedSqlScriptFile> plannedFiles = new ArrayList<>();
+        Map<String, ScriptSchemaState> scriptSchemaStates = new LinkedHashMap<>();
         int convertedFileCount = 0;
 
         for (int fileIndex = 0; fileIndex < sqlFiles.size(); fileIndex++) {
@@ -511,6 +519,7 @@ class SqlScriptMigrator {
                     request.targetCapabilities(),
                     outerJoinSourceUniqueKeys,
                     projectIdentityColumns,
+                    scriptSchemaStates,
                     manualReviewItems,
                     warnings
             );
@@ -2091,6 +2100,7 @@ class SqlScriptMigrator {
             LinkedHashMap<String, String> scriptUserVariables,
             ScriptDynamicDdlState scriptDynamicDdlState,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
+            Map<String, LinkedHashSet<String>> ignoredCreateColumns,
             Map<String, String> scriptIdentityColumns,
             Map<String, String> scriptProcedureRenames,
             String targetSchema,
@@ -2110,6 +2120,7 @@ class SqlScriptMigrator {
                 scriptUserVariables,
                 scriptDynamicDdlState,
                 scriptTableColumns,
+                ignoredCreateColumns,
                 scriptIdentityColumns,
                 scriptProcedureRenames,
                 targetSchema,
@@ -2938,6 +2949,7 @@ class SqlScriptMigrator {
             DamengTargetCapabilities targetCapabilities,
             Map<String, List<String>> outerJoinSourceUniqueKeys,
             Map<String, String> projectIdentityColumns,
+            Map<String, ScriptSchemaState> scriptSchemaStates,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -2965,7 +2977,16 @@ class SqlScriptMigrator {
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
         ScriptDynamicDdlState scriptDynamicDdlState = scriptDynamicDdlState(originalStatements);
-        LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns = new LinkedHashMap<>();
+        String schemaScope = (systemScript ? "system:" : "application:")
+                + targetSchema.toLowerCase(Locale.ROOT);
+        ScriptSchemaState persistedSchemaState = scriptSchemaStates.computeIfAbsent(
+                schemaScope,
+                ignored -> new ScriptSchemaState(new LinkedHashMap<>(), new LinkedHashMap<>())
+        );
+        LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns =
+                copyScriptTableColumns(persistedSchemaState.tableColumns());
+        LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumns =
+                copyScriptTableColumns(persistedSchemaState.ignoredCreateColumns());
         LinkedHashMap<String, String> scriptIdentityColumns =
                 new LinkedHashMap<>(projectIdentityColumns);
         Map<String, Set<String>> sourceTableCharsets = sourceTableCharsets(originalStatements);
@@ -3007,6 +3028,8 @@ class SqlScriptMigrator {
                     ScriptDynamicDdlState dynamicDdlStateSnapshot = copyScriptDynamicDdlState(scriptDynamicDdlState);
                     LinkedHashMap<String, LinkedHashSet<String>> tableColumnsSnapshot =
                             copyScriptTableColumns(scriptTableColumns);
+                    LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumnsSnapshot =
+                            copyScriptTableColumns(ignoredCreateColumns);
                     LinkedHashMap<String, String> identityColumnsSnapshot =
                             new LinkedHashMap<>(scriptIdentityColumns);
                     conversion = CompletableFuture.supplyAsync(
@@ -3018,6 +3041,7 @@ class SqlScriptMigrator {
                                     userVariablesSnapshot,
                                     dynamicDdlStateSnapshot,
                                     tableColumnsSnapshot,
+                                    ignoredCreateColumnsSnapshot,
                                     identityColumnsSnapshot,
                                     scriptProcedureRenames,
                                     targetSchema,
@@ -3034,6 +3058,7 @@ class SqlScriptMigrator {
                             scriptUserVariables,
                             scriptDynamicDdlState,
                             scriptTableColumns,
+                            ignoredCreateColumns,
                             scriptIdentityColumns,
                             scriptProcedureRenames,
                             targetSchema,
@@ -3047,6 +3072,11 @@ class SqlScriptMigrator {
                         scriptIdentityColumns
                 );
                 collectScriptAlterTableAddColumns(originalStatement, scriptTableColumns);
+                updateIgnoredCreateColumns(
+                        originalStatement,
+                        scriptTableColumns,
+                        ignoredCreateColumns
+                );
             }
 
             for (StatementConversionPlan plan : conversionPlans) {
@@ -3111,6 +3141,11 @@ class SqlScriptMigrator {
                 + ", statements=" + originalStatements.size()
                 + ", outputStatements=" + convertedStatements.size()
                 + ", elapsedMs=" + elapsedMillis(conversionStartedAt));
+
+        persistedSchemaState.tableColumns().clear();
+        persistedSchemaState.tableColumns().putAll(copyScriptTableColumns(scriptTableColumns));
+        persistedSchemaState.ignoredCreateColumns().clear();
+        persistedSchemaState.ignoredCreateColumns().putAll(copyScriptTableColumns(ignoredCreateColumns));
 
         MetadataSchemaBinding metadataSchemaBinding =
                 bindMetadataSchemaAtProcedureCalls(convertedStatements);
@@ -3559,7 +3594,10 @@ class SqlScriptMigrator {
             return "";
         }
         int openParen = skipWhitespace(body, procedure.end());
-        if (openParen >= body.length() || body.charAt(openParen) != '(') {
+        if (openParen < body.length()
+                && body.charAt(openParen) != '('
+                && body.charAt(openParen) != ';'
+                && body.charAt(openParen) != '/') {
             return "";
         }
         return unquoteIdentifier(lastIdentifierPart(procedure.token()));
@@ -3715,6 +3753,7 @@ class SqlScriptMigrator {
             LinkedHashMap<String, String> scriptUserVariables,
             ScriptDynamicDdlState scriptDynamicDdlState,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
+            Map<String, LinkedHashSet<String>> ignoredCreateColumns,
             Map<String, String> scriptIdentityColumns,
             Map<String, String> scriptProcedureRenames,
             String targetSchema,
@@ -3784,6 +3823,11 @@ class SqlScriptMigrator {
             rules.add(MYSQL_SCRIPT_USER_VARIABLE_LITERAL_RULE);
         }
         String sqlBody = userVariableInline.sql();
+        String originalSchemaShapeReason = originalSqlSchemaShapeManualReviewReason(
+                sqlBody,
+                scriptTableColumns,
+                ignoredCreateColumns
+        );
         ProcedureReferenceRename procedureReferenceRename =
                 renameScriptProcedureReferences(sqlBody, scriptProcedureRenames);
         if (procedureReferenceRename.changed()) {
@@ -3843,7 +3887,9 @@ class SqlScriptMigrator {
         boolean changed = !convertedSql.equals(originalStatement)
                 || !inlineCreateTableIndexes.outputStatements().isEmpty();
         String manualReason;
-        if (!safeRuleConversion.manualReviewReason().isBlank()) {
+        if (!originalSchemaShapeReason.isBlank()) {
+            manualReason = originalSchemaShapeReason;
+        } else if (!safeRuleConversion.manualReviewReason().isBlank()) {
             manualReason = safeRuleConversion.manualReviewReason();
         } else if (sqlConversion.manualReviewRequired()) {
             manualReason = sqlConversion.reason();
@@ -4616,7 +4662,6 @@ class SqlScriptMigrator {
             Matcher ownerMatcher = owner.matcher(predicates);
             Matcher tableMatcher = table.matcher(predicates);
             Matcher columnMatcher = column.matcher(predicates);
-            Matcher commentMatcher = comment.matcher(predicates);
             if (!ownerMatcher.find() || !tableMatcher.find() || !columnMatcher.find()) {
                 matcher.appendReplacement(converted, Matcher.quoteReplacement(matcher.group()));
                 continue;
@@ -4624,9 +4669,17 @@ class SqlScriptMigrator {
             String remaining = owner.matcher(predicates).replaceFirst("");
             remaining = table.matcher(remaining).replaceFirst("");
             remaining = column.matcher(remaining).replaceFirst("");
-            boolean hasCommentPredicate = commentMatcher.find();
-            if (hasCommentPredicate) {
-                remaining = comment.matcher(remaining).replaceFirst("");
+            List<String> commentPredicates = new ArrayList<>();
+            Matcher commentMatcher = comment.matcher(predicates);
+            while (commentMatcher.find()) {
+                commentPredicates.add("CC.COMMENTS "
+                        + commentMatcher.group("operator")
+                                .replaceAll("\\s+", " ")
+                                .toUpperCase(Locale.ROOT)
+                        + " " + commentMatcher.group("value"));
+            }
+            if (!commentPredicates.isEmpty()) {
+                remaining = comment.matcher(remaining).replaceAll("");
             }
             remaining = Pattern.compile("(?is)\\bAND\\b").matcher(remaining).replaceAll("");
             remaining = Pattern.compile("\\s+").matcher(remaining).replaceAll("");
@@ -4640,7 +4693,7 @@ class SqlScriptMigrator {
             String tableLiteral = tableMatcher.group("value");
             String columnLiteral = columnMatcher.group("value");
             String replacement;
-            if (hasCommentPredicate) {
+            if (!commentPredicates.isEmpty()) {
                 String commentProjection = "COLUMN_NAME".equalsIgnoreCase(matcher.group("projection"))
                         ? "C.COLUMN_NAME"
                         : "1";
@@ -4653,9 +4706,9 @@ class SqlScriptMigrator {
                         + "WHERE C.OWNER = " + DM_CURRENT_SCHEMA_EXPRESSION + "\n"
                         + "  AND UPPER(C.TABLE_NAME) = UPPER(" + tableLiteral + ")\n"
                         + "  AND UPPER(C.COLUMN_NAME) = UPPER(" + columnLiteral + ")\n"
-                        + "  AND CC.COMMENTS "
-                        + commentMatcher.group("operator").replaceAll("\\s+", " ").toUpperCase(Locale.ROOT)
-                        + " " + commentMatcher.group("value")
+                        + commentPredicates.stream()
+                                .map(predicate -> "  AND " + predicate)
+                                .collect(Collectors.joining("\n"))
                         + matcher.group("suffix");
             } else {
                 replacement = "SELECT " + projection + "\n"
@@ -4980,7 +5033,8 @@ class SqlScriptMigrator {
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
         String body = leadingSqlPrefix.body();
         Matcher matcher = Pattern.compile(
-                "(?is)^\\s*CREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                "(?is)^\\s*CREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+"
+                        + "(?<guard>IF\\s+NOT\\s+EXISTS\\s+)?"
                         + "(?<table>(?:" + SQL_IDENTIFIER_TOKEN + "))\\s*\\("
         ).matcher(body);
         if (!matcher.find()) {
@@ -4992,7 +5046,13 @@ class SqlScriptMigrator {
             return;
         }
         String tableName = matcher.group("table").strip();
-        LinkedHashSet<String> targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
+        LinkedHashSet<String> targetColumns = temporaryTableColumns(tableColumns, tableName);
+        if (targetColumns != null && matcher.group("guard") != null) {
+            return;
+        }
+        if (targetColumns == null) {
+            targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
+        }
         for (String part : splitTopLevelComma(body.substring(openParen + 1, closeParen))) {
             String definition = part.strip();
             String columnName = createTableColumnDefinitionName(definition);
@@ -5067,6 +5127,140 @@ class SqlScriptMigrator {
                 addColumnIfAbsentIgnoreCase(targetColumns, columnName);
             }
         }
+    }
+
+    private void updateIgnoredCreateColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns,
+            LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumns
+    ) {
+        CreateTableDefinition createTable = createTableDefinition(sql);
+        if (createTable != null && createTable.ifNotExists()) {
+            LinkedHashSet<String> effectiveColumns = temporaryTableColumns(tableColumns, createTable.table());
+            if (effectiveColumns != null) {
+                LinkedHashSet<String> ignoredColumns = temporaryTableColumnsFor(
+                        ignoredCreateColumns,
+                        createTable.table()
+                );
+                for (String column : createTable.columns()) {
+                    if (!containsIgnoreCase(effectiveColumns, column)) {
+                        addColumnIfAbsentIgnoreCase(ignoredColumns, column);
+                    }
+                }
+            }
+        }
+
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        if (!startsWithKeywords(leadingSqlPrefix.body(), "ALTER", "TABLE")) {
+            return;
+        }
+        Matcher alterAdd = Pattern.compile(
+                "(?is)\\bALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+ADD\\s+"
+                        + "(?:COLUMN\\s+)?(?<definition>[^;]+)"
+        ).matcher(leadingSqlPrefix.body());
+        while (alterAdd.find()) {
+            LinkedHashSet<String> ignoredColumns = temporaryTableColumns(
+                    ignoredCreateColumns,
+                    alterAdd.group("table")
+            );
+            if (ignoredColumns == null) {
+                continue;
+            }
+            String addedColumn = createTableColumnDefinitionName(alterAdd.group("definition").strip());
+            ignoredColumns.removeIf(column -> column.equalsIgnoreCase(addedColumn));
+        }
+    }
+
+    private String originalSqlSchemaShapeManualReviewReason(
+            String sql,
+            Map<String, LinkedHashSet<String>> tableColumns,
+            Map<String, LinkedHashSet<String>> ignoredCreateColumns
+    ) {
+        CreateTableDefinition createTable = createTableDefinition(sql);
+        if (createTable != null && createTable.ifNotExists()) {
+            LinkedHashSet<String> effectiveColumns = temporaryTableColumns(tableColumns, createTable.table());
+            if (effectiveColumns != null) {
+                List<String> missing = createTable.columns().stream()
+                        .filter(column -> !containsIgnoreCase(effectiveColumns, column))
+                        .toList();
+                if (!missing.isEmpty()) {
+                    return ORIGINAL_SQL_DUPLICATE_CREATE_TABLE_REASON.formatted(
+                            unquoteIdentifier(lastIdentifierPart(createTable.table())),
+                            missing
+                    );
+                }
+            }
+        }
+        if (ignoredCreateColumns == null || ignoredCreateColumns.isEmpty()) {
+            return "";
+        }
+        Matcher insert = Pattern.compile(
+                "(?is)\\bINSERT\\s+(?:IGNORE\\s+)?INTO\\s+"
+                        + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s*"
+                        + "\\((?<columns>[^()]*)\\)"
+        ).matcher(sql);
+        while (insert.find()) {
+            LinkedHashSet<String> ignoredColumns = temporaryTableColumns(
+                    ignoredCreateColumns,
+                    insert.group("table")
+            );
+            if (ignoredColumns == null || ignoredColumns.isEmpty()) {
+                continue;
+            }
+            List<String> referencedIgnoredColumns = splitTopLevelComma(insert.group("columns")).stream()
+                    .map(String::strip)
+                    .map(this::unquoteIdentifier)
+                    .filter(column -> containsIgnoreCase(ignoredColumns, column))
+                    .distinct()
+                    .toList();
+            if (!referencedIgnoredColumns.isEmpty()) {
+                return ORIGINAL_SQL_IGNORED_CREATE_COLUMNS_REASON.formatted(
+                        unquoteIdentifier(lastIdentifierPart(insert.group("table"))),
+                        referencedIgnoredColumns
+                );
+            }
+        }
+        return "";
+    }
+
+    private CreateTableDefinition createTableDefinition(String sql) {
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql == null ? "" : sql);
+        String body = leadingSqlPrefix.body();
+        Matcher matcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+"
+                        + "(?<guard>IF\\s+NOT\\s+EXISTS\\s+)?"
+                        + "(?<table>(?:" + SQL_IDENTIFIER_TOKEN + "))\\s*\\("
+        ).matcher(body);
+        if (!matcher.find()) {
+            return null;
+        }
+        int openParen = matcher.end() - 1;
+        int closeParen = findMatchingParen(body, openParen);
+        if (closeParen <= openParen) {
+            return null;
+        }
+        List<String> columns = splitTopLevelComma(body.substring(openParen + 1, closeParen)).stream()
+                .map(String::strip)
+                .map(this::createTableColumnDefinitionName)
+                .filter(column -> !column.isBlank())
+                .toList();
+        return new CreateTableDefinition(
+                matcher.group("table").strip(),
+                matcher.group("guard") != null,
+                columns
+        );
+    }
+
+    private boolean containsIgnoreCase(Iterable<String> values, String candidate) {
+        if (candidate == null) {
+            return false;
+        }
+        for (String value : values) {
+            if (value.equalsIgnoreCase(candidate)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean shouldApplyDefaultTemporaryColumns(String tableName, LinkedHashSet<String> columns) {
@@ -7432,9 +7626,7 @@ class SqlScriptMigrator {
             String sql,
             Map<String, LinkedHashSet<String>> scriptTableColumns
     ) {
-        if (!isCreateProcedureStatement(sql)
-                || scriptTableColumns == null
-                || scriptTableColumns.isEmpty()) {
+        if (!isCreateProcedureStatement(sql)) {
             return sql;
         }
         int beginIndex = firstProcedureBegin(sql);
@@ -7442,19 +7634,31 @@ class SqlScriptMigrator {
             return sql;
         }
         LinkedHashMap<String, String> knownColumns = new LinkedHashMap<>();
-        for (RoutineTableReference reference : staticRoutineTableReferences(sql, "")) {
-            LinkedHashSet<String> columns = temporaryTableColumns(
-                    scriptTableColumns,
-                    reference.table().name()
-            );
-            if (columns == null) {
-                continue;
-            }
-            for (String column : columns) {
-                if (isSimpleIdentifier(column)
-                        && column.chars().anyMatch(Character::isUpperCase)) {
-                    knownColumns.putIfAbsent(column.toLowerCase(Locale.ROOT), column);
+        if (scriptTableColumns != null && !scriptTableColumns.isEmpty()) {
+            for (RoutineTableReference reference : staticRoutineTableReferences(sql, "")) {
+                LinkedHashSet<String> columns = temporaryTableColumns(
+                        scriptTableColumns,
+                        reference.table().name()
+                );
+                if (columns == null) {
+                    continue;
                 }
+                for (String column : columns) {
+                    if (isSimpleIdentifier(column)
+                            && column.chars().anyMatch(Character::isUpperCase)) {
+                        knownColumns.putIfAbsent(column.toLowerCase(Locale.ROOT), column);
+                    }
+                }
+            }
+        }
+        Matcher quotedIdentifier = Pattern.compile("`(?<name>(?:``|[^`])+)`").matcher(sql);
+        while (quotedIdentifier.find()) {
+            String column = quotedIdentifier.group("name").replace("``", "`");
+            if (isSimpleIdentifier(column)
+                    && !column.isEmpty()
+                    && Character.isLowerCase(column.charAt(0))
+                    && column.chars().anyMatch(Character::isUpperCase)) {
+                knownColumns.putIfAbsent(column.toLowerCase(Locale.ROOT), column);
             }
         }
         if (knownColumns.isEmpty()) {
@@ -7462,17 +7666,27 @@ class SqlScriptMigrator {
         }
         LinkedHashSet<String> scopedNames = procedureNamesInScope(sql, beginIndex);
         scopedNames.addAll(procedureVariableNamesByLowercase(sql).keySet());
+        Matcher mysqlDeclaration = Pattern.compile(
+                "(?im)^\\s*DECLARE\\s+(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s+"
+        ).matcher(sql);
+        while (mysqlDeclaration.find()) {
+            scopedNames.add(mysqlDeclaration.group("name").toLowerCase(Locale.ROOT));
+        }
         String converted = sql;
         for (Map.Entry<String, String> entry : knownColumns.entrySet()) {
             if (scopedNames.contains(entry.getKey())) {
                 continue;
             }
             String column = entry.getValue();
+            String currentSql = converted;
             converted = replaceOutsideIgnoredText(
-                    converted,
+                    currentSql,
                     Pattern.compile("(?i)(?<![A-Za-z0-9_$])" + Pattern.quote(column)
                             + "(?![A-Za-z0-9_$])"),
-                    matcher -> "`" + column.replace("`", "``") + "`"
+                    matcher -> matcher.start() > 0
+                            && isIdentifierPart(currentSql.charAt(matcher.start() - 1))
+                            ? matcher.group()
+                            : "`" + column.replace("`", "``") + "`"
             );
         }
         return converted;
@@ -14773,6 +14987,23 @@ class SqlScriptMigrator {
 
         ProcedureVersionState withDirty(boolean value) {
             return new ProcedureVersionState(reference, dependencies, dynamicDdlTables, manualReview, value);
+        }
+    }
+
+    private record ScriptSchemaState(
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns,
+            LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumns
+    ) {
+    }
+
+    private record CreateTableDefinition(
+            String table,
+            boolean ifNotExists,
+            List<String> columns
+    ) {
+        private CreateTableDefinition {
+            table = table == null ? "" : table;
+            columns = List.copyOf(columns == null ? List.of() : columns);
         }
     }
 
