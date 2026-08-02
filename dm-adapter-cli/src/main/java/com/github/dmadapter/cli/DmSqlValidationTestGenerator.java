@@ -7611,6 +7611,12 @@ class DmSqlValidationTestGenerator {
                         return false;
                     }
                     return normalizedName.endsWith("num")
+                            || normalizedName.endsWith("hour")
+                            || normalizedName.endsWith("minute")
+                            || normalizedName.endsWith("second")
+                            || normalizedName.endsWith("duration")
+                            || normalizedName.endsWith("timeout")
+                            || normalizedName.endsWith("interval")
                             || normalizedName.contains("price")
                             || normalizedName.contains("amount")
                             || normalizedName.contains("money")
@@ -9970,7 +9976,14 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("\\\\bgroup\\\\s+by\\\\b[^)]*\\\\band\\\\b[^)]*\\\\bgroup\\\\s+by\\\\b", Pattern.CASE_INSENSITIVE)
                             .matcher(normalized).find()
                             || Pattern.compile("\\\\bselect\\\\b.{20,}\\\\bdistinct\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\.", Pattern.CASE_INSENSITIVE)
-                            .matcher(beforeMarker(normalized, " from ")).find();
+                            .matcher(beforeMarker(normalized, " from ")).find()
+                            || (record.parameterSource.startsWith("configured")
+                            && containsAny(message, "Repetitive table name or alias", "重复的表名或别名")
+                            && Pattern.compile(
+                                    "\\\\bjoin\\\\s*\\\\([^)]*\\\\)\\\\s+([A-Za-z_][A-Za-z0-9_$]*)\\\\b"
+                                            + "[\\\\s\\\\S]*\\\\bjoin\\\\s*\\\\([^)]*\\\\)\\\\s+\\\\1\\\\b",
+                                    Pattern.CASE_INSENSITIVE
+                            ).matcher(normalized).find());
                 }
 
                 private boolean containsAnyPattern(Map<String, Long> countsByPattern, String... patterns) {
