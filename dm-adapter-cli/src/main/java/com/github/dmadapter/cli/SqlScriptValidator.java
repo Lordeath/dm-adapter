@@ -10,6 +10,8 @@ import java.sql.SQLException;
 import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -195,7 +197,8 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                 successCount += fileValidation.successCount();
                 failures.addAll(fileValidation.failures());
                 if (fileValidation.failures().stream()
-                        .anyMatch(failure -> "VALIDATION_TIMEOUT".equals(failure.category()))) {
+                        .anyMatch(failure -> "VALIDATION_TIMEOUT".equals(failure.category())
+                                || "DATABASE_CONNECTION".equals(failure.category()))) {
                     break;
                 }
             }
@@ -221,6 +224,8 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
 
         String status = failures.stream().anyMatch(failure -> "VALIDATION_TIMEOUT".equals(failure.category()))
                 ? "Dameng SQL script validation timed out."
+                : failures.stream().anyMatch(failure -> "DATABASE_CONNECTION".equals(failure.category()))
+                ? "Dameng SQL script validation stopped after the database connection was lost."
                 : failures.isEmpty()
                 ? "Dameng SQL script validation passed."
                 : "Dameng SQL script validation completed with failed SQL statements.";
@@ -402,15 +407,20 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
             );
         } catch (Exception e) {
             boolean timedOut = e instanceof StatementValidationTimeoutException;
+            boolean connectionFailed = isDatabaseConnectionFailure(e);
             failures.add(new SqlScriptValidationFailure(
                     file.sourceDisplay(),
                     file.outputDisplay(),
                     file.schema(),
                     0,
-                    timedOut ? "VALIDATION_TIMEOUT" : "INVALID_SCHEMA",
+                    timedOut
+                            ? "VALIDATION_TIMEOUT"
+                            : connectionFailed ? "DATABASE_CONNECTION" : "INVALID_SCHEMA",
                     compact(redact(
                             timedOut
                                     ? safeMessage(e)
+                                    : connectionFailed
+                                    ? "Dameng database connection was lost: " + safeMessage(e)
                                     : "Invalid Dameng schema " + file.schema() + ": " + safeMessage(e),
                             environment
                     )),
@@ -448,6 +458,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
             CreatedObject createdObject = createdObject(sql);
             String alteredObject = alteredObject(sql);
             boolean statementTimedOut = false;
+            boolean connectionFailed = false;
             try {
                 executeStatement(statementExecutor, connection, sql, createdObject, environment);
                 if (createdObject != null) {
@@ -462,9 +473,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                 successCount++;
             } catch (Exception e) {
                 statementTimedOut = e instanceof StatementValidationTimeoutException;
+                connectionFailed = isDatabaseConnectionFailure(e);
                 String blockedObject = blockedObject(sql, failedCreatedObjects.keySet());
                 String category = statementTimedOut
                         ? "VALIDATION_TIMEOUT"
+                        : connectionFailed
+                        ? "DATABASE_CONNECTION"
                         : blockedObject.isBlank() ? classify(e, sql) : "BLOCKED_BY_PRIOR_FAILURE";
                 String errorSummary = compact(redact(safeMessage(e), environment));
                 if ("ORIGINAL_SQL".equals(category)) {
@@ -504,7 +518,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                         errorSummary,
                         compact(sql)
                 ));
-                if (!statementTimedOut && createdObject != null) {
+                if (!statementTimedOut && !connectionFailed && createdObject != null) {
                     failedCreatedObjects.putIfAbsent(createdObject.key(), statementIndex);
                 }
                 progress("SQL script statement failed: file=" + file.sourceDisplay()
@@ -516,7 +530,7 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
             } finally {
                 cancel(slowWarning);
             }
-            if (statementTimedOut) {
+            if (statementTimedOut || connectionFailed) {
                 break;
             }
             if (attemptedCount % STATEMENT_PROGRESS_INTERVAL == 0) {
@@ -679,15 +693,20 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                 );
             } catch (Exception e) {
                 boolean timedOut = e instanceof StatementValidationTimeoutException;
+                boolean connectionFailed = isDatabaseConnectionFailure(e);
                 return new SqlScriptValidationFailure(
                         "(schema-preflight)",
                         "",
                         schema,
                         0,
-                        timedOut ? "VALIDATION_TIMEOUT" : "INVALID_SCHEMA",
+                        timedOut
+                                ? "VALIDATION_TIMEOUT"
+                                : connectionFailed ? "DATABASE_CONNECTION" : "INVALID_SCHEMA",
                         compact(redact(
                                 timedOut
                                         ? safeMessage(e)
+                                        : connectionFailed
+                                        ? "Dameng database connection was lost: " + safeMessage(e)
                                         : "Invalid Dameng schema " + schema + ": " + safeMessage(e),
                                 environment
                         )),
@@ -1133,6 +1152,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
     }
 
     private String classify(Exception e, String sql) {
+        if (isDatabaseConnectionFailure(e)) {
+            return "DATABASE_CONNECTION";
+        }
         if (e instanceof InvalidCreatedObjectException) {
             String message = safeMessage(e).toLowerCase(Locale.ROOT);
             if (message.contains("无效的表") || message.contains("无效的视图")
@@ -1174,6 +1196,71 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
             return "SQL_SYNTAX";
         }
         return "SQL_EXECUTION";
+    }
+
+    private boolean isDatabaseConnectionFailure(Throwable throwable) {
+        if (throwable == null) {
+            return false;
+        }
+        Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        List<Throwable> pending = new ArrayList<>();
+        pending.add(throwable);
+        for (int index = 0; index < pending.size(); index++) {
+            Throwable current = pending.get(index);
+            if (current == null || !visited.add(current)) {
+                continue;
+            }
+            if (current instanceof SQLException sqlException) {
+                String sqlState = sqlException.getSQLState();
+                if (sqlState != null && sqlState.startsWith("08")) {
+                    return true;
+                }
+                SQLException next = sqlException.getNextException();
+                if (next != null && next != current) {
+                    pending.add(next);
+                }
+            }
+            String message = current.getMessage();
+            if (message != null && isDatabaseConnectionFailureMessage(message.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+            Throwable cause = current.getCause();
+            if (cause != null && cause != current) {
+                pending.add(cause);
+            }
+        }
+        return false;
+    }
+
+    private boolean isDatabaseConnectionFailureMessage(String message) {
+        return message.contains("connection is closed")
+                || message.contains("connection has been closed")
+                || message.contains("connection was closed")
+                || message.contains("connection already closed")
+                || message.contains("closed connection")
+                || message.contains("connection reset")
+                || message.contains("connection refused")
+                || message.contains("connection aborted")
+                || message.contains("communications link failure")
+                || message.contains("network communication")
+                || message.contains("network error")
+                || message.contains("network exception")
+                || message.contains("socket closed")
+                || message.contains("socket exception")
+                || message.contains("broken pipe")
+                || message.contains("read timed out")
+                || message.contains("i/o error")
+                || message.contains("io error")
+                || message.contains("网络通信异常")
+                || message.contains("通信链路失败")
+                || message.contains("网络连接异常")
+                || message.contains("连接已关闭")
+                || message.contains("连接已经关闭")
+                || message.contains("连接被关闭")
+                || message.contains("连接已断开")
+                || message.contains("连接中断")
+                || message.contains("连接重置")
+                || message.contains("连接被拒绝");
     }
 
     private boolean isGeneratedIndexDefinitionConflict(String message, String sql) {

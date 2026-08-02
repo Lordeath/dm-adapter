@@ -5716,6 +5716,155 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void stopsCurrentFileAfterDatabaseConnectionIsLostAndRedactsFailure() {
+        List<String> executedSql = new ArrayList<>();
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                executedSql.add(sql);
+                if (sql.contains("second")) {
+                    throw new SQLException(
+                            "网络通信异常 jdbc:dm://db-host:5236 APP_USER APP_SECRET",
+                            "08006"
+                    );
+                }
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+        DmValidationEnvironment environment = DmValidationEnvironment.from(Map.of(
+                "DM_SQL_VALIDATION", "true",
+                "DM_JDBC_URL", "jdbc:dm://db-host:5236",
+                "DM_DB_USERNAME", "APP_USER",
+                "DM_DB_PASSWORD", "APP_SECRET"
+        ));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "connection-loss.sql",
+                        "",
+                        List.of(
+                                "select 'first' from dual",
+                                "select 'second' from dual",
+                                "select 'third' from dual"
+                        )
+                )),
+                environment
+        );
+
+        assertThat(result.attempted()).isTrue();
+        assertThat(result.successCount()).isOne();
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("DATABASE_CONNECTION");
+            assertThat(failure.statementIndex()).isEqualTo(2);
+            assertThat(failure.errorSummary())
+                    .contains("网络通信异常", "******")
+                    .doesNotContain("jdbc:dm://db-host:5236", "APP_USER", "APP_SECRET");
+        });
+        assertThat(result.status()).contains("database connection was lost");
+        assertThat(executedSql)
+                .containsExactly("select 'first' from dual", "select 'second' from dual")
+                .doesNotContain("select 'third' from dual");
+    }
+
+    @Test
+    void stopsRemainingFilesAfterDatabaseConnectionIsLost() {
+        List<String> executedSql = new ArrayList<>();
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                executedSql.add(sql);
+                throw new SQLException("connection has been closed", "08003");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(
+                        plannedValidationFile("first.sql", "", List.of("select 1 from dual")),
+                        plannedValidationFile("later.sql", "", List.of("select 2 from dual"))
+                ),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure ->
+                assertThat(failure.category()).isEqualTo("DATABASE_CONNECTION"));
+        assertThat(result.fileValidations()).hasSize(1);
+        assertThat(executedSql).containsExactly("select 1 from dual");
+    }
+
+    @Test
+    void continuesAfterOrdinarySqlExecutionFailure() {
+        List<String> executedSql = new ArrayList<>();
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                String sql = (String) args[0];
+                executedSql.add(sql);
+                if (sql.contains("bad")) {
+                    throw new SQLException("constraint check failed", "23000");
+                }
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "ordinary-failure.sql",
+                        "",
+                        List.of("select 'bad' from dual", "select 'good' from dual")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure ->
+                assertThat(failure.category()).isEqualTo("SQL_EXECUTION"));
+        assertThat(result.successCount()).isOne();
+        assertThat(executedSql)
+                .containsExactly("select 'bad' from dual", "select 'good' from dual");
+    }
+
+    @Test
+    void classifiesSchemaPreflightConnectionLossAsDatabaseConnectionFailure() {
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute")) {
+                throw new SQLException("连接已经关闭", "08003");
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) ->
+                method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType()));
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "schema-connection-loss.sql",
+                        "sample-bill",
+                        List.of("select 1 from dual")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("DATABASE_CONNECTION");
+            assertThat(failure.errorSummary())
+                    .contains("Dameng database connection was lost")
+                    .doesNotContain("Invalid Dameng schema");
+        });
+    }
+
+    @Test
     void validationSkipsRepeatedSchemaSelectionForEmptyFiles() {
         AtomicInteger schemaSelections = new AtomicInteger();
         Statement statement = proxy(Statement.class, (ignored, method, args) -> {
