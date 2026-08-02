@@ -54,10 +54,12 @@
 - 同一查询中多个用户变量赋值彼此引用时，原 SQL 依赖 MySQL 不稳定的表达式求值顺序；不能把这种状态机直接猜成达梦 SQL。报告必须指出涉及的变量和原始求值顺序风险，并要求用明确排序的窗口函数、gaps-and-islands 查询重写，或由业务方提供预期分组语义。
 - 对 `GROUP_CONCAT`/`FIND_IN_SET` 配合用户变量累积父级或子级 ID 的 MyBatis 层级遍历，只有在游标变量、起点参数、ID/父 ID 列、三处来源表和输出过滤关系全部一致时，才可改写为达梦 `START WITH ... CONNECT BY NOCYCLE`。表名、列名、别名和参数必须从原 SQL 提取，不能写死项目库名或模式名；父级遍历须保留起点，子级遍历须按原语义决定是否包含起点，额外租户过滤和排序也必须保留。
 - MySQL `CREATE TABLE ... COMMENT '...'`、列级 `COMMENT '...'`、`ENGINE`、`USING BTREE` 等 DDL 选项要从迁移 SQL 中移除或改写。表/列注释如需保留，应后续生成达梦 `COMMENT ON` 语句，不应留在建表语句内。
-- `CREATE TABLE` 中普通/唯一的 MySQL 内联 `KEY` / `INDEX` 必须提取为带存在性保护的达梦 `CREATE [UNIQUE] INDEX`，并按表名生成 schema 范围唯一的索引名；前缀索引转函数索引。达梦会拒绝在同一表上创建异名但列定义相同的索引，因此保护条件不能只查目标索引名，必须通过 `ALL_INDEXES`、`ALL_IND_COLUMNS` 和 `ALL_IND_EXPRESSIONS` 比较目标 schema、表、唯一性、列数、列/表达式顺序及升降序。异名等价索引应视为已满足；同名但定义不同不能静默跳过，应让部署准确暴露名称冲突。`FULLTEXT`、`SPATIAL` 或无法确认等价性的表达式索引不得静默删除，必须保留原 SQL 并报告人工设计索引语义。
+- `CREATE TABLE` 中普通/唯一的 MySQL 内联 `KEY` / `INDEX` 必须提取为带存在性保护的达梦 `CREATE [UNIQUE] INDEX`，并按表名生成 schema 范围唯一的索引名；前缀索引转函数索引。达梦会拒绝在同一表上创建异名但列定义相同的索引，因此保护条件不能只查目标索引名，必须通过 `ALL_INDEXES`、`ALL_IND_COLUMNS` 和 `ALL_IND_EXPRESSIONS` 比较目标 schema、表、唯一性、列数、列/表达式顺序及升降序。异名等价索引应视为已满足；同名但定义不同不能静默跳过，应让部署准确暴露名称冲突。过程内 `ALTER TABLE ... DROP INDEX` 不能原样放入动态 SQL：达梦索引名是 schema 级对象，且 MySQL 唯一索引可能对应达梦唯一约束，必须同时兼容原始名与表作用域名，先尝试 `DROP CONSTRAINT`，再按存在性执行 `DROP INDEX`。`FULLTEXT`、`SPATIAL` 或无法确认等价性的表达式索引不得静默删除，必须保留原 SQL 并报告人工设计索引语义。
 - 同一列定义出现两个或更多 `DEFAULT` 子句时，原始 MySQL DDL 本身存在互相冲突的默认值，工具不能替业务选择保留哪一个。数据库验证应将其归为 `ORIGINAL_SQL`，保留转换结果并要求修正源脚本，不能误报为待补充的达梦转换规则。
 - MySQL `AUTO_INCREMENT` 和 `ALTER TABLE t AUTO_INCREMENT = n` 默认不再为了验证而改写。目标环境如果不支持或业务依赖重置序列语义，应按达梦身份列/序列方案人工确认，不能把 `AUTO_INCREMENT = n` 删除后留下半截 `ALTER TABLE`。
-- MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
+- MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；带精度的 `CURRENT_TIMESTAMP(n)` 必须对应为 `NOW(n)`，否则 `TIMESTAMP(n)` 会因表达式精度不匹配报“ON UPDATE 表达式错误”。只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
+- MySQL 允许在一条 `ALTER TABLE` 中连续写多个 `MODIFY COLUMN`，达梦需要把它们拆成按原顺序执行的独立 `ALTER TABLE ... MODIFY ...`。脚本转换必须保留第一条语句前的注释，并把每个字段修改作为独立验证单元。
+- `UPDATE ... SET a = value AND b = value` 在 MySQL 中会把 `AND` 解释为赋给 `a` 的布尔表达式，而不是同时更新 `a`、`b`；达梦会拒绝这种写法。工具无法判断业务究竟想用逗号更新两列，还是想计算单列布尔值，因此应保留原 SQL 并精确报告原始语义歧义。
 - MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。业务代码同时读取 `COLUMN_TYPE`、注释和默认值时，可从 `SYS.SYSCOLUMNS`、`SYS.SYSOBJECTS`、`SYS.SYSCOLUMNCOMMENTS` 按运行时 schema 和表名重建相同投影；不得把某个项目的 schema 固化到转换规则。
 - `AES_ENCRYPT`、`AES_DECRYPT`、`MD5`、`TO_BASE64` 等加密/编码函数要逐项确认。当前不再把 Base64 包裹 AES 密码场景改写为达梦 `SF_*` 函数，优先通过系统库兼容函数保持 MySQL 调用形态，避免修改业务 SQL。
 - MySQL `/` 具有小数除法语义，达梦的整数/整数可能先截断；对可完整识别的数值、列、日期数值函数、聚合和无子查询括号表达式，应把分子转为 `DECIMAL(38,10)`，并把分母转为 `NULLIF(CAST(... AS DECIMAL(38,10)), 0)`。分母为 0 的容错和达梦参数相关，不能依赖实例容错；无法完整识别表达式边界时仍须人工确认。
@@ -93,7 +95,7 @@
 
 - 原始 mapper XML 不由 dm-adapter 迁移流程覆盖；自动迁移输出保持在 `src/main/resources/mapper-dm`。
 - MySQL `LEFT JOIN` 更新若右表列参与赋值，不能直接降级成达梦 `UPDATE ... FROM`，因为无匹配行和重复来源行的语义会变化。只有项目 DDL 的真实主键或唯一键被 `ON` 条件完整绑定，或右侧派生表按连接列 `GROUP BY` 已直接证明每个键最多一行，且赋值形态可等价表示时，才可把右表表达式改为相关标量子查询；`WHERE` 中引用右表的 `AND` 条件必须同时下推到标量子查询并在外层补等价 `EXISTS`，不能留下失效的右表别名。动态 `<foreach>` 只是外层过滤条件时应原样保留，不应阻止上述转换。赋值完全不依赖右表时，可用 `EXISTS` 保留匹配过滤语义，不需要唯一性证明。`IF(IFNULL(右表非空主键, 哨兵)=哨兵, 未匹配值, 匹配值)` 只表达右表是否存在时，即使连接列不唯一，也可按真实非空主键改为 `CASE WHEN EXISTS`，因为重复来源不会改变结果；不得把普通可空列误作存在性证明。缺少必要的唯一性证明时应准确报告约束风险，不能任选一条来源记录。
-- 原始 SQL 明显错误时，可以修原始业务 SQL。例如列名写错、insert 列和值数量不一致、`set` 末尾多逗号、把 `UPDATE table` 写成 `UPDATE FROM table`。这类错误即使后续通用规则引用了达梦关键字，也仍应按原始 XML 语法缺陷分类。若问题来自 Java mapper 方法签名，如多个参数复用同一个 `@Param` 名称，或多个简单参数缺少必要 `@Param`，应修 Java mapper 方法签名，不应为了绕过绑定错误去改 XML 参数名。
+- 原始 SQL 明显错误时，可以修原始业务 SQL。例如列名写错、insert 列和值数量不一致、`set` 末尾多逗号、把 `UPDATE table` 写成 `UPDATE FROM table`、在 `#{...}` 前误粘普通字母而生成 `s?`，或把 MyBatis `jdbcType` 写成不存在的枚举（如 `TIMESTAMPT`）。这类错误即使后续通用规则引用了达梦关键字，也仍应按原始 XML 语法缺陷分类。若问题来自 Java mapper 方法签名，如多个参数复用同一个 `@Param` 名称，或多个简单参数缺少必要 `@Param`，应修 Java mapper 方法签名，不应为了绕过绑定错误去改 XML 参数名。
 - Java 注解里的 SQL 如果包含复杂动态 SQL、MySQL 专有语法或需要达梦改写，应优先迁移到 mapper XML，再由 dm-adapter 生成 `mapper-dm`；自动迁移也应把可识别的 `@Select`、`@Insert`、`@Update`、`@Delete` SQL 提取到 `mapper-dm` XML 后再执行达梦改写和验证。
 - mapper XML 可能带 UTF-8 BOM。解析器必须按字节流交给 XML 解析器识别 BOM；不能把 BOM 作为正文字符传入 `Reader`，否则整份文件会退化为“无法安全解析”，后续动态 SQL 结构转换将被跳过。
 - 改写动态 SQL 时必须把 MyBatis XML 元素视为完整节点。普通 `HAVING` 条件位于 `<if>...</if>` 内时，不能只移动 `HAVING` 后的文本和结束标签；若 `GROUP BY` 位于 `<choose>/<when>` 分支中，前移条件必须放在覆盖所有相关分支的公共位置。无法证明标签边界、查询作用域和分支语义等价时保留原文并报告。

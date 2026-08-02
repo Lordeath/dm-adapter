@@ -128,6 +128,58 @@ class GeneratedFailurePatternTest {
                     englishMissingColumnRecord
             )).isFalse();
 
+            addDatabaseColumn(
+                    validationClass,
+                    validation,
+                    "charge_discount_list",
+                    "CalcEndDate",
+                    "TIMESTAMP"
+            );
+            addDatabaseColumn(
+                    validationClass,
+                    validation,
+                    "charge_customerchargedetail",
+                    "CalcEndDate",
+                    "TIMESTAMP"
+            );
+            String originalAmbiguousColumn = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 有歧义的列名[CalcEndDate]
+                    ### SQL: select sum(case when CalcEndDate < ? then discountMoney else 0 end)
+                    from charge_discount_list discount
+                    left join charge_customerchargedetail charge
+                    on discount.chargeDetailId = charge.id
+                    ### Cause: dm.jdbc.driver.DMException: 有歧义的列名[CalcEndDate]
+                    """;
+            Object originalAmbiguousColumnRecord = failedRecord(validationClass, originalAmbiguousColumn);
+            assertThat(failurePattern(validationClass, validation, originalAmbiguousColumnRecord))
+                    .isEqualTo("ORIGINAL_SQL_AMBIGUOUS_COLUMN");
+            assertThat(category(validationClass, validation, originalAmbiguousColumnRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    originalAmbiguousColumnRecord
+            )).isFalse();
+
+            addDatabaseColumn(validationClass, validation, "ns_bill_billused", "squareTypeID", "BIGINT");
+            addDatabaseColumn(validationClass, validation, "ns_payment_chargepayment", "squareTypeID", "BIGINT");
+            String groupBySelectAlias = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 有歧义的列名[squareTypeID]
+                    ### SQL: select accountPayment.squareTypeID as squareTypeID
+                    from ns_bill_billused used
+                    left join ns_payment_chargepayment accountPayment
+                    on used.billNum = accountPayment.billNo
+                    group by squareTypeID
+                    ### Cause: dm.jdbc.driver.DMException: 有歧义的列名[squareTypeID]
+                    """;
+            Object groupBySelectAliasRecord = failedRecord(validationClass, groupBySelectAlias);
+            assertThat(failurePattern(validationClass, validation, groupBySelectAliasRecord))
+                    .isEqualTo("AMBIGUOUS_COLUMN");
+            assertThat(category(validationClass, validation, groupBySelectAliasRecord))
+                    .isEqualTo("SQL_SYNTAX");
+
             String havingSelectAlias = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error querying database. Cause: dm.jdbc.driver.DMException: 无效的列名[isFollowUp]
@@ -252,6 +304,55 @@ class GeneratedFailurePatternTest {
             assertThat(category(validationClass, validation, duplicatedAndRecord))
                     .isEqualTo("ORIGINAL_SQL");
 
+            String gluedPlaceholderPrefix = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: insert into ns_sr_services_extension(service_isdelay, service_first_isdelay)
+                    values (s?, s?)
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object gluedPlaceholderPrefixRecord = failedRecord(validationClass, gluedPlaceholderPrefix);
+            assertThat(failurePattern(validationClass, validation, gluedPlaceholderPrefixRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, gluedPlaceholderPrefixRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    gluedPlaceholderPrefixRecord
+            )).isFalse();
+
+            String invalidJdbcType = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: org.apache.ibatis.builder.BuilderException: Error resolving JdbcType.
+                    Cause: java.lang.IllegalArgumentException: No enum constant org.apache.ibatis.type.JdbcType.TIMESTAMPT
+                    """;
+            Object invalidJdbcTypeRecord = failedRecord(validationClass, invalidJdbcType);
+            assertThat(failurePattern(validationClass, validation, invalidJdbcTypeRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, invalidJdbcTypeRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, invalidJdbcTypeRecord))
+                    .isFalse();
+
+            String gluedBooleanLiteral = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select sum(if(year(receivablesDate) = '2024'OR1
+                    and year(paidDate) = '2024', amount, 0)) from bcrm_collection
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object gluedBooleanLiteralRecord = failedRecord(validationClass, gluedBooleanLiteral);
+            assertThat(failurePattern(validationClass, validation, gluedBooleanLiteralRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, gluedBooleanLiteralRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    gluedBooleanLiteralRecord
+            )).isFalse();
+
             String predicateTrailingComma = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
@@ -288,6 +389,24 @@ class GeneratedFailurePatternTest {
             assertThat(failurePattern(validationClass, validation, bareDynamicUpdateRecord))
                     .isEqualTo("BROKEN_DYNAMIC_SQL_OR_ARGS");
             assertThat(category(validationClass, validation, bareDynamicUpdateRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+
+            String generatedExpressionFragment = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select sum(case when 1=1 >= '2024-01-01'
+                    and 1=1 <= '2024-01-31' then amount else 0 end)
+                    from charge_customerchargedetail
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object generatedExpressionFragmentRecord = failedRecord(
+                    validationClass,
+                    "{startDate=\"2024-01-01\", fieldForCharge=\"1=1\", endDate=\"2024-01-31\"}",
+                    generatedExpressionFragment
+            );
+            assertThat(failurePattern(validationClass, validation, generatedExpressionFragmentRecord))
+                    .isEqualTo("DYNAMIC_SQL_FRAGMENT_PARAMETER");
+            assertThat(category(validationClass, validation, generatedExpressionFragmentRecord))
                     .isEqualTo("METHOD_ARGS_OR_BINDING");
 
             String missingWhere = """
@@ -424,6 +543,30 @@ class GeneratedFailurePatternTest {
             assertThat(category(validationClass, validation, conflictingOrderRecord))
                     .isEqualTo("METHOD_ARGS_OR_BINDING");
 
+            String missingTableWithConflictingBranches = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException:
+                    第41 行附近出现错误: 无效的表或视图名[ns_quality_inspect_schedule_task]
+                    ### SQL: select id from ns_quality_inspect_schedule_task
+                    order by update_datetime desc order by create_datetime asc
+                    ### Cause: dm.jdbc.driver.DMException:
+                    第41 行附近出现错误: 无效的表或视图名[ns_quality_inspect_schedule_task]
+                    """;
+            Object missingTableWithConflictingBranchesRecord = failedRecord(
+                    validationClass,
+                    missingTableWithConflictingBranches
+            );
+            assertThat(failurePattern(
+                    validationClass,
+                    validation,
+                    missingTableWithConflictingBranchesRecord
+            )).isEqualTo("TEST_SCHEMA_OBJECT");
+            assertThat(category(
+                    validationClass,
+                    validation,
+                    missingTableWithConflictingBranchesRecord
+            )).isEqualTo("TEST_SCHEMA");
+
             String conflictingDerivedTableAliases = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error querying database. Cause: dm.jdbc.driver.DMException:
@@ -494,6 +637,27 @@ class GeneratedFailurePatternTest {
                     validationClass,
                     validation,
                     missingPojoPropertyRecord
+            )).isFalse();
+
+            String malformedPlaceholderOptions = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: org.apache.ibatis.builder.BuilderException:
+                    Parsing error was found in mapping #{__frch_item_0.logoFile, logoFile }.
+                    Check syntax #{property|(expression), var1=value1, var2=value2, ...}
+                    ### The error may exist in mapper-dm/custom/SiteMapper.xml
+                    """;
+            Object malformedPlaceholderOptionsRecord = failedRecord(
+                    validationClass,
+                    malformedPlaceholderOptions
+            );
+            assertThat(failurePattern(validationClass, validation, malformedPlaceholderOptionsRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, malformedPlaceholderOptionsRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    malformedPlaceholderOptionsRecord
             )).isFalse();
 
             String genericObjectProperty = """
@@ -882,6 +1046,33 @@ class GeneratedFailurePatternTest {
         return failed.invoke(null, "com.example.Mapper.method", "configured", message);
     }
 
+    private Object failedRecord(
+            Class<?> validationClass,
+            String parameterSummary,
+            String message
+    ) throws Exception {
+        Class<?> recordClass = Class.forName(
+                validationClass.getName() + "$ValidationRecord",
+                true,
+                validationClass.getClassLoader()
+        );
+        Method failed = recordClass.getDeclaredMethod(
+                "failed",
+                String.class,
+                String.class,
+                String.class,
+                String.class
+        );
+        failed.setAccessible(true);
+        return failed.invoke(
+                null,
+                "com.example.Mapper.method",
+                "configured",
+                parameterSummary,
+                message
+        );
+    }
+
     private void loadRewriteConfig(
             Class<?> validationClass,
             Object validation,
@@ -912,9 +1103,14 @@ class GeneratedFailurePatternTest {
                 true,
                 validationClass.getClassLoader()
         );
-        var constructor = metadataClass.getDeclaredConstructor();
-        constructor.setAccessible(true);
-        Object metadata = constructor.newInstance();
+        Field dbColumnMetadata = validationClass.getDeclaredField("dbColumnMetadata");
+        dbColumnMetadata.setAccessible(true);
+        Object metadata = dbColumnMetadata.get(validation);
+        if (metadata == null) {
+            var constructor = metadataClass.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            metadata = constructor.newInstance();
+        }
         Method addColumn = metadataClass.getDeclaredMethod(
                 "addColumn",
                 String.class,
@@ -923,8 +1119,6 @@ class GeneratedFailurePatternTest {
         );
         addColumn.setAccessible(true);
         addColumn.invoke(metadata, table, column, type);
-        Field dbColumnMetadata = validationClass.getDeclaredField("dbColumnMetadata");
-        dbColumnMetadata.setAccessible(true);
         dbColumnMetadata.set(validation, metadata);
     }
 

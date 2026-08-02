@@ -902,7 +902,7 @@ class MySqlToDmSqlConverterTest {
         );
 
         assertThat(addResult.convertedSql())
-                .containsIgnoringCase("DEFAULT CURRENT_TIMESTAMP ON UPDATE NOW()")
+                .containsIgnoringCase("DEFAULT CURRENT_TIMESTAMP ON UPDATE NOW(3)")
                 .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP");
         assertThat(modifyResult.convertedSql())
                 .containsIgnoringCase("ON UPDATE NOW()")
@@ -910,6 +910,20 @@ class MySqlToDmSqlConverterTest {
         assertThat(addResult.appliedRules())
                 .contains(MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE);
         assertThat(modifyResult.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE);
+    }
+
+    @Test
+    void preservesTimestampPrecisionInDamengOnUpdateExpression() {
+        SqlConversionResult result = converter.convert(
+                "CREATE TABLE demo (updated_at timestamp(0) NULL DEFAULT NULL "
+                        + "ON UPDATE CURRENT_TIMESTAMP(0))"
+        );
+
+        assertThat(result.convertedSql())
+                .containsIgnoringCase("timestamp(0) NULL DEFAULT NULL ON UPDATE NOW(0)")
+                .doesNotContainIgnoringCase("ON UPDATE NOW()");
+        assertThat(result.appliedRules())
                 .contains(MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE);
     }
 

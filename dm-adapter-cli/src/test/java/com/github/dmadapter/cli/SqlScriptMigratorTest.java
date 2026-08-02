@@ -8,6 +8,7 @@ import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.nio.charset.StandardCharsets;
@@ -1370,6 +1371,36 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void reportsAmbiguousUpdateAndAssignmentAsOriginalSql() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE update_target_flags()
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM target_targetitem WHERE id = 83) THEN
+                        UPDATE target_targetitem
+                        SET isDivision = 0 AND isClassTarget = 1
+                        WHERE id = 83;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL update_target_flags();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
+        assertThat(converted.report().manualReviewItems())
+                .extracting(SqlScriptManualReviewItem::reason)
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("原始 SQL 语义歧义")
+                        .contains("AND")
+                        .contains("逗号"))
+                .anySatisfy(reason -> assertThat(reason)
+                        .contains("依赖需要人工确认的存储过程 `update_target_flags`"));
+        assertThat(converted.sql())
+                .contains("SET isDivision = 0 AND isClassTarget = 1")
+                .contains("CALL update_target_flags()");
+    }
+
+    @Test
     void reportsOriginalProcedureWithMissingEndIfAndSkipsDependentCall() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -2364,6 +2395,50 @@ class SqlScriptMigratorTest {
                 .doesNotContain("@sort")
                 .doesNotContain("@useSelfDesign")
                 .doesNotContain("tag_leave_ns_report_management:");
+    }
+
+    @Test
+    void treatsMysqlProcedureUserVariableNamesAsCaseInsensitive() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                CREATE TABLE ns_core_dictionary (
+                    ENTERPRISE_ID BIGINT,
+                    ORGANIZATION_ID BIGINT
+                );
+                CREATE PROCEDURE initQualityDictionaryData()
+                BEGIN
+                    SET @enterpriseId = 0;
+                    SET @organizationId = 0;
+                    INSERT INTO ns_core_dictionary(ENTERPRISE_ID, ORGANIZATION_ID)
+                    VALUES (@enterpriseID, @organizationID);
+                END;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-quality",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("dm_enterpriseId BIGINT;")
+                .contains("dm_organizationId BIGINT;")
+                .contains("dm_enterpriseId := 0;")
+                .contains("dm_organizationId := 0;")
+                .contains("VALUES (dm_enterpriseId, dm_organizationId)")
+                .doesNotContain("dm_enterpriseID_2")
+                .doesNotContain("dm_organizationID_2")
+                .doesNotContain("@enterprise")
+                .doesNotContain("@organization");
     }
 
     @Test
@@ -4426,6 +4501,65 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void synchronizesLegacyAndScopedNamesInsideMultiIndexAlterGuard() throws Exception {
+        SqlScriptMigrator subject = migrator(new RecordingValidator());
+        Method method = SqlScriptMigrator.class.getDeclaredMethod(
+                "synchronizeSchemaScopedIndexNames",
+                String.class
+        );
+        method.setAccessible(true);
+        String converted = (String) method.invoke(subject, """
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.statistics s
+                    WHERE s.TABLE_SCHEMA = DATABASE()
+                      AND s.TABLE_NAME = 'sample_table'
+                      AND s.INDEX_NAME = 'uk_user_date'
+                      AND s.NON_UNIQUE = 0
+                    GROUP BY s.TABLE_SCHEMA, s.TABLE_NAME, s.INDEX_NAME
+                    HAVING GROUP_CONCAT(s.COLUMN_NAME ORDER BY s.SEQ_IN_INDEX SEPARATOR ',') = 'user_id'
+                ) THEN
+                    ALTER TABLE sample_table
+                        DROP INDEX uk_user_date,
+                        ADD UNIQUE KEY uk_user_date (user_id, work_date);
+                END IF;
+                """);
+
+        assertThat(converted)
+                .contains("UPPER(s.INDEX_NAME) IN (UPPER('uk_user_date'), UPPER('sample_table_uk_user_date'))");
+    }
+
+    @Test
+    void convertsSingleMysqlProcedureAlterTableDropIndexToDamengGuard() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE drop_old_index()
+                BEGIN
+                    IF EXISTS (
+                        SELECT INDEX_NAME
+                        FROM information_schema.statistics
+                        WHERE table_schema = DATABASE()
+                          AND table_name = 'ns_my_backlog'
+                          AND index_name = 'idx_category'
+                    ) THEN
+                        ALTER TABLE ns_my_backlog DROP INDEX idx_category;
+                    END IF;
+                END;
+                /
+                CALL drop_old_index();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("FROM ALL_CONSTRAINTS")
+                .contains("UPPER(CONSTRAINT_NAME) = UPPER('idx_category')")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_my_backlog DROP CONSTRAINT idx_category'")
+                .contains("UPPER(INDEX_NAME) = UPPER('ns_my_backlog_idx_category')")
+                .contains("EXECUTE IMMEDIATE 'DROP INDEX idx_category'")
+                .contains("EXECUTE IMMEDIATE 'DROP INDEX ns_my_backlog_idx_category'")
+                .doesNotContain("EXECUTE IMMEDIATE 'ALTER TABLE ns_my_backlog DROP INDEX idx_category'");
+    }
+
+    @Test
     void convertsMysqlProcedureDropAndAddUniqueIndexAlterToSeparateDamengIndexDdl() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -4469,6 +4603,13 @@ class SqlScriptMigratorTest {
                 .contains("C.COLUMN_POSITION AS SEQ_IN_INDEX")
                 .contains("CASE WHEN I.UNIQUENESS = 'UNIQUE' THEN 0 ELSE 1 END AS NON_UNIQUE")
                 .contains("HAVING LISTAGG(s.COLUMN_NAME, ',') WITHIN GROUP (ORDER BY s.SEQ_IN_INDEX) = 'user_id'")
+                .contains("UPPER(s.INDEX_NAME) IN (UPPER('uk_user_date'), UPPER('sample_table_uk_user_date'))")
+                .contains("FROM ALL_CONSTRAINTS")
+                .contains("UPPER(CONSTRAINT_NAME) = UPPER('uk_user_date')")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE sample_table DROP CONSTRAINT uk_user_date';")
+                .contains("EXECUTE IMMEDIATE 'DROP INDEX uk_user_date';")
+                .contains("UPPER(CONSTRAINT_NAME) = UPPER('sample_table_uk_user_date')")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE sample_table DROP CONSTRAINT sample_table_uk_user_date';")
                 .contains("EXECUTE IMMEDIATE 'DROP INDEX sample_table_uk_user_date';")
                 .contains("EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX sample_table_uk_user_date ON sample_table (user_id, work_date)'")
                 .doesNotContain("DROP INDEX uk_user_date,")
@@ -5071,6 +5212,33 @@ class SqlScriptMigratorTest {
                                 SqlScriptMigrator.MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE
                         ));
+    }
+
+    @Test
+    void splitsTopLevelMysqlMultiModifyAlterTableForDameng() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                -- adjust target columns
+                ALTER TABLE `target_targetitem`
+                    MODIFY COLUMN `isDivision` tinyint DEFAULT 0 NULL COMMENT '是否为比例型指标' AFTER `targetItemName`,
+                    MODIFY COLUMN `isClassTarget` tinyint DEFAULT 0 NULL COMMENT '是否分类指标' AFTER `isDivision`,
+                    MODIFY COLUMN `isFormula` tinyint DEFAULT 0 NULL COMMENT '是否公式指标' AFTER `isClassTarget`,
+                    MODIFY COLUMN `sqlContentSingleValue` text NULL COMMENT '单指标SQL' AFTER `isFormula`,
+                    MODIFY COLUMN `accessMethod` tinyint DEFAULT 0 NULL COMMENT '取数方式' AFTER `isFormula`;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("-- adjust target columns\nALTER TABLE `target_targetitem` MODIFY `isDivision` tinyint DEFAULT 0 NULL;")
+                .contains("ALTER TABLE `target_targetitem` MODIFY `isClassTarget` tinyint DEFAULT 0 NULL;")
+                .contains("ALTER TABLE `target_targetitem` MODIFY `isFormula` tinyint DEFAULT 0 NULL;")
+                .contains("ALTER TABLE `target_targetitem` MODIFY `sqlContentSingleValue` CLOB NULL;")
+                .contains("ALTER TABLE `target_targetitem` MODIFY `accessMethod` tinyint DEFAULT 0 NULL;")
+                .doesNotContain("MODIFY COLUMN")
+                .doesNotContain(" AFTER ")
+                .doesNotContain(" COMMENT ");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT_RULE));
     }
 
     @Test
@@ -8190,6 +8358,34 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void rewritesDirectSelectIntoAfterDisposableProcedureBecomesAnonymousBlock() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS add_menu_version;
+                DELIMITER $$
+                CREATE PROCEDURE add_menu_version()
+                BEGIN
+                    CREATE TABLE IF NOT EXISTS ns_menu_version (
+                        ver INT PRIMARY KEY
+                    );
+                    IF NOT EXISTS (SELECT 1 FROM ns_menu_version) THEN
+                        INSERT INTO ns_menu_version(ver) VALUES (1);
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL add_menu_version();
+                DROP PROCEDURE IF EXISTS add_menu_version;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount())
+                .as("manual=%s%n%s", converted.report().manualReviewItems(), converted.sql())
+                .isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ns_menu_version")
+                .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM ns_menu_version' INTO dm_adapter_exists")
+                .contains("EXECUTE IMMEDIATE 'INSERT INTO ns_menu_version(ver) VALUES (1)'");
+    }
+
+    @Test
     void bindsProcedureInputsWhenRewritingPostDdlDml() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE PROCEDURE change_demo(new_status VARCHAR(20), target_id BIGINT)
@@ -8333,6 +8529,40 @@ class SqlScriptMigratorTest {
                 .contains("SELECT COUNT(*) INTO matching_count FROM (\n"
                         + "        SELECT status")
                 .doesNotContain("grouped_status\n    INTO matching_count");
+    }
+
+    @Test
+    void rewritesMultilineTrailingSelectIntoAfterMysqlUserVariableConversion() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE count_precincts(IN yearMonth VARCHAR(10))
+                BEGIN
+                    SET @nrows = 0;
+                    SET @trows = 0;
+                    SELECT COUNT(1)
+                    FROM (
+                        SELECT precinctname
+                        FROM dws_chargepaid_month_sum
+                        WHERE paidYearMonth = yearMonth
+                        GROUP BY data_source, precinctname
+                    ) t
+                    INTO @nrows;
+                    SELECT COUNT(1) FROM dim_org_precinct WHERE deleteFlag = 0 INTO @trows;
+                    IF @nrows <> @trows THEN
+                        INSERT INTO dim_log_view(operationContent) VALUES ('mismatch');
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT COUNT(1) INTO dm_nrows FROM (\n"
+                        + "        SELECT precinctname")
+                .contains("SELECT COUNT(1) INTO dm_trows FROM dim_org_precinct")
+                .doesNotContain("t\n    INTO dm_nrows")
+                .doesNotContain("@nrows")
+                .doesNotContain("@trows");
     }
 
     @Test
