@@ -177,6 +177,35 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateUsesUnambiguousResultMapMetadataWhenDamengValidationIsDisabled() throws Exception {
+        writeDemoProject();
+        Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <resultMap id="UserResultMap" type="map">
+                        <id property="id" column="id" jdbcType="BIGINT"/>
+                        <result property="assignedUserids" column="assigned_userids" jdbcType="VARCHAR"/>
+                    </resultMap>
+                    <select id="selectPending" resultMap="UserResultMap">
+                        select id, assigned_userids
+                        from sample_assignment a
+                        where a.assigned_userids = 0
+                    </select>
+                </mapper>
+                """);
+
+        int exitCode = execute("migrate", "--project", tempDir.toString());
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .contains("a.assigned_userids = '0'");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
+                .contains("unambiguous MyBatis resultMap jdbcType metadata");
+    }
+
+    @Test
     void migrateExtractsMybatisAnnotationSqlToMapperDmXml() throws Exception {
         writeDemoProject();
         writeFile("src/main/java/com/example/AnnotationMapper.java", """

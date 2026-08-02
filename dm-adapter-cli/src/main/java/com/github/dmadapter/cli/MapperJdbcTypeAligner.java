@@ -58,6 +58,9 @@ class MapperJdbcTypeAligner {
             "#\\{\\s*([A-Za-z_][A-Za-z0-9_.$]*)([^}]*)}"
     );
     private static final Pattern JDBC_TYPE_PATTERN = Pattern.compile("(?i)(jdbcType\\s*=\\s*)([A-Za-z0-9_]+)");
+    private static final Pattern RESULT_MAPPING_TAG_PATTERN = Pattern.compile(
+            "(?is)<(?:id|result)\\b[^>]*>"
+    );
     private static final Pattern MAPPER_NAMESPACE_PATTERN = Pattern.compile(
             "(?is)<mapper\\b[^>]*\\bnamespace\\s*=\\s*([\"'])(.*?)\\1"
     );
@@ -89,12 +92,108 @@ class MapperJdbcTypeAligner {
         return tables;
     }
 
+    Map<String, String> inferredResultMapCharacterColumnTypes(
+            ProjectScanResult scanResult,
+            AdapterContext context
+    ) {
+        Map<String, Set<String>> typesByColumn = new LinkedHashMap<>();
+        for (Path mapperPath : mapperTargetPaths(scanResult, context)) {
+            if (!Files.isRegularFile(mapperPath)) {
+                continue;
+            }
+            try {
+                String text = Files.readString(mapperPath, StandardCharsets.UTF_8);
+                Matcher tagMatcher = RESULT_MAPPING_TAG_PATTERN.matcher(text);
+                while (tagMatcher.find()) {
+                    if (insideXmlCommentOrCdata(text, tagMatcher.start())) {
+                        continue;
+                    }
+                    String tag = tagMatcher.group();
+                    String column = xmlAttribute(tag, "column");
+                    String jdbcType = xmlAttribute(tag, "jdbcType");
+                    String canonicalType = jdbcTypeForColumnType(jdbcType);
+                    if (column.isBlank() || canonicalType.isBlank()) {
+                        continue;
+                    }
+                    String normalizedColumn = normalizeIdentifier(lastIdentifierPart(column));
+                    if (!normalizedColumn.isBlank()) {
+                        typesByColumn.computeIfAbsent(normalizedColumn, ignored -> new LinkedHashSet<>())
+                                .add(canonicalType);
+                    }
+                }
+            } catch (IOException ignored) {
+                // Mapper validation reports unreadable files; this metadata is only a conservative fallback.
+            }
+        }
+        Map<String, String> inferred = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> entry : typesByColumn.entrySet()) {
+            if (entry.getValue().size() != 1) {
+                continue;
+            }
+            String type = entry.getValue().iterator().next();
+            if (isCharacterColumnType(type)) {
+                inferred.put(entry.getKey(), type);
+            }
+        }
+        return Map.copyOf(inferred);
+    }
+
+    private boolean insideXmlCommentOrCdata(String text, int position) {
+        int commentStart = text.lastIndexOf("<!--", position);
+        int commentEnd = text.lastIndexOf("-->", position);
+        if (commentStart > commentEnd) {
+            return true;
+        }
+        int cdataStart = text.lastIndexOf("<![CDATA[", position);
+        int cdataEnd = text.lastIndexOf("]]>", position);
+        return cdataStart > cdataEnd;
+    }
+
     MapperJdbcTypeAlignmentResult align(
             ProjectScanResult scanResult,
             AdapterContext context,
             Map<String, Map<String, String>> columnTypes
     ) {
-        if (context.dryRun() || columnTypes == null || columnTypes.isEmpty()) {
+        return align(scanResult, context, columnTypes, Map.of(), "Dameng column metadata");
+    }
+
+    MapperJdbcTypeAlignmentResult alignUsingResultMapFallback(
+            ProjectScanResult scanResult,
+            AdapterContext context,
+            Map<String, Map<String, String>> knownColumnTypes
+    ) {
+        Map<String, String> fallbackTypes = new LinkedHashMap<>(
+                inferredResultMapCharacterColumnTypes(scanResult, context)
+        );
+        if (knownColumnTypes != null && !knownColumnTypes.isEmpty()) {
+            fallbackTypes.keySet().removeIf(column -> containsColumn(knownColumnTypes, column));
+        }
+        MapperJdbcTypeAlignmentResult result = align(
+                scanResult,
+                context,
+                Map.of(),
+                fallbackTypes,
+                "unambiguous MyBatis resultMap jdbcType metadata"
+        );
+        if (result.fileChanges().isEmpty()) {
+            return result;
+        }
+        List<String> warnings = new ArrayList<>(result.warnings());
+        warnings.add("Aligned character-column numeric literals using unambiguous MyBatis resultMap "
+                + "jdbcType metadata where Dameng column metadata was unavailable.");
+        return new MapperJdbcTypeAlignmentResult(result.fileChanges(), warnings);
+    }
+
+    private MapperJdbcTypeAlignmentResult align(
+            ProjectScanResult scanResult,
+            AdapterContext context,
+            Map<String, Map<String, String>> columnTypes,
+            Map<String, String> fallbackCharacterColumnTypes,
+            String metadataDescription
+    ) {
+        if (context.dryRun()
+                || ((columnTypes == null || columnTypes.isEmpty())
+                && (fallbackCharacterColumnTypes == null || fallbackCharacterColumnTypes.isEmpty()))) {
             return MapperJdbcTypeAlignmentResult.empty();
         }
         List<FileChange> fileChanges = new ArrayList<>();
@@ -112,14 +211,19 @@ class MapperJdbcTypeAligner {
             }
             try {
                 String original = Files.readString(mapperPath, StandardCharsets.UTF_8);
-                Alignment alignment = alignText(original, columnTypes, javaFieldTypes);
+                Alignment alignment = alignText(
+                        original,
+                        columnTypes == null ? Map.of() : columnTypes,
+                        javaFieldTypes,
+                        fallbackCharacterColumnTypes == null ? Map.of() : fallbackCharacterColumnTypes
+                );
                 if (alignment.replacements() > 0 && !alignment.text().equals(original)) {
                     Files.writeString(mapperPath, alignment.text(), StandardCharsets.UTF_8);
                     fileChanges.add(FileChange.applied(
                             mapperPath.toString(),
                             "UPDATE",
                             "Aligned " + alignment.replacements()
-                                    + " MyBatis SQL type use(s) with Dameng column metadata."
+                                    + " MyBatis SQL type use(s) with " + metadataDescription + "."
                     ));
                 }
             } catch (IOException e) {
@@ -186,14 +290,21 @@ class MapperJdbcTypeAligner {
     private Alignment alignText(
             String text,
             Map<String, Map<String, String>> columnTypes,
-            JavaFieldTypeMetadata javaFieldTypes
+            JavaFieldTypeMetadata javaFieldTypes,
+            Map<String, String> fallbackCharacterColumnTypes
     ) {
         Matcher matcher = STATEMENT_PATTERN.matcher(text);
         String mapperType = mapperNamespace(text);
         StringBuffer output = new StringBuffer();
         int replacements = 0;
         while (matcher.find()) {
-            Alignment statement = alignStatement(matcher.group(), mapperType, columnTypes, javaFieldTypes);
+            Alignment statement = alignStatement(
+                    matcher.group(),
+                    mapperType,
+                    columnTypes,
+                    javaFieldTypes,
+                    fallbackCharacterColumnTypes
+            );
             replacements += statement.replacements();
             matcher.appendReplacement(output, Matcher.quoteReplacement(statement.text()));
         }
@@ -205,13 +316,18 @@ class MapperJdbcTypeAligner {
             String statement,
             String mapperType,
             Map<String, Map<String, String>> columnTypes,
-            JavaFieldTypeMetadata javaFieldTypes
+            JavaFieldTypeMetadata javaFieldTypes,
+            Map<String, String> fallbackCharacterColumnTypes
     ) {
         String statementId = statementAttribute(statement, "id");
         String parameterType = statementAttribute(statement, "parameterType");
         Alignment current = alignUpdatePlaceholders(statement, columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         Alignment comparisons = alignComparisonPlaceholders(current.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
-        Alignment literalComparisons = alignCharacterNumericLiteralComparisons(comparisons.text(), columnTypes);
+        Alignment literalComparisons = alignCharacterNumericLiteralComparisons(
+                comparisons.text(),
+                columnTypes,
+                fallbackCharacterColumnTypes
+        );
         Alignment simpleInsert = alignSimpleInsertPlaceholders(literalComparisons.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         Alignment structuredInsert = alignStructuredInsertPlaceholders(simpleInsert.text(), columnTypes, parameterType, mapperType, statementId, javaFieldTypes);
         return new Alignment(
@@ -223,7 +339,8 @@ class MapperJdbcTypeAligner {
 
     private Alignment alignCharacterNumericLiteralComparisons(
             String statement,
-            Map<String, Map<String, String>> columnTypes
+            Map<String, Map<String, String>> columnTypes,
+            Map<String, String> fallbackCharacterColumnTypes
     ) {
         Map<String, String> statementTables = statementTables(statement);
         if (statementTables.isEmpty()) {
@@ -235,7 +352,8 @@ class MapperJdbcTypeAligner {
                 1,
                 3,
                 statementTables,
-                columnTypes
+                columnTypes,
+                fallbackCharacterColumnTypes
         );
         Alignment leftLiteral = quoteCharacterColumnNumericLiteral(
                 rightLiteral.text(),
@@ -243,7 +361,8 @@ class MapperJdbcTypeAligner {
                 3,
                 1,
                 statementTables,
-                columnTypes
+                columnTypes,
+                fallbackCharacterColumnTypes
         );
         return new Alignment(leftLiteral.text(), rightLiteral.replacements() + leftLiteral.replacements());
     }
@@ -254,7 +373,8 @@ class MapperJdbcTypeAligner {
             int columnGroup,
             int literalGroup,
             Map<String, String> statementTables,
-            Map<String, Map<String, String>> columnTypes
+            Map<String, Map<String, String>> columnTypes,
+            Map<String, String> fallbackCharacterColumnTypes
     ) {
         Matcher matcher = pattern.matcher(text);
         StringBuffer output = new StringBuffer();
@@ -270,6 +390,10 @@ class MapperJdbcTypeAligner {
                     statementTables,
                     columnTypes
             );
+            if (columnType.isBlank()) {
+                String column = normalizeIdentifier(lastIdentifierPart(matcher.group(columnGroup)));
+                columnType = fallbackCharacterColumnTypes.getOrDefault(column, "");
+            }
             if (!isCharacterColumnType(columnType)) {
                 matcher.appendReplacement(output, Matcher.quoteReplacement(matcher.group()));
                 continue;
@@ -929,6 +1053,25 @@ class MapperJdbcTypeAligner {
     private String firstTable(String text, Pattern pattern) {
         Matcher matcher = pattern.matcher(text);
         return matcher.find() ? lastIdentifierPart(matcher.group(1)) : "";
+    }
+
+    private boolean containsColumn(
+            Map<String, Map<String, String>> columnTypes,
+            String column
+    ) {
+        for (String table : columnTypes.keySet()) {
+            if (!columnType(table, column, columnTypes).isBlank()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String xmlAttribute(String tag, String attributeName) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\b" + Pattern.quote(attributeName) + "\\s*=\\s*([\"'])(.*?)\\1"
+        ).matcher(tag == null ? "" : tag);
+        return matcher.find() ? matcher.group(2).trim() : "";
     }
 
     private String statementAttribute(String statement, String attributeName) {

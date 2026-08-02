@@ -22,6 +22,108 @@ class MapperJdbcTypeAlignerTest {
     private final MapperJdbcTypeAligner aligner = new MapperJdbcTypeAligner();
 
     @Test
+    void quotesNumericLiteralUsingUnambiguousResultMapMetadataFallback() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/FlowMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.FlowMapper">
+                    <resultMap id="FlowResultMap" type="map">
+                        <id property="id" jdbcType="BIGINT" column="id"/>
+                        <result property="currentUserids" jdbcType="VARCHAR" column="current_userids"/>
+                        <!-- <result property="legacyUserids" column="current_userids" jdbcType="INTEGER"/> -->
+                    </resultMap>
+                    <select id="selectPending" resultMap="FlowResultMap">
+                        select id, current_userids from sample_flow f
+                        where f.current_userids = 0
+                    </select>
+                    <update id="updatePending">
+                        update sample_flow
+                        set current_userids = #{currentUserids, jdbcType=BIGINT}
+                        where id = #{id}
+                    </update>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.alignUsingResultMapFallback(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("module/src/main/resources/mapper-dm/FlowMapper.xml"));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(result.warnings()).singleElement()
+                .asString()
+                .contains("unambiguous MyBatis resultMap jdbcType metadata");
+        assertThat(rewritten)
+                .contains("f.current_userids = '0'")
+                .contains("#{currentUserids, jdbcType=BIGINT}");
+        assertThat(aligner.inferredResultMapCharacterColumnTypes(
+                scanResult,
+                AdapterContext.builder(tempDir).build()
+        )).containsEntry("current_userids", "VARCHAR");
+    }
+
+    @Test
+    void rejectsConflictingResultMapMetadataFallback() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/ConflictingMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.ConflictingMapper">
+                    <resultMap id="TextResultMap" type="map">
+                        <result property="status" column="shared_status" jdbcType="VARCHAR"/>
+                    </resultMap>
+                    <resultMap id="NumericResultMap" type="map">
+                        <result property="status" column="shared_status" jdbcType="INTEGER"/>
+                    </resultMap>
+                    <select id="selectPending" resultMap="TextResultMap">
+                        select shared_status from sample_record where shared_status = 0
+                    </select>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.alignUsingResultMapFallback(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "module/src/main/resources/mapper-dm/ConflictingMapper.xml"
+        ));
+        assertThat(result.fileChanges()).isEmpty();
+        assertThat(aligner.inferredResultMapCharacterColumnTypes(
+                scanResult,
+                AdapterContext.builder(tempDir).build()
+        )).doesNotContainKey("shared_status");
+        assertThat(rewritten).contains("shared_status = 0");
+    }
+
+    @Test
+    void realDamengColumnMetadataSuppressesResultMapFallback() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/StatusMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.StatusMapper">
+                    <resultMap id="StatusResultMap" type="map">
+                        <result property="status" column="status_code" jdbcType="VARCHAR"/>
+                    </resultMap>
+                    <select id="selectPending" resultMap="StatusResultMap">
+                        select status_code from sample_record where status_code = 0
+                    </select>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.alignUsingResultMapFallback(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("sample_record", Map.of("status_code", "INTEGER"))
+        );
+
+        assertThat(result.fileChanges()).isEmpty();
+        assertThat(Files.readString(tempDir.resolve(
+                "module/src/main/resources/mapper-dm/StatusMapper.xml"
+        ))).contains("status_code = 0");
+    }
+
+    @Test
     void quotesNumericEqualityLiteralForCharacterColumnUsingDamengMetadata() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/NsSrServicesMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
