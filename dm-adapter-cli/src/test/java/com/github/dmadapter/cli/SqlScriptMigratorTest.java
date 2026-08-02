@@ -2036,6 +2036,72 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsNonAsciiMysqlProcedureUserVariablesToStableAsciiLocals() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc()
+                BEGIN
+                    SELECT MAX(display_order) + 1 INTO @排序id FROM demo_attribute;
+                    INSERT INTO demo_attribute(id, display_order) VALUES('demo', @排序id);
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-portrait",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("dm_u6392_u5e8f_id BIGINT;")
+                .contains("INTO dm_u6392_u5e8f_id FROM demo_attribute")
+                .contains("VALUES('demo', dm_u6392_u5e8f_id)")
+                .doesNotContain("@排序id")
+                .doesNotContain("dm_排序id");
+    }
+
+    @Test
+    void convertsMysqlOnUpdateTimestampInsideProcedureDdl() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc()
+                BEGIN
+                    ALTER TABLE demo_attribute
+                        ADD COLUMN update_time datetime DEFAULT CURRENT_TIMESTAMP
+                        ON UPDATE CURRENT_TIMESTAMP;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-portrait",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .containsIgnoringCase("ON UPDATE NOW()")
+                .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP");
+    }
+
+    @Test
     void usesClobForDynamicDmlAccumulatorUserVariablesInsideProcedure() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");

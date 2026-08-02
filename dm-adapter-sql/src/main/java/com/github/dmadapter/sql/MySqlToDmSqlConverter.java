@@ -111,7 +111,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_DECIMAL_PRECISION_CAP_RULE = "MYSQL_DECIMAL_PRECISION_CAP_TO_DM";
     public static final String MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE =
             "MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVED";
-    public static final String MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE = "MYSQL_ON_UPDATE_TIMESTAMP_REMOVED";
+    public static final String MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE = "MYSQL_ON_UPDATE_TIMESTAMP_TO_DM";
+    /**
+     * @deprecated Use {@link #MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE}. The conversion now preserves the
+     * automatic-update semantics with Dameng's {@code ON UPDATE NOW()} syntax.
+     */
+    @Deprecated
+    public static final String MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE = MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE;
     public static final String MYSQL_SESSION_VARIABLE_NOOP_RULE = "MYSQL_SESSION_VARIABLE_TO_NOOP";
     public static final String MYSQL_TRUNCATE_TABLE_RULE = "MYSQL_TRUNCATE_TABLE_TO_DM";
     public static final String DUPLICATE_WHERE_KEYWORD_RULE = "DUPLICATE_WHERE_KEYWORD_REMOVED";
@@ -640,10 +646,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
         }
 
-        GenericConversion onUpdateTimestampConversion = removeMysqlOnUpdateCurrentTimestamp(converted);
+        GenericConversion onUpdateTimestampConversion = convertMysqlOnUpdateCurrentTimestamp(converted);
         if (onUpdateTimestampConversion.changed()) {
             converted = onUpdateTimestampConversion.convertedSql();
-            rules.add(MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE);
+            rules.add(MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE);
         }
 
         GenericConversion sessionVariableConversion = convertMysqlSessionVariableSetToNoop(converted);
@@ -3412,7 +3418,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
-    private GenericConversion removeMysqlOnUpdateCurrentTimestamp(String sql) {
+    private GenericConversion convertMysqlOnUpdateCurrentTimestamp(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -3440,6 +3446,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                             cursor = skipWhitespace(sql, close + 1);
                         }
                     }
+                    converted.append("ON UPDATE NOW()");
                     index = cursor;
                     changed = true;
                     appendSpaceBeforeNextTokenIfNeeded(converted, sql, index);

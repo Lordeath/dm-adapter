@@ -10686,9 +10686,14 @@ class SqlScriptMigrator {
     }
 
     private String uniqueProcedureUserVariableName(String userVariableName, LinkedHashSet<String> existingNames) {
-        String base = normalizeIdentifierSegment(userVariableName);
+        String base = asciiProcedureUserVariableName(userVariableName);
         if (base.isBlank() || !Character.isLetter(base.charAt(0))) {
             base = "var_" + base;
+        }
+        int maxBaseLength = 100;
+        if (base.length() > maxBaseLength) {
+            String hash = Integer.toHexString(Objects.hash(userVariableName));
+            base = base.substring(0, maxBaseLength - hash.length() - 1) + "_" + hash;
         }
         String candidate = "dm_" + base;
         int suffix = 2;
@@ -10698,6 +10703,32 @@ class SqlScriptMigrator {
         }
         existingNames.add(candidate.toLowerCase(Locale.ROOT));
         return candidate;
+    }
+
+    private String asciiProcedureUserVariableName(String userVariableName) {
+        StringBuilder encoded = new StringBuilder(userVariableName.length());
+        boolean previousUnderscore = false;
+        for (int index = 0; index < userVariableName.length();) {
+            int codePoint = userVariableName.codePointAt(index);
+            index += Character.charCount(codePoint);
+            boolean asciiIdentifierPart = codePoint < 128
+                    && (Character.isLetterOrDigit(codePoint) || codePoint == '_');
+            if (asciiIdentifierPart) {
+                encoded.appendCodePoint(codePoint);
+                previousUnderscore = codePoint == '_';
+                continue;
+            }
+            if (!encoded.isEmpty() && !previousUnderscore) {
+                encoded.append('_');
+            }
+            encoded.append('u').append(Integer.toHexString(codePoint));
+            previousUnderscore = false;
+            if (index < userVariableName.length()) {
+                encoded.append('_');
+                previousUnderscore = true;
+            }
+        }
+        return normalizeIdentifierSegment(encoded.toString());
     }
 
     private String replaceMysqlUserVariables(
@@ -10798,6 +10829,9 @@ class SqlScriptMigrator {
                     .find()) {
                 return true;
             }
+            if (isNumericSelectIntoUserVariable(statement, userVariableName)) {
+                return true;
+            }
             if (isNumericAssignmentExpression(sql, reference)) {
                 return true;
             }
@@ -10806,6 +10840,22 @@ class SqlScriptMigrator {
             }
         }
         return false;
+    }
+
+    private boolean isNumericSelectIntoUserVariable(String statement, String userVariableName) {
+        Matcher matcher = Pattern.compile(
+                "(?is)\\bSELECT\\b(?<expression>.*?)\\bINTO\\s*@"
+                        + Pattern.quote(userVariableName)
+                        + "\\b"
+        ).matcher(statement);
+        if (!matcher.find()) {
+            return false;
+        }
+        String expression = matcher.group("expression");
+        return Pattern.compile("(?is)\\b(?:COUNT|SUM|AVG)\\s*\\(").matcher(expression).find()
+                || Pattern.compile("(?is)\\b(?:MAX|MIN)\\s*\\([^)]*\\)\\s*[-+*/%]\\s*[-+]?\\d")
+                .matcher(expression)
+                .find();
     }
 
     private String statementContaining(String sql, int index) {
@@ -11558,6 +11608,7 @@ class SqlScriptMigrator {
                     indexDefinition.unique()
             )));
         }
+        converted = convertProcedureAlterTableDdlSyntax(converted);
         converted = normalizeMysqlAlterModifySyntax(converted);
         converted = normalizeMysqlAlterChangeSyntax(converted);
         String withoutInlineKeys = removeMysqlCreateTableInlineKeyDefinitions(converted);
@@ -11588,6 +11639,18 @@ class SqlScriptMigrator {
         converted = normalizeProcedureDynamicDdlSpacing(converted);
         converted = convertProcedureCreateViewDdlSyntax(converted);
         return splitMultiModifyAlterTable(converted).stream().map(ProcedureStatement::dynamicSql).toList();
+    }
+
+    private String convertProcedureAlterTableDdlSyntax(String ddl) {
+        int start = skipWhitespace(ddl, 0);
+        if (!startsKeyword(ddl, start, "ALTER")) {
+            return ddl;
+        }
+        int tableIndex = skipWhitespace(ddl, start + "ALTER".length());
+        if (!startsKeyword(ddl, tableIndex, "TABLE")) {
+            return ddl;
+        }
+        return converter.convert(ddl).convertedSql();
     }
 
     private String normalizeMysqlDataTypes(String sql) {

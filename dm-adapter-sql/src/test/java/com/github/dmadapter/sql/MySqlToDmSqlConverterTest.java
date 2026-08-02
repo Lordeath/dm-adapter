@@ -845,6 +845,7 @@ class MySqlToDmSqlConverterTest {
                 .doesNotContainIgnoringCase("ENGINE")
                 .doesNotContainIgnoringCase("COLLATE")
                 .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP")
+                .containsIgnoringCase("ON UPDATE NOW()")
                 .doesNotContainIgnoringCase("COMMENT");
         assertThat(result.appliedRules()).contains(
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
@@ -853,8 +854,30 @@ class MySqlToDmSqlConverterTest {
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_USING_BTREE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE,
-                MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_REMOVAL_RULE
+                MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE
         );
+    }
+
+    @Test
+    void convertsMysqlOnUpdateCurrentTimestampInAlterStatementsToDamengNow() {
+        SqlConversionResult addResult = converter.convert(
+                "ALTER TABLE demo ADD COLUMN updated_at datetime DEFAULT CURRENT_TIMESTAMP "
+                        + "ON UPDATE CURRENT_TIMESTAMP(3)"
+        );
+        SqlConversionResult modifyResult = converter.convert(
+                "ALTER TABLE demo MODIFY COLUMN updated_at timestamp NULL ON UPDATE CURRENT_TIMESTAMP"
+        );
+
+        assertThat(addResult.convertedSql())
+                .containsIgnoringCase("DEFAULT CURRENT_TIMESTAMP ON UPDATE NOW()")
+                .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP");
+        assertThat(modifyResult.convertedSql())
+                .containsIgnoringCase("ON UPDATE NOW()")
+                .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP");
+        assertThat(addResult.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE);
+        assertThat(modifyResult.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE);
     }
 
     @Test
