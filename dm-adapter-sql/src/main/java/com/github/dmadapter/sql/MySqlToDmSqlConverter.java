@@ -74,8 +74,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL_RULE =
             "MYSQL_TEMPORARY_TABLE_AS_SELECT_FOREACH_LITERAL";
     public static final String MYSQL_DELETE_ALIAS_STAR_RULE = "MYSQL_DELETE_ALIAS_STAR_TO_DM";
+    public static final String MYSQL_DELETE_JOIN_RULE = "MYSQL_DELETE_JOIN_TO_DM_ROWID";
     public static final String DAMENG_KEYWORD_TABLE_ALIAS_RULE = "DAMENG_KEYWORD_TABLE_ALIAS_QUOTE";
     public static final String MYSQL_SINGLE_QUOTED_ALIAS_RULE = "MYSQL_SINGLE_QUOTED_ALIAS_TO_DM_IDENTIFIER";
+    public static final String MYSQL_NUMERIC_LEADING_SELECT_ALIAS_RULE =
+            "MYSQL_NUMERIC_LEADING_SELECT_ALIAS_QUOTE";
     public static final String MYSQL_INSERT_VALUE_TO_VALUES_RULE = "MYSQL_INSERT_VALUE_TO_VALUES";
     public static final String MYSQL_INDEX_HINT_REMOVAL_RULE = "MYSQL_INDEX_HINT_REMOVED";
     public static final String SQLSERVER_NOLOCK_HINT_REMOVAL_RULE = "SQLSERVER_NOLOCK_HINT_REMOVED";
@@ -514,6 +517,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return SqlConversionResult.unchanged(original);
     }
 
+    public SqlConversionResult convertJoinedDelete(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return SqlConversionResult.unchanged(sql == null ? "" : sql);
+        }
+        GenericConversion conversion = convertMysqlJoinedDelete(sql);
+        return conversion.changed()
+                ? SqlConversionResult.changed(sql, conversion.convertedSql(), List.of(MYSQL_DELETE_JOIN_RULE))
+                : SqlConversionResult.unchanged(sql);
+    }
+
     @Override
     public SqlConversionResult convert(String sql, List<String> upsertKeyColumns) {
         return convert(sql, upsertKeyColumns, List.of());
@@ -560,6 +573,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (singleQuotedAliasConversion.changed()) {
             converted = singleQuotedAliasConversion.convertedSql();
             rules.add(MYSQL_SINGLE_QUOTED_ALIAS_RULE);
+        }
+
+        GenericConversion numericLeadingAliasConversion = quoteNumericLeadingSelectAliases(converted);
+        if (numericLeadingAliasConversion.changed()) {
+            converted = numericLeadingAliasConversion.convertedSql();
+            rules.add(MYSQL_NUMERIC_LEADING_SELECT_ALIAS_RULE);
         }
 
         GenericConversion selectModifierConversion = removeMysqlSelectModifiers(converted);
@@ -861,6 +880,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (renameResult.changed()) {
             converted = renameResult.convertedSql();
             rules.add(DamengReservedColumnRenamer.RULE_NAME);
+        }
+
+        GenericConversion deleteJoinConversion = convertMysqlJoinedDelete(converted);
+        if (deleteJoinConversion.changed()) {
+            converted = deleteJoinConversion.convertedSql();
+            rules.add(MYSQL_DELETE_JOIN_RULE);
         }
 
         GenericConversion targetOnlyOuterJoinConversion = convertMysqlTargetOnlyOuterJoin(converted);
@@ -2171,6 +2196,54 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = appendUntilLineEnd(sql, index, converted);
             } else if (startsBlockComment(sql, index)) {
                 index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion quoteNumericLeadingSelectAliases(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (Character.isDigit(current)
+                    && (index == 0 || !isIdentifierPart(sql.charAt(index - 1)))) {
+                int end = index + 1;
+                boolean hasNonDigit = false;
+                while (end < sql.length() && isIdentifierPart(sql.charAt(end))) {
+                    hasNonDigit = hasNonDigit || !Character.isDigit(sql.charAt(end));
+                    end++;
+                }
+                int next = skipWhitespace(sql, end);
+                boolean aliasTerminator = next >= sql.length()
+                        || sql.charAt(next) == ','
+                        || startsKeyword(sql, next, "FROM");
+                if (hasNonDigit
+                        && previousNonWhitespace(sql, index) == ')'
+                        && aliasTerminator
+                        && (isInsideSelectList(sql, index)
+                        || isLikelySelectListFragmentAliasPosition(sql, index))) {
+                    converted.append("AS ").append(quoteDamengIdentifier(sql.substring(index, end)));
+                    index = end;
+                    changed = true;
+                } else {
+                    converted.append(current);
+                    index++;
+                }
             } else {
                 converted.append(current);
                 index++;
@@ -3783,6 +3856,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (dateExpression.isBlank() || dayExpression.isBlank()) {
             return null;
         }
+        Matcher interval = MYSQL_INTERVAL_PATTERN.matcher(dayExpression);
+        if (interval.matches()) {
+            String amount = interval.group(1).trim();
+            String unit = interval.group(2).toUpperCase(Locale.ROOT);
+            if (amount.isBlank()) {
+                return null;
+            }
+            return "DATEADD(" + unit + ", " + negatedIntervalAmount(amount) + ", " + dateExpression + ")";
+        }
         return "DATEADD(DAY, " + negatedIntervalAmount(dayExpression) + ", " + dateExpression + ")";
     }
 
@@ -3817,8 +3899,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = appendUntilLineEnd(sql, index, converted);
             } else if (startsBlockComment(sql, index)) {
                 index = appendUntilBlockCommentEnd(sql, index, converted);
-            } else if (startsFunction(sql, index, "DATE_ADD")) {
-                FunctionCall functionCall = readFunctionCall(sql, index, "DATE_ADD");
+            } else if (startsFunction(sql, index, "DATE_ADD") || startsFunction(sql, index, "ADDDATE")) {
+                String functionName = startsFunction(sql, index, "DATE_ADD") ? "DATE_ADD" : "ADDDATE";
+                FunctionCall functionCall = readFunctionCall(sql, index, functionName);
                 String replacement = functionCall == null ? null : rewriteDateAddInterval(functionCall);
                 if (replacement == null) {
                     converted.append(current);
@@ -4967,6 +5050,148 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return index;
     }
 
+    private GenericConversion convertMysqlJoinedDelete(String sql) {
+        List<StatementSegment> statements = splitTopLevelStatements(sql);
+        if (statements.size() > 1) {
+            StringBuilder converted = new StringBuilder(sql.length());
+            boolean changed = false;
+            for (StatementSegment statement : statements) {
+                GenericConversion statementConversion = convertSingleMysqlJoinedDelete(statement.sql());
+                converted.append(statementConversion.convertedSql()).append(statement.separator());
+                changed = changed || statementConversion.changed();
+            }
+            return changed ? new GenericConversion(converted.toString(), true) : GenericConversion.unchanged(sql);
+        }
+        return convertSingleMysqlJoinedDelete(sql);
+    }
+
+    private GenericConversion convertSingleMysqlJoinedDelete(String sql) {
+        int deleteIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, deleteIndex, "DELETE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int targetsStart = skipWhitespace(sql, deleteIndex + "DELETE".length());
+        int fromIndex = findTopLevelKeyword(sql, "FROM", targetsStart);
+        if (fromIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableStart = skipWhitespace(sql, fromIndex + "FROM".length());
+        int joinIndex = findTopLevelKeyword(sql, "JOIN", tableStart);
+        if (joinIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", joinIndex + "JOIN".length());
+        int joinClauseEnd = whereIndex < 0 ? statementEnd : whereIndex;
+        if (joinClauseEnd <= joinIndex) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        int joinTypeStart = joinTypeStart(sql, joinIndex);
+        String targetRelation = sql.substring(tableStart, joinTypeStart).strip();
+        String joinSource = sql.substring(joinIndex + "JOIN".length(), joinClauseEnd).strip();
+        UpdateJoinChain chain = updateJoinChain(targetRelation, joinSource, true);
+        if (chain == null || chain.tables().size() < 2) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<String> targetAliases = new ArrayList<>();
+        for (TopLevelArgument target : splitTopLevelArguments(sql.substring(targetsStart, fromIndex))) {
+            String alias = deleteTargetAlias(target.text());
+            if (alias.isBlank() || tableByAlias(chain.tables(), normalizeIdentifierKey(alias)) == null) {
+                return GenericConversion.unchanged(sql);
+            }
+            targetAliases.add(alias);
+        }
+        if (targetAliases.isEmpty()) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String fromAndPredicates = sql.substring(tableStart, statementEnd).strip();
+        String trailing = sql.substring(statementEnd);
+        if (targetAliases.size() == 1) {
+            String alias = targetAliases.get(0);
+            UpdateJoinTable target = tableByAlias(chain.tables(), normalizeIdentifierKey(alias));
+            String tableName = target == null ? "" : deleteTableName(target.tableSql());
+            if (tableName.isBlank()) {
+                return GenericConversion.unchanged(sql);
+            }
+            String rewritten = sql.substring(0, deleteIndex)
+                    + "DELETE FROM " + tableName
+                    + " WHERE ROWID IN (SELECT " + alias + ".ROWID FROM " + fromAndPredicates + ")"
+                    + trailing;
+            return new GenericConversion(rewritten, true);
+        }
+
+        if (targetAliases.size() != 2
+                || chain.tables().size() != 2
+                || !Pattern.compile("(?is)^LEFT(?:\\s+OUTER)?$")
+                .matcher(sql.substring(joinTypeStart, joinIndex).strip())
+                .matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        UpdateJoinTable primary = chain.tables().get(0);
+        UpdateJoinTable secondary = chain.tables().get(1);
+        String primaryAlias = targetAliases.get(0);
+        String secondaryAlias = targetAliases.get(1);
+        if (!primary.aliasKey().equals(normalizeIdentifierKey(primaryAlias))
+                || !secondary.aliasKey().equals(normalizeIdentifierKey(secondaryAlias))) {
+            return GenericConversion.unchanged(sql);
+        }
+        String whereClause = whereIndex < 0
+                ? ""
+                : sql.substring(whereIndex + "WHERE".length(), statementEnd);
+        if (referencesAliasOutsideIgnoredText(whereClause, secondary.aliasKey())) {
+            return GenericConversion.unchanged(sql);
+        }
+        String primaryTable = deleteTableName(primary.tableSql());
+        String secondaryTable = deleteTableName(secondary.tableSql());
+        if (primaryTable.isBlank() || secondaryTable.isBlank()) {
+            return GenericConversion.unchanged(sql);
+        }
+        String rewritten = sql.substring(0, deleteIndex)
+                + "BEGIN\n"
+                + "DELETE FROM " + secondaryTable
+                + " WHERE ROWID IN (SELECT " + secondaryAlias + ".ROWID FROM " + fromAndPredicates + ");\n"
+                + "DELETE FROM " + primaryTable
+                + " WHERE ROWID IN (SELECT " + primaryAlias + ".ROWID FROM " + fromAndPredicates + ");\n"
+                + "END"
+                + trailing;
+        return new GenericConversion(rewritten, true);
+    }
+
+    private String deleteTargetAlias(String target) {
+        String alias = target == null ? "" : target.strip();
+        Matcher star = Pattern.compile("(?is)^(?<alias>" + UPDATE_IDENTIFIER + ")\\s*\\.\\s*\\*$")
+                .matcher(alias);
+        if (star.matches()) {
+            return star.group("alias");
+        }
+        IdentifierToken token = readIdentifierToken(alias, 0);
+        return token != null && skipWhitespace(alias, token.endIndex()) == alias.length()
+                ? token.text()
+                : "";
+    }
+
+    private String deleteTableName(String tableSql) {
+        String relation = tableSql == null ? "" : tableSql.strip();
+        IdentifierToken table = readQualifiedIdentifierToken(relation, 0);
+        if (table == null) {
+            return "";
+        }
+        int index = skipWhitespace(relation, table.endIndex());
+        if (startsKeyword(relation, index, "AS")) {
+            index = skipWhitespace(relation, index + "AS".length());
+        }
+        if (index < relation.length()) {
+            IdentifierToken alias = readIdentifierToken(relation, index);
+            if (alias == null || skipWhitespace(relation, alias.endIndex()) != relation.length()) {
+                return "";
+            }
+        }
+        return relation.substring(0, table.endIndex());
+    }
+
     private GenericConversion convertMysqlDeleteAliasStar(String sql) {
         int deleteIndex = leadingWhitespaceLength(sql);
         if (!startsKeyword(sql, deleteIndex, "DELETE")) {
@@ -4998,6 +5223,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         IdentifierToken tableAlias = readIdentifierToken(sql, tableAliasStart);
         if (tableAlias == null
                 || !normalizeIdentifierKey(tableAlias.text()).equals(normalizeIdentifierKey(deleteAlias.text()))) {
+            return GenericConversion.unchanged(sql);
+        }
+        if (findTopLevelKeyword(sql, "JOIN", tableAlias.endIndex()) >= 0) {
             return GenericConversion.unchanged(sql);
         }
         return new GenericConversion(sql.substring(0, deleteIndex) + "delete from " + sql.substring(tableStart), true);

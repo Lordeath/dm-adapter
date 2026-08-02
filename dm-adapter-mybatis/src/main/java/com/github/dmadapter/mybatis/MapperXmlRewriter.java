@@ -999,6 +999,22 @@ public class MapperXmlRewriter {
                 || isKeywordAt(converted, sqlStart, "INSERT");
         boolean updateStatement = "update".equals(statementTagName)
                 || isKeywordAt(converted, sqlStart, "UPDATE");
+        boolean deleteStatement = "delete".equals(statementTagName)
+                || isKeywordAt(converted, sqlStart, "DELETE");
+        if (deleteStatement && sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter) {
+            SqlConversionResult deleteJoin = mySqlToDmSqlConverter.convertJoinedDelete(converted);
+            if (deleteJoin.changed()) {
+                converted = deleteJoin.convertedSql();
+                addAppliedRules(appliedRules, deleteJoin.appliedRules());
+                return new DynamicBodyConversion(
+                        body,
+                        converted,
+                        appliedRules,
+                        manualReviewReasons,
+                        true
+                );
+            }
+        }
         if (!insertStatement && !updateStatement) {
             return new DynamicBodyConversion(body, converted, appliedRules, manualReviewReasons, !appliedRules.isEmpty());
         }
@@ -8543,6 +8559,9 @@ public class MapperXmlRewriter {
             SqlRewriteConfig rewriteConfig,
             String followingTagName
     ) {
+        if (!followingTagName.isBlank() && isJoinedDeletePrefix(text)) {
+            return new TextSegmentConversion(text, List.of(), List.of(), false);
+        }
         boolean followedByDynamicWhere = isDynamicWhereTag(followingTagName);
         if (isUpdateJoinWithoutWhere(text)) {
             if (!followedByDynamicWhere) {
@@ -8566,6 +8585,14 @@ public class MapperXmlRewriter {
             );
         }
         return convertPlainTextSegment(text, statementKey, sqlConverter, rewriteConfig);
+    }
+
+    private boolean isJoinedDeletePrefix(String text) {
+        String sql = sqlView(text).text();
+        int start = leadingWhitespaceLength(sql);
+        return isKeywordAt(sql, start, "DELETE")
+                && findTopLevelKeywordSkippingXml(sql, "FROM", start + "DELETE".length()) >= 0
+                && findTopLevelKeywordSkippingXml(sql, "JOIN", start + "DELETE".length()) >= 0;
     }
 
     private TextSegmentConversion convertUpdateJoinPrefixTextSegment(String text, SqlConverter sqlConverter) {
