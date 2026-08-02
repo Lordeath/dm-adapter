@@ -1030,7 +1030,16 @@ public class MapperXmlRewriter {
             }
         }
 
-        DynamicHavingConversion havingConversion = convertDynamicHavingClauses(converted);
+        HavingAggregateAliasExpansion allHavingAggregateAliases = expandAggregateAliasesInAllHavingClauses(converted);
+        if (allHavingAggregateAliases.changed()) {
+            converted = allHavingAggregateAliases.text();
+            appliedRules.add(MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        }
+
+        DynamicHavingConversion havingConversion = convertDynamicHavingClauses(
+                converted,
+                allHavingAggregateAliases.expandedEnclosedHavingContents()
+        );
         if (havingConversion.changed()) {
             converted = havingConversion.convertedBody();
             addAppliedRules(appliedRules, havingConversion.appliedRules());
@@ -1799,14 +1808,20 @@ public class MapperXmlRewriter {
         );
     }
 
-    private DynamicHavingConversion convertDynamicHavingClauses(String body) {
+    private DynamicHavingConversion convertDynamicHavingClauses(
+            String body,
+            Set<String> expandedEnclosedHavingContents
+    ) {
         String converted = body;
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
         boolean changed = false;
         int guard = 0;
         while (guard < 100) {
-            ScopeHavingConversion scopeConversion = convertFirstDynamicHavingScope(converted);
+            ScopeHavingConversion scopeConversion = convertFirstDynamicHavingScope(
+                    converted,
+                    expandedEnclosedHavingContents
+            );
             addManualReviewReasons(manualReviewReasons, scopeConversion.manualReviewReasons());
             if (!scopeConversion.changed()) {
                 break;
@@ -2277,12 +2292,20 @@ public class MapperXmlRewriter {
         return content;
     }
 
-    private ScopeHavingConversion convertFirstDynamicHavingScope(String body) {
+    private ScopeHavingConversion convertFirstDynamicHavingScope(
+            String body,
+            Set<String> expandedEnclosedHavingContents
+    ) {
         SqlView view = sqlView(body);
         List<SelectScope> scopes = selectScopes(view.text());
         for (int i = scopes.size() - 1; i >= 0; i--) {
             SelectScope scope = scopes.get(i);
-            ScopeHavingConversion havingConversion = convertRegularHavingInScope(body, view.text(), scope);
+            ScopeHavingConversion havingConversion = convertRegularHavingInScope(
+                    body,
+                    view.text(),
+                    scope,
+                    expandedEnclosedHavingContents
+            );
             if (havingConversion.changed() || !havingConversion.manualReviewReasons().isEmpty()) {
                 return havingConversion;
             }
@@ -2294,7 +2317,12 @@ public class MapperXmlRewriter {
         return ScopeHavingConversion.unchanged(body);
     }
 
-    private ScopeHavingConversion convertRegularHavingInScope(String body, String view, SelectScope scope) {
+    private ScopeHavingConversion convertRegularHavingInScope(
+            String body,
+            String view,
+            SelectScope scope,
+            Set<String> expandedEnclosedHavingContents
+    ) {
         if (scope.havingIndex() < 0) {
             return ScopeHavingConversion.unchanged(body);
         }
@@ -2319,6 +2347,11 @@ public class MapperXmlRewriter {
             );
             if (enclosedConversion.changed()) {
                 return enclosedConversion;
+            }
+            int havingStart = scope.havingIndex() + "HAVING".length();
+            String havingContent = body.substring(havingStart, enclosingHavingIf.closingStart());
+            if (expandedEnclosedHavingContents.contains(havingContent)) {
+                return ScopeHavingConversion.unchanged(body);
             }
             return ScopeHavingConversion.manualReview(
                     body,
@@ -2410,6 +2443,99 @@ public class MapperXmlRewriter {
             rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
         }
         return new ScopeHavingConversion(converted, rules, true);
+    }
+
+    private HavingAggregateAliasExpansion expandAggregateAliasesInAllHavingClauses(String body) {
+        SqlView view = sqlView(body);
+        List<TextReplacement> replacements = new ArrayList<>();
+        Set<String> expandedEnclosedHavingContents = new LinkedHashSet<>();
+        for (SelectScope scope : selectScopes(view.text())) {
+            Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(
+                    body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
+            );
+            if (aggregateAliases.isEmpty()) {
+                continue;
+            }
+            int cursor = scope.fromIndex() + "FROM".length();
+            while (cursor < scope.scopeEnd()) {
+                int havingIndex = findTopLevelKeyword(
+                        view.text(),
+                        "HAVING",
+                        cursor,
+                        scope.scopeEnd(),
+                        scope.depth()
+                );
+                if (havingIndex < 0) {
+                    break;
+                }
+                int contentStart = havingIndex + "HAVING".length();
+                int contentEnd = findDynamicHavingClauseEnd(
+                        view.text(),
+                        contentStart,
+                        scope.scopeEnd(),
+                        scope.depth()
+                );
+                TextRewrite aliasRewrite = replaceAggregateAliases(
+                        body.substring(contentStart, contentEnd),
+                        aggregateAliases
+                );
+                if (aliasRewrite.changed()) {
+                    replacements.add(new TextReplacement(contentStart, contentEnd, aliasRewrite.text()));
+                    XmlBlock enclosingHavingIf = enclosingXmlBlock(body, havingIndex, "if");
+                    if (enclosingHavingIf != null
+                            && enclosingHavingIf.closingStart() > contentStart
+                            && enclosingHavingIf.closingStart() <= contentEnd) {
+                        TextRewrite enclosedHavingRewrite = replaceAggregateAliases(
+                                body.substring(contentStart, enclosingHavingIf.closingStart()),
+                                aggregateAliases
+                        );
+                        if (enclosedHavingRewrite.changed()) {
+                            expandedEnclosedHavingContents.add(enclosedHavingRewrite.text());
+                        }
+                    }
+                }
+                cursor = Math.max(contentEnd, contentStart + 1);
+            }
+        }
+        replacements.sort((left, right) -> Integer.compare(left.startIndex(), right.startIndex()));
+        TextRewrite rewrite = applyTextReplacements(body, replacements);
+        return new HavingAggregateAliasExpansion(
+                rewrite.text(),
+                expandedEnclosedHavingContents,
+                rewrite.changed()
+        );
+    }
+
+    private int findDynamicHavingClauseEnd(String view, int start, int end, int targetDepth) {
+        int depth = depthAt(view, start);
+        int index = start;
+        while (index < end) {
+            char current = view.charAt(index);
+            if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                if (depth == targetDepth) {
+                    return index;
+                }
+                if (depth > 0) {
+                    depth--;
+                }
+                index++;
+            } else if (depth == targetDepth
+                    && (isKeywordAt(view, index, "GROUP")
+                    || isKeywordAt(view, index, "HAVING")
+                    || isKeywordAt(view, index, "ORDER")
+                    || isKeywordAt(view, index, "LIMIT")
+                    || isKeywordAt(view, index, "OFFSET")
+                    || isKeywordAt(view, index, "FETCH")
+                    || isKeywordAt(view, index, "UNION"))) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return end;
     }
 
     private ScopeHavingConversion moveEnclosedHavingIfBeforeGroupBy(
@@ -9040,6 +9166,18 @@ public class MapperXmlRewriter {
         DynamicHavingConversion {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
             manualReviewReasons = List.copyOf(manualReviewReasons == null ? List.of() : manualReviewReasons);
+        }
+    }
+
+    private record HavingAggregateAliasExpansion(
+            String text,
+            Set<String> expandedEnclosedHavingContents,
+            boolean changed
+    ) {
+        HavingAggregateAliasExpansion {
+            expandedEnclosedHavingContents = Set.copyOf(
+                    expandedEnclosedHavingContents == null ? Set.of() : expandedEnclosedHavingContents
+            );
         }
     }
 
