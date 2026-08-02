@@ -22,6 +22,51 @@ class MapperJdbcTypeAlignerTest {
     private final MapperJdbcTypeAligner aligner = new MapperJdbcTypeAligner();
 
     @Test
+    void quotesNumericEqualityLiteralForCharacterColumnUsingDamengMetadata() throws Exception {
+        ProjectScanResult scanResult = writeMapperDm("mapper/NsSrServicesMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.NsSrServicesMapper">
+                    <select id="pushVisitService" resultType="map">
+                        select f.id from ns_sr_services_flow f
+                        <where>
+                            <!-- f.current_userids = 9 must stay untouched -->
+                            <if test="currentUserids != null and currentUserids != 8">
+                                and f.current_userids = 0
+                                and -1 != f.route_code
+                                and f.numeric_status = 0
+                                and 'f.current_userids = 7' = 'literal'
+                                -- f.current_userids = 6 must stay untouched
+                            </if>
+                        </where>
+                    </select>
+                </mapper>
+                """);
+
+        MapperJdbcTypeAlignmentResult result = aligner.align(
+                scanResult,
+                AdapterContext.builder(tempDir).build(),
+                Map.of("ns_sr_services_flow", Map.of(
+                        "current_userids", "CLOB",
+                        "route_code", "VARCHAR",
+                        "numeric_status", "INTEGER"
+                ))
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "module/src/main/resources/mapper-dm/NsSrServicesMapper.xml"
+        ));
+        assertThat(result.fileChanges()).hasSize(1);
+        assertThat(rewritten)
+                .contains("f.current_userids = '0'")
+                .contains("'-1' != f.route_code")
+                .contains("f.numeric_status = 0")
+                .contains("currentUserids != 8")
+                .contains("'f.current_userids = 7'")
+                .contains("-- f.current_userids = 6 must stay untouched")
+                .contains("<!-- f.current_userids = 9 must stay untouched -->");
+    }
+
+    @Test
     void alignsUpdateForeachJdbcTypeFromDamengColumnMetadata() throws Exception {
         ProjectScanResult scanResult = writeMapperDm("mapper/NsCoreDictionaryitemMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
