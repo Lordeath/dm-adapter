@@ -3498,7 +3498,8 @@ class DmSqlValidationTestGenerator {
                         return ParameterResolution.resolved("configured", new Object[] { namedParameters });
                     }
                     if (configuredArgs != null && configuredArgs.args.size() == 1) {
-                        if (Map.class.isAssignableFrom(mapperMethod.parameterType)
+                        if (mapperMethod.parameterType != null
+                                && Map.class.isAssignableFrom(mapperMethod.parameterType)
                                 && configuredArgs.args.get(0) instanceof Map<?, ?>) {
                             return ParameterResolution.resolved(
                                     "configured",
@@ -8766,6 +8767,7 @@ class DmSqlValidationTestGenerator {
                             "MYSQL_DATE_ADD_INTERVAL",
                             "MYSQL_MAKEDATE",
                             "MYSQL_SUBDATE",
+                            "MYSQL_TIMEDIFF",
                             "MYSQL_CONVERT_UNSIGNED",
                             "MYSQL_CONVERT_DECIMAL",
                             "MYSQL_CONVERT_GBK_ORDER",
@@ -9003,6 +9005,8 @@ class DmSqlValidationTestGenerator {
                             return "MAKEDATE 函数";
                         case "MYSQL_SUBDATE":
                             return "SUBDATE 函数";
+                        case "MYSQL_TIMEDIFF":
+                            return "TIMEDIFF 时间段函数";
                         case "MYSQL_PERIOD_DIFF_YEARMONTH":
                             return "PERIOD_DIFF 年月差";
                         case "MYSQL_COUNT_CONDITION_OR_NULL":
@@ -9329,6 +9333,9 @@ class DmSqlValidationTestGenerator {
                     if (lower.contains("on duplicate key update")) {
                         return "ON_DUPLICATE_KEY_UPDATE";
                     }
+                    if (hasMysqlTimeDiff(message)) {
+                        return "MYSQL_TIMEDIFF";
+                    }
                     if (hasUnresolvedFunctionObject(message)) {
                         return "TEST_SCHEMA_FUNCTION";
                     }
@@ -9600,6 +9607,11 @@ class DmSqlValidationTestGenerator {
                 private boolean hasMysqlSubdate(String message) {
                     return Pattern.compile("\\\\bsubdate\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
                             || Pattern.compile("无法解析的成员访问表达式\\\\s*\\\\[\\\\s*SUBDATE\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find();
+                }
+
+                private boolean hasMysqlTimeDiff(String message) {
+                    return Pattern.compile("\\\\btimediff\\\\s*\\\\(", Pattern.CASE_INSENSITIVE).matcher(message).find()
+                            || Pattern.compile("无法解析的成员访问表达式\\\\s*\\\\[\\\\s*TIMEDIFF\\\\s*]", Pattern.CASE_INSENSITIVE).matcher(message).find();
                 }
 
                 private boolean hasMysqlUpdateJoinMultiTarget(String message) {
