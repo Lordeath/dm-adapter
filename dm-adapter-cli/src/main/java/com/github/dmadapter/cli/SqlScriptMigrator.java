@@ -601,7 +601,22 @@ class SqlScriptMigrator {
                 + ", failed=" + validationRun.failureCount()
                 + ", elapsedMs=" + elapsedMillis(validationStartedAt));
         warnings.addAll(validationRun.warnings());
-        if (externalProcedureDependenciesUnverified(validationRun)) {
+        ExternalProcedureValidationRun externalProcedureValidation = null;
+        if (!dependencyAnalysis.externalDependencies().isEmpty()
+                && validationRun.attempted()
+                && validator instanceof ExternalProcedureValidator externalProcedureValidator) {
+            externalProcedureValidation = externalProcedureValidator.validateExternalProcedures(
+                    dependencyAnalysis.externalDependencies(),
+                    request.validationEnvironment()
+            );
+        }
+        if (externalProcedureValidation != null) {
+            if (externalProcedureValidation.attempted()) {
+                warnings.addAll(externalProcedureUnavailableWarnings(externalProcedureValidation.issues()));
+            } else {
+                warnings.addAll(externalProcedureDependencyWarnings(dependencyAnalysis.externalDependencies()));
+            }
+        } else if (externalProcedureDependenciesUnverified(validationRun)) {
             warnings.addAll(externalProcedureDependencyWarnings(dependencyAnalysis.externalDependencies()));
         }
 
@@ -1875,6 +1890,27 @@ class SqlScriptMigrator {
                             .sorted(String.CASE_INSENSITIVE_ORDER)
                             .toList();
                     return "外部存储过程依赖尚未完成达梦验证：schema="
+                            + entry.getKey()
+                            + ", procedures="
+                            + procedures;
+                })
+                .toList();
+    }
+
+    private List<String> externalProcedureUnavailableWarnings(
+            Map<String, Map<String, String>> issues
+    ) {
+        if (issues == null || issues.isEmpty()) {
+            return List.of();
+        }
+        return issues.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey(String.CASE_INSENSITIVE_ORDER))
+                .map(entry -> {
+                    List<String> procedures = entry.getValue().entrySet().stream()
+                            .sorted(Map.Entry.comparingByKey(String.CASE_INSENSITIVE_ORDER))
+                            .map(procedure -> procedure.getKey() + "(" + procedure.getValue() + ")")
+                            .toList();
+                    return "外部存储过程依赖在当前达梦目标库不可用：schema="
                             + entry.getKey()
                             + ", procedures="
                             + procedures;
@@ -14484,6 +14520,13 @@ class SqlScriptMigrator {
     interface Validator {
         SqlScriptValidationRun validate(
                 List<PlannedSqlScriptFile> files,
+                DmValidationEnvironment environment
+        );
+    }
+
+    interface ExternalProcedureValidator {
+        ExternalProcedureValidationRun validateExternalProcedures(
+                Map<String, Set<String>> externalDependencies,
                 DmValidationEnvironment environment
         );
     }

@@ -29,7 +29,7 @@ import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-class SqlScriptValidator implements SqlScriptMigrator.Validator {
+class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrator.ExternalProcedureValidator {
     private static final int DEFAULT_STATEMENT_TIMEOUT_SECONDS = 600;
     private static final int DEFAULT_CONNECTION_ATTEMPTS = 3;
     private static final long DEFAULT_CONNECTION_RETRY_DELAY_MILLIS = 2_000L;
@@ -225,6 +225,77 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 ? "Dameng SQL script validation passed."
                 : "Dameng SQL script validation completed with failed SQL statements.";
         return new SqlScriptValidationRun(true, status, successCount, failures.size(), fileValidations, failures, List.of());
+    }
+
+    @Override
+    public ExternalProcedureValidationRun validateExternalProcedures(
+            Map<String, Set<String>> externalDependencies,
+            DmValidationEnvironment environment
+    ) {
+        if (externalDependencies == null || externalDependencies.isEmpty()) {
+            return ExternalProcedureValidationRun.complete(Map.of());
+        }
+        if (environment == null || !environment.validationEnabled() || !environment.ready()) {
+            return ExternalProcedureValidationRun.notAttempted();
+        }
+        if (environment.deadline().expired()) {
+            return ExternalProcedureValidationRun.notAttempted();
+        }
+
+        Connection connection = null;
+        LinkedHashMap<String, Map<String, String>> issues = new LinkedHashMap<>();
+        try {
+            connection = openConnection(environment);
+            String sql = "SELECT STATUS FROM ALL_OBJECTS "
+                    + "WHERE UPPER(OWNER) = UPPER(?) "
+                    + "AND UPPER(OBJECT_NAME) = UPPER(?) "
+                    + "AND OBJECT_TYPE = 'PROCEDURE'";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                for (Map.Entry<String, Set<String>> schemaEntry : externalDependencies.entrySet()) {
+                    LinkedHashMap<String, String> schemaIssues = new LinkedHashMap<>();
+                    for (String procedure : schemaEntry.getValue()) {
+                        if (environment.deadline().expired()) {
+                            return ExternalProcedureValidationRun.notAttempted();
+                        }
+                        statement.clearParameters();
+                        configureStatement(statement, environment);
+                        statement.setString(1, schemaEntry.getKey());
+                        statement.setString(2, procedure);
+                        try (ResultSet resultSet = statement.executeQuery()) {
+                            if (!resultSet.next()) {
+                                schemaIssues.put(procedure, "NOT_FOUND");
+                                continue;
+                            }
+                            String status = resultSet.getString(1);
+                            if (!"VALID".equalsIgnoreCase(status == null ? "" : status.trim())) {
+                                schemaIssues.put(
+                                        procedure,
+                                        "STATUS_" + normalizeObjectStatus(status)
+                                );
+                            }
+                        }
+                    }
+                    if (!schemaIssues.isEmpty()) {
+                        issues.put(schemaEntry.getKey(), Map.copyOf(schemaIssues));
+                    }
+                }
+            }
+            return ExternalProcedureValidationRun.complete(issues);
+        } catch (Exception e) {
+            progress("External procedure status validation could not be completed: errorType="
+                    + e.getClass().getSimpleName());
+            return ExternalProcedureValidationRun.notAttempted();
+        } finally {
+            closeConnection(connection);
+        }
+    }
+
+    private String normalizeObjectStatus(String status) {
+        if (status == null || status.isBlank()) {
+            return "UNKNOWN";
+        }
+        String normalized = status.trim().toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_]+", "_");
+        return normalized.isBlank() ? "UNKNOWN" : normalized;
     }
 
     private Connection openConnection(DmValidationEnvironment environment) throws Exception {
@@ -1471,6 +1542,30 @@ record SqlScriptValidationRun(
                 true, "Dameng SQL script validation timed out.", successes, failures.size(),
                 fileValidations, failures, List.of()
         );
+    }
+}
+
+record ExternalProcedureValidationRun(
+        boolean attempted,
+        Map<String, Map<String, String>> issues
+) {
+    ExternalProcedureValidationRun {
+        LinkedHashMap<String, Map<String, String>> copied = new LinkedHashMap<>();
+        if (issues != null) {
+            issues.forEach((schema, procedures) -> copied.put(
+                    schema,
+                    Map.copyOf(procedures == null ? Map.of() : procedures)
+            ));
+        }
+        issues = Map.copyOf(copied);
+    }
+
+    static ExternalProcedureValidationRun complete(Map<String, Map<String, String>> issues) {
+        return new ExternalProcedureValidationRun(true, issues);
+    }
+
+    static ExternalProcedureValidationRun notAttempted() {
+        return new ExternalProcedureValidationRun(false, Map.of());
     }
 }
 

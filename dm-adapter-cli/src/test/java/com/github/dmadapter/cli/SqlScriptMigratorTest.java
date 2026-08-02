@@ -6865,6 +6865,135 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void suppressesWarningsForExternalProceduresThatAreValidInCurrentTarget() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205_system.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL addOrUpdate_dictionary();
+                    CALL SharedSchema.MixedCaseProc();
+                END$$
+                DELIMITER ;
+                """);
+        ExternalProcedureStatusValidator validator = new ExternalProcedureStatusValidator(Map.of());
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "sample-system",
+                validationEnvironment()
+        ));
+
+        assertThat(report.warnings()).noneSatisfy(warning ->
+                assertThat(warning).contains("外部存储过程依赖"));
+        assertThat(validator.dependencies)
+                .containsEntry("sample-system", Set.of("addOrUpdate_dictionary"))
+                .containsEntry("SharedSchema", Set.of("MixedCaseProc"));
+    }
+
+    @Test
+    void reportsOnlyExternalProceduresThatAreMissingOrInvalid() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260205_system.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL healthy_proc();
+                    CALL invalid_proc();
+                    CALL missing_proc();
+                END$$
+                DELIMITER ;
+                """);
+        ExternalProcedureStatusValidator validator = new ExternalProcedureStatusValidator(Map.of(
+                "sample-system",
+                Map.of("invalid_proc", "STATUS_INVALID", "missing_proc", "NOT_FOUND")
+        ));
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "sample-system",
+                validationEnvironment()
+        ));
+
+        assertThat(report.warnings()).singleElement().satisfies(warning -> assertThat(warning)
+                .contains("外部存储过程依赖在当前达梦目标库不可用")
+                .contains("invalid_proc(STATUS_INVALID)")
+                .contains("missing_proc(NOT_FOUND)")
+                .doesNotContain("healthy_proc")
+                .doesNotContain("尚未完成达梦验证"));
+    }
+
+    @Test
+    void queriesExternalProcedureStatusByCaseInsensitiveOwnerAndName() {
+        List<List<String>> queriedKeys = new ArrayList<>();
+        AtomicReference<String> schema = new AtomicReference<>();
+        AtomicReference<String> procedure = new AtomicReference<>();
+        PreparedStatement preparedStatement = proxy(PreparedStatement.class, (ignored, method, args) -> {
+            switch (method.getName()) {
+                case "setString" -> {
+                    if ((int) args[0] == 1) {
+                        schema.set((String) args[1]);
+                    } else if ((int) args[0] == 2) {
+                        procedure.set((String) args[1]);
+                    }
+                }
+                case "executeQuery" -> {
+                    queriedKeys.add(List.of(schema.get(), procedure.get()));
+                    AtomicInteger next = new AtomicInteger();
+                    return proxy(ResultSet.class, (ignoredResultSet, resultMethod, resultArgs) ->
+                            switch (resultMethod.getName()) {
+                                case "next" -> next.getAndIncrement() == 0;
+                                case "getString" -> "VALID";
+                                default -> defaultValue(resultMethod.getReturnType());
+                            });
+                }
+                default -> {
+                }
+            }
+            return defaultValue(method.getReturnType());
+        });
+        List<String> preparedSql = new ArrayList<>();
+        Connection connection = proxy(Connection.class, (ignored, method, args) -> {
+            if (method.getName().equals("prepareStatement")) {
+                preparedSql.add((String) args[0]);
+                return preparedStatement;
+            }
+            return defaultValue(method.getReturnType());
+        });
+
+        ExternalProcedureValidationRun result = new SqlScriptValidator(env -> connection)
+                .validateExternalProcedures(
+                        Map.of(
+                                "newsee-system", Set.of("addOrUpdate_dictionary"),
+                                "Mixed-Schema", Set.of("MixedCaseProc")
+                        ),
+                        validationEnvironment()
+                );
+
+        assertThat(result.attempted()).isTrue();
+        assertThat(result.issues()).isEmpty();
+        assertThat(queriedKeys)
+                .containsExactlyInAnyOrder(
+                        List.of("newsee-system", "addOrUpdate_dictionary"),
+                        List.of("Mixed-Schema", "MixedCaseProc")
+                );
+        assertThat(preparedSql).singleElement().satisfies(sql -> assertThat(sql)
+                .contains("UPPER(OWNER) = UPPER(?)")
+                .contains("UPPER(OBJECT_NAME) = UPPER(?)")
+                .contains("OBJECT_TYPE = 'PROCEDURE'"));
+    }
+
+    @Test
     void recompilesProcedureAfterSafeForwardDependencyInSameFile() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -8205,6 +8334,33 @@ class SqlScriptMigratorTest {
                 }
             }
             return count;
+        }
+    }
+
+    private static final class ExternalProcedureStatusValidator
+            implements SqlScriptMigrator.Validator, SqlScriptMigrator.ExternalProcedureValidator {
+        private final Map<String, Map<String, String>> issues;
+        private Map<String, Set<String>> dependencies = Map.of();
+
+        private ExternalProcedureStatusValidator(Map<String, Map<String, String>> issues) {
+            this.issues = issues;
+        }
+
+        @Override
+        public SqlScriptValidationRun validate(
+                List<SqlScriptMigrator.PlannedSqlScriptFile> files,
+                DmValidationEnvironment environment
+        ) {
+            return new RecordingValidator().validate(files, environment);
+        }
+
+        @Override
+        public ExternalProcedureValidationRun validateExternalProcedures(
+                Map<String, Set<String>> externalDependencies,
+                DmValidationEnvironment environment
+        ) {
+            this.dependencies = externalDependencies;
+            return ExternalProcedureValidationRun.complete(issues);
         }
     }
 
