@@ -26,6 +26,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_CAST_SIGNED_RULE = "MYSQL_CAST_SIGNED_TO_BIGINT";
     public static final String MYSQL_CONVERT_UNSIGNED_RULE = "MYSQL_CONVERT_UNSIGNED_TO_BIGINT";
     public static final String MYSQL_DATE_ADD_INTERVAL_RULE = "MYSQL_DATE_ADD_INTERVAL_TO_DATEADD";
+    public static final String MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE =
+            "MYSQL_NUMERIC_IFNULL_COMPARISON_TO_BIGINT";
     public static final String MYSQL_SUBDATE_RULE = "MYSQL_SUBDATE_TO_DATEADD";
     public static final String MYSQL_LOCATE_NUMERIC_NEEDLE_RULE = "MYSQL_LOCATE_NUMERIC_NEEDLE_CAST";
     public static final String MYSQL_MAKEDATE_RULE = "MYSQL_MAKEDATE_TO_DATEADD";
@@ -183,6 +185,21 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern SIMPLE_INTERVAL_AMOUNT_PATTERN = Pattern.compile(
             "(?is)^[+-]?(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})$"
     );
+    private static final Pattern INTEGER_LITERAL_PATTERN = Pattern.compile("^[+-]?\\d+$");
+    private static final Pattern NUMERIC_JDBC_TYPE_PLACEHOLDER_PATTERN = Pattern.compile(
+            "(?is)#\\{[^}]*\\bjdbcType\\s*=\\s*"
+                    + "(?:TINYINT|SMALLINT|INTEGER|INT|BIGINT|DECIMAL|NUMERIC|FLOAT|DOUBLE|REAL)\\b[^}]*}"
+    );
+    private static final Pattern NUMERIC_CAST_PATTERN = Pattern.compile(
+            "(?is)^CAST\\s*\\(.+\\s+AS\\s+"
+                    + "(?:TINYINT|SMALLINT|INTEGER|INT|BIGINT|DECIMAL(?:\\s*\\([^)]*\\))?|NUMERIC(?:\\s*\\([^)]*\\))?)"
+                    + "\\s*\\)$"
+    );
+    private static final Pattern NUMERIC_INTERVAL_EXPRESSION_PATTERN = Pattern.compile(
+            "(?is)^(?:ABS|CEIL|CEILING|FLOOR|TRUNC|ROUND|WEEKDAY|QUARTER|YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|"
+                    + "DATEDIFF|TIMESTAMPDIFF|LENGTH|COUNT)\\s*\\("
+    );
+    private static final Pattern NUMERIC_ARITHMETIC_INTERVAL_PATTERN = Pattern.compile("^[0-9+*/%().\\s-]+$");
     private static final List<String> MYSQL_INTERVAL_UNITS =
             List.of("HOUR_SECOND", "YEAR", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE", "SECOND");
     private static final List<String> MYSQL_SELECT_MODIFIERS_TO_REMOVE = List.of(
@@ -721,6 +738,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (dateAddIntervalConversion.changed()) {
             converted = dateAddIntervalConversion.convertedSql();
             rules.add(MYSQL_DATE_ADD_INTERVAL_RULE);
+        }
+
+        GenericConversion numericIfNullComparisonConversion = convertTimestampDiffNumericIfNullComparisons(converted);
+        if (numericIfNullComparisonConversion.changed()) {
+            converted = numericIfNullComparisonConversion.convertedSql();
+            rules.add(MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE);
         }
 
         GenericConversion makeDateConversion = convertMakeDateFunctions(converted);
@@ -3818,7 +3841,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         String dmDateExpression = isNowExpression(dateExpression) ? "SYSDATE" : dateExpression;
-        return "DATEADD(" + unit + ", " + negatedIntervalAmount(amount) + ", " + dmDateExpression + ")";
+        return "DATEADD(" + unit + ", " + negatedDmIntervalAmount(amount) + ", " + dmDateExpression + ")";
     }
 
     private GenericConversion convertSubDateFunctions(String sql) {
@@ -3873,9 +3896,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             if (amount.isBlank()) {
                 return null;
             }
-            return "DATEADD(" + unit + ", " + negatedIntervalAmount(amount) + ", " + dateExpression + ")";
+            return "DATEADD(" + unit + ", " + negatedDmIntervalAmount(amount) + ", " + dateExpression + ")";
         }
-        return "DATEADD(DAY, " + negatedIntervalAmount(dayExpression) + ", " + dateExpression + ")";
+        return "DATEADD(DAY, " + negatedDmIntervalAmount(dayExpression) + ", " + dateExpression + ")";
     }
 
     private GenericConversion convertDateAddInterval(String sql) {
@@ -3952,8 +3975,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     index++;
                 } else {
                     String amount = current == '-'
-                            ? negatedIntervalAmount(addition.intervalExpression().amount())
-                            : addition.intervalExpression().amount();
+                            ? negatedDmIntervalAmount(addition.intervalExpression().amount())
+                            : dmIntervalAmount(addition.intervalExpression().amount());
                     String unit = addition.intervalExpression().unit();
                     String rewrittenUnit = unit;
                     if ("HOUR_SECOND".equalsIgnoreCase(unit)) {
@@ -4132,7 +4155,81 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (amount.isBlank()) {
             return null;
         }
-        return "DATEADD(" + unit + ", " + amount + ", " + dateExpression + ")";
+        return "DATEADD(" + unit + ", " + dmIntervalAmount(amount) + ", " + dateExpression + ")";
+    }
+
+    private GenericConversion convertTimestampDiffNumericIfNullComparisons(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else if (startsFunction(sql, index, "TIMESTAMPDIFF")) {
+                FunctionCall timestampDiff = readFunctionCall(sql, index, "TIMESTAMPDIFF");
+                NumericIfNullComparison comparison = timestampDiff == null
+                        ? null
+                        : readNumericIfNullComparison(sql, timestampDiff.endIndex());
+                if (comparison == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(sql, index, comparison.ifNullStart());
+                    converted.append("CAST(")
+                            .append(sql, comparison.ifNullStart(), comparison.ifNullEnd())
+                            .append(" AS BIGINT)");
+                    index = comparison.ifNullEnd();
+                    changed = true;
+                }
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private NumericIfNullComparison readNumericIfNullComparison(String sql, int timestampDiffEnd) {
+        int operatorStart = skipWhitespace(sql, timestampDiffEnd);
+        int operatorEnd = comparisonOperatorEnd(sql, operatorStart);
+        if (operatorEnd < 0) {
+            return null;
+        }
+        int ifNullStart = skipWhitespace(sql, operatorEnd);
+        if (!startsFunction(sql, ifNullStart, "IFNULL")) {
+            return null;
+        }
+        FunctionCall ifNull = readFunctionCall(sql, ifNullStart, "IFNULL");
+        if (ifNull == null || !NUMERIC_JDBC_TYPE_PLACEHOLDER_PATTERN.matcher(ifNull.body()).find()) {
+            return null;
+        }
+        return new NumericIfNullComparison(ifNullStart, ifNull.endIndex());
+    }
+
+    private int comparisonOperatorEnd(String sql, int index) {
+        if (index >= sql.length()) {
+            return -1;
+        }
+        if (index + 1 < sql.length()) {
+            String twoCharacters = sql.substring(index, index + 2);
+            if (">=".equals(twoCharacters)
+                    || "<=".equals(twoCharacters)
+                    || "<>".equals(twoCharacters)
+                    || "!=".equals(twoCharacters)) {
+                return index + 2;
+            }
+        }
+        char operator = sql.charAt(index);
+        return operator == '=' || operator == '>' || operator == '<' ? index + 1 : -1;
     }
 
     private GenericConversion convertMakeDateFunctions(String sql) {
@@ -4729,6 +4826,37 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return "-" + trimmed;
         }
         return "(0 - " + trimmed + ")";
+    }
+
+    private String dmIntervalAmount(String amount) {
+        String trimmed = amount == null ? "" : amount.trim();
+        if (trimmed.isBlank()) {
+            return trimmed;
+        }
+        if (INTEGER_LITERAL_PATTERN.matcher(trimmed).matches()
+                || NUMERIC_JDBC_TYPE_PLACEHOLDER_PATTERN.matcher(trimmed).matches()
+                || NUMERIC_CAST_PATTERN.matcher(trimmed).matches()
+                || NUMERIC_INTERVAL_EXPRESSION_PATTERN.matcher(trimmed).find()
+                || NUMERIC_ARITHMETIC_INTERVAL_PATTERN.matcher(trimmed).matches()) {
+            return trimmed;
+        }
+        return "CAST(" + trimmed + " AS BIGINT)";
+    }
+
+    private String negatedDmIntervalAmount(String amount) {
+        String trimmed = amount == null ? "" : amount.trim();
+        if (trimmed.startsWith("-")) {
+            return dmIntervalAmount(trimmed.substring(1));
+        }
+        if (trimmed.startsWith("+")) {
+            return "-" + dmIntervalAmount(trimmed.substring(1));
+        }
+        String numericAmount = dmIntervalAmount(trimmed);
+        if (INTEGER_LITERAL_PATTERN.matcher(trimmed).matches()
+                || NUMERIC_JDBC_TYPE_PLACEHOLDER_PATTERN.matcher(trimmed).matches()) {
+            return "-" + numericAmount;
+        }
+        return "(0 - " + numericAmount + ")";
     }
 
     private GenericConversion convertUnsignedCasts(String sql) {
@@ -12082,6 +12210,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record DateIntervalAddition(DateExpression leftExpression, IntervalExpression intervalExpression) {
+    }
+
+    private record NumericIfNullComparison(int ifNullStart, int ifNullEnd) {
     }
 
     private record TopLevelArgument(String text, int startIndex, int endIndex) {

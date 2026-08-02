@@ -1686,7 +1686,7 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo(
-                "select DATEADD(MINUTE, ifnull(c.accept_time,#{acceptOvertimeMinute}) - 5, now())"
+                "select DATEADD(MINUTE, CAST(ifnull(c.accept_time,#{acceptOvertimeMinute}) - 5 AS BIGINT), now())"
         );
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
     }
@@ -1733,7 +1733,7 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select DATEADD(DAY, #{days}, created_at) from login_log");
+                .isEqualTo("select DATEADD(DAY, CAST(#{days} AS BIGINT), created_at) from login_log");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
     }
 
@@ -1757,7 +1757,7 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
-                .isEqualTo("select * from task where taskStartTime BETWEEN (DATEADD(DAY, -${day}, SYSDATE)) and SYSDATE");
+                .isEqualTo("select * from task where taskStartTime BETWEEN (DATEADD(DAY, (0 - CAST(${day} AS BIGINT)), SYSDATE)) and SYSDATE");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
     }
 
@@ -1793,10 +1793,37 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo(
-                "select DATEADD(MINUTE, (0 - ifnull(c.accept_time,#{acceptOvertimeMinute})), now())"
+                "select DATEADD(MINUTE, (0 - CAST(ifnull(c.accept_time,#{acceptOvertimeMinute}) AS BIGINT)), now())"
         );
         assertThat(result.convertedSql()).doesNotContain("DATEADD(DAY, (DATEADD(");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE);
+    }
+
+    @Test
+    void castsStringCompatibleMysqlIntervalAmountsForDamengDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select SUBDATE(f.begin_time, interval - #{complaintCanCustomerEvalHour} hour)"
+        );
+
+        assertThat(result.convertedSql()).isEqualTo(
+                "select DATEADD(HOUR, CAST(#{complaintCanCustomerEvalHour} AS BIGINT), f.begin_time)"
+        );
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE);
+    }
+
+    @Test
+    void castsNumericIfNullFallbackInTimestampDiffComparison() {
+        SqlConversionResult result = converter.convert(
+                "select * from task where TIMESTAMPDIFF(MINUTE, start_time, now()) "
+                        + ">= IFNULL(config_value,#{timeout,jdbcType=INTEGER})"
+        );
+
+        assertThat(result.convertedSql()).isEqualTo(
+                "select * from task where TIMESTAMPDIFF(MINUTE, start_time, now()) "
+                        + ">= CAST(IFNULL(config_value,#{timeout,jdbcType=INTEGER}) AS BIGINT)"
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE);
     }
 
     @Test

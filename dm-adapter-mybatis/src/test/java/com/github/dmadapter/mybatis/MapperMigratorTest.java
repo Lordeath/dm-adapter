@@ -6265,6 +6265,43 @@ class MapperMigratorTest {
     }
 
     @Test
+    void castsMysqlImplicitNumericIntervalValuesInsideMapperXml() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/TaskMapper.xml", """
+                select SUBDATE(f.begin_time, interval - #{customerEvalHour} hour)
+                from sample_flow f
+                where TIMESTAMPDIFF(MINUTE, f.begin_time, now())
+                    >= IFNULL(f.timeout_value,#{timeoutMinute,jdbcType=INTEGER})
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TaskMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml"));
+        assertThat(rewritten)
+                .contains("DATEADD(HOUR, CAST(#{customerEvalHour} AS BIGINT), f.begin_time)")
+                .contains("CAST(IFNULL(f.timeout_value,#{timeoutMinute,jdbcType=INTEGER}) AS BIGINT)");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .contains(
+                        MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE,
+                        MySqlToDmSqlConverter.MYSQL_NUMERIC_IFNULL_COMPARISON_CAST_RULE
+                );
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void convertsUpdateJoinWithLimitedDerivedSelectionAndAdditionalSource() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/TaskMapper.xml", """
                 update sample_task target

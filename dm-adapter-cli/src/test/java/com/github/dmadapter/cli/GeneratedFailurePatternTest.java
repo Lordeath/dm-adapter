@@ -59,6 +59,14 @@ class GeneratedFailurePatternTest {
                     .contains("java.lang.IllegalStateException: outer")
                     .contains(" <- caused by java.lang.IllegalArgumentException: inner");
 
+            Method defaultNameBasedString = validationClass.getDeclaredMethod(
+                    "defaultNameBasedString",
+                    String.class
+            );
+            defaultNameBasedString.setAccessible(true);
+            assertThat(defaultNameBasedString.invoke(validation, "repairCanCustomerEvalHour")).isEqualTo("1");
+            assertThat(defaultNameBasedString.invoke(validation, "dispatchingOvertimeMinute")).isEqualTo("1");
+
             assertThat(referencedTables(
                     validationClass,
                     validation,
@@ -372,6 +380,25 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("DYNAMIC_BRANCH_PARAMETER_CONFLICT");
             assertThat(category(validationClass, validation, conflictingOrderRecord))
                     .isEqualTo("METHOD_ARGS_OR_BINDING");
+
+            String conflictingDerivedTableAliases = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException:
+                    Repetitive table name or alias [t]
+                    ### SQL: select a.id from ns_sr_services a
+                    left join (select service_id from ns_sr_services_log where op_stepname = 'void') t
+                    on a.id = t.service_id
+                    left join (select service_id from ns_sr_services_log where op_stepname = 'pending') t
+                    on a.id = t.service_id
+                    ### Cause: dm.jdbc.driver.DMException: Repetitive table name or alias [t]
+                    """;
+            Object conflictingAliasRecord = failedRecord(validationClass, conflictingDerivedTableAliases);
+            assertThat(failurePattern(validationClass, validation, conflictingAliasRecord))
+                    .isEqualTo("DYNAMIC_BRANCH_PARAMETER_CONFLICT");
+            assertThat(category(validationClass, validation, conflictingAliasRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+            assertThat(shouldSuggestValidationArguments(validationClass, validation, conflictingAliasRecord))
+                    .isFalse();
 
             String trailingSelectComma = """
                     org.apache.ibatis.exceptions.PersistenceException:
