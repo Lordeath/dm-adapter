@@ -9325,6 +9325,9 @@ class DmSqlValidationTestGenerator {
                     if (hasLikelyOriginalColumnNameMismatch(message)) {
                         return "ORIGINAL_SQL_COLUMN_NAME_MISMATCH";
                     }
+                    if (hasOriginalAmbiguousColumnReference(message)) {
+                        return "ORIGINAL_SQL_AMBIGUOUS_COLUMN";
+                    }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
                         return "JAVA_MAPPER_PARAM_ANNOTATION";
                     }
@@ -9376,6 +9379,12 @@ class DmSqlValidationTestGenerator {
                     if (hasTestDataOrConstraintIssue(message)) {
                         return "TEST_DATA_OR_CONSTRAINT";
                     }
+                    if (hasUnresolvedFunctionObject(message)) {
+                        return "TEST_SCHEMA_FUNCTION";
+                    }
+                    if (isSchemaObjectFailure(lower)) {
+                        return "TEST_SCHEMA_OBJECT";
+                    }
                     if (hasMissingDynamicIdentifierIssue(message)) {
                         return "DYNAMIC_IDENTIFIER_PARAMETER";
                     }
@@ -9391,6 +9400,9 @@ class DmSqlValidationTestGenerator {
                     if (hasConflictingDynamicBranchClauses(record, message)) {
                         return "DYNAMIC_BRANCH_PARAMETER_CONFLICT";
                     }
+                    if (hasGeneratedDynamicExpressionParameterIssue(message, record.parameterSummary)) {
+                        return "DYNAMIC_SQL_FRAGMENT_PARAMETER";
+                    }
                     if (hasDynamicSqlFragmentParameterIssue(message)) {
                         return "DYNAMIC_SQL_FRAGMENT_PARAMETER";
                     }
@@ -9405,12 +9417,6 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasMysqlTimeDiff(message)) {
                         return "MYSQL_TIMEDIFF";
-                    }
-                    if (hasUnresolvedFunctionObject(message)) {
-                        return "TEST_SCHEMA_FUNCTION";
-                    }
-                    if (isSchemaObjectFailure(lower)) {
-                        return "TEST_SCHEMA_OBJECT";
                     }
                     if (hasOriginalXmlSyntaxDefect(message)) {
                         return "ORIGINAL_XML_SYNTAX_DEFECT";
@@ -9659,6 +9665,9 @@ class DmSqlValidationTestGenerator {
                     }
                     String message = normalizeMessage(record.message);
                     String parameterSummary = record.parameterSummary == null ? "" : record.parameterSummary;
+                    if (hasGeneratedDynamicExpressionParameterIssue(message, parameterSummary)) {
+                        return true;
+                    }
                     return hasGeneratedDynamicIdentifierPlaceholder(message)
                             || Pattern.compile("(?im)^### SQL:\\\\s*(?:ID|test)\\\\s*$").matcher(message).find()
                             || Pattern.compile("(?i)### SQL:\\\\s*(?:ID|test)(?:\\\\s*###|\\\\s*$)").matcher(message).find()
@@ -9674,6 +9683,20 @@ class DmSqlValidationTestGenerator {
                             || parameterSummary.contains("Tuple3{f0=null")
                             || parameterSummary.contains("Tuple4{f0=null")
                             || message.contains("Can't add values ` , null");
+                }
+
+                private boolean hasGeneratedDynamicExpressionParameterIssue(
+                        String message,
+                        String parameterSummary
+                ) {
+                    String value = message == null ? "" : message;
+                    String parameters = parameterSummary == null ? "" : parameterSummary;
+                    return Pattern.compile(
+                                    "(?i)\\\\b(?:field|column|expression|fragment|condition|predicate)[A-Za-z0-9_]*=\\\"1\\\\s*=\\\\s*1\\\""
+                            ).matcher(parameters).find()
+                            && Pattern.compile(
+                                    "(?i)### SQL:[\\\\s\\\\S]*?\\\\b1\\\\s*=\\\\s*1\\\\s*(?:=|<>|!=|>=|<=|>|<|like\\\\b|in\\\\s*\\\\()"
+                            ).matcher(value).find();
                 }
 
                 private boolean hasForeachItemBindingIssue(String message) {
@@ -9728,6 +9751,8 @@ class DmSqlValidationTestGenerator {
                     String lower = value.toLowerCase(Locale.ROOT);
                     return lower.contains("列表不匹配")
                             || lower.contains("重复的列名")
+                            || (lower.contains("parsing error was found in mapping #{")
+                                    && lower.contains("check syntax #{property"))
                             || (lower.contains("methodfailedexception")
                                     && lower.contains("nosuchmethodexception")
                                     && lower.contains("dynamiccontext$contextmap"))
@@ -9752,8 +9777,10 @@ class DmSqlValidationTestGenerator {
                             ).matcher(value).find()
                             || hasUnbalancedSqlParentheses(value)
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b[A-Za-z_][A-Za-z0-9_$]*\\\\?").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\blike\\\\s+\\\\?\\\\s*'").matcher(value).find()
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?(?:'[^']*'|\\\\?|\\\\d+)(?:and|or)\\\\d+\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\band[A-Za-z_][A-Za-z0-9_$]*\\\\s+(?:in|=|<>|!=|>|<|like)\\\\b").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\b(?:where|and|or)\\\\s+\\\\?(?=\\\\s*(?:and|or|group\\\\s+by|order\\\\s+by|having|### Cause:|$))").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\binsert\\\\s+into\\\\b[\\\\s\\\\S]*?\\\\([^)]*(?:`[^`]+`|\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)\\\\s+(?:`[^`]+`|\\\"[^\\\"]+\\\"|[A-Za-z_][A-Za-z0-9_$]*)\\\\s*(?:,|\\\\))").matcher(value).find()
@@ -9761,7 +9788,8 @@ class DmSqlValidationTestGenerator {
                             || Pattern.compile("(?i)insert\\\\s+into\\\\b[\\\\s\\\\S]*?values\\\\s*\\\\([\\\\s\\\\S]*?[A-Za-z_][A-Za-z0-9_$]*\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*=\\\\s*(?:\\\\?|\\\\d+|'[^']*')\\\\s+" + identifier + "\\\\s*=").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bwhere\\\\b[\\\\s\\\\S]*?\\\\b" + identifier + "\\\\s*(?:=|<>|!=|>=|<=|>|<|like)\\\\s*(?:\\\\?|\\\\d+|'[^']*'|\\\\([^)]*\\\\))\\\\s+" + identifier + "\\\\s+(?:in\\\\s*\\\\(|=|<>|!=|>=|<=|>|<|like\\\\b|is\\\\b)").matcher(value).find()
-                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(value).find();
+                            || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?;\\\\s*(?:group\\\\s+by|order\\\\s+by|having)\\\\b").matcher(value).find()
+                            || lower.contains("no enum constant org.apache.ibatis.type.jdbctype.");
                 }
 
                 private boolean hasTestDataOrConstraintIssue(String message) {
@@ -9997,6 +10025,55 @@ class DmSqlValidationTestGenerator {
                     return false;
                 }
 
+                private boolean hasOriginalAmbiguousColumnReference(String message) {
+                    if (dbColumnMetadata == null || isBlank(message)) {
+                        return false;
+                    }
+                    List<String> ambiguousColumns = new ArrayList<>();
+                    ambiguousColumns.addAll(bracketedValuesAfterMarker(message, "有歧义的列名"));
+                    ambiguousColumns.addAll(bracketedValuesAfterMarker(message, "Ambiguous column name"));
+                    if (ambiguousColumns.isEmpty()) {
+                        return false;
+                    }
+                    String sql = sqlFromMessage(message);
+                    if (isBlank(sql)) {
+                        return false;
+                    }
+                    LinkedHashSet<String> tables = new LinkedHashSet<>();
+                    Matcher tableMatcher = Pattern.compile(
+                            "\\\\b(?:from|join)\\\\s+([A-Za-z0-9_$.-]+)",
+                            Pattern.CASE_INSENSITIVE
+                    ).matcher(sql);
+                    while (tableMatcher.find()) {
+                        tables.add(tableMatcher.group(1));
+                    }
+                    if (tables.size() < 2) {
+                        return false;
+                    }
+                    for (String ambiguousColumn : ambiguousColumns) {
+                        String column = Pattern.quote(ambiguousColumn);
+                        boolean hasUnqualifiedReference = Pattern.compile(
+                                "(?<![A-Za-z0-9_$.])" + column + "(?![A-Za-z0-9_$])",
+                                Pattern.CASE_INSENSITIVE
+                        ).matcher(sql).find();
+                        boolean isSelectAliasReference = Pattern.compile(
+                                "\\\\bas\\\\s+" + column + "\\\\b",
+                                Pattern.CASE_INSENSITIVE
+                        ).matcher(sql).find();
+                        if (!hasUnqualifiedReference || isSelectAliasReference) {
+                            continue;
+                        }
+                        int matchingTables = 0;
+                        for (String table : tables) {
+                            if (dbColumnMetadata.hasColumn(table, ambiguousColumn)
+                                    && ++matchingTables > 1) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+
                 private boolean hasDamengHavingSelectAliasFailure(String message) {
                     List<String> invalidColumns = new ArrayList<>();
                     invalidColumns.addAll(bracketedValuesAfterMarker(message, "无效的列名"));
@@ -10094,6 +10171,9 @@ class DmSqlValidationTestGenerator {
                     }
                     String message = record.message == null ? "" : record.message;
                     String lower = message.toLowerCase(Locale.ROOT);
+                    if (hasOriginalXmlSyntaxDefect(message)) {
+                        return "ORIGINAL_SQL";
+                    }
                     if (containsAny(message,
                             "No mapper XML files matched",
                             "No mapped statements were found",
@@ -10125,13 +10205,22 @@ class DmSqlValidationTestGenerator {
                     if (hasLikelyOriginalColumnNameMismatch(message)) {
                         return "ORIGINAL_SQL";
                     }
+                    if (hasOriginalAmbiguousColumnReference(message)) {
+                        return "ORIGINAL_SQL";
+                    }
                     if (hasOriginalMapperPropertyNameMismatch(message)) {
                         return "ORIGINAL_SQL";
+                    }
+                    if (hasUnresolvedFunctionObject(message) || isSchemaObjectFailure(lower)) {
+                        return "TEST_SCHEMA";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
                     if (hasNonIterableCollectionParameter(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
+                    }
+                    if (hasGeneratedDynamicExpressionParameterIssue(message, record.parameterSummary)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
                     if (hasConflictingDynamicBranchClauses(record, message)) {
@@ -10160,13 +10249,7 @@ class DmSqlValidationTestGenerator {
                     if (isAutoParameter(record) && hasGeneratedDynamicIdentifierPlaceholder(message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
-                    if (isSchemaObjectFailure(lower)) {
-                        return "TEST_SCHEMA";
-                    }
                     if (hasRequiredInsertColumnOmission(message)) {
-                        return "ORIGINAL_SQL";
-                    }
-                    if (hasOriginalXmlSyntaxDefect(message)) {
                         return "ORIGINAL_SQL";
                     }
                     if (lower.contains("sql语句为null或空值") || hasBrokenDynamicSqlShape(message)) {
@@ -10178,9 +10261,6 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasMissingDynamicIdentifierIssue(message)) {
                         return "METHOD_ARGS_OR_BINDING";
-                    }
-                    if (hasUnresolvedFunctionObject(message)) {
-                        return "TEST_SCHEMA";
                     }
                     if (hasMysqlCollateClause(message)) {
                         return "SQL_SYNTAX";
@@ -12526,6 +12606,16 @@ class DmSqlValidationTestGenerator {
                             }
                         }
                         return candidates == 1;
+                    }
+
+                    private boolean hasColumn(String tableName, String columnName) {
+                        String normalizedTable = normalizeIdentifier(tableName);
+                        int separator = normalizedTable.lastIndexOf('.');
+                        if (separator >= 0) {
+                            normalizedTable = normalizedTable.substring(separator + 1);
+                        }
+                        Set<String> columns = tableColumns.get(normalizedTable);
+                        return columns != null && columns.contains(normalizeIdentifier(columnName));
                     }
 
                     private boolean editDistanceAtMostOne(String left, String right) {

@@ -3606,13 +3606,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 if (startsKeyword(sql, updateIndex, "UPDATE")
                         && startsKeyword(sql, timestampIndex, "CURRENT_TIMESTAMP")) {
                     int cursor = skipWhitespace(sql, timestampIndex + "CURRENT_TIMESTAMP".length());
+                    String precision = "";
                     if (cursor < sql.length() && sql.charAt(cursor) == '(') {
                         int close = findMatchingParen(sql, cursor);
                         if (close > 0) {
+                            String candidate = sql.substring(cursor + 1, close).strip();
+                            if (candidate.matches("\\d+")) {
+                                precision = candidate;
+                            }
                             cursor = skipWhitespace(sql, close + 1);
                         }
                     }
-                    converted.append("ON UPDATE NOW()");
+                    converted.append("ON UPDATE NOW(").append(precision).append(")");
                     index = cursor;
                     changed = true;
                     appendSpaceBeforeNextTokenIfNeeded(converted, sql, index);

@@ -6909,6 +6909,91 @@ class MapperMigratorTest {
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
+    @Test
+    void qualifiesSelectAliasInGroupByAcrossDynamicJoinBranches() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/BillUsedMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.BillUsedMapper">
+                    <select id="list" resultType="map">
+                        select
+                            used.precinctId,
+                            accountPayment.squareTypeID as squareTypeID,
+                            <choose>
+                                <when test="filtered">sum(if(used.BillStatus = '红字发票',
+                                    0 - ifnull(accountPayment.chargePaid, 0),
+                                    ifnull(accountPayment.chargePaid, 0))) as totalAmount,</when>
+                                <otherwise>sum(accountPayment.chargePaid) as totalAmount,</otherwise>
+                            </choose>
+                            accountPayment.squareTypeID as squareTypeID
+                        from ns_bill_billused used
+                        <choose>
+                            <when test="filtered">
+                                left join ns_bill_billuseddetail detail on detail.billUsedId = used.id
+                                left join bill_billused_detail_payment_relationship relate
+                                    on relate.bill_detail_id = ifnull(detail.refBlueBillDetailId, detail.id)
+                                left join ns_payment_chargepayment chargePayment
+                                    on relate.payment_id = chargePayment.id
+                                left join ns_payment_chargepayment accountPayment
+                                    on chargePayment.id = accountPayment.relatePayment
+                            </when>
+                            <otherwise>
+                                left join ns_payment_chargepayment chargePayment
+                                    on used.billNum = chargePayment.billNo
+                                left join ns_payment_chargepayment accountPayment
+                                    on chargePayment.id = accountPayment.relatePayment
+                            </otherwise>
+                        </choose>
+                        where used.isDelete = 0
+                        and used.precinctId in
+                        <foreach collection="precinctIdsList" item="item" open="(" close=")" separator=",">
+                            #{item}
+                        </foreach>
+                        <if test="dayClosingBatchList != null and dayClosingBatchList.size() > 0">
+                            and (chargePayment.dayClosingBatch in
+                            <foreach collection="dayClosingBatchList" item="item" open="(" close=")" separator=",">
+                                #{item}
+                            </foreach>
+                            <if test="dayClosingIdList != null and dayClosingIdList.size() > 0">
+                                or chargePayment.id in
+                                <foreach collection="dayClosingIdList" item="item" open="(" close=")" separator=",">
+                                    #{item}
+                                </foreach>
+                            </if>)
+                        </if>
+                        group by squareTypeID
+                        having totalAmount != 0
+                    </select>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BillUsedMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/BillUsedMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("group by accountPayment.squareTypeID")
+                .doesNotContain("group by squareTypeID")
+                .doesNotContain("having totalAmount != 0");
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_JOINED_SELECT_ALIAS_REFERENCE_QUALIFIED_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
     private int countMatches(String value, String needle) {
         int count = 0;
         int index = 0;
