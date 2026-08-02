@@ -1543,6 +1543,55 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsSingleTargetJoinedDeleteToRowidSubquery() {
+        SqlConversionResult result = converter.convert("""
+                delete s.* from ns_sr_flow_group_sentry s
+                left join ns_sr_flow_group_precinct p on s.precinct_groupid = p.id
+                where p.area_id = #{areaId}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                DELETE FROM ns_sr_flow_group_sentry WHERE ROWID IN (SELECT s.ROWID FROM ns_sr_flow_group_sentry s
+                left join ns_sr_flow_group_precinct p on s.precinct_groupid = p.id
+                where p.area_id = #{areaId})
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DELETE_JOIN_RULE);
+    }
+
+    @Test
+    void convertsSafeTwoTargetLeftJoinedDeleteInChildFirstOrder() {
+        SqlConversionResult result = converter.convert("""
+                delete a,c from ns_sr_flow_action a
+                left join ns_sr_flow_action_condition c on a.id = c.action_id
+                where a.step_id = #{stepId}
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                BEGIN
+                DELETE FROM ns_sr_flow_action_condition WHERE ROWID IN (SELECT c.ROWID FROM ns_sr_flow_action a
+                left join ns_sr_flow_action_condition c on a.id = c.action_id
+                where a.step_id = #{stepId});
+                DELETE FROM ns_sr_flow_action WHERE ROWID IN (SELECT a.ROWID FROM ns_sr_flow_action a
+                left join ns_sr_flow_action_condition c on a.id = c.action_id
+                where a.step_id = #{stepId});
+                END
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DELETE_JOIN_RULE);
+    }
+
+    @Test
+    void keepsTwoTargetJoinedDeleteWhenWhereClauseDependsOnChild() {
+        String sql = "delete a,c from parent a left join child c on a.id = c.parent_id where c.kind = #{kind}";
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
     void keepsDeleteAliasStarWhenAliasDoesNotMatchTargetAlias() {
         SqlConversionResult result = converter.convert("delete t.* from sample_user u where u.id = #{id}");
 
@@ -1594,6 +1643,37 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql())
                 .isEqualTo("select DATEADD(MINUTE, 120, CONCAT(DATE(checkDate), ' ', onOffTime)) from record");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
+    void convertsMysqlAdddateIntervalExpressionToDateadd() {
+        SqlConversionResult result = converter.convert(
+                "select ADDDATE(now(), interval ifnull(c.accept_time,#{acceptOvertimeMinute}) - 5 minute)"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select DATEADD(MINUTE, ifnull(c.accept_time,#{acceptOvertimeMinute}) - 5, now())"
+        );
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE);
+    }
+
+    @Test
+    void quotesNumericLeadingAggregateAliases() {
+        SqlConversionResult result = converter.convert("""
+                select sum(case when satisfaction = 5 then 1 else 0 end) 5points,
+                       sum(case when satisfaction = 4 then 1 else 0 end) 4points
+                from ns_sr_services
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select sum(case when satisfaction = 5 then 1 else 0 end) AS "5points",
+                       sum(case when satisfaction = 4 then 1 else 0 end) AS "4points"
+                from ns_sr_services
+                """);
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_NUMERIC_LEADING_SELECT_ALIAS_RULE);
     }
 
     @Test
@@ -1669,6 +1749,20 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql())
                 .isEqualTo("select DATEADD(DAY, (0 - WEEKDAY(#{day})), #{day}) from dual");
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE);
+    }
+
+    @Test
+    void convertsMysqlSubdateIntervalUsingItsActualUnit() {
+        SqlConversionResult result = converter.convert(
+                "select SUBDATE(now(), interval ifnull(c.accept_time,#{acceptOvertimeMinute}) minute)"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo(
+                "select DATEADD(MINUTE, (0 - ifnull(c.accept_time,#{acceptOvertimeMinute})), now())"
+        );
+        assertThat(result.convertedSql()).doesNotContain("DATEADD(DAY, (DATEADD(");
         assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_SUBDATE_RULE);
     }
 

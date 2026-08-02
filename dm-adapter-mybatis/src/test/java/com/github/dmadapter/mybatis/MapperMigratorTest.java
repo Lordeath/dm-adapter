@@ -3302,6 +3302,55 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicTwoTargetJoinedDeleteDuplicatesForeachInSafeChildFirstBlock() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.FlowActionMapper">
+                    <update id="deleteByStepIds" parameterType="java.util.List">
+                        delete a,c from ns_sr_flow_action a
+                        left join ns_sr_flow_action_condition c on a.id = c.action_id
+                        where a.step_id in
+                        <foreach collection="list" item="item" open="(" close=")" separator=",">
+                            #{item}
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/FlowActionMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/FlowActionMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve(
+                "src/main/resources/mapper-dm/FlowActionMapper.xml"
+        ));
+        assertThat(rewritten)
+                .contains("BEGIN")
+                .contains("DELETE FROM ns_sr_flow_action_condition WHERE ROWID IN")
+                .contains("DELETE FROM ns_sr_flow_action WHERE ROWID IN")
+                .doesNotContain("delete a,c from");
+        assertThat(rewritten.split("<foreach\\b", -1).length - 1).isEqualTo(2);
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_DELETE_JOIN_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicWhereKeepsForeachPredicateAfterOpenConnectorGroup() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
