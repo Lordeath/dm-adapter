@@ -310,6 +310,75 @@ class DamengSqlScriptIntegrationTest {
         }
     }
 
+    @Test
+    void executesMixedIdentityValuesTwiceWithExplicitAndGeneratedIds() throws Exception {
+        String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
+        String username = requiredEnvironment("DM_DB_USERNAME");
+        String password = requiredEnvironment("DM_DB_PASSWORD");
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "DM_ADAPTER_IT_IDENT_" + suffix;
+
+        Path sqlRoot = tempDir.resolve("identity-sql/v2");
+        Path sqlRootOut = tempDir.resolve("identity-sql/v2-dm");
+        Files.createDirectories(sqlRoot);
+        Files.writeString(sqlRoot.resolve("identity.sql"), """
+                CREATE TABLE IF NOT EXISTS %s (
+                    CODE VARCHAR(32),
+                    ID BIGINT AUTO_INCREMENT,
+                    NAME VARCHAR(64),
+                    PRIMARY KEY (ID)
+                );
+                DELETE FROM %s;
+                INSERT INTO %s (CODE, ID, NAME)
+                VALUES ('generated', NULL, 'Generated'), ('explicit', 7, 'Explicit');
+                """.formatted(table, table, table));
+        new SqlScriptMigrator(
+                new MySqlToDmSqlConverter(),
+                (files, environment) -> SqlScriptValidationRun.notAttempted("integration fixture", List.of())
+        ).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "dm-identity-integration",
+                schema,
+                DmValidationEnvironment.from(Map.of())
+        ));
+        List<String> convertedStatements = SqlScriptParser.statements(
+                Files.readString(sqlRootOut.resolve("identity.sql"))
+        ).stream().filter(SqlScriptParser::executable).toList();
+        assertThat(convertedStatements)
+                .anySatisfy(sql -> assertThat(sql)
+                        .contains("SET IDENTITY_INSERT " + table + " ON WITH REPLACE NULL")
+                        .contains("WHEN OTHERS THEN")
+                        .contains("RAISE;"));
+
+        Class.forName("dm.jdbc.driver.DmDriver");
+        try (Connection connection = DriverManager.getConnection(jdbcUrl, username, password);
+             Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                executeStatements(statement, convertedStatements);
+                executeStatements(statement, convertedStatements);
+
+                try (ResultSet resultSet = statement.executeQuery(
+                        "SELECT COUNT(*), SUM(CASE WHEN ID = 7 THEN 1 ELSE 0 END), "
+                                + "SUM(CASE WHEN CODE = 'generated' AND ID IS NOT NULL THEN 1 ELSE 0 END) "
+                                + "FROM " + table
+                )) {
+                    assertThat(resultSet.next()).isTrue();
+                    assertThat(resultSet.getInt(1)).isEqualTo(2);
+                    assertThat(resultSet.getInt(2)).isEqualTo(1);
+                    assertThat(resultSet.getInt(3)).isEqualTo(1);
+                }
+            } finally {
+                dropQuietly(statement, "SET IDENTITY_INSERT " + table + " OFF");
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
     private void executeStatements(Statement statement, List<String> statements) throws Exception {
         for (String sql : statements) {
             statement.execute(sql);

@@ -2753,10 +2753,12 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.sql())
                 .contains("""
-                        SET IDENTITY_INSERT sample_identity ON;
-                        INSERT INTO sample_identity (id, code) VALUES (7, 'A');
-                        SET IDENTITY_INSERT sample_identity OFF;
+                        EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity ON';
+                            INSERT INTO sample_identity (id, code) VALUES (7, 'A');
+                            EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity OFF';
                         """)
+                .contains("WHEN OTHERS THEN")
+                .contains("RAISE;")
                 .doesNotContain("INSERT INTO sample_identity VALUES (7, 'A');")
                 .doesNotContain("sample_identity (code) VALUES");
         assertThat(converted.report().files())
@@ -2789,16 +2791,110 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.sql())
                 .contains("""
-                        SET IDENTITY_INSERT sample_seed_item ON;
-                        INSERT INTO sample_seed_item (id, code, name) VALUES (2, 'A', 'Alpha');
-                        SET IDENTITY_INSERT sample_seed_item OFF;
+                        EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item ON';
+                            INSERT INTO sample_seed_item (id, code, name) VALUES (2, 'A', 'Alpha');
+                            EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item OFF';
                         """)
+                .contains("WHEN OTHERS THEN")
                 .doesNotContain("INSERT INTO sample_seed_item VALUES (2, 'A', 'Alpha');")
                 .doesNotContain("deleteFlag) VALUES");
         assertThat(converted.report().files())
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void wrapsExplicitIdentityColumnListUsingDefinitionOutsideVersionDirectory() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(tempDir.resolve("sql/00_Create_View.sql"), """
+                CREATE TABLE sample_view_node (
+                    code VARCHAR(32),
+                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    name VARCHAR(64),
+                    PRIMARY KEY (id)
+                );
+                """);
+        write(sqlRoot.resolve("20260205.sql"), """
+                INSERT INTO sample_view_node (id, code, name) VALUES (8, 'A', 'Alpha');
+                """);
+
+        SqlScriptMigrationReport report = migrateScriptRoot(sqlRoot, sqlRootOut);
+        String converted = Files.readString(sqlRootOut.resolve("20260205.sql"));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_view_node ON';")
+                .contains("INSERT INTO sample_view_node (id, code, name) VALUES (8, 'A', 'Alpha');")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_view_node OFF';")
+                .contains("WHEN OTHERS THEN")
+                .contains("RAISE;");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void removesGeneratedIdentityFromExistingColumnList() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_identity (
+                    code VARCHAR(32),
+                    id BIGINT IDENTITY(1,1),
+                    name VARCHAR(64)
+                );
+
+                INSERT INTO sample_identity (code, id, name)
+                VALUES ('A', NULL, 'Alpha'), ('B', DEFAULT, 'Beta');
+                """);
+
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_identity (code, name)\nVALUES ('A', 'Alpha'), ('B', 'Beta');")
+                .doesNotContain("IDENTITY_INSERT sample_identity");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
+    void usesReplaceNullForMixedGeneratedAndExplicitIdentityValues() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_identity (
+                    code VARCHAR(32),
+                    id BIGINT IDENTITY(1,1),
+                    name VARCHAR(64)
+                );
+
+                INSERT INTO sample_identity (code, id, name)
+                VALUES ('A', NULL, 'Alpha'), ('B', 7, 'Beta'), ('C', DEFAULT, 'Gamma');
+                """);
+
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity ON WITH REPLACE NULL';")
+                .contains("VALUES ('A', NULL, 'Alpha'), ('B', 7, 'Beta'), ('C', NULL, 'Gamma');")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity OFF';")
+                .contains("WHEN OTHERS THEN")
+                .contains("RAISE;");
+    }
+
+    @Test
+    void handlesIdentityColumnOutsideFirstPositionForImplicitValues() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE sample_identity (
+                    code VARCHAR(32),
+                    id BIGINT IDENTITY(1,1),
+                    name VARCHAR(64)
+                );
+
+                INSERT INTO sample_identity VALUES ('A', 9, 'Alpha');
+                """);
+
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_identity (code, id, name) VALUES ('A', 9, 'Alpha');")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity ON';")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity OFF';");
     }
 
     @Test
@@ -7248,6 +7344,51 @@ class SqlScriptMigratorTest {
                 .contains("WHERE status = ?' INTO matching_count USING new_status")
                 .doesNotContain("INTO ?")
                 .doesNotContain("WHERE status = new_status");
+    }
+
+    @Test
+    void rewritesPostDdlDmlAfterTransientProcedureCollapsesToAnonymousBlock() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS add_demo_columns;
+                DELIMITER $$
+                CREATE PROCEDURE add_demo_columns()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = database()
+                          AND table_name = 'demo'
+                          AND column_name = 'enterprise_id'
+                    ) THEN
+                        ALTER TABLE demo ADD enterprise_id BIGINT DEFAULT NULL;
+                    END IF;
+                    IF EXISTS (
+                        SELECT COLUMN_NAME
+                        FROM information_schema.COLUMNS
+                        WHERE table_schema = database()
+                          AND table_name = 'demo'
+                          AND column_name = 'enterprise_id'
+                    ) THEN
+                        ALTER TABLE demo MODIFY enterprise_id BIGINT DEFAULT 107;
+                        UPDATE demo SET enterprise_id = 107 WHERE enterprise_id IS NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL add_demo_columns();
+                DROP PROCEDURE IF EXISTS add_demo_columns;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ADD enterprise_id BIGINT DEFAULT NULL'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY enterprise_id BIGINT DEFAULT 107'")
+                .contains("EXECUTE IMMEDIATE 'UPDATE demo SET enterprise_id = 107 WHERE enterprise_id IS NULL'")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE add_demo_columns")
+                .doesNotContain("CALL add_demo_columns");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE));
     }
 
     @Test
