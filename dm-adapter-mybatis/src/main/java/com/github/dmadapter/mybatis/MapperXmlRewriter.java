@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class MapperXmlRewriter {
     public static final String MYBATIS_BATCH_INSERT_ADD_VALUES_RULE = "MYBATIS_BATCH_INSERT_ADD_VALUES";
@@ -85,6 +86,11 @@ public class MapperXmlRewriter {
                     + "most one source row. That cardinality cannot be proven from this SQL; fix "
                     + "the original join/deduplication or provide a real uniqueness guarantee "
                     + "instead of choosing an arbitrary source row.";
+    private static final String DAMENG_CTAS_BIND_PARAMETER_REASON =
+            "Dameng CREATE TABLE AS SELECT does not support JDBC bind parameters. The original "
+                    + "#{...} binding was retained because replacing it with ${...} would be injection-unsafe. "
+                    + "Split this mapper operation into an explicit temporary-table DDL and a parameterized "
+                    + "INSERT ... SELECT, or simplify the dynamic binding into a supported scalar <foreach>.";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Set<String> DAMENG_IDENTIFIER_QUOTES = Set.of(
@@ -339,6 +345,16 @@ public class MapperXmlRewriter {
             "MAX",
             "MIN",
             "SUM"
+    );
+    private static final Set<String> SAFE_HAVING_EXPRESSION_KEYWORDS = Set.of(
+            "ALL", "AND", "AS", "ASC", "BETWEEN", "BY", "CASE", "CURRENT", "CURRENT_DATE",
+            "CURRENT_ROW", "CURRENT_SCHEMA", "CURRENT_SCHID", "CURRENT_TIMESTAMP", "DATE", "DAY",
+            "DEC", "DECIMAL", "DESC", "DISTINCT", "DOUBLE", "ELSE", "END", "ESCAPE", "FALSE",
+            "FLOAT", "FOLLOWING", "FROM", "GROUP", "HOUR", "IN", "INT", "INTEGER", "INTERVAL",
+            "IS", "LIKE", "MINUTE", "MONTH", "NOT", "NULL", "NUMBER", "NUMERIC", "OR", "ORDER",
+            "OVER", "PARTITION", "PRECEDING", "RANGE", "REAL", "ROW", "ROWS", "SECOND", "SMALLINT",
+            "SYSDATE", "THEN", "TIMESTAMP", "TRUE", "UNBOUNDED", "VARCHAR", "VARCHAR2", "WHEN",
+            "WITHIN", "YEAR"
     );
 
     public MapperRewriteResult rewrite(Path inputPath, String reportPath, boolean writeChanges, SqlConverter sqlConverter) {
@@ -1121,6 +1137,9 @@ public class MapperXmlRewriter {
             appliedRules.add(MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE);
             converted = dynamicTemporaryTableBindSelect.text();
         }
+        if (containsTemporaryTableAsSelectBindParameter(converted)) {
+            addManualReviewReasons(manualReviewReasons, List.of(DAMENG_CTAS_BIND_PARAMETER_REASON));
+        }
 
         String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
         if (!foreachMerge.equals(converted)) {
@@ -1765,11 +1784,11 @@ public class MapperXmlRewriter {
     private TextRewrite splitTemporaryTableBindSelect(String body) {
         Matcher matcher = DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_PATTERN.matcher(body);
         if (!matcher.find()) {
-            return new TextRewrite(body, false);
+            return splitScalarForeachTemporaryTableBindSelect(body);
         }
         String trailing = body.substring(matcher.end()).strip();
         if (!body.substring(0, matcher.start()).isBlank() || !(trailing.isEmpty() || ";".equals(trailing))) {
-            return new TextRewrite(body, false);
+            return splitScalarForeachTemporaryTableBindSelect(body);
         }
         String tableName = matcher.group("table");
         String inner = matcher.group("inner");
@@ -1806,6 +1825,194 @@ public class MapperXmlRewriter {
                 body.substring(0, matcher.start()) + replacement + body.substring(matcher.end()),
                 true
         );
+    }
+
+    private TextRewrite splitScalarForeachTemporaryTableBindSelect(String body) {
+        TemporaryTableSelectStatement statement = firstTemporaryTableAsSelectStatement(body);
+        if (statement == null
+                || !body.substring(0, statement.createIndex()).isBlank()
+                || !body.substring(statement.endIndex()).isBlank()
+                || statement.tableName().contains("${")
+                || statement.tableName().contains("#{")) {
+            return new TextRewrite(body, false);
+        }
+        String selectSql = stripTrailingStatementTerminator(
+                body.substring(statement.selectIndex(), statement.endIndex())
+        );
+        Matcher foreachMatcher = FOREACH_BLOCK_PATTERN.matcher(selectSql);
+        if (!foreachMatcher.find()) {
+            return new TextRewrite(body, false);
+        }
+        int foreachStart = foreachMatcher.start();
+        int foreachEnd = foreachMatcher.end();
+        if (foreachMatcher.find()) {
+            return new TextRewrite(body, false);
+        }
+        ForeachBlock foreach = readForeach(selectSql.substring(foreachStart, foreachEnd));
+        if (foreach == null
+                || !isSimpleMyBatisPath(foreach.collection())
+                || !isSimpleMyBatisPath(foreach.item())
+                || (!foreach.index().isBlank() && !isSimpleMyBatisPath(foreach.index()))
+                || Pattern.compile("(?is)<(?!/?\s*foreach\b)").matcher(foreach.body()).find()) {
+            return new TextRewrite(body, false);
+        }
+        List<String> bindParameters = myBatisBindParameters(foreach.body());
+        if (bindParameters.isEmpty()
+                || containsMyBatisBindParameter(selectSql.substring(0, foreachStart))
+                || containsMyBatisBindParameter(selectSql.substring(foreachEnd))) {
+            return new TextRewrite(body, false);
+        }
+        String nonBindingForeachText = replaceMyBatisBindParameters(foreach.body(), "")
+                .replaceAll("[\\s,]+", "");
+        if (!nonBindingForeachText.isEmpty()) {
+            return new TextRewrite(body, false);
+        }
+        for (String bindParameter : bindParameters) {
+            String property = myBatisPlaceholderProperty(bindParameter, 0, bindParameter.length());
+            if (!property.equals(foreach.item()) && !property.startsWith(foreach.item() + ".")) {
+                return new TextRewrite(body, false);
+            }
+        }
+
+        String ddlSelect = replaceMyBatisBindParameters(selectSql, "NULL");
+        String insertSelect = replaceMyBatisBindParameters(selectSql, "?");
+        String baseIndent = leadingWhitespace(body);
+        String statementIndent = baseIndent + "    ";
+        ForeachBlock usingForeach = new ForeachBlock(
+                foreach.collection(),
+                foreach.item(),
+                foreach.index(),
+                "",
+                ",",
+                "\n" + statementIndent + "    " + String.join(", ", bindParameters) + "\n" + statementIndent
+        );
+        String replacement = baseIndent + "BEGIN\n"
+                + statementIndent + "EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE "
+                + statement.tableName()
+                + " ON COMMIT PRESERVE ROWS AS SELECT * FROM (\n"
+                + escapeExecuteImmediateSqlPreservingXml(ddlSelect)
+                + "\n) dm_adapter_ctas_source WHERE 1 = 0';\n"
+                + statementIndent + "EXECUTE IMMEDIATE 'INSERT INTO "
+                + statement.tableName()
+                + "\n"
+                + escapeExecuteImmediateSqlPreservingXml(insertSelect)
+                + "' USING\n"
+                + statementIndent
+                + usingForeach.toXml()
+                + ";\n"
+                + baseIndent + "END;";
+        return new TextRewrite(replacement, true);
+    }
+
+    private TemporaryTableSelectStatement firstTemporaryTableAsSelectStatement(String body) {
+        int index = 0;
+        while (index < body.length()) {
+            char current = body.charAt(index);
+            if (body.startsWith("<!--", index)) {
+                int end = body.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? body.length() : end + "-->".length();
+            } else if (body.startsWith("<![CDATA[", index)) {
+                int end = body.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? body.length() : end + "]]>".length();
+            } else if (current == '\'' || current == '"' || current == '`') {
+                index = skipQuoted(body, index, current);
+            } else if (startsMyBatisPlaceholder(body, index)) {
+                index = skipMyBatisPlaceholder(body, index);
+            } else if (current == '<') {
+                XmlTag tag = readXmlTag(body, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (isKeywordAt(body, index, "CREATE")) {
+                TemporaryTableSelectStatement statement = readTemporaryTableAsSelectStatement(body, index);
+                if (statement != null) {
+                    return statement;
+                }
+                index++;
+            } else {
+                index++;
+            }
+        }
+        return null;
+    }
+
+    private boolean containsTemporaryTableAsSelectBindParameter(String body) {
+        TemporaryTableSelectStatement statement = firstTemporaryTableAsSelectStatement(body);
+        return statement != null
+                && containsMyBatisBindParameter(body.substring(statement.selectIndex(), statement.endIndex()));
+    }
+
+    private boolean containsMyBatisBindParameter(String value) {
+        return value != null && value.contains("#{");
+    }
+
+    private List<String> myBatisBindParameters(String value) {
+        List<String> parameters = new ArrayList<>();
+        int index = 0;
+        while (index < value.length()) {
+            int start = value.indexOf("#{", index);
+            if (start < 0) {
+                break;
+            }
+            int end = skipMyBatisPlaceholder(value, start);
+            if (end <= start) {
+                return List.of();
+            }
+            parameters.add(value.substring(start, end));
+            index = end;
+        }
+        return parameters;
+    }
+
+    private String replaceMyBatisBindParameters(String value, String replacement) {
+        StringBuilder converted = new StringBuilder(value.length());
+        int copiedUntil = 0;
+        int index = 0;
+        while (index < value.length()) {
+            int start = value.indexOf("#{", index);
+            if (start < 0) {
+                break;
+            }
+            int end = skipMyBatisPlaceholder(value, start);
+            converted.append(value, copiedUntil, start).append(replacement);
+            copiedUntil = end;
+            index = end;
+        }
+        return converted.append(value, copiedUntil, value.length()).toString();
+    }
+
+    private String stripTrailingStatementTerminator(String sql) {
+        int end = sql.length();
+        while (end > 0 && Character.isWhitespace(sql.charAt(end - 1))) {
+            end--;
+        }
+        if (end > 0 && sql.charAt(end - 1) == ';') {
+            end--;
+        }
+        return sql.substring(0, end).stripTrailing();
+    }
+
+    private boolean isSimpleMyBatisPath(String value) {
+        return value != null && value.matches("[A-Za-z_][A-Za-z0-9_.$\\[\\]]*");
+    }
+
+    private String escapeExecuteImmediateSqlPreservingXml(String value) {
+        StringBuilder escaped = new StringBuilder(value.length() + 32);
+        int index = 0;
+        while (index < value.length()) {
+            if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                if (tag != null) {
+                    escaped.append(value, index, tag.endIndex());
+                    index = tag.endIndex();
+                    continue;
+                }
+            }
+            char current = value.charAt(index++);
+            escaped.append(current);
+            if (current == '\'') {
+                escaped.append('\'');
+            }
+        }
+        return escaped.toString();
     }
 
     private DynamicHavingConversion convertDynamicHavingClauses(
@@ -2310,7 +2517,7 @@ public class MapperXmlRewriter {
                 return havingConversion;
             }
             ScopeHavingConversion trimConversion = convertTrimHavingInScope(body, scope);
-            if (trimConversion.changed()) {
+            if (trimConversion.changed() || !trimConversion.manualReviewReasons().isEmpty()) {
                 return trimConversion;
             }
         }
@@ -2331,12 +2538,19 @@ public class MapperXmlRewriter {
         }
         String selectList = body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex());
         Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(selectList);
+        Map<String, SelectAlias> unsafeAggregateAliases = unsafeAggregateSelectAliases(selectList);
         Map<String, DynamicAggregateAlias> dynamicAggregateAliases = dynamicAggregateSelectAliases(selectList);
         Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(selectList);
         XmlBlock enclosingHavingIf = enclosingXmlBlock(body, scope.havingIndex(), "if");
         boolean havingStartsEnclosingIf = enclosingHavingIf != null
                 && sqlView(body.substring(enclosingHavingIf.openingEnd(), scope.havingIndex())).text().isBlank();
         if (havingStartsEnclosingIf) {
+            int havingStart = scope.havingIndex() + "HAVING".length();
+            String havingContent = body.substring(havingStart, enclosingHavingIf.closingStart());
+            String unsafeAliasReason = unsafeAggregateHavingAliasReason(havingContent, unsafeAggregateAliases);
+            if (!unsafeAliasReason.isBlank()) {
+                return ScopeHavingConversion.manualReview(body, unsafeAliasReason);
+            }
             ScopeHavingConversion enclosedConversion = moveEnclosedHavingIfBeforeGroupBy(
                     body,
                     scope,
@@ -2348,9 +2562,10 @@ public class MapperXmlRewriter {
             if (enclosedConversion.changed()) {
                 return enclosedConversion;
             }
-            int havingStart = scope.havingIndex() + "HAVING".length();
-            String havingContent = body.substring(havingStart, enclosingHavingIf.closingStart());
             if (expandedEnclosedHavingContents.contains(havingContent)) {
+                return ScopeHavingConversion.unchanged(body);
+            }
+            if (isSafeAggregateHavingExpression(havingContent)) {
                 return ScopeHavingConversion.unchanged(body);
             }
             return ScopeHavingConversion.manualReview(
@@ -2361,6 +2576,10 @@ public class MapperXmlRewriter {
         }
         int havingStart = scope.havingIndex() + "HAVING".length();
         String havingContent = body.substring(havingStart, scope.havingEnd());
+        String unsafeAliasReason = unsafeAggregateHavingAliasReason(havingContent, unsafeAggregateAliases);
+        if (!unsafeAliasReason.isBlank()) {
+            return ScopeHavingConversion.manualReview(body, unsafeAliasReason);
+        }
         int groupStart = scope.groupIndex() + "GROUP BY".length();
         String groupByContent = body.substring(groupStart, scope.havingIndex());
         DynamicHavingAliasRewrite dynamicAliasRewrite = rewriteDynamicAggregateHavingAlias(
@@ -2718,10 +2937,15 @@ public class MapperXmlRewriter {
     ) {
         String selectList = body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex());
         Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(selectList);
+        Map<String, SelectAlias> unsafeAggregateAliases = unsafeAggregateSelectAliases(selectList);
         Map<String, DynamicAggregateAlias> dynamicAggregateAliases = dynamicAggregateSelectAliases(selectList);
         Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(selectList);
         int havingStart = scope.havingIndex() + "HAVING".length();
         String havingContent = body.substring(havingStart, scope.havingEnd());
+        String unsafeAliasReason = unsafeAggregateHavingAliasReason(havingContent, unsafeAggregateAliases);
+        if (!unsafeAliasReason.isBlank()) {
+            return ScopeHavingConversion.manualReview(body, unsafeAliasReason);
+        }
         TextRewrite aggregateAliasRewrite = replaceAggregateAliases(havingContent, aggregateAliases);
         TextRewrite selectAliasRewrite = replaceSelectAliases(aggregateAliasRewrite.text(), selectAliases);
 
@@ -2800,10 +3024,10 @@ public class MapperXmlRewriter {
         if (scope.groupIndex() < 0) {
             return ScopeHavingConversion.unchanged(body);
         }
-        Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(
-                body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
-        );
-        if (aggregateAliases.isEmpty()) {
+        String selectList = body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex());
+        Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(selectList);
+        Map<String, SelectAlias> unsafeAggregateAliases = unsafeAggregateSelectAliases(selectList);
+        if (aggregateAliases.isEmpty() && unsafeAggregateAliases.isEmpty()) {
             return ScopeHavingConversion.unchanged(body);
         }
         TrimBlock trimBlock = firstHavingTrimBlock(body, scope.groupIndex(), scope.scopeEnd());
@@ -2811,6 +3035,10 @@ public class MapperXmlRewriter {
             return ScopeHavingConversion.unchanged(body);
         }
         String content = body.substring(trimBlock.contentStart(), trimBlock.contentEnd());
+        String unsafeAliasReason = unsafeAggregateHavingAliasReason(content, unsafeAggregateAliases);
+        if (!unsafeAliasReason.isBlank()) {
+            return ScopeHavingConversion.manualReview(body, unsafeAliasReason);
+        }
         TextRewrite aliasRewrite = replaceAggregateAliases(content, aggregateAliases);
         if (!aliasRewrite.changed()) {
             return ScopeHavingConversion.unchanged(body);
@@ -3520,11 +3748,41 @@ public class MapperXmlRewriter {
         Map<String, SelectAlias> aliases = new LinkedHashMap<>();
         for (String item : splitTopLevelComma(selectList)) {
             SelectAlias selectAlias = selectAlias(item);
-            if (selectAlias != null && containsAggregateFunction(selectAlias.expression())) {
+            if (selectAlias != null && isSafeAggregateHavingExpression(selectAlias.expression())) {
                 aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias);
             }
         }
         return aliases;
+    }
+
+    private Map<String, SelectAlias> unsafeAggregateSelectAliases(String selectList) {
+        Map<String, SelectAlias> aliases = new LinkedHashMap<>();
+        for (String item : splitTopLevelComma(selectList)) {
+            SelectAlias selectAlias = selectAlias(item);
+            if (selectAlias != null
+                    && containsAggregateFunction(selectAlias.expression())
+                    && !isSafeAggregateHavingExpression(selectAlias.expression())) {
+                aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias);
+            }
+        }
+        return aliases;
+    }
+
+    private String unsafeAggregateHavingAliasReason(
+            String havingContent,
+            Map<String, SelectAlias> unsafeAggregateAliases
+    ) {
+        Map<String, SelectAlias> referenced = referencedAliases(havingContent, unsafeAggregateAliases, false);
+        if (referenced.isEmpty()) {
+            return "";
+        }
+        String aliases = referenced.values().stream()
+                .map(SelectAlias::alias)
+                .distinct()
+                .collect(Collectors.joining(", "));
+        return "HAVING references aggregate alias(es) [" + aliases + "] whose SELECT expression mixes aggregate "
+                + "output with non-aggregate column references. Dameng does not accept direct alias expansion unless "
+                + "every non-aggregate expression is proven to match GROUP BY; the original XML was retained.";
     }
 
     private Map<String, DynamicAggregateAlias> dynamicAggregateSelectAliases(String selectList) {
@@ -3610,7 +3868,7 @@ public class MapperXmlRewriter {
             }
             String branchBody = value.substring(branchTag.endIndex(), branchClosingStart);
             SelectAlias branchAlias = selectAliasAllowingSqlFragments(branchBody);
-            if (branchAlias == null || !containsAggregateFunction(branchAlias.expression())) {
+            if (branchAlias == null || !isSafeAggregateHavingExpression(branchAlias.expression())) {
                 return null;
             }
             if (alias.isBlank()) {
@@ -3777,6 +4035,90 @@ public class MapperXmlRewriter {
             }
         }
         return false;
+    }
+
+    private boolean isSafeAggregateHavingExpression(String value) {
+        return containsAggregateFunction(value)
+                && !containsIdentifierOutsideAggregate(value, 0, value.length());
+    }
+
+    private boolean containsIdentifierOutsideAggregate(String value, int start, int end) {
+        int index = start;
+        while (index < end) {
+            if (value.startsWith("<!--", index)) {
+                int commentEnd = value.indexOf("-->", index + "<!--".length());
+                index = commentEnd < 0 ? end : Math.min(end, commentEnd + "-->".length());
+            } else if (value.startsWith("/*", index)) {
+                int commentEnd = value.indexOf("*/", index + 2);
+                index = commentEnd < 0 ? end : Math.min(end, commentEnd + 2);
+            } else if (value.startsWith("--", index)) {
+                int lineEnd = value.indexOf('\n', index + 2);
+                index = lineEnd < 0 ? end : Math.min(end, lineEnd + 1);
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int cdataEnd = value.indexOf("]]>", index + "<![CDATA[".length());
+                index = cdataEnd < 0 ? end : Math.min(end, cdataEnd + "]]>".length());
+            } else if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                index = tag == null ? index + 1 : Math.min(end, tag.endIndex());
+            } else if (value.charAt(index) == '&') {
+                int entityEnd = value.indexOf(';', index + 1);
+                index = entityEnd < 0 || entityEnd >= end ? index + 1 : entityEnd + 1;
+            } else if (value.charAt(index) == '\'' || value.charAt(index) == '"') {
+                index = Math.min(end, skipQuoted(value, index, value.charAt(index)));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = Math.min(end, skipMyBatisPlaceholder(value, index));
+            } else if (isIdentifierStart(value.charAt(index)) || value.charAt(index) == '`') {
+                IdentifierToken token = readIdentifierToken(value, index);
+                if (token == null || token.endIndex() > end) {
+                    return true;
+                }
+                String identifier = unquoteIdentifier(token.text()).toUpperCase(Locale.ROOT);
+                int afterToken = skipWhitespace(value, token.endIndex());
+                if (afterToken < end && value.charAt(afterToken) == '(') {
+                    int closeParen = findMatchingParen(value, afterToken);
+                    if (closeParen < 0 || closeParen >= end) {
+                        return true;
+                    }
+                    if (AGGREGATE_FUNCTIONS.contains(identifier)) {
+                        index = skipAggregateSuffix(value, identifier, closeParen + 1, end);
+                    } else {
+                        if (containsIdentifierOutsideAggregate(value, afterToken + 1, closeParen)) {
+                            return true;
+                        }
+                        index = closeParen + 1;
+                    }
+                } else if (SAFE_HAVING_EXPRESSION_KEYWORDS.contains(identifier)) {
+                    index = token.endIndex();
+                } else {
+                    return true;
+                }
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private int skipAggregateSuffix(String value, String aggregateFunction, int start, int end) {
+        if (!"LISTAGG".equals(aggregateFunction)) {
+            return start;
+        }
+        int withinStart = skipWhitespace(value, start);
+        IdentifierToken within = readIdentifierToken(value, withinStart);
+        if (within == null || !"WITHIN".equalsIgnoreCase(unquoteIdentifier(within.text()))) {
+            return start;
+        }
+        int groupStart = skipWhitespace(value, within.endIndex());
+        IdentifierToken group = readIdentifierToken(value, groupStart);
+        if (group == null || !"GROUP".equalsIgnoreCase(unquoteIdentifier(group.text()))) {
+            return start;
+        }
+        int openParen = skipWhitespace(value, group.endIndex());
+        if (openParen >= end || value.charAt(openParen) != '(') {
+            return start;
+        }
+        int closeParen = findMatchingParen(value, openParen);
+        return closeParen < 0 || closeParen >= end ? start : closeParen + 1;
     }
 
     private boolean containsSqlFunctionCall(String value) {

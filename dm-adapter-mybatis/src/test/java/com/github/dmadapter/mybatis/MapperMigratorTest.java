@@ -4287,7 +4287,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicTemporaryTableAsSelectKeepsScalarForeachBindings() throws Exception {
+    void dynamicTemporaryTableAsSelectSplitsScalarForeachBindingsIntoParameterizedInsert() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -4324,16 +4324,28 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
+                .contains("BEGIN")
                 .contains("CREATE GLOBAL TEMPORARY TABLE tmp_relationship_owner_20200204 ON COMMIT PRESERVE ROWS AS SELECT")
+                .contains("SELECT * FROM (")
+                .contains("NULL")
+                .contains(") dm_adapter_ctas_source WHERE 1 = 0'")
+                .contains("EXECUTE IMMEDIATE 'INSERT INTO tmp_relationship_owner_20200204")
+                .contains("?\n")
+                .contains("' USING")
+                .contains("<foreach collection=\"list\" item=\"houseId\" separator=\",\">")
                 .contains("#{houseId,jdbcType=BIGINT}")
                 .doesNotContain("${houseId}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
+                );
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
-    void dynamicTemporaryTableAsSelectKeepsObjectForeachBindings() throws Exception {
+    void dynamicTemporaryTableAsSelectSplitsObjectForeachBindingsIntoParameterizedInsert() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -4369,12 +4381,73 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
         assertThat(rewritten)
+                .contains("BEGIN")
                 .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS SELECT")
+                .contains("SELECT * FROM (")
+                .contains("NULL")
+                .contains(") dm_adapter_ctas_source WHERE 1 = 0'")
+                .contains("EXECUTE IMMEDIATE 'INSERT INTO tmp_owner")
+                .contains("?\n")
+                .contains("<foreach collection=\"records\" item=\"item\" separator=\",\">")
                 .contains("#{item.houseId}")
                 .doesNotContain("${item}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE);
+                .containsExactly(
+                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
+                );
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicTemporaryTableAsSelectRetainsUnsupportedBindingsForManualReview() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="createTmp">
+                        create TEMPORARY table tmp_owner
+                        SELECT rs.owner_id, rs.house_id
+                        FROM owner_house_relationship rs
+                        where rs.owner_type = #{ownerType}
+                        and rs.house_id in
+                        <foreach collection="records" item="item" open="(" separator="," close=")">
+                            #{item.houseId}
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/UserMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UserMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml"));
+        assertThat(rewritten)
+                .contains("CREATE GLOBAL TEMPORARY TABLE tmp_owner ON COMMIT PRESERVE ROWS AS SELECT")
+                .contains("#{ownerType}")
+                .contains("#{item.houseId}")
+                .doesNotContain("${ownerType}")
+                .doesNotContain("${item.houseId}");
+        assertThat(result.manualReviewItems()).hasSize(1);
+        assertThat(result.manualReviewItems().get(0).reason())
+                .contains("CREATE TABLE AS SELECT does not support JDBC bind parameters")
+                .contains("injection-unsafe")
+                .contains("parameterized INSERT ... SELECT");
     }
 
     @Test
@@ -5069,6 +5142,108 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
                 .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_HAVING_AGGREGATE_ALIAS_TO_EXPRESSION_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicHavingInsideIfRetainsAggregateAliasThatAlsoReferencesUngroupedColumns() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.BillMapper">
+                    <select id="getConfirmAccountList">
+                        select p.id,
+                               case
+                                   when p.account_total - ifnull(sum(c.paid_amount), 0) = 0 then 2
+                                   when p.account_total &gt; ifnull(sum(c.paid_amount), 0) then 3
+                                   else 0
+                               end accountStatus
+                        from payment p
+                        left join cancellation c on c.payment_id = p.id
+                        group by p.id
+                        <if test="accountStatusList != null and accountStatusList.size() > 0">
+                            having accountStatus in
+                            <foreach collection="accountStatusList" item="item" open="(" close=")" separator=",">
+                                #{item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/BillMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/BillMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/BillMapper.xml");
+        assertThat(Files.readString(output))
+                .contains("having accountStatus in")
+                .doesNotContain("having (case");
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("aggregate alias(es) [accountStatus]")
+                        .contains("mixes aggregate output with non-aggregate column references"));
+    }
+
+    @Test
+    void dynamicHavingInsideNestedForeachKeepsAlreadyValidAggregateExpression() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.QualityMapper">
+                    <select id="scoreListPage">
+                        select t.id
+                        from assessment_task t
+                        left join assessment_audit a on a.task_id = t.id
+                        group by t.id
+                        <if test="statusIds != null and statusIds.size() > 0">
+                            <foreach collection="statusIds" item="item">
+                                <if test="statusIds.size() == 1 and item == 3">
+                                    having count(a.id) &gt; 0
+                                </if>
+                            </foreach>
+                        </if>
+                        order by t.id
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/QualityMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/QualityMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/QualityMapper.xml");
+        assertThat(Files.readString(output)).contains("having count(a.id) &gt; 0");
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
