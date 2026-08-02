@@ -66,6 +66,12 @@ class DmAdapterCliTest {
                 .doesNotContain("SELECT 1 FROM dual");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-sql-script-report.md")))
                 .contains("严格验证清单");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-summary.json")))
+                .contains("\"overallStatus\" : \"PASSED\"")
+                .contains("\"status\" : \"SKIPPED\"")
+                .contains("--sql-scripts-only 模式未执行 Maven、Mapper 和应用文件迁移。")
+                .contains("--sql-scripts-only 模式未请求 Mapper 数据库验证。")
+                .doesNotContain("\"status\" : \"RUNNING\"");
     }
 
     @Test
