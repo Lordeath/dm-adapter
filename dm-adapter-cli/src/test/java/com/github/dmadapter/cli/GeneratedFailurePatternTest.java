@@ -327,6 +327,52 @@ class GeneratedFailurePatternTest {
                     invalidOgnlMethodCallRecord
             )).isFalse();
 
+            String nonIterableForeachParameter = """
+                    org.apache.ibatis.builder.BuilderException:
+                    Error evaluating expression 'precinctId'. Return value (1) was not iterable.
+                    """;
+            Object nonIterableForeachRecord = failedRecord(validationClass, nonIterableForeachParameter);
+            assertThat(failurePattern(validationClass, validation, nonIterableForeachRecord))
+                    .isEqualTo("NON_ITERABLE_COLLECTION_PARAMETER");
+            assertThat(category(validationClass, validation, nonIterableForeachRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    nonIterableForeachRecord
+            )).isFalse();
+
+            String conflictingPaginationBranches = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select id from ns_sr_services order by update_datetime desc
+                    limit ?, ? limit 0, ?
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object conflictingPaginationRecord = failedRecord(validationClass, conflictingPaginationBranches);
+            assertThat(failurePattern(validationClass, validation, conflictingPaginationRecord))
+                    .isEqualTo("DYNAMIC_BRANCH_PARAMETER_CONFLICT");
+            assertThat(category(validationClass, validation, conflictingPaginationRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    conflictingPaginationRecord
+            )).isFalse();
+
+            String conflictingOrderBranches = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select id from ns_sr_services
+                    order by update_datetime desc order by reception_date asc
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object conflictingOrderRecord = failedRecord(validationClass, conflictingOrderBranches);
+            assertThat(failurePattern(validationClass, validation, conflictingOrderRecord))
+                    .isEqualTo("DYNAMIC_BRANCH_PARAMETER_CONFLICT");
+            assertThat(category(validationClass, validation, conflictingOrderRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+
             String trailingSelectComma = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错

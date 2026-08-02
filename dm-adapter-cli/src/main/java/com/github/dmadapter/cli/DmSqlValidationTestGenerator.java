@@ -7750,7 +7750,12 @@ class DmSqlValidationTestGenerator {
                     return !"CONFIGURATION".equals(failureCategory)
                             && !"TEST_SCHEMA".equals(failureCategory)
                             && !"TEST_DATABASE_RUNTIME".equals(failureCategory)
-                            && !"ORIGINAL_SQL".equals(failureCategory);
+                            && !"ORIGINAL_SQL".equals(failureCategory)
+                            && !containsAny(
+                                    failurePattern(record),
+                                    "NON_ITERABLE_COLLECTION_PARAMETER",
+                                    "DYNAMIC_BRANCH_PARAMETER_CONFLICT"
+                            );
                 }
 
                 private MethodArgumentConfig suggestedArgumentConfig(ParameterResolution parameters) {
@@ -8931,6 +8936,10 @@ class DmSqlValidationTestGenerator {
                             return "绑定参数名问题";
                         case "FOREACH_ITEM_BINDING":
                             return "foreach 元素绑定问题";
+                        case "NON_ITERABLE_COLLECTION_PARAMETER":
+                            return "foreach 参数不是集合";
+                        case "DYNAMIC_BRANCH_PARAMETER_CONFLICT":
+                            return "动态分支参数组合冲突";
                         case "MAPPER_PROPERTY_NAME":
                             return "Mapper 属性名不匹配";
                         case "ORIGINAL_MAPPER_PROPERTY_NAME_MISMATCH":
@@ -9172,6 +9181,12 @@ class DmSqlValidationTestGenerator {
                     }
                     if (hasForeachItemBindingIssue(message)) {
                         return "FOREACH_ITEM_BINDING";
+                    }
+                    if (hasNonIterableCollectionParameter(message)) {
+                        return "NON_ITERABLE_COLLECTION_PARAMETER";
+                    }
+                    if (hasConflictingDynamicBranchClauses(record, message)) {
+                        return "DYNAMIC_BRANCH_PARAMETER_CONFLICT";
                     }
                     if (hasDynamicSqlFragmentParameterIssue(message)) {
                         return "DYNAMIC_SQL_FRAGMENT_PARAMETER";
@@ -9785,6 +9800,38 @@ class DmSqlValidationTestGenerator {
                             && message.contains("Original mapper XML defines duplicate statement id");
                 }
 
+                private boolean hasNonIterableCollectionParameter(String message) {
+                    if (message == null || isBlank(message)) {
+                        return false;
+                    }
+                    String lower = message.toLowerCase(Locale.ROOT);
+                    return lower.contains("was not iterable")
+                            || (lower.contains("error evaluating expression")
+                            && lower.contains("not iterable"));
+                }
+
+                private boolean hasConflictingDynamicBranchClauses(ValidationRecord record, String message) {
+                    if (record == null
+                            || record.parameterSource == null
+                            || !(record.parameterSource.startsWith("auto")
+                            || record.parameterSource.startsWith("configured"))) {
+                        return false;
+                    }
+                    String sql = sqlFromMessage(message);
+                    if (isBlank(sql)) {
+                        return false;
+                    }
+                    String normalized = sql.replaceAll("\\\\s+", " ").trim();
+                    return Pattern.compile("\\\\blimit\\\\b[\\\\s\\\\S]*\\\\blimit\\\\b", Pattern.CASE_INSENSITIVE)
+                            .matcher(normalized).find()
+                            || Pattern.compile("\\\\border\\\\s+by\\\\b[\\\\s\\\\S]*\\\\border\\\\s+by\\\\b", Pattern.CASE_INSENSITIVE)
+                            .matcher(normalized).find()
+                            || Pattern.compile("\\\\bgroup\\\\s+by\\\\b[^)]*\\\\band\\\\b[^)]*\\\\bgroup\\\\s+by\\\\b", Pattern.CASE_INSENSITIVE)
+                            .matcher(normalized).find()
+                            || Pattern.compile("\\\\bselect\\\\b.{20,}\\\\bdistinct\\\\s+[A-Za-z_][A-Za-z0-9_$]*\\\\.", Pattern.CASE_INSENSITIVE)
+                            .matcher(beforeMarker(normalized, " from ")).find();
+                }
+
                 private boolean containsAnyPattern(Map<String, Long> countsByPattern, String... patterns) {
                     for (String pattern : patterns) {
                         if (countsByPattern.containsKey(pattern)) {
@@ -9838,6 +9885,12 @@ class DmSqlValidationTestGenerator {
                         return "ORIGINAL_SQL";
                     }
                     if (hasJavaMapperParamAnnotationIssue(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
+                    }
+                    if (hasNonIterableCollectionParameter(message)) {
+                        return "METHOD_ARGS_OR_BINDING";
+                    }
+                    if (hasConflictingDynamicBranchClauses(record, message)) {
                         return "METHOD_ARGS_OR_BINDING";
                     }
                     if (containsAny(message,
