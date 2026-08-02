@@ -1299,10 +1299,21 @@ class DmAdapterCliTest {
     }
 
     @Test
-    void generateValidationTestPreservesExistingIncludedAndExcludedMethods() throws Exception {
+    void generateValidationTestPreservesExistingRuntimeSelectionConfiguration() throws Exception {
         writeDemoProject();
         writeApplicationClass("src/main/java/com/example/DemoApplication.java", "com.example", "DemoApplication");
         writeFile(".dm-adapter/sql-validation.yml", """
+                typeAliasesPackages:
+                  - com.example.domain
+                typeHandlersPackages:
+                  - com.example.mybatis
+                usageFilterEnabled: false
+                usageClassDirectories:
+                  - "custom-module/target/classes"
+                methods:
+                  com.example.UserMapper.selectUsers:
+                    args:
+                      - 42
                 includedMethods:
                   - com.example.UserMapper.selectUsers
                 excludedMethods:
@@ -1319,6 +1330,23 @@ class DmAdapterCliTest {
         String config = Files.readString(tempDir.resolve(".dm-adapter/sql-validation.yml"));
         assertThat(exitCode).isZero();
         assertThat(config)
+                .contains("""
+                        typeAliasesPackages:
+                          - "com.example.domain"
+                        typeHandlersPackages:
+                          - "com.example.mybatis"
+                        """)
+                .contains("""
+                        usageFilterEnabled: false
+                        usageClassDirectories:
+                          - "custom-module/target/classes"
+                        """)
+                .contains("""
+                        methods:
+                          com.example.UserMapper.selectUsers:
+                            args:
+                              - 42
+                        """)
                 .contains("""
                         includedMethods:
                           - "com.example.UserMapper.selectUsers"
