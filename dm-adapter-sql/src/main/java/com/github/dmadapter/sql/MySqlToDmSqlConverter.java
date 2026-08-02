@@ -5165,6 +5165,31 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return "NLSSORT(" + expression + ", 'NLS_SORT=SCHINESE_PINYIN_M')";
     }
 
+    public SqlConversionResult convertGbkOrderExpression(String expression) {
+        if (expression == null || expression.isBlank()) {
+            return SqlConversionResult.unchanged(expression == null ? "" : expression);
+        }
+        int start = leadingWhitespaceLength(expression);
+        if (!startsFunction(expression, start, "CONVERT")) {
+            return SqlConversionResult.unchanged(expression);
+        }
+        FunctionCall functionCall = readFunctionCall(expression, start, "CONVERT");
+        if (functionCall == null || !expression.substring(functionCall.endIndex()).isBlank()) {
+            return SqlConversionResult.unchanged(expression);
+        }
+        String replacement = rewriteGbkOrderConvert(functionCall);
+        if (replacement == null) {
+            return SqlConversionResult.unchanged(expression);
+        }
+        String converted = expression.substring(0, start) + replacement
+                + expression.substring(functionCall.endIndex());
+        return SqlConversionResult.changed(
+                expression,
+                converted,
+                List.of(MYSQL_CONVERT_GBK_ORDER_RULE)
+        );
+    }
+
     private GenericConversion convertMysqlTemporaryTableAsSelect(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
@@ -6238,6 +6263,34 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion addRecursiveCteColumnAliases(String sql) {
+        return addRecursiveCteColumnAliases(sql, List.of());
+    }
+
+    /**
+     * Adds the column alias list required by Dameng when a recursive CTE uses a
+     * {@code SELECT *} anchor and the mapper result metadata supplies an exact,
+     * ordered column list. The normal converter deliberately does not guess
+     * columns for star projections; callers may use this overload only with
+     * metadata tied to the current mapped statement.
+     */
+    public SqlConversionResult convertRecursiveCteWithFallbackColumns(
+            String sql,
+            List<String> fallbackColumns
+    ) {
+        if (sql == null || sql.isBlank() || fallbackColumns == null || fallbackColumns.isEmpty()) {
+            return SqlConversionResult.unchanged(sql == null ? "" : sql);
+        }
+        GenericConversion conversion = addRecursiveCteColumnAliases(sql, fallbackColumns);
+        return conversion.changed()
+                ? SqlConversionResult.changed(
+                        sql,
+                        conversion.convertedSql(),
+                        List.of(MYSQL_WITH_RECURSIVE_ALIAS_RULE)
+                )
+                : SqlConversionResult.unchanged(sql);
+    }
+
+    private GenericConversion addRecursiveCteColumnAliases(String sql, List<String> fallbackColumns) {
         int withIndex = leadingWhitespaceLength(sql);
         if (!startsKeyword(sql, withIndex, "WITH")) {
             return GenericConversion.unchanged(sql);
@@ -6266,7 +6319,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (closeParenIndex < 0) {
             return GenericConversion.unchanged(sql);
         }
-        List<String> aliases = inferCteColumnAliases(sql.substring(openParenIndex + 1, closeParenIndex));
+        String cteBody = sql.substring(openParenIndex + 1, closeParenIndex);
+        List<String> aliases = inferCteColumnAliases(cteBody);
+        if (aliases.isEmpty() && isRecursiveCteStarAnchor(cteBody)) {
+            aliases = validatedCteFallbackColumns(fallbackColumns);
+        }
         if (aliases.isEmpty()) {
             return GenericConversion.unchanged(sql);
         }
@@ -6276,6 +6333,40 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 + ")"
                 + sql.substring(cteName.endIndex());
         return new GenericConversion(converted, true);
+    }
+
+    private boolean isRecursiveCteStarAnchor(String cteBody) {
+        int selectIndex = findTopLevelKeyword(cteBody, "SELECT", 0);
+        if (selectIndex < 0) {
+            return false;
+        }
+        int fromIndex = findTopLevelKeyword(cteBody, "FROM", selectIndex + "SELECT".length());
+        if (fromIndex < 0) {
+            return false;
+        }
+        String projection = cteBody.substring(selectIndex + "SELECT".length(), fromIndex).strip();
+        return "*".equals(projection)
+                || Pattern.compile("(?is)^(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\.\\s*\\*$")
+                .matcher(projection)
+                .matches();
+    }
+
+    private List<String> validatedCteFallbackColumns(List<String> fallbackColumns) {
+        if (fallbackColumns == null || fallbackColumns.isEmpty()) {
+            return List.of();
+        }
+        List<String> aliases = new ArrayList<>(fallbackColumns.size());
+        LinkedHashSet<String> normalized = new LinkedHashSet<>();
+        for (String rawColumn : fallbackColumns) {
+            String column = rawColumn == null ? "" : rawColumn.strip();
+            if (!isSimpleIdentifier(column)
+                    || !normalized.add(column.replace("`", "").replace("\"", "")
+                    .toLowerCase(Locale.ROOT))) {
+                return List.of();
+            }
+            aliases.add(column);
+        }
+        return List.copyOf(aliases);
     }
 
     private List<String> inferCteColumnAliases(String cteBody) {

@@ -1282,6 +1282,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsStandaloneGbkOrderExpressionWithoutReinterpretingQuotedIdentifier() {
+        SqlConversionResult result = converter.convertGbkOrderExpression(
+                "CONVERT(\"name\" USING gbk)"
+        );
+
+        assertThat(result.convertedSql())
+                .isEqualTo("NLSSORT(\"name\", 'NLS_SORT=SCHINESE_PINYIN_M')");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_CONVERT_GBK_ORDER_RULE);
+    }
+
+    @Test
     void removesMysqlForceIndexHints() {
         SqlConversionResult result = converter.convert(
                 "SELECT * FROM owner_house_relationship force index(idx_houseId) WHERE house_id = #{houseId}"
@@ -2553,6 +2565,30 @@ class MySqlToDmSqlConverterTest {
                         MySqlToDmSqlConverter.MYSQL_CAST_UNSIGNED_RULE,
                         MySqlToDmSqlConverter.MYSQL_WITH_RECURSIVE_ALIAS_RULE
                 );
+    }
+
+    @Test
+    void addsRecursiveCteAliasesFromExactFallbackForStarAnchor() {
+        String sql = """
+                WITH RECURSIVE SubAddresses AS (
+                    SELECT * FROM ns_association_regions WHERE localName = #{localName}
+                    UNION ALL
+                    SELECT child.* FROM ns_association_regions child
+                    JOIN SubAddresses parent ON child.parentId = parent.id
+                )
+                SELECT * FROM SubAddresses
+                """;
+
+        SqlConversionResult result = converter.convertRecursiveCteWithFallbackColumns(
+                sql,
+                List.of("id", "parentId", "regionPath", "level", "localName", "cityCode", "adCode")
+        );
+
+        assertThat(result.convertedSql()).contains(
+                "WITH RECURSIVE SubAddresses(id, parentId, regionPath, level, localName, cityCode, adCode) AS ("
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_WITH_RECURSIVE_ALIAS_RULE);
     }
 
     @Test

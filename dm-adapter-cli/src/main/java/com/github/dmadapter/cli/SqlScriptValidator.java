@@ -492,6 +492,13 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                                 "Original SQL defines both NULL and NOT NULL for one column; "
                                         + "fix the source SQL before migration. " + errorSummary
                         );
+                    } else if (containsBareInsertValues(sql)
+                            && errorSummary.toLowerCase(Locale.ROOT).contains("列表不匹配")) {
+                        errorSummary = compact(
+                                "Original SQL uses INSERT INTO table VALUES without a target column list; "
+                                        + "the value count no longer matches the upgraded table definition. "
+                                        + "Fix the source SQL by naming the intended columns. " + errorSummary
+                        );
                     }
                 }
                 if ("OBJECT_DEFINITION_CHANGED".equals(category)) {
@@ -1189,6 +1196,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
         if (isGeneratedIndexDefinitionConflict(message, sql)) {
             return "INDEX_NAME_DEFINITION_CONFLICT";
         }
+        if (message.contains("列表不匹配") && containsBareInsertValues(sql)) {
+            return "ORIGINAL_SQL";
+        }
         if (message.contains("语法") || message.contains("syntax")) {
             if (containsDuplicateColumnDefault(sql) || containsContradictoryColumnNullability(sql)) {
                 return "ORIGINAL_SQL";
@@ -1196,6 +1206,15 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
             return "SQL_SYNTAX";
         }
         return "SQL_EXECUTION";
+    }
+
+    private boolean containsBareInsertValues(String sql) {
+        return sql != null && Pattern.compile(
+                "(?is)\\bINSERT\\s+INTO\\s+"
+                        + "(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
+                        + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))?"
+                        + "\\s+VALUES\\s*\\("
+        ).matcher(sql).find();
     }
 
     private boolean isDatabaseConnectionFailure(Throwable throwable) {

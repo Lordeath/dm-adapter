@@ -6457,6 +6457,105 @@ class MapperMigratorTest {
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
+    @Test
+    void usesMatchingResultTypeColumnsForRecursiveStarCte() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/RegionsMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.RegionsMapper">
+                    <resultMap id="BaseResultMap" type="com.example.Regions">
+                        <id column="id" property="id"/>
+                        <result column="parentId" property="parentId"/>
+                        <result column="regionPath" property="regionPath"/>
+                        <result column="level" property="level"/>
+                        <result column="localName" property="localName"/>
+                    </resultMap>
+                    <select id="getAllByFirstLocalName" resultType="com.example.Regions">
+                        WITH RECURSIVE SubAddresses AS (
+                            SELECT * FROM ns_regions WHERE localName = #{localName}
+                            UNION ALL
+                            SELECT child.* FROM ns_regions child
+                            JOIN SubAddresses parent ON child.parentId = parent.id
+                        )
+                        SELECT * FROM SubAddresses
+                    </select>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/RegionsMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/RegionsMapper.xml")
+        );
+        assertThat(rewritten).contains(
+                "WITH RECURSIVE SubAddresses(id, parentId, regionPath, level, localName) AS ("
+        );
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_WITH_RECURSIVE_ALIAS_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void convertsGbkSortExpressionInsideDynamicOrderByChoose() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/TalentMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.TalentMapper">
+                    <select id="listPage" resultType="map">
+                        select id, name from talent
+                        order by
+                        <choose>
+                            <when test="sortField == 'name'">
+                                CONVERT(`name` USING gbk) COLLATE gbk_chinese_ci
+                                <if test="sortOrder == 'asc'">asc</if>
+                                <if test="sortOrder != 'asc'">desc</if>
+                            </when>
+                            <otherwise>id desc</otherwise>
+                        </choose>
+                    </select>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TalentMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/TalentMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("NLSSORT(`name`, 'NLS_SORT=SCHINESE_PINYIN_M')")
+                .doesNotContainIgnoringCase("USING gbk")
+                .doesNotContainIgnoringCase("gbk_chinese_ci");
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_CONVERT_GBK_ORDER_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
     private int countMatches(String value, String needle) {
         int count = 0;
         int index = 0;
