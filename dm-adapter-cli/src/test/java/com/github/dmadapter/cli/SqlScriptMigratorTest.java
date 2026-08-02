@@ -1632,8 +1632,10 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE TABLE IF NOT EXISTS tmp_demo_a (id BIGINT, extra_name VARCHAR(200));")
-                .contains("CREATE TABLE IF NOT EXISTS tmp_demo_b (id BIGINT, extra_name VARCHAR(200));")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_demo_a "
+                        + "(id BIGINT, extra_name VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_demo_b "
+                        + "(id BIGINT, extra_name VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
                 .contains("CREATE OR REPLACE PROCEDURE demo_proc(input_json IN JSON, row_count OUT int) AS")
                 .doesNotContain("`input_json`")
                 .doesNotContain("`row_count`")
@@ -1655,7 +1657,8 @@ class SqlScriptMigratorTest {
                 .doesNotContain("DROP TABLE IF EXISTS tmp_demo_b;")
                 .doesNotContain("label_exit:BEGIN")
                 .doesNotContain("LEAVE label_exit")
-                .doesNotContain("TEMPORARY TABLE")
+                .doesNotContain("CREATE TEMPORARY TABLE")
+                .doesNotContain("DM_ADAPTER_GTT_DDL_BASE64")
                 .doesNotContain("ADD COLUMN extra_name")
                 .doesNotContain("EXECUTE IMMEDIATE 'DROP TABLE IF EXISTS tmp_demo_a'")
                 .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE tmp_demo_a");
@@ -1694,22 +1697,89 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("CREATE TABLE #temp_target")
-                .contains("CREATE TABLE #spilt_target")
-                .contains("IDENTITY(1,1)")
-                .contains("INSERT INTO #temp_target(targetId) VALUES (targetId)")
-                .contains("INSERT INTO #spilt_target(targetId)")
-                .contains("SELECT targetId FROM #temp_target")
-                .contains("DELETE FROM #spilt_target")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS temp_target")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS spilt_target")
+                .contains("ON COMMIT PRESERVE ROWS")
+                .contains("CREATE OR REPLACE TRIGGER DM_ADAPTER_GTT_AI_temp_target_")
+                .contains("CREATE OR REPLACE TRIGGER DM_ADAPTER_GTT_AI_spilt_target_")
+                .contains("WHEN (NEW.id IS NULL)")
+                .contains("SELECT COALESCE(MAX(id), 0) + 1 INTO dm_adapter_next_id")
+                .contains(":NEW.id := dm_adapter_next_id")
+                .doesNotContain("IDENTITY")
+                .doesNotContain("PRIMARY KEY")
+                .contains("INSERT INTO temp_target(targetId) VALUES (targetId)")
+                .contains("INSERT INTO spilt_target(targetId)")
+                .contains("SELECT targetId FROM temp_target")
+                .contains("DELETE FROM spilt_target")
                 .contains("NULL /* DM_ADAPTER: local temporary tables start empty and are released ")
-                .doesNotContain("DELETE FROM #temp_target")
+                .contains("DELETE FROM temp_target")
                 .doesNotContain("CREATE TEMPORARY TABLE")
-                .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE #")
+                .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE")
                 .doesNotContain("CAST(targetId AS VARCHAR")
-                .doesNotContain("CREATE TABLE IF NOT EXISTS #temp_target");
+                .doesNotContain("#temp_target");
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE));
+    }
+
+    @Test
+    void addsAsForProcedureLocalTemporaryTableCreatedFromSelect() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE initialize_config(IN business_type INT)
+                BEGIN
+                    CREATE TEMPORARY TABLE temp_config
+                    SELECT e.id AS enterprise_id, business_type AS business_type
+                    FROM ns_enterprise e;
+                    INSERT INTO ns_config(enterprise_id, business_type)
+                    SELECT enterprise_id, business_type FROM temp_config;
+                    DROP TABLE temp_config;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS temp_config")
+                .contains("DELETE FROM temp_config")
+                .contains("INSERT INTO temp_config (enterprise_id, business_type) SELECT")
+                .contains("FROM ns_enterprise e")
+                .doesNotContain("#temp_config")
+                .doesNotContain("CREATE TABLE temp_config\n                    SELECT");
+    }
+
+    @Test
+    void usesSessionScopedGlobalTemporaryTableForCrossProcedureReferences() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE populate_shared_temp()
+                BEGIN
+                    CREATE TEMPORARY TABLE temp_shared (
+                        id BIGINT NOT NULL AUTO_INCREMENT,
+                        value_code VARCHAR(20),
+                        PRIMARY KEY (id)
+                    );
+                    INSERT INTO temp_shared(value_code) VALUES ('A');
+                END$$
+                CREATE PROCEDURE consume_shared_temp(OUT row_count INT)
+                BEGIN
+                    SELECT COUNT(*) INTO row_count FROM temp_shared;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS temp_shared")
+                .contains("ON COMMIT PRESERVE ROWS")
+                .contains("CREATE OR REPLACE TRIGGER DM_ADAPTER_GTT_AI_temp_shared_")
+                .contains("WHEN (NEW.id IS NULL)")
+                .contains("DELETE FROM temp_shared")
+                .contains("FROM temp_shared")
+                .doesNotContain("#temp_shared")
+                .doesNotContain("CREATE TEMPORARY TABLE temp_shared")
+                .doesNotContain("IDENTITY")
+                .doesNotContain("DM_ADAPTER_GTT_DDL_BASE64");
     }
 
     @Test
@@ -1743,10 +1813,14 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("ENTERPRISE CURSOR;")
-                .contains("CREATE TABLE #temp_enterprise_ids")
-                .contains("OPEN ENTERPRISE FOR SELECT enterprise_id FROM #temp_enterprise_ids;")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS temp_enterprise_ids")
+                .contains("ON COMMIT PRESERVE ROWS")
+                .contains("OPEN ENTERPRISE FOR SELECT enterprise_id FROM temp_enterprise_ids;")
                 .doesNotContain("ENTERPRISE CURSOR FOR")
-                .doesNotContain("OPEN ENTERPRISE;");
+                .doesNotContain("OPEN ENTERPRISE;")
+                .doesNotContain("#temp_enterprise_ids")
+                .doesNotContain("DM_ADAPTER_GTT_DDL_BASE64")
+                .containsOnlyOnce("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS temp_enterprise_ids");
     }
 
     @Test
@@ -1800,15 +1874,17 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("NULL /* DM_ADAPTER: local temporary tables start empty and are released ")
-                .contains("CREATE TABLE #salayWell_social_Temp")
-                .contains("INSERT INTO #salayWell_social_Temp(systemUserId, money)")
-                .contains("FROM #salayWell_social_Temp")
-                .doesNotContain("DELETE FROM #salayWell_social_Temp")
-                .doesNotContain("DROP TABLE IF EXISTS #salayWell_social_Temp");
-        assertThat(converted.sql().indexOf("CREATE TABLE #salayWell_social_Temp"))
-                .isLessThan(converted.sql().indexOf("-- 创建中间表"));
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS salayWell_social_Temp")
+                .contains("ON COMMIT PRESERVE ROWS")
+                .contains("DELETE FROM salayWell_social_Temp")
+                .contains("INSERT INTO salayWell_social_Temp(systemUserId, money)")
+                .contains("FROM salayWell_social_Temp")
+                .doesNotContain("DROP TABLE IF EXISTS salayWell_social_Temp")
+                .doesNotContain("DM_ADAPTER_GTT_DDL_BASE64");
+        assertThat(converted.sql().indexOf("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS salayWell_social_Temp"))
+                .isLessThan(converted.sql().indexOf("CREATE OR REPLACE PROCEDURE social_detail"));
         assertThat(converted.sql().indexOf("-- 创建中间表"))
-                .isLessThan(converted.sql().indexOf("INSERT INTO #salayWell_social_Temp"));
+                .isLessThan(converted.sql().indexOf("INSERT INTO salayWell_social_Temp"));
     }
 
     @Test
@@ -1909,6 +1985,30 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsAggregateCountHavingExistsWithoutNestedDamengAggregate() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sync_budget_data()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT COUNT(*) FROM ns_budget_main_data HAVING COUNT(*) > 1
+                    ) THEN
+                        INSERT INTO ns_budget_main_data(id) VALUES (1);
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END INTO dm_adapter_exists "
+                        + "FROM ns_budget_main_data;")
+                .contains("IF dm_adapter_exists = 0 THEN")
+                .doesNotContain("FROM (\nSELECT COUNT(*)")
+                .doesNotContain("dm_adapter_exists_check");
+    }
+
+    @Test
     void removesPositiveMysqlLimitFromProcedureExistsBeforeCounting() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DELIMITER $$
@@ -1984,11 +2084,15 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewItems()).isEmpty();
         assertThat(converted.sql())
-                .contains("CREATE TABLE #daily_result_bak AS")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS daily_result_bak")
+                .contains("ON COMMIT PRESERVE ROWS")
+                .contains("DELETE FROM daily_result_bak")
+                .contains("INSERT INTO daily_result_bak (id, amount) SELECT id, amount FROM source_result")
                 .contains("EXECUTE IMMEDIATE 'TRUNCATE TABLE daily_result'")
                 .contains("EXECUTE IMMEDIATE 'INSERT INTO daily_result(id, amount)"
                         + System.lineSeparator()
-                        + "    SELECT id, amount FROM #daily_result_bak'");
+                        + "    SELECT id, amount FROM daily_result_bak'")
+                .doesNotContain("#daily_result_bak");
     }
 
     @Test
@@ -2070,6 +2174,33 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_GROUP_BY_ALIAS_RULE));
+    }
+
+    @Test
+    void qualifiesNestedProcedureCtasGroupByColumnsWhenJoinMakesNamesAmbiguous() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE demo_proc()
+                BEGIN
+                    CREATE TEMPORARY TABLE tmp_area AS (
+                        SELECT a.DataSource, a.PrecinctName, SUM(a.ChargeArea) ChargeArea
+                        FROM (
+                            SELECT f.DataSource, f.PrecinctName, f.HouseName, MAX(f.ChargeArea) ChargeArea
+                            FROM dw_charge f
+                            LEFT JOIN dim_limit d ON d.PrecinctName = f.PrecinctName
+                            GROUP BY PrecinctName, HouseName
+                        ) a
+                        LEFT JOIN dim_area area ON area.PrecinctName = a.PrecinctName
+                        GROUP BY DataSource, PrecinctName
+                    );
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("GROUP BY f.PrecinctName, f.HouseName")
+                .contains("GROUP BY a.DataSource, a.PrecinctName");
     }
 
     @Test
@@ -2963,11 +3094,11 @@ class SqlScriptMigratorTest {
                 """);
 
         assertThat(converted.sql())
-                .contains("""
-                        EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity ON';
-                            INSERT INTO sample_identity (id, code) VALUES (7, 'A');
-                            EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity OFF';
-                        """)
+                .contains("dm_adapter_identity_insert_enabled INT := 0")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity ON';")
+                .contains("IF SQLCODE <> -2717 THEN")
+                .contains("INSERT INTO sample_identity (id, code) VALUES (7, 'A');")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity OFF';")
                 .contains("WHEN OTHERS THEN")
                 .contains("RAISE;")
                 .doesNotContain("INSERT INTO sample_identity VALUES (7, 'A');")
@@ -3001,11 +3132,11 @@ class SqlScriptMigratorTest {
                 """);
 
         assertThat(converted.sql())
-                .contains("""
-                        EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item ON';
-                            INSERT INTO sample_seed_item (id, code, name) VALUES (2, 'A', 'Alpha');
-                            EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item OFF';
-                        """)
+                .contains("dm_adapter_identity_insert_enabled INT := 0")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item ON';")
+                .contains("IF SQLCODE <> -2717 THEN")
+                .contains("INSERT INTO sample_seed_item (id, code, name) VALUES (2, 'A', 'Alpha');")
+                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item OFF';")
                 .contains("WHEN OTHERS THEN")
                 .doesNotContain("INSERT INTO sample_seed_item VALUES (2, 'A', 'Alpha');")
                 .doesNotContain("deleteFlag) VALUES");
@@ -3658,6 +3789,35 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void doesNotSplitLongClobLiteralAfterAnUnpairedBackslash() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String longValue = "A".repeat(899) + "\\\\" + "\"" + "B" + "C".repeat(2600);
+        write(sqlRoot.resolve("procedure.sql"), """
+                CALL addAll_ns_report_management_20240314(
+                    '报表', '', '8020', 'demo.ureport.xml', '0', 'menu-id', 5,
+                    '%s', '');
+                """.formatted(longValue));
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .doesNotContain("A".repeat(899) + "\\');")
+                .contains("A".repeat(899) + "');")
+                .contains("TO_CLOB('\\\"B");
+    }
+
+    @Test
     void doesNotConvertUnknownLongCallStringArgumentsToClobBlock() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -3726,6 +3886,36 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_PROCEDURE_LOCAL_LABEL_TO_RETURN_RULE));
+    }
+
+    @Test
+    void convertsMysqlWhileLoopLabelsAndControlTransfers() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE loop_demo()
+                BEGIN
+                    DECLARE i INT DEFAULT 0;
+                    my_loop: WHILE i < 3 DO
+                        SET i = i + 1;
+                        IF i = 1 THEN
+                            ITERATE my_loop;
+                        END IF;
+                        IF i = 2 THEN
+                            LEAVE my_loop;
+                        END IF;
+                    END WHILE my_loop;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("<<my_loop>>")
+                .contains("WHILE i < 3 LOOP")
+                .contains("CONTINUE my_loop;")
+                .contains("EXIT my_loop;")
+                .contains("END LOOP my_loop;")
+                .doesNotContain("my_loop:");
     }
 
     @Test
@@ -5111,7 +5301,8 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("insert-ignore.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE TABLE IF NOT EXISTS tmp_demo (id BIGINT, name VARCHAR(200));")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_demo "
+                        + "(id BIGINT, name VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
                 .contains("DELETE FROM tmp_demo /* DM_ADAPTER_TMP_COLUMN tmp_demo id */")
                 .contains("MERGE INTO tmp_demo t")
                 .contains("SELECT s.id AS id, s.name AS name")
@@ -5165,7 +5356,9 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("temporary-table.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE TABLE IF NOT EXISTS tmp_menu_copy (source_id BIGINT, enterprise_id BIGINT, organization_id BIGINT, target_ver BIGINT, menu_id VARCHAR(200));")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_menu_copy "
+                        + "(source_id BIGINT, enterprise_id BIGINT, organization_id BIGINT, "
+                        + "target_ver BIGINT, menu_id VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
                 .contains("FROM SYS.SYSOBJECTS T")
                 .contains("T.SCHID = CURRENT_SCHID")
                 .contains("T.NAME IN ('tmp_menu_copy', UPPER('tmp_menu_copy'))")
@@ -5288,10 +5481,10 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("temporary-table-distinct.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE TABLE IF NOT EXISTS tmp_module_copy_top_menu"
-                        + " (enterprise_id BIGINT, menu_id VARCHAR(200));")
-                .contains("CREATE TABLE IF NOT EXISTS tmp_module_copy_all_menu"
-                        + " (enterprise_id BIGINT, menu_id VARCHAR(200));")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_module_copy_top_menu"
+                        + " (enterprise_id BIGINT, menu_id VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_module_copy_all_menu"
+                        + " (enterprise_id BIGINT, menu_id VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
                 .contains("INSERT INTO tmp_module_copy_top_menu (enterprise_id, menu_id) SELECT DISTINCT")
                 .contains("INSERT INTO tmp_module_copy_all_menu (enterprise_id, menu_id) SELECT DISTINCT")
                 .doesNotContain("organization_id BIGINT")
@@ -5406,10 +5599,8 @@ class SqlScriptMigratorTest {
                 .contains("CREATE TABLE IF NOT EXISTS ns_demo_bak_20260521 LIKE ns_demo")
                 .contains("MERGE INTO ns_demo_bak_20260521 t")
                 .contains("ON (t.ID = s.ID)")
-                .contains("T.SCHID = CURRENT_SCHID")
-                .contains("T.NAME IN ('ns_demo_bak_20260521', UPPER('ns_demo_bak_20260521'))")
-                .contains("C.NAME IN ('ID', UPPER('ID'))")
-                .contains("MOD(C.INFO2, 2) = 1")
+                .contains("dm_adapter_identity_insert_enabled INT := 0")
+                .contains("IF SQLCODE <> -2717 THEN")
                 .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT ns_demo_bak_20260521 ON'")
                 .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT ns_demo_bak_20260521 OFF'")
                 .contains("WHEN OTHERS THEN NULL")
@@ -8020,6 +8211,54 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void rewritesMultilineTrailingSelectIntoWithNestedFromQuery() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE count_demo()
+                BEGIN
+                    DECLARE matching_count BIGINT;
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT status
+                        FROM demo_snapshot
+                        GROUP BY status
+                    ) grouped_status
+                    INTO matching_count;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT COUNT(*) INTO matching_count FROM (\n"
+                        + "        SELECT status")
+                .doesNotContain("grouped_status\n    INTO matching_count");
+    }
+
+    @Test
+    void splitsProcedureDropPrimaryKeyAndAddIndexAlterIntoDamengStatements() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE drop_demo_id()
+                BEGIN
+                    ALTER TABLE demo_target
+                        DROP PRIMARY KEY,
+                        ADD INDEX index_target_id (id);
+                END$$
+                DELIMITER ;
+                CALL drop_demo_id();
+                DROP PROCEDURE IF EXISTS drop_demo_id;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo_target DROP PRIMARY KEY'")
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_target_index_target_id ON demo_target (id)'")
+                .doesNotContain("DROP PRIMARY KEY,")
+                .doesNotContain("ADD INDEX index_target_id");
+    }
+
+    @Test
     void keepsLoopWithSameObjectDdlForManualReview() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE PROCEDURE change_demo()
@@ -8181,6 +8420,41 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void usesRuntimeSchemaAndDamengTypeInLiteralLongtextMetadataGuard() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS alter_interface_call_details_columns;
+                DELIMITER $$
+                CREATE PROCEDURE alter_interface_call_details_columns()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = 'sample-app'
+                          AND TABLE_NAME = 'ns_interface_call_details'
+                          AND COLUMN_NAME = 'bizRequestHeader'
+                          AND DATA_TYPE = 'longtext'
+                    ) THEN
+                        ALTER TABLE `sample-app`.`ns_interface_call_details`
+                            MODIFY COLUMN `bizRequestHeader` longtext NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL alter_interface_call_details_columns();
+                DROP PROCEDURE IF EXISTS alter_interface_call_details_columns;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("OWNER = dm_adapter_schema")
+                .contains("UPPER(DATA_TYPE) = 'CLOB'")
+                .contains("ALTER TABLE `ns_interface_call_details`")
+                .contains("MODIFY `bizRequestHeader` CLOB NULL")
+                .doesNotContain("OWNER = 'sample-app'")
+                .doesNotContain("`sample-app`.`ns_interface_call_details`")
+                .doesNotContain("DATA_TYPE = 'longtext'");
+    }
+
+    @Test
     void inlinesCurrentSchemaScriptVariableInsideRoutineAndConvertsCommentLikeGuard() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SET @db_name = DATABASE();
@@ -8280,6 +8554,36 @@ class SqlScriptMigratorTest {
                 .contains("bannerComponentId := LAST_INSERT_ID()")
                 .doesNotContain("banner `componentId`")
                 .doesNotContain("WHERE siteId =");
+    }
+
+    @Test
+    void renamesProcedureVariableThatConflictsWithAggregateFunction() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS deal_history;
+                DELIMITER $$
+                CREATE PROCEDURE deal_history()
+                BEGIN
+                    DECLARE count INT;
+                    SELECT COUNT(1) INTO count FROM ns_contract_archive WHERE contractFee IS NULL;
+                    IF count > 0 THEN
+                        UPDATE ns_contract_archive SET contractFee = 0 WHERE contractFee IS NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL deal_history();
+                DROP PROCEDURE IF EXISTS deal_history;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.report().files())
+                .anySatisfy(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_FUNCTION_NAME_VARIABLE_RENAME_RULE));
+        assertThat(converted.sql())
+                .contains("dm_adapter_local_count INT")
+                .contains("SELECT COUNT(1) INTO dm_adapter_local_count")
+                .contains("IF dm_adapter_local_count > 0 THEN")
+                .doesNotContain("INTO count")
+                .doesNotContain("IF count > 0");
     }
 
     @Test
@@ -8387,6 +8691,37 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void recognizesDamengVirtualColumnIndexesWithExpandedDependencyColumns() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE IF NOT EXISTS charge_standard (
+                    enterprise_id BIGINT,
+                    delete_flag BIGINT,
+                    house_id BIGINT,
+                    path VARCHAR(100),
+                    full_path VARCHAR(200) GENERATED ALWAYS AS (CONCAT(path, house_id, '/')) STORED,
+                    KEY idx_full_path (enterprise_id, delete_flag, full_path)
+                );
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("JOIN ALL_TAB_COLS T")
+                .contains("SELECT C.COLUMN_POSITION")
+                .contains("SELECT E.COLUMN_POSITION")
+                .contains("DM_LOGICAL_INDEX_COLUMNS")
+                .contains("dm_indexable_column_count")
+                .contains("UPPER(DATA_TYPE) NOT IN "
+                        + "('BLOB', 'CLOB', 'IMAGE', 'LONGVARCHAR', 'LONGVARBINARY')")
+                .contains("C.COLUMN_POSITION < 0")
+                .contains("UPPER(T.VIRTUAL_COLUMN) = 'YES'")
+                .contains("E.COLUMN_POSITION = 3")
+                .contains("T.DATA_DEFAULT")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('full_path')")
+                .contains("CREATE INDEX charge_standard_idx_full_path ON charge_standard "
+                        + "(enterprise_id, delete_flag, full_path)");
+    }
+
+    @Test
     void removesMysqlOnlyCharsetPredicateWhenGuardHasNoTargetTypeChange() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DROP PROCEDURE IF EXISTS inspect_demo;
@@ -8444,6 +8779,8 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("CREATE INDEX demo_idx_status ON demo (status)")
+                .containsOnlyOnce("dm_equivalent_indexes")
+                .doesNotContain("dm_existing_count")
                 .doesNotContain("'idx_status '")
                 .doesNotContain("INDEX_NAME) = UPPER('idx_status')");
     }

@@ -939,6 +939,31 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlCreateTableTextTypesWithoutTreatingTextColumnNameAsType() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE ns_interface_call_details (
+                  `bizRequestHeader` tinytext COMMENT 'request header',
+                  `requestBody` mediumtext,
+                  `responseBody` longtext,
+                  `payload` text,
+                  text varchar(50)
+                )
+                """);
+
+        assertThat(result.convertedSql())
+                .contains("`bizRequestHeader` CLOB")
+                .contains("`requestBody` CLOB")
+                .contains("`responseBody` CLOB")
+                .contains("`payload` CLOB")
+                .contains("text varchar(50)")
+                .doesNotContainIgnoringCase("tinytext")
+                .doesNotContainIgnoringCase("mediumtext")
+                .doesNotContainIgnoringCase("longtext");
+        assertThat(result.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_TEXT_TYPE_TO_DM_CLOB_RULE);
+    }
+
+    @Test
     void movesInlinePrimaryKeyFromIdentityColumnToTableConstraint() {
         SqlConversionResult result = converter.convert("""
                 CREATE TABLE IF NOT EXISTS ns_core_role_del (
@@ -2568,6 +2593,26 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void addsRecursiveCteColumnAliasesWhenConstantAnchorHasNoFromClause() {
+        SqlConversionResult result = converter.convert("""
+                WITH RECURSIVE template_table AS (
+                    SELECT 1 AS id, 107 AS enterpriseId
+                    UNION ALL
+                    SELECT id + 1, 107 FROM template_table WHERE id < 100
+                    UNION ALL
+                    SELECT id + 1000, 108 FROM template_table WHERE id < 100
+                )
+                SELECT id, enterpriseId FROM template_table
+                """);
+
+        assertThat(result.convertedSql()).contains(
+                "WITH RECURSIVE template_table(id, enterpriseId) AS ("
+        );
+        assertThat(result.appliedRules())
+                .contains(MySqlToDmSqlConverter.MYSQL_WITH_RECURSIVE_ALIAS_RULE);
+    }
+
+    @Test
     void addsRecursiveCteAliasesFromExactFallbackForStarAnchor() {
         String sql = """
                 WITH RECURSIVE SubAddresses AS (
@@ -2585,7 +2630,7 @@ class MySqlToDmSqlConverterTest {
         );
 
         assertThat(result.convertedSql()).contains(
-                "WITH RECURSIVE SubAddresses(id, parentId, regionPath, level, localName, cityCode, adCode) AS ("
+                "WITH RECURSIVE SubAddresses(id, parentId, regionPath, \"level\", localName, cityCode, adCode) AS ("
         );
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_WITH_RECURSIVE_ALIAS_RULE);
