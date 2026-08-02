@@ -327,6 +327,39 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsTimePartsExtractedFromTimeDiffWithMysqlDurationSemantics() {
+        SqlConversionResult result = converter.convert(
+                "select minute(timediff(a.accomplish_date, a.reception_date)), "
+                        + "hour(timediff(a.accomplish_date, a.accept_date)), "
+                        + "second(timediff(NOW(), a.create_datetime)) from ns_sr_services a"
+        );
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("MOD(TRUNC(CAST(ABS(DATEDIFF(SECOND, a.reception_date, a.accomplish_date)) "
+                        + "AS DECIMAL(38,10)) / NULLIF(CAST(60 AS DECIMAL(38,10)), 0)), 60)")
+                .contains("TRUNC(CAST(ABS(DATEDIFF(SECOND, a.accept_date, a.accomplish_date)) "
+                        + "AS DECIMAL(38,10)) / NULLIF(CAST(3600 AS DECIMAL(38,10)), 0))")
+                .contains("MOD(ABS(DATEDIFF(SECOND, a.create_datetime, SYSDATE)), 60)")
+                .doesNotContainIgnoringCase("TIMEDIFF");
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_TIME_PART_TIMEDIFF_RULE,
+                MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE
+        );
+    }
+
+    @Test
+    void leavesStandaloneTimeDiffForManualReview() {
+        SqlConversionResult result = converter.convert(
+                "select timediff(finished_at, started_at) from tenant_task"
+        );
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason()).contains("TIMEDIFF");
+    }
+
+    @Test
     void leavesUnsupportedTimeToSecShapeForManualReview() {
         SqlConversionResult result = converter.convert(
                 "select TIME_TO_SEC(duration_value)/60 from tenant_task"

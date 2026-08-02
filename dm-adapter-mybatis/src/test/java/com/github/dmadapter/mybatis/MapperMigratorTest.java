@@ -3254,6 +3254,50 @@ class MapperMigratorTest {
     }
 
     @Test
+    void rewritesTimePartsExtractedFromTimeDiffInMapperSelect() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ServiceMapper">
+                    <select id="censusCollection">
+                        select sum(minute(timediff(a.accomplish_date,a.reception_date))) / 60 workHours
+                        from ns_sr_services a
+                        where hour(timediff(a.accomplish_date,a.accept_date)) &lt; 24
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ServiceMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ServiceMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/ServiceMapper.xml"));
+        assertThat(rewritten)
+                .contains("MOD(TRUNC(ABS(DATEDIFF(SECOND, a.reception_date, a.accomplish_date)) / 60), 60)")
+                .contains("TRUNC(CAST(ABS(DATEDIFF(SECOND, a.accept_date, a.accomplish_date))")
+                .doesNotContainIgnoringCase("TIMEDIFF");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules()).contains(
+                MySqlToDmSqlConverter.MYSQL_TIME_PART_TIMEDIFF_RULE,
+                MySqlToDmSqlConverter.MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE
+        );
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicDeleteUpdateAddsMissingAndBetweenStaticWherePredicates() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

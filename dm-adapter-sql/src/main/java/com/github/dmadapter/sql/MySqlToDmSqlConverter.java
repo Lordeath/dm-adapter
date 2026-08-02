@@ -137,6 +137,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_HOUR_SECOND_INTERVAL_TO_DATEADD_SECOND";
     public static final String MYSQL_TIME_TO_SEC_TIMEDIFF_RULE =
             "MYSQL_TIME_TO_SEC_TIMEDIFF_TO_DATEDIFF_SECOND";
+    public static final String MYSQL_TIME_PART_TIMEDIFF_RULE =
+            "MYSQL_TIME_PART_TIMEDIFF_TO_DATEDIFF_SECOND";
     public static final String MYSQL_INTEGER_DIVISION_TO_DECIMAL_RULE =
             "MYSQL_INTEGER_DIVISION_TO_DECIMAL";
     public static final String MYSQL_DIV_OPERATOR_TO_TRUNC_DECIMAL_RULE =
@@ -215,6 +217,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "DATE_SUB",
             "MAKEDATE",
             "PERIOD_DIFF",
+            "TIMEDIFF",
+            "TIME_TO_SEC",
             "YEARWEEK"
     );
     private static final Set<String> SIMPLE_ARITHMETIC_FUNCTION_OPERANDS = Set.of(
@@ -1012,6 +1016,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (timeToSecTimeDiffConversion.changed()) {
             converted = timeToSecTimeDiffConversion.convertedSql();
             rules.add(MYSQL_TIME_TO_SEC_TIMEDIFF_RULE);
+        }
+
+        GenericConversion timePartTimeDiffConversion = convertTimePartTimeDiff(converted);
+        if (timePartTimeDiffConversion.changed()) {
+            converted = timePartTimeDiffConversion.convertedSql();
+            rules.add(MYSQL_TIME_PART_TIMEDIFF_RULE);
         }
 
         GenericConversion updateOrderLimitConversion = convertMysqlUpdateOrderLimitOne(converted);
@@ -4615,6 +4625,82 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return "DATEDIFF(SECOND, " + startExpression + ", " + end + ")";
+    }
+
+    private GenericConversion convertTimePartTimeDiff(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = appendSingleQuotedString(sql, index, converted);
+            } else if (current == '"') {
+                index = appendDoubleQuotedText(sql, index, converted);
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = appendMyBatisPlaceholder(sql, index, converted);
+            } else if (startsLineComment(sql, index)) {
+                index = appendUntilLineEnd(sql, index, converted);
+            } else if (startsBlockComment(sql, index)) {
+                index = appendUntilBlockCommentEnd(sql, index, converted);
+            } else {
+                String functionName = timePartFunctionName(sql, index);
+                FunctionCall functionCall = functionName == null
+                        ? null
+                        : readFunctionCall(sql, index, functionName);
+                String replacement = functionCall == null
+                        ? null
+                        : rewriteTimePartTimeDiff(functionName, functionCall);
+                if (replacement == null) {
+                    converted.append(current);
+                    index++;
+                } else {
+                    converted.append(replacement);
+                    index = functionCall.endIndex();
+                    changed = true;
+                }
+            }
+        }
+        return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private String timePartFunctionName(String sql, int index) {
+        for (String functionName : List.of("HOUR", "MINUTE", "SECOND")) {
+            if (startsFunction(sql, index, functionName)) {
+                return functionName;
+            }
+        }
+        return null;
+    }
+
+    private String rewriteTimePartTimeDiff(String functionName, FunctionCall timePartCall) {
+        List<TopLevelArgument> outerArguments = splitTopLevelArguments(timePartCall.body());
+        if (outerArguments.size() != 1) {
+            return null;
+        }
+        String timeDiffExpression = outerArguments.get(0).text().trim();
+        int start = leadingWhitespaceLength(timeDiffExpression);
+        FunctionCall timeDiffCall = readFunctionCall(timeDiffExpression, start, "TIMEDIFF");
+        if (timeDiffCall == null || skipWhitespace(timeDiffExpression, timeDiffCall.endIndex())
+                != timeDiffExpression.length()) {
+            return null;
+        }
+        List<TopLevelArgument> arguments = splitTopLevelArguments(timeDiffCall.body());
+        if (arguments.size() != 2) {
+            return null;
+        }
+        String end = dmDateTimeExpression(arguments.get(0).text());
+        String startExpression = dmDateTimeExpression(arguments.get(1).text());
+        if (end.isBlank() || startExpression.isBlank()) {
+            return null;
+        }
+        String seconds = "ABS(DATEDIFF(SECOND, " + startExpression + ", " + end + "))";
+        return switch (functionName) {
+            case "HOUR" -> "TRUNC(" + seconds + " / 3600)";
+            case "MINUTE" -> "MOD(TRUNC(" + seconds + " / 60), 60)";
+            case "SECOND" -> "MOD(" + seconds + ", 60)";
+            default -> null;
+        };
     }
 
     private String dmDateTimeExpression(String expression) {
