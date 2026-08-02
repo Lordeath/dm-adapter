@@ -734,7 +734,7 @@ public class MigrateCommand implements Callable<Integer> {
         if (configured != null && configured > 0L) {
             return configured;
         }
-        long scaled = DEFAULT_METADATA_READ_TIMEOUT_SECONDS + Math.max(0, tableCount);
+        long scaled = DEFAULT_METADATA_READ_TIMEOUT_SECONDS + Math.max(0, tableCount) * 5L;
         return Math.min(MAX_METADATA_READ_TIMEOUT_SECONDS, scaled);
     }
 

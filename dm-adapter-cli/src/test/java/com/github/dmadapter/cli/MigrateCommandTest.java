@@ -23,7 +23,8 @@ class MigrateCommandTest {
         try {
             System.clearProperty(propertyName);
             assertThat(MigrateCommand.metadataReadTimeoutSeconds(0)).isEqualTo(12L);
-            assertThat(MigrateCommand.metadataReadTimeoutSeconds(122)).isEqualTo(134L);
+            assertThat(MigrateCommand.metadataReadTimeoutSeconds(6)).isEqualTo(42L);
+            assertThat(MigrateCommand.metadataReadTimeoutSeconds(122)).isEqualTo(300L);
             assertThat(MigrateCommand.metadataReadTimeoutSeconds(1_000)).isEqualTo(300L);
 
             System.setProperty(propertyName, "45");
