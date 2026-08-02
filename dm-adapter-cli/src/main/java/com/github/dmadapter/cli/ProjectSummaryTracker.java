@@ -464,6 +464,9 @@ final class ProjectSummaryTracker {
             nextActions.add("检查 -7184 失败前最近修改依赖对象的 DDL，并在 CALL 前重新编译对应过程；"
                     + "不要由工具修改 PL_SQL_STRIP。");
         }
+        if (issues.stream().anyMatch(issue -> "INDEX_NAME_DEFINITION_CONFLICT".equals(issue.pattern()))) {
+            nextActions.add("检查同名索引的现有定义；仅在确认业务语义后重命名或替换，工具不会把不同定义视为等价。");
+        }
         if (issues.stream().anyMatch(issue -> issue.rootCount() > 0L)) {
             nextActions.add("按主要问题中的根因优先级处理详细报告，再重新执行完整数据库验证。");
         }
@@ -503,6 +506,8 @@ final class ProjectSummaryTracker {
             case "OBJECT_STATUS_VALIDATION_FAILED" -> "授予验证账号查询当前 schema 对象状态的权限后重新运行。";
             case "OBJECT_DEFINITION_CHANGED" -> "根据报告中的最近相关 DDL 检查过程依赖并重新编译；"
                     + "复杂动态 DDL 改为人工确认。";
+            case "INDEX_NAME_DEFINITION_CONFLICT" -> "检查同名索引的列、表达式、顺序和唯一性，"
+                    + "确认后重命名或替换现有索引。";
             case "TEST_SCHEMA_OBJECT", "TEST_SCHEMA_FUNCTION" -> "先补齐测试库对象，再判断是否属于业务 SQL 问题。";
             default -> "查看详细报告中的首个失败样例并按迁移分类处理。";
         };

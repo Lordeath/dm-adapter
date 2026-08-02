@@ -412,6 +412,13 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
                 if ("OBJECT_DEFINITION_CHANGED".equals(category)) {
                     errorSummary = objectDefinitionChangedSummary(errorSummary, e, recentObjectDdl);
                 }
+                if ("INDEX_NAME_DEFINITION_CONFLICT".equals(category)) {
+                    errorSummary = compact(
+                            "The generated target index name already exists with a non-equivalent definition; "
+                                    + "review or rename the existing index before migration. "
+                                    + errorSummary
+                    );
+                }
                 if (!blockedObject.isBlank()) {
                     errorSummary = compact("Blocked by failed statement "
                             + failedCreatedObjects.get(blockedObject)
@@ -1086,6 +1093,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
         if (message.contains("无效的函数") || message.contains("无法解析的成员访问表达式")) {
             return "TEST_SCHEMA_FUNCTION";
         }
+        if (isGeneratedIndexDefinitionConflict(message, sql)) {
+            return "INDEX_NAME_DEFINITION_CONFLICT";
+        }
         if (message.contains("语法") || message.contains("syntax")) {
             if (containsDuplicateColumnDefault(sql) || containsContradictoryColumnNullability(sql)) {
                 return "ORIGINAL_SQL";
@@ -1093,6 +1103,18 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator {
             return "SQL_SYNTAX";
         }
         return "SQL_EXECUTION";
+    }
+
+    private boolean isGeneratedIndexDefinitionConflict(String message, String sql) {
+        if (message == null || sql == null
+                || !sql.toUpperCase(Locale.ROOT).contains("DM_EQUIVALENT_INDEXES")
+                || !Pattern.compile("(?is)\\bEXECUTE\\s+IMMEDIATE\\s+'.*?CREATE\\s+(?:UNIQUE\\s+)?INDEX\\b")
+                .matcher(sql)
+                .find()) {
+            return false;
+        }
+        return (message.contains("索引[") && message.contains("已存在"))
+                || (message.contains("index") && message.contains("already exists"));
     }
 
     private boolean containsDuplicateColumnDefault(String sql) {
