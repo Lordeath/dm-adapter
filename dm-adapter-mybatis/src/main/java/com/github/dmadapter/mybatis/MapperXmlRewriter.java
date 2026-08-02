@@ -72,6 +72,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE";
     public static final String MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE =
             "MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE";
+    public static final String MYBATIS_JOINED_SELECT_ALIAS_REFERENCE_QUALIFIED_RULE =
+            "MYBATIS_JOINED_SELECT_ALIAS_REFERENCE_QUALIFIED";
     public static final String MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE =
             "MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT";
     public static final String DAMENG_BLOCK_DUPLICATE_SEMICOLON_REMOVED_RULE =
@@ -1082,6 +1084,12 @@ public class MapperXmlRewriter {
         if (keywordAliasReferences.changed()) {
             converted = keywordAliasReferences.text();
             appliedRules.add(MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE);
+        }
+
+        TextRewrite joinedSelectAliasReferences = qualifyJoinedSelectAliasReferences(converted);
+        if (joinedSelectAliasReferences.changed()) {
+            converted = joinedSelectAliasReferences.text();
+            appliedRules.add(MYBATIS_JOINED_SELECT_ALIAS_REFERENCE_QUALIFIED_RULE);
         }
 
         TextRewrite informationSchemaColumns = convertDynamicInformationSchemaColumns(converted);
@@ -3625,6 +3633,135 @@ public class MapperXmlRewriter {
 
     private TextRewrite replaceSelectAliases(String value, Map<String, SelectAlias> selectAliases) {
         return replaceAliases(value, selectAliases, true);
+    }
+
+    private TextRewrite qualifyJoinedSelectAliasReferences(String body) {
+        SqlView view = sqlView(body);
+        SelectScope scope = selectScopes(view.text()).stream()
+                .filter(candidate -> candidate.depth() == 0)
+                .findFirst()
+                .orElse(null);
+        if (scope == null
+                || findTopLevelKeyword(
+                        view.text(),
+                        "JOIN",
+                        scope.fromIndex() + "FROM".length(),
+                        scope.scopeEnd(),
+                        scope.depth()
+                ) < 0) {
+            return new TextRewrite(body, false);
+        }
+
+        Map<String, SelectAlias> aliases = simpleQualifiedSelectAliases(
+                body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
+        );
+        if (aliases.isEmpty()) {
+            return new TextRewrite(body, false);
+        }
+
+        int referenceStart;
+        MyBatisWhereBlock whereBlock = findMyBatisWhereBlock(body, scope.fromIndex(), scope.scopeEnd());
+        if (whereBlock != null) {
+            referenceStart = whereBlock.openingEnd();
+        } else {
+            int whereIndex = findTopLevelKeyword(
+                    view.text(),
+                    "WHERE",
+                    scope.fromIndex() + "FROM".length(),
+                    scope.scopeEnd(),
+                    scope.depth()
+            );
+            if (whereIndex >= 0) {
+                referenceStart = whereIndex + "WHERE".length();
+            } else {
+                int orderIndex = findTopLevelKeyword(
+                        view.text(),
+                        "ORDER",
+                        scope.fromIndex() + "FROM".length(),
+                        scope.scopeEnd(),
+                        scope.depth()
+                );
+                if (orderIndex < 0) {
+                    return new TextRewrite(body, false);
+                }
+                referenceStart = orderIndex + "ORDER".length();
+            }
+        }
+        TextRewrite references = replaceJoinedSelectAliasReferences(
+                body.substring(referenceStart, scope.scopeEnd()),
+                aliases
+        );
+        if (!references.changed()) {
+            return new TextRewrite(body, false);
+        }
+        return new TextRewrite(
+                body.substring(0, referenceStart)
+                        + references.text()
+                        + body.substring(scope.scopeEnd()),
+                true
+        );
+    }
+
+    private Map<String, SelectAlias> simpleQualifiedSelectAliases(String selectList) {
+        Map<String, SelectAlias> aliases = new LinkedHashMap<>();
+        Set<String> ambiguous = new LinkedHashSet<>();
+        for (String item : splitTopLevelComma(selectList)) {
+            SelectAlias alias = selectAlias(item);
+            if (alias == null
+                    || !isSimpleQualifiedIdentifierExpression(alias.expression())
+                    || !alias.expression().contains(".")) {
+                continue;
+            }
+            String key = identifierKey(alias.alias());
+            SelectAlias existing = aliases.get(key);
+            if (existing == null && !ambiguous.contains(key)) {
+                aliases.put(key, alias);
+            } else if (existing != null && !existing.expression().equalsIgnoreCase(alias.expression())) {
+                aliases.remove(key);
+                ambiguous.add(key);
+            }
+        }
+        return aliases;
+    }
+
+    private TextRewrite replaceJoinedSelectAliasReferences(
+            String value,
+            Map<String, SelectAlias> aliases
+    ) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        int index = 0;
+        while (index < value.length()) {
+            if (value.startsWith("<!--", index)) {
+                int end = value.indexOf("-->", index + "<!--".length());
+                index = end < 0 ? value.length() : end + "-->".length();
+            } else if (value.startsWith("<![CDATA[", index)) {
+                int end = value.indexOf("]]>", index + "<![CDATA[".length());
+                index = end < 0 ? value.length() : end + "]]>".length();
+            } else if (value.charAt(index) == '<') {
+                XmlTag tag = readXmlTag(value, index);
+                index = tag == null ? index + 1 : tag.endIndex();
+            } else if (value.charAt(index) == '\'') {
+                index = skipQuoted(value, index, value.charAt(index));
+            } else if (startsMyBatisPlaceholder(value, index)) {
+                index = skipMyBatisPlaceholder(value, index);
+            } else if (isIdentifierStart(value.charAt(index))
+                    || value.charAt(index) == '`'
+                    || value.charAt(index) == '"') {
+                IdentifierToken token = readIdentifierToken(value, index);
+                if (token == null) {
+                    index++;
+                    continue;
+                }
+                SelectAlias alias = aliases.get(identifierKey(token.text()));
+                if (alias != null && shouldReplaceAliasToken(value, index, token, alias, false)) {
+                    replacements.add(new TextReplacement(index, token.endIndex(), alias.expression()));
+                }
+                index = token.endIndex();
+            } else {
+                index++;
+            }
+        }
+        return applyTextReplacements(value, replacements);
     }
 
     private Map<String, SelectAlias> referencedAliases(

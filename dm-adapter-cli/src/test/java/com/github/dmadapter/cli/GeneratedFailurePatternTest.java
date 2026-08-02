@@ -210,6 +210,18 @@ class GeneratedFailurePatternTest {
                     failedRecord(validationClass, suppliedRequiredColumn)
             )).isTrue();
 
+            String invalidGeneratedJsonValue = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error updating database. Cause: dm.jdbc.driver.DMException: JSON值语法错误
+                    ### SQL: insert into ns_message(data) values (?)
+                    ### Cause: dm.jdbc.driver.DMException: JSON值语法错误
+                    """;
+            Object invalidJsonRecord = failedRecord(validationClass, invalidGeneratedJsonValue);
+            assertThat(failurePattern(validationClass, validation, invalidJsonRecord))
+                    .isEqualTo("TEST_DATA_OR_CONSTRAINT");
+            assertThat(category(validationClass, validation, invalidJsonRecord))
+                    .isEqualTo("TEST_DATA_OR_SCHEMA");
+
             String missingAnd = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error updating database. Cause: dm.jdbc.driver.DMException: 语法分析出错
@@ -498,6 +510,61 @@ class GeneratedFailurePatternTest {
                     validation,
                     genericObjectPropertyRecord
             )).isTrue();
+
+            String generatedStringElementProperty = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    Error evaluating expression 'v.type != null'.
+                    Cause: org.apache.ibatis.ognl.NoSuchPropertyException: java.lang.String.type
+                    """;
+            Object generatedStringElementPropertyRecord = failedRecord(
+                    validationClass,
+                    generatedStringElementProperty
+            );
+            assertThat(failurePattern(validationClass, validation, generatedStringElementPropertyRecord))
+                    .isEqualTo("MAPPER_PROPERTY_NAME");
+            assertThat(category(validationClass, validation, generatedStringElementPropertyRecord))
+                    .isEqualTo("METHOD_ARGS_OR_BINDING");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    generatedStringElementPropertyRecord
+            )).isTrue();
+
+            String missingEntityProperty = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    Error evaluating expression 'item.id'.
+                    Cause: org.apache.ibatis.ognl.NoSuchPropertyException: com.newsee.dorm.entity.NsDormPlan.id
+                    """;
+            Object missingEntityPropertyRecord = failedRecord(validationClass, missingEntityProperty);
+            assertThat(failurePattern(validationClass, validation, missingEntityPropertyRecord))
+                    .isEqualTo("ORIGINAL_MAPPER_PROPERTY_NAME_MISMATCH");
+            assertThat(category(validationClass, validation, missingEntityPropertyRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    missingEntityPropertyRecord
+            )).isFalse();
+
+            String missingWhereBeforeAliasedTablePredicate = """
+                    org.apache.ibatis.exceptions.PersistenceException:
+                    ### Error querying database. Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    ### SQL: select planId from ns_dorm_plan plan and deleteFlag = 0 and planId = ?
+                    ### Cause: dm.jdbc.driver.DMException: 语法分析出错
+                    """;
+            Object missingWhereAfterAliasedTableRecord = failedRecord(
+                    validationClass,
+                    missingWhereBeforeAliasedTablePredicate
+            );
+            assertThat(failurePattern(validationClass, validation, missingWhereAfterAliasedTableRecord))
+                    .isEqualTo("ORIGINAL_XML_SYNTAX_DEFECT");
+            assertThat(category(validationClass, validation, missingWhereAfterAliasedTableRecord))
+                    .isEqualTo("ORIGINAL_SQL");
+            assertThat(shouldSuggestValidationArguments(
+                    validationClass,
+                    validation,
+                    missingWhereAfterAliasedTableRecord
+            )).isFalse();
         }
     }
 

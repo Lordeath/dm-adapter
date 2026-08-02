@@ -9546,7 +9546,8 @@ class DmSqlValidationTestGenerator {
                     if (hasOriginalMapperPropertyNameMismatch(message)) {
                         return "ORIGINAL_MAPPER_PROPERTY_NAME_MISMATCH";
                     }
-                    if (lower.contains("there is no getter for property")) {
+                    if (lower.contains("there is no getter for property")
+                            || lower.contains("nosuchpropertyexception:")) {
                         return "MAPPER_PROPERTY_NAME";
                     }
                     if (lower.contains("违反引用约束")) {
@@ -9581,10 +9582,18 @@ class DmSqlValidationTestGenerator {
                             "(?i)there is no getter for property(?: named)?\\\\s+['\\\"]?[^'\\\"]+['\\\"]?"
                                     + "\\\\s+in\\\\s+['\\\"]?class\\\\s+([A-Za-z_$][A-Za-z0-9_$.]*)"
                     ).matcher(message);
-                    if (!matcher.find()) {
-                        return false;
+                    if (matcher.find()) {
+                        return isApplicationParameterClass(matcher.group(1));
                     }
-                    String parameterClass = matcher.group(1).toLowerCase(Locale.ROOT);
+                    Matcher noSuchPropertyMatcher = Pattern.compile(
+                            "(?i)nosuchpropertyexception:\\\\s+([A-Za-z_$][A-Za-z0-9_$.]*)\\\\.[A-Za-z_$][A-Za-z0-9_$]*"
+                    ).matcher(message);
+                    return noSuchPropertyMatcher.find()
+                            && isApplicationParameterClass(noSuchPropertyMatcher.group(1));
+                }
+
+                private boolean isApplicationParameterClass(String className) {
+                    String parameterClass = className.toLowerCase(Locale.ROOT);
                     return !parameterClass.startsWith("java.")
                             && !parameterClass.startsWith("javax.")
                             && !parameterClass.startsWith("jakarta.")
@@ -9735,6 +9744,12 @@ class DmSqlValidationTestGenerator {
                                             + "(?:\\\"and\\\"|\\\"or\\\"|and|or)\\\\s+"
                                             + "[A-Za-z_][A-Za-z0-9_$]*\\\\s*(?:=|<>|!=|>=|<=|>|<|like\\\\b|in\\\\s*\\\\()"
                             ).matcher(value).find()
+                            || Pattern.compile(
+                                    "(?i)### SQL:[\\\\s\\\\S]*?\\\\bfrom\\\\s+[^\\\\s,()]+\\\\s+"
+                                            + "(?:as\\\\s+)?[A-Za-z_][A-Za-z0-9_$]*\\\\s+"
+                                            + "(?:\\\"and\\\"|\\\"or\\\"|and|or)\\\\s+"
+                                            + "[A-Za-z_][A-Za-z0-9_$]*\\\\s*(?:=|<>|!=|>=|<=|>|<|like\\\\b|in\\\\s*\\\\()"
+                            ).matcher(value).find()
                             || hasUnbalancedSqlParentheses(value)
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\?\\\\s+\\\\?").matcher(value).find()
                             || Pattern.compile("(?i)### SQL:[\\\\s\\\\S]*?\\\\bupdate\\\\b[\\\\s\\\\S]*?\\\\bset\\\\b[\\\\s\\\\S]*?(?:,\\\\s*)?\\\\?(?:\\\\s*,|\\\\s+where\\\\b)").matcher(value).find()
@@ -9757,6 +9772,7 @@ class DmSqlValidationTestGenerator {
                             "类型转换异常",
                             "唯一性约束",
                             "非法的时间日期类型数据",
+                            "JSON值语法错误",
                             "SET IDENTITY_INSERT",
                             "自增列");
                 }
@@ -10126,6 +10142,7 @@ class DmSqlValidationTestGenerator {
                             "Parameter '",
                             "not found. Available parameters",
                             "There is no getter for property",
+                            "NoSuchPropertyException:",
                             "No setter found for the keyProperty",
                             "ClassCastException",
                             "invalid comparison:",

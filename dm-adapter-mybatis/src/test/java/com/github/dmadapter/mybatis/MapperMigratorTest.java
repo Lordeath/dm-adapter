@@ -6790,7 +6790,7 @@ class MapperMigratorTest {
                 tempDir.resolve("src/main/resources/mapper-dm/RegionsMapper.xml")
         );
         assertThat(rewritten).contains(
-                "WITH RECURSIVE SubAddresses(id, parentId, regionPath, level, localName) AS ("
+                "WITH RECURSIVE SubAddresses(id, parentId, regionPath, \"level\", localName) AS ("
         );
         assertThat(result.automaticConversions()).singleElement().satisfies(change ->
                 assertThat(change.appliedRules())
@@ -6843,6 +6843,69 @@ class MapperMigratorTest {
         assertThat(result.automaticConversions()).singleElement().satisfies(change ->
                 assertThat(change.appliedRules())
                         .contains(MySqlToDmSqlConverter.MYSQL_CONVERT_GBK_ORDER_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void qualifiesJoinedSelectProjectionAliasesInDynamicWhereAndOrderBy() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/RedInvoiceDetailsMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.RedInvoiceDetailsMapper">
+                    <select id="listPage" resultType="map">
+                        select
+                            npc.Id as id,
+                            npc.EnterpriseId as enterpriseId,
+                            npc.OrganizationId as organizationId
+                        from ns_redpayment_order nro
+                        left join ns_redpayment_order_detail nrod on nro.orderNo = nrod.orderNo
+                        left join ns_payment_chargepayment npc on nrod.paymentId = npc.Id
+                        <where>
+                            nro.isDelete = 0
+                            <if test="enterpriseId != null">
+                                and `enterpriseId` = #{enterpriseId}
+                            </if>
+                            <if test="organizationIdList != null">
+                                and `organizationId` in
+                                <foreach collection="organizationIdList" item="item" open="(" close=")">
+                                    #{item}
+                                </foreach>
+                            </if>
+                        </where>
+                        <choose>
+                            <when test="orderFieldName != null">order by ${orderFieldName}</when>
+                            <otherwise>order by `id` desc</otherwise>
+                        </choose>
+                    </select>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/RedInvoiceDetailsMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/RedInvoiceDetailsMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("and npc.EnterpriseId = #{enterpriseId}")
+                .contains("and npc.OrganizationId in")
+                .contains("order by npc.Id desc")
+                .contains("test=\"enterpriseId != null\"")
+                .contains("order by ${orderFieldName}");
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_JOINED_SELECT_ALIAS_REFERENCE_QUALIFIED_RULE));
         assertThat(result.manualReviewItems()).isEmpty();
     }
 

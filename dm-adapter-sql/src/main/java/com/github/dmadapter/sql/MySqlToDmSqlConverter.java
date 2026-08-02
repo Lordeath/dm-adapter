@@ -116,6 +116,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_GENERATED_COLUMN_STORED_REMOVAL_RULE =
             "MYSQL_GENERATED_COLUMN_STORED_REMOVED";
     public static final String MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE = "MYSQL_NUMERIC_TYPE_ATTRIBUTE_TO_DM";
+    public static final String MYSQL_TEXT_TYPE_TO_DM_CLOB_RULE = "MYSQL_TEXT_TYPE_TO_DM_CLOB";
     public static final String MYSQL_DECIMAL_PRECISION_CAP_RULE = "MYSQL_DECIMAL_PRECISION_CAP_TO_DM";
     public static final String MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE =
             "MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVED";
@@ -633,6 +634,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (numericTypeAttributeConversion.changed()) {
             converted = numericTypeAttributeConversion.convertedSql();
             rules.add(MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE);
+        }
+
+        GenericConversion createTableTextTypeConversion = convertMysqlCreateTableTextTypes(converted);
+        if (createTableTextTypeConversion.changed()) {
+            converted = createTableTextTypeConversion.convertedSql();
+            rules.add(MYSQL_TEXT_TYPE_TO_DM_CLOB_RULE);
         }
 
         GenericConversion autoIncrementConversion = convertMysqlAutoIncrement(converted);
@@ -3041,6 +3048,56 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private GenericConversion convertMysqlCreateTableTextTypes(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        List<TopLevelArgument> definitions = splitTopLevelArguments(sql.substring(openParenIndex + 1, closeParenIndex));
+        List<String> convertedDefinitions = new ArrayList<>(definitions.size());
+        boolean changed = false;
+        for (TopLevelArgument definition : definitions) {
+            String text = definition.text();
+            int columnStart = skipWhitespace(text, 0);
+            IdentifierToken column = readIdentifierToken(text, columnStart);
+            if (column == null) {
+                convertedDefinitions.add(text);
+                continue;
+            }
+            int typeStart = skipWhitespace(text, column.endIndex());
+            IdentifierToken type = readIdentifierToken(text, typeStart);
+            if (type == null || !Set.of("TINYTEXT", "MEDIUMTEXT", "LONGTEXT", "TEXT")
+                    .contains(type.text().toUpperCase(Locale.ROOT))) {
+                convertedDefinitions.add(text);
+                continue;
+            }
+            convertedDefinitions.add(text.substring(0, typeStart) + "CLOB" + text.substring(type.endIndex()));
+            changed = true;
+        }
+        if (!changed) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(
+                sql.substring(0, openParenIndex + 1)
+                        + String.join(",", convertedDefinitions)
+                        + sql.substring(closeParenIndex),
+                true
+        );
     }
 
     private NumericTypeRewrite readMysqlNumericTypeRewrite(String sql, IdentifierToken token) {
@@ -6327,6 +6384,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (aliases.isEmpty()) {
             return GenericConversion.unchanged(sql);
         }
+        aliases = aliases.stream()
+                .map(this::quoteRecursiveCteAliasIfNeeded)
+                .toList();
         String converted = sql.substring(0, cteName.endIndex())
                 + "("
                 + String.join(", ", aliases)
@@ -6369,16 +6429,28 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return List.copyOf(aliases);
     }
 
+    private String quoteRecursiveCteAliasIfNeeded(String alias) {
+        String candidate = alias == null ? "" : alias.strip();
+        if (!isSimpleIdentifier(candidate) || !isDamengKeywordRequiringQuotes(candidate)) {
+            return candidate;
+        }
+        return quoteDamengIdentifier(candidate);
+    }
+
     private List<String> inferCteColumnAliases(String cteBody) {
         int selectIndex = findTopLevelKeyword(cteBody, "SELECT", 0);
         if (selectIndex < 0) {
             return List.of();
         }
         int fromIndex = findTopLevelKeyword(cteBody, "FROM", selectIndex + "SELECT".length());
-        if (fromIndex < 0) {
+        int unionIndex = findTopLevelKeyword(cteBody, "UNION", selectIndex + "SELECT".length());
+        int selectListEnd = fromIndex >= 0 && (unionIndex < 0 || fromIndex < unionIndex)
+                ? fromIndex
+                : unionIndex;
+        if (selectListEnd < 0) {
             return List.of();
         }
-        String selectList = cteBody.substring(selectIndex + "SELECT".length(), fromIndex);
+        String selectList = cteBody.substring(selectIndex + "SELECT".length(), selectListEnd);
         List<String> aliases = new ArrayList<>();
         for (TopLevelArgument item : splitTopLevelArguments(selectList)) {
             String alias = inferSelectItemAlias(item.text());
