@@ -50,6 +50,8 @@ class SqlScriptMigrator {
     static final String MYSQL_CREATE_DEFINER_REMOVAL_RULE = "MYSQL_CREATE_DEFINER_REMOVED";
     static final String MYSQL_CREATE_PROCEDURE_TO_DM_RULE = "MYSQL_CREATE_PROCEDURE_TO_DM";
     static final String MYSQL_CREATE_FUNCTION_TO_DM_RULE = "MYSQL_CREATE_FUNCTION_TO_DM";
+    static final String MYSQL_ROUTINE_PARAMETER_COMMENT_REMOVAL_RULE =
+            "MYSQL_ROUTINE_PARAMETER_COMMENT_REMOVED";
     static final String MYSQL_SCRIPT_METADATA_TO_DM_RULE = "MYSQL_SCRIPT_METADATA_TO_DM";
     static final String MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVAL_RULE = "MYSQL_SCRIPT_COMMENT_CLAUSE_REMOVED";
     static final String MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE = "MYSQL_SCHEMA_SCOPED_INDEX_NAME";
@@ -321,24 +323,22 @@ class SqlScriptMigrator {
             ),
             new TextReplacement(
                     Pattern.compile(
-                            "(?is)\\bselect\\s+column_name\\s+from\\s+information_schema\\s*\\.\\s*"
-                                    + "(?:statistics|`statistics`|\"statistics\")"
-                    ),
-                    "SELECT INDEX_NAME FROM ALL_INDEXES"
-            ),
-            new TextReplacement(
-                    Pattern.compile(
                             "(?is)\\binformation_schema\\s*\\.\\s*(?:statistics|`statistics`|\"statistics\")"
                     ),
-                    "(SELECT I.OWNER, I.TABLE_NAME, I.INDEX_NAME, "
+                    "(SELECT I.TABLE_OWNER AS OWNER, I.TABLE_NAME, I.INDEX_NAME, "
                             + "CASE WHEN I.UNIQUENESS = 'UNIQUE' THEN 0 ELSE 1 END AS NON_UNIQUE, "
-                            + "C.COLUMN_NAME, C.COLUMN_POSITION AS SEQ_IN_INDEX "
+                            + "C.COLUMN_NAME, C.COLUMN_POSITION AS SEQ_IN_INDEX, "
+                            + "CASE WHEN TC.NULLABLE = 'Y' THEN 'YES' ELSE '' END AS NULLABLE "
                             + "FROM ALL_INDEXES I "
                             + "JOIN ALL_IND_COLUMNS C "
                             + "ON C.INDEX_OWNER = I.OWNER "
                             + "AND C.INDEX_NAME = I.INDEX_NAME "
                             + "AND C.TABLE_OWNER = I.TABLE_OWNER "
-                            + "AND C.TABLE_NAME = I.TABLE_NAME)"
+                            + "AND C.TABLE_NAME = I.TABLE_NAME "
+                            + "LEFT JOIN ALL_TAB_COLUMNS TC "
+                            + "ON TC.OWNER = C.TABLE_OWNER "
+                            + "AND TC.TABLE_NAME = C.TABLE_NAME "
+                            + "AND TC.COLUMN_NAME = C.COLUMN_NAME)"
             ),
             new TextReplacement(
                     Pattern.compile(
@@ -6369,6 +6369,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_CREATE_DEFINER_REMOVAL_RULE);
         }
 
+        String routineParameterCommentSql = removeMysqlRoutineParameterComments(converted);
+        if (!routineParameterCommentSql.equals(converted)) {
+            converted = routineParameterCommentSql;
+            rules.add(MYSQL_ROUTINE_PARAMETER_COMMENT_REMOVAL_RULE);
+        }
+
         String procedureSql = convertCreateProcedureHeader(converted);
         if (!procedureSql.equals(converted)) {
             converted = procedureSql;
@@ -7591,6 +7597,68 @@ class SqlScriptMigrator {
             )));
         }
         return converted;
+    }
+
+    private String removeMysqlRoutineParameterComments(String sql) {
+        if (!isCreateRoutineStatement(sql)) {
+            return sql;
+        }
+        int openParen = firstTopLevelParen(sql);
+        int closeParen = findMatchingParen(sql, openParen);
+        if (openParen < 0 || closeParen <= openParen) {
+            return sql;
+        }
+        String parameters = sql.substring(openParen + 1, closeParen);
+        String withoutComments = removeSqlCommentsPreservingLineBreaks(parameters);
+        if (withoutComments.equals(parameters)) {
+            return sql;
+        }
+        return sql.substring(0, openParen + 1)
+                + withoutComments
+                + sql.substring(closeParen);
+    }
+
+    private String removeSqlCommentsPreservingLineBreaks(String value) {
+        StringBuilder converted = new StringBuilder(value.length());
+        boolean changed = false;
+        int index = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\'') {
+                int end = skipSingleQuotedString(value, index);
+                converted.append(value, index, end);
+                index = end;
+            } else if (current == '"') {
+                int end = skipDoubleQuotedText(value, index);
+                converted.append(value, index, end);
+                index = end;
+            } else if (current == '`') {
+                int end = skipBacktickIdentifier(value, index);
+                converted.append(value, index, end);
+                index = end;
+            } else if (startsLineComment(value, index)) {
+                int end = skipUntilLineEnd(value, index);
+                appendCommentWhitespace(converted, value, index, end);
+                index = end;
+                changed = true;
+            } else if (startsBlockComment(value, index)) {
+                int end = skipUntilBlockCommentEnd(value, index);
+                appendCommentWhitespace(converted, value, index, end);
+                index = end;
+                changed = true;
+            } else {
+                converted.append(current);
+                index++;
+            }
+        }
+        return changed ? converted.toString() : value;
+    }
+
+    private void appendCommentWhitespace(StringBuilder converted, String value, int start, int end) {
+        for (int index = start; index < end; index++) {
+            char current = value.charAt(index);
+            converted.append(current == '\r' || current == '\n' ? current : ' ');
+        }
     }
 
     private String convertCreateFunctionHeader(String sql) {
@@ -10392,7 +10460,9 @@ class SqlScriptMigrator {
         }
         List<ProcedureExistsTerm> terms = new ArrayList<>();
         while (true) {
-            String existsSelect = sql.substring(cursor + 1, closeParen).strip();
+            String existsSelect = removePositiveMysqlLimitFromExistsSelect(
+                    sql.substring(cursor + 1, closeParen)
+            );
             if (!startsKeyword(existsSelect, skipWhitespace(existsSelect, 0), "SELECT")) {
                 return null;
             }
@@ -10483,6 +10553,21 @@ class SqlScriptMigrator {
             }
         }
         return collapseSqlWhitespaceOutsideQuotedText(fromClause);
+    }
+
+    private String removePositiveMysqlLimitFromExistsSelect(String existsSelect) {
+        String query = existsSelect == null ? "" : existsSelect.strip();
+        int limitIndex = topLevelKeywordIndex(query, "LIMIT");
+        if (limitIndex < 0) {
+            return query;
+        }
+        String limitClause = query.substring(limitIndex).strip();
+        if (!Pattern.compile("(?is)^LIMIT\\s+[1-9]\\d*\\s*;?$", Pattern.CASE_INSENSITIVE)
+                .matcher(limitClause)
+                .matches()) {
+            return query;
+        }
+        return query.substring(0, limitIndex).stripTrailing();
     }
 
     private String collapseSqlWhitespaceOutsideQuotedText(String value) {
@@ -11085,6 +11170,10 @@ class SqlScriptMigrator {
                 index = skipDoubleQuotedText(value, index);
             } else if (current == '`') {
                 index = skipBacktickIdentifier(value, index);
+            } else if (startsLineComment(value, index)) {
+                index = skipUntilLineEnd(value, index);
+            } else if (startsBlockComment(value, index)) {
+                index = skipUntilBlockCommentEnd(value, index);
             } else if (current == '(') {
                 return index;
             } else {
@@ -13467,6 +13556,10 @@ class SqlScriptMigrator {
                 index = skipDoubleQuotedText(value, index);
             } else if (current == '`') {
                 index = skipBacktickIdentifier(value, index);
+            } else if (startsLineComment(value, index)) {
+                index = skipUntilLineEnd(value, index);
+            } else if (startsBlockComment(value, index)) {
+                index = skipUntilBlockCommentEnd(value, index);
             } else if (current == '(') {
                 depth++;
                 index++;

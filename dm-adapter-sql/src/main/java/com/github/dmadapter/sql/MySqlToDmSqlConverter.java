@@ -460,7 +460,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     + "(?<trailing>\\s*;?\\s*)$"
     );
     private static final Pattern MYSQL_HELP_TOPIC_SPLIT_JOIN_PATTERN = Pattern.compile(
-            "(?is)\\bJOIN\\s+mysql\\s*\\.\\s*help_topic\\s+"
+            "(?is)\\b(?:INNER\\s+)?JOIN\\s+mysql\\s*\\.\\s*help_topic\\s+"
                     + "(?<alias>" + SIMPLE_IDENTIFIER + ")\\s+ON\\s+"
                     + "(?<conditionAlias>" + SIMPLE_IDENTIFIER + ")\\s*\\.\\s*help_topic_id\\s*"
                     + "(?<lessThan>&lt;|<)\\s*\\(\\s*"
@@ -7749,6 +7749,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 "RIGHT",
                 "FULL",
                 "JOIN",
+                "CROSS",
+                "APPLY",
+                "CONNECT",
+                "START",
                 "GROUP",
                 "ORDER",
                 "HAVING",

@@ -1750,6 +1750,36 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void removesInlineCommentsFromMysqlProcedureParameterListBeforeReorderingModes() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE add_dictionary_item(
+                    IN class_code VARCHAR(100),
+                    IN item_name VARCHAR(100), -- 名称，必填
+                    IN item_value VARCHAR(100), /* 值（必填） */
+                    IN item_code VARCHAR(100),  -- 编码，非必填
+                    IN order_index INT
+                )
+                BEGIN
+                    SELECT item_value;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("add_dictionary_item(class_code IN VARCHAR(100), item_name IN VARCHAR(100),")
+                .contains("item_value IN VARCHAR(100), item_code IN VARCHAR(100), order_index IN INT)")
+                .doesNotContain("名称，必填")
+                .doesNotContain("值（必填）")
+                .doesNotContain("编码，非必填");
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_ROUTINE_PARAMETER_COMMENT_REMOVAL_RULE));
+    }
+
+    @Test
     void treatsProcedureDropWithoutTemporaryKeywordAsLocalTempInitializationNoop() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DELIMITER $$
@@ -1876,6 +1906,34 @@ class SqlScriptMigratorTest {
                                 SqlScriptMigrator.MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE
                         ));
+    }
+
+    @Test
+    void removesPositiveMysqlLimitFromProcedureExistsBeforeCounting() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE init_settlement_company_relate()
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM ns_contract_tob_settlement LIMIT 1) THEN
+                        IF NOT EXISTS (SELECT 1 FROM ns_settlement_company_relate LIMIT 1) THEN
+                            INSERT INTO ns_settlement_company_relate(id) VALUES (1);
+                        END IF;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT COUNT(*) INTO dm_adapter_exists FROM ns_contract_tob_settlement;")
+                .contains("SELECT COUNT(*) INTO dm_adapter_exists_2 FROM ns_settlement_company_relate;")
+                .contains("IF dm_adapter_exists > 0 THEN")
+                .contains("IF dm_adapter_exists_2 = 0 THEN")
+                .doesNotContain("LIMIT 1")
+                .doesNotContain("dm_adapter_exists_check");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE));
     }
 
     @Test
@@ -4723,6 +4781,37 @@ class SqlScriptMigratorTest {
                                 SqlScriptMigrator.MYSQL_PROCEDURE_IF_EXISTS_TO_COUNT_RULE,
                                 SqlScriptMigrator.MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE
                         ));
+    }
+
+    @Test
+    void convertsMysqlStatisticsColumnNullabilityCheckUsingIndexAndColumnMetadata() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE relax_collection_plan_id()
+                BEGIN
+                    IF EXISTS (
+                        SELECT COLUMN_NAME FROM information_schema.STATISTICS
+                        WHERE table_schema = DATABASE()
+                          AND table_name = 'bcrm_collection'
+                          AND column_name = 'collectionPlanId'
+                          AND NULLABLE <> 'YES'
+                    ) THEN
+                        ALTER TABLE bcrm_collection MODIFY COLUMN collectionPlanId BIGINT NULL;
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT I.TABLE_OWNER AS OWNER, I.TABLE_NAME, I.INDEX_NAME")
+                .contains("JOIN ALL_IND_COLUMNS C")
+                .contains("LEFT JOIN ALL_TAB_COLUMNS TC")
+                .contains("CASE WHEN TC.NULLABLE = 'Y' THEN 'YES' ELSE '' END AS NULLABLE")
+                .contains("UPPER(COLUMN_NAME) = UPPER('collectionPlanId')")
+                .contains("NULLABLE <> 'YES'")
+                .doesNotContain("SELECT INDEX_NAME FROM ALL_INDEXES")
+                .doesNotContain("information_schema.STATISTICS");
     }
 
     @Test

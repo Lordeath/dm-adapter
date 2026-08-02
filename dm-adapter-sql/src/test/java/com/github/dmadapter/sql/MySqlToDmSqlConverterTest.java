@@ -1860,6 +1860,26 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesInnerJoinQualifierWhenConvertingMysqlHelpTopicSplit() {
+        SqlConversionResult result = converter.convert("""
+                select a.id,
+                       substring_index(substring_index(a.department_id, ',', b.help_topic_id + 1), ',', -1)
+                from ns_company a
+                inner join mysql.help_topic b
+                  on b.help_topic_id < (
+                      length(a.department_id) - length(replace(a.department_id, ',', '')) + 1
+                  )
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("CROSS APPLY (SELECT LEVEL - 1 AS help_topic_id FROM dual CONNECT BY LEVEL <= ")
+                .doesNotContainIgnoringCase("INNER CROSS APPLY")
+                .doesNotContain("\"CONNECT\"")
+                .doesNotContainIgnoringCase("mysql.help_topic");
+    }
+
+    @Test
     void convertsDistinctGroupConcatWithMultipleTopLevelExpressions() {
         SqlConversionResult result = converter.convert("select GROUP_CONCAT(DISTINCT first_name, last_name) from user");
 
