@@ -6719,6 +6719,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_CREATE_FUNCTION_TO_DM_RULE);
         }
 
+        String procedureUserVariableSql = convertMysqlProcedureUserVariables(converted);
+        if (!procedureUserVariableSql.equals(converted)) {
+            converted = procedureUserVariableSql;
+            rules.add(MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE);
+        }
+
         String procedureIdentifierSql = normalizeMysqlProcedureIdentifiers(converted);
         if (!procedureIdentifierSql.equals(converted)) {
             converted = procedureIdentifierSql;
@@ -6774,12 +6780,6 @@ class SqlScriptMigrator {
         if (!functionNameVariableSql.equals(converted)) {
             converted = functionNameVariableSql;
             rules.add(MYSQL_PROCEDURE_FUNCTION_NAME_VARIABLE_RENAME_RULE);
-        }
-
-        String procedureUserVariableSql = convertMysqlProcedureUserVariables(converted);
-        if (!procedureUserVariableSql.equals(converted)) {
-            converted = procedureUserVariableSql;
-            rules.add(MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE);
         }
 
         String trailingSelectIntoSql = convertMysqlProcedureTrailingSelectInto(converted);
@@ -10935,6 +10935,14 @@ class SqlScriptMigrator {
         if (references.isEmpty() || hasUnsafeUserVariableAssignment(sql, references)) {
             return sql;
         }
+        LinkedHashMap<String, UserVariableReference> firstReferenceByName = new LinkedHashMap<>();
+        for (UserVariableReference reference : references) {
+            firstReferenceByName.putIfAbsent(reference.name(), reference);
+        }
+        if (firstReferenceByName.values().stream()
+                .anyMatch(reference -> !isProcedureUserVariableAssignment(sql, reference))) {
+            return sql;
+        }
 
         LinkedHashSet<String> existingNames = procedureNamesInScope(sql, beginIndex);
         LinkedHashMap<String, String> localNamesByUserVariable = new LinkedHashMap<>();
@@ -10962,6 +10970,25 @@ class SqlScriptMigrator {
         return replaced.substring(0, declarationInsertIndex)
                 + declarations
                 + replaced.substring(declarationInsertIndex);
+    }
+
+    private boolean isProcedureUserVariableAssignment(String sql, UserVariableReference reference) {
+        int cursor = skipWhitespace(sql, reference.end());
+        boolean assignmentOperator = cursor < sql.length()
+                && (sql.charAt(cursor) == '='
+                || (cursor + 1 < sql.length()
+                && sql.charAt(cursor) == ':'
+                && sql.charAt(cursor + 1) == '='));
+        if (assignmentOperator
+                && (previousWordIsKeyword(sql, reference.start(), "SET")
+                || statementStartsWithKeyword(sql, reference.start(), "SET"))) {
+            return true;
+        }
+        int statementStart = previousStatementStart(sql, reference.start());
+        String targetPrefix = sql.substring(statementStart, reference.start());
+        return Pattern.compile(
+                "(?is)\\bINTO\\s+(?:@(?:`[^`]+`|[^\\s,;]+)\\s*,\\s*)*$"
+        ).matcher(targetPrefix).find();
     }
 
     private String convertMysqlProcedureTrailingSelectInto(String sql) {
@@ -11993,6 +12020,7 @@ class SqlScriptMigrator {
                 } else {
                     Matcher matcher = replacement.pattern().matcher(sql);
                     matcher.region(index, sql.length());
+                    matcher.useTransparentBounds(true);
                     matcher.lookingAt();
                     converted.append(replacement.replacement());
                     index = matcher.end();
@@ -14694,6 +14722,7 @@ class SqlScriptMigrator {
         for (TextReplacement replacement : replacements) {
             Matcher matcher = replacement.pattern().matcher(sql);
             matcher.region(index, sql.length());
+            matcher.useTransparentBounds(true);
             if (matcher.lookingAt()) {
                 return replacement;
             }
@@ -14730,6 +14759,7 @@ class SqlScriptMigrator {
             } else {
                 Matcher matcher = pattern.matcher(sql);
                 matcher.region(index, sql.length());
+                matcher.useTransparentBounds(true);
                 if (matcher.lookingAt()) {
                     converted.append(replacement.apply(matcher));
                     index = matcher.end();

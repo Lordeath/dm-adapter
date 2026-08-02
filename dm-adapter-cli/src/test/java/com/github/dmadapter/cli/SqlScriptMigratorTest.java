@@ -2307,6 +2307,105 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsUserVariablesInLabeledMysqlProcedureBody() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                CREATE TABLE ns_report_template (
+                    templateBuinessType VARCHAR(100),
+                    sort BIGINT,
+                    useSelfDesign BIGINT,
+                    reportName VARCHAR(100)
+                );
+                CREATE PROCEDURE `addAll_ns_report_management_20240314`(
+                    IN reportName VARCHAR(9999),
+                    IN treeCode VARCHAR(9999)
+                )
+                tag_leave_ns_report_management:
+                BEGIN
+                    SELECT templateBuinessType INTO @templateBuinessType
+                    FROM ns_report_template WHERE id = treeCode;
+                    SELECT sort INTO @sort
+                    FROM ns_report_template ORDER BY sort DESC LIMIT 1;
+                    SET @useSelfDesign = 0;
+                    IF reportName <> '' THEN
+                        SET @useSelfDesign = 1;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM ns_report_management WHERE reportName = reportName) THEN
+                        LEAVE tag_leave_ns_report_management;
+                    END IF;
+                    INSERT INTO ns_report_template(templateBuinessType, sort, useSelfDesign)
+                    VALUES (@templateBuinessType, @sort, @useSelfDesign);
+                END;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-datacenter",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE PROCEDURE addAll_ns_report_management_20240314")
+                .contains("dm_templateBuinessType VARCHAR(4000);")
+                .contains("dm_sort VARCHAR(4000);")
+                .contains("dm_useSelfDesign BIGINT;")
+                .contains("SELECT `templateBuinessType` INTO dm_templateBuinessType")
+                .contains("VALUES (dm_templateBuinessType, dm_sort, dm_useSelfDesign)")
+                .doesNotContain("@templateBuinessType")
+                .doesNotContain("@sort")
+                .doesNotContain("@useSelfDesign")
+                .doesNotContain("tag_leave_ns_report_management:");
+    }
+
+    @Test
+    void keepsUnassignedProcedureSessionVariablesForManualReview() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("procedure.sql"), """
+                CREATE TABLE ns_dorm_param_type (
+                    enterpriseID BIGINT,
+                    organizationID BIGINT,
+                    paramTypeID BIGINT
+                );
+                CREATE PROCEDURE updateDormCheckData()
+                BEGIN
+                    INSERT INTO ns_dorm_param_type(enterpriseID, organizationID, paramTypeID)
+                    VALUES (@enterpriseID, @organizationID, 1);
+                END;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-dorm",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        String executable = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("MySQL user variables"));
+        assertThat(executable)
+                .contains("VALUES (@enterpriseID, @organizationID, 1)")
+                .doesNotContain("dm_enterpriseID")
+                .doesNotContain("dm_organizationID");
+    }
+
+    @Test
     void convertsNonAsciiMysqlProcedureUserVariablesToStableAsciiLocals() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -3290,8 +3389,9 @@ class SqlScriptMigratorTest {
                 BEGIN
                     DECLARE etrId BIGINT (20);
                     DECLARE STOP INT DEFAULT 0;
-                    DECLARE ENTERPRISE CURSOR FOR SELECT DISTINCT enterpriseID FROM ns_quality_param_value union SELECT @enterpriseID;
+                    DECLARE ENTERPRISE CURSOR FOR SELECT DISTINCT enterpriseID FROM ns_quality_param_value;
                     DECLARE CONTINUE HANDLER FOR SQLSTATE '02000'SET STOP=1;
+                    SET @adminUserID = 1;
                     OPEN ENTERPRISE;
                     FETCH ENTERPRISE INTO etrId;
                     WHILE STOP<> 1 DO
@@ -3317,10 +3417,10 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .containsSubsequence(
-                        "dm_enterpriseID VARCHAR(4000);",
-                        "dm_adminUserID VARCHAR(4000);",
-                        "ENTERPRISE CURSOR FOR SELECT DISTINCT enterpriseID FROM ns_quality_param_value union SELECT dm_enterpriseID;"
+                        "dm_adminUserID BIGINT;",
+                        "ENTERPRISE CURSOR FOR SELECT DISTINCT enterpriseID FROM ns_quality_param_value;"
                 )
+                .contains("dm_adminUserID := 1;")
                 .contains("EXIT WHEN ENTERPRISE%NOTFOUND;")
                 .doesNotContain("DECLARE CONTINUE HANDLER");
     }
@@ -8997,6 +9097,28 @@ class SqlScriptMigratorTest {
         assertThat(SqlScriptParser.statements(converted.sql()))
                 .hasSize(2)
                 .allSatisfy(statement -> assertThat(statement).startsWith("BEGIN"));
+    }
+
+    @Test
+    void keepsDatabaseSuffixInProcedureNamesWhileConvertingStandaloneDatabaseFunction() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS `ns_user_baseinfo_UPDATE_SQL_resignationDatabase`;
+                CREATE PROCEDURE `ns_user_baseinfo_UPDATE_SQL_resignationDatabase`()
+                BEGIN
+                    SELECT DATABASE();
+                END;
+                /
+                CALL ns_user_baseinfo_UPDATE_SQL_resignationDatabase();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("DROP PROCEDURE IF EXISTS ns_user_baseinfo_UPDATE_SQL_resignationDatabase")
+                .contains("CREATE OR REPLACE PROCEDURE ns_user_baseinfo_UPDATE_SQL_resignationDatabase() AS")
+                .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
+                .contains("SELECT dm_adapter_schema;")
+                .contains("CALL ns_user_baseinfo_UPDATE_SQL_resignationDatabase()")
+                .doesNotContain("resignationSF_GET_SCHEMA_NAME_BY_ID");
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {
