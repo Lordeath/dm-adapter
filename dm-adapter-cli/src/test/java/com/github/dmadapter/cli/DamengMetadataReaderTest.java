@@ -27,6 +27,7 @@ class DamengMetadataReaderTest {
         assertThat(DamengMetadataReader.tableObjectQuerySql(3))
                 .contains("SYS.SYSOBJECTS")
                 .contains("o.SCHID = CURRENT_SCHID()")
+                .contains("SUBSTRING(o.INFO6, 50, 1) AS AUTO_INCREMENT_KIND")
                 .contains("o.NAME IN (?, ?, ?)")
                 .doesNotContain("ALL_TAB_COLUMNS");
         assertThat(DamengMetadataReader.columnTypeQuerySql(3))
@@ -45,5 +46,17 @@ class DamengMetadataReaderTest {
                 .contains("cons.TABLEID IN (?, ?)")
                 .contains("cons.TYPE$ IN ('P', 'U')")
                 .doesNotContain("ALL_CONSTRAINTS");
+    }
+
+    @Test
+    void distinguishesIdentityAndMysqlCompatibleAutoIncrementCatalogValues() {
+        assertThat(DamengMetadataReader.AutoIncrementKind.fromCatalogValue("1"))
+                .isEqualTo(DamengMetadataReader.AutoIncrementKind.IDENTITY);
+        assertThat(DamengMetadataReader.AutoIncrementKind.fromCatalogValue("2"))
+                .isEqualTo(DamengMetadataReader.AutoIncrementKind.AUTO_INCREMENT);
+        assertThat(DamengMetadataReader.AutoIncrementKind.fromCatalogValue("0"))
+                .isEqualTo(DamengMetadataReader.AutoIncrementKind.NONE);
+        assertThat(DamengMetadataReader.AutoIncrementKind.fromCatalogValue(null))
+                .isEqualTo(DamengMetadataReader.AutoIncrementKind.NONE);
     }
 }

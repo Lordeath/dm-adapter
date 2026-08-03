@@ -27,6 +27,10 @@ class SqlRewriteConfigUpdater {
             "(?is)\\bINSERT\\s+INTO\\s+((?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`)"
                     + "(?:\\s*\\.\\s*(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`))?)\\s*\\("
     );
+    private static final Pattern NO_IDENTITY_TABLE_PATTERN = Pattern.compile(
+            "(?iu)(?:表|TABLE)\\s*\\[([^\\]]+)]\\s*(?:不存在\\s*IDENTITY\\s*列|"
+                    + "(?:(?:DOES|DID)\\s+NOT|(?:DOESN|DIDN)['’]?T)\\s+CONTAINS?\\s+IDENTITY\\s+COLUMN)"
+    );
     private final UpsertKeyInference inference = new UpsertKeyInference();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -38,11 +42,43 @@ class SqlRewriteConfigUpdater {
             Map<String, TableKeyMetadata> metadataByTable,
             boolean metadataAvailable
     ) {
+        return update(
+                context,
+                rewriteConfigPath,
+                loadedRewriteConfig,
+                candidates,
+                metadataByTable,
+                metadataAvailable,
+                Map.of()
+        );
+    }
+
+    SqlRewriteConfigUpdate update(
+            AdapterContext context,
+            Path rewriteConfigPath,
+            SqlRewriteConfig loadedRewriteConfig,
+            List<RewriteConfigCandidate> candidates,
+            Map<String, TableKeyMetadata> metadataByTable,
+            boolean metadataAvailable,
+            Map<String, DamengMetadataReader.AutoIncrementKind> autoIncrementKinds
+    ) {
         List<String> warnings = new ArrayList<>();
         RewriteConfigModel model = RewriteConfigModel.load(rewriteConfigPath);
-        boolean learnedIdentityInsertTable = learnIdentityInsertTables(context, model, warnings);
+        IdentityInsertReconciliation reconciliation = reconcileIdentityInsertTables(
+                context,
+                model,
+                autoIncrementKinds,
+                warnings
+        );
+        boolean learnedIdentityInsertTable = learnIdentityInsertTables(
+                context,
+                model,
+                reconciliation.nonIdentityTables(),
+                warnings
+        );
+        boolean identityInsertTablesChanged = reconciliation.changed() || learnedIdentityInsertTable;
         if (candidates.isEmpty()) {
-            if (!learnedIdentityInsertTable) {
+            if (!identityInsertTablesChanged) {
                 return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), warnings);
             }
             SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, Map.of());
@@ -194,6 +230,7 @@ class SqlRewriteConfigUpdater {
     private boolean learnIdentityInsertTables(
             AdapterContext context,
             RewriteConfigModel model,
+            Set<String> nonIdentityTables,
             List<String> warnings
     ) {
         Path reportPath = context.reportDir().resolve(VALIDATION_REPORT_JSON);
@@ -220,6 +257,9 @@ class SqlRewriteConfigUpdater {
                     continue;
                 }
                 String tableName = matcher.group(1).replaceAll("\\s+", "");
+                if (nonIdentityTables.contains(DamengMetadataReader.normalizeTableName(tableName))) {
+                    continue;
+                }
                 if (model.addIdentityInsertTable(tableName)) {
                     changed = true;
                     warnings.add("Learned identityInsertTables entry " + tableName
@@ -230,6 +270,76 @@ class SqlRewriteConfigUpdater {
             // A malformed or partially written previous report must not block migration.
         }
         return changed;
+    }
+
+    private IdentityInsertReconciliation reconcileIdentityInsertTables(
+            AdapterContext context,
+            RewriteConfigModel model,
+            Map<String, DamengMetadataReader.AutoIncrementKind> autoIncrementKinds,
+            List<String> warnings
+    ) {
+        boolean changed = false;
+        Set<String> nonIdentityTables = new LinkedHashSet<>();
+        Set<String> confirmedIdentityTables = new LinkedHashSet<>();
+        Map<String, DamengMetadataReader.AutoIncrementKind> kinds = autoIncrementKinds == null
+                ? Map.of()
+                : autoIncrementKinds;
+        for (Map.Entry<String, DamengMetadataReader.AutoIncrementKind> entry : kinds.entrySet()) {
+            String tableName = entry.getKey();
+            DamengMetadataReader.AutoIncrementKind kind = entry.getValue();
+            if (kind == DamengMetadataReader.AutoIncrementKind.IDENTITY) {
+                confirmedIdentityTables.add(DamengMetadataReader.normalizeTableName(tableName));
+                continue;
+            }
+            if (kind == DamengMetadataReader.AutoIncrementKind.NOT_FOUND) {
+                continue;
+            }
+            nonIdentityTables.add(DamengMetadataReader.normalizeTableName(tableName));
+            if (model.removeIdentityInsertTable(tableName)) {
+                changed = true;
+                String reason = kind == DamengMetadataReader.AutoIncrementKind.AUTO_INCREMENT
+                        ? "uses AUTO_INCREMENT rather than IDENTITY"
+                        : "does not contain an IDENTITY column";
+                warnings.add("Removed identityInsertTables entry " + tableName
+                        + " because the target Dameng table " + reason + ".");
+            }
+        }
+
+        Path reportPath = context.reportDir().resolve(VALIDATION_REPORT_JSON);
+        if (!Files.isRegularFile(reportPath)) {
+            return new IdentityInsertReconciliation(changed, nonIdentityTables);
+        }
+        try {
+            JsonNode records = objectMapper.readTree(reportPath.toFile()).path("records");
+            if (!records.isArray()) {
+                return new IdentityInsertReconciliation(changed, nonIdentityTables);
+            }
+            for (JsonNode record : records) {
+                if (!"FAILED".equalsIgnoreCase(record.path("status").asText())) {
+                    continue;
+                }
+                String details = record.path("summary").asText("") + "\n"
+                        + record.path("message").asText("");
+                Matcher matcher = NO_IDENTITY_TABLE_PATTERN.matcher(details);
+                while (matcher.find()) {
+                    String tableName = matcher.group(1).trim();
+                    String normalizedTable = DamengMetadataReader.normalizeTableName(tableName);
+                    if (confirmedIdentityTables.contains(normalizedTable)) {
+                        continue;
+                    }
+                    nonIdentityTables.add(normalizedTable);
+                    if (model.removeIdentityInsertTable(tableName)) {
+                        changed = true;
+                        warnings.add("Removed identityInsertTables entry " + tableName
+                                + " because the previous Dameng validation reported that the target table "
+                                + "has no IDENTITY column.");
+                    }
+                }
+            }
+        } catch (IOException ignored) {
+            // A malformed or partially written previous report must not block migration.
+        }
+        return new IdentityInsertReconciliation(changed, nonIdentityTables);
     }
 
     private void applyUnambiguousTableKeys(
@@ -306,6 +416,9 @@ class SqlRewriteConfigUpdater {
 
     private Set<String> mergedIdentityInsertTables(SqlRewriteConfig loadedRewriteConfig, RewriteConfigModel model) {
         Set<String> identityInsertTables = new LinkedHashSet<>(loadedRewriteConfig.identityInsertTables());
+        identityInsertTables.removeIf(table -> model.removedIdentityInsertTables().contains(
+                DamengMetadataReader.normalizeTableName(table)
+        ));
         identityInsertTables.addAll(model.identityInsertTables());
         return identityInsertTables;
     }
@@ -364,6 +477,7 @@ class SqlRewriteConfigUpdater {
         private final LinkedHashMap<String, String> methodResolutions = new LinkedHashMap<>();
         private final List<String> identityInsertLines = new ArrayList<>();
         private final LinkedHashSet<String> identityInsertTables = new LinkedHashSet<>();
+        private final LinkedHashSet<String> removedIdentityInsertTables = new LinkedHashSet<>();
         private final List<String> validationIgnoreLines = new ArrayList<>();
         private final List<String> validationArgsLines = new ArrayList<>();
 
@@ -495,6 +609,10 @@ class SqlRewriteConfigUpdater {
             return Set.copyOf(identityInsertTables);
         }
 
+        Set<String> removedIdentityInsertTables() {
+            return Set.copyOf(removedIdentityInsertTables);
+        }
+
         boolean addIdentityInsertTable(String tableName) {
             if (tableName == null || tableName.isBlank() || !identityInsertTables.add(tableName.trim())) {
                 return false;
@@ -508,6 +626,31 @@ class SqlRewriteConfigUpdater {
             }
             identityInsertLines.add("  - \"" + escapeYaml(tableName.trim()) + "\"");
             return true;
+        }
+
+        boolean removeIdentityInsertTable(String tableName) {
+            String normalized = DamengMetadataReader.normalizeTableName(tableName);
+            List<String> matches = identityInsertTables.stream()
+                    .filter(candidate -> DamengMetadataReader.normalizeTableName(candidate).equals(normalized))
+                    .toList();
+            if (matches.isEmpty()) {
+                return false;
+            }
+            identityInsertTables.removeAll(matches);
+            removedIdentityInsertTables.add(normalized);
+            rebuildIdentityInsertLines();
+            return true;
+        }
+
+        private void rebuildIdentityInsertLines() {
+            identityInsertLines.clear();
+            if (identityInsertTables.isEmpty()) {
+                return;
+            }
+            identityInsertLines.add("identityInsertTables:");
+            identityInsertTables.forEach(table -> identityInsertLines.add(
+                    "  - \"" + escapeYaml(table) + "\""
+            ));
         }
 
         String toYaml() {
@@ -843,6 +986,12 @@ class SqlRewriteConfigUpdater {
                 return trimmed.substring(1, trimmed.length() - 1);
             }
             return trimmed;
+        }
+    }
+
+    private record IdentityInsertReconciliation(boolean changed, Set<String> nonIdentityTables) {
+        private IdentityInsertReconciliation {
+            nonIdentityTables = Set.copyOf(nonIdentityTables == null ? Set.of() : nonIdentityTables);
         }
     }
 }
