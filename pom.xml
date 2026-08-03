@@ -19,6 +19,7 @@
         <module>dm-adapter-mybatis</module>
         <module>dm-adapter-report</module>
         <module>dm-adapter-cli</module>
+        <module>dm-adapter-gui</module>
         <module>dm-adapter-test-fixtures</module>
     </modules>
 

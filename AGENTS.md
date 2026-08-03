@@ -10,6 +10,7 @@
 - `dm-adapter-mybatis`：扫描 mapper XML、复制到 `mapper-dm`、接入 SQL 重写。
 - `dm-adapter-sql`：保守的 MySQL 到达梦 SQL 转换规则。
 - `dm-adapter-report`：生成和读取 Markdown/JSON 报告。
+- `dm-adapter-gui`：Swing 桌面界面，通过独立 JVM 子进程调用 CLI，并支持 Windows EXE 打包。
 - `dm-adapter-test-fixtures`：测试用示例项目和资源。
 
 生产代码放在各模块 `src/main/java`，测试放在 `src/test/java`，fixture 资源放在 `dm-adapter-test-fixtures/src/main/resources`。
@@ -21,6 +22,8 @@
 - `mvn -q -DskipTests package`：构建 CLI shaded jar。
 - `java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar --help`：验证 CLI 入口。
 - `java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --dry-run`：对目标项目执行 dry-run 迁移报告。
+- `java -jar dm-adapter-gui/target/dm-adapter-gui-0.1.0-SNAPSHOT.jar`：本地启动 GUI。
+- `powershell -File scripts/package-windows.ps1`：在 Windows 生成自带运行时的便携 EXE 应用目录。
 
 ## 编码风格与命名规范
 

@@ -48,7 +48,41 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 
-以上命令从 `dm-adapter` 目录执行时，默认应用工作目录为 `dm-adapter/.dm-adapter/demo-rest/`。目录名优先取 `--app-module` 定位到的 Maven `artifactId`；未传时自动发现唯一 Spring Boot 应用模块，无法唯一发现时回退到根 POM `artifactId` 和 `--project` 目录名。`scan`、`migrate`、`validate-sql`、`report`、`generate-validation-test` 使用同一规则。升级前业务项目中已有的 `sql-rewrite.yml`、`sql-validation.yml` 会在新目录缺文件时首次复制，旧文件不会删除或覆盖新文件。
+## GUI 与 Windows EXE
+
+`dm-adapter-gui` 提供 Java 17 Swing 桌面界面。GUI 不复制迁移逻辑，而是在独立 JVM
+子进程中调用同一套 Picocli 命令，因此 CLI 和 GUI 的迁移规则、报告及退出码保持一致。界面支持项目扫描、
+dry-run、正式迁移、SQL 脚本目录、达梦验证环境、实时日志、取消任务和摘要报告展示。
+
+开发环境可直接运行 shaded jar：
+
+```bash
+mvn -q -DskipTests package
+java -jar dm-adapter-gui/target/dm-adapter-gui-0.1.0-SNAPSHOT.jar
+```
+
+在 Windows PowerShell 中生成可双击运行、无需预装 Java 的便携应用：
+
+```powershell
+.\scripts\package-windows.ps1
+```
+
+产物入口为
+`dm-adapter-gui\target\package\dm-adapter-gui\dm-adapter-gui.exe`。整个
+`dm-adapter-gui` 目录需要一起分发，因为其中包含应用 jar 和 Java 运行时。
+
+如需 Windows 安装器 EXE，可在已安装兼容 WiX Toolset 的 Windows 构建机上运行：
+
+```powershell
+.\scripts\package-windows.ps1 -Type exe
+```
+
+若 shaded jar 已由前一步或 CI 构建，可追加 `-SkipBuild`，只执行 Windows 打包。
+
+数据库连接信息只注入 GUI 启动的 CLI 子进程环境，不进入命令参数、项目配置或报告。启用数据库验证前请注意：
+SQL 脚本验证会真实修改测试库，按清单执行且不自动回滚。
+
+前面的 CLI 命令从 `dm-adapter` 目录执行时，默认应用工作目录为 `dm-adapter/.dm-adapter/demo-rest/`。目录名优先取 `--app-module` 定位到的 Maven `artifactId`；未传时自动发现唯一 Spring Boot 应用模块，无法唯一发现时回退到根 POM `artifactId` 和 `--project` 目录名。`scan`、`migrate`、`validate-sql`、`report`、`generate-validation-test` 使用同一规则。升级前业务项目中已有的 `sql-rewrite.yml`、`sql-validation.yml` 会在新目录缺文件时首次复制，旧文件不会删除或覆盖新文件。
 
 生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。配置以下环境变量后，`generate-validation-test` 会在生成后自动运行一次；也可以在达梦测试环境中手动运行：
 
@@ -105,6 +139,7 @@ CLI 退出码约定：`0` 表示请求的迁移/验证成功或未请求数据�
 - `dm-adapter-mybatis`：mapper XML 扫描、复制和 SQL 重写接入。
 - `dm-adapter-sql`：MySQL 到达梦 SQL 转换规则。
 - `dm-adapter-report`：Markdown/JSON 报告生成与读取。
+- `dm-adapter-gui`：Swing 桌面界面、CLI 子进程桥接和 Windows EXE 打包。
 - `dm-adapter-test-fixtures`：测试示例项目。
 
 ## 当前边界
