@@ -2148,7 +2148,7 @@ class SqlScriptMigratorTest {
                 .contains("INSERT INTO daily_result_bak (id, amount) SELECT id, amount FROM source_result")
                 .contains("EXECUTE IMMEDIATE 'TRUNCATE TABLE daily_result'")
                 .contains("EXECUTE IMMEDIATE 'INSERT INTO daily_result(id, amount)"
-                        + System.lineSeparator()
+                        + "\n"
                         + "    SELECT id, amount FROM daily_result_bak'")
                 .doesNotContain("#daily_result_bak");
     }

@@ -1229,16 +1229,12 @@ class GeneratedFailurePatternTest {
     private void compile(List<Path> sources, Path outputDirectory) throws Exception {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         assertThat(compiler).as("JDK compiler").isNotNull();
-        Files.createDirectories(outputDirectory);
-        List<String> arguments = new java.util.ArrayList<>();
-        arguments.add("--release");
-        arguments.add("8");
-        arguments.add("-classpath");
-        arguments.add(System.getProperty("java.class.path"));
-        arguments.add("-d");
-        arguments.add(outputDirectory.toString());
-        sources.forEach(source -> arguments.add(source.toString()));
-        assertThat(compiler.run(null, null, null, arguments.toArray(new String[0])))
+        assertThat(JavaCompilerTestSupport.compileJava8(
+                compiler,
+                sources,
+                outputDirectory,
+                JavaCompilerTestSupport.runtimeClasspath()
+        ))
                 .as("generated validation source compilation")
                 .isZero();
     }
