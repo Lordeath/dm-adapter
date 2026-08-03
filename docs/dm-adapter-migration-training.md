@@ -75,7 +75,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar \
   --schema sample-system
 ```
 
-本文中的 `<应用工作目录>` 默认指启动 CLI 的当前目录下 `.dm-adapter/<应用 artifactId>/`。例如从 dm-adapter 工具目录执行并传入 `--app-module demo-rest` 时，默认目录是 `dm-adapter/.dm-adapter/demo-rest/`；也可用 `--report-dir` 指定完整最终目录。该目录保存配置、报告和验证临时文件，不再默认创建在业务项目中。
+本文中的 `<应用工作目录>` 默认就是启动 CLI 时的当前目录。例如从 dm-adapter 工具目录执行时，默认目录就是 `dm-adapter/`；`--report-dir` 是可选参数，仅在需要为不同项目隔离配置、报告和验证临时文件时指定。
 
 说明：
 
@@ -223,7 +223,7 @@ DM_JDBC_URL=jdbc:dm://host:5236 \
 DM_DB_USERNAME=user \
 DM_DB_PASSWORD=password \
 DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS=7200 \
-DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
+DM_ADAPTER_DIR=/path/to/dm-adapter \
 mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest -DskipTests=false -Dmaven.test.skip=false test
 ```
 

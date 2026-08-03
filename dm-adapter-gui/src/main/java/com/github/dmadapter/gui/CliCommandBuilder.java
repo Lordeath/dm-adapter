@@ -33,7 +33,10 @@ final class CliCommandBuilder {
             environment.put(DB_USERNAME, configuration.username());
             environment.put(DB_PASSWORD, configuration.password());
         }
-        return new CliInvocation(arguments, environment, configuration.reportDir());
+        Path effectiveReportDir = configuration.reportDir() == null
+                ? defaultReportDir()
+                : configuration.reportDir().toAbsolutePath().normalize();
+        return new CliInvocation(arguments, environment, effectiveReportDir);
     }
 
     private void addMigrationArguments(
@@ -75,9 +78,6 @@ final class CliCommandBuilder {
         if (configuration == null || configuration.project() == null) {
             throw new IllegalArgumentException("请选择项目根目录。");
         }
-        if (configuration.reportDir() == null) {
-            throw new IllegalArgumentException("请选择 dm-adapter 工作目录。");
-        }
         if (operation == GuiOperation.SCAN) {
             return;
         }
@@ -109,5 +109,9 @@ final class CliCommandBuilder {
             arguments.add(option);
             arguments.add(value);
         }
+    }
+
+    static Path defaultReportDir() {
+        return Path.of(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
     }
 }
