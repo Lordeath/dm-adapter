@@ -49,7 +49,30 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
 
-When these commands are started from the `dm-adapter` directory, the default application workspace is `dm-adapter/.dm-adapter/demo-rest/`. The directory name uses the Maven `artifactId` resolved from `--app-module`; without it, the CLI discovers a unique Spring Boot application module and falls back to the root POM artifactId or project directory name. The subcommands share this rule. Existing target-project `sql-rewrite.yml` and `sql-validation.yml` files are copied once when their new destinations are absent; old files are not deleted and existing destination files are never overwritten.
+## GUI and Windows EXE
+
+`dm-adapter-gui` is a Java 17 Swing desktop application. It launches the existing Picocli CLI in an
+isolated child JVM, so CLI and GUI migrations use the same rules, reports, and exit codes.
+
+Run the shaded jar during development:
+
+```bash
+mvn -q -DskipTests package
+java -jar dm-adapter-gui/target/dm-adapter-gui-0.1.0-SNAPSHOT.jar
+```
+
+On Windows, build a portable application that includes its Java runtime:
+
+```powershell
+.\scripts\package-windows.ps1
+```
+
+Launch `dm-adapter-gui\target\package\dm-adapter-gui\dm-adapter-gui.exe`. Distribute the complete
+application directory. Use `.\scripts\package-windows.ps1 -Type exe` on a Windows build machine with
+a compatible WiX Toolset to create an installer EXE. Add `-SkipBuild` when the shaded jar has already
+been built by an earlier step or CI.
+
+When the CLI commands above are started from the `dm-adapter` directory, the default application workspace is `dm-adapter/.dm-adapter/demo-rest/`. The directory name uses the Maven `artifactId` resolved from `--app-module`; without it, the CLI discovers a unique Spring Boot application module and falls back to the root POM artifactId or project directory name. The subcommands share this rule. Existing target-project `sql-rewrite.yml` and `sql-validation.yml` files are copied once when their new destinations are absent; old files are not deleted and existing destination files are never overwritten.
 
 The generated SQL validation test does not connect to the database during ordinary `mvn test` runs. With the following environment variables, `generate-validation-test` runs it once after generation; you can also run it manually in the Dameng test environment:
 
@@ -105,6 +128,7 @@ The same environment variables are also used by `migrate` for read-only Dameng m
 - `dm-adapter-mybatis`: mapper XML scanning, copying, and SQL rewrite integration.
 - `dm-adapter-sql`: MySQL-to-Dameng SQL conversion rules.
 - `dm-adapter-report`: Markdown/JSON report writing and reading.
+- `dm-adapter-gui`: Swing desktop UI, CLI child-process bridge, and Windows EXE packaging.
 - `dm-adapter-test-fixtures`: sample projects for tests.
 
 ## Current Scope
