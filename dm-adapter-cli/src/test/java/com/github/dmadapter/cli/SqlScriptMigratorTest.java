@@ -5596,13 +5596,15 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("insert-ignore.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_demo "
-                        + "(id BIGINT, name VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_demo")
+                .contains("id BIGINT NOT NULL")
+                .contains("name VARCHAR(100)")
                 .contains("DELETE FROM tmp_demo /* DM_ADAPTER_TMP_COLUMN tmp_demo id */")
                 .contains("MERGE INTO tmp_demo t")
                 .contains("SELECT s.id AS id, s.name AS name")
                 .contains("ON (t.id = s.id)")
                 .contains("WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)")
+                .doesNotContain("name VARCHAR(200)")
                 .doesNotContain("INSERT IGNORE")
                 .doesNotContain("DROP TABLE IF EXISTS tmp_demo;")
                 .doesNotContain("EXECUTE IMMEDIATE 'CREATE TABLE tmp_demo")
@@ -5651,18 +5653,132 @@ class SqlScriptMigratorTest {
         String converted = Files.readString(sqlRootOut.resolve("temporary-table.sql"));
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
-                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_menu_copy "
-                        + "(source_id BIGINT, enterprise_id BIGINT, organization_id BIGINT, "
-                        + "target_ver BIGINT, menu_id VARCHAR(200)) ON COMMIT PRESERVE ROWS;")
-                .contains("FROM SYS.SYSOBJECTS T")
-                .contains("T.SCHID = CURRENT_SCHID")
-                .contains("T.NAME IN ('tmp_menu_copy', UPPER('tmp_menu_copy'))")
-                .contains("C.NAME IN ('menu_id', UPPER('menu_id'))")
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE tmp_menu_copy ADD menu_id VARCHAR(200)'")
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_menu_copy")
+                .contains("source_id BIGINT NOT NULL")
+                .contains("enterprise_id BIGINT NOT NULL")
+                .contains("organization_id BIGINT NOT NULL")
+                .contains("target_ver INT NOT NULL")
+                .contains("menu_id VARCHAR(100) NOT NULL")
+                .contains("FROM ALL_TAB_COLUMNS C")
+                .contains("C.OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)")
+                .contains("UPPER(C.TABLE_NAME) = UPPER('tmp_menu_copy')")
+                .contains("UPPER(C.COLUMN_NAME) = UPPER('menu_id')")
+                .contains("ALTER TABLE tmp_menu_copy MODIFY menu_id VARCHAR(100)")
                 .contains("DELETE FROM tmp_menu_copy /* DM_ADAPTER_TMP_COLUMN tmp_menu_copy source_id */")
                 .contains("MERGE INTO tmp_menu_copy t")
                 .contains("ON (t.source_id = s.source_id)")
+                .doesNotContain("target_ver BIGINT")
+                .doesNotContain("menu_id VARCHAR(200)")
                 .doesNotContain("roleid VARCHAR(200)");
+    }
+
+    @Test
+    void preservesStringIdentifierTypesAndConvertsUpdateJoinInsideProcedure() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("resourcecolumn.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_upsert_resourcecolumn()
+                BEGIN
+                    DROP TABLE IF EXISTS tmp_resourcecolumn;
+                    CREATE TEMPORARY TABLE tmp_resourcecolumn (
+                        resourcecolumn_id VARCHAR(100) NOT NULL,
+                        resourcecolumn_funcinfo_id VARCHAR(100),
+                        resourcecolumn_parent_funcinfo_id VARCHAR(50),
+                        enterprise_id BIGINT,
+                        organization_id BIGINT,
+                        resourcecolumn_name VARCHAR(255)
+                    );
+                    -- Update existing resource columns after inserting missing rows.
+                    UPDATE resourcecolumn c
+                    INNER JOIN tmp_resourcecolumn tp
+                        ON c.resourcecolumn_id = tp.resourcecolumn_id
+                       AND c.enterprise_id = tp.enterprise_id
+                       AND c.organization_id = tp.organization_id
+                    SET c.resourcecolumn_funcinfo_id = tp.resourcecolumn_funcinfo_id,
+                        c.resourcecolumn_parent_funcinfo_id = tp.resourcecolumn_parent_funcinfo_id,
+                        c.resourcecolumn_name = tp.resourcecolumn_name;
+                END$$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("resourcecolumn.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_PROCEDURE_UPDATE_JOIN_TO_DM_RULE));
+        assertThat(converted)
+                .contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_resourcecolumn")
+                .contains("resourcecolumn_id VARCHAR(100)")
+                .contains("resourcecolumn_funcinfo_id VARCHAR(100)")
+                .contains("resourcecolumn_parent_funcinfo_id VARCHAR(50)")
+                .contains("enterprise_id BIGINT")
+                .contains("organization_id BIGINT")
+                .contains("ALTER TABLE tmp_resourcecolumn MODIFY resourcecolumn_id VARCHAR(100)")
+                .contains("update resourcecolumn c set resourcecolumn_funcinfo_id = tp.resourcecolumn_funcinfo_id")
+                .contains("from tmp_resourcecolumn tp")
+                .contains("c.resourcecolumn_id = tp.resourcecolumn_id")
+                .contains("c.enterprise_id = tp.enterprise_id")
+                .contains("c.organization_id = tp.organization_id")
+                .doesNotContain("resourcecolumn_id BIGINT")
+                .doesNotContain("resourcecolumn_funcinfo_id BIGINT")
+                .doesNotContain("resourcecolumn_parent_funcinfo_id BIGINT")
+                .doesNotContainIgnoringCase("INNER JOIN tmp_resourcecolumn");
+
+        migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+        assertThat(Files.readString(sqlRootOut.resolve("resourcecolumn.sql"))).isEqualTo(converted);
+    }
+
+    @Test
+    void infersUnknownIdentifierColumnsAsStringsWhenTemporaryDefinitionIsUnavailable() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("inferred-temporary-table.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE use_external_temporary_table()
+                BEGIN
+                    DELETE FROM tmp_external_items;
+                    INSERT INTO tmp_external_items (external_item_id, enterprise_id, organization_id)
+                    SELECT source_key, enterprise_id, organization_id
+                    FROM source_items;
+                END$$
+                DELIMITER ;
+                """);
+
+        migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-app",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("inferred-temporary-table.sql"));
+        assertThat(converted)
+                .contains("external_item_id VARCHAR(200)")
+                .contains("enterprise_id BIGINT")
+                .contains("organization_id BIGINT")
+                .doesNotContain("external_item_id BIGINT");
     }
 
     @Test

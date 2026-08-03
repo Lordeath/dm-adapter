@@ -177,6 +177,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_DELETE_ALIAS_STAR_TO_DM";
     static final String MYSQL_PROCEDURE_DELETE_JOIN_TO_EXISTS_RULE =
             "MYSQL_PROCEDURE_DELETE_JOIN_TO_EXISTS";
+    static final String MYSQL_PROCEDURE_UPDATE_JOIN_TO_DM_RULE =
+            "MYSQL_PROCEDURE_UPDATE_JOIN_TO_DM";
     static final String MYSQL_PROCEDURE_RESERVED_CURSOR_RENAME_RULE =
             "MYSQL_PROCEDURE_RESERVED_CURSOR_RENAMED";
     static final String MYSQL_PROCEDURE_FUNCTION_NAME_VARIABLE_RENAME_RULE =
@@ -3881,6 +3883,11 @@ class SqlScriptMigrator {
                 .contains(MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE)) {
             convertedBody = restoreDmLocalTemporaryTableNames(convertedBody);
         }
+        String procedureUpdateJoinSql = convertMysqlProcedureUpdateJoins(convertedBody);
+        if (!procedureUpdateJoinSql.equals(convertedBody)) {
+            convertedBody = procedureUpdateJoinSql;
+            rules.add(MYSQL_PROCEDURE_UPDATE_JOIN_TO_DM_RULE);
+        }
         if (MYSQL_PREFIX_INDEX_DDL_PATTERN.matcher(sqlBody).find()
                 && DM_PREFIX_FUNCTION_INDEX_PATTERN.matcher(convertedBody).find()) {
             rules.add(MYSQL_PREFIX_INDEX_TO_FUNCTION_INDEX_RULE);
@@ -4961,7 +4968,13 @@ class SqlScriptMigrator {
         }
         LinkedHashSet<String> placeholders = new LinkedHashSet<>();
         List<String> exactDefinitions = procedureGlobalTemporaryTableDdlMarkers(leadingSqlPrefix.body());
-        placeholders.addAll(exactDefinitions);
+        for (String exactDefinition : exactDefinitions) {
+            placeholders.add(exactDefinition);
+            String reconciliation = procedureExactTempTableColumnReconciliationBlock(exactDefinition);
+            if (!reconciliation.isBlank()) {
+                placeholders.add(reconciliation);
+            }
+        }
         Set<String> exactDefinitionTables = exactDefinitions.stream()
                 .map(this::globalTemporaryTableName)
                 .filter(table -> !table.isBlank())
@@ -4985,6 +4998,119 @@ class SqlScriptMigrator {
         }
         placeholders.addAll(procedureCreateTableLikeCompilePlaceholders(leadingSqlPrefix.body()));
         return List.copyOf(placeholders);
+    }
+
+    private String procedureExactTempTableColumnReconciliationBlock(String ddl) {
+        Matcher tableMatcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+GLOBAL\\s+TEMPORARY\\s+TABLE\\s+"
+                        + "(?:IF\\s+NOT\\s+EXISTS\\s+)?(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\("
+        ).matcher(ddl);
+        if (!tableMatcher.find()) {
+            return "";
+        }
+        int openParen = tableMatcher.end() - 1;
+        int closeParen = findMatchingParen(ddl, openParen);
+        if (closeParen <= openParen) {
+            return "";
+        }
+        String tableToken = tableMatcher.group("table").strip();
+        String tableName = unquoteIdentifier(lastIdentifierPart(tableToken));
+        List<ProcedureTempTableExactColumn> columns = new ArrayList<>();
+        for (String part : splitTopLevelComma(ddl.substring(openParen + 1, closeParen))) {
+            String definition = part.strip();
+            String columnName = createTableColumnDefinitionName(definition);
+            String type = procedureTempTableDeclaredType(definition);
+            if (!columnName.isBlank() && !type.isBlank()) {
+                columns.add(new ProcedureTempTableExactColumn(columnName, type));
+            }
+        }
+        if (columns.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder block = new StringBuilder();
+        block.append("DECLARE\n")
+                .append("    dm_adapter_column_count INT;\n")
+                .append("    dm_adapter_type_count INT;\n")
+                .append("BEGIN\n");
+        for (ProcedureTempTableExactColumn column : columns) {
+            String columnToken = dmSimpleIdentifier(column.name());
+            block.append("    SELECT COUNT(*) INTO dm_adapter_column_count\n")
+                    .append("    FROM ALL_TAB_COLUMNS C\n")
+                    .append("    WHERE C.OWNER = ").append(DM_CURRENT_SCHEMA_EXPRESSION).append("\n")
+                    .append("      AND UPPER(C.TABLE_NAME) = UPPER(")
+                    .append(sqlStringLiteral(tableName)).append(")\n")
+                    .append("      AND UPPER(C.COLUMN_NAME) = UPPER(")
+                    .append(sqlStringLiteral(column.name())).append(");\n")
+                    .append("    IF dm_adapter_column_count = 0 THEN\n")
+                    .append("        EXECUTE IMMEDIATE ")
+                    .append(sqlStringLiteral("ALTER TABLE " + tableToken + " ADD "
+                            + columnToken + " " + column.type()))
+                    .append(";\n");
+            String typePredicate = procedureTempTableTypePredicate(column);
+            if (!typePredicate.isBlank()) {
+                block.append("    ELSE\n")
+                        .append("        SELECT COUNT(*) INTO dm_adapter_type_count\n")
+                        .append("        FROM ALL_TAB_COLUMNS C\n")
+                        .append("        WHERE C.OWNER = ").append(DM_CURRENT_SCHEMA_EXPRESSION).append("\n")
+                        .append("          AND UPPER(C.TABLE_NAME) = UPPER(")
+                        .append(sqlStringLiteral(tableName)).append(")\n")
+                        .append("          AND UPPER(C.COLUMN_NAME) = UPPER(")
+                        .append(sqlStringLiteral(column.name())).append(")\n")
+                        .append("          AND ").append(typePredicate).append(";\n")
+                        .append("        IF dm_adapter_type_count = 0 THEN\n")
+                        .append("            DELETE FROM ").append(tableToken).append(";\n")
+                        .append("            EXECUTE IMMEDIATE ")
+                        .append(sqlStringLiteral("ALTER TABLE " + tableToken + " MODIFY "
+                                + columnToken + " " + column.type()))
+                        .append(";\n")
+                        .append("        END IF;\n");
+            }
+            block.append("    END IF;\n");
+        }
+        return block.append("END").toString();
+    }
+
+    private String procedureTempTableDeclaredType(String definition) {
+        int cursor = skipWhitespace(definition, 0);
+        SqlIdentifierReference column = sqlIdentifierReferenceAt(definition, cursor);
+        if (column == null) {
+            return "";
+        }
+        String remainder = definition.substring(column.end()).stripLeading();
+        Matcher typeMatcher = Pattern.compile(
+                "(?is)^(?<type>"
+                        + "(?:VAR)?CHAR2?\\s*\\([^)]*\\)"
+                        + "|CHARACTER\\s+VARYING\\s*\\([^)]*\\)"
+                        + "|DECIMAL\\s*\\([^)]*\\)"
+                        + "|NUMERIC\\s*\\([^)]*\\)"
+                        + "|NUMBER\\s*\\([^)]*\\)"
+                        + "|TIMESTAMP(?:\\s*\\([^)]*\\))?"
+                        + "|DATETIME(?:\\s*\\([^)]*\\))?"
+                        + "|DOUBLE\\s+PRECISION"
+                        + "|BIGINT|INTEGER|INT|SMALLINT|TINYINT"
+                        + "|CLOB|BLOB|JSON|DATE|TIME|BOOLEAN|BIT|REAL|FLOAT)(?=\\s|$)"
+        ).matcher(remainder);
+        return typeMatcher.find()
+                ? typeMatcher.group("type").strip().replaceAll("\\s+", " ")
+                : "";
+    }
+
+    private String procedureTempTableTypePredicate(ProcedureTempTableExactColumn column) {
+        String lowerName = column.name().toLowerCase(Locale.ROOT);
+        String upperType = column.type().toUpperCase(Locale.ROOT);
+        boolean identifierColumn = lowerName.endsWith("_id") || lowerName.endsWith("id");
+        Matcher characterType = Pattern.compile(
+                "(?is)^(?:VARCHAR2?|CHAR2?|CHARACTER\\s+VARYING)\\s*\\(\\s*(?<length>[0-9]+)"
+        ).matcher(upperType);
+        if (identifierColumn && characterType.find()) {
+            return "UPPER(C.DATA_TYPE) IN ('CHAR', 'VARCHAR', 'VARCHAR2')"
+                    + " AND C.CHAR_LENGTH = " + characterType.group("length");
+        }
+        if (identifierColumn && upperType.equals("CLOB")) {
+            return "UPPER(C.DATA_TYPE) = 'CLOB'";
+        }
+        return "";
     }
 
     private List<String> procedureGlobalTemporaryTableDdlMarkers(String sql) {
@@ -6615,10 +6741,11 @@ class SqlScriptMigrator {
                 || lower.equals("organization_id")
                 || lower.equals("id")
                 || lower.equals("orderindex")
-                || lower.equals("target_ver")
-                || lower.endsWith("_id")
-                || lower.endsWith("id")) {
+                || lower.equals("target_ver")) {
             return "BIGINT";
+        }
+        if (lower.endsWith("_id") || lower.endsWith("id")) {
+            return "VARCHAR(200)";
         }
         if (lower.endsWith("code") || lower.endsWith("name")) {
             return "VARCHAR(200)";
@@ -9943,6 +10070,61 @@ class SqlScriptMigrator {
         return converted.toString();
     }
 
+    private String convertMysqlProcedureUpdateJoins(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        int cursor = 0;
+        int index = firstProcedureBegin(sql);
+        boolean changed = false;
+        while (index >= 0 && index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "UPDATE") || startsQuotedUpdateKeyword(sql, index)) {
+                int end = findStatementTerminator(sql, index);
+                String statement = sql.substring(index, end);
+                if (startsQuotedUpdateKeyword(statement, 0)) {
+                    statement = "UPDATE" + statement.substring("\"UPDATE\"".length());
+                }
+                SqlConversionResult conversion = converter.convert(statement);
+                if (!conversion.appliedRules().contains(MySqlToDmSqlConverter.MYSQL_UPDATE_JOIN_RULE)) {
+                    index++;
+                    continue;
+                }
+                converted.append(sql, cursor, index).append(conversion.convertedSql());
+                cursor = end;
+                index = end;
+                changed = true;
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else {
+                index++;
+            }
+        }
+        if (!changed) {
+            return sql;
+        }
+        return converted.append(sql.substring(cursor)).toString();
+    }
+
+    private boolean startsQuotedUpdateKeyword(String sql, int index) {
+        String keyword = "\"UPDATE\"";
+        if (index < 0 || index + keyword.length() > sql.length()
+                || !sql.regionMatches(true, index, keyword, 0, keyword.length())) {
+            return false;
+        }
+        int end = index + keyword.length();
+        return end >= sql.length() || Character.isWhitespace(sql.charAt(end));
+    }
+
     private String convertMysqlDeleteJoinStatement(String statement) {
         int cursor = skipWhitespace(statement, 0);
         if (!startsKeyword(statement, cursor, "DELETE")) {
@@ -12692,6 +12874,14 @@ class SqlScriptMigrator {
         }
         ProcedureStatement temporaryCreateTableDefinition = convertTemporaryCreateTableDefinitionToDml(converted);
         if (temporaryCreateTableDefinition != null) {
+            String exactDefinition = normalizeGlobalTemporaryTableDefinition(converted);
+            if (!exactDefinition.isBlank()) {
+                return List.of(ProcedureStatement.directSql(
+                        temporaryCreateTableDefinition.sql()
+                                + " "
+                                + globalTemporaryTableDdlMarker(exactDefinition)
+                ));
+            }
             return List.of(temporaryCreateTableDefinition);
         }
         ProcedureStatement temporaryCreateTableSelect =
@@ -13472,6 +13662,37 @@ class SqlScriptMigrator {
             }
         }
         return ProcedureStatement.directSql(statement.toString());
+    }
+
+    private String normalizeGlobalTemporaryTableDefinition(String createTable) {
+        Matcher tableMatcher = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\("
+        ).matcher(createTable);
+        if (!tableMatcher.find() || !isProcedureTemporaryTableName(tableMatcher.group("table"))) {
+            return "";
+        }
+        String withoutInlineKeys = removeMysqlCreateTableInlineKeyDefinitions(createTable);
+        String converted = converter.convert(withoutInlineKeys).convertedSql().strip();
+        converted = normalizeMysqlDynamicDdlForDameng(converted);
+        converted = removeMysqlCreateTableInlineKeyDefinitions(converted);
+        converted = removeDmLocalTemporaryTablePrimaryKey(converted);
+        converted = normalizeProcedureDynamicDdlSpacing(converted).strip();
+        if (converted.endsWith(";")) {
+            converted = converted.substring(0, converted.length() - 1).stripTrailing();
+        }
+
+        Matcher convertedTable = Pattern.compile(
+                "(?is)^\\s*CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")"
+        ).matcher(converted);
+        if (!convertedTable.find()) {
+            return "";
+        }
+        return "CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS "
+                + convertedTable.group("table").strip()
+                + converted.substring(convertedTable.end())
+                + " ON COMMIT PRESERVE ROWS";
     }
 
     private ProcedureStatement convertTemporaryAlterTableAddColumnToNoop(String ddl) {
@@ -16369,6 +16590,9 @@ class SqlScriptMigrator {
     }
 
     private record ProcedureTempTableColumn(String name, String type) {
+    }
+
+    private record ProcedureTempTableExactColumn(String name, String type) {
     }
 
     private record LocalTemporaryCursorRewrite(
