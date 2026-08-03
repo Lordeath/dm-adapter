@@ -14,7 +14,7 @@
 - Rewrite configurable `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` statements to Dameng `MERGE` when the application workspace's `sql-rewrite.yml` provides trusted `keyColumns`; when Dameng validation environment variables are configured, `migrate` can infer and maintain that config from test-database primary/unique metadata, leaving unresolved SQL unchanged and reported.
 - Mark `GROUP_CONCAT`, JSON functions, complex time calculation/conversion functions, `REPLACE INTO`, upsert/ignore SQL without safe key-column configuration, and backtick-quoted identifiers for manual review.
 - Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class in the target project plus an external `sql-validation.yml` template, without starting Spring Boot, ShardingSphere, MQ, or web beans; when `DM_SQL_VALIDATION=true` and connection variables are complete, generation also runs the validation test once and prints the report path.
-- Write configs, Markdown/JSON reports, and validation temporary files under `<current-directory>/.dm-adapter/<application-artifactId>/` by default instead of creating `.dm-adapter` in the target project.
+- Keep `--report-dir` optional; when omitted, write configs, Markdown/JSON reports, and validation temporary files directly to the current working directory.
 
 ## Dameng Special Column Rewrite Notes
 
@@ -42,7 +42,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
   --sql-root ./sql/v2 --sql-root-out ./sql/v2-dm \
   --schema sample-system --target-length-semantics BYTE
 
-# --report-dir overrides the complete application workspace and does not append the artifactId.
+# Pass --report-dir only to use a custom application workspace; omitting it uses the current working directory.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --report-dir /data/dm-work/demo-rest
 
 # You can also generate the SQL validation test after migrate; --app-module accepts a module path or Maven artifactId, and --app-module, --schema, or --config implies generation.
@@ -72,7 +72,7 @@ application directory. Use `.\scripts\package-windows.ps1 -Type exe` on a Window
 a compatible WiX Toolset to create an installer EXE. Add `-SkipBuild` when the shaded jar has already
 been built by an earlier step or CI.
 
-When the CLI commands above are started from the `dm-adapter` directory, the default application workspace is `dm-adapter/.dm-adapter/demo-rest/`. The directory name uses the Maven `artifactId` resolved from `--app-module`; without it, the CLI discovers a unique Spring Boot application module and falls back to the root POM artifactId or project directory name. The subcommands share this rule. Existing target-project `sql-rewrite.yml` and `sql-validation.yml` files are copied once when their new destinations are absent; old files are not deleted and existing destination files are never overwritten.
+`--report-dir` is optional. `scan`, `migrate`, `validate-sql`, `report`, and `generate-validation-test` use the CLI process's current working directory when it is omitted. For example, commands started from `dm-adapter` write reports and configs directly to that directory. Pass a distinct `--report-dir` when outputs for multiple projects must be isolated. Existing `sql-rewrite.yml` and `sql-validation.yml` files under a target project's legacy `.dm-adapter` directory are copied once when the destination is absent; old files are not deleted and existing destination files are never overwritten.
 
 The generated SQL validation test does not connect to the database during ordinary `mvn test` runs. With the following environment variables, `generate-validation-test` runs it once after generation; you can also run it manually in the Dameng test environment:
 
@@ -81,7 +81,7 @@ DM_SQL_VALIDATION=true \
 DM_JDBC_URL=jdbc:dm://host:5236 \
 DM_DB_USERNAME=user \
 DM_DB_PASSWORD=password \
-DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
+DM_ADAPTER_DIR=/path/to/dm-adapter \
 mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest test
 ```
 

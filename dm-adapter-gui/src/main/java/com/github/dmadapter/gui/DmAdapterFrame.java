@@ -83,6 +83,7 @@ final class DmAdapterFrame extends JFrame {
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     private final Timer summaryTimer;
     private GuiOperation lastOperation;
+    private Path lastReportDir = CliCommandBuilder.defaultReportDir();
 
     DmAdapterFrame() {
         super("dm-adapter GUI");
@@ -113,8 +114,8 @@ final class DmAdapterFrame extends JFrame {
 
     private JPanel createProjectPanel() {
         JPanel panel = formPanel();
-        addPathRow(panel, 0, "项目根目录 (--project) *", projectField, true, this::projectSelected);
-        addPathRow(panel, 1, "工作目录 (--report-dir) *", reportDirField, true, null);
+        addPathRow(panel, 0, "项目根目录 (--project) *", projectField, true, null);
+        addPathRow(panel, 1, "工作目录 (--report-dir；留空=当前目录)", reportDirField, true, null);
         addTextRow(panel, 2, "应用模块 (--app-module)", appModuleField,
                 "可填写 Maven artifactId 或模块路径；留空时由 CLI 自动发现。");
         addPathRow(panel, 3, "Mapper 输出目录 (--mapper-dir)", mapperDirField, true, null);
@@ -206,7 +207,7 @@ final class DmAdapterFrame extends JFrame {
         migrateButton.addActionListener(event -> start(GuiOperation.MIGRATE));
         cancelButton.addActionListener(event -> cancel());
         openReportButton.addActionListener(event -> openLatestReport());
-        openWorkspaceButton.addActionListener(event -> openPath(pathValue(reportDirField)));
+        openWorkspaceButton.addActionListener(event -> openPath(selectedReportDir()));
         databaseValidationBox.addActionListener(event -> updateDatabaseFields());
         addWindowListener(new WindowAdapter() {
             @Override
@@ -229,6 +230,7 @@ final class DmAdapterFrame extends JFrame {
                 return;
             }
             lastOperation = operation;
+            lastReportDir = invocation.reportDir();
             logArea.setText("");
             summaryArea.setText(operation == GuiOperation.SCAN
                     ? "正在扫描项目……"
@@ -332,10 +334,7 @@ final class DmAdapterFrame extends JFrame {
     }
 
     private void refreshSummary(boolean finalRefresh) {
-        Path reportDir = pathValue(reportDirField);
-        if (reportDir == null) {
-            return;
-        }
+        Path reportDir = lastReportDir;
         try {
             if (lastOperation == GuiOperation.SCAN) {
                 Path scanJson = reportDir.resolve(ReportWriter.SCAN_REPORT_JSON);
@@ -411,11 +410,7 @@ final class DmAdapterFrame extends JFrame {
     }
 
     private void openLatestReport() {
-        Path reportDir = pathValue(reportDirField);
-        if (reportDir == null) {
-            showError("请先选择工作目录。");
-            return;
-        }
+        Path reportDir = lastOperation == null ? selectedReportDir() : lastReportDir;
         Path report;
         if (lastOperation == GuiOperation.SCAN) {
             report = reportDir.resolve(ReportWriter.SCAN_REPORT_MARKDOWN);
@@ -442,15 +437,9 @@ final class DmAdapterFrame extends JFrame {
         }
     }
 
-    private void projectSelected(Path project) {
-        if (project == null || !reportDirField.getText().isBlank()) {
-            return;
-        }
-        Path name = project.getFileName();
-        String projectKey = name == null ? "project" : name.toString().replaceAll("[^A-Za-z0-9._-]", "_");
-        Path workspace = Path.of(System.getProperty("user.dir", "."), ".dm-adapter", projectKey)
-                .toAbsolutePath().normalize();
-        reportDirField.setText(workspace.toString());
+    private Path selectedReportDir() {
+        Path configured = pathValue(reportDirField);
+        return configured == null ? CliCommandBuilder.defaultReportDir() : configured;
     }
 
     private void updateDatabaseFields() {

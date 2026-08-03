@@ -31,6 +31,35 @@ class CliCommandBuilderTest {
     }
 
     @Test
+    void omitsOptionalReportDirAndUsesCurrentDirectoryForResults() {
+        GuiRunConfiguration configuration = new GuiRunConfiguration(
+                tempDir,
+                null,
+                "",
+                null,
+                null,
+                null,
+                "",
+                null,
+                null,
+                false,
+                "",
+                null,
+                "",
+                false,
+                false,
+                "",
+                "",
+                ""
+        );
+
+        CliInvocation invocation = builder.build(GuiOperation.SCAN, configuration);
+
+        assertThat(invocation.arguments()).doesNotContain("--report-dir");
+        assertThat(invocation.reportDir()).isEqualTo(CliCommandBuilder.defaultReportDir());
+    }
+
+    @Test
     void scanIgnoresIncompleteMigrationOnlyOptions() {
         GuiRunConfiguration configuration = new GuiRunConfiguration(
                 tempDir,

@@ -14,7 +14,7 @@
 - 支持通过应用工作目录中的 `sql-rewrite.yml` 配置 `keyColumns`，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；配置达梦验证环境变量后，`migrate` 会优先从测试库主键、唯一键和自增列元数据自动推断并维护该配置。若元数据证明 `INSERT IGNORE` 不可能发生重复键冲突，则自动转为普通 `INSERT`；其他无法确认的情况保留原 SQL 并写入报告。
 - 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore 等标记为人工确认；达梦 MySQL 兼容模式可执行的反引号标识符默认保留。
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类，在工具侧应用工作目录生成 `sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean；若 `DM_SQL_VALIDATION=true` 且连接环境变量齐全，生成后会自动执行一次验证测试并输出报告路径。
-- 默认将配置、Markdown/JSON 报告和验证临时文件输出到 `<当前命令目录>/.dm-adapter/<应用 artifactId>/`，不在业务项目中创建 `.dm-adapter`。
+- `--report-dir` 可选；省略时将配置、Markdown/JSON 报告和验证临时文件直接输出到当前命令目录。
 
 ## 达梦特殊列名重写注意事项
 
@@ -41,7 +41,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
   --sql-root ./sql/v2 --sql-root-out ./sql/v2-dm \
   --schema sample-system --target-length-semantics BYTE
 
-# 需要自定义完整应用工作目录时，--report-dir 的值就是最终目录，不会再追加 artifactId。
+# 需要自定义应用工作目录时再传 --report-dir；省略时使用当前命令目录。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --report-dir /data/dm-work/demo-rest
 
 # 也可以在 migrate 后自动生成 SQL 验证测试；--app-module 可传模块路径或 Maven artifactId，传入 --app-module、--schema 或 --config 会自动触发生成。
@@ -58,7 +58,7 @@ GUI 表单标签会直接显示对应的 CLI 参数或环境变量，主要映�
 
 | GUI 输入项 | CLI 参数或环境变量 |
 | --- | --- |
-| 项目根目录 / 工作目录 / 应用模块 | `--project` / `--report-dir` / `--app-module` |
+| 项目根目录 / 工作目录 / 应用模块 | `--project` / `--report-dir`（可选，留空使用当前目录）/ `--app-module` |
 | Mapper 输出目录 | `--mapper-dir` |
 | MySQL SQL 源目录 / 达梦 SQL 输出目录 | `--sql-root` / `--sql-root-out` |
 | 业务 schema / system schema | `--schema` / `--system-schema` |
@@ -98,7 +98,7 @@ java -jar dm-adapter-gui/target/dm-adapter-gui-0.1.0-SNAPSHOT.jar
 数据库连接信息只注入 GUI 启动的 CLI 子进程环境，不进入命令参数、项目配置或报告。启用数据库验证前请注意：
 SQL 脚本验证会真实修改测试库，按清单执行且不自动回滚。
 
-前面的 CLI 命令从 `dm-adapter` 目录执行时，默认应用工作目录为 `dm-adapter/.dm-adapter/demo-rest/`。目录名优先取 `--app-module` 定位到的 Maven `artifactId`；未传时自动发现唯一 Spring Boot 应用模块，无法唯一发现时回退到根 POM `artifactId` 和 `--project` 目录名。`scan`、`migrate`、`validate-sql`、`report`、`generate-validation-test` 使用同一规则。升级前业务项目中已有的 `sql-rewrite.yml`、`sql-validation.yml` 会在新目录缺文件时首次复制，旧文件不会删除或覆盖新文件。
+`--report-dir` 不是必填参数。`scan`、`migrate`、`validate-sql`、`report`、`generate-validation-test` 均在省略该参数时使用启动 CLI 的当前目录；例如从 `dm-adapter` 目录执行，报告和配置就直接写入 `dm-adapter` 目录。需要隔离不同项目的产物时，应显式指定不同的 `--report-dir`。升级前业务项目 `.dm-adapter` 中已有的 `sql-rewrite.yml`、`sql-validation.yml` 会在目标目录缺文件时首次复制，旧文件不会删除或覆盖目标文件。
 
 生成的 SQL 验证测试默认不会在普通 `mvn test` 中连接数据库。配置以下环境变量后，`generate-validation-test` 会在生成后自动运行一次；也可以在达梦测试环境中手动运行：
 
@@ -108,7 +108,7 @@ DM_JDBC_URL=jdbc:dm://host:5236 \
 DM_DB_USERNAME=user \
 DM_DB_PASSWORD=password \
 DM_SQL_VALIDATION_TOTAL_TIMEOUT_SECONDS=7200 \
-DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
+DM_ADAPTER_DIR=/path/to/dm-adapter \
 mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest test
 ```
 

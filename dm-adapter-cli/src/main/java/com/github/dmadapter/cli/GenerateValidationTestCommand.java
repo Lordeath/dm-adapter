@@ -28,7 +28,7 @@ public class GenerateValidationTestCommand implements Callable<Integer> {
     @Option(names = "--config", description = "Validation config path. Defaults to <workspace>/sql-validation.yml.")
     private Path config;
 
-    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to the current working directory.")
     private Path reportDir;
 
     @Option(names = "--schema", description = "Dameng schema to set before invoking mapper methods. Supports comma-separated fallback schemas.")
