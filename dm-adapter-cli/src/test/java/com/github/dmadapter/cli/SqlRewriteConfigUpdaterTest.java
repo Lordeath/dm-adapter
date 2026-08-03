@@ -297,6 +297,158 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
+    void removesIdentityInsertTablesForAutoIncrementAndNonIdentityTargets() throws Exception {
+        Path adapterDir = tempDir.resolve(".dm-adapter");
+        Files.createDirectories(adapterDir);
+        Path config = adapterDir.resolve("sql-rewrite.yml");
+        Files.writeString(config, """
+                identityInsertTables:
+                  - "auto_table"
+                  - "identity_table"
+                  - "ordinary_table"
+
+                upsertKeys:
+                  tables:
+                    {}
+                  methods:
+                    {}
+                """);
+        SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                loaded,
+                List.of(),
+                Map.of(),
+                false,
+                Map.of(
+                        "auto_table", DamengMetadataReader.AutoIncrementKind.AUTO_INCREMENT,
+                        "identity_table", DamengMetadataReader.AutoIncrementKind.IDENTITY,
+                        "ordinary_table", DamengMetadataReader.AutoIncrementKind.NONE
+                )
+        );
+
+        assertThat(update.fileChange()).isPresent();
+        assertThat(update.rewriteConfig().requiresIdentityInsert("auto_table")).isFalse();
+        assertThat(update.rewriteConfig().requiresIdentityInsert("ordinary_table")).isFalse();
+        assertThat(update.rewriteConfig().requiresIdentityInsert("identity_table")).isTrue();
+        assertThat(update.warnings())
+                .containsExactly(
+                        "Removed identityInsertTables entry auto_table because the target Dameng table "
+                                + "uses AUTO_INCREMENT rather than IDENTITY.",
+                        "Removed identityInsertTables entry ordinary_table because the target Dameng table "
+                                + "does not contain an IDENTITY column."
+                );
+        assertThat(Files.readString(config))
+                .contains("identityInsertTables:")
+                .contains("- \"identity_table\"")
+                .doesNotContain("auto_table")
+                .doesNotContain("ordinary_table");
+    }
+
+    @Test
+    void removesStaleIdentityInsertTablesFromChineseAndEnglishValidationFailures() throws Exception {
+        Path adapterDir = tempDir.resolve(".dm-adapter");
+        Files.createDirectories(adapterDir);
+        Path config = adapterDir.resolve("sql-rewrite.yml");
+        Files.writeString(config, """
+                identityInsertTables:
+                  - "owner_house_relationship"
+                  - "owner_customer_precinct_relation"
+
+                upsertKeys:
+                  tables:
+                    {}
+                  methods:
+                    {}
+                """);
+        Files.writeString(adapterDir.resolve("sql-validation-report.json"), """
+                {
+                  "records": [
+                    {
+                      "status": "FAILED",
+                      "summary": "表[owner_house_relationship]不存在IDENTITY列",
+                      "message": "### SQL: SET IDENTITY_INSERT owner_house_relationship ON"
+                    },
+                    {
+                      "status": "FAILED",
+                      "summary": "Table [owner_customer_precinct_relation] didn’t contains identity column",
+                      "message": "### SQL: SET IDENTITY_INSERT owner_customer_precinct_relation ON"
+                    }
+                  ]
+                }
+                """);
+        SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                loaded,
+                List.of(),
+                Map.of(),
+                false
+        );
+
+        assertThat(update.fileChange()).isPresent();
+        assertThat(update.rewriteConfig().identityInsertTables()).isEmpty();
+        assertThat(update.warnings()).containsExactly(
+                "Removed identityInsertTables entry owner_house_relationship because the previous Dameng "
+                        + "validation reported that the target table has no IDENTITY column.",
+                "Removed identityInsertTables entry owner_customer_precinct_relation because the previous "
+                        + "Dameng validation reported that the target table has no IDENTITY column."
+        );
+        assertThat(Files.readString(config))
+                .doesNotContain("identityInsertTables:")
+                .doesNotContain("owner_house_relationship")
+                .doesNotContain("owner_customer_precinct_relation");
+    }
+
+    @Test
+    void currentIdentityMetadataOverridesAStaleNoIdentityValidationFailure() throws Exception {
+        Path adapterDir = tempDir.resolve(".dm-adapter");
+        Files.createDirectories(adapterDir);
+        Path config = adapterDir.resolve("sql-rewrite.yml");
+        Files.writeString(config, """
+                identityInsertTables:
+                  - "current_identity_table"
+
+                upsertKeys:
+                  tables:
+                    {}
+                  methods:
+                    {}
+                """);
+        Files.writeString(adapterDir.resolve("sql-validation-report.json"), """
+                {
+                  "records": [
+                    {
+                      "status": "FAILED",
+                      "summary": "表[current_identity_table]不存在IDENTITY列",
+                      "message": "### SQL: SET IDENTITY_INSERT current_identity_table ON"
+                    }
+                  ]
+                }
+                """);
+        SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                loaded,
+                List.of(),
+                Map.of(),
+                false,
+                Map.of("current_identity_table", DamengMetadataReader.AutoIncrementKind.IDENTITY)
+        );
+
+        assertThat(update.fileChange()).isEmpty();
+        assertThat(update.warnings()).isEmpty();
+        assertThat(update.rewriteConfig().requiresIdentityInsert("current_identity_table")).isTrue();
+        assertThat(Files.readString(config)).contains("- \"current_identity_table\"");
+    }
+
+    @Test
     void doesNotTurnPreviousTypeMismatchFailuresIntoValidationIgnores() throws Exception {
         Path adapterDir = tempDir.resolve(".dm-adapter");
         Files.createDirectories(adapterDir);

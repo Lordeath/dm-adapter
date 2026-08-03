@@ -222,6 +222,13 @@ public class MigrateCommand implements Callable<Integer> {
             Path rewriteConfigPath = rewriteConfigPath(context);
             CliLogger.info("Loading SQL rewrite config: " + rewriteConfigPath);
             SqlRewriteConfig loadedRewriteConfig = sqlRewriteConfigLoader.load(rewriteConfigPath);
+            AutoIncrementKindLookupResult autoIncrementKindLookupResult =
+                    autoIncrementKindsForIdentityInsertTables(
+                            context,
+                            validationEnvironment,
+                            loadedRewriteConfig.identityInsertTables()
+                    );
+            warnings.addAll(autoIncrementKindLookupResult.warnings());
             MySqlToDmSqlConverter sqlConverter = new MySqlToDmSqlConverter();
             CliLogger.info("Previewing mapper XML migration for rewrite candidates...");
             MapperMigrationResult previewMigrationResult = mapperMigrator.migrate(
@@ -249,7 +256,8 @@ public class MigrateCommand implements Callable<Integer> {
                     loadedRewriteConfig,
                     rewriteConfigCandidates,
                     metadataLookupResult.metadataByTable(),
-                    metadataLookupResult.available()
+                    metadataLookupResult.available(),
+                    autoIncrementKindLookupResult.kindsByTable()
             );
             rewriteConfigUpdate.fileChange().ifPresent(fileChanges::add);
             warnings.addAll(rewriteConfigUpdate.warnings());
@@ -566,6 +574,44 @@ public class MigrateCommand implements Callable<Integer> {
                     ddlMetadata,
                     !ddlMetadata.isEmpty(),
                     warnings
+            );
+        }
+    }
+
+    private AutoIncrementKindLookupResult autoIncrementKindsForIdentityInsertTables(
+            AdapterContext context,
+            DmValidationEnvironment environment,
+            Set<String> identityInsertTables
+    ) {
+        if (identityInsertTables == null || identityInsertTables.isEmpty()
+                || !environment.validationEnabled()) {
+            return new AutoIncrementKindLookupResult(Map.of(), List.of());
+        }
+        if (!environment.ready()) {
+            return new AutoIncrementKindLookupResult(
+                    Map.of(),
+                    List.of("Dameng auto-increment metadata reconciliation was skipped because required "
+                            + "validation variables are missing: " + environment.missingVariables())
+            );
+        }
+        try {
+            CliLogger.info("Reconciling IDENTITY_INSERT tables with target Dameng auto-increment metadata...");
+            Map<String, DamengMetadataReader.AutoIncrementKind> kinds = runWithMetadataTimeout(
+                    () -> damengMetadataReader.readAutoIncrementKinds(
+                            environment,
+                            configuredSchema(context),
+                            identityInsertTables
+                    ),
+                    metadataReadTimeoutSeconds(identityInsertTables.size()),
+                    TimeUnit.SECONDS,
+                    "Dameng auto-increment metadata reconciliation"
+            );
+            return new AutoIncrementKindLookupResult(kinds, List.of());
+        } catch (Exception e) {
+            return new AutoIncrementKindLookupResult(
+                    Map.of(),
+                    List.of("Dameng auto-increment metadata reconciliation was skipped: "
+                            + redact(e.getMessage(), environment))
             );
         }
     }
@@ -1114,6 +1160,16 @@ public class MigrateCommand implements Callable<Integer> {
     ) {
         private MetadataLookupResult {
             metadataByTable = Map.copyOf(metadataByTable == null ? Map.of() : metadataByTable);
+            warnings = List.copyOf(warnings == null ? List.of() : warnings);
+        }
+    }
+
+    private record AutoIncrementKindLookupResult(
+            Map<String, DamengMetadataReader.AutoIncrementKind> kindsByTable,
+            List<String> warnings
+    ) {
+        private AutoIncrementKindLookupResult {
+            kindsByTable = Map.copyOf(kindsByTable == null ? Map.of() : kindsByTable);
             warnings = List.copyOf(warnings == null ? List.of() : warnings);
         }
     }

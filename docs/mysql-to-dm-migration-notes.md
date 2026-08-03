@@ -26,7 +26,7 @@
 
 - MySQL `VARCHAR(n)`/`CHAR(n)` 迁移到 `LENGTH_IN_CHAR=0` 的达梦实例时，应定义为 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`，保持原字符数上限。不要按 `utf8` 3 倍或 `utf8mb4` 4 倍修改 `n`：倍数扩长只能增加字节容量，还会允许写入超过 MySQL 上限的较短字节字符。达梦 DTS 的 MySQL 类型映射同样使用 `VARCHAR(n char)`/`CHAR(n char)`。
 - MySQL `TEXT`、`LONGTEXT`、`JSON` 等类型迁移到达梦时通常需要映射到大字段或字符串类型，并检查业务是否依赖 MySQL JSON 函数。
-- 自增列迁移后要特别处理。MySQL `AUTO_INCREMENT` 可对应达梦 `IDENTITY(start, increment)` 或迁移工具提供的 `auto_increment` 兼容方案；`IDENTITY` 自增列类型只能使用 `INT` 或 `BIGINT`。脚本里无列清单的 `INSERT INTO t VALUES(NULL, ...)` / `VALUES(DEFAULT, ...)` 如果首列明确是自增列，可省略该列和值，让达梦继续自动生成主键；显式插入具体 id 且列清单可从同脚本表定义确定时，可补列清单并用 `SET IDENTITY_INSERT ... ON/OFF` 保留种子 id。MyBatis 批量插入可能同时包含空 id 和显式 id，不能按首个元素决定整批是否保留 id；达梦 8 已验证 `SET IDENTITY_INSERT ... ON WITH REPLACE NULL` 能让空值自动生成、同时保留显式值。dm-adapter 应从语句表名和验证报告学习项目级 `identityInsertTables`，不能把具体表名写死在通用规则里。
+- 自增列迁移后要特别处理。MySQL `AUTO_INCREMENT` 可对应达梦原生 `IDENTITY(start, increment)`，也可在 MySQL 兼容模式下保留为达梦 `AUTO_INCREMENT`；两者都是自增机制，但不能混用控制语法。只有目标表实际为原生 `IDENTITY` 时，显式插入 id 才能使用 `SET IDENTITY_INSERT ... ON/OFF`；达梦 `AUTO_INCREMENT` 表不需要也不接受该开关，省略 id 时直接由数据库生成，显式 id 则按兼容自增语义插入。脚本里无列清单的 `INSERT INTO t VALUES(NULL, ...)` / `VALUES(DEFAULT, ...)` 如果首列明确是自增列，可省略该列和值。原生 `IDENTITY` 的 MyBatis 批量插入可能同时包含空 id 和显式 id，不能按首个元素决定整批是否保留 id；达梦 8 已验证 `SET IDENTITY_INSERT ... ON WITH REPLACE NULL` 能让空值自动生成、同时保留显式值。dm-adapter 的 `identityInsertTables` 只能记录经目标达梦元数据确认的原生 `IDENTITY` 表；目标为 `AUTO_INCREMENT`、普通列，或验证明确报告“不存在 IDENTITY 列”时必须撤销错误记录，不能把具体表名写死在通用规则里。
 - 触发器、函数、存储过程、视图、事件、外键、索引等对象不能只靠 mapper SQL 验证判断完整性。缺对象导致的 `无效的表或视图名`、`无效的列名`、`无法解析成员访问表达式`，优先归类为测试库对象缺失或原始 SQL 引用错误。
 
 ## SQL 语法差异
