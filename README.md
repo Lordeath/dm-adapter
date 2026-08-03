@@ -54,6 +54,22 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 子进程中调用同一套 Picocli 命令，因此 CLI 和 GUI 的迁移规则、报告及退出码保持一致。界面支持项目扫描、
 dry-run、正式迁移、SQL 脚本目录、达梦验证环境、实时日志、取消任务和摘要报告展示。
 
+GUI 表单标签会直接显示对应的 CLI 参数或环境变量，主要映射如下：
+
+| GUI 输入项 | CLI 参数或环境变量 |
+| --- | --- |
+| 项目根目录 / 工作目录 / 应用模块 | `--project` / `--report-dir` / `--app-module` |
+| Mapper 输出目录 | `--mapper-dir` |
+| MySQL SQL 源目录 / 达梦 SQL 输出目录 | `--sql-root` / `--sql-root-out` |
+| 业务 schema / system schema | `--schema` / `--system-schema` |
+| 仅迁移 SQL 脚本 | `--sql-scripts-only` |
+| SQL 重写配置 / 验证配置 | `--rewrite-config` / `--config` |
+| 达梦驱动坐标 / 字符长度语义 | `--dm-driver` / `--target-length-semantics` |
+| 生成 Mapper 验证测试 | `--generate-validation-test` |
+| 数据库验证、JDBC URL、用户名、密码 | `DM_SQL_VALIDATION`、`DM_JDBC_URL`、`DM_DB_USERNAME`、`DM_DB_PASSWORD` |
+
+底部三个操作按钮分别对应 `scan`、`migrate --dry-run` 和 `migrate`。
+
 开发环境可直接运行 shaded jar：
 
 ```bash
