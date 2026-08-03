@@ -49,15 +49,17 @@ final class DmAdapterFrame extends JFrame {
     private final JTextField mapperDirField = new JTextField();
     private final JTextField sqlRootField = new JTextField();
     private final JTextField sqlRootOutField = new JTextField();
-    private final JCheckBox sqlScriptsOnlyBox = new JCheckBox("仅迁移 SQL 脚本");
+    private final JCheckBox sqlScriptsOnlyBox = new JCheckBox("仅迁移 SQL 脚本 (--sql-scripts-only)");
     private final JTextField schemaField = new JTextField();
     private final JTextField systemSchemaField = new JTextField();
-    private final JCheckBox databaseValidationBox = new JCheckBox("启用达梦数据库验证与元数据探测");
+    private final JCheckBox databaseValidationBox = new JCheckBox(
+            "启用达梦数据库验证与元数据探测 (DM_SQL_VALIDATION=true)"
+    );
     private final JTextField jdbcUrlField = new JTextField();
     private final JTextField usernameField = new JTextField();
     private final JPasswordField passwordField = new JPasswordField();
     private final JCheckBox generateValidationTestBox = new JCheckBox(
-            "生成 Mapper 验证测试（启用数据库验证时自动运行）"
+            "生成 Mapper 验证测试 (--generate-validation-test；启用数据库验证时自动运行)"
     );
     private final JTextField dmDriverField = new JTextField();
     private final JTextField rewriteConfigField = new JTextField();
@@ -68,9 +70,9 @@ final class DmAdapterFrame extends JFrame {
     private final JTextArea summaryArea = new JTextArea();
     private final JTextArea logArea = new JTextArea();
     private final JLabel statusLabel = new JLabel("就绪");
-    private final JButton scanButton = new JButton("扫描项目");
-    private final JButton dryRunButton = new JButton("迁移预览（dry-run）");
-    private final JButton migrateButton = new JButton("执行迁移");
+    private final JButton scanButton = new JButton("扫描项目 (scan)");
+    private final JButton dryRunButton = new JButton("迁移预览 (migrate --dry-run)");
+    private final JButton migrateButton = new JButton("执行迁移 (migrate)");
     private final JButton cancelButton = new JButton("取消");
     private final JButton openReportButton = new JButton("打开报告");
     private final JButton openWorkspaceButton = new JButton("打开工作目录");
@@ -111,11 +113,11 @@ final class DmAdapterFrame extends JFrame {
 
     private JPanel createProjectPanel() {
         JPanel panel = formPanel();
-        addPathRow(panel, 0, "项目根目录 *", projectField, true, this::projectSelected);
-        addPathRow(panel, 1, "工作目录 *", reportDirField, true, null);
-        addTextRow(panel, 2, "应用模块", appModuleField,
+        addPathRow(panel, 0, "项目根目录 (--project) *", projectField, true, this::projectSelected);
+        addPathRow(panel, 1, "工作目录 (--report-dir) *", reportDirField, true, null);
+        addTextRow(panel, 2, "应用模块 (--app-module)", appModuleField,
                 "可填写 Maven artifactId 或模块路径；留空时由 CLI 自动发现。");
-        addPathRow(panel, 3, "Mapper 输出目录", mapperDirField, true, null);
+        addPathRow(panel, 3, "Mapper 输出目录 (--mapper-dir)", mapperDirField, true, null);
         JLabel hint = new JLabel("留空时继续使用 CLI 默认目录：各模块 src/main/resources/mapper-dm；不会覆盖原始 mapper XML。");
         hint.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 2));
         addFullWidth(panel, 4, hint);
@@ -124,10 +126,10 @@ final class DmAdapterFrame extends JFrame {
 
     private JPanel createSqlPanel() {
         JPanel panel = formPanel();
-        addPathRow(panel, 0, "MySQL SQL 源目录", sqlRootField, true, null);
-        addPathRow(panel, 1, "达梦 SQL 输出目录", sqlRootOutField, true, null);
-        addTextRow(panel, 2, "业务 schema", schemaField, "支持逗号分隔的候选 schema。");
-        addTextRow(panel, 3, "system schema", systemSchemaField,
+        addPathRow(panel, 0, "MySQL SQL 源目录 (--sql-root)", sqlRootField, true, null);
+        addPathRow(panel, 1, "达梦 SQL 输出目录 (--sql-root-out)", sqlRootOutField, true, null);
+        addTextRow(panel, 2, "业务 schema (--schema)", schemaField, "支持逗号分隔的候选 schema。");
+        addTextRow(panel, 3, "system schema (--system-schema)", systemSchemaField,
                 "用于文件名中包含独立 system 段的 SQL 脚本。");
         addFullWidth(panel, 4, sqlScriptsOnlyBox);
         return panel;
@@ -136,9 +138,11 @@ final class DmAdapterFrame extends JFrame {
     private JPanel createDatabasePanel() {
         JPanel panel = formPanel();
         addFullWidth(panel, 0, databaseValidationBox);
-        addTextRow(panel, 1, "JDBC URL", jdbcUrlField, "例如 jdbc:dm://127.0.0.1:5236?schema=APP。");
-        addTextRow(panel, 2, "用户名", usernameField, "仅注入 CLI 子进程环境，不写入配置或报告。");
-        addComponentRow(panel, 3, "密码", passwordField,
+        addTextRow(panel, 1, "JDBC URL (DM_JDBC_URL)", jdbcUrlField,
+                "例如 jdbc:dm://127.0.0.1:5236?schema=APP。");
+        addTextRow(panel, 2, "用户名 (DM_DB_USERNAME)", usernameField,
+                "仅注入 CLI 子进程环境，不写入配置或报告。");
+        addComponentRow(panel, 3, "密码 (DM_DB_PASSWORD)", passwordField,
                 "密码不会出现在命令参数和 GUI 日志中。");
         addFullWidth(panel, 4, generateValidationTestBox);
         JLabel warning = new JLabel("警告：启用验证后可能真实修改共享测试库，SQL 脚本按清单执行且不自动回滚。");
@@ -149,10 +153,10 @@ final class DmAdapterFrame extends JFrame {
 
     private JPanel createAdvancedPanel() {
         JPanel panel = formPanel();
-        addTextRow(panel, 0, "达梦驱动坐标", dmDriverField, "留空使用 CLI 默认坐标。");
-        addPathRow(panel, 1, "SQL 重写配置", rewriteConfigField, false, null);
-        addPathRow(panel, 2, "验证配置", validationConfigField, false, null);
-        addComponentRow(panel, 3, "字符长度语义", targetLengthSemanticsBox,
+        addTextRow(panel, 0, "达梦驱动坐标 (--dm-driver)", dmDriverField, "留空使用 CLI 默认坐标。");
+        addPathRow(panel, 1, "SQL 重写配置 (--rewrite-config)", rewriteConfigField, false, null);
+        addPathRow(panel, 2, "验证配置 (--config)", validationConfigField, false, null);
+        addComponentRow(panel, 3, "字符长度语义 (--target-length-semantics)", targetLengthSemanticsBox,
                 "离线迁移可显式选择 CHAR 或 BYTE；默认由目标库探测。");
         return panel;
     }
