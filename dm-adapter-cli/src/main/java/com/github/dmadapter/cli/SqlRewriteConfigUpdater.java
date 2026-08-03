@@ -284,7 +284,13 @@ class SqlRewriteConfigUpdater {
         Map<String, DamengMetadataReader.AutoIncrementKind> kinds = autoIncrementKinds == null
                 ? Map.of()
                 : autoIncrementKinds;
-        for (Map.Entry<String, DamengMetadataReader.AutoIncrementKind> entry : kinds.entrySet()) {
+        List<Map.Entry<String, DamengMetadataReader.AutoIncrementKind>> sortedKinds =
+                new ArrayList<>(kinds.entrySet());
+        sortedKinds.sort((left, right) -> {
+            int comparison = String.CASE_INSENSITIVE_ORDER.compare(left.getKey(), right.getKey());
+            return comparison != 0 ? comparison : left.getKey().compareTo(right.getKey());
+        });
+        for (Map.Entry<String, DamengMetadataReader.AutoIncrementKind> entry : sortedKinds) {
             String tableName = entry.getKey();
             DamengMetadataReader.AutoIncrementKind kind = entry.getValue();
             if (kind == DamengMetadataReader.AutoIncrementKind.IDENTITY) {
