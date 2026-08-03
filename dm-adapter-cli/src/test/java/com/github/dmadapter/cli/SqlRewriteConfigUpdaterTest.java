@@ -8,6 +8,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -314,6 +315,10 @@ class SqlRewriteConfigUpdaterTest {
                     {}
                 """);
         SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
+        Map<String, DamengMetadataReader.AutoIncrementKind> autoIncrementKinds = new LinkedHashMap<>();
+        autoIncrementKinds.put("ordinary_table", DamengMetadataReader.AutoIncrementKind.NONE);
+        autoIncrementKinds.put("identity_table", DamengMetadataReader.AutoIncrementKind.IDENTITY);
+        autoIncrementKinds.put("auto_table", DamengMetadataReader.AutoIncrementKind.AUTO_INCREMENT);
 
         SqlRewriteConfigUpdate update = updater.update(
                 AdapterContext.builder(tempDir).build(),
@@ -322,11 +327,7 @@ class SqlRewriteConfigUpdaterTest {
                 List.of(),
                 Map.of(),
                 false,
-                Map.of(
-                        "auto_table", DamengMetadataReader.AutoIncrementKind.AUTO_INCREMENT,
-                        "identity_table", DamengMetadataReader.AutoIncrementKind.IDENTITY,
-                        "ordinary_table", DamengMetadataReader.AutoIncrementKind.NONE
-                )
+                autoIncrementKinds
         );
 
         assertThat(update.fileChange()).isPresent();
