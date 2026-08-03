@@ -59,6 +59,8 @@
 - 存储过程中出现 `SELECT ... END INTO ...` 且对应表达式中没有 `CASE` 时，多出的 `END` 是原始 SQL 语法缺陷。验证应归为 `ORIGINAL_SQL`，不能由转换器猜测删除；合法的 `SELECT CASE ... END INTO ...` 不属于此类。
 - MySQL 为删除自增主键列而连续执行“删除主键并补普通索引 → 去掉自增属性 → 删除该列”时，达梦会在第一个中间态拒绝没有唯一约束的自增列。若三个 DDL 紧邻、表名和列名一致且新增索引只包含该列，可直接收敛为 `DROP COLUMN`，最终结构等价且避免无效中间态。
 - 存储过程中的 `CREATE TEMPORARY TABLE name AS (SELECT ...)` 需要去掉包裹整个查询的单层括号，再按会话级全局临时表加 `DELETE + INSERT ... SELECT` 转换；否则过程编译时会把临时表误当成运行期普通表，形成“无效的表”假失败。
+- 存储过程中的显式 `CREATE TEMPORARY TABLE name (...)` 必须把原字段类型带到达梦全局临时表编译占位对象，不能根据列名后缀猜测类型。尤其是以 `ID` 结尾的字母数字业务键不能推断成 `BIGINT`；没有原始定义时，除已明确的数值租户字段和裸 `id` 外，未知 ID 应保守使用字符串类型。`CREATE ... IF NOT EXISTS` 不会修正历史错误对象，因此占位表已存在时还必须按当前 schema 校正字符串 ID 的类型和长度，再编译过程。
+- 存储过程体中的 `UPDATE ... JOIN` 必须与顶层 SQL 使用同一转换规则；语句前的行注释或块注释不能让 `UPDATE` 被当成普通标识符，也不能导致原始 JOIN 更新绕过转换。生成的 `UPDATE ... FROM`/`MERGE` 必须保留全部 JOIN 和 WHERE 谓词，并以包含无关目标行的回归用例证明不会扩大更新范围。
 - MySQL `AUTO_INCREMENT` 和 `ALTER TABLE t AUTO_INCREMENT = n` 默认不再为了验证而改写。目标环境如果不支持或业务依赖重置序列语义，应按达梦身份列/序列方案人工确认，不能把 `AUTO_INCREMENT = n` 删除后留下半截 `ALTER TABLE`。
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；带精度的 `CURRENT_TIMESTAMP(n)` 必须对应为 `NOW(n)`，否则 `TIMESTAMP(n)` 会因表达式精度不匹配报“ON UPDATE 表达式错误”。只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
 - MySQL 允许在一条 `ALTER TABLE` 中连续写多个 `MODIFY COLUMN`，达梦需要把它们拆成按原顺序执行的独立 `ALTER TABLE ... MODIFY ...`。脚本转换必须保留第一条语句前的注释，并把每个字段修改作为独立验证单元。
