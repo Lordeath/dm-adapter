@@ -2066,18 +2066,11 @@ class DmAdapterCliTest {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         assertThat(compiler).as("JDK compiler").isNotNull();
         Path outputDirectory = tempDir.resolve("generated-test-classes");
-        Files.createDirectories(outputDirectory);
-        int exitCode = compiler.run(
-                null,
-                null,
-                null,
-                "--release",
-                "8",
-                "-classpath",
-                System.getProperty("java.class.path"),
-                "-d",
-                outputDirectory.toString(),
-                sourceFile.toString()
+        int exitCode = JavaCompilerTestSupport.compileJava8(
+                compiler,
+                List.of(sourceFile),
+                outputDirectory,
+                JavaCompilerTestSupport.runtimeClasspath()
         );
         assertThat(exitCode).as("generated Java 8 validation test compilation").isZero();
     }

@@ -67,7 +67,7 @@ class GeneratedActualParameterTypeIndexTest {
                     .sorted()
                     .forEach(fixtureSources::add);
         }
-        compile(fixtureSources, fixtureClasses, System.getProperty("java.class.path"));
+        compile(fixtureSources, fixtureClasses, JavaCompilerTestSupport.runtimeClasspath());
 
         Path generatedSource = tempDir.resolve("generated/com/example/DmSqlValidationTest.java");
         Files.createDirectories(generatedSource.getParent());
@@ -76,7 +76,7 @@ class GeneratedActualParameterTypeIndexTest {
         compile(
                 List.of(generatedSource),
                 generatedClasses,
-                System.getProperty("java.class.path") + File.pathSeparator + fixtureClasses
+                JavaCompilerTestSupport.runtimeClasspath() + File.pathSeparator + fixtureClasses
         );
 
         try (URLClassLoader classLoader = new URLClassLoader(
@@ -181,18 +181,7 @@ class GeneratedActualParameterTypeIndexTest {
     private void compile(List<Path> sourceFiles, Path outputDirectory, String classpath) throws Exception {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         assertThat(compiler).as("JDK compiler").isNotNull();
-        Files.createDirectories(outputDirectory);
-        List<String> arguments = new ArrayList<>();
-        arguments.add("--release");
-        arguments.add("8");
-        arguments.add("-classpath");
-        arguments.add(classpath);
-        arguments.add("-d");
-        arguments.add(outputDirectory.toString());
-        for (Path sourceFile : sourceFiles) {
-            arguments.add(sourceFile.toString());
-        }
-        assertThat(compiler.run(null, null, null, arguments.toArray(new String[0])))
+        assertThat(JavaCompilerTestSupport.compileJava8(compiler, sourceFiles, outputDirectory, classpath))
                 .as("generated validation source compilation")
                 .isZero();
     }
