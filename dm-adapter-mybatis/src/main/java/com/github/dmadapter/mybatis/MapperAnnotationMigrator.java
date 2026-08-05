@@ -7,6 +7,8 @@ import com.github.dmadapter.core.MapperXmlFile;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlChange;
 import com.github.dmadapter.core.SqlConversionResult;
+import com.github.dmadapter.sql.MySqlToDmSqlConverter;
+import com.github.dmadapter.sql.ReservedColumnRewriteMode;
 import com.github.dmadapter.sql.SqlConverter;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.StaticJavaParser;
@@ -329,10 +331,18 @@ public class MapperAnnotationMigrator {
                     "Extract MyBatis annotation SQL to mapper-dm XML"
             ));
             for (AnnotationStatement statement : entry.getValue()) {
-                SqlConversionResult conversion = sqlConverter.convert(
-                        statement.sql(),
-                        rewriteConfig.keyColumnsFor(statement.key(), "")
-                );
+                SqlConversionResult conversion = sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                        ? mySqlToDmSqlConverter.convert(
+                                statement.sql(),
+                                rewriteConfig.keyColumnsFor(statement.key(), ""),
+                                "select".equals(statement.tagName())
+                                        ? ReservedColumnRewriteMode.TOP_LEVEL_RESULT
+                                        : ReservedColumnRewriteMode.PHYSICAL_ONLY
+                        )
+                        : sqlConverter.convert(
+                                statement.sql(),
+                                rewriteConfig.keyColumnsFor(statement.key(), "")
+                        );
                 if (conversion.changed()) {
                     automaticConversions.add(new SqlChange(
                             target.toString(),

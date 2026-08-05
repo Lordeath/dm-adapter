@@ -10,7 +10,7 @@
 - mapper XML 优先根据项目内 `application*.properties`、`application*.yml`、`application*.yaml` 中的 `mybatis.mapperLocations` / `mybatis.mapper-locations` 等配置项定位；支持 `classpath*:/mapper/*.xml` 这类跨模块 classpath 配置；未配置时回退到资源目录扫描。
 - 检查 `pom.xml` 是否已有达梦 JDBC 驱动依赖。
 - `migrate` 默认复制 mapper XML 到 mapper 所在模块的 `src/main/resources/mapper-dm`，不覆盖原文件。
-- 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页、`DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`、`CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`、`FROM/JOIN ... AS 别名` -> `FROM/JOIN ... 别名`，并将 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦特殊列名重命名为追加下划线形式。
+- 自动转换保守 SQL 规则：`IFNULL` -> `NVL`、`NOW()` -> `SYSDATE`、双引号字符串常量 -> 单引号字符串常量、简单 `LIMIT` 分页、`DATE_ADD(..., INTERVAL n UNIT)` -> `DATEADD(UNIT, n, ...)`、`CONVERT(..., UNSIGNED)` -> `CAST(... AS BIGINT)`、`FROM/JOIN ... AS 别名` -> `FROM/JOIN ... 别名`，并将 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦特殊业务列名重命名为前缀下划线形式。
 - 支持通过应用工作目录中的 `sql-rewrite.yml` 配置 `keyColumns`，将可确认唯一键的 `ON DUPLICATE KEY UPDATE` / `INSERT IGNORE` 改写为达梦 `MERGE`；配置达梦验证环境变量后，`migrate` 会优先从测试库主键、唯一键和自增列元数据自动推断并维护该配置。若元数据证明 `INSERT IGNORE` 不可能发生重复键冲突，则自动转为普通 `INSERT`；其他无法确认的情况保留原 SQL 并写入报告。
 - 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore 等标记为人工确认；达梦 MySQL 兼容模式可执行的反引号标识符默认保留。
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类，在工具侧应用工作目录生成 `sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean；若 `DM_SQL_VALIDATION=true` 且连接环境变量齐全，生成后会自动执行一次验证测试并输出报告路径。
@@ -18,9 +18,11 @@
 
 ## 达梦特殊列名重写注意事项
 
-达梦中的 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_STARTTIME`、`VERSIONS_ENDTIME`、`VERSIONS_STARTTRXID`、`VERSIONS_ENDTRXID`、`VERSIONS_OPERATION` 属于伪列或特殊列名，业务表字段迁移到达梦时应改名。`migrate` 重写 mapper XML 时会把 SQL 中这些裸标识符追加下划线，例如 `rowid` -> `rowid_`、`trxid` -> `trxid_`。
+达梦中的 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_STARTTIME`、`VERSIONS_ENDTIME`、`VERSIONS_STARTTRXID`、`VERSIONS_ENDTRXID`、`VERSIONS_OPERATION` 属于伪列或特殊列名，业务表字段迁移到达梦时应改名。`migrate` 会为这些物理列名增加前缀下划线，例如 `rowid` -> `_rowid`、`trxid` -> `_trxid`。
 
-该规则是大小写不敏感的，但只处理 SQL 裸标识符；字符串常量、SQL 注释、`#{rowid}` / `${trxid}` 这类 MyBatis 参数占位符会保持原样，避免误改 Java 参数名和文本内容。
+Mapper 最外层显式查询投影会同时保留原结果标签，例如 `SELECT trxid ... WHERE trxid = #{trxid}` 转为 `SELECT _trxid AS "trxid" ... WHERE _trxid = #{trxid}`。因此已有的 `resultMap column="trxid"`、Java 属性名和 MyBatis 参数名不需要修改。只用于 SELECT 投影的本地 `<sql>` 列清单使用相同规则；用途混合或无法确认的片段保留原样并进入人工确认。`SELECT *` / `t.*` 不展开、不增加专项提示。
+
+该规则大小写不敏感，并保留原标识符的大小写；字符串常量、SQL 注释、`#{rowid}` / `${trxid}` 这类 MyBatis 参数占位符会保持原样，避免误改 Java 参数名和文本内容。数据库侧的 `keyColumn` 会同步使用前缀物理列名，`keyProperty` 保持不变。
 
 达梦普通关键字/保留字不会做全量自动重命名。原因是 `SELECT`、`FROM`、`WHERE`、`ORDER`、`LIMIT` 等词同时也是 SQL 语法的一部分，盲目替换会破坏语句。若业务表字段命中普通保留字，应结合实际表结构采用改字段名、双引号标识符、连接串/客户端 `KEYWORDS` 配置或人工确认报告处理。
 

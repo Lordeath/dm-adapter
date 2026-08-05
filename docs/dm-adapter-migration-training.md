@@ -170,7 +170,7 @@ status = 'ACTIVE'
 
 ## 特殊列名与关键字
 
-- 达梦特殊列名如 `ROWID`、`ROWNUM`、`TRXID` 等追加下划线。
+- 达梦特殊业务列名如 `ROWID`、`ROWNUM`、`TRXID` 等增加前缀下划线；Mapper 最外层显式投影通过双引号别名保留原结果标签，例如 `_trxid AS "trxid"`。
 - 部分命中达梦关键字的业务标识符会加双引号。
 - 字符串、注释、MyBatis 参数占位符不做误改。
 
