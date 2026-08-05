@@ -4,6 +4,7 @@ import com.github.dmadapter.core.TargetLengthSemantics;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -28,14 +29,19 @@ class CliCommandBuilderTest {
                 "--app-module", "demo-app"
         );
         assertThat(invocation.environment()).containsEntry("DM_SQL_VALIDATION", "false");
+        assertThat(invocation.reportDir())
+                .isEqualTo(tempDir.resolve("workspace").toAbsolutePath().normalize());
     }
 
     @Test
-    void omitsOptionalReportDirAndUsesCurrentDirectoryForResults() {
+    void omitsOptionalReportDirAndUsesArtifactWorkspaceForResults() throws Exception {
+        Path project = tempDir.resolve("enterprise");
+        Path module = project.resolve("newsee-enterprise-rest");
+        writePom(module.resolve("pom.xml"), "newsee-enterprise-rest");
         GuiRunConfiguration configuration = new GuiRunConfiguration(
-                tempDir,
+                project,
                 null,
-                "",
+                "newsee-enterprise-rest",
                 null,
                 null,
                 null,
@@ -56,7 +62,12 @@ class CliCommandBuilderTest {
         CliInvocation invocation = builder.build(GuiOperation.SCAN, configuration);
 
         assertThat(invocation.arguments()).doesNotContain("--report-dir");
-        assertThat(invocation.reportDir()).isEqualTo(CliCommandBuilder.defaultReportDir());
+        assertThat(invocation.reportDir()).isEqualTo(
+                Path.of(System.getProperty("user.dir", "."))
+                        .toAbsolutePath()
+                        .normalize()
+                        .resolve(".dm-adapter/newsee-enterprise-rest")
+        );
     }
 
     @Test
@@ -209,5 +220,17 @@ class CliCommandBuilderTest {
                 "",
                 ""
         );
+    }
+
+    private void writePom(Path path, String artifactId) throws Exception {
+        Files.createDirectories(path.getParent());
+        Files.writeString(path, """
+                <project>
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>%s</artifactId>
+                    <version>1.0.0</version>
+                </project>
+                """.formatted(artifactId));
     }
 }

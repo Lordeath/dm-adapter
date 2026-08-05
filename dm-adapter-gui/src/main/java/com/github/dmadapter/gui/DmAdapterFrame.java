@@ -83,7 +83,7 @@ final class DmAdapterFrame extends JFrame {
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     private final Timer summaryTimer;
     private GuiOperation lastOperation;
-    private Path lastReportDir = CliCommandBuilder.defaultReportDir();
+    private Path lastReportDir;
 
     DmAdapterFrame() {
         super("dm-adapter GUI");
@@ -115,13 +115,12 @@ final class DmAdapterFrame extends JFrame {
     private JPanel createProjectPanel() {
         JPanel panel = formPanel();
         addPathRow(panel, 0, "项目根目录 (--project) *", projectField, true, null);
-        addPathRow(panel, 1, "工作目录 (--report-dir；留空=当前目录)", reportDirField, true, null);
-        addTextRow(panel, 2, "应用模块 (--app-module)", appModuleField,
+        addTextRow(panel, 1, "应用模块 (--app-module)", appModuleField,
                 "可填写 Maven artifactId 或模块路径；留空时由 CLI 自动发现。");
-        addPathRow(panel, 3, "Mapper 输出目录 (--mapper-dir)", mapperDirField, true, null);
+        addPathRow(panel, 2, "Mapper 输出目录 (--mapper-dir)", mapperDirField, true, null);
         JLabel hint = new JLabel("留空时继续使用 CLI 默认目录：各模块 src/main/resources/mapper-dm；不会覆盖原始 mapper XML。");
         hint.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 2));
-        addFullWidth(panel, 4, hint);
+        addFullWidth(panel, 3, hint);
         return panel;
     }
 
@@ -154,11 +153,17 @@ final class DmAdapterFrame extends JFrame {
 
     private JPanel createAdvancedPanel() {
         JPanel panel = formPanel();
-        addTextRow(panel, 0, "达梦驱动坐标 (--dm-driver)", dmDriverField, "留空使用 CLI 默认坐标。");
-        addPathRow(panel, 1, "SQL 重写配置 (--rewrite-config)", rewriteConfigField, false, null);
-        addPathRow(panel, 2, "验证配置 (--config)", validationConfigField, false, null);
-        addComponentRow(panel, 3, "字符长度语义 (--target-length-semantics)", targetLengthSemanticsBox,
+        addPathRow(panel, 0, "工作目录覆盖 (--report-dir，可选)", reportDirField, true, null);
+        addTextRow(panel, 1, "达梦驱动坐标 (--dm-driver)", dmDriverField, "留空使用 CLI 默认坐标。");
+        addPathRow(panel, 2, "SQL 重写配置 (--rewrite-config)", rewriteConfigField, false, null);
+        addPathRow(panel, 3, "验证配置 (--config)", validationConfigField, false, null);
+        addComponentRow(panel, 4, "字符长度语义 (--target-length-semantics)", targetLengthSemanticsBox,
                 "离线迁移可显式选择 CHAR 或 BYTE；默认由目标库探测。");
+        JLabel workspaceHint = new JLabel(
+                "工作目录留空时不传 --report-dir，由 CLI 使用 <启动目录>/.dm-adapter/<应用 artifactId>。"
+        );
+        workspaceHint.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 2));
+        addFullWidth(panel, 5, workspaceHint);
         return panel;
     }
 
@@ -207,7 +212,7 @@ final class DmAdapterFrame extends JFrame {
         migrateButton.addActionListener(event -> start(GuiOperation.MIGRATE));
         cancelButton.addActionListener(event -> cancel());
         openReportButton.addActionListener(event -> openLatestReport());
-        openWorkspaceButton.addActionListener(event -> openPath(selectedReportDir()));
+        openWorkspaceButton.addActionListener(event -> openWorkspace());
         databaseValidationBox.addActionListener(event -> updateDatabaseFields());
         addWindowListener(new WindowAdapter() {
             @Override
@@ -335,6 +340,9 @@ final class DmAdapterFrame extends JFrame {
 
     private void refreshSummary(boolean finalRefresh) {
         Path reportDir = lastReportDir;
+        if (reportDir == null) {
+            return;
+        }
         try {
             if (lastOperation == GuiOperation.SCAN) {
                 Path scanJson = reportDir.resolve(ReportWriter.SCAN_REPORT_JSON);
@@ -410,7 +418,17 @@ final class DmAdapterFrame extends JFrame {
     }
 
     private void openLatestReport() {
-        Path reportDir = lastOperation == null ? selectedReportDir() : lastReportDir;
+        Path reportDir;
+        try {
+            reportDir = lastOperation == null ? selectedReportDir() : lastReportDir;
+        } catch (Exception e) {
+            showError(e.getMessage());
+            return;
+        }
+        if (reportDir == null) {
+            showError("请先选择项目根目录。");
+            return;
+        }
         Path report;
         if (lastOperation == GuiOperation.SCAN) {
             report = reportDir.resolve(ReportWriter.SCAN_REPORT_MARKDOWN);
@@ -437,9 +455,25 @@ final class DmAdapterFrame extends JFrame {
         }
     }
 
+    private void openWorkspace() {
+        try {
+            Path reportDir = lastOperation == null ? selectedReportDir() : lastReportDir;
+            if (reportDir == null) {
+                showError("请先选择项目根目录。");
+                return;
+            }
+            openPath(reportDir);
+        } catch (Exception e) {
+            showError(e.getMessage());
+        }
+    }
+
     private Path selectedReportDir() {
-        Path configured = pathValue(reportDirField);
-        return configured == null ? CliCommandBuilder.defaultReportDir() : configured;
+        GuiRunConfiguration configuration = configuration();
+        if (configuration.reportDir() == null && configuration.project() == null) {
+            return null;
+        }
+        return commandBuilder.resolveReportDir(configuration);
     }
 
     private void updateDatabaseFields() {
