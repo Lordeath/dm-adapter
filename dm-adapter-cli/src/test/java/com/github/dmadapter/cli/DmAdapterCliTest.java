@@ -177,7 +177,7 @@ class DmAdapterCliTest {
     }
 
     @Test
-    void migrateUsesUnambiguousResultMapMetadataWhenDamengValidationIsDisabled() throws Exception {
+    void migratePreservesMapperJdbcTypeAndNumericLiteralWhenDamengValidationIsDisabled() throws Exception {
         writeDemoProject();
         Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -200,9 +200,13 @@ class DmAdapterCliTest {
 
         assertThat(exitCode).isZero();
         assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
-                .contains("a.assigned_userids = '0'");
+                .contains("a.assigned_userids = 0")
+                .contains("jdbcType=\"BIGINT\"")
+                .contains("jdbcType=\"VARCHAR\"")
+                .doesNotContain("a.assigned_userids = '0'");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
-                .contains("unambiguous MyBatis resultMap jdbcType metadata");
+                .doesNotContain("jdbcType alignment")
+                .doesNotContain("unambiguous MyBatis resultMap jdbcType metadata");
     }
 
     @Test
