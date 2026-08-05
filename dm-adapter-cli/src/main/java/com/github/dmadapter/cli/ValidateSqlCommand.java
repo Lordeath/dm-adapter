@@ -24,7 +24,7 @@ public class ValidateSqlCommand implements Callable<Integer> {
     @Option(names = "--project", required = true, description = "Project root path used by the migration plan.")
     private Path project;
 
-    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to the current working directory.")
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
     private Path reportDir;
 
     @Option(

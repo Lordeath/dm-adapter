@@ -1,5 +1,7 @@
 package com.github.dmadapter.gui;
 
+import com.github.dmadapter.cli.AdapterWorkspaceResolver;
+
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -11,6 +13,8 @@ final class CliCommandBuilder {
     static final String JDBC_URL = "DM_JDBC_URL";
     static final String DB_USERNAME = "DM_DB_USERNAME";
     static final String DB_PASSWORD = "DM_DB_PASSWORD";
+
+    private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
 
     CliInvocation build(GuiOperation operation, GuiRunConfiguration configuration) {
         validate(operation, configuration);
@@ -33,10 +37,7 @@ final class CliCommandBuilder {
             environment.put(DB_USERNAME, configuration.username());
             environment.put(DB_PASSWORD, configuration.password());
         }
-        Path effectiveReportDir = configuration.reportDir() == null
-                ? defaultReportDir()
-                : configuration.reportDir().toAbsolutePath().normalize();
-        return new CliInvocation(arguments, environment, effectiveReportDir);
+        return new CliInvocation(arguments, environment, resolveReportDir(configuration));
     }
 
     private void addMigrationArguments(
@@ -111,7 +112,8 @@ final class CliCommandBuilder {
         }
     }
 
-    static Path defaultReportDir() {
-        return Path.of(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
+    Path resolveReportDir(GuiRunConfiguration configuration) {
+        Path appModule = configuration.appModule().isBlank() ? null : Path.of(configuration.appModule());
+        return workspaceResolver.resolve(configuration.project(), appModule, configuration.reportDir());
     }
 }

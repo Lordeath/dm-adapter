@@ -62,7 +62,7 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--dm-driver", description = "Dameng JDBC dependency coordinate: groupId:artifactId:version.")
     private String dmDriver;
 
-    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to the current working directory.")
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
     private Path reportDir;
 
     @Option(names = "--mapper-dir", description = "Target mapper directory. Defaults to src/main/resources/mapper-dm.")

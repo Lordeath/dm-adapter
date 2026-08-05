@@ -22,7 +22,7 @@ public class ScanCommand implements Callable<Integer> {
     @Option(names = "--app-module", description = "Application module path or Maven artifactId used for the default workspace name.")
     private Path appModule;
 
-    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to the current working directory.")
+    @Option(names = "--report-dir", description = "dm-adapter workspace directory. Defaults to <cwd>/.dm-adapter/<app-artifactId>.")
     private Path reportDir;
 
     private final ProjectScanner projectScanner = new ProjectScanner();
