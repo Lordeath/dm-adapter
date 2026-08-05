@@ -2,7 +2,9 @@ package com.github.dmadapter.mybatis;
 
 import com.github.dmadapter.core.SqlChange;
 import com.github.dmadapter.core.SqlConversionResult;
+import com.github.dmadapter.sql.DamengReservedColumnRenamer;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
+import com.github.dmadapter.sql.ReservedColumnRewriteMode;
 import com.github.dmadapter.sql.SqlConverter;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -93,6 +95,10 @@ public class MapperXmlRewriter {
                     + "#{...} binding was retained because replacing it with ${...} would be injection-unsafe. "
                     + "Split this mapper operation into an explicit temporary-table DDL and a parameterized "
                     + "INSERT ... SELECT, or simplify the dynamic binding into a supported scalar <foreach>.";
+    private static final String AMBIGUOUS_RESERVED_COLUMN_FRAGMENT_REASON =
+            "SQL fragment contains a Dameng special business column but its <include> usage is mixed, "
+                    + "external, or cannot be classified as a result projection. The fragment was preserved; "
+                    + "use the physical _column name and keep the logical result label explicitly.";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Set<String> DAMENG_IDENTIFIER_QUOTES = Set.of(
@@ -385,6 +391,7 @@ public class MapperXmlRewriter {
         List<SqlChange> manualReviewItems = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
         List<StatementReplacement> replacements = new ArrayList<>();
+        List<KeyColumnReplacement> keyColumnReplacements = new ArrayList<>();
         Set<String> restrictedStatementKeys = statementKeysToRewrite == null
                 ? Set.of()
                 : statementKeysToRewrite;
@@ -411,6 +418,8 @@ public class MapperXmlRewriter {
                 ? ""
                 : document.getDocumentElement().getAttribute("namespace");
         Map<String, String> resultMapColumnByProperty = resultMapColumnByProperty(document);
+        Map<String, ReservedColumnRewriteMode> reservedColumnFragmentModes =
+                reservedColumnFragmentModes(document, inputPath, namespace);
         String xml = null;
         boolean changed = false;
         for (Element statement : statementElements(document)) {
@@ -439,6 +448,44 @@ public class MapperXmlRewriter {
             if (restricted && !restrictedStatementKeys.contains(statementKey)) {
                 continue;
             }
+            String originalKeyColumn = statement.getAttribute("keyColumn");
+            String convertedKeyColumn = renameKeyColumns(originalKeyColumn);
+            if (!convertedKeyColumn.equals(originalKeyColumn)) {
+                keyColumnReplacements.add(new KeyColumnReplacement(
+                        tagName,
+                        statementId,
+                        occurrenceIndex,
+                        convertedKeyColumn
+                ));
+                automaticConversions.add(new SqlChange(
+                        reportPath,
+                        statementKey,
+                        originalSql,
+                        originalSql,
+                        List.of(DamengReservedColumnRenamer.RULE_NAME),
+                        false,
+                        ""
+                ));
+            }
+            ReservedColumnRewriteMode reservedColumnRewriteMode = reservedColumnRewriteMode(
+                    tagName,
+                    statementId,
+                    reservedColumnFragmentModes
+            );
+            if ("sql".equals(tagName)
+                    && reservedColumnRewriteMode == null
+                    && DamengReservedColumnRenamer.renameBareIdentifiers(originalSql).changed()) {
+                manualReviewItems.add(new SqlChange(
+                        reportPath,
+                        statementKey,
+                        originalSql,
+                        originalSql,
+                        List.of(),
+                        true,
+                        AMBIGUOUS_RESERVED_COLUMN_FRAGMENT_REASON
+                ));
+                continue;
+            }
             if (hasElementChild(statement)) {
                 if (xml == null) {
                     xml = readXml(inputPath);
@@ -454,7 +501,8 @@ public class MapperXmlRewriter {
                                 resultMapColumnByProperty,
                                 "true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys")),
                                 statement.getAttribute("keyProperty"),
-                                statement.getAttribute("keyColumn")
+                                statement.getAttribute("keyColumn"),
+                                reservedColumnRewriteMode
                         );
                 if (!dynamicBodyConversion.manualReviewReasons().isEmpty()) {
                     manualReviewItems.add(new SqlChange(
@@ -515,6 +563,13 @@ public class MapperXmlRewriter {
                 conversionResult = mySqlToDmSqlConverter.convertOuterJoinWithUniqueSourceKeys(
                         commentSafeSql,
                         rewriteConfig.tableKeyColumns()
+                );
+            } else if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                    && reservedColumnRewriteMode != null) {
+                conversionResult = mySqlToDmSqlConverter.convert(
+                        commentSafeSql,
+                        rewriteConfig.keyColumnsFor(statementKey, tableName),
+                        reservedColumnRewriteMode
                 );
             } else {
                 conversionResult =
@@ -610,9 +665,9 @@ public class MapperXmlRewriter {
             }
         }
 
-        changed = !replacements.isEmpty();
+        changed = !replacements.isEmpty() || !keyColumnReplacements.isEmpty();
         if (changed && writeChanges) {
-            writeReplacements(inputPath, replacements);
+            writeReplacements(inputPath, replacements, keyColumnReplacements);
         }
         return new MapperRewriteResult(automaticConversions, manualReviewItems, warnings);
     }
@@ -700,6 +755,124 @@ public class MapperXmlRewriter {
             }
         }
         return elements;
+    }
+
+    private ReservedColumnRewriteMode reservedColumnRewriteMode(
+            String tagName,
+            String statementId,
+            Map<String, ReservedColumnRewriteMode> fragmentModes
+    ) {
+        if ("select".equals(tagName)) {
+            return ReservedColumnRewriteMode.TOP_LEVEL_RESULT;
+        }
+        if ("sql".equals(tagName)) {
+            return fragmentModes.get(statementId);
+        }
+        return ReservedColumnRewriteMode.PHYSICAL_ONLY;
+    }
+
+    private Map<String, ReservedColumnRewriteMode> reservedColumnFragmentModes(
+            Document document,
+            Path inputPath,
+            String namespace
+    ) {
+        Set<String> fragmentIds = new LinkedHashSet<>();
+        for (Element statement : statementElements(document)) {
+            if ("sql".equals(statement.getTagName()) && !statement.getAttribute("id").isBlank()) {
+                fragmentIds.add(statement.getAttribute("id"));
+            }
+        }
+        if (fragmentIds.isEmpty()) {
+            return Map.of();
+        }
+
+        String sourceXml = readXml(inputPath);
+        Map<String, Set<FragmentUsage>> usagesByFragment = new LinkedHashMap<>();
+        Map<String, Set<String>> nestedIncludes = new LinkedHashMap<>();
+        Map<String, Integer> occurrences = new LinkedHashMap<>();
+        for (Element statement : statementElements(document)) {
+            String tagName = statement.getTagName();
+            String statementId = statement.getAttribute("id");
+            if (statementId.isBlank()) {
+                continue;
+            }
+            int occurrence = statementOccurrenceIndex(occurrences, tagName, statementId);
+            String body = findStatementBody(sourceXml, tagName, statementId, occurrence).rawBody();
+            for (IncludeUsage include : localIncludeUsages(body, namespace, fragmentIds)) {
+                if ("sql".equals(tagName)) {
+                    nestedIncludes.computeIfAbsent(statementId, ignored -> new LinkedHashSet<>())
+                            .add(include.fragmentId());
+                    continue;
+                }
+                FragmentUsage usage = "select".equals(tagName) && isTopLevelSelectProjection(body, include.startIndex())
+                        ? FragmentUsage.RESULT_PROJECTION
+                        : FragmentUsage.PHYSICAL_ONLY;
+                usagesByFragment.computeIfAbsent(include.fragmentId(), ignored -> new LinkedHashSet<>()).add(usage);
+            }
+        }
+
+        boolean changed;
+        do {
+            changed = false;
+            for (Map.Entry<String, Set<String>> nested : nestedIncludes.entrySet()) {
+                Set<FragmentUsage> parentUsages = usagesByFragment.getOrDefault(nested.getKey(), Set.of());
+                for (String child : nested.getValue()) {
+                    Set<FragmentUsage> childUsages = usagesByFragment.computeIfAbsent(
+                            child,
+                            ignored -> new LinkedHashSet<>()
+                    );
+                    if (childUsages.addAll(parentUsages)) {
+                        changed = true;
+                    }
+                }
+            }
+        } while (changed);
+
+        Map<String, ReservedColumnRewriteMode> modes = new LinkedHashMap<>();
+        for (String fragmentId : fragmentIds) {
+            Set<FragmentUsage> usages = usagesByFragment.getOrDefault(fragmentId, Set.of());
+            if (usages.equals(Set.of(FragmentUsage.RESULT_PROJECTION))) {
+                modes.put(fragmentId, ReservedColumnRewriteMode.RESULT_COLUMN_LIST);
+            } else if (usages.equals(Set.of(FragmentUsage.PHYSICAL_ONLY))) {
+                modes.put(fragmentId, ReservedColumnRewriteMode.PHYSICAL_ONLY);
+            }
+        }
+        return modes;
+    }
+
+    private List<IncludeUsage> localIncludeUsages(String body, String namespace, Set<String> fragmentIds) {
+        List<IncludeUsage> usages = new ArrayList<>();
+        Matcher matcher = Pattern.compile("(?is)<\\s*include\\b[^>]*>").matcher(body);
+        while (matcher.find()) {
+            String refId = defaultString(xmlAttribute(matcher.group(), "refid")).strip();
+            String localId = localFragmentId(refId, namespace);
+            if (fragmentIds.contains(localId)) {
+                usages.add(new IncludeUsage(localId, matcher.start()));
+            }
+        }
+        return usages;
+    }
+
+    private String localFragmentId(String refId, String namespace) {
+        if (refId.isBlank() || refId.contains("${")) {
+            return "";
+        }
+        int dot = refId.lastIndexOf('.');
+        if (dot < 0) {
+            return refId;
+        }
+        return refId.substring(0, dot).equals(namespace) ? refId.substring(dot + 1) : "";
+    }
+
+    private boolean isTopLevelSelectProjection(String body, int index) {
+        for (SelectScope scope : selectScopes(sqlView(body).text())) {
+            if (scope.depth() == 0
+                    && index >= scope.selectIndex() + "SELECT".length()
+                    && index < scope.fromIndex()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Map<String, String> resultMapColumnByProperty(Document document) {
@@ -798,7 +971,11 @@ public class MapperXmlRewriter {
         return false;
     }
 
-    private void writeReplacements(Path path, List<StatementReplacement> replacements) {
+    private void writeReplacements(
+            Path path,
+            List<StatementReplacement> replacements,
+            List<KeyColumnReplacement> keyColumnReplacements
+    ) {
         String xml;
         try {
             Files.createDirectories(path.getParent());
@@ -815,10 +992,72 @@ public class MapperXmlRewriter {
                         : replacement.convertedBody();
                 xml = xml.substring(0, statementBody.start()) + rewrittenBody + xml.substring(statementBody.end());
             }
+            for (KeyColumnReplacement replacement : keyColumnReplacements) {
+                xml = replaceKeyColumnAttribute(xml, replacement);
+            }
         } catch (IOException e) {
             throw new IllegalStateException("Failed to write mapper XML: " + path, e);
         }
         writeWellFormedXml(path, xml);
+    }
+
+    private String renameKeyColumns(String keyColumn) {
+        if (keyColumn == null || keyColumn.isBlank()) {
+            return keyColumn == null ? "" : keyColumn;
+        }
+        String[] columns = keyColumn.split(",", -1);
+        StringBuilder renamed = new StringBuilder(keyColumn.length() + columns.length);
+        for (int i = 0; i < columns.length; i++) {
+            if (i > 0) {
+                renamed.append(',');
+            }
+            String column = columns[i];
+            int leading = 0;
+            while (leading < column.length() && Character.isWhitespace(column.charAt(leading))) {
+                leading++;
+            }
+            int trailing = column.length();
+            while (trailing > leading && Character.isWhitespace(column.charAt(trailing - 1))) {
+                trailing--;
+            }
+            String name = column.substring(leading, trailing);
+            renamed.append(column, 0, leading)
+                    .append(DamengReservedColumnRenamer.renameColumnName(name))
+                    .append(column.substring(trailing));
+        }
+        return renamed.toString();
+    }
+
+    private String replaceKeyColumnAttribute(String xml, KeyColumnReplacement replacement) {
+        String quotedTag = Pattern.quote(replacement.tagName());
+        String quotedId = Pattern.quote(replacement.statementId());
+        Pattern openingPattern = Pattern.compile(
+                "(?s)<\\s*" + quotedTag + "\\b(?=[^>]*\\bid\\s*=\\s*(?:\""
+                        + quotedId
+                        + "\"|'"
+                        + quotedId
+                        + "'))[^>]*>"
+        );
+        Matcher openingMatcher = openingPattern.matcher(xml);
+        for (int currentOccurrence = 0; currentOccurrence <= replacement.occurrenceIndex(); currentOccurrence++) {
+            if (!openingMatcher.find()) {
+                throw new IllegalStateException("Failed to locate mapper statement: " + replacement.statementId());
+            }
+        }
+        String opening = openingMatcher.group();
+        Pattern attributePattern = Pattern.compile("(?is)(\\bkeyColumn\\s*=\\s*)([\"'])(.*?)(\\2)");
+        Matcher attributeMatcher = attributePattern.matcher(opening);
+        if (!attributeMatcher.find()) {
+            throw new IllegalStateException(
+                    "Failed to locate keyColumn attribute for mapper statement: " + replacement.statementId()
+            );
+        }
+        String rewrittenOpening = opening.substring(0, attributeMatcher.start(3))
+                + replacement.keyColumn()
+                + opening.substring(attributeMatcher.end(3));
+        return xml.substring(0, openingMatcher.start())
+                + rewrittenOpening
+                + xml.substring(openingMatcher.end());
     }
 
     void writeWellFormedXml(Path path, String xml) {
@@ -903,7 +1142,8 @@ public class MapperXmlRewriter {
             Map<String, String> resultMapColumnByProperty,
             boolean useGeneratedKeys,
             String generatedKeyProperty,
-            String generatedKeyColumn
+            String generatedKeyColumn,
+            ReservedColumnRewriteMode reservedColumnRewriteMode
     ) {
         StringBuilder convertedBody = new StringBuilder(rawBody.length());
         List<String> appliedRules = new ArrayList<>();
@@ -923,7 +1163,13 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        nextTagName(rawBody, cdataEnd + "]]>".length())
+                        nextTagName(rawBody, cdataEnd + "]]>".length()),
+                        dynamicTextReservedColumnMode(
+                                rawBody,
+                                index + "<![CDATA[".length(),
+                                cdataEnd,
+                                reservedColumnRewriteMode
+                        )
                 );
                 convertedBody.append(toCdata(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -955,7 +1201,8 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        nextTagName(rawBody, textEnd)
+                        nextTagName(rawBody, textEnd),
+                        dynamicTextReservedColumnMode(rawBody, index, textEnd, reservedColumnRewriteMode)
                 );
                 convertedBody.append(escapeBareXmlLessThan(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -1014,6 +1261,26 @@ public class MapperXmlRewriter {
                 manualReviewReasons,
                 changed
         );
+    }
+
+    private ReservedColumnRewriteMode dynamicTextReservedColumnMode(
+            String rawBody,
+            int textStart,
+            int textEnd,
+            ReservedColumnRewriteMode statementMode
+    ) {
+        if (statementMode != ReservedColumnRewriteMode.TOP_LEVEL_RESULT) {
+            return statementMode == null ? ReservedColumnRewriteMode.PHYSICAL_ONLY : statementMode;
+        }
+        if (isTopLevelSelectProjection(rawBody, textStart)) {
+            return ReservedColumnRewriteMode.RESULT_COLUMN_LIST;
+        }
+        for (SelectScope scope : selectScopes(sqlView(rawBody).text())) {
+            if (scope.depth() == 0 && scope.selectIndex() >= textStart && scope.selectIndex() < textEnd) {
+                return ReservedColumnRewriteMode.TOP_LEVEL_RESULT;
+            }
+        }
+        return ReservedColumnRewriteMode.PHYSICAL_ONLY;
     }
 
     private DynamicBodyConversion convertDynamicXmlStructure(
@@ -6633,7 +6900,8 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        ""
+                        "",
+                        ReservedColumnRewriteMode.PHYSICAL_ONLY
                 );
                 converted.append(toCdata(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -6665,7 +6933,8 @@ public class MapperXmlRewriter {
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        ""
+                        "",
+                        ReservedColumnRewriteMode.PHYSICAL_ONLY
                 );
                 converted.append(conversion.convertedText());
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -9309,7 +9578,8 @@ public class MapperXmlRewriter {
             String statementKey,
             SqlConverter sqlConverter,
             SqlRewriteConfig rewriteConfig,
-            String followingTagName
+            String followingTagName,
+            ReservedColumnRewriteMode reservedColumnRewriteMode
     ) {
         if (!followingTagName.isBlank() && isJoinedDeletePrefix(text)) {
             return new TextSegmentConversion(text, List.of(), List.of(), false);
@@ -9336,7 +9606,13 @@ public class MapperXmlRewriter {
                     false
             );
         }
-        return convertPlainTextSegment(text, statementKey, sqlConverter, rewriteConfig);
+        return convertPlainTextSegment(
+                text,
+                statementKey,
+                sqlConverter,
+                rewriteConfig,
+                reservedColumnRewriteMode
+        );
     }
 
     private boolean isJoinedDeletePrefix(String text) {
@@ -9370,7 +9646,8 @@ public class MapperXmlRewriter {
             String text,
             String statementKey,
             SqlConverter sqlConverter,
-            SqlRewriteConfig rewriteConfig
+            SqlRewriteConfig rewriteConfig,
+            ReservedColumnRewriteMode reservedColumnRewriteMode
     ) {
         TextRewrite plainInsert = convertConfiguredInsertIgnoreToPlainInsert(
                 text,
@@ -9384,6 +9661,17 @@ public class MapperXmlRewriter {
                         ? mySqlToDmSqlConverter.convertInsertIgnoreWithConflictKeyGroups(
                                 plainInsert.text(),
                                 rewriteConfig.conflictKeyGroupsFor(statementKey)
+                        )
+                        : sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                        ? mySqlToDmSqlConverter.convert(
+                                plainInsert.text(),
+                                rewriteConfig.keyColumnsFor(
+                                        statementKey,
+                                        extractInsertTableName(plainInsert.text())
+                                ),
+                                reservedColumnRewriteMode == null
+                                        ? ReservedColumnRewriteMode.PHYSICAL_ONLY
+                                        : reservedColumnRewriteMode
                         )
                         : sqlConverter.convert(
                                 plainInsert.text(),
@@ -9696,6 +9984,22 @@ public class MapperXmlRewriter {
     }
 
     private record SqlView(String text) {
+    }
+
+    private enum FragmentUsage {
+        RESULT_PROJECTION,
+        PHYSICAL_ONLY
+    }
+
+    private record IncludeUsage(String fragmentId, int startIndex) {
+    }
+
+    private record KeyColumnReplacement(
+            String tagName,
+            String statementId,
+            int occurrenceIndex,
+            String keyColumn
+    ) {
     }
 
     private record SelectListPart(String text, int startIndex, int endIndex) {

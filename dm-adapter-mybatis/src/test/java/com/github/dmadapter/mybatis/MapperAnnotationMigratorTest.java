@@ -76,6 +76,42 @@ class MapperAnnotationMigratorTest {
     }
 
     @Test
+    void annotationSelectKeepsReservedLogicalLabelInDryRunAndAppliedMapper() throws Exception {
+        writeFile("src/main/java/com/example/PaymentOrderMapper.java", """
+                package com.example;
+
+                import org.apache.ibatis.annotations.Select;
+
+                public interface PaymentOrderMapper {
+                    @Select("select trxid from NS_PAYMENT_ORDER where trxid = #{trxid}")
+                    String findTrxid(String trxid);
+                }
+                """);
+
+        MapperMigrationResult dryRun = new MapperAnnotationMigrator().migrate(
+                scanResult(List.of()),
+                AdapterContext.builder(tempDir).dryRun(true).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        assertThat(dryRun.automaticConversions())
+                .singleElement()
+                .satisfies(change -> assertThat(change.convertedSql())
+                        .isEqualTo("select _trxid AS \"trxid\" from NS_PAYMENT_ORDER where _trxid = #{trxid}"));
+
+        new MapperAnnotationMigrator().migrate(
+                scanResult(List.of()),
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")))
+                .contains("select _trxid AS \"trxid\" from NS_PAYMENT_ORDER where _trxid = #{trxid}");
+    }
+
+    @Test
     void extractsAnnotationSqlWithoutRewritingExistingMapperDmStatements() throws Exception {
         writeFile("src/main/resources/mapper-dm/VoucherTaskMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>

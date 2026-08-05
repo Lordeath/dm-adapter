@@ -487,12 +487,59 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                select rowid_, ROWNUM_, TRXID_, phyrowid_, versions_starttime_, versions_endtime_,
-                       versions_starttrxid_, versions_endtrxid_, versions_operation_
+                select _rowid, _ROWNUM, _TRXID, _phyrowid, _versions_starttime, _versions_endtime,
+                       _versions_starttrxid, _versions_endtrxid, _versions_operation
                 from user
-                where u.rowid_ = #{rowid} and rownum_ = #{rownum} and trxid_ = ${trxid}
+                where u._rowid = #{rowid} and _rownum = #{rownum} and _trxid = ${trxid}
                 """);
         assertThat(result.appliedRules()).containsExactly("DAMENG_RESERVED_COLUMN_RENAME");
+    }
+
+    @Test
+    void preservesReservedColumnLabelsForMapperTopLevelSelects() {
+        SqlConversionResult result = converter.convert(
+                "select trxid, app.t.rowid, phyrowid AS physical_id from user t where t.trxid = #{trxid}",
+                List.of(),
+                ReservedColumnRewriteMode.TOP_LEVEL_RESULT
+        );
+
+        assertThat(result.convertedSql()).isEqualTo(
+                "select _trxid AS \"trxid\", app.t._rowid AS \"rowid\", _phyrowid AS physical_id "
+                        + "from user t where t._trxid = #{trxid}"
+        );
+        assertThat(result.appliedRules()).containsExactly(
+                DamengReservedColumnRenamer.RULE_NAME,
+                DamengReservedColumnRenamer.RESULT_ALIAS_RULE_NAME
+        );
+    }
+
+    @Test
+    void onlyPreservesLabelsAtTheOutermostMapperSelectScope() {
+        SqlConversionResult result = converter.convert(
+                "with source as (select trxid from audit_log) "
+                        + "select s.trxid from source s union select trxid from archive_log",
+                List.of(),
+                ReservedColumnRewriteMode.TOP_LEVEL_RESULT
+        );
+
+        assertThat(result.convertedSql()).isEqualTo(
+                "with source as (select _trxid from audit_log) "
+                        + "select s._trxid AS \"trxid\" from source s union "
+                        + "select _trxid AS \"trxid\" from archive_log"
+        );
+    }
+
+    @Test
+    void preservesReservedLabelsInSelectColumnListFragments() {
+        SqlConversionResult result = converter.convert(
+                "ID, EnterpriseID, trxid, t.`ROWID`",
+                List.of(),
+                ReservedColumnRewriteMode.RESULT_COLUMN_LIST
+        );
+
+        assertThat(result.convertedSql()).isEqualTo(
+                "ID, EnterpriseID, _trxid AS \"trxid\", t.`_ROWID` AS \"ROWID\""
+        );
     }
 
     @Test
@@ -520,7 +567,7 @@ class MySqlToDmSqlConverterTest {
 
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
-                select rowid_ from user
+                select _rowid from user
                 where note = 'rowid trxid'
                   and id = #{rowid}
                   and name = ${trxid}

@@ -4,6 +4,7 @@ import com.github.dmadapter.core.AdapterContext;
 import com.github.dmadapter.core.MapperMigrationResult;
 import com.github.dmadapter.core.MapperXmlFile;
 import com.github.dmadapter.core.ProjectScanResult;
+import com.github.dmadapter.sql.DamengReservedColumnRenamer;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -1439,10 +1440,224 @@ class MapperMigratorTest {
 
         Path copied = tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml");
         assertThat(Files.readString(copied))
-                .contains("select rowid_, trxid_, rownum_ from user where rowid_ = #{rowid} and trxid_ = #{trxid}");
+                .contains("select _rowid AS \"rowid\", _trxid AS \"trxid\", _rownum AS \"rownum\" "
+                        + "from user where _rowid = #{rowid} and _trxid = #{trxid}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly("DAMENG_RESERVED_COLUMN_RENAME");
+                .containsExactly(
+                        DamengReservedColumnRenamer.RULE_NAME,
+                        DamengReservedColumnRenamer.RESULT_ALIAS_RULE_NAME
+                );
+    }
+
+    @Test
+    void migrationKeepsResultMapColumnsWhenSelectColumnFragmentAddsLogicalAliases() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <resultMap id="PaymentOrderResultMap" type="com.example.PaymentOrder">
+                        <id property="id" column="ID"/>
+                        <result property="trxid" column="trxid" jdbcType="VARCHAR"/>
+                    </resultMap>
+                    <sql id="PaymentOrder_Column_List">
+                        ID, EnterpriseID, trxid, OrderNo
+                    </sql>
+                    <select id="selectById" resultMap="PaymentOrderResultMap">
+                        select <include refid="PaymentOrder_Column_List"/>
+                        from NS_PAYMENT_ORDER
+                        where trxid = #{trxid}
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("<result property=\"trxid\" column=\"trxid\" jdbcType=\"VARCHAR\"/>")
+                .contains("ID, EnterpriseID, _trxid AS \"trxid\", OrderNo")
+                .contains("where _trxid = #{trxid}");
+        assertThat(result.manualReviewItems()).isEmpty();
+        assertThat(result.automaticConversions())
+                .anySatisfy(change -> assertThat(change.appliedRules()).contains(
+                        DamengReservedColumnRenamer.RESULT_ALIAS_RULE_NAME
+                ));
+    }
+
+    @Test
+    void migrationAddsLogicalAliasesInsideDynamicSelectProjections() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <select id="search" resultType="com.example.PaymentOrder">
+                        select ID,
+                        <if test="includeTrxid">trxid,</if>
+                        OrderNo
+                        from NS_PAYMENT_ORDER
+                        where trxid = #{trxid}
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("<if test=\"includeTrxid\">_trxid AS \"trxid\",</if>")
+                .contains("where _trxid = #{trxid}");
+    }
+
+    @Test
+    void migrationPreservesMixedUseReservedColumnFragmentsForManualReview() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <sql id="SharedColumns">ID, trxid</sql>
+                    <select id="search" resultType="map">
+                        select <include refid="SharedColumns"/> from NS_PAYMENT_ORDER
+                    </select>
+                    <insert id="insert">
+                        insert into NS_PAYMENT_ORDER (<include refid="SharedColumns"/>) values (#{id}, #{trxid})
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
+        );
+        assertThat(rewritten).contains("<sql id=\"SharedColumns\">ID, trxid</sql>");
+        assertThat(result.manualReviewItems())
+                .anySatisfy(change -> assertThat(change.reason()).contains("fragment was preserved"));
+    }
+
+    @Test
+    void migrationRenamesReservedDatabaseKeyColumnsWithoutChangingKeyProperties() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <insert id="insert" useGeneratedKeys="true" keyProperty="trxid" keyColumn="trxid">
+                        insert into NS_PAYMENT_ORDER (trxid) values (#{trxid})
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("keyProperty=\"trxid\" keyColumn=\"_trxid\"")
+                .contains("insert into NS_PAYMENT_ORDER (_trxid) values (#{trxid})");
+    }
+
+    @Test
+    void migrationLeavesWildcardSelectsAndTheirResultMapsUnchangedWithoutReview() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <resultMap id="PaymentOrderResultMap" type="com.example.PaymentOrder">
+                        <result property="trxid" column="trxid"/>
+                    </resultMap>
+                    <select id="selectAll" resultMap="PaymentOrderResultMap">
+                        select * from NS_PAYMENT_ORDER
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")))
+                .contains("<result property=\"trxid\" column=\"trxid\"/>")
+                .contains("select * from NS_PAYMENT_ORDER");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
