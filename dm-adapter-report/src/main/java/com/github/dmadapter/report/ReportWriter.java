@@ -1,9 +1,8 @@
 package com.github.dmadapter.report;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.dmadapter.core.BatchMigrationReport;
-import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.FileChange;
+import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlChange;
@@ -32,8 +31,6 @@ public class ReportWriter {
     public static final String SQL_SCRIPT_VALIDATION_REPORT_JSON = "sql-script-validation-report.json";
     public static final String SUMMARY_MARKDOWN = "dm-adapter-summary.md";
     public static final String SUMMARY_JSON = "dm-adapter-summary.json";
-    public static final String BATCH_REPORT_MARKDOWN = "dm-adapter-batch-report.md";
-    public static final String BATCH_REPORT_JSON = "dm-adapter-batch-report.json";
 
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
@@ -85,51 +82,6 @@ public class ReportWriter {
         writeStringAtomically(markdownPath, summaryMarkdown(summary));
         writeJsonAtomically(jsonPath, summary);
         return new ReportPaths(markdownPath, jsonPath);
-    }
-
-    public ReportPaths writeBatchMigrationReport(BatchMigrationReport report, Path reportDir) throws IOException {
-        Files.createDirectories(reportDir);
-        Path markdownPath = reportDir.resolve(BATCH_REPORT_MARKDOWN);
-        Path jsonPath = reportDir.resolve(BATCH_REPORT_JSON);
-        writeStringAtomically(markdownPath, batchMigrationMarkdown(report));
-        writeJsonAtomically(jsonPath, report);
-        return new ReportPaths(markdownPath, jsonPath);
-    }
-
-    private String batchMigrationMarkdown(BatchMigrationReport report) {
-        StringBuilder markdown = new StringBuilder();
-        markdown.append("# dm-adapter Batch Report\n\n");
-        markdown.append("- 状态：`").append(report.status()).append("`\n");
-        markdown.append("- 生成时间：`").append(report.generatedAt()).append("`\n");
-        markdown.append("- 项目：`").append(report.projectRoot()).append("`\n");
-        markdown.append("- 远端分支：`").append(report.remote()).append("/")
-                .append(report.branch()).append("`\n");
-        markdown.append("- 基础提交：`").append(report.baseCommit()).append("`\n");
-        markdown.append("- 推送提交：`").append(report.pushedCommit()).append("`\n");
-        markdown.append("- 尝试次数：`").append(report.attempts()).append("`\n");
-        if (!report.failureStage().isBlank()) {
-            markdown.append("- 失败阶段：`").append(report.failureStage()).append("`\n");
-        }
-        if (!report.message().isBlank()) {
-            markdown.append("- 结果：").append(report.message()).append("\n");
-        }
-        markdown.append("\n## 变更文件\n\n");
-        if (report.changedFiles().isEmpty()) {
-            markdown.append("无。\n");
-        } else {
-            report.changedFiles().forEach(path -> markdown.append("- `").append(path).append("`\n"));
-        }
-        markdown.append("\n## 详细报告\n\n");
-        if (!report.migrationReport().isBlank()) {
-            markdown.append("- [项目迁移报告](").append(report.migrationReport()).append(")\n");
-        }
-        if (!report.sqlScriptReport().isBlank()) {
-            markdown.append("- [SQL 脚本迁移报告](").append(report.sqlScriptReport()).append(")\n");
-        }
-        if (report.migrationReport().isBlank() && report.sqlScriptReport().isBlank()) {
-            markdown.append("无。\n");
-        }
-        return markdown.toString();
     }
 
     private void writeStringAtomically(Path path, String content) throws IOException {
