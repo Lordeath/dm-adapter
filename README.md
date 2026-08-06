@@ -48,23 +48,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 
 # 也可以在 migrate 后自动生成 SQL 验证测试；--app-module 可传模块路径或 Maven artifactId，传入 --app-module、--schema 或 --config 会自动触发生成。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
-
-# 无人值守 batch：从远端 main 最新提交创建临时 worktree，离线转换后提交并推送。
-java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
-  --batch --project ./demo \
-  --git-remote origin --git-branch main \
-  --git-commit-message "定时同步 MySQL 到达梦适配" \
-  --report-dir /data/dm-batch-reports/demo
 ```
-
-`--batch` 是一次性执行模式，定时由 Jenkins 等外部调度器负责。它始终忽略达梦验证环境变量，不连接数据库、
-不读取数据库元数据，也不生成或运行验证测试。转换在远端分支最新提交的临时 Git worktree 中进行；原检出目录
-的 HEAD 和文件不会被推进或修改。存在人工确认项时不提交，远端在转换期间前进时最多从新 HEAD 重跑一次，
-无变更和锁冲突均以退出码 `0` 安全结束。SQL 脚本转换还必须显式传入
-`--target-length-semantics CHAR|BYTE`。
-
-Windows Jenkins Freestyle Job 的完整无人值守配置、项目 JSON 清单和 PowerShell 编排脚本见
-[Jenkins Windows Freestyle batch Codex 交接文档](docs/jenkins-windows-freestyle-batch-codex-guide.md)。
 
 ## GUI 与 Windows EXE
 
@@ -164,7 +148,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar validate-sql \
 
 每次 `migrate` 还会在应用工作目录生成 `dm-adapter-summary.md` 和 `dm-adapter-summary.json`，汇总迁移、SQL 脚本验证、Mapper 验证三阶段状态、根因/级联阻塞数、人工确认降噪统计和详细报告链接。`report` 命令优先读取该摘要，旧工作目录则回退到原迁移报告。
 
-CLI 退出码约定：`0` 表示请求成功、batch 无变更或 batch 因同目标已有任务而安全跳过，`1` 表示工具内部错误，`2` 表示项目/参数无效，`3` 表示数据库验证存在 SQL 根因失败或仍有人工确认项，`4` 表示清单、连接、schema、数据库能力前置检查、验证环境或总时限问题，`5` 表示 batch 的 Git/fetch/worktree/commit/push 基础设施失败。
+CLI 退出码约定：`0` 表示请求的迁移/验证成功或未请求数据库验证，`1` 表示工具内部错误，`2` 表示项目路径无效或不是 Maven 项目，`3` 表示数据库验证存在 SQL 根因失败或仍有人工确认项，`4` 表示清单、连接、schema、数据库能力前置检查、验证环境或总时限问题。
 
 同一组环境变量也会被 `migrate` 用于只读读取达梦元数据：优先使用 CLI `--schema` / 应用工作目录 `sql-validation.yml` 中的 `schema`，其次使用 JDBC URL 的 `schema` 参数、连接默认 schema 或用户名。自动推断只写入表名、方法名和 `keyColumns`，不会把连接串、用户名或密码写入仓库文件。
 
