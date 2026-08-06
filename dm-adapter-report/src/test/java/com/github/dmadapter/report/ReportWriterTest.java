@@ -1,5 +1,7 @@
 package com.github.dmadapter.report;
 
+import com.github.dmadapter.core.BatchRepositoryReport;
+import com.github.dmadapter.core.BatchRunReport;
 import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.OverallStatus;
@@ -26,6 +28,51 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ReportWriterTest {
     @TempDir
     Path tempDir;
+
+    @Test
+    void writesBatchRepositoryAndRunReports() throws Exception {
+        BatchRepositoryReport repository = new BatchRepositoryReport(
+                1,
+                "2026-08-07T00:00:00Z",
+                "service-a",
+                "SUCCESS",
+                "main",
+                "base-commit",
+                "pushed-commit",
+                2,
+                List.of("src/main/resources/mapper-dm/UserMapper.xml"),
+                "",
+                "Conversion changes were committed and pushed.",
+                ReportWriter.MIGRATION_REPORT_MARKDOWN,
+                ReportWriter.SQL_SCRIPT_REPORT_MARKDOWN
+        );
+        BatchRunReport run = new BatchRunReport(
+                1,
+                "run-1",
+                "2026-08-07T00:00:00Z",
+                "SUCCESS",
+                0,
+                1,
+                1,
+                0,
+                0,
+                List.of(repository)
+        );
+
+        ReportWriter writer = new ReportWriter();
+        ReportPaths repositoryPaths = writer.writeBatchRepositoryReport(repository, tempDir.resolve("service-a"));
+        ReportPaths runPaths = writer.writeBatchRunReport(run, tempDir);
+
+        assertThat(Files.readString(repositoryPaths.markdownPath()))
+                .contains("service-a")
+                .contains("pushed-commit")
+                .contains("mapper-dm/UserMapper.xml");
+        assertThat(Files.readString(runPaths.markdownPath()))
+                .contains("[details](service-a/dm-adapter-batch-report.md)");
+        assertThat(Files.readString(runPaths.jsonPath()))
+                .contains("\"exitCode\" : 0")
+                .contains("\"pushedCommit\" : \"pushed-commit\"");
+    }
 
     @Test
     void writesStandaloneSqlScriptValidationReport() throws Exception {

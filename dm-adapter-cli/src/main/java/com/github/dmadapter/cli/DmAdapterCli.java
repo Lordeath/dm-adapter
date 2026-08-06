@@ -11,6 +11,7 @@ import picocli.CommandLine.Command;
         subcommands = {
                 ScanCommand.class,
                 MigrateCommand.class,
+                BatchCommand.class,
                 ValidateSqlCommand.class,
                 ReportCommand.class,
                 GenerateValidationTestCommand.class

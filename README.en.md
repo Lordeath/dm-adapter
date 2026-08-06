@@ -15,6 +15,7 @@
 - Mark `GROUP_CONCAT`, JSON functions, complex time calculation/conversion functions, `REPLACE INTO`, upsert/ignore SQL without safe key-column configuration, and backtick-quoted identifiers for manual review.
 - Generate a Dameng test-environment SQL integration test: a JUnit/MyBatis/JDBC test class in the target project plus an external `sql-validation.yml` template, without starting Spring Boot, ShardingSphere, MQ, or web beans; when `DM_SQL_VALIDATION=true` and connection variables are complete, generation also runs the validation test once and prints the report path.
 - Write configs, Markdown/JSON reports, and validation temporary files under `<current-directory>/.dm-adapter/<application-artifactId>/` by default instead of creating `.dm-adapter` in the target project.
+- Provide an unattended `batch --config <yaml>` workflow that uses JGit to fetch explicitly configured repositories and branches, performs offline conversion, commits and pushes changes, and writes aggregate reports without connecting to Dameng or requiring an external Git script.
 
 ## Dameng Special Column Rewrite Notes
 
@@ -37,6 +38,9 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 
+# Unattended multi-repository conversion configured by one YAML file.
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar batch --config /data/dm-batch/batch.yml
+
 # Declare the target length semantics when SQL scripts are converted offline.
 # BYTE targets use explicit VARCHAR(n CHAR)/CHAR(n CHAR) definitions.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
@@ -50,6 +54,9 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 # You can also generate the SQL validation test after migrate; --app-module accepts a module path or Maven artifactId, and --app-module, --schema, or --config implies generation.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
+
+See the [Jenkins unattended batch guide](docs/jenkins-batch-codex-guide.md) for the full YAML schema,
+Jenkins setup, IntelliJ IDEA debug arguments, exit codes, and cache recovery rules.
 
 ## GUI and Windows EXE
 

@@ -15,6 +15,7 @@
 - 将 `GROUP_CONCAT`、JSON 函数、复杂时间计算/转换函数、`REPLACE INTO`、无法安全确认唯一键的 upsert/ignore 等标记为人工确认；达梦 MySQL 兼容模式可执行的反引号标识符默认保留。
 - 生成达梦测试环境 SQL 集成验证测试：在目标项目生成 JUnit/MyBatis/JDBC 测试类，在工具侧应用工作目录生成 `sql-validation.yml` 参数模板，不启动 Spring Boot、ShardingSphere、MQ 或 Web 相关 Bean；若 `DM_SQL_VALIDATION=true` 且连接环境变量齐全，生成后会自动执行一次验证测试并输出报告路径。
 - 默认将配置、Markdown/JSON 报告和验证临时文件输出到 `<当前命令目录>/.dm-adapter/<应用 artifactId>/`，不在业务项目中创建 `.dm-adapter`。
+- 提供 `batch --config <yaml>` 无人值守模式：CLI 使用 JGit 按配置逐个拉取仓库和指定分支，离线转换后自动提交、推送并生成汇总报告；整个流程不连接达梦数据库，也不需要外围 Git 脚本。
 
 ## 达梦特殊列名重写注意事项
 
@@ -37,6 +38,9 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar report --project ./demo
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-validation-test --project ./demo --schema sample-system
 
+# 多仓库无人值守转换；仓库、分支、Git 身份和迁移参数均从 YAML 读取。
+java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar batch --config /data/dm-batch/batch.yml
+
 # 离线转换 SQL 脚本时显式声明目标库字符长度语义；BYTE 会生成 VARCHAR(n CHAR)/CHAR(n CHAR)。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
   --project ./demo --sql-scripts-only \
@@ -49,6 +53,9 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 # 也可以在 migrate 后自动生成 SQL 验证测试；--app-module 可传模块路径或 Maven artifactId，传入 --app-module、--schema 或 --config 会自动触发生成。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --schema sample-system
 ```
+
+`batch` 的完整 YAML 示例、Jenkins 配置、IntelliJ IDEA 调试参数、退出码和缓存恢复规则见
+[Jenkins 无人值守 Batch 模式部署说明](docs/jenkins-batch-codex-guide.md)。
 
 ## GUI 与 Windows EXE
 

@@ -209,8 +209,8 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("SQL_SYNTAX");
 
             String missingSchema = """
-                    java.lang.IllegalStateException: Failed to set Dameng schema: example-association
-                    Caused by: dm.jdbc.driver.DMException: 无效的模式名[example-association]
+                    java.lang.IllegalStateException: Failed to set Dameng schema: sample-association
+                    Caused by: dm.jdbc.driver.DMException: 无效的模式名[sample-association]
                     """;
             Object missingSchemaRecord = failedRecord(validationClass, missingSchema);
             assertThat(failurePattern(validationClass, validation, missingSchemaRecord))
@@ -709,7 +709,7 @@ class GeneratedFailurePatternTest {
             String missingEntityProperty = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     Error evaluating expression 'item.id'.
-                    Cause: org.apache.ibatis.ognl.NoSuchPropertyException: com.example.dorm.entity.NsDormPlan.id
+                    Cause: org.apache.ibatis.ognl.NoSuchPropertyException: com.example.dorm.entity.DormPlan.id
                     """;
             Object missingEntityPropertyRecord = failedRecord(validationClass, missingEntityProperty);
             assertThat(failurePattern(validationClass, validation, missingEntityPropertyRecord))
