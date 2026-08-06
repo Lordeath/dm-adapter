@@ -1,6 +1,8 @@
 package com.github.dmadapter.report;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dmadapter.core.BatchRepositoryReport;
+import com.github.dmadapter.core.BatchRunReport;
 import com.github.dmadapter.core.FileChange;
 import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.MigrationReport;
@@ -31,6 +33,10 @@ public class ReportWriter {
     public static final String SQL_SCRIPT_VALIDATION_REPORT_JSON = "sql-script-validation-report.json";
     public static final String SUMMARY_MARKDOWN = "dm-adapter-summary.md";
     public static final String SUMMARY_JSON = "dm-adapter-summary.json";
+    public static final String BATCH_REPOSITORY_REPORT_MARKDOWN = "dm-adapter-batch-report.md";
+    public static final String BATCH_REPOSITORY_REPORT_JSON = "dm-adapter-batch-report.json";
+    public static final String BATCH_RUN_REPORT_MARKDOWN = "dm-adapter-batch-summary.md";
+    public static final String BATCH_RUN_REPORT_JSON = "dm-adapter-batch-summary.json";
 
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
@@ -82,6 +88,81 @@ public class ReportWriter {
         writeStringAtomically(markdownPath, summaryMarkdown(summary));
         writeJsonAtomically(jsonPath, summary);
         return new ReportPaths(markdownPath, jsonPath);
+    }
+
+    public ReportPaths writeBatchRepositoryReport(BatchRepositoryReport report, Path reportDir) throws IOException {
+        Files.createDirectories(reportDir);
+        Path markdownPath = reportDir.resolve(BATCH_REPOSITORY_REPORT_MARKDOWN);
+        Path jsonPath = reportDir.resolve(BATCH_REPOSITORY_REPORT_JSON);
+        writeStringAtomically(markdownPath, batchRepositoryMarkdown(report));
+        writeJsonAtomically(jsonPath, report);
+        return new ReportPaths(markdownPath, jsonPath);
+    }
+
+    public ReportPaths writeBatchRunReport(BatchRunReport report, Path reportDir) throws IOException {
+        Files.createDirectories(reportDir);
+        Path markdownPath = reportDir.resolve(BATCH_RUN_REPORT_MARKDOWN);
+        Path jsonPath = reportDir.resolve(BATCH_RUN_REPORT_JSON);
+        writeStringAtomically(markdownPath, batchRunMarkdown(report));
+        writeJsonAtomically(jsonPath, report);
+        return new ReportPaths(markdownPath, jsonPath);
+    }
+
+    private String batchRepositoryMarkdown(BatchRepositoryReport report) {
+        StringBuilder markdown = new StringBuilder("# dm-adapter Batch Repository Report\n\n");
+        markdown.append("- Repository: `").append(report.repository()).append("`\n");
+        markdown.append("- Status: `").append(report.status()).append("`\n");
+        markdown.append("- Branch: `").append(report.branch()).append("`\n");
+        markdown.append("- Base commit: `").append(report.baseCommit()).append("`\n");
+        markdown.append("- Pushed commit: `").append(report.pushedCommit()).append("`\n");
+        markdown.append("- Attempts: `").append(report.attempts()).append("`\n");
+        if (!report.failureStage().isBlank()) {
+            markdown.append("- Failure stage: `").append(report.failureStage()).append("`\n");
+        }
+        if (!report.message().isBlank()) {
+            markdown.append("- Result: ").append(report.message()).append("\n");
+        }
+        markdown.append("\n## Changed files\n\n");
+        if (report.changedFiles().isEmpty()) {
+            markdown.append("None.\n");
+        } else {
+            report.changedFiles().forEach(path -> markdown.append("- `").append(path).append("`\n"));
+        }
+        markdown.append("\n## Detailed reports\n\n");
+        if (!report.migrationReport().isBlank()) {
+            markdown.append("- [Migration report](").append(report.migrationReport()).append(")\n");
+        }
+        if (!report.sqlScriptReport().isBlank()) {
+            markdown.append("- [SQL script report](").append(report.sqlScriptReport()).append(")\n");
+        }
+        if (report.migrationReport().isBlank() && report.sqlScriptReport().isBlank()) {
+            markdown.append("None.\n");
+        }
+        return markdown.toString();
+    }
+
+    private String batchRunMarkdown(BatchRunReport report) {
+        StringBuilder markdown = new StringBuilder("# dm-adapter Batch Run Report\n\n");
+        markdown.append("- Run: `").append(report.runId()).append("`\n");
+        markdown.append("- Generated: `").append(report.generatedAt()).append("`\n");
+        markdown.append("- Status: `").append(report.status()).append("`\n");
+        markdown.append("- Exit code: `").append(report.exitCode()).append("`\n");
+        markdown.append("- Repositories: `").append(report.repositoryCount()).append("`\n");
+        markdown.append("- Success: `").append(report.successCount()).append("`\n");
+        markdown.append("- No changes: `").append(report.noChangesCount()).append("`\n");
+        markdown.append("- Failed: `").append(report.failedCount()).append("`\n\n");
+        markdown.append("| Repository | Status | Branch | Attempts | Result | Report |\n");
+        markdown.append("| --- | --- | --- | ---: | --- | --- |\n");
+        for (BatchRepositoryReport repository : report.repositories()) {
+            markdown.append("| ").append(escapeTable(repository.repository()))
+                    .append(" | `").append(repository.status())
+                    .append("` | `").append(repository.branch())
+                    .append("` | ").append(repository.attempts())
+                    .append(" | ").append(escapeTable(repository.message()))
+                    .append(" | [details](").append(repository.repository())
+                    .append("/").append(BATCH_REPOSITORY_REPORT_MARKDOWN).append(") |\n");
+        }
+        return markdown.toString();
     }
 
     private void writeStringAtomically(Path path, String content) throws IOException {

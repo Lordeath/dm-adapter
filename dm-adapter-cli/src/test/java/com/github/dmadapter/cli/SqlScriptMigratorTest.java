@@ -8025,7 +8025,7 @@ class SqlScriptMigratorTest {
         ExternalProcedureValidationRun result = new SqlScriptValidator(env -> connection)
                 .validateExternalProcedures(
                         Map.of(
-                                "newsee-system", Set.of("addOrUpdate_dictionary"),
+                                "sample-system", Set.of("addOrUpdate_dictionary"),
                                 "Mixed-Schema", Set.of("MixedCaseProc")
                         ),
                         validationEnvironment()
@@ -8035,7 +8035,7 @@ class SqlScriptMigratorTest {
         assertThat(result.issues()).isEmpty();
         assertThat(queriedKeys)
                 .containsExactlyInAnyOrder(
-                        List.of("newsee-system", "addOrUpdate_dictionary"),
+                        List.of("sample-system", "addOrUpdate_dictionary"),
                         List.of("Mixed-Schema", "MixedCaseProc")
                 );
         assertThat(preparedSql).singleElement().satisfies(sql -> assertThat(sql)
@@ -8687,7 +8687,7 @@ class SqlScriptMigratorTest {
                 .contains("EXECUTE IMMEDIATE 'update demo")
                 .contains("from demo_source where demo.id = demo_source.id")
                 .contains("set status = ''ready''")
-                .doesNotContain("newsee-system.");
+                .doesNotContain("sample-system.");
         assertThat(converted.report().files()).singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.DM_PROCEDURE_SAME_OBJECT_STATIC_SQL_TO_DYNAMIC_RULE));

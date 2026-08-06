@@ -133,13 +133,18 @@ public class MigrateCommand implements Callable<Integer> {
     private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
     private final LegacyWorkspaceMigrator legacyWorkspaceMigrator = new LegacyWorkspaceMigrator();
     private final DamengTargetCapabilitiesReader targetCapabilitiesReader = new DamengTargetCapabilitiesReader();
+    private MigrationReport lastMigrationReport;
+    private SqlScriptMigrationReport lastSqlScriptMigrationReport;
 
     @Override
     public Integer call() {
+        return runMigration(DmValidationEnvironment.fromSystem());
+    }
+
+    private Integer runMigration(DmValidationEnvironment validationEnvironment) {
         ProjectSummaryTracker summaryTracker = null;
         try {
             AdapterContext context = buildContext();
-            DmValidationEnvironment validationEnvironment = DmValidationEnvironment.fromSystem();
             summaryTracker = new ProjectSummaryTracker(
                     context,
                     reportWriter,
@@ -242,7 +247,11 @@ public class MigrateCommand implements Callable<Integer> {
             if (!rewriteConfigCandidates.isEmpty()) {
                 CliLogger.info("Resolving metadata for rewrite config candidates...");
             }
-            MetadataLookupResult metadataLookupResult = metadataForRewriteCandidates(context, rewriteConfigCandidates);
+            MetadataLookupResult metadataLookupResult = metadataForRewriteCandidates(
+                    context,
+                    validationEnvironment,
+                    rewriteConfigCandidates
+            );
             if (!rewriteConfigCandidates.isEmpty()) {
                 CliLogger.info("Metadata resolution completed. Available: " + metadataLookupResult.available()
                         + ", tables: " + metadataLookupResult.metadataByTable().size());
@@ -520,6 +529,7 @@ public class MigrateCommand implements Callable<Integer> {
 
     private MetadataLookupResult metadataForRewriteCandidates(
             AdapterContext context,
+            DmValidationEnvironment environment,
             List<RewriteConfigCandidate> candidates
     ) {
         if (candidates.isEmpty()) {
@@ -527,7 +537,6 @@ public class MigrateCommand implements Callable<Integer> {
         }
         List<String> warnings = new ArrayList<>();
         Map<String, TableKeyMetadata> ddlMetadata = projectDdlMetadataForRewriteCandidates(context, candidates, warnings);
-        DmValidationEnvironment environment = DmValidationEnvironment.fromSystem();
         if (!environment.validationEnabled()) {
             return new MetadataLookupResult(ddlMetadata, !ddlMetadata.isEmpty(), warnings);
         }
@@ -798,6 +807,7 @@ public class MigrateCommand implements Callable<Integer> {
                 manualReviewItems,
                 warnings
         );
+        lastMigrationReport = report;
         return new MigrationReportResult(report, reportWriter.writeMigrationReport(report, context.reportDir()));
     }
 
@@ -825,8 +835,29 @@ public class MigrateCommand implements Callable<Integer> {
                 targetCapabilities,
                 context.reportDir().resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME)
         ));
+        lastSqlScriptMigrationReport = report;
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
         return new SqlScriptReportResult(report, reportPaths);
+    }
+
+    static OfflineMigrationRun runOffline(BatchMigrationRequest request) {
+        MigrateCommand migration = new MigrateCommand();
+        migration.project = request.projectRoot();
+        migration.reportDir = request.reportDir();
+        migration.mapperDir = request.mapperDir();
+        migration.rewriteConfig = request.rewriteConfig();
+        migration.dmDriver = request.dmDriver();
+        migration.sqlRoot = request.sqlRoot();
+        migration.sqlRootOut = request.sqlRootOut();
+        migration.preservedSqlPaths = new ArrayList<>(request.preservedSqlPaths());
+        migration.sqlScriptsOnly = request.sqlScriptsOnly();
+        migration.targetLengthSemantics = request.targetLengthSemantics();
+        int exitCode = migration.runMigration(DmValidationEnvironment.disabled());
+        return new OfflineMigrationRun(
+                exitCode,
+                migration.lastMigrationReport,
+                migration.lastSqlScriptMigrationReport
+        );
     }
 
     private DamengTargetCapabilities resolveTargetCapabilities(DmValidationEnvironment environment) {

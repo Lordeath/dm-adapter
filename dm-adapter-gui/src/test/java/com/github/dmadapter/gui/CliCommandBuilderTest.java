@@ -36,12 +36,12 @@ class CliCommandBuilderTest {
     @Test
     void omitsOptionalReportDirAndUsesArtifactWorkspaceForResults() throws Exception {
         Path project = tempDir.resolve("enterprise");
-        Path module = project.resolve("newsee-enterprise-rest");
-        writePom(module.resolve("pom.xml"), "newsee-enterprise-rest");
+        Path module = project.resolve("sample-enterprise-rest");
+        writePom(module.resolve("pom.xml"), "sample-enterprise-rest");
         GuiRunConfiguration configuration = new GuiRunConfiguration(
                 project,
                 null,
-                "newsee-enterprise-rest",
+                "sample-enterprise-rest",
                 null,
                 null,
                 null,
@@ -66,7 +66,7 @@ class CliCommandBuilderTest {
                 Path.of(System.getProperty("user.dir", "."))
                         .toAbsolutePath()
                         .normalize()
-                        .resolve(".dm-adapter/newsee-enterprise-rest")
+                        .resolve(".dm-adapter/sample-enterprise-rest")
         );
     }
 

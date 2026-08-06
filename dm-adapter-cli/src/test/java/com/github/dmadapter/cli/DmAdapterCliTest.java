@@ -37,6 +37,13 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void exposesBatchCommandHelpWithoutRequiringConfig() {
+        int exitCode = new CommandLine(new DmAdapterCli()).execute("batch", "--help");
+
+        assertThat(exitCode).isZero();
+    }
+
+    @Test
     void sqlScriptMigrationWritesStrictValidationPlan() throws Exception {
         writeDemoProject();
         writeFile("sql/v2/demo.sql", "SELECT 1 FROM dual;\n");
@@ -148,7 +155,7 @@ class DmAdapterCliTest {
     @Test
     void scanWritesOnlyToExplicitExternalWorkspace() throws Exception {
         writeDemoProject();
-        Path workspace = tempDir.resolve("tool-work/newsee-hr-rest");
+        Path workspace = tempDir.resolve("tool-work/sample-hr-rest");
 
         int exitCode = execute(
                 "scan",

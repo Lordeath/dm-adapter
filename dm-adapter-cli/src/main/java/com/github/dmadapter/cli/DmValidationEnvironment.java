@@ -41,6 +41,10 @@ final class DmValidationEnvironment {
         return from(System.getenv());
     }
 
+    static DmValidationEnvironment disabled() {
+        return from(Map.of());
+    }
+
     static DmValidationEnvironment from(Map<String, String> environment) {
         Map<String, String> env = environment == null ? Map.of() : environment;
         boolean enabled = "true".equalsIgnoreCase(value(env, ENABLED));

@@ -16,7 +16,7 @@ class LegacyWorkspaceMigratorTest {
     void copiesLegacyYamlFilesWithoutCopyingReports() throws Exception {
         Path project = tempDir.resolve("project");
         Path legacyDir = project.resolve(".dm-adapter");
-        Path workspace = tempDir.resolve("tool/.dm-adapter/newsee-hr-rest");
+        Path workspace = tempDir.resolve("tool/.dm-adapter/sample-hr-rest");
         Files.createDirectories(legacyDir);
         Files.writeString(legacyDir.resolve("sql-rewrite.yml"), "keyColumns: {}\n");
         Files.writeString(legacyDir.resolve("sql-validation.yml"), "schema: sample\n");
@@ -35,7 +35,7 @@ class LegacyWorkspaceMigratorTest {
     void doesNotOverwriteExistingWorkspaceConfig() throws Exception {
         Path project = tempDir.resolve("project");
         Path legacyDir = project.resolve(".dm-adapter");
-        Path workspace = tempDir.resolve("tool/.dm-adapter/newsee-hr-rest");
+        Path workspace = tempDir.resolve("tool/.dm-adapter/sample-hr-rest");
         Files.createDirectories(legacyDir);
         Files.createDirectories(workspace);
         Files.writeString(legacyDir.resolve("sql-rewrite.yml"), "legacy\n");

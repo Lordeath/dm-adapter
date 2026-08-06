@@ -19,7 +19,7 @@ class AdapterWorkspaceResolverTest {
         Path project = tempDir.resolve("business-project");
         Path module = project.resolve("service-module");
         writePom(project.resolve("pom.xml"), "business-parent");
-        writePom(module.resolve("pom.xml"), "newsee-hr-rest");
+        writePom(module.resolve("pom.xml"), "sample-hr-rest");
 
         AdapterWorkspaceResolver resolver = new AdapterWorkspaceResolver(
                 new ApplicationModuleSelector(),
@@ -27,7 +27,7 @@ class AdapterWorkspaceResolverTest {
         );
 
         assertThat(resolver.resolve(project, Path.of("service-module"), null))
-                .isEqualTo(tempDir.resolve("dm-adapter/.dm-adapter/newsee-hr-rest").toAbsolutePath().normalize());
+                .isEqualTo(tempDir.resolve("dm-adapter/.dm-adapter/sample-hr-rest").toAbsolutePath().normalize());
     }
 
     @Test
@@ -35,7 +35,7 @@ class AdapterWorkspaceResolverTest {
         Path project = tempDir.resolve("business-project");
         Path module = project.resolve("rest-module");
         writePom(project.resolve("pom.xml"), "business-parent");
-        writePom(module.resolve("pom.xml"), "newsee-hr-rest");
+        writePom(module.resolve("pom.xml"), "sample-hr-rest");
         Path application = module.resolve("src/main/java/com/example/Application.java");
         Files.createDirectories(application.getParent());
         Files.writeString(application, """
@@ -50,7 +50,7 @@ class AdapterWorkspaceResolverTest {
                 () -> tempDir.resolve("dm-adapter")
         );
 
-        assertThat(resolver.projectKey(project, null)).isEqualTo("newsee-hr-rest");
+        assertThat(resolver.projectKey(project, null)).isEqualTo("sample-hr-rest");
     }
 
     @Test

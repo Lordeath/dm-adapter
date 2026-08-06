@@ -209,8 +209,8 @@ class GeneratedFailurePatternTest {
                     .isEqualTo("SQL_SYNTAX");
 
             String missingSchema = """
-                    java.lang.IllegalStateException: Failed to set Dameng schema: newsee-association
-                    Caused by: dm.jdbc.driver.DMException: 无效的模式名[newsee-association]
+                    java.lang.IllegalStateException: Failed to set Dameng schema: sample-association
+                    Caused by: dm.jdbc.driver.DMException: 无效的模式名[sample-association]
                     """;
             Object missingSchemaRecord = failedRecord(validationClass, missingSchema);
             assertThat(failurePattern(validationClass, validation, missingSchemaRecord))
@@ -635,9 +635,9 @@ class GeneratedFailurePatternTest {
             String missingPojoProperty = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     ### Error updating database. Cause: org.apache.ibatis.reflection.ReflectionException:
-                    There is no getter for property named 'zipCode' in 'class com.newsee.city.entity.base.Regions'
+                    There is no getter for property named 'zipCode' in 'class com.example.city.entity.base.Regions'
                     ### The error may exist in mapper-dm/base/RegionsMapper.xml
-                    ### The error may involve com.newsee.city.dao.base.RegionsMapper.insert
+                    ### The error may involve com.example.city.dao.base.RegionsMapper.insert
                     ### SQL: insert into ns_city_regions(cityCode) values (?)
                     """;
             Object missingPojoPropertyRecord = failedRecord(validationClass, missingPojoProperty);
@@ -709,7 +709,7 @@ class GeneratedFailurePatternTest {
             String missingEntityProperty = """
                     org.apache.ibatis.exceptions.PersistenceException:
                     Error evaluating expression 'item.id'.
-                    Cause: org.apache.ibatis.ognl.NoSuchPropertyException: com.newsee.dorm.entity.NsDormPlan.id
+                    Cause: org.apache.ibatis.ognl.NoSuchPropertyException: com.example.dorm.entity.DormPlan.id
                     """;
             Object missingEntityPropertyRecord = failedRecord(validationClass, missingEntityProperty);
             assertThat(failurePattern(validationClass, validation, missingEntityPropertyRecord))
