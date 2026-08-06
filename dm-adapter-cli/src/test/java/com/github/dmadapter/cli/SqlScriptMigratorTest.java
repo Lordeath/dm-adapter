@@ -4020,7 +4020,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void doesNotConvertUnknownLongCallStringArgumentsToClobBlock() throws Exception {
+    void keepsUnknownLongCallStringArgumentsForManualReview() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         String longJson = "[{\"id\":\"" + "A".repeat(3500) + "\"}]";
@@ -4039,14 +4039,198 @@ class SqlScriptMigratorTest {
         ));
 
         String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
         assertThat(converted)
                 .doesNotContain("DECLARE")
                 .doesNotContain("TO_CLOB(")
                 .contains(longJson);
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("超过 3000 字节"));
         assertThat(report.files())
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .doesNotContain(SqlScriptMigrator.DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE));
+    }
+
+    @Test
+    void convertsVeryLongUpdateValueToDisqlCompatibleClobBlockWithoutChangingContent() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String value = "中文🙂 O'Reilly C:\\archive\\2026 " + "表单内容-ABCDE".repeat(18_000);
+        write(sqlRoot.resolve("20260312_system.sql"), """
+                UPDATE ns_core_form
+                   SET form_content = '%s'
+                 WHERE form_code = 'contractParameterSettings';
+                """.formatted(value.replace("'", "''")));
+
+        SqlScriptMigrationReport dryRunReport = migrator(new FailingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        true,
+                        "sample-system",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+        assertThat(sqlRootOut.resolve("20260312_system.sql")).doesNotExist();
+
+        RecordingValidator validator = new RecordingValidator();
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("20260312_system.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("DECLARE")
+                .contains("dm_adapter_clob_value_1 CLOB;")
+                .contains("dm_adapter_clob_value_1 := TO_CLOB('")
+                .contains("dm_adapter_clob_value_1 := dm_adapter_clob_value_1 || TO_CLOB('")
+                .contains("SET form_content = dm_adapter_clob_value_1")
+                .contains("END;\n/");
+        assertThat(decodedClobAssignmentValue(converted, "dm_adapter_clob_value_1")).isEqualTo(value);
+        assertThat(converted.lines()
+                .mapToInt(line -> line.getBytes(StandardCharsets.UTF_8).length)
+                .max()
+                .orElse(0)).isLessThan(2_048);
+        assertThat(SqlScriptParser.statements(converted)).hasSize(1);
+        assertThat(validator.files)
+                .singleElement()
+                .satisfies(file -> assertThat(file.statements()).hasSize(1));
+        assertThat(dryRunReport.files().get(0).appliedRules())
+                .containsExactlyElementsOf(report.files().get(0).appliedRules());
+        assertThat(dryRunReport.files().get(0).convertedStatementCount())
+                .isEqualTo(report.files().get(0).convertedStatementCount());
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK_RULE));
+    }
+
+    @Test
+    void convertsLongInsertAndMergeDirectValuesToClobBlocks() throws Exception {
+        String insertValue1 = "插入值🙂'\\A" + "x".repeat(3_200);
+        String insertValue2 = "第二行\\B" + "y".repeat(3_200);
+        String mergeUpdateValue = "合并更新" + "u".repeat(3_200);
+        String mergeInsertValue = "合并插入" + "i".repeat(3_200);
+
+        ConvertedScript converted = migrateSingleScript("""
+                INSERT INTO demo(id, payload) VALUES
+                    (1, '%s'),
+                    (2, '%s');
+                MERGE INTO demo target
+                USING (SELECT 1 id FROM dual) source
+                   ON (target.id = source.id)
+                WHEN MATCHED THEN UPDATE SET target.payload = '%s'
+                WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, '%s');
+                """.formatted(
+                insertValue1.replace("'", "''"),
+                insertValue2.replace("'", "''"),
+                mergeUpdateValue,
+                mergeInsertValue
+        ));
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(SqlScriptParser.statements(converted.sql())).hasSize(2);
+        assertThat(converted.sql())
+                .contains("(1, dm_adapter_clob_value_1)")
+                .contains("(2, dm_adapter_clob_value_2)")
+                .contains("UPDATE SET target.payload = dm_adapter_clob_value_1")
+                .contains("VALUES (source.id, dm_adapter_clob_value_2)");
+        List<String> blocks = SqlScriptParser.statements(converted.sql());
+        assertThat(decodedClobAssignmentValue(blocks.get(0), "dm_adapter_clob_value_1"))
+                .isEqualTo(insertValue1);
+        assertThat(decodedClobAssignmentValue(blocks.get(0), "dm_adapter_clob_value_2"))
+                .isEqualTo(insertValue2);
+        assertThat(decodedClobAssignmentValue(blocks.get(1), "dm_adapter_clob_value_1"))
+                .isEqualTo(mergeUpdateValue);
+        assertThat(decodedClobAssignmentValue(blocks.get(1), "dm_adapter_clob_value_2"))
+                .isEqualTo(mergeInsertValue);
+    }
+
+    @Test
+    void keepsThresholdValueAndRequiresManualReviewForUnsafeLongLiteralPosition() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String thresholdValue = "a".repeat(3_000);
+        String unsafeValue = "b".repeat(3_001);
+        write(sqlRoot.resolve("safe.sql"),
+                "UPDATE demo SET payload = '" + thresholdValue + "' WHERE id = 1;\n");
+        write(sqlRoot.resolve("unsafe.sql"),
+                "UPDATE demo SET payload = 'short' WHERE marker = '" + unsafeValue + "';\n");
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(Files.readString(sqlRootOut.resolve("safe.sql")))
+                .contains(thresholdValue)
+                .doesNotContain("dm_adapter_clob_value_");
+        assertThat(Files.readString(sqlRootOut.resolve("unsafe.sql")))
+                .contains(unsafeValue)
+                .doesNotContain("DECLARE")
+                .doesNotContain("TO_CLOB(");
+        assertThat(report.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("UPDATE SET")
+                        .contains("INSERT VALUES")
+                        .contains("MERGE"));
+    }
+
+    @Test
+    void requiresManualReviewForLongLiteralsInReturningDdlAndExistingBlock() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String value = "内容" + "z".repeat(3_100);
+        write(sqlRoot.resolve("returning.sql"),
+                "UPDATE demo SET payload = '" + value + "' RETURNING id;\n");
+        write(sqlRoot.resolve("ddl.sql"),
+                "COMMENT ON TABLE demo IS '" + value + "';\n");
+        write(sqlRoot.resolve("block.sql"), """
+                BEGIN
+                    UPDATE demo SET payload = '%s';
+                END;
+                /
+                """.formatted(value));
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(3);
+        assertThat(report.manualReviewItems())
+                .anySatisfy(item -> assertThat(item.reason()).contains("RETURNING"))
+                .allSatisfy(item -> assertThat(item.convertedSql())
+                        .doesNotContain("dm_adapter_clob_value_"));
+        assertThat(Files.readString(sqlRootOut.resolve("ddl.sql"))).contains(value);
+        assertThat(Files.readString(sqlRootOut.resolve("block.sql"))).contains(value);
     }
 
     @Test
@@ -9562,6 +9746,28 @@ class SqlScriptMigratorTest {
                 .contains("SELECT dm_adapter_schema;")
                 .contains("CALL ns_user_baseinfo_UPDATE_SQL_resignationDatabase()")
                 .doesNotContain("resignationSF_GET_SCHEMA_NAME_BY_ID");
+    }
+
+    private String decodedClobAssignmentValue(String sql, String variableName) {
+        StringBuilder value = new StringBuilder();
+        String marker = variableName + " := ";
+        for (String line : sql.lines().toList()) {
+            int assignment = line.indexOf(marker);
+            int toClob = line.indexOf("TO_CLOB('", assignment < 0 ? 0 : assignment);
+            if (assignment < 0 || toClob < 0) {
+                continue;
+            }
+            int literalStart = toClob + "TO_CLOB(".length();
+            int literalEnd = line.lastIndexOf(");");
+            assertThat(literalEnd).isGreaterThan(literalStart);
+            value.append(decodedDmSqlLiteral(line.substring(literalStart, literalEnd)));
+        }
+        return value.toString();
+    }
+
+    private String decodedDmSqlLiteral(String literal) {
+        assertThat(literal).startsWith("'").endsWith("'");
+        return literal.substring(1, literal.length() - 1).replace("''", "'");
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {
