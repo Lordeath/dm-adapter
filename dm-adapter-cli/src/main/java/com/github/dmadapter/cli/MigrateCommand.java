@@ -59,6 +59,18 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--dry-run", description = "Only generate a migration report without changing project files.")
     private boolean dryRun;
 
+    @Option(names = "--batch", description = "Run an unattended offline migration in an isolated Git worktree, then commit and push changes.")
+    private boolean batch;
+
+    @Option(names = "--git-commit-message", description = "Exact Git commit message used by --batch.")
+    private String gitCommitMessage;
+
+    @Option(names = "--git-remote", description = "Git remote used by --batch. Must be combined with --git-branch; otherwise the current upstream is used.")
+    private String gitRemote;
+
+    @Option(names = "--git-branch", description = "Git branch used by --batch. Must be combined with --git-remote; otherwise the current upstream is used.")
+    private String gitBranch;
+
     @Option(names = "--dm-driver", description = "Dameng JDBC dependency coordinate: groupId:artifactId:version.")
     private String dmDriver;
 
@@ -133,13 +145,21 @@ public class MigrateCommand implements Callable<Integer> {
     private final AdapterWorkspaceResolver workspaceResolver = new AdapterWorkspaceResolver();
     private final LegacyWorkspaceMigrator legacyWorkspaceMigrator = new LegacyWorkspaceMigrator();
     private final DamengTargetCapabilitiesReader targetCapabilitiesReader = new DamengTargetCapabilitiesReader();
+    private MigrationReport lastMigrationReport;
+    private SqlScriptMigrationReport lastSqlScriptMigrationReport;
 
     @Override
     public Integer call() {
+        if (batch) {
+            return new GitBatchRunner(new GitCommandRunner(), reportWriter).run(this);
+        }
+        return runMigration(DmValidationEnvironment.fromSystem());
+    }
+
+    private Integer runMigration(DmValidationEnvironment validationEnvironment) {
         ProjectSummaryTracker summaryTracker = null;
         try {
             AdapterContext context = buildContext();
-            DmValidationEnvironment validationEnvironment = DmValidationEnvironment.fromSystem();
             summaryTracker = new ProjectSummaryTracker(
                     context,
                     reportWriter,
@@ -242,7 +262,11 @@ public class MigrateCommand implements Callable<Integer> {
             if (!rewriteConfigCandidates.isEmpty()) {
                 CliLogger.info("Resolving metadata for rewrite config candidates...");
             }
-            MetadataLookupResult metadataLookupResult = metadataForRewriteCandidates(context, rewriteConfigCandidates);
+            MetadataLookupResult metadataLookupResult = metadataForRewriteCandidates(
+                    context,
+                    rewriteConfigCandidates,
+                    validationEnvironment
+            );
             if (!rewriteConfigCandidates.isEmpty()) {
                 CliLogger.info("Metadata resolution completed. Available: " + metadataLookupResult.available()
                         + ", tables: " + metadataLookupResult.metadataByTable().size());
@@ -370,6 +394,159 @@ public class MigrateCommand implements Callable<Integer> {
             CliLogger.error("Migration failed: " + e.getMessage());
             return 1;
         }
+    }
+
+    OfflineMigrationRun runOfflineInWorktree(
+            Path sourceRepositoryRoot,
+            Path worktreeRoot,
+            Path batchReportDir
+    ) {
+        MigrateCommand migration = new MigrateCommand();
+        migration.project = mapBatchPath(
+                project.toAbsolutePath().normalize(),
+                project,
+                sourceRepositoryRoot,
+                worktreeRoot,
+                "--project"
+        );
+        migration.sourceDb = sourceDb;
+        migration.targetDb = targetDb;
+        migration.dryRun = false;
+        migration.dmDriver = dmDriver;
+        migration.reportDir = batchReportDir;
+        migration.mapperDir = mapOptionalBatchPath(
+                mapperDir,
+                project,
+                sourceRepositoryRoot,
+                worktreeRoot,
+                "--mapper-dir"
+        );
+        migration.rewriteConfig = mapOptionalBatchPath(
+                rewriteConfig,
+                project,
+                sourceRepositoryRoot,
+                worktreeRoot,
+                "--rewrite-config"
+        );
+        migration.sqlRoot = mapOptionalBatchPath(
+                sqlRoot,
+                project,
+                sourceRepositoryRoot,
+                worktreeRoot,
+                "--sql-root"
+        );
+        migration.sqlRootOut = mapOptionalBatchPath(
+                sqlRootOut,
+                project,
+                sourceRepositoryRoot,
+                worktreeRoot,
+                "--sql-root-out"
+        );
+        migration.preservedSqlPaths = new ArrayList<>(preservedSqlPaths);
+        migration.sqlScriptsOnly = sqlScriptsOnly;
+        migration.schema = schema;
+        migration.systemSchema = systemSchema;
+        migration.targetLengthSemantics = targetLengthSemantics;
+        int exitCode = migration.runMigration(DmValidationEnvironment.disabled());
+        return new OfflineMigrationRun(
+                exitCode,
+                migration.lastMigrationReport,
+                migration.lastSqlScriptMigrationReport
+        );
+    }
+
+    void validateBatchOptions() {
+        if (gitCommitMessage == null || gitCommitMessage.isBlank()) {
+            throw new DmAdapterException("--git-commit-message is required with --batch.");
+        }
+        if (dryRun) {
+            throw new DmAdapterException("--batch cannot be combined with --dry-run.");
+        }
+        if (appModule != null) {
+            throw new DmAdapterException("--batch cannot be combined with --app-module.");
+        }
+        if (generateValidationTest) {
+            throw new DmAdapterException("--batch cannot be combined with --generate-validation-test.");
+        }
+        if (config != null) {
+            throw new DmAdapterException("--batch cannot be combined with --config.");
+        }
+        boolean remoteProvided = gitRemote != null && !gitRemote.isBlank();
+        boolean branchProvided = gitBranch != null && !gitBranch.isBlank();
+        if (remoteProvided != branchProvided) {
+            throw new DmAdapterException("--git-remote and --git-branch must be provided together.");
+        }
+        if (schema != null && !schema.isBlank() && !sqlScriptMigrationRequested()) {
+            throw new DmAdapterException("--schema can only be used with --sql-root in --batch mode.");
+        }
+        validateSqlScriptMigrationOptions();
+        if (sqlScriptMigrationRequested() && targetLengthSemantics == null) {
+            throw new DmAdapterException(
+                    "--target-length-semantics is required for SQL script migration in --batch mode."
+            );
+        }
+    }
+
+    Path batchProjectRoot() {
+        return project.toAbsolutePath().normalize();
+    }
+
+    String batchGitCommitMessage() {
+        return gitCommitMessage;
+    }
+
+    String batchGitRemote() {
+        return gitRemote == null ? "" : gitRemote.trim();
+    }
+
+    String batchGitBranch() {
+        return gitBranch == null ? "" : gitBranch.trim();
+    }
+
+    Path batchReportDirectory(Path repositoryRoot, Path gitCommonDirectory) {
+        Path resolved = workspaceResolver.resolve(project, null, reportDir);
+        if (reportDir == null && resolved.startsWith(repositoryRoot)) {
+            resolved = gitCommonDirectory.resolve("dm-adapter-batch")
+                    .resolve(workspaceResolver.projectKey(project, null))
+                    .toAbsolutePath()
+                    .normalize();
+        }
+        if (reportDir != null && resolved.startsWith(repositoryRoot)) {
+            throw new DmAdapterException(
+                    "--report-dir must be outside the Git working tree in --batch mode: " + resolved
+            );
+        }
+        return resolved;
+    }
+
+    private Path mapOptionalBatchPath(
+            Path configured,
+            Path projectRoot,
+            Path sourceRepositoryRoot,
+            Path worktreeRoot,
+            String option
+    ) {
+        return configured == null
+                ? null
+                : mapBatchPath(configured, projectRoot, sourceRepositoryRoot, worktreeRoot, option);
+    }
+
+    private Path mapBatchPath(
+            Path configured,
+            Path projectRoot,
+            Path sourceRepositoryRoot,
+            Path worktreeRoot,
+            String option
+    ) {
+        Path normalizedProject = projectRoot.toAbsolutePath().normalize();
+        Path source = configured.isAbsolute()
+                ? configured.toAbsolutePath().normalize()
+                : normalizedProject.resolve(configured).normalize();
+        Path normalizedRepository = sourceRepositoryRoot.toAbsolutePath().normalize();
+        if (!source.startsWith(normalizedRepository)) {
+            throw new GitBatchException("path-validation", option + " must stay inside the Git repository: " + source);
+        }
+        return worktreeRoot.toAbsolutePath().normalize().resolve(normalizedRepository.relativize(source)).normalize();
     }
 
     private AdapterContext buildContext() {
@@ -520,14 +697,17 @@ public class MigrateCommand implements Callable<Integer> {
 
     private MetadataLookupResult metadataForRewriteCandidates(
             AdapterContext context,
-            List<RewriteConfigCandidate> candidates
+            List<RewriteConfigCandidate> candidates,
+            DmValidationEnvironment validationEnvironment
     ) {
         if (candidates.isEmpty()) {
             return new MetadataLookupResult(Map.of(), false, List.of());
         }
         List<String> warnings = new ArrayList<>();
         Map<String, TableKeyMetadata> ddlMetadata = projectDdlMetadataForRewriteCandidates(context, candidates, warnings);
-        DmValidationEnvironment environment = DmValidationEnvironment.fromSystem();
+        DmValidationEnvironment environment = validationEnvironment == null
+                ? DmValidationEnvironment.disabled()
+                : validationEnvironment;
         if (!environment.validationEnabled()) {
             return new MetadataLookupResult(ddlMetadata, !ddlMetadata.isEmpty(), warnings);
         }
@@ -798,6 +978,7 @@ public class MigrateCommand implements Callable<Integer> {
                 manualReviewItems,
                 warnings
         );
+        lastMigrationReport = report;
         return new MigrationReportResult(report, reportWriter.writeMigrationReport(report, context.reportDir()));
     }
 
@@ -825,6 +1006,7 @@ public class MigrateCommand implements Callable<Integer> {
                 targetCapabilities,
                 context.reportDir().resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME)
         ));
+        lastSqlScriptMigrationReport = report;
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
         return new SqlScriptReportResult(report, reportPaths);
     }
