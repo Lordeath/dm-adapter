@@ -122,6 +122,15 @@ used inside these procedures because it may resolve to the procedure owner's
 default schema. Scripts containing backtick identifiers require Dameng
 `COMPATIBLE_MODE=4`.
 
+Older DIsql clients may still report `DISQL-10033: input too long` for a single
+DML statement containing a very long string, even when it is executed through
+`START`/`@file`. For safe direct string values larger than 3000 UTF-8 bytes in
+`UPDATE SET`, `INSERT VALUES`, or `MERGE`, the migrator emits one anonymous
+block and builds the value from `TO_CLOB` chunks of at most 900 bytes before
+executing the DML. Long strings in `WHERE`, function expressions, `RETURNING`,
+DDL, or an existing routine/block are preserved for manual review. The maximum
+automatically handled value is 20 MB.
+
 The same environment variables are also used by `migrate` for read-only Dameng metadata inference. Schema resolution prefers CLI `--schema` / the workspace `sql-validation.yml`, then the JDBC URL `schema` parameter, then the connection default schema or username. Inference only writes table names, method names, and `keyColumns`; it never stores JDBC URLs, usernames, or passwords in repository files.
 
 ## Module Layout

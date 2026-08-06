@@ -133,6 +133,8 @@ class SqlScriptMigrator {
             "MYSQL_SYSTEM_METADATA_SCALAR_ID_TO_MIN";
     static final String DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE =
             "DM_LONG_CLOB_CALL_ARGUMENT_BLOCK";
+    static final String DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK_RULE =
+            "DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK";
     static final String DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE =
             "DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK";
     static final String MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE =
@@ -310,7 +312,12 @@ class SqlScriptMigrator {
             "(?is)(?<left>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*(?:<>|!=)\\s*''"
     );
     private static final int DM_CLOB_CALL_LITERAL_THRESHOLD = 3000;
-    private static final int DM_CLOB_CALL_LITERAL_CHUNK_BYTES = 900;
+    private static final int DM_CLOB_LITERAL_CHUNK_BYTES = 900;
+    private static final int DM_DISQL_LONG_LITERAL_THRESHOLD_BYTES = 3000;
+    private static final int DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES = 20 * 1024 * 1024;
+    private static final String DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON =
+            "SQL 包含超过 3000 字节的字符串，但它不在可安全自动拆分的 UPDATE SET、"
+                    + "INSERT VALUES 或 MERGE 直接赋值位置；已保留原 SQL，请人工拆分为 CLOB 匿名块后执行。";
     private static final Map<String, Set<Integer>> DM_CALL_CLOB_ARGUMENT_INDEXES = Map.of(
             "addall_ns_report_management_20240314", Set.of(7, 8)
     );
@@ -3100,6 +3107,7 @@ class SqlScriptMigrator {
                         sourceTableCharsets,
                         targetCapabilities
                 );
+                conversion = applyDisqlLongDmlLiteralCompatibility(conversion);
                 List<String> outputStatements = expandConvertedOutputStatements(conversion);
                 String calledProcedureName = procedureNameFromCall(originalStatement);
                 boolean dependencyManualReviewRequired = !calledProcedureName.isBlank()
@@ -8096,7 +8104,7 @@ class SqlScriptMigrator {
     }
 
     private void appendClobLiteralAssignments(StringBuilder block, String variableName, String literal) {
-        List<String> chunks = splitTextByUtf8Bytes(literal, DM_CLOB_CALL_LITERAL_CHUNK_BYTES);
+        List<String> chunks = splitTextByUtf8Bytes(literal, DM_CLOB_LITERAL_CHUNK_BYTES);
         for (int i = 0; i < chunks.size(); i++) {
             block.append("    ").append(variableName);
             if (i == 0) {
@@ -15975,6 +15983,428 @@ class SqlScriptMigrator {
         );
     }
 
+    private ScriptStatementConversion applyDisqlLongDmlLiteralCompatibility(
+            ScriptStatementConversion conversion
+    ) {
+        if (conversion.manualReviewRequired()) {
+            return conversion;
+        }
+        LongDmlClobRewrite outputRewrite = convertLongDirectDmlLiteralsToClobBlock(conversion.outputSql());
+        if (!outputRewrite.manualReviewReason().isBlank()) {
+            return longDmlLiteralManualReview(conversion, outputRewrite.manualReviewReason());
+        }
+        List<String> additionalOutputStatements = new ArrayList<>(conversion.additionalOutputStatements().size());
+        boolean changed = outputRewrite.changed();
+        for (String additionalOutputStatement : conversion.additionalOutputStatements()) {
+            LongDmlClobRewrite additionalRewrite =
+                    convertLongDirectDmlLiteralsToClobBlock(additionalOutputStatement);
+            if (!additionalRewrite.manualReviewReason().isBlank()) {
+                return longDmlLiteralManualReview(conversion, additionalRewrite.manualReviewReason());
+            }
+            additionalOutputStatements.add(additionalRewrite.sql());
+            changed = changed || additionalRewrite.changed();
+        }
+        if (!changed) {
+            return conversion;
+        }
+        List<String> rules = new ArrayList<>(conversion.appliedRules());
+        rules.add(DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK_RULE);
+        String convertedSql = conversion.convertedSql().equals(conversion.outputSql())
+                ? outputRewrite.sql()
+                : conversion.convertedSql();
+        return new ScriptStatementConversion(
+                conversion.originalSql(),
+                convertedSql,
+                outputRewrite.sql(),
+                true,
+                false,
+                "",
+                rules,
+                additionalOutputStatements
+        );
+    }
+
+    private ScriptStatementConversion longDmlLiteralManualReview(
+            ScriptStatementConversion conversion,
+            String reason
+    ) {
+        return new ScriptStatementConversion(
+                conversion.originalSql(),
+                conversion.convertedSql(),
+                conversion.originalSql(),
+                conversion.changed(),
+                true,
+                reason,
+                conversion.appliedRules()
+        );
+    }
+
+    private LongDmlClobRewrite convertLongDirectDmlLiteralsToClobBlock(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return LongDmlClobRewrite.unchanged(sql == null ? "" : sql);
+        }
+        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
+        String body = leadingSqlPrefix.body();
+        List<DmStringLiteral> longLiterals = longDmStringLiterals(body);
+        if (longLiterals.isEmpty()) {
+            return LongDmlClobRewrite.unchanged(sql);
+        }
+        int start = skipWhitespace(body, 0);
+        boolean update = startsKeyword(body, start, "UPDATE");
+        boolean insert = startsKeyword(body, start, "INSERT");
+        boolean merge = startsKeyword(body, start, "MERGE");
+        if (!update && !insert && !merge) {
+            return LongDmlClobRewrite.manual(sql, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
+        }
+        if (dmTopLevelKeywordIndexAfter(body, "RETURNING", start) >= 0) {
+            return LongDmlClobRewrite.manual(
+                    sql,
+                    "SQL 包含 RETURNING 和超过 3000 字节的字符串，无法安全包装为 DIsql CLOB 匿名块；"
+                            + "已保留原 SQL，请人工确认。"
+            );
+        }
+
+        LinkedHashSet<TextRange> directLiteralRanges = new LinkedHashSet<>();
+        if (update || merge) {
+            collectDirectUpdateSetLiteralRanges(body, directLiteralRanges, merge);
+        }
+        if (insert || merge) {
+            collectDirectInsertValuesLiteralRanges(body, directLiteralRanges);
+        }
+        for (DmStringLiteral literal : longLiterals) {
+            if (literal.utf8Bytes() > DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES) {
+                return LongDmlClobRewrite.manual(
+                        sql,
+                        "SQL 单个字符串超过 20MB，超出自动 CLOB 拆分上限；已保留原 SQL，请人工处理。"
+                );
+            }
+            if (!directLiteralRanges.contains(new TextRange(literal.start(), literal.end()))) {
+                return LongDmlClobRewrite.manual(sql, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
+            }
+        }
+
+        StringBuilder rewrittenBody = new StringBuilder(body);
+        List<LongDmlClobValue> values = new ArrayList<>(longLiterals.size());
+        for (int i = longLiterals.size() - 1; i >= 0; i--) {
+            DmStringLiteral literal = longLiterals.get(i);
+            String variableName = "dm_adapter_clob_value_" + (i + 1);
+            rewrittenBody.replace(literal.start(), literal.end(), variableName);
+            values.add(0, new LongDmlClobValue(variableName, literal.value()));
+        }
+
+        String executableSql = rewrittenBody.toString().strip();
+        if (executableSql.endsWith(";")) {
+            executableSql = executableSql.substring(0, executableSql.length() - 1).stripTrailing();
+        }
+        StringBuilder block = new StringBuilder(sql.length() + 512);
+        block.append(leadingSqlPrefix.prefix()).append("DECLARE\n");
+        for (LongDmlClobValue value : values) {
+            block.append("    ").append(value.variableName()).append(" CLOB;\n");
+        }
+        block.append("BEGIN\n");
+        for (LongDmlClobValue value : values) {
+            appendClobLiteralAssignments(block, value.variableName(), value.literal());
+        }
+        block.append(indentSql(executableSql, "    ")).append(";\nEND;");
+        return LongDmlClobRewrite.changed(block.toString());
+    }
+
+    private List<DmStringLiteral> longDmStringLiterals(String sql) {
+        List<DmStringLiteral> literals = new ArrayList<>();
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                int end = skipDmSingleQuotedString(sql, index);
+                String value = decodeDmSingleQuotedLiteral(sql.substring(index, end));
+                int utf8Bytes = value.getBytes(StandardCharsets.UTF_8).length;
+                if (utf8Bytes > DM_DISQL_LONG_LITERAL_THRESHOLD_BYTES) {
+                    literals.add(new DmStringLiteral(index, end, value, utf8Bytes));
+                }
+                index = end;
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                index++;
+            }
+        }
+        return List.copyOf(literals);
+    }
+
+    private void collectDirectUpdateSetLiteralRanges(
+            String sql,
+            Set<TextRange> ranges,
+            boolean merge
+    ) {
+        for (int updateIndex : dmTopLevelKeywordIndexes(sql, "UPDATE")) {
+            int setIndex = dmTopLevelKeywordIndexAfter(sql, "SET", updateIndex + "UPDATE".length());
+            if (setIndex < 0) {
+                continue;
+            }
+            int nextWhen = merge
+                    ? dmTopLevelKeywordIndexAfter(sql, "WHEN", updateIndex + "UPDATE".length())
+                    : -1;
+            if (nextWhen >= 0 && setIndex > nextWhen) {
+                continue;
+            }
+            List<String> clauseEndKeywords = merge
+                    ? List.of("WHERE", "RETURNING", "WHEN", "DELETE", "ORDER BY", "LIMIT")
+                    : List.of("WHERE", "RETURNING", "ORDER BY", "LIMIT");
+            int clauseEnd = firstDmTopLevelKeywordAfter(
+                    sql,
+                    setIndex + "SET".length(),
+                    clauseEndKeywords
+            );
+            for (TextRange assignment : splitDmTopLevelRanges(
+                    sql,
+                    setIndex + "SET".length(),
+                    clauseEnd
+            )) {
+                int equalsIndex = findDmTopLevelChar(sql, '=', assignment.start(), assignment.end());
+                if (equalsIndex < 0) {
+                    continue;
+                }
+                TextRange literal = directDmStringLiteralRange(sql, equalsIndex + 1, assignment.end());
+                if (literal != null) {
+                    ranges.add(literal);
+                }
+            }
+        }
+    }
+
+    private void collectDirectInsertValuesLiteralRanges(String sql, Set<TextRange> ranges) {
+        for (int insertIndex : dmTopLevelKeywordIndexes(sql, "INSERT")) {
+            int valuesIndex = dmTopLevelKeywordIndexAfter(sql, "VALUES", insertIndex + "INSERT".length());
+            if (valuesIndex < 0) {
+                continue;
+            }
+            int nextWhen = dmTopLevelKeywordIndexAfter(sql, "WHEN", insertIndex + "INSERT".length());
+            if (nextWhen >= 0 && valuesIndex > nextWhen) {
+                continue;
+            }
+            int cursor = skipWhitespace(sql, valuesIndex + "VALUES".length());
+            while (cursor < sql.length() && sql.charAt(cursor) == '(') {
+                int closeParen = findDmMatchingParen(sql, cursor);
+                if (closeParen <= cursor) {
+                    break;
+                }
+                for (TextRange value : splitDmTopLevelRanges(sql, cursor + 1, closeParen)) {
+                    TextRange literal = directDmStringLiteralRange(sql, value.start(), value.end());
+                    if (literal != null) {
+                        ranges.add(literal);
+                    }
+                }
+                cursor = skipWhitespace(sql, closeParen + 1);
+                if (cursor >= sql.length() || sql.charAt(cursor) != ',') {
+                    break;
+                }
+                int nextTuple = skipWhitespace(sql, cursor + 1);
+                if (nextTuple >= sql.length() || sql.charAt(nextTuple) != '(') {
+                    break;
+                }
+                cursor = nextTuple;
+            }
+        }
+    }
+
+    private TextRange directDmStringLiteralRange(String sql, int start, int end) {
+        int literalStart = skipWhitespace(sql, start);
+        int literalEnd = end;
+        while (literalEnd > literalStart && Character.isWhitespace(sql.charAt(literalEnd - 1))) {
+            literalEnd--;
+        }
+        if (literalStart >= literalEnd || sql.charAt(literalStart) != '\'') {
+            return null;
+        }
+        return skipDmSingleQuotedString(sql, literalStart) == literalEnd
+                ? new TextRange(literalStart, literalEnd)
+                : null;
+    }
+
+    private List<TextRange> splitDmTopLevelRanges(String sql, int start, int end) {
+        List<TextRange> ranges = new ArrayList<>();
+        int partStart = start;
+        int depth = 0;
+        int index = start;
+        while (index < end) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipDmSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (current == ',' && depth == 0) {
+                ranges.add(new TextRange(partStart, index));
+                partStart = ++index;
+            } else {
+                index++;
+            }
+        }
+        ranges.add(new TextRange(partStart, end));
+        return ranges;
+    }
+
+    private int findDmTopLevelChar(String sql, char target, int start, int end) {
+        int depth = 0;
+        int index = start;
+        while (index < end) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipDmSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (current == target && depth == 0) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private int findDmMatchingParen(String sql, int openParen) {
+        int depth = 0;
+        int index = openParen;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipDmSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth--;
+                if (depth == 0) {
+                    return index;
+                }
+                index++;
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private List<Integer> dmTopLevelKeywordIndexes(String sql, String keyword) {
+        List<Integer> indexes = new ArrayList<>();
+        int depth = 0;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipDmSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (depth == 0 && startsKeyword(sql, index, keyword)) {
+                indexes.add(index);
+                index += keyword.length();
+            } else {
+                index++;
+            }
+        }
+        return List.copyOf(indexes);
+    }
+
+    private int dmTopLevelKeywordIndexAfter(String sql, String keyword, int fromIndex) {
+        return dmTopLevelKeywordIndexes(sql, keyword).stream()
+                .filter(index -> index >= fromIndex)
+                .findFirst()
+                .orElse(-1);
+    }
+
+    private int firstDmTopLevelKeywordAfter(String sql, int fromIndex, List<String> keywords) {
+        int result = sql.length();
+        for (String keyword : keywords) {
+            int index = dmTopLevelKeywordIndexAfter(sql, keyword, fromIndex);
+            if (index >= 0) {
+                result = Math.min(result, index);
+            }
+        }
+        return result;
+    }
+
+    private int skipDmSingleQuotedString(String sql, int start) {
+        int index = start + 1;
+        while (index < sql.length()) {
+            if (sql.charAt(index) != '\'') {
+                index++;
+            } else if (index + 1 < sql.length() && sql.charAt(index + 1) == '\'') {
+                index += 2;
+            } else {
+                return index + 1;
+            }
+        }
+        return sql.length();
+    }
+
+    private String decodeDmSingleQuotedLiteral(String literal) {
+        if (literal.length() < 2 || literal.charAt(0) != '\'' || literal.charAt(literal.length() - 1) != '\'') {
+            return literal;
+        }
+        StringBuilder value = new StringBuilder(literal.length() - 2);
+        int index = 1;
+        while (index < literal.length() - 1) {
+            char current = literal.charAt(index);
+            if (current == '\'' && index + 1 < literal.length() - 1 && literal.charAt(index + 1) == '\'') {
+                value.append('\'');
+                index += 2;
+            } else {
+                value.append(current);
+                index++;
+            }
+        }
+        return value.toString();
+    }
+
     private Set<String> lengthDdlSourceCharsets(
             String sql,
             Map<String, Set<String>> sourceTableCharsets
@@ -16426,6 +16856,33 @@ class SqlScriptMigrator {
     }
 
     private record ClobCallArgument(String variableName, String literal) {
+    }
+
+    private record TextRange(int start, int end) {
+    }
+
+    private record DmStringLiteral(int start, int end, String value, int utf8Bytes) {
+    }
+
+    private record LongDmlClobValue(String variableName, String literal) {
+    }
+
+    private record LongDmlClobRewrite(
+            String sql,
+            boolean changed,
+            String manualReviewReason
+    ) {
+        static LongDmlClobRewrite unchanged(String sql) {
+            return new LongDmlClobRewrite(sql, false, "");
+        }
+
+        static LongDmlClobRewrite changed(String sql) {
+            return new LongDmlClobRewrite(sql, true, "");
+        }
+
+        static LongDmlClobRewrite manual(String sql, String reason) {
+            return new LongDmlClobRewrite(sql, false, reason);
+        }
     }
 
     private record ProcedureParameterParts(String name, String type) {

@@ -137,6 +137,8 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar validate-sql \
 
 生成脚本保留 `DROP PROCEDURE IF EXISTS`、`CREATE OR REPLACE PROCEDURE`、`CALL`、再次 `DROP` 的生命周期，并使用单独一行 `/` 结束过程块。在 DBeaver 中应使用“执行 SQL 脚本”（Windows/Linux 默认 `Alt+X`），不要选中整段后使用“执行 SQL 语句”（默认 `Ctrl+Enter`），否则多个语句可能被一次发送并在第二个 `PROCEDURE` 附近报语法错误。连接的 SQL Processing 设置中需保留 `;` 语句分隔符，并将 `/` 配置为脚本/过程块分隔符。
 
+旧版 DIsql 即使使用 `START`/`@文件`，也可能对包含超长字符串的单条 DML 报 `DISQL-10033: 输入过长`。迁移器会把 `UPDATE SET`、`INSERT VALUES` 和 `MERGE` 中超过 3000 UTF-8 字节的安全直接字符串值转换为匿名块，以最多 900 字节的 `TO_CLOB` 片段拼接后执行；生成块使用单独一行 `/` 结束。位于 `WHERE`、函数、`RETURNING`、DDL 或已有过程块中的超长字符串不会强制改写，而会保留原 SQL 并进入人工确认。单个字符串的自动处理上限为 20MB。
+
 临时过程不再接收 schema 参数，也不会把 `--schema` 的值写入脚本；过程内部使用
 `SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)` 在运行时解析当前 schema，并将结果保存到局部变量，调用统一为
 `CALL procedure_name()`。不能在过程内部使用 `SYS_CONTEXT('USERENV','CURRENT_SCHEMA')` 推断目标 schema：
