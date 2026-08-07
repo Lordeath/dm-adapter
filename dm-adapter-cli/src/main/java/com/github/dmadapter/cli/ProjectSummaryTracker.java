@@ -105,7 +105,9 @@ final class ProjectSummaryTracker {
     }
 
     void startSqlScriptValidation(boolean requested) throws IOException {
-        if (!requested || !environment.validationEnabled()) {
+        if (environment.databaseValidationMuted()) {
+            skipStage("sqlScriptValidation", "Batch 模式未请求数据库验证。");
+        } else if (!requested || !environment.validationEnabled()) {
             skipStage(
                     "sqlScriptValidation",
                     requested

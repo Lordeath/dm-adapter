@@ -37,6 +37,10 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 class SqlScriptMigrator {
+    static final String BATCH_VALIDATION_STATUS =
+            "Batch mode; SQL script database validation was not requested.";
+    private static final String MISSING_SYSTEM_SCHEMA_WARNING_PREFIX =
+            "System SQL script has no --system-schema and will use the current connection schema: ";
     private static final Path DEFAULT_PRESERVED_SQL_PATH = Path.of("00000000.sql");
     private static final Pattern SYSTEM_SCRIPT_FILE_NAME_PATTERN = Pattern.compile(
             "(?i)(?:^|[._-])system(?:[._-]|$)"
@@ -598,9 +602,15 @@ class SqlScriptMigrator {
                             + request.targetCapabilities().compatibleMode() + ", expected 4."
             );
         }
+        boolean databaseValidationMuted = request.validationEnvironment() != null
+                && request.validationEnvironment().databaseValidationMuted();
+        if (databaseValidationMuted) {
+            warnings.removeIf(warning -> warning != null
+                    && warning.startsWith(MISSING_SYSTEM_SCHEMA_WARNING_PREFIX));
+        }
         String validationPlan = "";
         List<PlannedSqlScriptFile> validationFiles = plannedFiles;
-        if (!request.dryRun() && request.validationPlan() != null) {
+        if (!databaseValidationMuted && !request.dryRun() && request.validationPlan() != null) {
             Path writtenPlan = validationPlanStore.write(
                     request.validationPlan(),
                     projectRoot,
@@ -621,18 +631,24 @@ class SqlScriptMigrator {
                     + "--target-length-semantics value was retained for manual review.");
         }
 
-        long validationStartedAt = System.nanoTime();
-        progress("Starting SQL script database validation: files=" + validationFiles.size());
-        SqlScriptValidationRun validationRun = request.dryRun()
-                ? SqlScriptValidationRun.notAttempted("Dry run; SQL script validation skipped.", List.of())
-                : validator.validate(validationFiles, request.validationEnvironment());
-        progress("SQL script database validation completed: attempted=" + validationRun.attempted()
-                + ", succeeded=" + validationRun.successCount()
-                + ", failed=" + validationRun.failureCount()
-                + ", elapsedMs=" + elapsedMillis(validationStartedAt));
-        warnings.addAll(validationRun.warnings());
+        SqlScriptValidationRun validationRun;
+        if (databaseValidationMuted) {
+            validationRun = SqlScriptValidationRun.notAttempted(BATCH_VALIDATION_STATUS, List.of());
+        } else {
+            long validationStartedAt = System.nanoTime();
+            progress("Starting SQL script database validation: files=" + validationFiles.size());
+            validationRun = request.dryRun()
+                    ? SqlScriptValidationRun.notAttempted("Dry run; SQL script validation skipped.", List.of())
+                    : validator.validate(validationFiles, request.validationEnvironment());
+            progress("SQL script database validation completed: attempted=" + validationRun.attempted()
+                    + ", succeeded=" + validationRun.successCount()
+                    + ", failed=" + validationRun.failureCount()
+                    + ", elapsedMs=" + elapsedMillis(validationStartedAt));
+            warnings.addAll(validationRun.warnings());
+        }
         ExternalProcedureValidationRun externalProcedureValidation = null;
-        if (!dependencyAnalysis.externalDependencies().isEmpty()
+        if (!databaseValidationMuted
+                && !dependencyAnalysis.externalDependencies().isEmpty()
                 && validationRun.attempted()
                 && validator instanceof ExternalProcedureValidator externalProcedureValidator) {
             externalProcedureValidation = externalProcedureValidator.validateExternalProcedures(
@@ -640,13 +656,13 @@ class SqlScriptMigrator {
                     request.validationEnvironment()
             );
         }
-        if (externalProcedureValidation != null) {
+        if (!databaseValidationMuted && externalProcedureValidation != null) {
             if (externalProcedureValidation.attempted()) {
                 warnings.addAll(externalProcedureUnavailableWarnings(externalProcedureValidation.issues()));
             } else {
                 warnings.addAll(externalProcedureDependencyWarnings(dependencyAnalysis.externalDependencies()));
             }
-        } else if (externalProcedureDependenciesUnverified(validationRun)) {
+        } else if (!databaseValidationMuted && externalProcedureDependenciesUnverified(validationRun)) {
             warnings.addAll(externalProcedureDependencyWarnings(dependencyAnalysis.externalDependencies()));
         }
 

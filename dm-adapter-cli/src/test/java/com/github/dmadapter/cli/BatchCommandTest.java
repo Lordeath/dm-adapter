@@ -76,6 +76,36 @@ class BatchCommandTest {
     }
 
     @Test
+    void batchSilentlySkipsDatabaseValidationForSqlScripts() throws Exception {
+        RemoteFixture remote = createRemote("offline-sql", false);
+        pushRemoteChange(remote, "sql/v2/20260807_system.sql", """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL addOrUpdate_dictionary();
+                END$$
+                DELIMITER ;
+                """);
+
+        int exitCode = execute(writeConfig(remote));
+
+        assertThat(exitCode).isZero();
+        Path repositoryReportDir = latestReportDir().resolve("offline-sql");
+        JsonNode report = new ObjectMapper().readTree(
+                repositoryReportDir.resolve("dm-adapter-sql-script-report.json").toFile()
+        );
+        assertThat(report.path("validationAttempted").asBoolean()).isFalse();
+        assertThat(report.path("validationPlan").asText()).isEmpty();
+        assertThat(report.path("warnings").toString())
+                .doesNotContain("System SQL script has no --system-schema")
+                .doesNotContain("外部存储过程依赖");
+        assertThat(Files.readString(repositoryReportDir.resolve("dm-adapter-sql-script-report.md")))
+                .contains("Batch 模式未请求达梦 SQL 脚本试执行")
+                .doesNotContain("外部存储过程依赖");
+        assertThat(repositoryReportDir.resolve("sql-script-validation-plan.json")).doesNotExist();
+    }
+
+    @Test
     void recreatesMarkedCorruptCache() throws Exception {
         RemoteFixture remote = createRemote("recover", false);
         Path config = writeConfig(remote);
@@ -220,7 +250,9 @@ class BatchCommandTest {
                 .setBranch("main")
                 .setDirectory(clone.toFile())
                 .call()) {
-            Files.writeString(clone.resolve(path), content, StandardCharsets.UTF_8);
+            Path target = clone.resolve(path);
+            Files.createDirectories(target.getParent());
+            Files.writeString(target, content, StandardCharsets.UTF_8);
             git.add().addFilepattern(".").call();
             git.commit().setMessage("Concurrent update").setAuthor(author).setCommitter(author).call();
             git.push().setRemote("origin").setRefSpecs(new RefSpec("HEAD:refs/heads/main")).call();
@@ -267,12 +299,18 @@ class BatchCommandTest {
     }
 
     private JsonNode summaryJson() throws Exception {
+        return new ObjectMapper().readTree(
+                latestReportDir().resolve(ReportWriter.BATCH_RUN_REPORT_JSON).toFile()
+        );
+    }
+
+    private Path latestReportDir() throws Exception {
         Path reports = tempDir.resolve("reports");
-        Path latest;
         try (var directories = Files.list(reports)) {
-            latest = directories.filter(Files::isDirectory).max(Comparator.comparing(Path::getFileName)).orElseThrow();
+            return directories.filter(Files::isDirectory)
+                    .max(Comparator.comparing(Path::getFileName))
+                    .orElseThrow();
         }
-        return new ObjectMapper().readTree(latest.resolve(ReportWriter.BATCH_RUN_REPORT_JSON).toFile());
     }
 
     private String remoteHead(Path remote) throws Exception {

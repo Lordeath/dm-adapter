@@ -7559,6 +7559,56 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void batchSilentModeSkipsDatabaseValidationAndValidationOnlyWarnings() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        Path validationPlan = tempDir.resolve("reports/sql-script-validation-plan.json");
+        write(sqlRoot.resolve("20260807_system.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE batch_insert()
+                BEGIN
+                    CALL addOrUpdate_dictionary();
+                END$$
+                DELIMITER ;
+                """);
+        RecordingValidator validator = new RecordingValidator();
+        List<String> progress = new ArrayList<>();
+
+        SqlScriptMigrationReport report = new SqlScriptMigrator(
+                new MySqlToDmSqlConverter(),
+                validator,
+                progress::add
+        ).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "",
+                "",
+                List.of(),
+                DmValidationEnvironment.batchSilent(),
+                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                validationPlan
+        ));
+
+        assertThat(report.validationAttempted()).isFalse();
+        assertThat(report.validationStatus()).isEqualTo(SqlScriptMigrator.BATCH_VALIDATION_STATUS);
+        assertThat(report.validationPlan()).isEmpty();
+        assertThat(report.validationSuccessCount()).isZero();
+        assertThat(report.validationFailureCount()).isZero();
+        assertThat(report.warnings()).noneSatisfy(warning -> assertThat(warning)
+                .containsAnyOf("System SQL script has no --system-schema", "外部存储过程依赖"));
+        assertThat(validator.files).isEmpty();
+        assertThat(validationPlan).doesNotExist();
+        assertThat(progress).noneSatisfy(message -> assertThat(message)
+                .containsAnyOf(
+                        "SQL script validation plan written",
+                        "Starting SQL script database validation",
+                        "SQL script database validation completed"
+                ));
+    }
+
+    @Test
     void parsesLargeMultilineStatementInLinearTime() {
         StringBuilder sql = new StringBuilder("insert into demo(id, content) values\n");
         int rowCount = 20_000;

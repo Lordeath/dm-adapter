@@ -19,6 +19,7 @@ final class DmValidationEnvironment {
     private final List<String> missingVariables;
     private final long totalTimeoutSeconds;
     private final ValidationDeadline deadline;
+    private final ExecutionMode executionMode;
 
     private DmValidationEnvironment(
             boolean enabled,
@@ -26,7 +27,8 @@ final class DmValidationEnvironment {
             String username,
             String password,
             List<String> missingVariables,
-            long totalTimeoutSeconds
+            long totalTimeoutSeconds,
+            ExecutionMode executionMode
     ) {
         this.enabled = enabled;
         this.jdbcUrl = jdbcUrl;
@@ -35,6 +37,7 @@ final class DmValidationEnvironment {
         this.missingVariables = List.copyOf(missingVariables);
         this.totalTimeoutSeconds = totalTimeoutSeconds;
         this.deadline = new ValidationDeadline(totalTimeoutSeconds);
+        this.executionMode = executionMode;
     }
 
     static DmValidationEnvironment fromSystem() {
@@ -45,7 +48,18 @@ final class DmValidationEnvironment {
         return from(Map.of());
     }
 
+    static DmValidationEnvironment batchSilent() {
+        return from(Map.of(), ExecutionMode.BATCH_SILENT);
+    }
+
     static DmValidationEnvironment from(Map<String, String> environment) {
+        return from(environment, ExecutionMode.STANDARD);
+    }
+
+    private static DmValidationEnvironment from(
+            Map<String, String> environment,
+            ExecutionMode executionMode
+    ) {
         Map<String, String> env = environment == null ? Map.of() : environment;
         boolean enabled = "true".equalsIgnoreCase(value(env, ENABLED));
         List<String> missing = new ArrayList<>();
@@ -64,7 +78,15 @@ final class DmValidationEnvironment {
             }
         }
         long timeoutSeconds = positiveLong(value(env, TOTAL_TIMEOUT_SECONDS), DEFAULT_TOTAL_TIMEOUT_SECONDS);
-        return new DmValidationEnvironment(enabled, jdbcUrl, username, password, missing, timeoutSeconds);
+        return new DmValidationEnvironment(
+                enabled,
+                jdbcUrl,
+                username,
+                password,
+                missing,
+                timeoutSeconds,
+                executionMode
+        );
     }
 
     boolean validationEnabled() {
@@ -73,6 +95,10 @@ final class DmValidationEnvironment {
 
     boolean ready() {
         return enabled && missingVariables.isEmpty();
+    }
+
+    boolean databaseValidationMuted() {
+        return executionMode == ExecutionMode.BATCH_SILENT;
     }
 
     String jdbcUrl() {
@@ -114,5 +140,10 @@ final class DmValidationEnvironment {
     private static String value(Map<String, String> environment, String name) {
         String value = environment.get(name);
         return value == null ? "" : value.trim();
+    }
+
+    private enum ExecutionMode {
+        STANDARD,
+        BATCH_SILENT
     }
 }

@@ -98,7 +98,8 @@ repositories:
 - `mapperDir`、`rewriteConfig`、SQL 输入输出目录均相对仓库检出根目录，而不是相对 `projectSubdir`。
 - `targetLengthSemantics` 在 SQL 模式为 `IF_PRESENT` 或 `REQUIRED` 时必须指定。`CHAR` 表示目标库按字符长度，`BYTE` 会在必要时生成显式 `VARCHAR(n CHAR)` / `CHAR(n CHAR)`。
 - 仓库 URL 不允许内嵌凭据。HTTP(S) 仓库必须同时配置全局 `username` 和 `password`；`file` URL 可不配凭据。
-- 当前 batch 模式故意不提供 schema 参数。它不会访问数据库，转换所需但无法离线确定的信息会进入人工确认。
+- 当前 batch 模式故意不提供 schema 参数。它不会访问数据库，也不会生成 SQL 验证清单、调用验证器或输出 system-schema、外部存储过程未验证等数据库验证告警。
+- Batch 仍会阻止包含真实转换人工确认项的仓库提交和推送；数据库验证被静默不代表自动放行不确定 SQL。
 
 ## Git 与失败处理
 
