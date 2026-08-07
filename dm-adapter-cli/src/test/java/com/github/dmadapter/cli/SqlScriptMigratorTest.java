@@ -3340,6 +3340,49 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsLargeExplicitIdentitySeedProcedureWithinTimeLimit() throws Exception {
+        int rowCount = 2_000;
+        StringBuilder inserts = new StringBuilder();
+        for (int row = 1; row <= rowCount; row++) {
+            inserts.append("    INSERT INTO sample_identity_seed VALUES (")
+                    .append(row)
+                    .append(", 'CODE_")
+                    .append(row)
+                    .append("');\n");
+        }
+        String script = """
+                CREATE TABLE sample_identity_seed (
+                    id BIGINT IDENTITY(1,1),
+                    code VARCHAR(32)
+                );
+
+                DELIMITER $$
+                CREATE PROCEDURE seed_sample_identity()
+                BEGIN
+                %sEND$$
+                DELIMITER ;
+                """.formatted(inserts);
+
+        ConvertedScript converted = assertTimeout(
+                Duration.ofSeconds(10),
+                () -> migrateSingleScript(script)
+        );
+
+        String identityInsertOn =
+                "EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_identity_seed ON';";
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("INSERT INTO sample_identity_seed (id, code) VALUES (1, 'CODE_1');")
+                .contains("INSERT INTO sample_identity_seed (id, code) VALUES (2000, 'CODE_2000');");
+        assertThat(converted.sql().split(Pattern.quote(identityInsertOn), -1).length - 1)
+                .isEqualTo(rowCount);
+        assertThat(converted.report().files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE));
+    }
+
+    @Test
     void wrapsExplicitAutoIncrementInsertAfterScriptAlterTableAddColumn() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE TABLE sample_seed_item (

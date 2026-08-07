@@ -452,8 +452,11 @@ class SqlScriptMigrator {
             new TextReplacement(Pattern.compile("(?is)\\bnumeric_scale\\b"), "DATA_SCALE"),
             new TextReplacement(Pattern.compile("(?is)\\bcharacter_maximum_length\\b"), "CHAR_LENGTH")
     );
+    private static final Pattern MYSQL_DECLARE_HANDLER_MANUAL_REVIEW_PATTERN = Pattern.compile(
+            "(?is)\\bDECLARE\\s+.+?\\s+HANDLER\\s+FOR\\b"
+    );
     private static final Map<Pattern, String> MANUAL_REVIEW_PATTERNS = Map.of(
-            Pattern.compile("(?is)\\bDECLARE\\s+.+?\\s+HANDLER\\s+FOR\\b"),
+            MYSQL_DECLARE_HANDLER_MANUAL_REVIEW_PATTERN,
             "MySQL procedure HANDLER syntax needs manual confirmation for Dameng.",
             Pattern.compile("(?is)\\bSIGNAL\\s+SQLSTATE\\b"),
             "MySQL SIGNAL SQLSTATE handling needs manual confirmation for Dameng.",
@@ -15697,7 +15700,11 @@ class SqlScriptMigrator {
         if (!suspiciousLengthModifyReason.isBlank()) {
             return suspiciousLengthModifyReason;
         }
+        boolean containsHandler = containsKeywordOutsideIgnoredText(searchableSql, "HANDLER");
         for (Map.Entry<Pattern, String> entry : MANUAL_REVIEW_PATTERNS.entrySet()) {
+            if (entry.getKey() == MYSQL_DECLARE_HANDLER_MANUAL_REVIEW_PATTERN && !containsHandler) {
+                continue;
+            }
             if (entry.getKey().matcher(sql).find()) {
                 return entry.getValue();
             }
