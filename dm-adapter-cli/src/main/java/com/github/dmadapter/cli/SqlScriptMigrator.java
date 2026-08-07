@@ -141,6 +141,8 @@ class SqlScriptMigrator {
             "DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK";
     static final String DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE_RULE =
             "DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE";
+    static final String DM_PROCEDURE_LONG_DYNAMIC_SQL_TO_VARCHAR_VARIABLE_RULE =
+            "DM_PROCEDURE_LONG_DYNAMIC_SQL_TO_VARCHAR_VARIABLE";
     static final String DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE =
             "DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK";
     static final String MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE =
@@ -320,6 +322,7 @@ class SqlScriptMigrator {
     private static final int DM_CLOB_LITERAL_CHUNK_BYTES = 900;
     private static final int DM_DISQL_LONG_LITERAL_THRESHOLD_BYTES = 3000;
     private static final int DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES = 20 * 1024 * 1024;
+    private static final int DM_DYNAMIC_SQL_VARCHAR_MAX_BYTES = 32_767;
     private static final String DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON =
             "SQL 包含超过 3000 字节的字符串，但它不在可安全自动拆分的 CLOB 变量赋值、"
                     + "已知大字段 CALL 参数、UPDATE SET、INSERT VALUES、INSERT SELECT "
@@ -7229,11 +7232,56 @@ class SqlScriptMigrator {
         String procedureName = procedureNameFromCreateProcedure(body);
         boolean generatedSnapshotProcedure =
                 procedureName.toLowerCase(Locale.ROOT).startsWith("dm_adapter_snapshot_");
-        if (!(startsKeyword(body, 0, "INSERT")
+        if (startsKeyword(body, 0, "INSERT")
                 || startsKeyword(body, 0, "UPDATE")
-                || generatedSnapshotProcedure)) {
+                || generatedSnapshotProcedure) {
+            return convertEmbeddedSqlLiteralsInText(sql, targetSchema);
+        }
+        if (!isCreateProcedureStatement(body)) {
             return new SafeRuleConversion(sql, false, List.of(), "");
         }
+
+        List<RoutineTextReplacement> replacements = new ArrayList<>();
+        LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
+        String manualReviewReason = "";
+        for (RoutineSqlStatement routineStatement : routineSqlStatements(sql)) {
+            String statement = sql.substring(routineStatement.start(), routineStatement.end());
+            int statementStart = skipWhitespace(statement, 0);
+            if (!(startsKeyword(statement, statementStart, "INSERT")
+                    || startsKeyword(statement, statementStart, "UPDATE")
+                    || startsKeyword(statement, statementStart, "MERGE"))) {
+                continue;
+            }
+            SafeRuleConversion conversion = convertEmbeddedSqlLiteralsInText(statement, targetSchema);
+            if (conversion.changed()) {
+                replacements.add(new RoutineTextReplacement(
+                        routineStatement.start(),
+                        routineStatement.end(),
+                        conversion.sql()
+                ));
+                appliedRules.addAll(conversion.appliedRules());
+            }
+            if (manualReviewReason.isBlank() && !conversion.manualReviewReason().isBlank()) {
+                manualReviewReason = conversion.manualReviewReason();
+            }
+        }
+        if (replacements.isEmpty()) {
+            return new SafeRuleConversion(sql, false, List.of(), manualReviewReason);
+        }
+        StringBuilder rewritten = new StringBuilder(sql);
+        for (int index = replacements.size() - 1; index >= 0; index--) {
+            RoutineTextReplacement replacement = replacements.get(index);
+            rewritten.replace(replacement.start(), replacement.end(), replacement.replacement());
+        }
+        return new SafeRuleConversion(
+                rewritten.toString(),
+                true,
+                List.copyOf(appliedRules),
+                manualReviewReason
+        );
+    }
+
+    private SafeRuleConversion convertEmbeddedSqlLiteralsInText(String sql, String targetSchema) {
         StringBuilder rewritten = new StringBuilder(sql.length());
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
         int index = 0;
@@ -16022,39 +16070,31 @@ class SqlScriptMigrator {
         if (conversion.manualReviewRequired()) {
             return conversion;
         }
-        LongDmlClobRewrite outputProcedureRewrite =
-                convertLongProcedureLiteralsToClobVariables(conversion.outputSql());
-        if (!outputProcedureRewrite.manualReviewReason().isBlank()) {
-            return longDmlLiteralManualReview(conversion, outputProcedureRewrite.manualReviewReason());
-        }
-        LongDmlClobRewrite outputRewrite =
-                convertLongDirectDmlLiteralsToClobBlock(outputProcedureRewrite.sql());
+        LongLiteralCompatibility outputRewrite = convertLongLiteralCompatibility(conversion.outputSql());
         if (!outputRewrite.manualReviewReason().isBlank()) {
             return longDmlLiteralManualReview(conversion, outputRewrite.manualReviewReason());
         }
         List<String> additionalOutputStatements = new ArrayList<>(conversion.additionalOutputStatements().size());
-        boolean procedureChanged = outputProcedureRewrite.changed();
-        boolean dmlChanged = outputRewrite.changed();
+        boolean dynamicSqlChanged = outputRewrite.dynamicSqlChanged();
+        boolean procedureChanged = outputRewrite.procedureClobChanged();
+        boolean dmlChanged = outputRewrite.directDmlChanged();
         for (String additionalOutputStatement : conversion.additionalOutputStatements()) {
-            LongDmlClobRewrite additionalProcedureRewrite =
-                    convertLongProcedureLiteralsToClobVariables(additionalOutputStatement);
-            if (!additionalProcedureRewrite.manualReviewReason().isBlank()) {
-                return longDmlLiteralManualReview(conversion, additionalProcedureRewrite.manualReviewReason());
-            }
-            LongDmlClobRewrite additionalRewrite = convertLongDirectDmlLiteralsToClobBlock(
-                    additionalProcedureRewrite.sql()
-            );
+            LongLiteralCompatibility additionalRewrite = convertLongLiteralCompatibility(additionalOutputStatement);
             if (!additionalRewrite.manualReviewReason().isBlank()) {
                 return longDmlLiteralManualReview(conversion, additionalRewrite.manualReviewReason());
             }
             additionalOutputStatements.add(additionalRewrite.sql());
-            procedureChanged = procedureChanged || additionalProcedureRewrite.changed();
-            dmlChanged = dmlChanged || additionalRewrite.changed();
+            dynamicSqlChanged = dynamicSqlChanged || additionalRewrite.dynamicSqlChanged();
+            procedureChanged = procedureChanged || additionalRewrite.procedureClobChanged();
+            dmlChanged = dmlChanged || additionalRewrite.directDmlChanged();
         }
-        if (!procedureChanged && !dmlChanged) {
+        if (!dynamicSqlChanged && !procedureChanged && !dmlChanged) {
             return conversion;
         }
         List<String> rules = new ArrayList<>(conversion.appliedRules());
+        if (dynamicSqlChanged) {
+            rules.add(DM_PROCEDURE_LONG_DYNAMIC_SQL_TO_VARCHAR_VARIABLE_RULE);
+        }
         if (procedureChanged) {
             rules.add(DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE_RULE);
         }
@@ -16076,6 +16116,31 @@ class SqlScriptMigrator {
         );
     }
 
+    private LongLiteralCompatibility convertLongLiteralCompatibility(String sql) {
+        LongDmlClobRewrite dynamicSqlRewrite =
+                convertLongProcedureDynamicSqlLiteralsToVarcharVariables(sql);
+        if (!dynamicSqlRewrite.manualReviewReason().isBlank()) {
+            return LongLiteralCompatibility.manual(sql, dynamicSqlRewrite.manualReviewReason());
+        }
+        LongDmlClobRewrite procedureClobRewrite =
+                convertLongProcedureLiteralsToClobVariables(dynamicSqlRewrite.sql());
+        if (!procedureClobRewrite.manualReviewReason().isBlank()) {
+            return LongLiteralCompatibility.manual(sql, procedureClobRewrite.manualReviewReason());
+        }
+        LongDmlClobRewrite directDmlRewrite =
+                convertLongDirectDmlLiteralsToClobBlock(procedureClobRewrite.sql());
+        if (!directDmlRewrite.manualReviewReason().isBlank()) {
+            return LongLiteralCompatibility.manual(sql, directDmlRewrite.manualReviewReason());
+        }
+        return new LongLiteralCompatibility(
+                directDmlRewrite.sql(),
+                dynamicSqlRewrite.changed(),
+                procedureClobRewrite.changed(),
+                directDmlRewrite.changed(),
+                ""
+        );
+    }
+
     private ScriptStatementConversion longDmlLiteralManualReview(
             ScriptStatementConversion conversion,
             String reason
@@ -16089,6 +16154,135 @@ class SqlScriptMigrator {
                 reason,
                 conversion.appliedRules()
         );
+    }
+
+    private LongDmlClobRewrite convertLongProcedureDynamicSqlLiteralsToVarcharVariables(String sql) {
+        if (sql == null || sql.isBlank() || !isCreateProcedureStatement(sql)) {
+            return LongDmlClobRewrite.unchanged(sql == null ? "" : sql);
+        }
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0) {
+            return LongDmlClobRewrite.unchanged(sql);
+        }
+        Map<Integer, DmStringLiteral> longLiteralsByStart = longDmStringLiterals(sql).stream()
+                .filter(literal -> literal.start() > beginIndex)
+                .collect(Collectors.toMap(
+                        DmStringLiteral::start,
+                        literal -> literal,
+                        (left, right) -> left,
+                        LinkedHashMap::new
+                ));
+        if (longLiteralsByStart.isEmpty()) {
+            return LongDmlClobRewrite.unchanged(sql);
+        }
+
+        List<ResolvedProcedureLongLiteral> targets = new ArrayList<>();
+        LinkedHashSet<String> existingNames = procedureNamesInScope(sql, beginIndex);
+        int generatedVariableIndex = 1;
+        int index = beginIndex + "BEGIN".length();
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipDmSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "EXECUTE")) {
+                int immediateIndex = skipWhitespace(sql, index + "EXECUTE".length());
+                if (!startsKeyword(sql, immediateIndex, "IMMEDIATE")) {
+                    index += "EXECUTE".length();
+                    continue;
+                }
+                int literalStart = skipWhitespace(sql, immediateIndex + "IMMEDIATE".length());
+                DmStringLiteral literal = longLiteralsByStart.get(literalStart);
+                if (literal == null) {
+                    index = literalStart;
+                    continue;
+                }
+                int suffixStart = skipWhitespace(sql, literal.end());
+                boolean directExpression = suffixStart >= sql.length()
+                        || sql.charAt(suffixStart) == ';'
+                        || startsKeyword(sql, suffixStart, "INTO")
+                        || startsKeyword(sql, suffixStart, "USING");
+                if (!directExpression) {
+                    return LongDmlClobRewrite.manual(
+                            sql,
+                            "存储过程 EXECUTE IMMEDIATE 中超过 3000 字节的动态 SQL 不是单个字符串表达式；"
+                                    + "已保留原 SQL，请人工确认拼接和执行方式。"
+                    );
+                }
+                if (literal.utf8Bytes() > DM_DYNAMIC_SQL_VARCHAR_MAX_BYTES) {
+                    return LongDmlClobRewrite.manual(
+                            sql,
+                            "存储过程 EXECUTE IMMEDIATE 的动态 SQL 超过 32767 字节，"
+                                    + "无法安全放入达梦 VARCHAR 变量；已保留原 SQL，请人工处理。"
+                    );
+                }
+                String variableName = uniqueProcedureLocalName(
+                        "dm_adapter_dynamic_sql_" + generatedVariableIndex,
+                        existingNames
+                );
+                generatedVariableIndex++;
+                targets.add(new ResolvedProcedureLongLiteral(
+                        literal,
+                        variableName,
+                        index,
+                        lineIndentBefore(sql, index),
+                        true
+                ));
+                index = literal.end();
+            } else {
+                index++;
+            }
+        }
+        if (targets.isEmpty()) {
+            return LongDmlClobRewrite.unchanged(sql);
+        }
+
+        List<RoutineTextReplacement> replacements = new ArrayList<>();
+        for (ResolvedProcedureLongLiteral target : targets) {
+            replacements.add(new RoutineTextReplacement(
+                    target.literal().start(),
+                    target.literal().end(),
+                    target.variableName()
+            ));
+            StringBuilder assignments = new StringBuilder();
+            appendProcedureVarcharAssignments(
+                    assignments,
+                    target.variableName(),
+                    target.literal().value(),
+                    target.indent()
+            );
+            replacements.add(new RoutineTextReplacement(
+                    target.insertionIndex(),
+                    target.insertionIndex(),
+                    assignments.toString()
+            ));
+        }
+        replacements.sort(Comparator.comparingInt(RoutineTextReplacement::start).reversed());
+        StringBuilder rewritten = new StringBuilder(sql);
+        for (RoutineTextReplacement replacement : replacements) {
+            rewritten.replace(replacement.start(), replacement.end(), replacement.replacement());
+        }
+
+        int rewrittenBeginIndex = firstProcedureBegin(rewritten.toString());
+        if (rewrittenBeginIndex < 0) {
+            return LongDmlClobRewrite.manual(sql, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
+        }
+        int declarationInsertIndex = procedureUserVariableDeclarationInsertIndex(
+                rewritten.toString(),
+                rewrittenBeginIndex
+        );
+        String declarations = targets.stream()
+                .map(target -> "    " + target.variableName() + " VARCHAR(32767);\n")
+                .collect(Collectors.joining());
+        rewritten.insert(declarationInsertIndex, declarations);
+        return LongDmlClobRewrite.changed(rewritten.toString());
     }
 
     private LongDmlClobRewrite convertLongProcedureLiteralsToClobVariables(String sql) {
@@ -16425,6 +16619,26 @@ class SqlScriptMigrator {
             assignments.append("TO_CLOB(")
                     .append(sqlStringLiteral(chunks.get(index)))
                     .append(");\n");
+        }
+        assignments.append(indent);
+    }
+
+    private void appendProcedureVarcharAssignments(
+            StringBuilder assignments,
+            String variableName,
+            String literal,
+            String indent
+    ) {
+        List<String> chunks = splitTextByUtf8Bytes(literal, DM_CLOB_LITERAL_CHUNK_BYTES);
+        for (int index = 0; index < chunks.size(); index++) {
+            if (index > 0) {
+                assignments.append(indent);
+            }
+            assignments.append(variableName).append(" := ");
+            if (index > 0) {
+                assignments.append(variableName).append(" || ");
+            }
+            assignments.append(sqlStringLiteral(chunks.get(index))).append(";\n");
         }
         assignments.append(indent);
     }
@@ -17295,6 +17509,22 @@ class SqlScriptMigrator {
 
         static LongDmlClobRewrite manual(String sql, String reason) {
             return new LongDmlClobRewrite(sql, false, reason);
+        }
+    }
+
+    private record LongLiteralCompatibility(
+            String sql,
+            boolean dynamicSqlChanged,
+            boolean procedureClobChanged,
+            boolean directDmlChanged,
+            String manualReviewReason
+    ) {
+        private LongLiteralCompatibility {
+            manualReviewReason = manualReviewReason == null ? "" : manualReviewReason;
+        }
+
+        static LongLiteralCompatibility manual(String sql, String reason) {
+            return new LongLiteralCompatibility(sql, false, false, false, reason);
         }
     }
 
