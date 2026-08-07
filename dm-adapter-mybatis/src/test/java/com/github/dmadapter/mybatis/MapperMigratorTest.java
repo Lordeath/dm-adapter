@@ -202,6 +202,46 @@ class MapperMigratorTest {
     }
 
     @Test
+    void migrationRemovesPrimaryKeyForceIndexHintFromDynamicMapperSql() throws Exception {
+        Path mapper = writeMapper("src/main/resources/mapper/NsSrServicesMapper.xml", """
+                select count(*) totalNum
+                from ns_sr_services a
+                left join ns_sr_services_extension e FORCE INDEX(PRIMARY) on a.id = e.service_id
+                where a.organization_id in
+                <foreach collection="organizationIds" item="id" open="(" close=")" separator=",">
+                    #{id}
+                </foreach>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/NsSrServicesMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/NsSrServicesMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("left join ns_sr_services_extension e on a.id = e.service_id")
+                .doesNotContainIgnoringCase("FORCE INDEX")
+                .contains("<foreach collection=\"organizationIds\"");
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_INDEX_HINT_REMOVAL_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void reportsProgressDuringMapperMigration() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/UserMapper.xml", "select NOW() from dual");
         ProjectScanResult scanResult = new ProjectScanResult(

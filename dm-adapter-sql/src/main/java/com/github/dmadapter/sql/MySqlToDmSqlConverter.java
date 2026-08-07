@@ -840,6 +840,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_TABLE_ALIAS_AS_RULE);
         }
 
+        GenericConversion indexHintConversion = removeMysqlIndexHints(converted);
+        if (indexHintConversion.changed()) {
+            converted = indexHintConversion.convertedSql();
+            rules.add(MYSQL_INDEX_HINT_REMOVAL_RULE);
+        }
+
         GenericConversion implicitCrossJoinConversion = convertImplicitCrossJoins(converted);
         if (implicitCrossJoinConversion.changed()) {
             converted = implicitCrossJoinConversion.convertedSql();
@@ -850,12 +856,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (jsonTableJoinConversion.changed()) {
             converted = jsonTableJoinConversion.convertedSql();
             rules.add(MYSQL_JSON_TABLE_JOIN_TO_DM_CROSS_JOIN_RULE);
-        }
-
-        GenericConversion indexHintConversion = removeMysqlIndexHints(converted);
-        if (indexHintConversion.changed()) {
-            converted = indexHintConversion.convertedSql();
-            rules.add(MYSQL_INDEX_HINT_REMOVAL_RULE);
         }
 
         GenericConversion noLockHintConversion = removeSqlServerNoLockHints(converted);
@@ -8865,6 +8865,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = skipSingleQuotedString(sql, index);
             } else if (current == '"') {
                 index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : index + 1;
             } else if (startsMyBatisPlaceholder(sql, index)) {
                 index = skipMyBatisPlaceholder(sql, index);
             } else if (startsLineComment(sql, index)) {
@@ -9292,10 +9295,37 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         int cursor = skipWhitespace(sql, index + hintKeyword.length());
-        if (!startsKeyword(sql, cursor, "INDEX")) {
+        String indexKeyword = null;
+        for (String candidate : List.of("INDEX", "KEY")) {
+            if (startsKeyword(sql, cursor, candidate)) {
+                indexKeyword = candidate;
+                break;
+            }
+        }
+        if (indexKeyword == null) {
             return null;
         }
-        cursor = skipWhitespace(sql, cursor + "INDEX".length());
+        cursor = skipWhitespace(sql, cursor + indexKeyword.length());
+        if (startsKeyword(sql, cursor, "FOR")) {
+            cursor = skipWhitespace(sql, cursor + "FOR".length());
+            if (startsKeyword(sql, cursor, "JOIN")) {
+                cursor = skipWhitespace(sql, cursor + "JOIN".length());
+            } else if (startsKeyword(sql, cursor, "ORDER")) {
+                cursor = skipWhitespace(sql, cursor + "ORDER".length());
+                if (!startsKeyword(sql, cursor, "BY")) {
+                    return null;
+                }
+                cursor = skipWhitespace(sql, cursor + "BY".length());
+            } else if (startsKeyword(sql, cursor, "GROUP")) {
+                cursor = skipWhitespace(sql, cursor + "GROUP".length());
+                if (!startsKeyword(sql, cursor, "BY")) {
+                    return null;
+                }
+                cursor = skipWhitespace(sql, cursor + "BY".length());
+            } else {
+                return null;
+            }
+        }
         if (cursor >= sql.length() || sql.charAt(cursor) != '(') {
             return null;
         }

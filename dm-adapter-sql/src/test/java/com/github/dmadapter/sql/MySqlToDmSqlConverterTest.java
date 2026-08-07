@@ -1381,6 +1381,48 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void removesMysqlPrimaryKeyForceIndexHint() {
+        SqlConversionResult result = converter.convert("""
+                select count(*) totalNum
+                from ns_sr_services a
+                left join ns_sr_services_extension e FORCE INDEX(PRIMARY) on a.id = e.service_id
+                where a.enterprise_id = ?
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select count(*) totalNum
+                from ns_sr_services a
+                left join ns_sr_services_extension e on a.id = e.service_id
+                where a.enterprise_id = ?
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_INDEX_HINT_REMOVAL_RULE);
+    }
+
+    @Test
+    void removesMysqlKeyHintsWithOptionalScopes() {
+        SqlConversionResult result = converter.convert("""
+                select *
+                from service_extension force key for join (PRIMARY)
+                join service_flow ignore index for order by (idx_created_at) on service_flow.id = service_extension.id
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                select *
+                from service_extension join service_flow on service_flow.id = service_extension.id
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.MYSQL_INDEX_HINT_REMOVAL_RULE);
+    }
+
+    @Test
+    void doesNotRemoveMysqlIndexHintsInsideBacktickIdentifiers() {
+        SqlConversionResult result = converter.convert("select `force index(PRIMARY)` from audit_log");
+
+        assertThat(result.changed()).isFalse();
+    }
+
+    @Test
     void removesSqlServerNoLockTableHintsWithoutChangingCtesOrIgnoredText() {
         SqlConversionResult result = converter.convert("""
                 WITH active_users AS (

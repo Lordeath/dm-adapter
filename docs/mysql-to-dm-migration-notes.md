@@ -37,6 +37,7 @@
 - MySQL 用双引号表示字符串的写法应改为单引号；达梦双引号表示标识符。转换时必须区分字符串常量、对象名、动态 `${}` 片段，不能把未知业务字符串转成对象名。
 - MySQL 查询分页 `LIMIT offset,size`、`LIMIT size` 在达梦 53 兼容模式下可执行，默认保留。简单单表 `UPDATE`/`DELETE` 的无排序 `LIMIT row_count` 可把候选行限制改写为 `ROWID` 子查询和 `ROWNUM <= row_count`，保留 MySQL 未指定顺序时“任取不超过 N 行”的语义；带 `ORDER BY ... LIMIT 1` 的形态必须把排序保留在内层候选查询。含表别名、多表目标、offset 或无法解析计数的 DML 仍要人工确认。
 - MySQL `LIKE #{name} '%'`、`LIKE '%' #{name}` 这类参数与字符串字面量相邻拼接在达梦 53 仍会失败，应改为 `#{name} || '%'` 形式。`#{}` 参数可以安全拼接，`${}` 动态片段必须保守处理。
+- MySQL 表级索引提示 `USE INDEX(...)`、`FORCE INDEX(...)`、`IGNORE INDEX(...)` 不能原样交给达梦执行，工具应删除这些优化器提示；`PRIMARY` 也是索引提示参数，例如 `FORCE INDEX(PRIMARY)` 必须整体删除。`KEY` 同义写法以及可选的 `FOR JOIN`、`FOR ORDER BY`、`FOR GROUP BY` 作用域使用相同规则。
 - `CONCAT`、`CONCAT_WS`、`IFNULL`、`IF`、`ISNULL`、`FIND_IN_SET`、`DATE_FORMAT`、`STR_TO_DATE`、`SUBSTRING_INDEX`、两参数 `DATEDIFF`、`UNIX_TIMESTAMP`、`FROM_UNIXTIME`、`TIMESTAMPDIFF`、常见 `JSON_*` 函数在达梦 53 验证可执行，默认保留 MySQL 函数形态。
 - MySQL 可在查询列中用 `(列 IS [NOT] NULL) AS 标志` 直接返回 0/1，达梦不接受这种布尔投影；工具应转换为 `CASE WHEN 列 IS [NOT] NULL THEN 1 ELSE 0 END AS 标志`，且不能改写 `WHERE` 中本来合法的空值判断。
 - `NOW()` 与达梦 `SYSDATE` 在 53 环境中存在时区/时间来源差异，不能再把 `NOW()` 盲目替换为 `SYSDATE`。原始 mapper 中也应保留 MySQL 函数形态，不能把达梦函数反写到原始 MySQL XML。
