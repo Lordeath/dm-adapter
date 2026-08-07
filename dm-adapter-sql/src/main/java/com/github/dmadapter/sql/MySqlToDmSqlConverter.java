@@ -339,6 +339,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     + DM_IDENTIFIER
                     + ")*)\\s+IS\\s+(?<not>NOT\\s+)?NULL\\s*$"
     );
+    private static final Pattern MYSQL_BOOLEAN_NULL_PROJECTION_CANDIDATE_PATTERN = Pattern.compile(
+            "(?is)\\bIS\\s+(?:NOT\\s+)?NULL\\b"
+    );
     private static final Pattern UPDATE_SET_TABLE_ORDER_PATTERN = Pattern.compile(
             "(?is)^(\\s*)update\\s+set\\s+("
                     + DM_IDENTIFIER
@@ -10326,7 +10329,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertBooleanNullProjection(String sql) {
+        if (!MYSQL_BOOLEAN_NULL_PROJECTION_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return new GenericConversion(sql, false);
+        }
         List<TextReplacement> replacements = new ArrayList<>();
+        Map<Integer, Boolean> selectListByDepth = new LinkedHashMap<>();
+        int depth = 0;
         int index = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
@@ -10343,9 +10351,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = skipUntilLineEnd(sql, index);
             } else if (startsBlockComment(sql, index)) {
                 index = skipUntilBlockCommentEnd(sql, index);
-            } else if (current == '(' && isInsideSelectList(sql, index)) {
+            } else if (current == '(') {
+                if (!Boolean.TRUE.equals(selectListByDepth.get(depth))) {
+                    depth++;
+                    index++;
+                    continue;
+                }
                 int closeParenIndex = findMatchingParen(sql, index);
                 if (closeParenIndex < 0) {
+                    depth++;
                     index++;
                     continue;
                 }
@@ -10369,6 +10383,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     }
                 }
                 index = closeParenIndex + 1;
+            } else if (current == ')') {
+                if (depth > 0) {
+                    selectListByDepth.remove(depth);
+                    depth--;
+                }
+                index++;
+            } else if (startsKeyword(sql, index, "SELECT")) {
+                selectListByDepth.put(depth, true);
+                index += "SELECT".length();
+            } else if (startsKeyword(sql, index, "FROM")) {
+                selectListByDepth.put(depth, false);
+                index += "FROM".length();
             } else {
                 index++;
             }

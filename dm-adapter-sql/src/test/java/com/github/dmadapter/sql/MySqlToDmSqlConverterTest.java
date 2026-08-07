@@ -4791,6 +4791,53 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsNestedBooleanNullProjectionWithFlexibleWhitespace() {
+        SqlConversionResult result = converter.convert("""
+                select nested.id,
+                       (nested.deleted_at
+                           IS
+                           NOT NULL) AS available,
+                       '(nested.deleted_at IS NULL) AS text_value' AS raw_text
+                from (
+                    select source.id,
+                           (source.archived_at IS NULL) AS active,
+                           source.deleted_at
+                    from ns_finance_receivables source
+                    where (source.deleted_at IS NULL)
+                      and source.note = #{note}
+                ) nested
+                where (nested.deleted_at IS NOT NULL)
+                """);
+
+        assertThat(result.convertedSql())
+                .contains("CASE WHEN nested.deleted_at IS NOT NULL THEN 1 ELSE 0 END AS available")
+                .contains("CASE WHEN source.archived_at IS NULL THEN 1 ELSE 0 END AS active")
+                .contains("where (source.deleted_at IS NULL)")
+                .contains("where (nested.deleted_at IS NOT NULL)")
+                .contains("'(nested.deleted_at IS NULL) AS text_value' AS raw_text")
+                .contains("source.note = #{note}");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_BOOLEAN_NULL_PROJECTION_RULE);
+    }
+
+    @Test
+    void ignoresSelectKeywordsInsideQuotedIdentifiersAndCommentsWhenConvertingNullProjection() {
+        SqlConversionResult result = converter.convert("""
+                select source.`select`,
+                       -- FROM ignored_source
+                       (source.deleted_at IS NULL) AS active
+                from ns_finance_receivables source
+                """);
+
+        assertThat(result.convertedSql())
+                .contains("source.`select`")
+                .contains("-- FROM ignored_source")
+                .contains("CASE WHEN source.deleted_at IS NULL THEN 1 ELSE 0 END AS active");
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_BOOLEAN_NULL_PROJECTION_RULE);
+    }
+
+    @Test
     void convertsBareBooleanPredicateColumnsToEqualsOne() {
         SqlConversionResult result = converter.convert("""
                 select count(*)
