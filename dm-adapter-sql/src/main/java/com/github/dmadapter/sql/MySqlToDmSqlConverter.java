@@ -554,29 +554,20 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     @Override
     public SqlConversionResult convert(String sql, List<String> upsertKeyColumns) {
-        return convert(sql, upsertKeyColumns, List.of(), ReservedColumnRewriteMode.PHYSICAL_ONLY);
-    }
-
-    public SqlConversionResult convert(
-            String sql,
-            List<String> upsertKeyColumns,
-            ReservedColumnRewriteMode reservedColumnRewriteMode
-    ) {
-        return convert(sql, upsertKeyColumns, List.of(), reservedColumnRewriteMode);
+        return convert(sql, upsertKeyColumns, List.of());
     }
 
     public SqlConversionResult convertInsertIgnoreWithConflictKeyGroups(
             String sql,
             List<List<String>> conflictKeyGroups
     ) {
-        return convert(sql, List.of(), conflictKeyGroups, ReservedColumnRewriteMode.PHYSICAL_ONLY);
+        return convert(sql, List.of(), conflictKeyGroups);
     }
 
     private SqlConversionResult convert(
             String sql,
             List<String> upsertKeyColumns,
-            List<List<String>> insertIgnoreConflictKeyGroups,
-            ReservedColumnRewriteMode reservedColumnRewriteMode
+            List<List<String>> insertIgnoreConflictKeyGroups
     ) {
         if (sql == null || sql.isBlank()) {
             return SqlConversionResult.unchanged(sql == null ? "" : sql);
@@ -922,13 +913,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
 
         DamengReservedColumnRenamer.RenameResult renameResult =
-                DamengReservedColumnRenamer.renameBareIdentifiers(converted, reservedColumnRewriteMode);
+                DamengReservedColumnRenamer.renameBareIdentifiers(converted);
         if (renameResult.changed()) {
             converted = renameResult.convertedSql();
             rules.add(DamengReservedColumnRenamer.RULE_NAME);
-            if (renameResult.resultAliasAdded()) {
-                rules.add(DamengReservedColumnRenamer.RESULT_ALIAS_RULE_NAME);
-            }
         }
 
         GenericConversion deleteJoinConversion = convertMysqlJoinedDelete(converted);
