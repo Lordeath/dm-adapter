@@ -136,6 +136,7 @@ public class MigrateCommand implements Callable<Integer> {
     private MigrationReport lastMigrationReport;
     private SqlScriptMigrationReport lastSqlScriptMigrationReport;
     private boolean batchMode;
+    private Map<String, List<String>> batchTableKeyColumns = Map.of();
 
     @Override
     public Integer call() {
@@ -226,7 +227,9 @@ public class MigrateCommand implements Callable<Integer> {
 
             Path rewriteConfigPath = rewriteConfigPath(context);
             CliLogger.info("Loading SQL rewrite config: " + rewriteConfigPath);
-            SqlRewriteConfig loadedRewriteConfig = sqlRewriteConfigLoader.load(rewriteConfigPath);
+            SqlRewriteConfig loadedRewriteConfig = withBatchTableKeyColumns(
+                    sqlRewriteConfigLoader.load(rewriteConfigPath)
+            );
             AutoIncrementKindLookupResult autoIncrementKindLookupResult =
                     autoIncrementKindsForIdentityInsertTables(
                             context,
@@ -266,7 +269,8 @@ public class MigrateCommand implements Callable<Integer> {
                     rewriteConfigCandidates,
                     metadataLookupResult.metadataByTable(),
                     metadataLookupResult.available(),
-                    autoIncrementKindLookupResult.kindsByTable()
+                    autoIncrementKindLookupResult.kindsByTable(),
+                    batchTableKeyColumns
             );
             rewriteConfigUpdate.fileChange().ifPresent(fileChanges::add);
             warnings.addAll(rewriteConfigUpdate.warnings());
@@ -438,6 +442,24 @@ public class MigrateCommand implements Callable<Integer> {
                 : (rewriteConfig.isAbsolute()
                         ? rewriteConfig.toAbsolutePath().normalize()
                         : context.projectRoot().resolve(rewriteConfig).toAbsolutePath().normalize());
+    }
+
+    private SqlRewriteConfig withBatchTableKeyColumns(SqlRewriteConfig loaded) {
+        if (batchTableKeyColumns == null || batchTableKeyColumns.isEmpty()) {
+            return loaded;
+        }
+        Map<String, List<String>> merged = new LinkedHashMap<>(loaded.tableKeyColumns());
+        merged.putAll(new SqlRewriteConfig(batchTableKeyColumns, Map.of()).tableKeyColumns());
+        return new SqlRewriteConfig(
+                merged,
+                loaded.methodKeyColumns(),
+                loaded.ignoredMissingTables(),
+                loaded.ignoredMissingColumns(),
+                loaded.ignoredMissingSchemas(),
+                loaded.identityInsertTables(),
+                loaded.upsertKeyResolutions(),
+                loaded.methodConflictKeyGroups()
+        );
     }
 
     List<RewriteConfigCandidate> rewriteConfigCandidates(MapperMigrationResult mapperMigrationResult) {
@@ -853,6 +875,7 @@ public class MigrateCommand implements Callable<Integer> {
         migration.preservedSqlPaths = new ArrayList<>(request.preservedSqlPaths());
         migration.sqlScriptsOnly = request.sqlScriptsOnly();
         migration.targetLengthSemantics = request.targetLengthSemantics();
+        migration.batchTableKeyColumns = request.tableKeyColumns();
         migration.batchMode = true;
         int exitCode = migration.runMigration(DmValidationEnvironment.batchSilent());
         return new OfflineMigrationRun(

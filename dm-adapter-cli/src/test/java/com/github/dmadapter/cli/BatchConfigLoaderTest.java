@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -138,6 +139,74 @@ class BatchConfigLoaderTest {
         )).isEqualTo("Authentication failed for https://******@git.example.com/repository.git");
     }
 
+    @Test
+    void mergesGlobalAndRepositoryTableKeyColumns() throws Exception {
+        Path config = tempDir.resolve("upsert-keys.yml");
+        Files.writeString(config, """
+                schemaVersion: 1
+                workspaceDir: workspace
+                reportDir: reports
+                git:
+                  authorName: Batch Bot
+                  authorEmail: batch@example.com
+                  commitMessage: Convert SQL
+                migrationDefaults:
+                  upsertKeys:
+                    tables:
+                      "${schemaName}.charge_customerchargedetail_ext":
+                        keyColumns: [chargeDetailId]
+                      shared_table:
+                        keyColumns: [default_id]
+                  sql:
+                    mode: IF_PRESENT
+                    targetLengthSemantics: CHAR
+                repositories:
+                  - name: bill
+                    url: file:///tmp/bill.git
+                    branch: main
+                    migration:
+                      upsertKeys:
+                        tables:
+                          shared_table:
+                            keyColumns: [bill_id]
+                """);
+
+        ResolvedBatchConfig loaded = new BatchConfigLoader().load(config);
+
+        assertThat(loaded.repositories()).singleElement().satisfies(repository ->
+                assertThat(repository.migration().tableKeyColumns())
+                        .containsEntry("${schemaname}.charge_customerchargedetail_ext", List.of("chargeDetailId"))
+                        .containsEntry("shared_table", List.of("bill_id"))
+        );
+    }
+
+    @Test
+    void rejectsEmptyOrDuplicateTableKeyColumns() throws Exception {
+        Path empty = tempDir.resolve("empty-upsert-keys.yml");
+        Files.writeString(empty, baseConfigWithMigration("""
+                    upsertKeys:
+                      tables:
+                        sample_table:
+                          keyColumns: []
+                """));
+
+        assertThatThrownBy(() -> new BatchConfigLoader().load(empty))
+                .isInstanceOf(DmAdapterException.class)
+                .hasMessageContaining("keyColumns must not be empty");
+
+        Path duplicate = tempDir.resolve("duplicate-upsert-keys.yml");
+        Files.writeString(duplicate, baseConfigWithMigration("""
+                    upsertKeys:
+                      tables:
+                        sample_table:
+                          keyColumns: [id, ID]
+                """));
+
+        assertThatThrownBy(() -> new BatchConfigLoader().load(duplicate))
+                .isInstanceOf(DmAdapterException.class)
+                .hasMessageContaining("contains duplicate column");
+    }
+
     private String baseConfig(String repositories) {
         return """
                 schemaVersion: 1
@@ -153,5 +222,26 @@ class BatchConfigLoaderTest {
                     targetLengthSemantics: CHAR
                 repositories:
                 """ + repositories;
+    }
+
+    private String baseConfigWithMigration(String migration) {
+        return """
+                schemaVersion: 1
+                workspaceDir: workspace
+                reportDir: reports
+                git:
+                  authorName: Batch Bot
+                  authorEmail: batch@example.com
+                  commitMessage: Convert SQL
+                migrationDefaults:
+                """ + migration.strip().indent(2) + """
+                  sql:
+                    mode: IF_PRESENT
+                    targetLengthSemantics: CHAR
+                repositories:
+                  - name: service-a
+                    url: file:///tmp/service-a.git
+                    branch: main
+                """;
     }
 }

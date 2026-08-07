@@ -670,6 +670,12 @@ class SqlScriptMigrator {
                 .filter(validation -> validation.outputFile().equals(output))
                 .findFirst()
                 .orElse(new SqlScriptFileValidation(output, 0, List.of()));
+        Map<String, Long> manualReviewCountBySource = manualReviewItems.stream()
+                .collect(Collectors.groupingBy(
+                        SqlScriptManualReviewItem::sourceFile,
+                        LinkedHashMap::new,
+                        Collectors.counting()
+                ));
         List<SqlScriptFileResult> fileResults = plannedFiles.stream()
                 .map(file -> {
                     SqlScriptFileValidation validation = validationByOutput.apply(file.outputDisplay());
@@ -682,7 +688,7 @@ class SqlScriptMigrator {
                             file.converted(),
                             file.originalStatementCount(),
                             file.convertedStatementCount(),
-                            file.manualReviewStatementCount(),
+                            Math.toIntExact(manualReviewCountBySource.getOrDefault(file.sourceDisplay(), 0L)),
                             validation.successCount(),
                             validation.failureCount(),
                             file.appliedRules()

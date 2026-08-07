@@ -53,6 +53,14 @@ migrationDefaults:
   # rewriteConfig: ".dm-adapter/sql-rewrite.yml"
   sqlScriptsOnly: false
 
+  # 可选：为无法从当前仓库 DDL 获取元数据的 INSERT IGNORE/ON DUPLICATE KEY 配置真实表主键或唯一键。
+  # 表名需要与 Mapper SQL 中的写法一致；动态 schema 占位符按字面量配置。
+  upsertKeys:
+    tables:
+      "${schemaName}.charge_customerchargedetail_ext":
+        keyColumns:
+          - chargeDetailId
+
   sql:
     # IF_PRESENT：目录存在就转换，不存在则跳过。
     # REQUIRED：目录不存在时当前仓库失败。
@@ -96,6 +104,10 @@ repositories:
 - `name` 只允许字母、数字、点、下划线和连字符，且忽略大小写后不能重复。
 - `projectSubdir` 指向仓库内 Maven 项目根目录，必须存在 `pom.xml`。
 - `mapperDir`、`rewriteConfig`、SQL 输入输出目录均相对仓库检出根目录，而不是相对 `projectSubdir`。
+- `upsertKeys` 当前只支持 `tables`。每个表必须配置至少一个非空 `keyColumns`；只能填写已由业务 DDL 确认的主键或唯一键，不能根据字段名猜测。
+- `migrationDefaults.upsertKeys.tables` 对所有仓库生效；仓库自己的 `migration.upsertKeys.tables` 按表覆盖全局配置。
+- batch 内联的表主键优先于 `rewriteConfig` 中的同表配置；值不一致时使用内联配置，并在当前仓库迁移报告中输出告警。
+- 表名比较忽略大小写、反引号和双引号，但不会移除 schema。`${schemaName}.table_name` 与 `table_name` 是不同配置键。
 - `targetLengthSemantics` 在 SQL 模式为 `IF_PRESENT` 或 `REQUIRED` 时必须指定。`CHAR` 表示目标库按字符长度，`BYTE` 会在必要时生成显式 `VARCHAR(n CHAR)` / `CHAR(n CHAR)`。
 - 仓库 URL 不允许内嵌凭据。HTTP(S) 仓库必须同时配置全局 `username` 和 `password`；`file` URL 可不配凭据。
 - 当前 batch 模式故意不提供 schema 参数。它不会访问数据库，也不会生成 SQL 验证清单、调用验证器或输出 system-schema、外部存储过程未验证等数据库验证告警。

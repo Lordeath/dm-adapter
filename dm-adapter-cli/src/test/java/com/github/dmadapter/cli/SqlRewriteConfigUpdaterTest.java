@@ -92,6 +92,41 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
+    void batchTableKeyOverridesRewriteConfigAndWritesWarning() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        Files.createDirectories(config.getParent());
+        Files.writeString(config, """
+                upsertKeys:
+                  tables:
+                    "${schemaName}.charge_customerchargedetail_ext":
+                      keyColumns: [legacy_id]
+                  methods:
+                    {}
+                """);
+        SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                loaded,
+                List.of(),
+                Map.of(),
+                false,
+                Map.of(),
+                Map.of("${schemaName}.charge_customerchargedetail_ext", List.of("chargeDetailId"))
+        );
+
+        assertThat(update.rewriteConfig().tableKeyColumns())
+                .containsEntry("${schemaname}.charge_customerchargedetail_ext", List.of("chargeDetailId"));
+        assertThat(update.warnings()).singleElement().asString()
+                .contains("Batch upsert keyColumns override rewriteConfig")
+                .contains("[legacy_id] -> [chargeDetailId]");
+        assertThat(Files.readString(config))
+                .contains("keyColumns: [\"chargeDetailId\"]")
+                .doesNotContain("legacy_id");
+    }
+
+    @Test
     void preservesExistingMethodKeyColumnsWhenMetadataDiffers() throws Exception {
         Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         Files.createDirectories(config.getParent());

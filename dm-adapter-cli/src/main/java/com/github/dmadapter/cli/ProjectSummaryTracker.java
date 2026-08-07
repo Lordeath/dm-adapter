@@ -7,6 +7,7 @@ import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.MigrationReport;
 import com.github.dmadapter.core.OverallStatus;
 import com.github.dmadapter.core.SqlChange;
+import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
 import com.github.dmadapter.core.StageStatus;
@@ -84,6 +85,7 @@ final class ProjectSummaryTracker {
         reports.put("migrationMarkdown", fileName(paths.markdownPath()));
         reports.put("migrationJson", fileName(paths.jsonPath()));
         collectManualReviewCounts(report.autoConvertedSqlItems(), report.manualReviewSqlItems());
+        collectMapperManualReviewIssue(report.manualReviewSqlItems());
         write();
     }
 
@@ -171,6 +173,7 @@ final class ProjectSummaryTracker {
                     action("DATABASE_CONNECTION")
             ));
         }
+        collectSqlScriptManualReviewIssue(report.manualReviewItems());
         collectSqlScriptIssues(report.validationFailures());
         write();
     }
@@ -280,6 +283,50 @@ final class ProjectSummaryTracker {
         manualReview.put("uniqueStatements", (long) manualKeys.size());
         manualReview.put("overlapWithAutomatic", overlap);
         manualReview.put("genericDynamicStatements", genericDynamic);
+    }
+
+    private void collectMapperManualReviewIssue(List<SqlChange> manualReviewItems) {
+        long count = manualReviewItems == null
+                ? 0L
+                : manualReviewItems.stream().map(this::sqlChangeKey).distinct().count();
+        if (count == 0L) {
+            return;
+        }
+        issues.add(new SummaryIssue(
+                "ERROR",
+                "MAPPER_MIGRATION",
+                "MAPPER_MANUAL_REVIEW",
+                count,
+                count,
+                0,
+                "逐项修正 Mapper 迁移报告中的人工确认 SQL；未确认前 batch 不会提交或推送。"
+        ));
+    }
+
+    private void collectSqlScriptManualReviewIssue(List<SqlScriptManualReviewItem> manualReviewItems) {
+        if (manualReviewItems == null || manualReviewItems.isEmpty()) {
+            return;
+        }
+        long blocked = manualReviewItems.stream()
+                .filter(this::isManualReviewCascade)
+                .count();
+        long total = manualReviewItems.size();
+        issues.add(new SummaryIssue(
+                "ERROR",
+                "SQL_SCRIPT_MIGRATION",
+                "SQL_SCRIPT_MANUAL_REVIEW",
+                total,
+                total - blocked,
+                blocked,
+                "先修正 SQL 脚本报告中的根问题，再处理依赖这些存储过程的级联 CALL。"
+        ));
+    }
+
+    private boolean isManualReviewCascade(SqlScriptManualReviewItem item) {
+        String reason = item == null || item.reason() == null ? "" : item.reason();
+        return reason.contains("依赖需要人工确认的存储过程")
+                || reason.contains("依赖当前迁移队列中需要人工确认的存储过程")
+                || reason.contains("调用的存储过程存在无法安全自动处理的对象版本依赖");
     }
 
     private void collectSqlScriptIssues(List<SqlScriptValidationFailure> failures) {

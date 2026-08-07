@@ -4054,6 +4054,43 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void fileManualReviewCountUsesSourceItemsInsteadOfExpandedProcedureStatements() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        RecordingValidator validator = new RecordingValidator();
+        String longMarker = "M".repeat(3_100);
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_manual_count()
+                BEGIN
+                    CREATE TEMPORARY TABLE tmp_demo (id BIGINT NOT NULL);
+                    INSERT INTO tmp_demo(id)
+                    SELECT id FROM source_demo WHERE marker = '%s';
+                END$$
+                DELIMITER ;
+                """.formatted(longMarker));
+
+        SqlScriptMigrationReport report = migrator(validator).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-system",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
+        assertThat(report.manualReviewItems()).hasSize(1);
+        assertThat(report.files()).singleElement().satisfies(file ->
+                assertThat(file.manualReviewStatementCount()).isEqualTo(1)
+        );
+        assertThat(validator.files).singleElement().satisfies(file ->
+                assertThat(file.manualReviewStatementIndexes()).hasSizeGreaterThan(1)
+        );
+    }
+
+    @Test
     void convertsVeryLongUpdateValueToDisqlCompatibleClobBlockWithoutChangingContent() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");

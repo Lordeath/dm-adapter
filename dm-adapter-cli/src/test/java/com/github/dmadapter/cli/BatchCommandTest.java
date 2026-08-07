@@ -106,6 +106,59 @@ class BatchCommandTest {
     }
 
     @Test
+    void batchUsesGlobalTableKeyColumnsForDynamicSchemaInsertIgnore() throws Exception {
+        RemoteFixture remote = createRemote("configured-upsert", false);
+        pushRemoteChange(remote, "src/main/resources/mapper/UserMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UserMapper">
+                    <insert id="insertExt">
+                        insert ignore into ${schemaName}.charge_customerchargedetail_ext
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                chargeDetailId,
+                            </if>
+                            <if test="receivingBusiness != null">
+                                receivingBusiness,
+                            </if>
+                        </trim>
+                        <trim prefix="values (" suffix=")" suffixOverrides=",">
+                            <if test="id != null">
+                                #{id},
+                            </if>
+                            <if test="receivingBusiness != null">
+                                #{receivingBusiness},
+                            </if>
+                        </trim>
+                    </insert>
+                </mapper>
+                """);
+        Path config = writeConfig(remote);
+        Files.writeString(config, Files.readString(config).replace(
+                "migrationDefaults:\n",
+                """
+                migrationDefaults:
+                  upsertKeys:
+                    tables:
+                      "${schemaName}.charge_customerchargedetail_ext":
+                        keyColumns: [chargeDetailId]
+                """
+        ));
+
+        int exitCode = execute(config);
+
+        assertThat(exitCode).isZero();
+        assertThat(readRemoteFile(remote.remote(), "src/main/resources/mapper-dm/UserMapper.xml"))
+                .contains("MERGE INTO ${schemaName}.charge_customerchargedetail_ext t")
+                .contains("ON (t.chargeDetailId = s.chargeDetailId)")
+                .doesNotContainIgnoringCase("insert ignore");
+        assertThat(Files.readString(latestReportDir().resolve("configured-upsert/sql-rewrite.yml")))
+                .contains("\"${schemaname}.charge_customerchargedetail_ext\":")
+                .contains("keyColumns: [\"chargeDetailId\"]");
+    }
+
+    @Test
     void recreatesMarkedCorruptCache() throws Exception {
         RemoteFixture remote = createRemote("recover", false);
         Path config = writeConfig(remote);
