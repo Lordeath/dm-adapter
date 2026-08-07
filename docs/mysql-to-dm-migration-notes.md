@@ -66,7 +66,7 @@
 - MySQL `AUTO_INCREMENT` 和 `ALTER TABLE t AUTO_INCREMENT = n` 默认不再为了验证而改写。目标环境如果不支持或业务依赖重置序列语义，应按达梦身份列/序列方案人工确认，不能把 `AUTO_INCREMENT = n` 删除后留下半截 `ALTER TABLE`。
 - MySQL `ON UPDATE CURRENT_TIMESTAMP` 在达梦 53 环境验证失败，但达梦 53 支持 `ON UPDATE NOW()` 列属性，且无需触发器即可在更新普通列时自动刷新时间列。默认应把 `ON UPDATE CURRENT_TIMESTAMP` 改为 `ON UPDATE NOW()`；带精度的 `CURRENT_TIMESTAMP(n)` 必须对应为 `NOW(n)`，否则 `TIMESTAMP(n)` 会因表达式精度不匹配报“ON UPDATE 表达式错误”。只有目标达梦版本不支持 `ON UPDATE` 时，才退回触发器或应用 SQL 维护更新时间。
 - MySQL 允许在一条 `ALTER TABLE` 中连续写多个 `MODIFY COLUMN`，达梦需要把它们拆成按原顺序执行的独立 `ALTER TABLE ... MODIFY ...`。脚本转换必须保留第一条语句前的注释，并把每个字段修改作为独立验证单元。
-- `UPDATE ... SET a = value AND b = value` 在 MySQL 中会把 `AND` 解释为赋给 `a` 的布尔表达式，而不是同时更新 `a`、`b`；达梦会拒绝这种写法。工具无法判断业务究竟想用逗号更新两列，还是想计算单列布尔值，因此应保留原 SQL 并精确报告原始语义歧义。
+- `UPDATE ... SET a = value AND b = value` 在 MySQL 中会把 `AND` 解释为赋给 `a` 的布尔表达式，而不是同时更新 `a`、`b`；达梦会拒绝这种写法。工具无法判断业务究竟想用逗号更新两列，还是想计算单列布尔值，因此应保留原 SQL 并精确报告原始语义歧义。`SET a = CASE WHEN 条件1 AND 条件2 THEN ... END` 中的 `AND` 属于合法的 CASE 分支条件；本地 DM8 已验证普通 UPDATE、存储过程静态 UPDATE 和 `EXECUTE IMMEDIATE` 动态 UPDATE 均可执行，歧义检测不得把 CASE 内部的条件误认成第二个列赋值。
 - MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。业务代码同时读取 `COLUMN_TYPE`、注释和默认值时，可从 `SYS.SYSCOLUMNS`、`SYS.SYSOBJECTS`、`SYS.SYSCOLUMNCOMMENTS` 按运行时 schema 和表名重建相同投影；不得把某个项目的 schema 固化到转换规则。
 - `AES_ENCRYPT`、`AES_DECRYPT`、`MD5`、`TO_BASE64` 等加密/编码函数要逐项确认。当前不再把 Base64 包裹 AES 密码场景改写为达梦 `SF_*` 函数，优先通过系统库兼容函数保持 MySQL 调用形态，避免修改业务 SQL。
 - MySQL `/` 具有小数除法语义，达梦的整数/整数可能先截断；对可完整识别的数值、列、日期数值函数、聚合和无子查询括号表达式，应把分子转为 `DECIMAL(38,10)`，并把分母转为 `NULLIF(CAST(... AS DECIMAL(38,10)), 0)`。分母为 0 的容错和达梦参数相关，不能依赖实例容错；无法完整识别表达式边界时仍须人工确认。

@@ -15737,13 +15737,13 @@ class SqlScriptMigrator {
                     || !assignmentStart.matcher(assignments).find()) {
                 continue;
             }
-            int andIndex = topLevelKeywordIndex(assignments, "AND");
+            int andIndex = topLevelKeywordIndexOutsideCaseAfter(assignments, "AND", 0);
             while (andIndex >= 0) {
                 String afterAnd = assignments.substring(andIndex + "AND".length());
                 if (assignmentStart.matcher(afterAnd).find()) {
                     return true;
                 }
-                int next = topLevelKeywordIndexAfter(
+                int next = topLevelKeywordIndexOutsideCaseAfter(
                         assignments,
                         "AND",
                         andIndex + "AND".length()
@@ -15755,6 +15755,41 @@ class SqlScriptMigrator {
             }
         }
         return false;
+    }
+
+    private int topLevelKeywordIndexOutsideCaseAfter(String value, String keyword, int fromIndex) {
+        int index = Math.max(0, fromIndex);
+        int parenthesisDepth = 0;
+        int caseDepth = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(value, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(value, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(value, index);
+            } else if (current == '(') {
+                parenthesisDepth++;
+                index++;
+            } else if (current == ')') {
+                parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+                index++;
+            } else if (startsKeyword(value, index, "CASE")) {
+                caseDepth++;
+                index += "CASE".length();
+            } else if (caseDepth > 0 && startsKeyword(value, index, "END")) {
+                caseDepth--;
+                index += "END".length();
+            } else if (parenthesisDepth == 0
+                    && caseDepth == 0
+                    && startsKeyword(value, index, keyword)) {
+                return index;
+            } else {
+                index++;
+            }
+        }
+        return -1;
     }
 
     private String mysqlProcedureUnbalancedIfReason(String sql) {

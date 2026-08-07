@@ -1403,6 +1403,31 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void acceptsAndConditionsInsideUpdateCaseExpression() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE update_invoice_use_status()
+                BEGIN
+                    UPDATE ns_finance_invoice
+                    SET invoiceUseStatus = CASE
+                        WHEN usedTotalAmount = 0 THEN '0'
+                        WHEN usedTotalAmount > 0 AND usedTotalAmount < totalPriceAndTax THEN '1'
+                        WHEN usedTotalAmount > 0 AND usedTotalAmount = totalPriceAndTax THEN '2'
+                        ELSE invoiceUseStatus
+                    END
+                    WHERE businessType = 'INPUT' AND deleteFlag = 0;
+                END$$
+                DELIMITER ;
+                CALL update_invoice_use_status();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("WHEN usedTotalAmount > 0 AND usedTotalAmount = totalPriceAndTax THEN '2'")
+                .doesNotContain("原始 SQL 语义歧义");
+    }
+
+    @Test
     void reportsOriginalProcedureWithMissingEndIfAndSkipsDependentCall() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
