@@ -2924,7 +2924,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void leavesSingleTargetMysqlUpdateWithOuterJoinForManualHandling() {
+    void keepsDamengNativeSingleTargetMysqlUpdateWithOuterJoin() {
         SqlConversionResult result = converter.convert("""
                 UPDATE sample_target target
                 LEFT JOIN sample_source source ON target.source_id = source.id
@@ -2933,12 +2933,49 @@ class MySqlToDmSqlConverterTest {
                 """);
 
         assertThat(result.changed()).isFalse();
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.reason())
-                .contains("outer/cross UPDATE JOIN")
-                .contains("at most one source row")
-                .contains("real uniqueness guarantee");
+        assertThat(result.manualReviewRequired()).isFalse();
         assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void keepsDamengNativeSingleTargetUpdateWithInnerAndLeftJoinChain() {
+        String sql = """
+                update ns_system_organization o
+                inner join ys_organization y on o.sync_organization_id = y.sync_organization_id
+                left join ns_system_user u on y.organization_manager_id = u.ys_user_id
+                set o.organization_manager_id = u.user_id
+                where o.enterprise_id = y.enterprise_id
+                and o.enterprise_id = u.enterprise_id
+                and o.enterprise_id = #{enterpriseId}
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
+    void keepsDamengNativeSingleTargetUpdateWithDerivedLeftJoinSource() {
+        String sql = """
+                update ns_system_user u
+                inner join ys_user y on u.ys_user_id = y.sso_user_id
+                left join (
+                    select dictionaryitem_itemname, dictionaryitem_itemcode
+                    from ns_core_dictionaryitem
+                    where dictionaryitem_dictionary_id = 'dictionary-id'
+                ) c on y.sentry_name = c.dictionaryitem_itemname
+                set u.sentry_id = c.dictionaryitem_itemcode
+                where y.update_time >= #{lastFinishTime}
+                and c.dictionaryitem_itemcode is not null
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
     }
 
     @Test
@@ -3085,7 +3122,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void keepsLeftJoinUpdateManualWhenJoinDoesNotBindProvenUniqueKey() {
+    void keepsDamengNativeLeftJoinUpdateWithoutProvenUniqueKey() {
         SqlConversionResult result = converter.convertOuterJoinWithUniqueSourceKeys("""
                 UPDATE sample_detail detail
                 LEFT JOIN sample_header header ON detail.batch_code = header.batch_code
@@ -3093,12 +3130,11 @@ class MySqlToDmSqlConverterTest {
                 """, Map.of("sample_header", List.of("id")));
 
         assertThat(result.changed()).isFalse();
-        assertThat(result.manualReviewRequired()).isTrue();
-        assertThat(result.reason()).contains("real uniqueness guarantee");
+        assertThat(result.manualReviewRequired()).isFalse();
     }
 
     @Test
-    void leavesSingleTargetMysqlUpdateWithExplicitOuterJoinForManualHandling() {
+    void keepsDamengNativeSingleTargetMysqlUpdateWithExplicitOuterJoin() {
         SqlConversionResult result = converter.convert("""
                 UPDATE sample_target target
                 LEFT OUTER JOIN sample_source source ON target.source_id = source.id
@@ -3107,9 +3143,23 @@ class MySqlToDmSqlConverterTest {
                 """);
 
         assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
+    }
+
+    @Test
+    void keepsOuterJoinMultiTargetUpdateWithCrossAssignmentDependencyForManualReview() {
+        SqlConversionResult result = converter.convert("""
+                UPDATE sample_target target
+                LEFT JOIN sample_source source ON target.source_id = source.id
+                SET target.label = source.label,
+                    source.previous_label = target.label
+                WHERE target.is_deleted = 0
+                """);
+
+        assertThat(result.changed()).isFalse();
         assertThat(result.manualReviewRequired()).isTrue();
         assertThat(result.reason()).contains("UPDATE JOIN");
-        assertThat(result.convertedSql()).isEqualTo(result.originalSql());
     }
 
     @Test
