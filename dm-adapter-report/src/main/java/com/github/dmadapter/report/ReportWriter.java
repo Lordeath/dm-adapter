@@ -460,6 +460,9 @@ public class ReportWriter {
         if (status.equals("DM_SQL_VALIDATION is not true; SQL script validation skipped.")) {
             return "DM_SQL_VALIDATION 不是 true；已跳过 SQL 脚本试执行。";
         }
+        if (status.equals("Batch mode; SQL script database validation was not requested.")) {
+            return "Batch 模式未请求达梦 SQL 脚本试执行。";
+        }
         if (status.startsWith("DM_SQL_VALIDATION is true but required variables are missing: ")) {
             return "DM_SQL_VALIDATION=true，但缺少必要环境变量："
                     + status.substring("DM_SQL_VALIDATION is true but required variables are missing: ".length());

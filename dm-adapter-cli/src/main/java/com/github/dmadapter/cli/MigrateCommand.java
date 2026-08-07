@@ -135,6 +135,7 @@ public class MigrateCommand implements Callable<Integer> {
     private final DamengTargetCapabilitiesReader targetCapabilitiesReader = new DamengTargetCapabilitiesReader();
     private MigrationReport lastMigrationReport;
     private SqlScriptMigrationReport lastSqlScriptMigrationReport;
+    private boolean batchMode;
 
     @Override
     public Integer call() {
@@ -852,7 +853,8 @@ public class MigrateCommand implements Callable<Integer> {
         migration.preservedSqlPaths = new ArrayList<>(request.preservedSqlPaths());
         migration.sqlScriptsOnly = request.sqlScriptsOnly();
         migration.targetLengthSemantics = request.targetLengthSemantics();
-        int exitCode = migration.runMigration(DmValidationEnvironment.disabled());
+        migration.batchMode = true;
+        int exitCode = migration.runMigration(DmValidationEnvironment.batchSilent());
         return new OfflineMigrationRun(
                 exitCode,
                 migration.lastMigrationReport,
@@ -1013,8 +1015,10 @@ public class MigrateCommand implements Callable<Integer> {
         CliLogger.info("SQL script files: " + report.scannedFileCount());
         CliLogger.info("SQL script converted files: " + report.convertedFileCount());
         CliLogger.info("SQL script manual review SQL items: " + report.manualReviewSqlCount());
-        CliLogger.info("SQL script validation success SQL count: " + report.validationSuccessCount());
-        CliLogger.info("SQL script validation failed SQL count: " + report.validationFailureCount());
+        if (!batchMode) {
+            CliLogger.info("SQL script validation success SQL count: " + report.validationSuccessCount());
+            CliLogger.info("SQL script validation failed SQL count: " + report.validationFailureCount());
+        }
         CliLogger.info("SQL script report: " + result.reportPaths().markdownPath());
         if (!report.warnings().isEmpty()) {
             CliLogger.info("SQL script warnings:");
