@@ -11577,8 +11577,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private String firstMySqlFunctionRequiringReview(String sql) {
         for (String functionName : MYSQL_FUNCTIONS_REQUIRING_REVIEW) {
-            Pattern pattern = Pattern.compile("\\b" + Pattern.quote(functionName) + "\\s*\\(", Pattern.CASE_INSENSITIVE);
-            if (pattern.matcher(sql).find()) {
+            if (containsFunction(sql, functionName)) {
                 return functionName;
             }
         }

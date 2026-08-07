@@ -4056,6 +4056,75 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsLongExecuteImmediateLiteralsToVarcharVariablesInTheirBranches() throws Exception {
+        String firstPayload = "A".repeat(4_200);
+        String secondPayload = "中".repeat(1_500);
+        String firstDynamicSql = "CREATE TABLE demo_dynamic_a AS SELECT ''"
+                + firstPayload + "'' AS payload FROM dual";
+        String secondDynamicSql = "CREATE TABLE demo_dynamic_b AS SELECT ''"
+                + secondPayload + "'' AS payload FROM dual";
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE OR REPLACE PROCEDURE demo_long_dynamic_sql() AS
+                BEGIN
+                    IF 1 = 1 THEN
+                        EXECUTE IMMEDIATE '%s';
+                    ELSE
+                        EXECUTE IMMEDIATE '%s';
+                    END IF;
+                END;
+                /
+                CALL demo_long_dynamic_sql();
+                """.formatted(firstDynamicSql, secondDynamicSql));
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("dm_adapter_dynamic_sql_1 VARCHAR(32767);")
+                .contains("dm_adapter_dynamic_sql_2 VARCHAR(32767);")
+                .contains("IF 1 = 1 THEN\n        dm_adapter_dynamic_sql_1 := '")
+                .contains("EXECUTE IMMEDIATE dm_adapter_dynamic_sql_1;")
+                .contains("ELSE\n        dm_adapter_dynamic_sql_2 := '")
+                .contains("EXECUTE IMMEDIATE dm_adapter_dynamic_sql_2;")
+                .doesNotContain(firstPayload)
+                .doesNotContain(secondPayload);
+        assertThat(decodedVarcharAssignmentValue(converted.sql(), "dm_adapter_dynamic_sql_1"))
+                .isEqualTo(firstDynamicSql.replace("''", "'"));
+        assertThat(decodedVarcharAssignmentValue(converted.sql(), "dm_adapter_dynamic_sql_2"))
+                .isEqualTo(secondDynamicSql.replace("''", "'"));
+        assertThat(converted.sql().lines()
+                .mapToInt(line -> line.getBytes(StandardCharsets.UTF_8).length)
+                .max()
+                .orElse(0)).isLessThan(2_048);
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.DM_PROCEDURE_LONG_DYNAMIC_SQL_TO_VARCHAR_VARIABLE_RULE
+                ));
+    }
+
+    @Test
+    void keepsExecuteImmediateLiteralOverVarcharLimitForManualReview() throws Exception {
+        String payload = "X".repeat(33_000);
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE OR REPLACE PROCEDURE demo_oversized_dynamic_sql() AS
+                BEGIN
+                    EXECUTE IMMEDIATE 'CREATE TABLE demo_dynamic AS SELECT ''%s'' AS payload FROM dual';
+                END;
+                /
+                CALL demo_oversized_dynamic_sql();
+                """.formatted(payload));
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
+        assertThat(converted.report().manualReviewItems())
+                .anySatisfy(item -> assertThat(item.reason())
+                        .contains("EXECUTE IMMEDIATE")
+                        .contains("32767"))
+                .anySatisfy(item -> assertThat(item.reason())
+                        .contains("依赖需要人工确认的存储过程"));
+        assertThat(converted.sql())
+                .contains(payload)
+                .doesNotContain("dm_adapter_dynamic_sql_1 VARCHAR(32767)");
+    }
+
+    @Test
     void convertsSafeLongLiteralsInsideProcedureToClobVariables() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -9828,8 +9897,79 @@ class SqlScriptMigratorTest {
                 assertThat(file.appliedRules()).contains(
                         SqlScriptMigrator.MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE,
                         SqlScriptMigrator.MYSQL_TARGET_SCHEMA_QUALIFIER_REMOVAL_RULE,
+                            MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE
+                ));
+    }
+
+    @Test
+    void convertsCompleteSqlPayloadStoredByProcedureDml() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE seed_rule_sql()
+                BEGIN
+                    INSERT INTO tenant_rule (rule_id, rule_sql)
+                    SELECT 1,
+                           'SELECT DATE_ADD(created_at, INTERVAL 1 MONTH), DATE_SUB(CURDATE(), INTERVAL 30 DAY) FROM tenant_event'
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM tenant_rule WHERE rule_id = 1
+                    );
+                END;
+                /
+                CALL seed_rule_sql();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT DATEADD(MONTH, 1, created_at), "
+                        + "DATEADD(DAY, -30, CURDATE()) FROM tenant_event")
+                .doesNotContain("DATE_ADD")
+                .doesNotContain("DATE_SUB");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE,
+                        MySqlToDmSqlConverter.MYSQL_DATE_ADD_INTERVAL_RULE,
                         MySqlToDmSqlConverter.MYSQL_DATE_SUB_INTERVAL_RULE
                 ));
+    }
+
+    @Test
+    void leavesOrdinaryProcedureStringThatMentionsDateAddUnchanged() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE seed_rule_description()
+                BEGIN
+                    INSERT INTO tenant_rule (rule_id, rule_sql)
+                    SELECT 1, 'DATE_ADD(...) is documented here';
+                END;
+                /
+                CALL seed_rule_description();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).contains("'DATE_ADD(...) is documented here'");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE));
+    }
+
+    @Test
+    void keepsUnsafeSqlPayloadStoredByProcedureDmlForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE seed_unsafe_rule_sql()
+                BEGIN
+                    INSERT INTO tenant_rule (rule_id, rule_sql)
+                    SELECT 2, 'SELECT YEARWEEK(created_at, 3) FROM tenant_event';
+                END;
+                /
+                CALL seed_unsafe_rule_sql();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
+        assertThat(converted.report().manualReviewItems())
+                .anySatisfy(item -> assertThat(item.reason())
+                        .contains("作为字段值保存的 SQL 文本需要人工确认")
+                        .contains("YEARWEEK"))
+                .anySatisfy(item -> assertThat(item.reason())
+                        .contains("依赖需要人工确认的存储过程"));
+        assertThat(converted.sql()).contains("SELECT YEARWEEK(created_at, 3) FROM tenant_event");
     }
 
     @Test
@@ -9944,6 +10084,23 @@ class SqlScriptMigratorTest {
             int literalEnd = line.lastIndexOf(");");
             assertThat(literalEnd).isGreaterThan(literalStart);
             value.append(decodedDmSqlLiteral(line.substring(literalStart, literalEnd)));
+        }
+        return value.toString();
+    }
+
+    private String decodedVarcharAssignmentValue(String sql, String variableName) {
+        StringBuilder value = new StringBuilder();
+        Pattern assignmentPattern = Pattern.compile(
+                Pattern.quote(variableName)
+                        + " := (?:"
+                        + Pattern.quote(variableName)
+                        + " \\|\\| )?('(?:''|[^'])*');"
+        );
+        for (String line : sql.lines().toList()) {
+            Matcher matcher = assignmentPattern.matcher(line);
+            if (matcher.find()) {
+                value.append(decodedDmSqlLiteral(matcher.group(1)));
+            }
         }
         return value.toString();
     }

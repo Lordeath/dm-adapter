@@ -1808,6 +1808,18 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void ignoresMysqlDateFunctionsInsideStoredSqlStringLiterals() {
+        String sql = "select 'SELECT DATE_ADD(created_at, INTERVAL 1 DAY), "
+                + "DATE_SUB(CURDATE(), INTERVAL 30 DAY) FROM audit_log' AS rule_sql from dual";
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
     void convertsMysqlAdddateIntervalExpressionToDateadd() {
         SqlConversionResult result = converter.convert(
                 "select ADDDATE(now(), interval ifnull(c.accept_time,#{acceptOvertimeMinute}) - 5 minute)"
