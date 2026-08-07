@@ -29,6 +29,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
@@ -4025,7 +4027,7 @@ class SqlScriptMigratorTest {
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         String longJson = "[{\"id\":\"" + "A".repeat(3500) + "\"}]";
         write(sqlRoot.resolve("procedure.sql"), """
-                CALL batch_insert_ns_core_resourcecolumn('%s');
+                CALL unknown_business_procedure('%s');
                 """.formatted(longJson));
 
         SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
@@ -4051,6 +4053,100 @@ class SqlScriptMigratorTest {
                 .singleElement()
                 .satisfies(file -> assertThat(file.appliedRules())
                         .doesNotContain(SqlScriptMigrator.DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE));
+    }
+
+    @Test
+    void convertsSafeLongLiteralsInsideProcedureToClobVariables() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        String assignedValue = "表单🙂 O'Reilly C:\\archive\\2026 " + "中".repeat(1_100);
+        String callValue = "[{\"id\":\"" + "调用参数".repeat(900) + "\"}]";
+        String updateValue = "更新内容" + "U".repeat(3_100);
+        String insertSelectValue = "插入投影" + "I".repeat(3_100);
+        write(sqlRoot.resolve("procedure.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE demo_long_literals()
+                BEGIN
+                    SET @new_form_data = '%s';
+                    CALL batch_insert_ns_core_tablecolumn('%s');
+                    IF 1 = 1 THEN
+                        UPDATE demo_form SET form_content = '%s' WHERE id = 1;
+                    END IF;
+                    INSERT INTO demo_archive(id, payload)
+                    SELECT 1, '%s' FROM dual;
+                END$$
+                DELIMITER ;
+                CALL demo_long_literals();
+                """.formatted(
+                assignedValue.replace("'", "''"),
+                callValue,
+                updateValue,
+                insertSelectValue
+        ));
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-system",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        String converted = Files.readString(sqlRootOut.resolve("procedure.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("dm_new_form_data CLOB;")
+                .contains("dm_new_form_data := TO_CLOB('")
+                .contains("dm_new_form_data := dm_new_form_data || TO_CLOB('")
+                .contains("CALL batch_insert_ns_core_tablecolumn(dm_adapter_clob_value_")
+                .contains("UPDATE demo_form SET form_content = dm_adapter_clob_value_")
+                .contains("SELECT 1, dm_adapter_clob_value_")
+                .contains("CALL demo_long_literals()")
+                .doesNotContain(callValue)
+                .doesNotContain(updateValue)
+                .doesNotContain(insertSelectValue);
+        assertThat(decodedClobAssignmentValue(converted, "dm_new_form_data"))
+                .isEqualTo(assignedValue);
+        assertThat(converted.lines()
+                .mapToInt(line -> line.getBytes(StandardCharsets.UTF_8).length)
+                .max()
+                .orElse(0)).isLessThan(2_048);
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE_RULE));
+
+        Matcher callVariable = Pattern.compile(
+                "CALL batch_insert_ns_core_tablecolumn\\((dm_adapter_clob_value_[A-Za-z0-9_]+)\\)"
+        ).matcher(converted);
+        assertThat(callVariable.find()).isTrue();
+        assertThat(decodedClobAssignmentValue(converted, callVariable.group(1))).isEqualTo(callValue);
+    }
+
+    @Test
+    void keepsUnknownLongCallInsideProcedureForManualReview() throws Exception {
+        String longValue = "未知参数" + "X".repeat(3_100);
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE demo_unknown_call()
+                BEGIN
+                    CALL unknown_business_procedure('%s');
+                END$$
+                DELIMITER ;
+                CALL demo_unknown_call();
+                """.formatted(longValue));
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(2);
+        assertThat(converted.report().manualReviewItems())
+                .anySatisfy(item -> assertThat(item.reason()).contains("已知大字段 CALL 参数"))
+                .anySatisfy(item -> assertThat(item.reason()).contains("依赖需要人工确认的存储过程"));
+        assertThat(converted.sql())
+                .contains(longValue)
+                .doesNotContain("dm_adapter_clob_value_");
     }
 
     @Test

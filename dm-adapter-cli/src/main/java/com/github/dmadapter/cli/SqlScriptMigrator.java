@@ -139,6 +139,8 @@ class SqlScriptMigrator {
             "DM_LONG_CLOB_CALL_ARGUMENT_BLOCK";
     static final String DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK_RULE =
             "DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK";
+    static final String DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE_RULE =
+            "DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE";
     static final String DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK_RULE =
             "DM_PROCEDURE_CLOB_EMPTY_STRING_CHECK";
     static final String MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE =
@@ -315,15 +317,22 @@ class SqlScriptMigrator {
     private static final Pattern CLOB_EMPTY_STRING_COMPARISON_PATTERN = Pattern.compile(
             "(?is)(?<left>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*(?:<>|!=)\\s*''"
     );
-    private static final int DM_CLOB_CALL_LITERAL_THRESHOLD = 3000;
     private static final int DM_CLOB_LITERAL_CHUNK_BYTES = 900;
     private static final int DM_DISQL_LONG_LITERAL_THRESHOLD_BYTES = 3000;
     private static final int DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES = 20 * 1024 * 1024;
     private static final String DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON =
-            "SQL 包含超过 3000 字节的字符串，但它不在可安全自动拆分的 UPDATE SET、"
-                    + "INSERT VALUES 或 MERGE 直接赋值位置；已保留原 SQL，请人工拆分为 CLOB 匿名块后执行。";
+            "SQL 包含超过 3000 字节的字符串，但它不在可安全自动拆分的 CLOB 变量赋值、"
+                    + "已知大字段 CALL 参数、UPDATE SET、INSERT VALUES、INSERT SELECT "
+                    + "或 MERGE 的直接赋值位置；"
+                    + "已保留原 SQL，请人工拆分为 CLOB 变量或匿名块后执行。";
     private static final Map<String, Set<Integer>> DM_CALL_CLOB_ARGUMENT_INDEXES = Map.of(
-            "addall_ns_report_management_20240314", Set.of(7, 8)
+            "addall_ns_report_management_20240314", Set.of(7, 8),
+            "batch_insert_ns_core_tablecolumn", Set.of(0),
+            "batch_insert_ns_core_resourcecolumn", Set.of(0),
+            "batch_insert_ns_core_permission", Set.of(0),
+            "batch_insert_ns_core_dictionarygroup", Set.of(0),
+            "batch_insert_ns_core_dictionary", Set.of(0),
+            "batch_insert_ns_core_dictionaryitem", Set.of(0)
     );
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
     private static final List<ProcedureTempTableColumn> PROCEDURE_TEMP_TABLE_DEFAULT_COLUMNS = List.of(
@@ -8122,7 +8131,8 @@ class SqlScriptMigrator {
         String stripped = value == null ? "" : value.strip();
         return stripped.startsWith("'")
                 && skipSingleQuotedString(stripped, 0) == stripped.length()
-                && stripped.length() - 2 > DM_CLOB_CALL_LITERAL_THRESHOLD;
+                && decodeMysqlSingleQuotedLiteral(stripped)
+                        .getBytes(StandardCharsets.UTF_8).length > DM_DISQL_LONG_LITERAL_THRESHOLD_BYTES;
     }
 
     private void appendClobLiteralAssignments(StringBuilder block, String variableName, String literal) {
@@ -11968,7 +11978,8 @@ class SqlScriptMigrator {
                 continue;
             }
             String literal = assignedStringLiteral(sql, reference);
-            if (literal.length() > 3500) {
+            if (literal.getBytes(StandardCharsets.UTF_8).length
+                    > DM_DISQL_LONG_LITERAL_THRESHOLD_BYTES) {
                 return true;
             }
         }
@@ -16011,26 +16022,45 @@ class SqlScriptMigrator {
         if (conversion.manualReviewRequired()) {
             return conversion;
         }
-        LongDmlClobRewrite outputRewrite = convertLongDirectDmlLiteralsToClobBlock(conversion.outputSql());
+        LongDmlClobRewrite outputProcedureRewrite =
+                convertLongProcedureLiteralsToClobVariables(conversion.outputSql());
+        if (!outputProcedureRewrite.manualReviewReason().isBlank()) {
+            return longDmlLiteralManualReview(conversion, outputProcedureRewrite.manualReviewReason());
+        }
+        LongDmlClobRewrite outputRewrite =
+                convertLongDirectDmlLiteralsToClobBlock(outputProcedureRewrite.sql());
         if (!outputRewrite.manualReviewReason().isBlank()) {
             return longDmlLiteralManualReview(conversion, outputRewrite.manualReviewReason());
         }
         List<String> additionalOutputStatements = new ArrayList<>(conversion.additionalOutputStatements().size());
-        boolean changed = outputRewrite.changed();
+        boolean procedureChanged = outputProcedureRewrite.changed();
+        boolean dmlChanged = outputRewrite.changed();
         for (String additionalOutputStatement : conversion.additionalOutputStatements()) {
-            LongDmlClobRewrite additionalRewrite =
-                    convertLongDirectDmlLiteralsToClobBlock(additionalOutputStatement);
+            LongDmlClobRewrite additionalProcedureRewrite =
+                    convertLongProcedureLiteralsToClobVariables(additionalOutputStatement);
+            if (!additionalProcedureRewrite.manualReviewReason().isBlank()) {
+                return longDmlLiteralManualReview(conversion, additionalProcedureRewrite.manualReviewReason());
+            }
+            LongDmlClobRewrite additionalRewrite = convertLongDirectDmlLiteralsToClobBlock(
+                    additionalProcedureRewrite.sql()
+            );
             if (!additionalRewrite.manualReviewReason().isBlank()) {
                 return longDmlLiteralManualReview(conversion, additionalRewrite.manualReviewReason());
             }
             additionalOutputStatements.add(additionalRewrite.sql());
-            changed = changed || additionalRewrite.changed();
+            procedureChanged = procedureChanged || additionalProcedureRewrite.changed();
+            dmlChanged = dmlChanged || additionalRewrite.changed();
         }
-        if (!changed) {
+        if (!procedureChanged && !dmlChanged) {
             return conversion;
         }
         List<String> rules = new ArrayList<>(conversion.appliedRules());
-        rules.add(DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK_RULE);
+        if (procedureChanged) {
+            rules.add(DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE_RULE);
+        }
+        if (dmlChanged) {
+            rules.add(DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK_RULE);
+        }
         String convertedSql = conversion.convertedSql().equals(conversion.outputSql())
                 ? outputRewrite.sql()
                 : conversion.convertedSql();
@@ -16059,6 +16089,344 @@ class SqlScriptMigrator {
                 reason,
                 conversion.appliedRules()
         );
+    }
+
+    private LongDmlClobRewrite convertLongProcedureLiteralsToClobVariables(String sql) {
+        if (sql == null || sql.isBlank() || !isCreateProcedureStatement(sql)) {
+            return LongDmlClobRewrite.unchanged(sql == null ? "" : sql);
+        }
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0) {
+            return LongDmlClobRewrite.unchanged(sql);
+        }
+        List<DmStringLiteral> longLiterals = longDmStringLiterals(sql).stream()
+                .filter(literal -> literal.start() > beginIndex)
+                .toList();
+        if (longLiterals.isEmpty()) {
+            return LongDmlClobRewrite.unchanged(sql);
+        }
+        for (DmStringLiteral literal : longLiterals) {
+            if (literal.utf8Bytes() > DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES) {
+                return LongDmlClobRewrite.manual(
+                        sql,
+                        "存储过程内单个字符串超过 20MB，超出自动 CLOB 拆分上限；"
+                                + "已保留原 SQL，请人工处理。"
+                );
+            }
+        }
+
+        LinkedHashMap<TextRange, ProcedureLongLiteralTarget> targets = new LinkedHashMap<>();
+        collectDirectProcedureClobAssignments(sql, longLiterals, targets);
+        collectKnownProcedureClobCallArguments(sql, beginIndex, targets);
+        collectDirectProcedureDmlLiterals(sql, targets);
+        for (DmStringLiteral literal : longLiterals) {
+            if (!targets.containsKey(new TextRange(literal.start(), literal.end()))) {
+                return LongDmlClobRewrite.manual(sql, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
+            }
+        }
+
+        LinkedHashSet<String> existingNames = procedureNamesInScope(sql, beginIndex);
+        List<ResolvedProcedureLongLiteral> resolvedTargets = new ArrayList<>(longLiterals.size());
+        int generatedVariableIndex = 1;
+        for (DmStringLiteral literal : longLiterals) {
+            ProcedureLongLiteralTarget target = targets.get(new TextRange(literal.start(), literal.end()));
+            String variableName = target.existingVariable();
+            boolean declareVariable = variableName.isBlank();
+            if (declareVariable) {
+                variableName = uniqueProcedureLocalName(
+                        "dm_adapter_clob_value_" + generatedVariableIndex,
+                        existingNames
+                );
+                generatedVariableIndex++;
+            }
+            resolvedTargets.add(new ResolvedProcedureLongLiteral(
+                    literal,
+                    variableName,
+                    target.insertionIndex(),
+                    target.indent(),
+                    declareVariable
+            ));
+        }
+
+        List<RoutineTextReplacement> replacements = new ArrayList<>();
+        LinkedHashMap<Integer, StringBuilder> assignmentsByInsertion = new LinkedHashMap<>();
+        for (ResolvedProcedureLongLiteral target : resolvedTargets) {
+            DmStringLiteral literal = target.literal();
+            if (!target.declareVariable()) {
+                replacements.add(new RoutineTextReplacement(
+                        literal.start(),
+                        literal.end(),
+                        clobAssignmentContinuation(
+                                target.variableName(),
+                                literal.value(),
+                                target.indent()
+                        )
+                ));
+                continue;
+            }
+            replacements.add(new RoutineTextReplacement(
+                    literal.start(),
+                    literal.end(),
+                    target.variableName()
+            ));
+            StringBuilder assignments = assignmentsByInsertion.computeIfAbsent(
+                    target.insertionIndex(),
+                    ignored -> new StringBuilder()
+            );
+            appendProcedureClobAssignments(
+                    assignments,
+                    target.variableName(),
+                    literal.value(),
+                    target.indent()
+            );
+        }
+        assignmentsByInsertion.forEach((insertionIndex, assignments) ->
+                replacements.add(new RoutineTextReplacement(
+                        insertionIndex,
+                        insertionIndex,
+                        assignments.toString()
+                ))
+        );
+        replacements.sort(Comparator.comparingInt(RoutineTextReplacement::start).reversed());
+        StringBuilder rewritten = new StringBuilder(sql);
+        for (RoutineTextReplacement replacement : replacements) {
+            rewritten.replace(replacement.start(), replacement.end(), replacement.replacement());
+        }
+
+        List<String> declarations = resolvedTargets.stream()
+                .filter(ResolvedProcedureLongLiteral::declareVariable)
+                .map(target -> "    " + target.variableName() + " CLOB;\n")
+                .toList();
+        if (!declarations.isEmpty()) {
+            int rewrittenBeginIndex = firstProcedureBegin(rewritten.toString());
+            if (rewrittenBeginIndex < 0) {
+                return LongDmlClobRewrite.manual(sql, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
+            }
+            int declarationInsertIndex = procedureUserVariableDeclarationInsertIndex(
+                    rewritten.toString(),
+                    rewrittenBeginIndex
+            );
+            rewritten.insert(declarationInsertIndex, String.join("", declarations));
+        }
+        return LongDmlClobRewrite.changed(rewritten.toString());
+    }
+
+    private void collectDirectProcedureClobAssignments(
+            String sql,
+            List<DmStringLiteral> longLiterals,
+            Map<TextRange, ProcedureLongLiteralTarget> targets
+    ) {
+        Map<String, String> variableTypes = procedureVariableTypesByLowercase(sql);
+        for (DmStringLiteral literal : longLiterals) {
+            int statementEnd = skipWhitespace(sql, literal.end());
+            if (statementEnd >= sql.length() || sql.charAt(statementEnd) != ';') {
+                continue;
+            }
+            int equalsIndex = previousNonWhitespace(sql, literal.start() - 1);
+            int colonIndex = previousNonWhitespace(sql, equalsIndex - 1);
+            if (equalsIndex < 0
+                    || colonIndex < 0
+                    || sql.charAt(equalsIndex) != '='
+                    || sql.charAt(colonIndex) != ':') {
+                continue;
+            }
+            int variableEnd = previousNonWhitespace(sql, colonIndex - 1) + 1;
+            int variableStart = variableEnd;
+            while (variableStart > 0 && isIdentifierPart(sql.charAt(variableStart - 1))) {
+                variableStart--;
+            }
+            if (variableStart >= variableEnd) {
+                continue;
+            }
+            String variableName = sql.substring(variableStart, variableEnd);
+            String variableType = variableTypes.getOrDefault(
+                    normalizedProcedureVariableName(variableName),
+                    ""
+            );
+            if (!Pattern.compile("(?i)\\bCLOB\\b").matcher(variableType).find()) {
+                continue;
+            }
+            targets.putIfAbsent(
+                    new TextRange(literal.start(), literal.end()),
+                    new ProcedureLongLiteralTarget(-1, lineIndentBefore(sql, variableStart), variableName)
+            );
+        }
+    }
+
+    private void collectKnownProcedureClobCallArguments(
+            String sql,
+            int beginIndex,
+            Map<TextRange, ProcedureLongLiteralTarget> targets
+    ) {
+        int index = beginIndex + "BEGIN".length();
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipDmSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "CALL")) {
+                int procedureStart = skipWhitespace(sql, index + "CALL".length());
+                SqlIdentifierReference procedure = sqlIdentifierReferenceAt(sql, procedureStart);
+                if (procedure == null) {
+                    index += "CALL".length();
+                    continue;
+                }
+                String procedureName = unquoteIdentifier(lastIdentifierPart(procedure.token()))
+                        .toLowerCase(Locale.ROOT);
+                Set<Integer> clobArgumentIndexes = DM_CALL_CLOB_ARGUMENT_INDEXES.get(procedureName);
+                int openParen = skipWhitespace(sql, procedure.end());
+                if (clobArgumentIndexes == null
+                        || clobArgumentIndexes.isEmpty()
+                        || openParen >= sql.length()
+                        || sql.charAt(openParen) != '(') {
+                    index = procedure.end();
+                    continue;
+                }
+                int closeParen = findMatchingParen(sql, openParen);
+                if (closeParen <= openParen) {
+                    index = openParen + 1;
+                    continue;
+                }
+                List<TextRange> arguments = splitDmTopLevelRanges(sql, openParen + 1, closeParen);
+                for (int argumentIndex : clobArgumentIndexes) {
+                    if (argumentIndex < 0 || argumentIndex >= arguments.size()) {
+                        continue;
+                    }
+                    TextRange argument = arguments.get(argumentIndex);
+                    TextRange literal = directDmStringLiteralRange(sql, argument.start(), argument.end());
+                    if (literal != null) {
+                        targets.putIfAbsent(
+                                literal,
+                                new ProcedureLongLiteralTarget(
+                                        index,
+                                        lineIndentBefore(sql, index),
+                                        ""
+                                )
+                        );
+                    }
+                }
+                index = closeParen + 1;
+            } else {
+                index++;
+            }
+        }
+    }
+
+    private void collectDirectProcedureDmlLiterals(
+            String sql,
+            Map<TextRange, ProcedureLongLiteralTarget> targets
+    ) {
+        for (RoutineSqlStatement routineStatement : routineSqlStatements(sql)) {
+            String statement = sql.substring(routineStatement.start(), routineStatement.end());
+            int start = skipWhitespace(statement, 0);
+            boolean update = startsKeyword(statement, start, "UPDATE");
+            boolean insert = startsKeyword(statement, start, "INSERT");
+            boolean merge = startsKeyword(statement, start, "MERGE");
+            if (!update && !insert && !merge) {
+                continue;
+            }
+            LinkedHashSet<TextRange> statementRanges = new LinkedHashSet<>();
+            if (update || merge) {
+                collectDirectUpdateSetLiteralRanges(statement, statementRanges, merge);
+            }
+            if (insert || merge) {
+                collectDirectInsertValuesLiteralRanges(statement, statementRanges);
+            }
+            if (insert) {
+                collectDirectInsertSelectLiteralRanges(statement, statementRanges);
+            }
+            for (TextRange range : statementRanges) {
+                TextRange absoluteRange = new TextRange(
+                        routineStatement.start() + range.start(),
+                        routineStatement.start() + range.end()
+                );
+                targets.putIfAbsent(
+                        absoluteRange,
+                        new ProcedureLongLiteralTarget(
+                                routineStatement.start(),
+                                lineIndentBefore(sql, routineStatement.start()),
+                                ""
+                        )
+                );
+            }
+        }
+    }
+
+    private void collectDirectInsertSelectLiteralRanges(String sql, Set<TextRange> ranges) {
+        int start = skipWhitespace(sql, 0);
+        if (!startsKeyword(sql, start, "INSERT")) {
+            return;
+        }
+        int selectIndex = dmTopLevelKeywordIndexAfter(sql, "SELECT", start + "INSERT".length());
+        if (selectIndex < 0) {
+            return;
+        }
+        int projectionStart = skipWhitespace(sql, selectIndex + "SELECT".length());
+        for (String modifier : List.of("DISTINCT", "ALL")) {
+            if (startsKeyword(sql, projectionStart, modifier)) {
+                projectionStart = skipWhitespace(sql, projectionStart + modifier.length());
+                break;
+            }
+        }
+        int fromIndex = dmTopLevelKeywordIndexAfter(sql, "FROM", projectionStart);
+        int projectionEnd = fromIndex < 0 ? sql.length() : fromIndex;
+        for (TextRange projection : splitDmTopLevelRanges(sql, projectionStart, projectionEnd)) {
+            TextRange literal = directDmStringLiteralRange(sql, projection.start(), projection.end());
+            if (literal != null) {
+                ranges.add(literal);
+            }
+        }
+    }
+
+    private String clobAssignmentContinuation(String variableName, String literal, String indent) {
+        List<String> chunks = splitTextByUtf8Bytes(literal, DM_CLOB_LITERAL_CHUNK_BYTES);
+        StringBuilder replacement = new StringBuilder(literal.length() + 128);
+        for (int index = 0; index < chunks.size(); index++) {
+            if (index == 0) {
+                replacement.append("TO_CLOB(")
+                        .append(sqlStringLiteral(chunks.get(index)))
+                        .append(")");
+            } else {
+                replacement.append(";\n")
+                        .append(indent)
+                        .append(variableName)
+                        .append(" := ")
+                        .append(variableName)
+                        .append(" || TO_CLOB(")
+                        .append(sqlStringLiteral(chunks.get(index)))
+                        .append(")");
+            }
+        }
+        return replacement.toString();
+    }
+
+    private void appendProcedureClobAssignments(
+            StringBuilder assignments,
+            String variableName,
+            String literal,
+            String indent
+    ) {
+        List<String> chunks = splitTextByUtf8Bytes(literal, DM_CLOB_LITERAL_CHUNK_BYTES);
+        for (int index = 0; index < chunks.size(); index++) {
+            if (index > 0) {
+                assignments.append(indent);
+            }
+            assignments.append(variableName).append(" := ");
+            if (index > 0) {
+                assignments.append(variableName).append(" || ");
+            }
+            assignments.append("TO_CLOB(")
+                    .append(sqlStringLiteral(chunks.get(index)))
+                    .append(");\n");
+        }
+        assignments.append(indent);
     }
 
     private LongDmlClobRewrite convertLongDirectDmlLiteralsToClobBlock(String sql) {
@@ -16887,6 +17255,29 @@ class SqlScriptMigrator {
     }
 
     private record LongDmlClobValue(String variableName, String literal) {
+    }
+
+    private record ProcedureLongLiteralTarget(
+            int insertionIndex,
+            String indent,
+            String existingVariable
+    ) {
+        private ProcedureLongLiteralTarget {
+            indent = indent == null ? "" : indent;
+            existingVariable = existingVariable == null ? "" : existingVariable;
+        }
+    }
+
+    private record ResolvedProcedureLongLiteral(
+            DmStringLiteral literal,
+            String variableName,
+            int insertionIndex,
+            String indent,
+            boolean declareVariable
+    ) {
+        private ResolvedProcedureLongLiteral {
+            indent = indent == null ? "" : indent;
+        }
     }
 
     private record LongDmlClobRewrite(
