@@ -42,7 +42,7 @@
 - MySQL 可在查询列中用 `(列 IS [NOT] NULL) AS 标志` 直接返回 0/1，达梦不接受这种布尔投影；工具应转换为 `CASE WHEN 列 IS [NOT] NULL THEN 1 ELSE 0 END AS 标志`，且不能改写 `WHERE` 中本来合法的空值判断。
 - `NOW()` 与达梦 `SYSDATE` 在 53 环境中存在时区/时间来源差异，不能再把 `NOW()` 盲目替换为 `SYSDATE`。原始 mapper 中也应保留 MySQL 函数形态，不能把达梦函数反写到原始 MySQL XML。
 - MySQL `GROUP_CONCAT(DISTINCT a, ',', b)` 这类聚合不能保留 MySQL 形态，要先把参数拼接为一个表达式，再转为达梦 `LISTAGG(DISTINCT ..., ',') WITHIN GROUP (...)`。
-- MySQL 允许在 `HAVING` 中写未聚合、未列入 `GROUP BY` 的普通列条件，达梦会报“无效的 HAVING 项”。仅由 `AND` 连接、没有聚合函数、子查询、`OR` 或动态标识符的普通比较条件，应前移到同一查询作用域的 `WHERE`，聚合条件继续保留在 `HAVING`；嵌套子查询必须在各自作用域内改写。
+- MySQL 允许在 `HAVING` 中写未聚合、未列入 `GROUP BY` 的普通列条件，达梦会报“无效的 HAVING 项”。仅由 `AND` 连接、没有聚合函数、子查询、`OR` 或动态标识符的普通比较条件，应前移到同一查询作用域的 `WHERE`，聚合条件继续保留在 `HAVING`；嵌套子查询必须在各自作用域内改写。达梦允许 `HAVING` 直接过滤实际分组列，因此条件位于 MyBatis `<if>` 内且不能安全前移时，只要静态 `GROUP BY` 或完整 `<choose>` 的每个 `<when>`/`<otherwise>` 分支都明确包含条件引用的普通列，就应保留原 `HAVING` 且不报告人工确认；缺少兜底分支、使用动态分组表达式或任一分支无法证明时仍须人工确认。
 - MySQL `REGEXP`/`NOT REGEXP` 操作符应改写为达梦 `REGEXP_LIKE`。右侧表达式如果已经是达梦可执行的 `CONCAT(...)`，不需要额外转成 `||`。
 - MySQL `DATE_ADD`/`DATE_SUB`/`INTERVAL` 形式应改写为 `DATEADD`。`YEARWEEK`、无法识别的 `DATE_ADD`/`DATE_SUB` 形态、以及未被规则覆盖的 `PERIOD_DIFF` 需要人工确认；已识别的 `PERIOD_DIFF(DATE_FORMAT(...,'%Y%m'), ...)` 可转为月份差。通用函数风险扫描必须跳过普通字符串字面量，避免把配置文案或待存储的 SQL 文本误报成当前语句的函数风险；但顶层 DML 或普通存储过程内 `INSERT`、`UPDATE`、`MERGE` 直接写入字段、且内容以 `SELECT`、`WITH`、`INSERT`、`UPDATE`、`DELETE`、`MERGE` 开头的完整 SQL 字符串，应作为内嵌 SQL 单独执行同一套安全转换。内嵌 SQL 无法完整转换时仍须保留原值并进入人工确认，不能只消除告警。
 - MySQL `CONVERT(expr, DECIMAL(n))`、`CONVERT(expr, DECIMAL(n,m))` 应转为 `CAST(expr AS DECIMAL(...))`，不能按达梦 `CONVERT` 函数原样保留。
