@@ -3208,6 +3208,15 @@ public class MapperXmlRewriter {
             if (isSafeAggregateHavingExpression(havingContent)) {
                 return ScopeHavingConversion.unchanged(body);
             }
+            if (isSafeGroupedColumnHavingExpression(
+                    body,
+                    scope,
+                    enclosingHavingIf,
+                    havingContent,
+                    selectAliases
+            )) {
+                return ScopeHavingConversion.unchanged(body);
+            }
             return ScopeHavingConversion.manualReview(
                     body,
                     "HAVING is enclosed by a MyBatis <if> block that cannot be moved before dynamic GROUP BY "
@@ -3496,6 +3505,172 @@ public class MapperXmlRewriter {
         }
         rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
         return new ScopeHavingConversion(converted, rules, true);
+    }
+
+    private boolean isSafeGroupedColumnHavingExpression(
+            String body,
+            SelectScope scope,
+            XmlBlock havingIf,
+            String havingContent,
+            Map<String, SelectAlias> selectAliases
+    ) {
+        String normalizedHaving = stripXmlMarkup(havingContent);
+        if (normalizedHaving.isBlank()
+                || containsAggregateFunction(normalizedHaving)
+                || containsSqlFunctionCall(normalizedHaving)
+                || containsKeyword(normalizedHaving, "SELECT")
+                || containsKeyword(normalizedHaving, "EXISTS")
+                || normalizedHaving.indexOf('@') >= 0
+                || !containsComparisonOperator(normalizedHaving)) {
+            return false;
+        }
+        Set<String> havingColumns = conditionColumnReferences(normalizedHaving);
+        if (havingColumns.isEmpty() || referencesComputedSelectAlias(havingColumns, selectAliases)) {
+            return false;
+        }
+        List<Set<String>> groupByAlternatives = groupByIdentifierAlternatives(body, scope, havingIf);
+        return !groupByAlternatives.isEmpty()
+                && groupByAlternatives.stream().allMatch(columns -> columns.containsAll(havingColumns));
+    }
+
+    private boolean referencesComputedSelectAlias(
+            Set<String> havingColumns,
+            Map<String, SelectAlias> selectAliases
+    ) {
+        for (String column : havingColumns) {
+            if (column.indexOf('.') >= 0) {
+                continue;
+            }
+            SelectAlias alias = selectAliases.get(column);
+            if (alias != null && isComputedSelectAliasExpression(alias.expression())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private List<Set<String>> groupByIdentifierAlternatives(
+            String body,
+            SelectScope scope,
+            XmlBlock havingIf
+    ) {
+        XmlBlock choose = enclosingXmlBlock(body, scope.groupIndex(), "choose");
+        if (choose != null
+                && choose.openingStart() > scope.fromIndex()
+                && choose.closingEnd() <= havingIf.openingStart()) {
+            List<String> branches = completeChooseBranchBodies(body, choose);
+            if (branches == null) {
+                return List.of();
+            }
+            List<Set<String>> alternatives = new ArrayList<>();
+            for (String branch : branches) {
+                Set<String> columns = groupByIdentifiers(branch);
+                if (columns.isEmpty()) {
+                    return List.of();
+                }
+                alternatives.add(columns);
+            }
+            return alternatives;
+        }
+
+        boolean dynamicallyEnclosed = openXmlTagsAt(body, scope.groupIndex()).stream()
+                .anyMatch(tag -> tag.startIndex() > scope.fromIndex());
+        if (dynamicallyEnclosed) {
+            return List.of();
+        }
+        int groupStart = scope.groupIndex() + "GROUP BY".length();
+        String groupByContent = body.substring(groupStart, havingIf.openingStart());
+        int firstDynamicTag = groupByContent.indexOf('<');
+        if (firstDynamicTag >= 0) {
+            groupByContent = groupByContent.substring(0, firstDynamicTag);
+        }
+        Set<String> columns = simpleGroupByIdentifiers(groupByContent);
+        return columns.isEmpty() ? List.of() : List.of(columns);
+    }
+
+    private List<String> completeChooseBranchBodies(String body, XmlBlock choose) {
+        List<String> branches = new ArrayList<>();
+        boolean hasWhen = false;
+        boolean hasOtherwise = false;
+        int index = choose.openingEnd();
+        while (index < choose.closingStart()) {
+            int tagStart = body.indexOf('<', index);
+            if (tagStart < 0 || tagStart >= choose.closingStart()) {
+                return sqlView(body.substring(index, choose.closingStart())).text().isBlank()
+                        && hasWhen && hasOtherwise ? branches : null;
+            }
+            if (!sqlView(body.substring(index, tagStart)).text().isBlank()) {
+                return null;
+            }
+            if (body.startsWith("<!--", tagStart)) {
+                int commentEnd = body.indexOf("-->", tagStart + "<!--".length());
+                if (commentEnd < 0 || commentEnd >= choose.closingStart()) {
+                    return null;
+                }
+                index = commentEnd + "-->".length();
+                continue;
+            }
+            XmlTag branchTag = readXmlTag(body, tagStart);
+            if (branchTag == null || branchTag.closing() || branchTag.selfClosing()
+                    || (!"when".equalsIgnoreCase(branchTag.name())
+                    && !"otherwise".equalsIgnoreCase(branchTag.name()))) {
+                return null;
+            }
+            boolean otherwise = "otherwise".equalsIgnoreCase(branchTag.name());
+            if (otherwise && hasOtherwise) {
+                return null;
+            }
+            int closingStart = findClosingTag(
+                    body,
+                    branchTag.endIndex(),
+                    branchTag.name(),
+                    choose.closingStart()
+            );
+            if (closingStart < 0) {
+                return null;
+            }
+            XmlTag closingTag = readXmlTag(body, closingStart);
+            if (closingTag == null) {
+                return null;
+            }
+            branches.add(body.substring(branchTag.endIndex(), closingStart));
+            hasWhen |= !otherwise;
+            hasOtherwise |= otherwise;
+            index = closingTag.endIndex();
+        }
+        return hasWhen && hasOtherwise ? branches : null;
+    }
+
+    private Set<String> groupByIdentifiers(String branch) {
+        String view = sqlView(branch).text();
+        int groupIndex = findTopLevelGroupBy(view, 0, view.length(), 0);
+        if (groupIndex < 0) {
+            return Set.of();
+        }
+        int nextGroup = findTopLevelGroupBy(view, groupIndex + "GROUP BY".length(), view.length(), 0);
+        if (nextGroup >= 0) {
+            return Set.of();
+        }
+        int groupStart = groupIndex + "GROUP BY".length();
+        int groupEnd = findClauseEnd(view, groupStart, view.length(), 0);
+        return simpleGroupByIdentifiers(branch.substring(groupStart, groupEnd));
+    }
+
+    private Set<String> simpleGroupByIdentifiers(String groupByContent) {
+        Set<String> identifiers = new LinkedHashSet<>();
+        for (String item : splitTopLevelComma(groupByContent)) {
+            String expression = stripXmlMarkup(item).strip();
+            if (expression.isBlank()
+                    || expression.contains("${")
+                    || !isSimpleQualifiedIdentifierExpression(expression)) {
+                continue;
+            }
+            Set<String> references = conditionColumnReferences(expression);
+            if (references.size() == 1) {
+                identifiers.add(references.iterator().next());
+            }
+        }
+        return identifiers;
     }
 
     private int dynamicGroupByContainerStart(String body, SelectScope scope) {

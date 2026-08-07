@@ -5477,6 +5477,294 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicHavingInsideIfKeepsGroupedColumnWithDynamicForeachValues() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="listCharges">
+                        select d.house_id, sum(d.charge_sum)
+                        from charge_detail d
+                        group by d.house_id
+                        <if test="houseIdList != null and houseIdList.size() > 0">
+                            having d.house_id in
+                            <foreach collection="houseIdList" item="item" open="(" close=")" separator=",">
+                                ${item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml");
+        assertThat(Files.readString(output)).isEqualTo(originalXml);
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicHavingInsideIfKeepsUnconditionalGroupColumnBeforeOptionalGroupSuffix() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="listCharges">
+                        select d.house_id, d.charge_item_id, sum(d.charge_sum)
+                        from charge_detail d
+                        group by d.house_id
+                        <choose>
+                            <when test="includeChargeItem == true">
+                                , d.charge_item_id
+                            </when>
+                        </choose>
+                        <if test="houseIdList != null and houseIdList.size() > 0">
+                            having d.house_id in
+                            <foreach collection="houseIdList" item="item" open="(" close=")" separator=",">
+                                ${item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml");
+        assertThat(Files.readString(output)).isEqualTo(originalXml);
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicHavingInsideIfKeepsGroupedColumnWhenEveryChooseBranchGroupsIt() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="listCharges">
+                        select d.house_id, sum(d.charge_sum)
+                        from charge_detail d
+                        <choose>
+                            <when test="summaryType == 1">
+                                group by d.house_id
+                            </when>
+                            <otherwise>
+                                group by d.house_id, d.charge_item_id
+                            </otherwise>
+                        </choose>
+                        <if test="houseIdList != null and houseIdList.size() > 0">
+                            having d.house_id in
+                            <foreach collection="houseIdList" item="item" open="(" close=")" separator=",">
+                                ${item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/ChargeDetailMapper.xml");
+        assertThat(Files.readString(output)).isEqualTo(originalXml);
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicHavingInsideIfRequiresEveryChooseBranchToGroupReferencedColumn() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="listCharges">
+                        select d.house_id, sum(d.charge_sum)
+                        from charge_detail d
+                        <choose>
+                            <when test="summaryType == 1">
+                                group by d.house_id
+                            </when>
+                            <otherwise>
+                                group by d.charge_item_id
+                            </otherwise>
+                        </choose>
+                        <if test="houseIdList != null and houseIdList.size() > 0">
+                            having d.house_id in
+                            <foreach collection="houseIdList" item="item" open="(" close=")" separator=",">
+                                ${item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("complete XML-tag and query-branch equivalence"));
+    }
+
+    @Test
+    void dynamicHavingInsideIfRequiresCompleteChooseFallback() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="listCharges">
+                        select d.house_id, sum(d.charge_sum)
+                        from charge_detail d
+                        <choose>
+                            <when test="summaryType == 1">
+                                group by d.house_id
+                            </when>
+                        </choose>
+                        <if test="houseIdList != null and houseIdList.size() > 0">
+                            having d.house_id in
+                            <foreach collection="houseIdList" item="item" open="(" close=")" separator=",">
+                                ${item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("complete XML-tag and query-branch equivalence"));
+    }
+
+    @Test
+    void dynamicHavingInsideIfRejectsDynamicGroupByExpression() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ChargeDetailMapper">
+                    <select id="listCharges">
+                        select d.house_id, sum(d.charge_sum)
+                        from charge_detail d
+                        <choose>
+                            <when test="summaryType == 1">
+                                group by d.house_id
+                            </when>
+                            <otherwise>
+                                group by ${groupByColumn}
+                            </otherwise>
+                        </choose>
+                        <if test="houseIdList != null and houseIdList.size() > 0">
+                            having d.house_id in
+                            <foreach collection="houseIdList" item="item" open="(" close=")" separator=",">
+                                ${item}
+                            </foreach>
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/ChargeDetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ChargeDetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains("complete XML-tag and query-branch equivalence"));
+    }
+
+    @Test
     void dynamicHavingInsideIfIsRetainedForReviewWhenAggregateAndPlainConditionsAreMixed() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
