@@ -1814,7 +1814,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private String unsupportedReason(String sql) {
-        if (containsMysqlUpdateJoin(sql)) {
+        if (containsMysqlUpdateJoin(sql) && !isDamengNativeSingleTargetLeftJoinUpdate(sql)) {
             if (containsUnresolvedOuterOrCrossUpdateJoin(sql)) {
                 return "MySQL outer/cross UPDATE JOIN could not be converted safely: an equivalent "
                         + "Dameng rewrite requires proof that each target row receives values from at "
@@ -1863,6 +1863,78 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return mysqlFunction + " requires manual confirmation because Dameng support or syntax may differ from MySQL.";
         }
         return "";
+    }
+
+    private boolean isDamengNativeSingleTargetLeftJoinUpdate(String sql) {
+        long statementCount = splitTopLevelStatements(sql).stream()
+                .filter(statement -> !statement.sql().isBlank())
+                .count();
+        if (statementCount != 1) {
+            return false;
+        }
+        int updateIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, updateIndex, "UPDATE")) {
+            return false;
+        }
+        int joinIndex = findTopLevelKeyword(sql, "JOIN", updateIndex + "UPDATE".length());
+        if (joinIndex < 0) {
+            return false;
+        }
+        int setIndex = findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length());
+        if (setIndex < 0 || !containsTopLevelLeftJoin(sql.substring(updateIndex, setIndex))) {
+            return false;
+        }
+        int joinTypeStart = joinTypeStart(sql, joinIndex);
+        String target = sql.substring(updateIndex + "UPDATE".length(), joinTypeStart).strip();
+        String targetAlias = updateTargetAlias(target);
+        if (targetAlias.isBlank()) {
+            return false;
+        }
+        String joinSource = sql.substring(joinIndex + "JOIN".length(), setIndex).strip();
+        UpdateJoinChain chain = updateJoinChain(target, joinSource, true);
+        if (chain == null
+                || chain.tables().size() < 2
+                || !chain.tables().get(0).aliasKey().equals(targetAlias)) {
+            return false;
+        }
+        int whereIndex = findTopLevelKeyword(sql, "WHERE", setIndex + "SET".length());
+        int statementEnd = stripTrailingSemicolon(sql);
+        String setClause = sql.substring(
+                setIndex + "SET".length(),
+                whereIndex < 0 ? statementEnd : whereIndex
+        ).strip();
+        if (setClause.isBlank()) {
+            return false;
+        }
+        boolean hasAssignment = false;
+        for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
+            Matcher matcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
+            if (!matcher.find()
+                    || !normalizeIdentifierKey(matcher.group("alias")).equals(targetAlias)) {
+                return false;
+            }
+            hasAssignment = true;
+        }
+        return hasAssignment;
+    }
+
+    private boolean containsTopLevelLeftJoin(String updateJoinClause) {
+        int searchFrom = 0;
+        while (searchFrom < updateJoinClause.length()) {
+            int joinIndex = findTopLevelKeyword(updateJoinClause, "JOIN", searchFrom);
+            if (joinIndex < 0) {
+                return false;
+            }
+            int typeStart = joinTypeStart(updateJoinClause, joinIndex);
+            String joinType = updateJoinClause.substring(typeStart, joinIndex).strip();
+            if (Pattern.compile("(?is)^LEFT(?:\\s+OUTER)?$")
+                    .matcher(joinType)
+                    .matches()) {
+                return true;
+            }
+            searchFrom = joinIndex + "JOIN".length();
+        }
+        return false;
     }
 
     private boolean containsMysqlMetadataOutsideIgnoredText(String sql) {
