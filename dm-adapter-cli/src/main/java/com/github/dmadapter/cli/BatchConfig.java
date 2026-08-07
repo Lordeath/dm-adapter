@@ -3,6 +3,7 @@ package com.github.dmadapter.cli;
 import com.github.dmadapter.core.TargetLengthSemantics;
 
 import java.util.List;
+import java.util.Map;
 
 record BatchConfig(
         Integer schemaVersion,
@@ -42,7 +43,18 @@ record BatchConfig(
             String mapperDir,
             String rewriteConfig,
             Boolean sqlScriptsOnly,
+            UpsertKeysConfig upsertKeys,
             SqlConfig sql
+    ) {
+    }
+
+    record UpsertKeysConfig(
+            Map<String, KeyColumnsConfig> tables
+    ) {
+    }
+
+    record KeyColumnsConfig(
+            List<String> keyColumns
     ) {
     }
 

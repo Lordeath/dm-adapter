@@ -3,7 +3,10 @@ package com.github.dmadapter.cli;
 import com.github.dmadapter.core.TargetLengthSemantics;
 
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 record ResolvedBatchConfig(
         Path configPath,
@@ -47,8 +50,19 @@ record ResolvedBatchConfig(
             Path mapperDir,
             Path rewriteConfig,
             boolean sqlScriptsOnly,
+            Map<String, List<String>> tableKeyColumns,
             Sql sql
     ) {
+        Migration {
+            LinkedHashMap<String, List<String>> copied = new LinkedHashMap<>();
+            if (tableKeyColumns != null) {
+                tableKeyColumns.forEach((table, columns) -> copied.put(
+                        table,
+                        List.copyOf(columns == null ? List.of() : columns)
+                ));
+            }
+            tableKeyColumns = Collections.unmodifiableMap(copied);
+        }
     }
 
     record Sql(

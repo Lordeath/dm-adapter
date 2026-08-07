@@ -49,6 +49,7 @@ class SqlRewriteConfigUpdater {
                 candidates,
                 metadataByTable,
                 metadataAvailable,
+                Map.of(),
                 Map.of()
         );
     }
@@ -62,8 +63,31 @@ class SqlRewriteConfigUpdater {
             boolean metadataAvailable,
             Map<String, DamengMetadataReader.AutoIncrementKind> autoIncrementKinds
     ) {
+        return update(
+                context,
+                rewriteConfigPath,
+                loadedRewriteConfig,
+                candidates,
+                metadataByTable,
+                metadataAvailable,
+                autoIncrementKinds,
+                Map.of()
+        );
+    }
+
+    SqlRewriteConfigUpdate update(
+            AdapterContext context,
+            Path rewriteConfigPath,
+            SqlRewriteConfig loadedRewriteConfig,
+            List<RewriteConfigCandidate> candidates,
+            Map<String, TableKeyMetadata> metadataByTable,
+            boolean metadataAvailable,
+            Map<String, DamengMetadataReader.AutoIncrementKind> autoIncrementKinds,
+            Map<String, List<String>> configuredTableKeys
+    ) {
         List<String> warnings = new ArrayList<>();
         RewriteConfigModel model = RewriteConfigModel.load(rewriteConfigPath);
+        boolean configuredTableKeysChanged = applyConfiguredTableKeys(model, configuredTableKeys, warnings);
         IdentityInsertReconciliation reconciliation = reconcileIdentityInsertTables(
                 context,
                 model,
@@ -78,7 +102,7 @@ class SqlRewriteConfigUpdater {
         );
         boolean identityInsertTablesChanged = reconciliation.changed() || learnedIdentityInsertTable;
         if (candidates.isEmpty()) {
-            if (!identityInsertTablesChanged) {
+            if (!identityInsertTablesChanged && !configuredTableKeysChanged) {
                 return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), warnings);
             }
             SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, Map.of());
@@ -180,6 +204,31 @@ class SqlRewriteConfigUpdater {
         SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, inferredMethodKeys);
         Optional<FileChange> fileChange = writeIfChanged(context, rewriteConfigPath, model);
         return new SqlRewriteConfigUpdate(rewriteConfig, fileChange, warnings);
+    }
+
+    private boolean applyConfiguredTableKeys(
+            RewriteConfigModel model,
+            Map<String, List<String>> configuredTableKeys,
+            List<String> warnings
+    ) {
+        if (configuredTableKeys == null || configuredTableKeys.isEmpty()) {
+            return false;
+        }
+        boolean changed = false;
+        Map<String, List<String>> normalized = new SqlRewriteConfig(configuredTableKeys, Map.of())
+                .tableKeyColumns();
+        for (Map.Entry<String, List<String>> entry : normalized.entrySet()) {
+            List<String> existing = model.tableColumns(entry.getKey());
+            if (!existing.isEmpty() && !normalizedColumns(existing).equals(normalizedColumns(entry.getValue()))) {
+                warnings.add("Batch upsert keyColumns override rewriteConfig for table "
+                        + entry.getKey() + ": " + existing + " -> " + entry.getValue() + ".");
+            }
+            if (!normalizedColumns(existing).equals(normalizedColumns(entry.getValue()))) {
+                model.putTable(entry.getKey(), entry.getValue());
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     private boolean hasStaleConflictKeyGroups(

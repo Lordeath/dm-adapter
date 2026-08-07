@@ -13,8 +13,11 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 final class BatchConfigLoader {
@@ -185,8 +188,68 @@ final class BatchConfigLoader {
                 optionalRelativePath(mapperDir, "repositories[" + repository + "].migration.mapperDir"),
                 optionalRelativePath(rewriteConfig, "repositories[" + repository + "].migration.rewriteConfig"),
                 Boolean.TRUE.equals(scriptsOnly),
+                resolveTableKeyColumns(defaults, override, repository),
                 new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, lengthSemantics, preserveSql)
         );
+    }
+
+    private Map<String, List<String>> resolveTableKeyColumns(
+            BatchConfig.MigrationConfig defaults,
+            BatchConfig.MigrationConfig override,
+            String repository
+    ) {
+        LinkedHashMap<String, List<String>> resolved = new LinkedHashMap<>();
+        mergeTableKeyColumns(
+                resolved,
+                defaults == null ? null : defaults.upsertKeys(),
+                "migrationDefaults.upsertKeys.tables"
+        );
+        mergeTableKeyColumns(
+                resolved,
+                override == null ? null : override.upsertKeys(),
+                "repositories[" + repository + "].migration.upsertKeys.tables"
+        );
+        return Map.copyOf(resolved);
+    }
+
+    private void mergeTableKeyColumns(
+            Map<String, List<String>> target,
+            BatchConfig.UpsertKeysConfig upsertKeys,
+            String field
+    ) {
+        if (upsertKeys == null || upsertKeys.tables() == null) {
+            return;
+        }
+        upsertKeys.tables().forEach((configuredTable, configuredKeys) -> {
+            String table = requiredText(configuredTable, field + " table name");
+            String normalizedTable = normalizeTableName(table);
+            List<String> configuredColumns = configuredKeys == null ? null : configuredKeys.keyColumns();
+            if (configuredColumns == null || configuredColumns.isEmpty()) {
+                throw new DmAdapterException(field + "[" + table + "].keyColumns must not be empty.");
+            }
+            List<String> columns = new ArrayList<>();
+            Set<String> normalizedColumns = new LinkedHashSet<>();
+            for (String configuredColumn : configuredColumns) {
+                String column = requiredText(
+                        configuredColumn,
+                        field + "[" + table + "].keyColumns[]"
+                );
+                if (!normalizedColumns.add(column.toLowerCase(Locale.ROOT))) {
+                    throw new DmAdapterException(
+                            field + "[" + table + "].keyColumns contains duplicate column: " + column
+                    );
+                }
+                columns.add(column);
+            }
+            target.put(normalizedTable, List.copyOf(columns));
+        });
+    }
+
+    private String normalizeTableName(String tableName) {
+        return tableName.trim()
+                .replace("\"", "")
+                .replace("`", "")
+                .toLowerCase(Locale.ROOT);
     }
 
     private void validateUrl(String url, boolean credentialsConfigured, String repository) {
