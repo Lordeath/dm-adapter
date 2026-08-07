@@ -76,7 +76,7 @@ class MapperAnnotationMigratorTest {
     }
 
     @Test
-    void annotationSelectKeepsReservedLogicalLabelInDryRunAndAppliedMapper() throws Exception {
+    void annotationSelectUsesPhysicalColumnAndReportsResultTypeAutoMapping() throws Exception {
         writeFile("src/main/java/com/example/PaymentOrderMapper.java", """
                 package com.example;
 
@@ -98,9 +98,12 @@ class MapperAnnotationMigratorTest {
         assertThat(dryRun.automaticConversions())
                 .singleElement()
                 .satisfies(change -> assertThat(change.convertedSql())
-                        .isEqualTo("select _trxid AS \"trxid\" from NS_PAYMENT_ORDER where _trxid = #{trxid}"));
+                        .isEqualTo("select _trxid from NS_PAYMENT_ORDER where _trxid = #{trxid}"));
+        assertThat(dryRun.manualReviewItems())
+                .singleElement()
+                .satisfies(change -> assertThat(change.reason()).contains("resultType/automatic mapping"));
 
-        new MapperAnnotationMigrator().migrate(
+        MapperMigrationResult applied = new MapperAnnotationMigrator().migrate(
                 scanResult(List.of()),
                 AdapterContext.builder(tempDir).dryRun(false).build(),
                 new MySqlToDmSqlConverter(),
@@ -108,7 +111,10 @@ class MapperAnnotationMigratorTest {
         );
 
         assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")))
-                .contains("select _trxid AS \"trxid\" from NS_PAYMENT_ORDER where _trxid = #{trxid}");
+                .contains("select _trxid from NS_PAYMENT_ORDER where _trxid = #{trxid}");
+        assertThat(applied.manualReviewItems())
+                .singleElement()
+                .satisfies(change -> assertThat(change.reason()).contains("resultType/automatic mapping"));
     }
 
     @Test

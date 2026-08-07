@@ -21,7 +21,9 @@
 
 达梦中的 `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_STARTTIME`、`VERSIONS_ENDTIME`、`VERSIONS_STARTTRXID`、`VERSIONS_ENDTRXID`、`VERSIONS_OPERATION` 属于伪列或特殊列名，业务表字段迁移到达梦时应改名。`migrate` 会为这些物理列名增加前缀下划线，例如 `rowid` -> `_rowid`、`trxid` -> `_trxid`。
 
-Mapper 最外层显式查询投影会同时保留原结果标签，例如 `SELECT trxid ... WHERE trxid = #{trxid}` 转为 `SELECT _trxid AS "trxid" ... WHERE _trxid = #{trxid}`。因此已有的 `resultMap column="trxid"`、Java 属性名和 MyBatis 参数名不需要修改。只用于 SELECT 投影的本地 `<sql>` 列清单使用相同规则；用途混合或无法确认的片段保留原样并进入人工确认。`SELECT *` / `t.*` 不展开、不增加专项提示。
+SQL 中所有这类业务列都统一改为前缀物理名，例如 `SELECT trxid ... WHERE trxid = #{trxid}` 转为 `SELECT _trxid ... WHERE _trxid = #{trxid}`。达梦不允许把这些特殊名称继续用作结果别名，即使 `_trxid AS "trxid"` 也会报无效别名，因此 `mapper-dm` 中已有的 `resultMap column="trxid"` 会同步改为 `column="_trxid"`；Java 属性名和 MyBatis 参数名保持不变。SELECT、DML、动态 SQL 和混合用途的本地 `<sql>` 片段均使用相同物理列规则。
+
+没有显式 `resultMap`、依赖 `resultType` 或 `Map` 自动映射的查询如果直接返回特殊物理列，工具会保留转换后的 SQL 并加入人工确认，避免自动生成不完整的映射或修改全局 MyBatis 配置。`SELECT *` / `t.*` 不自动展开；使用显式 `resultMap` 时，其数据库列映射仍会同步修改。
 
 该规则大小写不敏感，并保留原标识符的大小写；字符串常量、SQL 注释、`#{rowid}` / `${trxid}` 这类 MyBatis 参数占位符会保持原样，避免误改 Java 参数名和文本内容。数据库侧的 `keyColumn` 会同步使用前缀物理列名，`keyProperty` 保持不变。
 

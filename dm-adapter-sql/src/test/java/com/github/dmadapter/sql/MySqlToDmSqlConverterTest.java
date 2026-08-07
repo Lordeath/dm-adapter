@@ -496,49 +496,38 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void preservesReservedColumnLabelsForMapperTopLevelSelects() {
+    void usesPhysicalReservedColumnNamesWithoutResultAliases() {
         SqlConversionResult result = converter.convert(
-                "select trxid, app.t.rowid, phyrowid AS physical_id from user t where t.trxid = #{trxid}",
-                List.of(),
-                ReservedColumnRewriteMode.TOP_LEVEL_RESULT
+                "select trxid, app.t.rowid, phyrowid AS physical_id from user t where t.trxid = #{trxid}"
         );
 
         assertThat(result.convertedSql()).isEqualTo(
-                "select _trxid AS \"trxid\", app.t._rowid AS \"rowid\", _phyrowid AS physical_id "
+                "select _trxid, app.t._rowid, _phyrowid AS physical_id "
                         + "from user t where t._trxid = #{trxid}"
         );
-        assertThat(result.appliedRules()).containsExactly(
-                DamengReservedColumnRenamer.RULE_NAME,
-                DamengReservedColumnRenamer.RESULT_ALIAS_RULE_NAME
-        );
+        assertThat(result.appliedRules()).containsExactly(DamengReservedColumnRenamer.RULE_NAME);
     }
 
     @Test
-    void onlyPreservesLabelsAtTheOutermostMapperSelectScope() {
+    void usesPhysicalReservedColumnNamesInAllSelectScopes() {
         SqlConversionResult result = converter.convert(
                 "with source as (select trxid from audit_log) "
-                        + "select s.trxid from source s union select trxid from archive_log",
-                List.of(),
-                ReservedColumnRewriteMode.TOP_LEVEL_RESULT
+                        + "select s.trxid from source s union select trxid from archive_log"
         );
 
         assertThat(result.convertedSql()).isEqualTo(
                 "with source as (select _trxid from audit_log) "
-                        + "select s._trxid AS \"trxid\" from source s union "
-                        + "select _trxid AS \"trxid\" from archive_log"
+                        + "select s._trxid from source s union "
+                        + "select _trxid from archive_log"
         );
     }
 
     @Test
-    void preservesReservedLabelsInSelectColumnListFragments() {
-        SqlConversionResult result = converter.convert(
-                "ID, EnterpriseID, trxid, t.`ROWID`",
-                List.of(),
-                ReservedColumnRewriteMode.RESULT_COLUMN_LIST
-        );
+    void usesPhysicalReservedColumnNamesInColumnListFragments() {
+        SqlConversionResult result = converter.convert("ID, EnterpriseID, trxid, t.`ROWID`");
 
         assertThat(result.convertedSql()).isEqualTo(
-                "ID, EnterpriseID, _trxid AS \"trxid\", t.`_ROWID` AS \"ROWID\""
+                "ID, EnterpriseID, _trxid, t.`_ROWID`"
         );
     }
 

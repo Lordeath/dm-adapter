@@ -1440,18 +1440,15 @@ class MapperMigratorTest {
 
         Path copied = tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml");
         assertThat(Files.readString(copied))
-                .contains("select _rowid AS \"rowid\", _trxid AS \"trxid\", _rownum AS \"rownum\" "
+                .contains("select _rowid, _trxid, _rownum "
                         + "from user where _rowid = #{rowid} and _trxid = #{trxid}");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(
-                        DamengReservedColumnRenamer.RULE_NAME,
-                        DamengReservedColumnRenamer.RESULT_ALIAS_RULE_NAME
-                );
+                .containsExactly(DamengReservedColumnRenamer.RULE_NAME);
     }
 
     @Test
-    void migrationKeepsResultMapColumnsWhenSelectColumnFragmentAddsLogicalAliases() throws Exception {
+    void migrationRewritesResultMapColumnsAndSelectFragmentsToPhysicalNames() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -1482,6 +1479,18 @@ class MapperMigratorTest {
                 List.of()
         );
 
+        MapperMigrationResult dryRunResult = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(true).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(Files.readString(mapper)).isEqualTo(originalXml);
+        assertThat(dryRunResult.automaticConversions())
+                .anySatisfy(change -> assertThat(change.appliedRules()).contains(
+                        MapperXmlRewriter.MYBATIS_RESERVED_RESULT_MAP_COLUMN_RENAME_RULE
+                ));
+
         MapperMigrationResult result = new MapperMigrator().migrate(
                 scanResult,
                 AdapterContext.builder(tempDir).dryRun(false).build(),
@@ -1492,18 +1501,18 @@ class MapperMigratorTest {
                 tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
         );
         assertThat(rewritten)
-                .contains("<result property=\"trxid\" column=\"trxid\" jdbcType=\"VARCHAR\"/>")
-                .contains("ID, EnterpriseID, _trxid AS \"trxid\", OrderNo")
+                .contains("<result property=\"trxid\" column=\"_trxid\" jdbcType=\"VARCHAR\"/>")
+                .contains("ID, EnterpriseID, _trxid, OrderNo")
                 .contains("where _trxid = #{trxid}");
         assertThat(result.manualReviewItems()).isEmpty();
         assertThat(result.automaticConversions())
                 .anySatisfy(change -> assertThat(change.appliedRules()).contains(
-                        DamengReservedColumnRenamer.RESULT_ALIAS_RULE_NAME
+                        MapperXmlRewriter.MYBATIS_RESERVED_RESULT_MAP_COLUMN_RENAME_RULE
                 ));
     }
 
     @Test
-    void migrationAddsLogicalAliasesInsideDynamicSelectProjections() throws Exception {
+    void migrationUsesPhysicalColumnsInsideDynamicSelectProjections() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -1539,12 +1548,12 @@ class MapperMigratorTest {
                 tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
         );
         assertThat(rewritten)
-                .contains("<if test=\"includeTrxid\">_trxid AS \"trxid\",</if>")
+                .contains("<if test=\"includeTrxid\">_trxid,</if>")
                 .contains("where _trxid = #{trxid}");
     }
 
     @Test
-    void migrationPreservesMixedUseReservedColumnFragmentsForManualReview() throws Exception {
+    void migrationRewritesMixedUseReservedColumnFragmentsAsPhysicalColumns() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -1579,9 +1588,175 @@ class MapperMigratorTest {
         String rewritten = Files.readString(
                 tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
         );
-        assertThat(rewritten).contains("<sql id=\"SharedColumns\">ID, trxid</sql>");
+        assertThat(rewritten).contains("<sql id=\"SharedColumns\">ID, _trxid</sql>");
         assertThat(result.manualReviewItems())
-                .anySatisfy(change -> assertThat(change.reason()).contains("fragment was preserved"));
+                .singleElement()
+                .satisfies(change -> assertThat(change.statementId())
+                        .isEqualTo("com.example.PaymentOrderMapper.search"));
+    }
+
+    @Test
+    void migrationRewritesAllResultMapDatabaseColumnAttributes() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <resultMap id="PaymentOrderResultMap" type="map">
+                        <constructor>
+                            <idArg column="trxid" javaType="string"/>
+                            <arg column="rowid" javaType="string"/>
+                        </constructor>
+                        <id property="physicalRowId" column="PHYROWID"/>
+                        <result property="operation" column="versions_operation"/>
+                        <association property="audit" javaType="map"
+                                     column="{id=id,trx=trxid}"
+                                     notNullColumn="id, trxid"
+                                     foreignColumn="rowid, id"
+                                     columnPrefix="trxid_">
+                            <result property="start" column="versions_starttime"/>
+                        </association>
+                        <collection property="items" ofType="map" column="versions_endtrxid"/>
+                        <discriminator column="versions_starttrxid" javaType="string">
+                            <case value="1" resultMap="PaymentOrderResultMap"/>
+                        </discriminator>
+                    </resultMap>
+                    <select id="selectAll" resultMap="PaymentOrderResultMap">
+                        select * from NS_PAYMENT_ORDER
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("<idArg column=\"_trxid\" javaType=\"string\"/>")
+                .contains("<arg column=\"_rowid\" javaType=\"string\"/>")
+                .contains("<id property=\"physicalRowId\" column=\"_PHYROWID\"/>")
+                .contains("<result property=\"operation\" column=\"_versions_operation\"/>")
+                .contains("column=\"{id=id,trx=_trxid}\"")
+                .contains("notNullColumn=\"id, _trxid\"")
+                .contains("foreignColumn=\"_rowid, id\"")
+                .contains("columnPrefix=\"trxid_\"")
+                .contains("<result property=\"start\" column=\"_versions_starttime\"/>")
+                .contains("<collection property=\"items\" ofType=\"map\" column=\"_versions_endtrxid\"/>")
+                .contains("<discriminator column=\"_versions_starttrxid\" javaType=\"string\">");
+        assertThat(result.manualReviewItems()).isEmpty();
+        assertThat(result.automaticConversions())
+                .allSatisfy(change -> assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_RESERVED_RESULT_MAP_COLUMN_RENAME_RULE));
+    }
+
+    @Test
+    void migrationPreservesUnsupportedResultMapColumnExpressionsForManualReview() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <resultMap id="PaymentOrderResultMap" type="map">
+                        <result property="trxid" column="audit.trxid"/>
+                    </resultMap>
+                    <select id="selectOne" resultMap="PaymentOrderResultMap">
+                        select audit.trxid from NS_PAYMENT_ORDER audit
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")))
+                .contains("<result property=\"trxid\" column=\"audit.trxid\"/>")
+                .contains("._trxid from NS_PAYMENT_ORDER");
+        assertThat(result.manualReviewItems())
+                .singleElement()
+                .satisfies(change -> {
+                    assertThat(change.statementId()).isEqualTo("com.example.PaymentOrderMapper.PaymentOrderResultMap");
+                    assertThat(change.reason()).contains("mapping attribute was preserved");
+                });
+    }
+
+    @Test
+    void migrationReportsReservedResultColumnsThatStillDependOnResultTypeAutoMapping() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.PaymentOrderMapper">
+                    <sql id="OrderColumns">ID, trxid</sql>
+                    <select id="direct" resultType="com.example.PaymentOrder">
+                        select trxid from NS_PAYMENT_ORDER
+                    </select>
+                    <select id="included" resultType="map">
+                        select <include refid="OrderColumns"/> from NS_PAYMENT_ORDER
+                    </select>
+                    <select id="safeAlias" resultType="com.example.PaymentOrder">
+                        select trxid AS payTrxId from NS_PAYMENT_ORDER
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/PaymentOrderMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/PaymentOrderMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("select _trxid from NS_PAYMENT_ORDER")
+                .contains("<sql id=\"OrderColumns\">ID, _trxid</sql>")
+                .contains("select _trxid AS payTrxId from NS_PAYMENT_ORDER");
+        assertThat(result.manualReviewItems())
+                .filteredOn(change -> change.reason().contains("resultType/automatic mapping"))
+                .extracting(change -> change.statementId())
+                .containsExactlyInAnyOrder(
+                        "com.example.PaymentOrderMapper.direct",
+                        "com.example.PaymentOrderMapper.included"
+                );
     }
 
     @Test
@@ -1622,7 +1797,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void migrationLeavesWildcardSelectsAndTheirResultMapsUnchangedWithoutReview() throws Exception {
+    void migrationRewritesResultMapsUsedByWildcardSelectsWithoutExpandingTheSql() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -1654,9 +1829,11 @@ class MapperMigratorTest {
         );
 
         assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentOrderMapper.xml")))
-                .contains("<result property=\"trxid\" column=\"trxid\"/>")
+                .contains("<result property=\"trxid\" column=\"_trxid\"/>")
                 .contains("select * from NS_PAYMENT_ORDER");
-        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.automaticConversions())
+                .anySatisfy(change -> assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_RESERVED_RESULT_MAP_COLUMN_RENAME_RULE));
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
