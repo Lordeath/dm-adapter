@@ -2938,6 +2938,23 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void keepsDamengNativeOuterJoinUpdateWhenOnlyJoinedAliasIsModified() {
+        String sql = """
+                UPDATE sample_source source
+                LEFT JOIN sample_target target ON target.source_id = source.id
+                SET target.label = source.label,
+                    target.updated_at = NOW()
+                WHERE target.id IS NOT NULL
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(sql);
+    }
+
+    @Test
     void keepsDamengNativeSingleTargetUpdateWithInnerAndLeftJoinChain() {
         String sql = """
                 update ns_system_organization o
@@ -3816,6 +3833,23 @@ class MySqlToDmSqlConverterTest {
         );
         assertThat(result.appliedRules())
                 .containsExactly(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+    }
+
+    @Test
+    void convertsSourceIndependentUpdateForColumnOutsideInsertList() {
+        SqlConversionResult result = converter.convert("""
+                insert into sample_hash(pk, table_hash) values(#{pk}, #{tableHash})
+                on duplicate key update
+                    table_hash = values(table_hash),
+                    update_date_time = NOW()
+                """, List.of("pk"));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).contains(
+                "WHEN MATCHED THEN UPDATE SET t.table_hash = s.table_hash, t.update_date_time = NOW()",
+                "WHEN NOT MATCHED THEN INSERT (pk, table_hash) VALUES (s.pk, s.table_hash)"
+        );
     }
 
     @Test

@@ -137,6 +137,8 @@ public class MigrateCommand implements Callable<Integer> {
     private SqlScriptMigrationReport lastSqlScriptMigrationReport;
     private boolean batchMode;
     private Map<String, List<String>> batchTableKeyColumns = Map.of();
+    private Map<String, List<String>> batchMethodKeyColumns = Map.of();
+    private Map<String, List<List<String>>> batchMethodConflictKeyGroups = Map.of();
 
     @Override
     public Integer call() {
@@ -227,7 +229,7 @@ public class MigrateCommand implements Callable<Integer> {
 
             Path rewriteConfigPath = rewriteConfigPath(context);
             CliLogger.info("Loading SQL rewrite config: " + rewriteConfigPath);
-            SqlRewriteConfig loadedRewriteConfig = withBatchTableKeyColumns(
+            SqlRewriteConfig loadedRewriteConfig = withBatchUpsertKeys(
                     sqlRewriteConfigLoader.load(rewriteConfigPath)
             );
             AutoIncrementKindLookupResult autoIncrementKindLookupResult =
@@ -270,7 +272,9 @@ public class MigrateCommand implements Callable<Integer> {
                     metadataLookupResult.metadataByTable(),
                     metadataLookupResult.available(),
                     autoIncrementKindLookupResult.kindsByTable(),
-                    batchTableKeyColumns
+                    batchTableKeyColumns,
+                    batchMethodKeyColumns,
+                    batchMethodConflictKeyGroups
             );
             rewriteConfigUpdate.fileChange().ifPresent(fileChanges::add);
             warnings.addAll(rewriteConfigUpdate.warnings());
@@ -444,21 +448,45 @@ public class MigrateCommand implements Callable<Integer> {
                         : context.projectRoot().resolve(rewriteConfig).toAbsolutePath().normalize());
     }
 
-    private SqlRewriteConfig withBatchTableKeyColumns(SqlRewriteConfig loaded) {
-        if (batchTableKeyColumns == null || batchTableKeyColumns.isEmpty()) {
+    private SqlRewriteConfig withBatchUpsertKeys(SqlRewriteConfig loaded) {
+        boolean noTableKeys = batchTableKeyColumns == null || batchTableKeyColumns.isEmpty();
+        boolean noMethodKeys = batchMethodKeyColumns == null || batchMethodKeyColumns.isEmpty();
+        boolean noConflictGroups = batchMethodConflictKeyGroups == null
+                || batchMethodConflictKeyGroups.isEmpty();
+        if (noTableKeys && noMethodKeys && noConflictGroups) {
             return loaded;
         }
-        Map<String, List<String>> merged = new LinkedHashMap<>(loaded.tableKeyColumns());
-        merged.putAll(new SqlRewriteConfig(batchTableKeyColumns, Map.of()).tableKeyColumns());
+        SqlRewriteConfig batch = new SqlRewriteConfig(
+                batchTableKeyColumns,
+                batchMethodKeyColumns,
+                Set.of(),
+                Set.of(),
+                Set.of(),
+                Set.of(),
+                Map.of(),
+                batchMethodConflictKeyGroups
+        );
+        Map<String, List<String>> mergedTables = new LinkedHashMap<>(loaded.tableKeyColumns());
+        mergedTables.putAll(batch.tableKeyColumns());
+        Map<String, List<String>> mergedMethods = new LinkedHashMap<>(loaded.methodKeyColumns());
+        Map<String, List<List<String>>> mergedGroups = new LinkedHashMap<>(loaded.methodConflictKeyGroups());
+        Set<String> overriddenMethods = new LinkedHashSet<>(batch.methodKeyColumns().keySet());
+        overriddenMethods.addAll(batch.methodConflictKeyGroups().keySet());
+        overriddenMethods.forEach(method -> {
+            mergedMethods.remove(method);
+            mergedGroups.remove(method);
+        });
+        mergedMethods.putAll(batch.methodKeyColumns());
+        mergedGroups.putAll(batch.methodConflictKeyGroups());
         return new SqlRewriteConfig(
-                merged,
-                loaded.methodKeyColumns(),
+                mergedTables,
+                mergedMethods,
                 loaded.ignoredMissingTables(),
                 loaded.ignoredMissingColumns(),
                 loaded.ignoredMissingSchemas(),
                 loaded.identityInsertTables(),
                 loaded.upsertKeyResolutions(),
-                loaded.methodConflictKeyGroups()
+                mergedGroups
         );
     }
 
@@ -473,6 +501,9 @@ public class MigrateCommand implements Callable<Integer> {
         for (com.github.dmadapter.core.SqlChange sqlChange : candidateChanges) {
             String sql = sqlChange.originalSql() == null ? "" : sqlChange.originalSql();
             String lower = sql.toLowerCase();
+            String convertedLower = sqlChange.convertedSql() == null
+                    ? ""
+                    : sqlChange.convertedSql().toLowerCase();
             String reason = sqlChange.reason() == null ? "" : sqlChange.reason().toLowerCase();
             String methodKey = sqlChange.statementId();
             if (methodKey != null && !methodKey.isBlank() && !methodKey.startsWith("(")) {
@@ -494,6 +525,13 @@ public class MigrateCommand implements Callable<Integer> {
                     || lower.contains("insert ignore")
                     || reason.contains("on duplicate key update requires configured keycolumns")
                     || reason.contains("insert ignore requires configured keycolumns");
+            if (lower.contains("insert ignore")
+                    && !convertedLower.contains("insert ignore")
+                    && sqlChange.appliedRules().contains(
+                            com.github.dmadapter.mybatis.MapperXmlRewriter.MYBATIS_BATCH_INSERT_IGNORE_TO_DM_BLOCK_RULE
+                    )) {
+                needsKeyColumns = false;
+            }
             if (!needsKeyColumns) {
                 continue;
             }
@@ -876,6 +914,8 @@ public class MigrateCommand implements Callable<Integer> {
         migration.sqlScriptsOnly = request.sqlScriptsOnly();
         migration.targetLengthSemantics = request.targetLengthSemantics();
         migration.batchTableKeyColumns = request.tableKeyColumns();
+        migration.batchMethodKeyColumns = request.methodKeyColumns();
+        migration.batchMethodConflictKeyGroups = request.methodConflictKeyGroups();
         migration.batchMode = true;
         int exitCode = migration.runMigration(DmValidationEnvironment.batchSilent());
         return new OfflineMigrationRun(

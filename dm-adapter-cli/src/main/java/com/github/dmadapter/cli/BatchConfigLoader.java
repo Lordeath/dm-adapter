@@ -183,14 +183,104 @@ final class BatchConfigLoader {
         List<Path> preserveSql = configuredPreserve.stream()
                 .map(path -> relativePath(path, "repositories[" + repository + "].migration.sql.preserveSql"))
                 .toList();
+        Map<String, MethodKeySettings> methodKeys = resolveMethodKeys(defaults, override, repository);
         return new ResolvedBatchConfig.Migration(
                 value(dmDriver),
                 optionalRelativePath(mapperDir, "repositories[" + repository + "].migration.mapperDir"),
                 optionalRelativePath(rewriteConfig, "repositories[" + repository + "].migration.rewriteConfig"),
                 Boolean.TRUE.equals(scriptsOnly),
                 resolveTableKeyColumns(defaults, override, repository),
+                methodKeys.entrySet().stream().filter(entry -> !entry.getValue().keyColumns().isEmpty())
+                        .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                                Map.Entry::getKey,
+                                entry -> entry.getValue().keyColumns()
+                        )),
+                methodKeys.entrySet().stream().filter(entry -> !entry.getValue().conflictKeyGroups().isEmpty())
+                        .collect(java.util.stream.Collectors.toUnmodifiableMap(
+                                Map.Entry::getKey,
+                                entry -> entry.getValue().conflictKeyGroups()
+                        )),
                 new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, lengthSemantics, preserveSql)
         );
+    }
+
+    private Map<String, MethodKeySettings> resolveMethodKeys(
+            BatchConfig.MigrationConfig defaults,
+            BatchConfig.MigrationConfig override,
+            String repository
+    ) {
+        LinkedHashMap<String, MethodKeySettings> resolved = new LinkedHashMap<>();
+        mergeMethodKeys(
+                resolved,
+                defaults == null ? null : defaults.upsertKeys(),
+                "migrationDefaults.upsertKeys.methods"
+        );
+        mergeMethodKeys(
+                resolved,
+                override == null ? null : override.upsertKeys(),
+                "repositories[" + repository + "].migration.upsertKeys.methods"
+        );
+        return Map.copyOf(resolved);
+    }
+
+    private void mergeMethodKeys(
+            Map<String, MethodKeySettings> target,
+            BatchConfig.UpsertKeysConfig upsertKeys,
+            String field
+    ) {
+        if (upsertKeys == null || upsertKeys.methods() == null) {
+            return;
+        }
+        upsertKeys.methods().forEach((configuredMethod, configuredKeys) -> {
+            String method = requiredText(configuredMethod, field + " method name");
+            List<String> keyColumns = validatedColumns(
+                    configuredKeys == null ? null : configuredKeys.keyColumns(),
+                    field + "[" + method + "].keyColumns",
+                    true
+            );
+            List<List<String>> conflictKeyGroups = new ArrayList<>();
+            List<List<String>> configuredGroups = configuredKeys == null
+                    ? null
+                    : configuredKeys.conflictKeyGroups();
+            if (configuredGroups != null) {
+                for (int index = 0; index < configuredGroups.size(); index++) {
+                    List<String> group = validatedColumns(
+                            configuredGroups.get(index),
+                            field + "[" + method + "].conflictKeyGroups[" + index + "]",
+                            false
+                    );
+                    conflictKeyGroups.add(group);
+                }
+            }
+            if (keyColumns.isEmpty() && conflictKeyGroups.isEmpty()) {
+                throw new DmAdapterException(
+                        field + "[" + method + "] must configure keyColumns or conflictKeyGroups."
+                );
+            }
+            target.put(method, new MethodKeySettings(keyColumns, List.copyOf(conflictKeyGroups)));
+        });
+    }
+
+    private List<String> validatedColumns(List<String> configuredColumns, String field, boolean optional) {
+        if (configuredColumns == null) {
+            return List.of();
+        }
+        if (configuredColumns.isEmpty()) {
+            if (optional) {
+                return List.of();
+            }
+            throw new DmAdapterException(field + " must not be empty.");
+        }
+        List<String> columns = new ArrayList<>();
+        Set<String> normalizedColumns = new LinkedHashSet<>();
+        for (String configuredColumn : configuredColumns) {
+            String column = requiredText(configuredColumn, field + "[]");
+            if (!normalizedColumns.add(column.toLowerCase(Locale.ROOT))) {
+                throw new DmAdapterException(field + " contains duplicate column: " + column);
+            }
+            columns.add(column);
+        }
+        return List.copyOf(columns);
     }
 
     private Map<String, List<String>> resolveTableKeyColumns(
@@ -250,6 +340,12 @@ final class BatchConfigLoader {
                 .replace("\"", "")
                 .replace("`", "")
                 .toLowerCase(Locale.ROOT);
+    }
+
+    private record MethodKeySettings(
+            List<String> keyColumns,
+            List<List<String>> conflictKeyGroups
+    ) {
     }
 
     private void validateUrl(String url, boolean credentialsConfigured, String repository) {

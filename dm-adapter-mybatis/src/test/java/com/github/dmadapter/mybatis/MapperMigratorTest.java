@@ -938,7 +938,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void migrationRewritesBatchInsertIgnoreWithTrimColumnListToMerge() throws Exception {
+    void migrationRewritesBatchInsertIgnoreWithTrimColumnListToDuplicateHandlerBlock() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -994,14 +994,14 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/RolePermMapper.xml"));
         assertThat(rewritten)
-                .contains("MERGE INTO ns_core_role_perm t")
-                .contains("ON (t.ENTERPRISE_ID = s.ENTERPRISE_ID AND t.ORGANIZATION_ID = s.ORGANIZATION_ID")
-                .contains("t.\"TYPE\" = s.\"TYPE\"")
-                .contains("WHEN NOT MATCHED THEN INSERT")
+                .contains("BEGIN")
+                .contains("INSERT INTO ns_core_role_perm")
+                .contains("WHEN DUP_VAL_ON_INDEX THEN NULL;")
+                .doesNotContain("MERGE INTO")
                 .doesNotContain("insert ignore");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+                .contains(MapperXmlRewriter.MYBATIS_BATCH_INSERT_IGNORE_TO_DM_BLOCK_RULE);
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
@@ -1190,7 +1190,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void migrationRewritesBacktickBatchInsertIgnoreToMerge() throws Exception {
+    void migrationRewritesBacktickBatchInsertIgnoreToDuplicateHandlerBlock() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -1235,16 +1235,262 @@ class MapperMigratorTest {
 
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/PaymentExtMapper.xml"));
         assertThat(rewritten)
-                .contains("MERGE INTO `ns_payment_chargepayment_ext` t")
-                .contains("#{item.id,jdbcType=BIGINT} AS payment_id")
-                .contains("CAST(#{item.carryVoucherStatus,jdbcType=VARCHAR} AS INTEGER) AS carry_voucher_status")
-                .contains("ON (t.payment_id = s.payment_id)")
-                .contains("WHEN NOT MATCHED THEN INSERT")
+                .contains("INSERT INTO `ns_payment_chargepayment_ext`")
+                .contains("#{item.id,jdbcType=BIGINT}")
+                .contains("CAST(#{item.carryVoucherStatus,jdbcType=VARCHAR} AS INTEGER)")
+                .contains("WHEN DUP_VAL_ON_INDEX THEN NULL;")
+                .doesNotContain("MERGE INTO")
                 .doesNotContain("INSERT ignore");
         assertThat(result.automaticConversions()).hasSize(1);
         assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+                .contains(MapperXmlRewriter.MYBATIS_BATCH_INSERT_IGNORE_TO_DM_BLOCK_RULE);
         assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void migrationRewritesNestedDynamicBatchInsertIgnoreWithoutGuessingKeys() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CanalMapper">
+                    <insert id="insertBatchWide">
+                        insert ignore into ${tableName}
+                        <foreach collection="fieldNames" item="field" separator="," open="(" close=")">
+                            ${field.f1}
+                        </foreach>
+                        values
+                        <foreach collection="list" item="form" index="index" open="" close="" separator=",">
+                            <foreach collection="fieldNames" item="field" separator="," open="(" close=")">
+                                <choose>
+                                    <when test="form.get(field.f0) == null">null</when>
+                                    <otherwise>#{form.${field.f0}}</otherwise>
+                                </choose>
+                            </foreach>
+                        </foreach>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CanalMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CanalMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CanalMapper.xml"));
+        assertThat(rewritten)
+                .contains("BEGIN")
+                .contains("INSERT INTO ${tableName}")
+                .contains("<foreach collection=\"fieldNames\" item=\"field\" separator=\",\" open=\"(\" close=\")\">")
+                .contains("WHEN DUP_VAL_ON_INDEX THEN NULL;")
+                .doesNotContainIgnoringCase("insert ignore");
+        assertThat(result.manualReviewItems()).isEmpty();
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MapperXmlRewriter.MYBATIS_BATCH_INSERT_IGNORE_TO_DM_BLOCK_RULE));
+    }
+
+    @Test
+    void migrationRewritesDynamicColumnBatchUpsertWithConfiguredMethodKey() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CanalMapper">
+                    <insert id="upsertCompressedSnapshot">
+                        insert into ${tableName}
+                        (
+                        <foreach collection="fieldNames" item="field" separator=",">
+                            ${field}
+                        </foreach>
+                        , canal_source, canal_write_time
+                        )
+                        values
+                        <foreach collection="rows" item="row" separator=",">
+                            (
+                            <foreach collection="fieldNames" item="field" separator=",">
+                                #{row.${field}}
+                            </foreach>
+                            , #{canalSource}, now()
+                            )
+                        </foreach>
+                        on duplicate key update
+                        canal_source = values(canal_source),
+                        canal_write_time = values(canal_write_time)
+                        <if test="updateFieldNames != null and updateFieldNames.size()>0">
+                            ,
+                            <foreach collection="updateFieldNames" item="field" separator=",">
+                                ${field} = values(${field})
+                            </foreach>
+                        </if>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CanalMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CanalMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.CanalMapper.upsertCompressedSnapshot", List.of("pk"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CanalMapper.xml"));
+        assertThat(rewritten)
+                .contains("MERGE INTO ${tableName} t")
+                .contains("#{row.${field}} AS ${field}")
+                .contains("ON (t.pk = s.pk)")
+                .contains("t.canal_source = s.canal_source")
+                .contains("t.${field} = s.${field}")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContainIgnoringCase("on duplicate key update");
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void migrationRetainsDynamicColumnBatchUpsertWithoutConfiguredMethodKey() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CanalMapper">
+                    <insert id="upsertCompressedSnapshot">
+                        insert into ${tableName}
+                        (
+                        <foreach collection="fieldNames" item="field" separator=",">
+                            ${field}
+                        </foreach>
+                        , canal_source, canal_write_time
+                        )
+                        values
+                        <foreach collection="rows" item="row" separator=",">
+                            (
+                            <foreach collection="fieldNames" item="field" separator=",">
+                                #{row.${field}}
+                            </foreach>
+                            , #{canalSource}, now()
+                            )
+                        </foreach>
+                        on duplicate key update
+                        canal_source = values(canal_source),
+                        canal_write_time = values(canal_write_time)
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CanalMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CanalMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                SqlRewriteConfig.empty()
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CanalMapper.xml"));
+        assertThat(rewritten)
+                .containsIgnoringCase("on duplicate key update")
+                .doesNotContain("MERGE INTO ${tableName}");
+        assertThat(result.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).containsIgnoringCase("keyColumns"));
+    }
+
+    @Test
+    void migrationRewritesDynamicInsertSelectUpsertAsPerRowCursorMerge() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CanalMapper">
+                    <update id="updateTableHash">
+                        insert into ${targetTableName}
+                        (pk,
+                        <foreach collection="fields" item="c" separator=",">${c.value}</foreach>
+                        )
+                        select make_hash(source_id),
+                        <foreach collection="fields" item="c" separator=",">
+                            sum(${c.key}) as ${c.value}
+                        </foreach>
+                        from ${tableName}
+                        group by source_id
+                        for update
+                        on duplicate key update
+                        <foreach collection="fields" item="c" separator=",">
+                            ${c.value} = ${c.value} + values(${c.value})
+                        </foreach>
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CanalMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CanalMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(),
+                        Map.of("com.example.CanalMapper.updateTableHash", List.of("pk"))
+                )
+        );
+
+        String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/CanalMapper.xml"));
+        assertThat(rewritten)
+                .contains("FOR dm_source IN")
+                .contains("LOCK TABLE ${tableName} IN SHARE MODE;")
+                .contains("make_hash(source_id) AS pk")
+                .contains("MERGE INTO ${targetTableName} t")
+                .contains("ON (t.pk = s.pk)")
+                .contains("t.${c.value} = t.${c.value} + s.${c.value}")
+                .contains("WHEN NOT MATCHED THEN INSERT")
+                .doesNotContainIgnoringCase("for update")
+                .doesNotContainIgnoringCase("on duplicate key update");
+        assertThat(result.manualReviewItems()).isEmpty();
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules()).contains(
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_INSERT_SELECT_TO_DM_MERGE_RULE,
+                        MapperXmlRewriter.MYBATIS_INSERT_SELECT_FOR_UPDATE_TO_DM_TABLE_LOCK_RULE
+                ));
     }
 
     @Test
@@ -5918,6 +6164,62 @@ class MapperMigratorTest {
                 .satisfies(item -> assertThat(item.reason())
                         .contains("aggregate alias(es) [accountStatus]")
                         .contains("mixes aggregate output with non-aggregate column references"));
+    }
+
+    @Test
+    void aggregateAliasDeclaredInsideIfRemainsInsideDynamicHavingBranches() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.CustomerMapper">
+                    <select id="selectCustomersByParams">
+                        SELECT c.*
+                        <if test="followUp != null">
+                            , COUNT(ct.id) AS count_ct
+                        </if>
+                        FROM customer c
+                        LEFT JOIN customer_track ct ON c.id = ct.customer_id
+                        <if test="followUp == 1">
+                            GROUP BY c.id
+                            HAVING count_ct = 0
+                        </if>
+                        <if test="followUp == 2">
+                            GROUP BY c.id
+                            HAVING count_ct = 1
+                        </if>
+                        <if test="followUp == 3">
+                            GROUP BY c.id
+                            HAVING count_ct &gt; 1
+                        </if>
+                    </select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CustomerMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CustomerMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/CustomerMapper.xml");
+        String rewritten = Files.readString(output);
+        assertThat(rewritten)
+                .contains("HAVING (COUNT(ct.id)) = 0")
+                .contains("HAVING (COUNT(ct.id)) = 1")
+                .contains("HAVING (COUNT(ct.id)) &gt; 1")
+                .doesNotContain("WHERE count_ct")
+                .doesNotContain("where count_ct");
+        assertThat(XmlSupport.parse(output).getDocumentElement().getTagName()).isEqualTo("mapper");
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test

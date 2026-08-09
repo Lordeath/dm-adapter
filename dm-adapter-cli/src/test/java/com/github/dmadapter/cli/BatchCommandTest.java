@@ -159,6 +159,60 @@ class BatchCommandTest {
     }
 
     @Test
+    void batchUsesGlobalMethodKeyColumnsForDynamicBatchUpsert() throws Exception {
+        RemoteFixture remote = createRemote("configured-method-upsert", false);
+        pushRemoteChange(remote, "src/main/resources/mapper/CanalMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CanalMapper">
+                    <insert id="upsertCompressedSnapshot">
+                        insert into ${tableName}
+                        (
+                        <foreach collection="fieldNames" item="field" separator=",">
+                            ${field}
+                        </foreach>
+                        , canal_source
+                        )
+                        values
+                        <foreach collection="rows" item="row" separator=",">
+                            (
+                            <foreach collection="fieldNames" item="field" separator=",">
+                                #{row.${field}}
+                            </foreach>
+                            , #{canalSource}
+                            )
+                        </foreach>
+                        on duplicate key update
+                        canal_source = values(canal_source)
+                    </insert>
+                </mapper>
+                """);
+        Path config = writeConfig(remote);
+        Files.writeString(config, Files.readString(config).replace(
+                "migrationDefaults:\n",
+                """
+                migrationDefaults:
+                  upsertKeys:
+                    methods:
+                      "com.example.CanalMapper.upsertCompressedSnapshot":
+                        keyColumns: [pk]
+                """
+        ));
+
+        int exitCode = execute(config);
+
+        assertThat(exitCode).isZero();
+        assertThat(readRemoteFile(remote.remote(), "src/main/resources/mapper-dm/CanalMapper.xml"))
+                .contains("MERGE INTO ${tableName} t")
+                .contains("ON (t.pk = s.pk)")
+                .doesNotContainIgnoringCase("on duplicate key update");
+        assertThat(Files.readString(latestReportDir().resolve("configured-method-upsert/sql-rewrite.yml")))
+                .contains("\"com.example.CanalMapper.upsertCompressedSnapshot\":")
+                .contains("keyColumns: [\"pk\"]");
+    }
+
+    @Test
     void recreatesMarkedCorruptCache() throws Exception {
         RemoteFixture remote = createRemote("recover", false);
         Path config = writeConfig(remote);

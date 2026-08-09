@@ -49,12 +49,19 @@ record BatchConfig(
     }
 
     record UpsertKeysConfig(
-            Map<String, KeyColumnsConfig> tables
+            Map<String, KeyColumnsConfig> tables,
+            Map<String, MethodKeyColumnsConfig> methods
     ) {
     }
 
     record KeyColumnsConfig(
             List<String> keyColumns
+    ) {
+    }
+
+    record MethodKeyColumnsConfig(
+            List<String> keyColumns,
+            List<List<String>> conflictKeyGroups
     ) {
     }
 

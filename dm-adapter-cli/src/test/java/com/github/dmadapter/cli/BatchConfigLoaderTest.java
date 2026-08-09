@@ -181,6 +181,64 @@ class BatchConfigLoaderTest {
     }
 
     @Test
+    void mergesGlobalAndRepositoryMethodKeyColumns() throws Exception {
+        Path config = tempDir.resolve("method-upsert-keys.yml");
+        Files.writeString(config, """
+                schemaVersion: 1
+                workspaceDir: workspace
+                reportDir: reports
+                git:
+                  authorName: Batch Bot
+                  authorEmail: batch@example.com
+                  commitMessage: Convert SQL
+                migrationDefaults:
+                  upsertKeys:
+                    methods:
+                      "com.example.CanalMapper.upsert":
+                        keyColumns: [pk]
+                      "com.example.CanalMapper.insertIgnore":
+                        conflictKeyGroups: [[pk], [tenant_id, code]]
+                  sql:
+                    mode: IF_PRESENT
+                    targetLengthSemantics: CHAR
+                repositories:
+                  - name: canal
+                    url: file:///tmp/canal.git
+                    branch: main
+                    migration:
+                      upsertKeys:
+                        methods:
+                          "com.example.CanalMapper.upsert":
+                            keyColumns: [repository_pk]
+                """);
+
+        ResolvedBatchConfig.Migration migration = new BatchConfigLoader().load(config)
+                .repositories().get(0).migration();
+
+        assertThat(migration.methodKeyColumns())
+                .containsEntry("com.example.CanalMapper.upsert", List.of("repository_pk"));
+        assertThat(migration.methodConflictKeyGroups())
+                .containsEntry(
+                        "com.example.CanalMapper.insertIgnore",
+                        List.of(List.of("pk"), List.of("tenant_id", "code"))
+                );
+    }
+
+    @Test
+    void rejectsMethodKeysWithoutUsableColumns() throws Exception {
+        Path config = tempDir.resolve("empty-method-upsert-keys.yml");
+        Files.writeString(config, baseConfigWithMigration("""
+                    upsertKeys:
+                      methods:
+                        "com.example.CanalMapper.upsert": {}
+                """));
+
+        assertThatThrownBy(() -> new BatchConfigLoader().load(config))
+                .isInstanceOf(DmAdapterException.class)
+                .hasMessageContaining("must configure keyColumns or conflictKeyGroups");
+    }
+
+    @Test
     void rejectsEmptyOrDuplicateTableKeyColumns() throws Exception {
         Path empty = tempDir.resolve("empty-upsert-keys.yml");
         Files.writeString(empty, baseConfigWithMigration("""

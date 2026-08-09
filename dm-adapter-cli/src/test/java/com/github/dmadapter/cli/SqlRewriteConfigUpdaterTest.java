@@ -127,6 +127,55 @@ class SqlRewriteConfigUpdaterTest {
     }
 
     @Test
+    void batchMethodKeysReplaceBothPartsOfExistingMethodConfiguration() throws Exception {
+        Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
+        Files.createDirectories(config.getParent());
+        Files.writeString(config, """
+                upsertKeys:
+                  tables: {}
+                  methods:
+                    "com.example.CanalMapper.upsert":
+                      keyColumns: [legacy_id]
+                      conflictKeyGroups: [[legacy_id], [tenant_id, code]]
+                    "com.example.CanalMapper.insertIgnore":
+                      keyColumns: [legacy_id]
+                """);
+        SqlRewriteConfig loaded = new SqlRewriteConfigLoader().load(config);
+
+        SqlRewriteConfigUpdate update = updater.update(
+                AdapterContext.builder(tempDir).build(),
+                config,
+                loaded,
+                List.of(),
+                Map.of(),
+                false,
+                Map.of(),
+                Map.of(),
+                Map.of("com.example.CanalMapper.upsert", List.of("pk")),
+                Map.of(
+                        "com.example.CanalMapper.insertIgnore",
+                        List.of(List.of("pk"), List.of("tenant_id", "code"))
+                )
+        );
+
+        assertThat(update.rewriteConfig().methodKeyColumns())
+                .containsEntry("com.example.CanalMapper.upsert", List.of("pk"))
+                .doesNotContainKey("com.example.CanalMapper.insertIgnore");
+        assertThat(update.rewriteConfig().methodConflictKeyGroups())
+                .doesNotContainKey("com.example.CanalMapper.upsert")
+                .containsEntry(
+                        "com.example.CanalMapper.insertIgnore",
+                        List.of(List.of("pk"), List.of("tenant_id", "code"))
+                );
+        assertThat(Files.readString(config))
+                .contains("\"com.example.CanalMapper.upsert\":")
+                .contains("keyColumns: [\"pk\"]")
+                .contains("\"com.example.CanalMapper.insertIgnore\":")
+                .contains("conflictKeyGroups:")
+                .doesNotContain("legacy_id");
+    }
+
+    @Test
     void preservesExistingMethodKeyColumnsWhenMetadataDiffers() throws Exception {
         Path config = tempDir.resolve(".dm-adapter/sql-rewrite.yml");
         Files.createDirectories(config.getParent());

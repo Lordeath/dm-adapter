@@ -60,6 +60,15 @@ migrationDefaults:
       "${schemaName}.charge_customerchargedetail_ext":
         keyColumns:
           - chargeDetailId
+    # 动态表名无法绑定到静态 DDL 时，可按 Mapper 完整方法名配置权威冲突键。
+    methods:
+      "com.example.canal.dao.CanalMapper.upsertCompressedSnapshot":
+        keyColumns:
+          - pk
+      "com.example.canal.dao.CanalMapper.insertIfAbsent":
+        conflictKeyGroups:
+          - [pk]
+          - [tenant_id, business_code]
 
   sql:
     # IF_PRESENT：目录存在就转换，不存在则跳过。
@@ -104,9 +113,10 @@ repositories:
 - `name` 只允许字母、数字、点、下划线和连字符，且忽略大小写后不能重复。
 - `projectSubdir` 指向仓库内 Maven 项目根目录，必须存在 `pom.xml`。
 - `mapperDir`、`rewriteConfig`、SQL 输入输出目录均相对仓库检出根目录，而不是相对 `projectSubdir`。
-- `upsertKeys` 当前只支持 `tables`。每个表必须配置至少一个非空 `keyColumns`；只能填写已由业务 DDL 确认的主键或唯一键，不能根据字段名猜测。
-- `migrationDefaults.upsertKeys.tables` 对所有仓库生效；仓库自己的 `migration.upsertKeys.tables` 按表覆盖全局配置。
-- batch 内联的表主键优先于 `rewriteConfig` 中的同表配置；值不一致时使用内联配置，并在当前仓库迁移报告中输出告警。
+- `upsertKeys` 支持 `tables` 和 `methods`。表配置用于静态表名；方法配置键必须是 `namespace.statementId`，用于 `${tableName}` 等无法静态绑定 DDL 的动态写入。两者都只能填写已由业务 DDL 或业务约束确认的真实键，不能根据 `id`、`pk` 等字段名猜测。
+- `tables` 中每个表必须配置非空 `keyColumns`。`methods` 中的 `keyColumns` 表示普通 upsert 的唯一匹配键，`conflictKeyGroups` 表示 `INSERT IGNORE` 需要覆盖的全部可达主键/唯一键，组内为 AND、组间为 OR；每个方法必须至少配置其中一项。列名和键组不得为空或重复。
+- `migrationDefaults.upsertKeys.tables/methods` 对所有仓库生效；仓库自己的 `migration.upsertKeys.tables/methods` 分别按表或完整方法名覆盖全局配置。
+- batch 内联的表/方法键优先于 `rewriteConfig` 中的同名配置；值不一致时使用内联配置，并在当前仓库迁移报告中输出告警。运行时会把最终配置写入当前报告目录的 `sql-rewrite.yml`，便于审计和复现。
 - 表名比较忽略大小写、反引号和双引号，但不会移除 schema。`${schemaName}.table_name` 与 `table_name` 是不同配置键。
 - `targetLengthSemantics` 在 SQL 模式为 `IF_PRESENT` 或 `REQUIRED` 时必须指定。`CHAR` 表示目标库按字符长度，`BYTE` 会在必要时生成显式 `VARCHAR(n CHAR)` / `CHAR(n CHAR)`。
 - 仓库 URL 不允许内嵌凭据。HTTP(S) 仓库必须同时配置全局 `username` 和 `password`；`file` URL 可不配凭据。

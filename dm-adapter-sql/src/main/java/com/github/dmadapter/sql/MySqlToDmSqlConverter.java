@@ -1817,7 +1817,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private String unsupportedReason(String sql) {
-        if (containsMysqlUpdateJoin(sql) && !isDamengNativeSingleTargetLeftJoinUpdate(sql)) {
+        if (containsMysqlUpdateJoin(sql) && !isDamengNativeSingleTargetUpdateJoin(sql)) {
             if (containsUnresolvedOuterOrCrossUpdateJoin(sql)) {
                 return "MySQL outer/cross UPDATE JOIN could not be converted safely: an equivalent "
                         + "Dameng rewrite requires proof that each target row receives values from at "
@@ -1868,7 +1868,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return "";
     }
 
-    private boolean isDamengNativeSingleTargetLeftJoinUpdate(String sql) {
+    public boolean isDamengNativeSingleTargetUpdateJoin(String sql) {
         long statementCount = splitTopLevelStatements(sql).stream()
                 .filter(statement -> !statement.sql().isBlank())
                 .count();
@@ -1884,7 +1884,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return false;
         }
         int setIndex = findTopLevelKeyword(sql, "SET", joinIndex + "JOIN".length());
-        if (setIndex < 0 || !containsTopLevelLeftJoin(sql.substring(updateIndex, setIndex))) {
+        if (setIndex < 0) {
             return false;
         }
         int joinTypeStart = joinTypeStart(sql, joinIndex);
@@ -1909,16 +1909,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (setClause.isBlank()) {
             return false;
         }
-        boolean hasAssignment = false;
+        Set<String> tableAliases = chain.tables().stream()
+                .map(UpdateJoinTable::aliasKey)
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        Set<String> updatedAliases = new LinkedHashSet<>();
         for (TopLevelArgument assignment : splitTopLevelArguments(setClause)) {
             Matcher matcher = UPDATE_SET_QUALIFIED_ASSIGNMENT.matcher(assignment.text());
-            if (!matcher.find()
-                    || !normalizeIdentifierKey(matcher.group("alias")).equals(targetAlias)) {
+            if (!matcher.find()) {
                 return false;
             }
-            hasAssignment = true;
+            String updatedAlias = normalizeIdentifierKey(matcher.group("alias"));
+            if (!tableAliases.contains(updatedAlias)) {
+                return false;
+            }
+            updatedAliases.add(updatedAlias);
         }
-        return hasAssignment;
+        return updatedAliases.size() == 1;
     }
 
     private boolean containsTopLevelLeftJoin(String updateJoinClause) {
@@ -6925,6 +6931,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (setClause.isBlank()) {
             return GenericConversion.unchanged(sql);
         }
+        if (containsTopLevelLeftJoin(sql.substring(updateIndex, setIndex))
+                && isDamengNativeSingleTargetUpdateJoin(sql)) {
+            return GenericConversion.unchanged(sql);
+        }
         GenericConversion multiTarget = convertMultiTargetMysqlUpdateJoin(
                 sql,
                 updateIndex,
@@ -9560,13 +9570,6 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return GenericConversion.unchanged(sql);
         }
 
-        boolean allAssignmentsUseInsertColumns = updateAssignments.stream()
-                .allMatch(assignment -> insert.columns().stream()
-                        .anyMatch(column -> column.name().key().equals(assignment.column().key())));
-        if (!allAssignmentsUseInsertColumns) {
-            return GenericConversion.unchanged(sql);
-        }
-
         String converted = mergeSql(insert.toInsertValues(), updateAssignments, keyColumns);
         return converted == null ? GenericConversion.unchanged(sql) : new GenericConversion(converted, true);
     }
@@ -9616,8 +9619,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         List<UpdateAssignment> effectiveAssignments = updateAssignments.stream()
                 .filter(assignment -> !normalizedKeys.contains(assignment.column().key()))
                 .toList();
-        if (effectiveAssignments.stream().anyMatch(assignment -> insert.columns().stream()
-                .noneMatch(column -> column.name().key().equals(assignment.column().key())))) {
+        if (effectiveAssignments.stream().anyMatch(assignment -> assignment.valuesReference()
+                && insert.columns().stream()
+                .noneMatch(column -> column.name().key().equals(identifierKey(assignment.sourceExpression()))))) {
             return null;
         }
 

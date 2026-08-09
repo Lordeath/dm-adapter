@@ -19,7 +19,9 @@ record BatchMigrationRequest(
         List<Path> preservedSqlPaths,
         boolean sqlScriptsOnly,
         TargetLengthSemantics targetLengthSemantics,
-        Map<String, List<String>> tableKeyColumns
+        Map<String, List<String>> tableKeyColumns,
+        Map<String, List<String>> methodKeyColumns,
+        Map<String, List<List<String>>> methodConflictKeyGroups
 ) {
     BatchMigrationRequest {
         preservedSqlPaths = List.copyOf(preservedSqlPaths == null ? List.of() : preservedSqlPaths);
@@ -31,5 +33,23 @@ record BatchMigrationRequest(
             ));
         }
         tableKeyColumns = Collections.unmodifiableMap(copied);
+        LinkedHashMap<String, List<String>> copiedMethods = new LinkedHashMap<>();
+        if (methodKeyColumns != null) {
+            methodKeyColumns.forEach((method, columns) -> copiedMethods.put(
+                    method,
+                    List.copyOf(columns == null ? List.of() : columns)
+            ));
+        }
+        methodKeyColumns = Collections.unmodifiableMap(copiedMethods);
+        LinkedHashMap<String, List<List<String>>> copiedGroups = new LinkedHashMap<>();
+        if (methodConflictKeyGroups != null) {
+            methodConflictKeyGroups.forEach((method, groups) -> copiedGroups.put(
+                    method,
+                    (groups == null ? List.<List<String>>of() : groups).stream()
+                            .map(group -> List.copyOf(group == null ? List.of() : group))
+                            .toList()
+            ));
+        }
+        methodConflictKeyGroups = Collections.unmodifiableMap(copiedGroups);
     }
 }
