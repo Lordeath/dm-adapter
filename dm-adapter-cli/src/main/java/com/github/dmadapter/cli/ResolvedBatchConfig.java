@@ -51,17 +51,34 @@ record ResolvedBatchConfig(
             Path rewriteConfig,
             boolean sqlScriptsOnly,
             Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Map<String, List<List<String>>> methodConflictKeyGroups,
             Sql sql
     ) {
         Migration {
+            tableKeyColumns = copyColumns(tableKeyColumns);
+            methodKeyColumns = copyColumns(methodKeyColumns);
+            LinkedHashMap<String, List<List<String>>> copiedGroups = new LinkedHashMap<>();
+            if (methodConflictKeyGroups != null) {
+                methodConflictKeyGroups.forEach((method, groups) -> copiedGroups.put(
+                        method,
+                        (groups == null ? List.<List<String>>of() : groups).stream()
+                                .map(group -> List.copyOf(group == null ? List.of() : group))
+                                .toList()
+                ));
+            }
+            methodConflictKeyGroups = Collections.unmodifiableMap(copiedGroups);
+        }
+
+        private static Map<String, List<String>> copyColumns(Map<String, List<String>> source) {
             LinkedHashMap<String, List<String>> copied = new LinkedHashMap<>();
-            if (tableKeyColumns != null) {
-                tableKeyColumns.forEach((table, columns) -> copied.put(
-                        table,
+            if (source != null) {
+                source.forEach((key, columns) -> copied.put(
+                        key,
                         List.copyOf(columns == null ? List.of() : columns)
                 ));
             }
-            tableKeyColumns = Collections.unmodifiableMap(copied);
+            return Collections.unmodifiableMap(copied);
         }
     }
 

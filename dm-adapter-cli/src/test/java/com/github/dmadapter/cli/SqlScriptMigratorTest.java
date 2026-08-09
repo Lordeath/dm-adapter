@@ -6658,14 +6658,15 @@ class SqlScriptMigratorTest {
     void retainsCreateTableWithUnsupportedInlineFulltextIndexForManualReview() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
-        write(sqlRoot.resolve("fulltext.sql"), """
+        String original = """
                 CREATE TABLE sample_article (
                     id BIGINT NOT NULL,
                     body TEXT,
                     PRIMARY KEY (id),
                     FULLTEXT KEY ft_article_body (body)
                 );
-                """);
+                """;
+        write(sqlRoot.resolve("fulltext.sql"), original);
 
         SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
                 tempDir,
@@ -6683,6 +6684,7 @@ class SqlScriptMigratorTest {
                 assertThat(item.reason()).contains("FULLTEXT", "已保留原 SQL"));
         assertThat(Files.readString(sqlRootOut.resolve("fulltext.sql")))
                 .contains("FULLTEXT KEY ft_article_body (body)");
+        assertThat(Files.readString(sqlRoot.resolve("fulltext.sql"))).isEqualTo(original);
     }
 
     @Test
@@ -10016,6 +10018,25 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .doesNotContain(SqlScriptMigrator.MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE));
+    }
+
+    @Test
+    void preservesJavascriptPayloadThatContainsSqlWordsAsOrdinaryData() throws Exception {
+        String original = """
+                INSERT INTO ns_custom_functions (func_name, func_code)
+                VALUES ('pad', 'function pad(n) { return n < 10 ? "0" + n : "" + n; } // SELECT DATE_ADD');
+                """;
+        ConvertedScript converted = migrateSingleScript(original);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("'function pad(n) { return n < 10 ? \"0\" + n : \"\" + n; } // SELECT DATE_ADD'")
+                .doesNotContain("FROM DUAL")
+                .doesNotContain("WHERE NOT EXISTS");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_EMBEDDED_SQL_LITERAL_TO_DM_RULE));
+        assertThat(Files.readString(tempDir.resolve("sql/v2/procedure.sql"))).isEqualTo(original);
     }
 
     @Test

@@ -50,6 +50,8 @@ class SqlRewriteConfigUpdater {
                 metadataByTable,
                 metadataAvailable,
                 Map.of(),
+                Map.of(),
+                Map.of(),
                 Map.of()
         );
     }
@@ -71,6 +73,8 @@ class SqlRewriteConfigUpdater {
                 metadataByTable,
                 metadataAvailable,
                 autoIncrementKinds,
+                Map.of(),
+                Map.of(),
                 Map.of()
         );
     }
@@ -85,9 +89,41 @@ class SqlRewriteConfigUpdater {
             Map<String, DamengMetadataReader.AutoIncrementKind> autoIncrementKinds,
             Map<String, List<String>> configuredTableKeys
     ) {
+        return update(
+                context,
+                rewriteConfigPath,
+                loadedRewriteConfig,
+                candidates,
+                metadataByTable,
+                metadataAvailable,
+                autoIncrementKinds,
+                configuredTableKeys,
+                Map.of(),
+                Map.of()
+        );
+    }
+
+    SqlRewriteConfigUpdate update(
+            AdapterContext context,
+            Path rewriteConfigPath,
+            SqlRewriteConfig loadedRewriteConfig,
+            List<RewriteConfigCandidate> candidates,
+            Map<String, TableKeyMetadata> metadataByTable,
+            boolean metadataAvailable,
+            Map<String, DamengMetadataReader.AutoIncrementKind> autoIncrementKinds,
+            Map<String, List<String>> configuredTableKeys,
+            Map<String, List<String>> configuredMethodKeys,
+            Map<String, List<List<String>>> configuredMethodConflictKeyGroups
+    ) {
         List<String> warnings = new ArrayList<>();
         RewriteConfigModel model = RewriteConfigModel.load(rewriteConfigPath);
         boolean configuredTableKeysChanged = applyConfiguredTableKeys(model, configuredTableKeys, warnings);
+        boolean configuredMethodKeysChanged = applyConfiguredMethodKeys(
+                model,
+                configuredMethodKeys,
+                configuredMethodConflictKeyGroups,
+                warnings
+        );
         IdentityInsertReconciliation reconciliation = reconcileIdentityInsertTables(
                 context,
                 model,
@@ -102,7 +138,7 @@ class SqlRewriteConfigUpdater {
         );
         boolean identityInsertTablesChanged = reconciliation.changed() || learnedIdentityInsertTable;
         if (candidates.isEmpty()) {
-            if (!identityInsertTablesChanged && !configuredTableKeysChanged) {
+            if (!identityInsertTablesChanged && !configuredTableKeysChanged && !configuredMethodKeysChanged) {
                 return new SqlRewriteConfigUpdate(loadedRewriteConfig, Optional.empty(), warnings);
             }
             SqlRewriteConfig rewriteConfig = mergedRewriteConfig(loadedRewriteConfig, model, Map.of());
@@ -226,6 +262,57 @@ class SqlRewriteConfigUpdater {
             if (!normalizedColumns(existing).equals(normalizedColumns(entry.getValue()))) {
                 model.putTable(entry.getKey(), entry.getValue());
                 changed = true;
+            }
+        }
+        return changed;
+    }
+
+    private boolean applyConfiguredMethodKeys(
+            RewriteConfigModel model,
+            Map<String, List<String>> configuredMethodKeys,
+            Map<String, List<List<String>>> configuredMethodConflictKeyGroups,
+            List<String> warnings
+    ) {
+        SqlRewriteConfig normalized = new SqlRewriteConfig(
+                Map.of(),
+                configuredMethodKeys,
+                Set.of(),
+                Set.of(),
+                Set.of(),
+                Set.of(),
+                Map.of(),
+                configuredMethodConflictKeyGroups
+        );
+        boolean changed = false;
+        Set<String> methods = new LinkedHashSet<>(normalized.methodKeyColumns().keySet());
+        methods.addAll(normalized.methodConflictKeyGroups().keySet());
+        for (String method : methods) {
+            List<String> configuredKeys = normalized.methodKeyColumns(method);
+            List<String> existingKeys = model.methodColumns(method);
+            if (!normalizedColumns(existingKeys).equals(normalizedColumns(configuredKeys))) {
+                if (!existingKeys.isEmpty()) {
+                    warnings.add("Batch upsert keyColumns override rewriteConfig for method "
+                            + method + ": " + existingKeys + " -> " + configuredKeys + ".");
+                }
+                model.putMethod(method, configuredKeys);
+                changed = true;
+            }
+            List<List<String>> configuredGroups = normalized.conflictKeyGroupsFor(method);
+            List<List<String>> existingGroups = model.methodConflictKeyGroups(method);
+            if (!existingGroups.equals(configuredGroups)) {
+                if (!existingGroups.isEmpty()) {
+                    warnings.add("Batch upsert conflictKeyGroups override rewriteConfig for method "
+                            + method + ": " + existingGroups + " -> " + configuredGroups + ".");
+                }
+                if (configuredGroups.isEmpty()) {
+                    model.removeMethodConflictKeyGroups(method);
+                } else {
+                    model.putMethodConflictKeyGroups(method, configuredGroups);
+                }
+                changed = true;
+            }
+            if (!configuredKeys.isEmpty() || !configuredGroups.isEmpty()) {
+                model.removeMethodResolution(method);
             }
         }
         return changed;

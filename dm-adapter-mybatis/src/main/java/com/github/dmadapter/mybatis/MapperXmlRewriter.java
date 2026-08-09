@@ -51,6 +51,12 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
     public static final String MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE =
             "MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE";
+    public static final String MYBATIS_BATCH_INSERT_IGNORE_TO_DM_BLOCK_RULE =
+            "MYBATIS_BATCH_INSERT_IGNORE_TO_DM_DUPLICATE_HANDLER_BLOCK";
+    public static final String MYBATIS_DYNAMIC_INSERT_SELECT_TO_DM_MERGE_RULE =
+            "MYBATIS_DYNAMIC_INSERT_SELECT_TO_DM_CURSOR_MERGE";
+    public static final String MYBATIS_INSERT_SELECT_FOR_UPDATE_TO_DM_TABLE_LOCK_RULE =
+            "MYBATIS_INSERT_SELECT_FOR_UPDATE_TO_DM_TABLE_LOCK";
     public static final String MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT_RULE =
             "MYBATIS_INSERT_IGNORE_AS_PLAIN_INSERT";
     public static final String MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE =
@@ -104,6 +110,9 @@ public class MapperXmlRewriter {
             "Result mapping contains a dynamic or unsupported database-column expression with a Dameng special "
                     + "column name. The mapping attribute was preserved; rewrite only its database-column side "
                     + "to the physical _column name.";
+    private static final String MALFORMED_STATEMENT_REWRITE_REASON =
+            "The automatic rewrite produced malformed mapper XML for this statement. The original statement was "
+                    + "retained and other statements will continue to be processed.";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Set<String> RESULT_MAPPING_TAGS = Set.of(
@@ -320,6 +329,33 @@ public class MapperXmlRewriter {
                     + "(?<valuesTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)"
                     + "(?<trailing>;?\\s*)$"
     );
+    private static final Pattern DYNAMIC_FOREACH_INSERT_IGNORE_PREFIX_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)insert\\s+ignore\\s+into\\s+"
+                    + "(?<table>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?"
+                    + ")\\s*"
+    );
+    private static final Pattern DYNAMIC_BATCH_ON_DUPLICATE_PREFIX_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)insert\\s+into\\s+"
+                    + "(?<table>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?"
+                    + ")\\s*"
+    );
+    private static final Pattern DYNAMIC_INSERT_SELECT_PREFIX_PATTERN = Pattern.compile(
+            "(?is)^(?<leading>\\s*)insert\\s+(?<ignore>ignore\\s+)?into\\s+"
+                    + "(?<table>"
+                    + DM_IDENTIFIER
+                    + "(?:\\s*\\.\\s*"
+                    + DM_IDENTIFIER
+                    + ")?"
+                    + ")\\s*"
+    );
     private static final Pattern ON_DUPLICATE_TRIM_COLUMNS_VALUES_PATTERN = Pattern.compile(
             "(?is)^(?<leading>\\s*)insert\\s+into\\s+"
                     + "(?<table>"
@@ -533,7 +569,26 @@ public class MapperXmlRewriter {
                             dynamicXmlManualReviewReason(dynamicBodyConversion.manualReviewReasons())
                     ));
                 }
-                if (dynamicBodyConversion.changed()) {
+                boolean validDynamicReplacement = !dynamicBodyConversion.changed()
+                        || isWellFormedStatementBodyReplacement(
+                                sourceXml,
+                                tagName,
+                                statementId,
+                                occurrenceIndex,
+                                dynamicBodyConversion.convertedBody()
+                        );
+                if (dynamicBodyConversion.changed() && !validDynamicReplacement) {
+                    manualReviewItems.add(new SqlChange(
+                            reportPath,
+                            statementKey,
+                            dynamicBodyConversion.originalBody(),
+                            dynamicBodyConversion.originalBody(),
+                            List.of(),
+                            true,
+                            MALFORMED_STATEMENT_REWRITE_REASON
+                    ));
+                }
+                if (dynamicBodyConversion.changed() && validDynamicReplacement) {
                     replacements.add(StatementReplacement.dynamicBody(
                             tagName,
                             statementId,
@@ -550,7 +605,7 @@ public class MapperXmlRewriter {
                             ""
                     ));
                 }
-                String convertedBody = dynamicBodyConversion.changed()
+                String convertedBody = dynamicBodyConversion.changed() && validDynamicReplacement
                         ? dynamicBodyConversion.convertedBody()
                         : statementBody.rawBody();
                 if (hasResultTypeReservedColumnRisk(
@@ -1469,6 +1524,25 @@ public class MapperXmlRewriter {
         }
     }
 
+    private boolean isWellFormedStatementBodyReplacement(
+            String xml,
+            String tagName,
+            String statementId,
+            int occurrenceIndex,
+            String convertedBody
+    ) {
+        try {
+            StatementBody statementBody = findStatementBody(xml, tagName, statementId, occurrenceIndex);
+            String candidate = xml.substring(0, statementBody.start())
+                    + convertedBody
+                    + xml.substring(statementBody.end());
+            XmlSupport.parse(candidate);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     private StatementBody findStatementBody(String xml, String tagName, String statementId, int occurrenceIndex) {
         if (statementId.isBlank()) {
             throw new IllegalStateException("Mapper statement id is required for text-preserving rewrite.");
@@ -1537,6 +1611,9 @@ public class MapperXmlRewriter {
             String generatedKeyProperty,
             String generatedKeyColumn
     ) {
+        boolean damengNativeSingleTargetUpdateJoin =
+                sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                        && mySqlToDmSqlConverter.isDamengNativeSingleTargetUpdateJoin(sqlView(rawBody).text());
         StringBuilder convertedBody = new StringBuilder(rawBody.length());
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
@@ -1637,6 +1714,9 @@ public class MapperXmlRewriter {
             manualReviewReasons.removeIf(this::isMysqlInsertIgnoreManualReviewReason);
         }
         if (appliedRules.contains(MYBATIS_DYNAMIC_UPDATE_JOIN_TO_DM_UPDATE_FROM_RULE)) {
+            manualReviewReasons.removeIf(this::isMysqlUpdateJoinManualReviewReason);
+        }
+        if (damengNativeSingleTargetUpdateJoin) {
             manualReviewReasons.removeIf(this::isMysqlUpdateJoinManualReviewReason);
         }
         return new DynamicBodyConversion(
@@ -1781,10 +1861,27 @@ public class MapperXmlRewriter {
             addManualReviewReasons(manualReviewReasons, List.of(DAMENG_CTAS_BIND_PARAMETER_REASON));
         }
 
-        String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
-        if (!foreachMerge.equals(converted)) {
-            appliedRules.add(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
-            converted = foreachMerge;
+        String nestedBatchMerge = convertNestedDynamicBatchOnDuplicateKeyUpdate(
+                converted,
+                statementKey,
+                rewriteConfig
+        );
+        if (!nestedBatchMerge.equals(converted)) {
+            appliedRules.add(MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+            converted = nestedBatchMerge;
+        }
+
+        String insertSelectMerge = convertDynamicInsertSelectToCursorMerge(
+                converted,
+                statementKey,
+                rewriteConfig
+        );
+        if (!insertSelectMerge.equals(converted)) {
+            appliedRules.add(MYBATIS_DYNAMIC_INSERT_SELECT_TO_DM_MERGE_RULE);
+            if (insertSelectMerge.contains("LOCK TABLE ")) {
+                appliedRules.add(MYBATIS_INSERT_SELECT_FOR_UPDATE_TO_DM_TABLE_LOCK_RULE);
+            }
+            converted = insertSelectMerge;
         }
 
         String batchMerge = convertBatchOnDuplicateKeyUpdate(converted, statementKey, rewriteConfig);
@@ -1793,9 +1890,17 @@ public class MapperXmlRewriter {
             converted = batchMerge;
         }
 
+        String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
+        if (!foreachMerge.equals(converted)) {
+            appliedRules.add(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+            converted = foreachMerge;
+        }
+
         String insertIgnoreMerge = convertBatchInsertIgnore(converted, statementKey, rewriteConfig);
         if (!insertIgnoreMerge.equals(converted)) {
-            appliedRules.add(MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
+            appliedRules.add(insertIgnoreMerge.contains("DUP_VAL_ON_INDEX")
+                    ? MYBATIS_BATCH_INSERT_IGNORE_TO_DM_BLOCK_RULE
+                    : MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE_RULE);
             converted = insertIgnoreMerge;
         }
 
@@ -4696,7 +4801,37 @@ public class MapperXmlRewriter {
                 aliases.putIfAbsent(identifierKey(selectAlias.alias()), selectAlias);
             }
         }
+        addTopLevelIfAggregateAliases(selectList, aliases);
         return aliases;
+    }
+
+    private void addTopLevelIfAggregateAliases(String selectList, Map<String, SelectAlias> aliases) {
+        int index = 0;
+        while (index < selectList.length()) {
+            int ifStart = selectList.indexOf("<if", index);
+            if (ifStart < 0) {
+                return;
+            }
+            XmlTag ifTag = readXmlTag(selectList, ifStart);
+            if (ifTag == null || ifTag.closing() || ifTag.selfClosing()
+                    || !"if".equalsIgnoreCase(ifTag.name())) {
+                index = ifStart + "<if".length();
+                continue;
+            }
+            int closingStart = findClosingTag(selectList, ifTag.endIndex(), "if", selectList.length());
+            if (closingStart < 0) {
+                return;
+            }
+            String content = selectList.substring(ifTag.endIndex(), closingStart).strip();
+            if (content.startsWith(",")) {
+                content = content.substring(1).strip();
+            }
+            SelectAlias alias = selectAliasAllowingSqlFragments(content);
+            if (alias != null && isSafeAggregateHavingExpression(alias.expression())) {
+                aliases.putIfAbsent(identifierKey(alias.alias()), alias);
+            }
+            index = closingTagEnd(selectList, closingStart);
+        }
     }
 
     private Map<String, SelectAlias> unsafeAggregateSelectAliases(String selectList) {
@@ -5734,9 +5869,60 @@ public class MapperXmlRewriter {
         return wrapper == null ? converted : wrapper.wrap(converted);
     }
 
+    private String convertBatchInsertIgnoreToDuplicateHandlerBlock(
+            String leading,
+            String table,
+            String columnList,
+            String foreachXml,
+            String trailing
+    ) {
+        ForeachBlock foreach = readForeach(foreachXml);
+        String tupleBody = foreach == null ? "" : outerParenthesizedContent(foreach.body());
+        if (foreach == null || !foreach.open().isBlank() || columnList.isBlank() || tupleBody.isBlank()) {
+            return null;
+        }
+        String baseIndent = indentationOfLastLine(leading);
+        String rowIndent = baseIndent + "    ";
+        String statementIndent = rowIndent + "    ";
+        String handlerIndent = statementIndent + "    ";
+        String cleanTrailing = trailing.replaceFirst("(?s)^\\s*;", "");
+        return new StringBuilder(leading.length() + foreachXml.length() + columnList.length() + 160)
+                .append(leading)
+                .append("BEGIN\n")
+                .append(rowIndent)
+                .append(foreach.openingWithSeparator(""))
+                .append("\n")
+                .append(statementIndent)
+                .append("BEGIN\n")
+                .append(handlerIndent)
+                .append("INSERT INTO ")
+                .append(table)
+                .append(" (")
+                .append(columnList.trim())
+                .append(") VALUES (")
+                .append(tupleBody.trim())
+                .append(");\n")
+                .append(statementIndent)
+                .append("EXCEPTION\n")
+                .append(handlerIndent)
+                .append("WHEN DUP_VAL_ON_INDEX THEN NULL;\n")
+                .append(statementIndent)
+                .append("END;\n")
+                .append(rowIndent)
+                .append("</foreach>\n")
+                .append(baseIndent)
+                .append("END;")
+                .append(cleanTrailing)
+                .toString();
+    }
+
     private String convertBatchInsertIgnore(String body, String statementKey, SqlRewriteConfig rewriteConfig) {
         IfWrapper wrapper = readWrappingIf(body);
         String candidate = wrapper == null ? body : wrapper.body();
+        String nestedForeachBlock = convertNestedForeachBatchInsertIgnore(candidate);
+        if (nestedForeachBlock != null && !nestedForeachBlock.equals(candidate)) {
+            return wrapper == null ? nestedForeachBlock : wrapper.wrap(nestedForeachBlock);
+        }
         Matcher matcher = BATCH_INSERT_IGNORE_PATTERN.matcher(candidate);
         BatchInsertValues batchInsertValues;
         if (matcher.matches()) {
@@ -5791,23 +5977,663 @@ public class MapperXmlRewriter {
                 return wrapper == null ? converted : wrapper.wrap(converted);
             }
         }
-        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, batchInsertValues.table());
-        if (keyColumns.isEmpty()) {
-            return body;
-        }
-        String converted = convertBatchInsertValuesToMerge(
+        String converted = convertBatchInsertIgnoreToDuplicateHandlerBlock(
                 batchInsertValues.leading(),
                 batchInsertValues.table(),
                 batchInsertValues.columns(),
                 batchInsertValues.foreach(),
-                batchInsertValues.updates(),
-                keyColumns,
                 batchInsertValues.trailing()
         );
         if (converted == null || converted.equals(candidate)) {
             return body;
         }
         return wrapper == null ? converted : wrapper.wrap(converted);
+    }
+
+    private String convertNestedDynamicBatchOnDuplicateKeyUpdate(
+            String body,
+            String statementKey,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        Matcher prefix = DYNAMIC_BATCH_ON_DUPLICATE_PREFIX_PATTERN.matcher(body);
+        if (!prefix.find()) {
+            return body;
+        }
+        int columnOpen = skipWhitespace(body, prefix.end());
+        if (columnOpen >= body.length() || body.charAt(columnOpen) != '(') {
+            return body;
+        }
+        int columnClose = findMatchingParen(body, columnOpen);
+        if (columnClose < 0) {
+            return body;
+        }
+        int valuesIndex = skipWhitespace(body, columnClose + 1);
+        if (!isKeywordAt(body, valuesIndex, "VALUES")) {
+            return body;
+        }
+        int rowStart = skipWhitespace(body, valuesIndex + "VALUES".length());
+        XmlElementRange rowForeach = readXmlElementAt(body, rowStart);
+        if (rowForeach == null || !"foreach".equalsIgnoreCase(rowForeach.name())) {
+            return body;
+        }
+        String rowOpening = body.substring(rowForeach.start(), rowForeach.openingEnd());
+        if (!defaultString(xmlAttribute(rowOpening, "open")).isBlank()
+                || !defaultString(xmlAttribute(rowOpening, "close")).isBlank()) {
+            return body;
+        }
+        int onIndex = skipWhitespace(body, rowForeach.end());
+        if (!isKeywordAt(body, onIndex, "ON")) {
+            return body;
+        }
+        int duplicateIndex = skipWhitespace(body, onIndex + "ON".length());
+        int keyIndex = duplicateIndex < body.length() && isKeywordAt(body, duplicateIndex, "DUPLICATE")
+                ? skipWhitespace(body, duplicateIndex + "DUPLICATE".length())
+                : -1;
+        int updateIndex = keyIndex >= 0 && isKeywordAt(body, keyIndex, "KEY")
+                ? skipWhitespace(body, keyIndex + "KEY".length())
+                : -1;
+        int updateClauseStart = updateIndex >= 0 && isKeywordAt(body, updateIndex, "UPDATE")
+                ? skipWhitespace(body, updateIndex + "UPDATE".length())
+                : -1;
+        if (updateClauseStart < 0) {
+            return body;
+        }
+
+        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, prefix.group("table"));
+        if (keyColumns.isEmpty()) {
+            return body;
+        }
+        String columnList = body.substring(columnOpen + 1, columnClose);
+        String tupleBody = outerParenthesizedContent(
+                body.substring(rowForeach.openingEnd(), rowForeach.closingStart())
+        );
+        if (!columnList.contains("<foreach") || !tupleBody.contains("<foreach")) {
+            return body;
+        }
+        DynamicMergeLists mergeLists = dynamicMergeLists(columnList, tupleBody);
+        if (mergeLists == null) {
+            return body;
+        }
+        String updateClause = body.substring(updateClauseStart).replaceFirst("(?s);?\\s*$", "");
+        String mergeUpdates = convertDynamicValuesAssignmentsForMerge(updateClause);
+        if (mergeUpdates == null) {
+            return body;
+        }
+
+        String leading = prefix.group("leading");
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        String nestedIndent = childIndent + "    ";
+        StringBuilder converted = new StringBuilder(body.length() + 256);
+        converted.append(leading)
+                .append("BEGIN\n")
+                .append(childIndent)
+                .append(withXmlAttribute(rowOpening, "separator", ";"))
+                .append("\n")
+                .append(nestedIndent)
+                .append("MERGE INTO ")
+                .append(prefix.group("table"))
+                .append(" t\n")
+                .append(nestedIndent)
+                .append("USING (SELECT ")
+                .append(mergeLists.sourceProjection())
+                .append(" FROM dual) s\n")
+                .append(nestedIndent)
+                .append("ON (");
+        for (int index = 0; index < keyColumns.size(); index++) {
+            if (index > 0) {
+                converted.append(" AND ");
+            }
+            converted.append("t.").append(dmIdentifier(keyColumns.get(index)))
+                    .append(" = s.").append(dmIdentifier(keyColumns.get(index)));
+        }
+        converted.append(")\n")
+                .append(nestedIndent)
+                .append("WHEN MATCHED THEN UPDATE SET ")
+                .append(mergeUpdates)
+                .append("\n")
+                .append(nestedIndent)
+                .append("WHEN NOT MATCHED THEN INSERT (")
+                .append(columnList.strip())
+                .append(") VALUES (")
+                .append(mergeLists.insertSourceList())
+                .append(")\n")
+                .append(childIndent)
+                .append(body, rowForeach.closingStart(), rowForeach.end())
+                .append(";\n")
+                .append(baseIndent)
+                .append("END;")
+                .append(body.substring(rowForeach.end()).replaceFirst(
+                        "(?is)^\\s*on\\s+duplicate\\s+key\\s+update[\\s\\S]*$",
+                        ""
+                ));
+        return converted.toString();
+    }
+
+    private String convertDynamicInsertSelectToCursorMerge(
+            String body,
+            String statementKey,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        Matcher prefix = DYNAMIC_INSERT_SELECT_PREFIX_PATTERN.matcher(body);
+        if (!prefix.find()) {
+            return body;
+        }
+        int columnOpen = skipWhitespace(body, prefix.end());
+        if (columnOpen >= body.length() || body.charAt(columnOpen) != '(') {
+            return body;
+        }
+        int columnClose = findMatchingParen(body, columnOpen);
+        if (columnClose < 0) {
+            return body;
+        }
+        int selectIndex = skipWhitespace(body, columnClose + 1);
+        if (!isKeywordAt(body, selectIndex, "SELECT")) {
+            return body;
+        }
+        int projectionStart = skipWhitespace(body, selectIndex + "SELECT".length());
+        int fromIndex = findTopLevelKeywordSkippingXml(body, "FROM", projectionStart);
+        if (fromIndex < 0) {
+            return body;
+        }
+        String sqlText = sqlView(body).text();
+        Matcher onDuplicate = Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
+                .matcher(sqlText);
+        int onDuplicateIndex = onDuplicate.find(fromIndex) ? onDuplicate.start() : -1;
+        boolean insertIgnore = prefix.group("ignore") != null;
+        if (!insertIgnore && onDuplicateIndex < 0) {
+            return body;
+        }
+        int statementEnd = body.length();
+        while (statementEnd > 0 && Character.isWhitespace(body.charAt(statementEnd - 1))) {
+            statementEnd--;
+        }
+        if (statementEnd > 0 && body.charAt(statementEnd - 1) == ';') {
+            statementEnd--;
+        }
+        int sourceEnd = onDuplicateIndex < 0 ? statementEnd : onDuplicateIndex;
+        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, prefix.group("table"));
+        if (keyColumns.isEmpty()) {
+            return body;
+        }
+        String columnList = body.substring(columnOpen + 1, columnClose);
+        String selectList = body.substring(projectionStart, fromIndex);
+        String aliasedSelectList = aliasDynamicSelectProjection(columnList, selectList);
+        String cursorProjection = dynamicColumnSourceProjection(columnList, "dm_source");
+        if (aliasedSelectList == null || cursorProjection == null) {
+            return body;
+        }
+        String sourceSql = body.substring(fromIndex, sourceEnd);
+        Matcher sourceLock = Pattern.compile("(?is)\\s+FOR\\s+UPDATE\\s*$").matcher(sourceSql);
+        String lockTable = "";
+        if (sourceLock.find()) {
+            Matcher sourceTable = Pattern.compile(
+                    "(?is)^\\s*FROM\\s+(?<table>" + DM_IDENTIFIER
+                            + "(?:\\s*\\.\\s*" + DM_IDENTIFIER + ")?)(?=\\s|$)"
+            ).matcher(sourceSql);
+            if (!sourceTable.find()) {
+                return body;
+            }
+            lockTable = sourceTable.group("table");
+            sourceSql = sourceSql.substring(0, sourceLock.start());
+        }
+        String updateClause = onDuplicateIndex < 0
+                ? ""
+                : body.substring(onDuplicate.end(), statementEnd);
+        String mergeUpdates = updateClause.isBlank()
+                ? ""
+                : convertDynamicValuesAssignmentsForMerge(updateClause);
+        if (!updateClause.isBlank() && mergeUpdates == null) {
+            return body;
+        }
+
+        String leading = prefix.group("leading");
+        String baseIndent = indentationOfLastLine(leading);
+        String childIndent = baseIndent + "    ";
+        String nestedIndent = childIndent + "    ";
+        StringBuilder converted = new StringBuilder(body.length() + 320);
+        converted.append(leading)
+                .append("DECLARE\n")
+                .append("BEGIN\n");
+        if (!lockTable.isBlank()) {
+            converted.append(childIndent)
+                    .append("LOCK TABLE ")
+                    .append(lockTable)
+                    .append(" IN SHARE MODE;\n");
+        }
+        converted.append(childIndent)
+                .append("FOR dm_source IN (\n")
+                .append(nestedIndent)
+                .append("SELECT ")
+                .append(aliasedSelectList)
+                .append("\n")
+                .append(sourceSql)
+                .append("\n")
+                .append(childIndent)
+                .append(") LOOP\n")
+                .append(nestedIndent)
+                .append("MERGE INTO ")
+                .append(prefix.group("table"))
+                .append(" t\n")
+                .append(nestedIndent)
+                .append("USING (SELECT ")
+                .append(cursorProjection)
+                .append(" FROM dual) s\n")
+                .append(nestedIndent)
+                .append("ON (");
+        for (int index = 0; index < keyColumns.size(); index++) {
+            if (index > 0) {
+                converted.append(" AND ");
+            }
+            converted.append("t.").append(dmIdentifier(keyColumns.get(index)))
+                    .append(" = s.").append(dmIdentifier(keyColumns.get(index)));
+        }
+        converted.append(")\n");
+        if (!mergeUpdates.isBlank()) {
+            converted.append(nestedIndent)
+                    .append("WHEN MATCHED THEN UPDATE SET ")
+                    .append(mergeUpdates)
+                    .append("\n");
+        }
+        converted.append(nestedIndent)
+                .append("WHEN NOT MATCHED THEN INSERT (")
+                .append(columnList.strip())
+                .append(") VALUES (")
+                .append(dynamicColumnSourceList(columnList, "s"))
+                .append(");\n")
+                .append(childIndent)
+                .append("END LOOP;\n")
+                .append(baseIndent)
+                .append("END;")
+                .append(body.substring(statementEnd));
+        return converted.toString();
+    }
+
+    private String aliasDynamicSelectProjection(String columnList, String selectList) {
+        List<String> columns = splitTopLevelComma(columnList);
+        List<String> projections = splitTopLevelComma(selectList);
+        if (columns.isEmpty() || columns.size() != projections.size()) {
+            return null;
+        }
+        List<String> aliased = new ArrayList<>();
+        for (int index = 0; index < columns.size(); index++) {
+            DynamicMergeListItem item = pairDynamicProjection(columns.get(index), projections.get(index));
+            if (item == null) {
+                return null;
+            }
+            aliased.add(item.sourceProjection());
+        }
+        return String.join(", ", aliased);
+    }
+
+    private DynamicMergeListItem pairDynamicProjection(String columnPart, String projectionPart) {
+        String column = columnPart.strip();
+        String projection = projectionPart.strip();
+        boolean columnComma = column.startsWith(",");
+        boolean projectionComma = projection.startsWith(",");
+        if (columnComma) {
+            column = column.substring(1).stripLeading();
+        }
+        if (projectionComma) {
+            projection = projection.substring(1).stripLeading();
+        }
+        String sourcePrefix = projectionComma ? ", " : "";
+        String insertPrefix = columnComma ? ", " : "";
+
+        XmlElementRange columnElement = column.startsWith("<") ? readXmlElementAt(column, 0) : null;
+        XmlElementRange projectionElement = projection.startsWith("<") ? readXmlElementAt(projection, 0) : null;
+        if (columnElement == null && projectionElement == null) {
+            if (!isSimpleQualifiedIdentifierExpression(column)) {
+                return null;
+            }
+            SelectAlias existingAlias = selectAlias(projection);
+            String expression = existingAlias == null ? projection : existingAlias.expression();
+            return new DynamicMergeListItem(
+                    sourcePrefix + expression + " AS " + column,
+                    insertPrefix + "s." + column
+            );
+        }
+        if (columnElement == null || projectionElement == null
+                || !columnElement.name().equalsIgnoreCase(projectionElement.name())
+                || !Set.of("foreach", "if").contains(columnElement.name().toLowerCase(Locale.ROOT))) {
+            return null;
+        }
+        String columnOpening = column.substring(columnElement.start(), columnElement.openingEnd());
+        String projectionOpening = projection.substring(projectionElement.start(), projectionElement.openingEnd());
+        if (!sameDynamicElementScope(columnElement.name(), columnOpening, projectionOpening)) {
+            return null;
+        }
+        DynamicMergeListItem pairedBody = pairDynamicProjection(
+                column.substring(columnElement.openingEnd(), columnElement.closingStart()),
+                projection.substring(projectionElement.openingEnd(), projectionElement.closingStart())
+        );
+        if (pairedBody == null) {
+            return null;
+        }
+        DynamicMergeListItem pairedRemainder = null;
+        String columnRemainder = column.substring(columnElement.end()).strip();
+        String projectionRemainder = projection.substring(projectionElement.end()).strip();
+        if (!columnRemainder.isBlank() || !projectionRemainder.isBlank()) {
+            pairedRemainder = pairDynamicProjection(columnRemainder, projectionRemainder);
+            if (pairedRemainder == null) {
+                return null;
+            }
+        }
+        String source = sourcePrefix + projectionOpening + pairedBody.sourceProjection()
+                + projection.substring(projectionElement.closingStart(), projectionElement.end());
+        String insert = insertPrefix + columnOpening + pairedBody.insertSource()
+                + column.substring(columnElement.closingStart(), columnElement.end());
+        if (pairedRemainder != null) {
+            source += pairedRemainder.sourceProjection();
+            insert += pairedRemainder.insertSource();
+        }
+        return new DynamicMergeListItem(source, insert);
+    }
+
+    private boolean sameDynamicElementScope(String name, String leftOpening, String rightOpening) {
+        if ("if".equalsIgnoreCase(name)) {
+            return defaultString(xmlAttribute(leftOpening, "test"))
+                    .equals(defaultString(xmlAttribute(rightOpening, "test")));
+        }
+        return defaultString(xmlAttribute(leftOpening, "collection"))
+                        .equals(defaultString(xmlAttribute(rightOpening, "collection")))
+                && defaultString(xmlAttribute(leftOpening, "item"))
+                        .equals(defaultString(xmlAttribute(rightOpening, "item")));
+    }
+
+    private String dynamicColumnSourceProjection(String columnList, String sourceAlias) {
+        return transformDynamicColumnStructure(columnList, sourceAlias, true);
+    }
+
+    private String dynamicColumnSourceList(String columnList, String sourceAlias) {
+        return transformDynamicColumnStructure(columnList, sourceAlias, false);
+    }
+
+    private String transformDynamicColumnStructure(String value, String sourceAlias, boolean includeAlias) {
+        StringBuilder converted = new StringBuilder(value.length() + 64);
+        int index = 0;
+        while (index < value.length()) {
+            if (value.charAt(index) == '<') {
+                XmlElementRange element = readXmlElementAt(value, index);
+                if (element == null || !Set.of("foreach", "if").contains(element.name().toLowerCase(Locale.ROOT))) {
+                    return null;
+                }
+                String body = transformDynamicColumnStructure(
+                        value.substring(element.openingEnd(), element.closingStart()),
+                        sourceAlias,
+                        includeAlias
+                );
+                if (body == null) {
+                    return null;
+                }
+                converted.append(value, element.start(), element.openingEnd())
+                        .append(body)
+                        .append(value, element.closingStart(), element.end());
+                index = element.end();
+                continue;
+            }
+            int nextTag = value.indexOf('<', index);
+            int textEnd = nextTag < 0 ? value.length() : nextTag;
+            String text = value.substring(index, textEnd);
+            List<String> parts = splitTopLevelComma(text);
+            for (int partIndex = 0; partIndex < parts.size(); partIndex++) {
+                if (partIndex > 0) {
+                    converted.append(',');
+                }
+                String part = parts.get(partIndex);
+                String identifier = part.strip();
+                if (identifier.isBlank()) {
+                    converted.append(part);
+                    continue;
+                }
+                if (!isSimpleQualifiedIdentifierExpression(identifier)) {
+                    return null;
+                }
+                String leading = part.substring(0, part.indexOf(identifier));
+                String trailing = part.substring(part.indexOf(identifier) + identifier.length());
+                converted.append(leading)
+                        .append(sourceAlias).append('.').append(identifier);
+                if (includeAlias) {
+                    converted.append(" AS ").append(identifier);
+                }
+                converted.append(trailing);
+            }
+            index = textEnd;
+        }
+        return converted.toString().strip();
+    }
+
+    private DynamicMergeLists dynamicMergeLists(String columnList, String valueList) {
+        List<String> columns = splitTopLevelComma(columnList);
+        List<String> values = splitTopLevelComma(valueList);
+        if (columns.isEmpty() || columns.size() != values.size()) {
+            return null;
+        }
+        List<String> source = new ArrayList<>();
+        List<String> insert = new ArrayList<>();
+        for (int index = 0; index < columns.size(); index++) {
+            DynamicMergeListItem item = dynamicMergeListItem(columns.get(index), values.get(index));
+            if (item == null) {
+                return null;
+            }
+            source.add(item.sourceProjection());
+            insert.add(item.insertSource());
+        }
+        return new DynamicMergeLists(String.join(", ", source), String.join(", ", insert));
+    }
+
+    private DynamicMergeListItem dynamicMergeListItem(String columnPart, String valuePart) {
+        String column = columnPart.strip();
+        String value = valuePart.strip();
+        XmlElementRange columnElement = column.startsWith("<") ? readXmlElementAt(column, 0) : null;
+        XmlElementRange valueElement = value.startsWith("<") ? readXmlElementAt(value, 0) : null;
+        if (columnElement == null && valueElement == null) {
+            if (!isSimpleQualifiedIdentifierExpression(column)) {
+                return null;
+            }
+            return new DynamicMergeListItem(
+                    value + " AS " + dmIdentifier(column),
+                    "s." + dmIdentifier(column)
+            );
+        }
+        if (columnElement == null || valueElement == null
+                || !"foreach".equalsIgnoreCase(columnElement.name())
+                || !"foreach".equalsIgnoreCase(valueElement.name())
+                || columnElement.end() != column.length()
+                || valueElement.end() != value.length()) {
+            return null;
+        }
+        String columnOpening = column.substring(0, columnElement.openingEnd());
+        String valueOpening = value.substring(0, valueElement.openingEnd());
+        if (!defaultString(xmlAttribute(columnOpening, "collection"))
+                        .equals(defaultString(xmlAttribute(valueOpening, "collection")))
+                || !defaultString(xmlAttribute(columnOpening, "item"))
+                        .equals(defaultString(xmlAttribute(valueOpening, "item")))) {
+            return null;
+        }
+        String dynamicColumn = column.substring(columnElement.openingEnd(), columnElement.closingStart()).strip();
+        String dynamicValue = value.substring(valueElement.openingEnd(), valueElement.closingStart()).strip();
+        if (!isSimpleQualifiedIdentifierExpression(dynamicColumn)) {
+            return null;
+        }
+        String sourceProjection = valueOpening + dynamicValue + " AS " + dynamicColumn
+                + value.substring(valueElement.closingStart(), valueElement.end());
+        String insertSource = columnOpening + "s." + dynamicColumn
+                + column.substring(columnElement.closingStart(), columnElement.end());
+        return new DynamicMergeListItem(sourceProjection, insertSource);
+    }
+
+    private String convertDynamicValuesAssignmentsForMerge(String updateClause) {
+        Pattern arithmeticAssignment = Pattern.compile(
+                "(?is)(?<target>`[^`]+`|\"[^\"]+\"|\\$\\{[^}]+}|[A-Za-z_][A-Za-z0-9_$]*)"
+                        + "\\s*=\\s*"
+                        + "(?<current>`[^`]+`|\"[^\"]+\"|\\$\\{[^}]+}|[A-Za-z_][A-Za-z0-9_$]*)"
+                        + "\\s*(?<operator>[+-])\\s*values\\s*\\(\\s*"
+                        + "(?<source>`[^`]+`|\"[^\"]+\"|\\$\\{[^}]+}|[A-Za-z_][A-Za-z0-9_$]*)"
+                        + "\\s*\\)"
+        );
+        Matcher arithmeticMatcher = arithmeticAssignment.matcher(updateClause);
+        StringBuffer arithmeticConverted = new StringBuffer();
+        int arithmeticReplacements = 0;
+        while (arithmeticMatcher.find()) {
+            String normalizedTarget = normalizeIdentifier(arithmeticMatcher.group("target"));
+            if (!normalizedTarget.equals(normalizeIdentifier(arithmeticMatcher.group("current")))
+                    || !normalizedTarget.equals(normalizeIdentifier(arithmeticMatcher.group("source")))) {
+                return null;
+            }
+            arithmeticMatcher.appendReplacement(
+                    arithmeticConverted,
+                    Matcher.quoteReplacement("t." + arithmeticMatcher.group("target")
+                            + " = t." + arithmeticMatcher.group("current")
+                            + " " + arithmeticMatcher.group("operator")
+                            + " s." + arithmeticMatcher.group("source"))
+            );
+            arithmeticReplacements++;
+        }
+        arithmeticMatcher.appendTail(arithmeticConverted);
+        String candidate = arithmeticConverted.toString();
+        Pattern assignment = Pattern.compile(
+                "(?is)(?<target>`[^`]+`|\"[^\"]+\"|\\$\\{[^}]+}|[A-Za-z_][A-Za-z0-9_$]*)"
+                        + "\\s*=\\s*values\\s*\\(\\s*"
+                        + "(?<source>`[^`]+`|\"[^\"]+\"|\\$\\{[^}]+}|[A-Za-z_][A-Za-z0-9_$]*)"
+                        + "\\s*\\)"
+        );
+        Matcher matcher = assignment.matcher(candidate);
+        StringBuffer converted = new StringBuffer();
+        int replacements = 0;
+        while (matcher.find()) {
+            if (!normalizeIdentifier(matcher.group("target"))
+                    .equals(normalizeIdentifier(matcher.group("source")))) {
+                return null;
+            }
+            matcher.appendReplacement(
+                    converted,
+                    Matcher.quoteReplacement("t." + matcher.group("target") + " = s." + matcher.group("source"))
+            );
+            replacements++;
+        }
+        matcher.appendTail(converted);
+        if (replacements + arithmeticReplacements == 0
+                || Pattern.compile("(?is)\\bvalues\\s*\\(").matcher(converted).find()) {
+            return null;
+        }
+        return converted.toString().strip();
+    }
+
+    private String convertNestedForeachBatchInsertIgnore(String candidate) {
+        Matcher prefix = DYNAMIC_FOREACH_INSERT_IGNORE_PREFIX_PATTERN.matcher(candidate);
+        if (!prefix.find()) {
+            return null;
+        }
+        XmlElementRange columnForeach = readXmlElementAt(candidate, skipWhitespace(candidate, prefix.end()));
+        if (columnForeach == null || !"foreach".equalsIgnoreCase(columnForeach.name())) {
+            return null;
+        }
+        String columnOpening = candidate.substring(columnForeach.start(), columnForeach.openingEnd());
+        if (!"(".equals(defaultString(xmlAttribute(columnOpening, "open")))
+                || !")".equals(defaultString(xmlAttribute(columnOpening, "close")))) {
+            return null;
+        }
+        int valuesIndex = skipWhitespace(candidate, columnForeach.end());
+        if (!isKeywordAt(candidate, valuesIndex, "VALUES")) {
+            return null;
+        }
+        int rowStart = skipWhitespace(candidate, valuesIndex + "VALUES".length());
+        XmlElementRange rowForeach = readXmlElementAt(candidate, rowStart);
+        if (rowForeach == null || !"foreach".equalsIgnoreCase(rowForeach.name())) {
+            return null;
+        }
+        String rowOpening = candidate.substring(rowForeach.start(), rowForeach.openingEnd());
+        if (!defaultString(xmlAttribute(rowOpening, "open")).isBlank()
+                || !defaultString(xmlAttribute(rowOpening, "close")).isBlank()
+                || !candidate.substring(rowForeach.end()).matches("(?s)\\s*;?\\s*")) {
+            return null;
+        }
+        String rowBody = candidate.substring(rowForeach.openingEnd(), rowForeach.closingStart());
+        int innerStart = skipWhitespace(rowBody, 0);
+        XmlElementRange valueForeach = readXmlElementAt(rowBody, innerStart);
+        if (valueForeach == null
+                || !"foreach".equalsIgnoreCase(valueForeach.name())
+                || !rowBody.substring(valueForeach.end()).isBlank()) {
+            return null;
+        }
+        String valueOpening = rowBody.substring(valueForeach.start(), valueForeach.openingEnd());
+        if (!"(".equals(defaultString(xmlAttribute(valueOpening, "open")))
+                || !")".equals(defaultString(xmlAttribute(valueOpening, "close")))) {
+            return null;
+        }
+
+        String leading = prefix.group("leading");
+        String baseIndent = indentationOfLastLine(leading);
+        String rowIndent = baseIndent + "    ";
+        String statementIndent = rowIndent + "    ";
+        String handlerIndent = statementIndent + "    ";
+        String rowOpeningWithoutSeparator = withXmlAttribute(rowOpening, "separator", "");
+        return new StringBuilder(candidate.length() + 180)
+                .append(leading)
+                .append("BEGIN\n")
+                .append(rowIndent)
+                .append(rowOpeningWithoutSeparator)
+                .append("\n")
+                .append(statementIndent)
+                .append("BEGIN\n")
+                .append(handlerIndent)
+                .append("INSERT INTO ")
+                .append(prefix.group("table"))
+                .append("\n")
+                .append(candidate, columnForeach.start(), columnForeach.end())
+                .append("\n")
+                .append(handlerIndent)
+                .append("VALUES\n")
+                .append(rowBody.strip())
+                .append(";\n")
+                .append(statementIndent)
+                .append("EXCEPTION\n")
+                .append(handlerIndent)
+                .append("WHEN DUP_VAL_ON_INDEX THEN NULL;\n")
+                .append(statementIndent)
+                .append("END;\n")
+                .append(rowIndent)
+                .append(candidate, rowForeach.closingStart(), rowForeach.end())
+                .append("\n")
+                .append(baseIndent)
+                .append("END;")
+                .append(candidate.substring(rowForeach.end()).replaceFirst("(?s)^\\s*;", ""))
+                .toString();
+    }
+
+    private XmlElementRange readXmlElementAt(String value, int start) {
+        if (start < 0 || start >= value.length() || value.charAt(start) != '<') {
+            return null;
+        }
+        XmlTag opening = readXmlTag(value, start);
+        if (opening == null || opening.closing() || opening.selfClosing()) {
+            return null;
+        }
+        int closingStart = findClosingTag(value, opening.endIndex(), opening.name(), value.length());
+        if (closingStart < 0) {
+            return null;
+        }
+        XmlTag closing = readXmlTag(value, closingStart);
+        if (closing == null || !closing.closing()) {
+            return null;
+        }
+        return new XmlElementRange(start, opening.endIndex(), closingStart, closing.endIndex(), opening.name());
+    }
+
+    private String withXmlAttribute(String openingTag, String attributeName, String value) {
+        Pattern attribute = Pattern.compile(
+                "(?is)(\\b" + Pattern.quote(attributeName) + "\\s*=\\s*)([\"'])(.*?)\\2"
+        );
+        Matcher matcher = attribute.matcher(openingTag);
+        if (matcher.find()) {
+            return matcher.replaceFirst(Matcher.quoteReplacement(matcher.group(1) + matcher.group(2)
+                    + value + matcher.group(2)));
+        }
+        int close = openingTag.lastIndexOf('>');
+        return close < 0
+                ? openingTag
+                : openingTag.substring(0, close) + " " + attributeName + "=\"" + value + "\">";
     }
 
     private String trimColumnList(String trimXml) {
@@ -10408,6 +11234,21 @@ public class MapperXmlRewriter {
     }
 
     private record ParenthesizedBody(String leading, String content, String trailing) {
+    }
+
+    private record XmlElementRange(
+            int start,
+            int openingEnd,
+            int closingStart,
+            int end,
+            String name
+    ) {
+    }
+
+    private record DynamicMergeLists(String sourceProjection, String insertSourceList) {
+    }
+
+    private record DynamicMergeListItem(String sourceProjection, String insertSource) {
     }
 
     private record BatchInsertValues(

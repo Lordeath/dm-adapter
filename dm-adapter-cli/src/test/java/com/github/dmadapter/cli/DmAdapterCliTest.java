@@ -459,7 +459,7 @@ class DmAdapterCliTest {
     }
 
     @Test
-    void migrateInfersOuterJoinSourceKeyAndRewritesDynamicUpdate() throws Exception {
+    void migrateKeepsDamengNativeSingleTargetDynamicUpdateJoin() throws Exception {
         writeDemoProject();
         Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """
                 <?xml version="1.0" encoding="UTF-8"?>
@@ -490,16 +490,14 @@ class DmAdapterCliTest {
         int exitCode = execute("migrate", "--project", tempDir.toString());
 
         assertThat(exitCode).isZero();
-        assertThat(Files.readString(tempDir.resolve(".dm-adapter/sql-rewrite.yml")))
-                .contains("\"sample_organization\":")
-                .contains("keyColumns: [\"id\"]")
-                .doesNotContain("\"com.example.UserMapper.updateOrganizationNames\":");
+        assertThat(tempDir.resolve(".dm-adapter/sql-rewrite.yml")).doesNotExist();
         assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
-                .contains("organization_name = (SELECT organization.name FROM sample_organization organization")
-                .contains("where EXISTS (SELECT 1 FROM sample_organization organization")
-                .doesNotContainIgnoringCase("left join");
+                .contains("left join sample_organization organization")
+                .contains("set user_row.organization_name = organization.name")
+                .doesNotContain("SELECT organization.name FROM sample_organization organization");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
-                .doesNotContain("MySQL UPDATE JOIN continues across dynamic MyBatis XML elements");
+                .doesNotContain("MySQL UPDATE JOIN continues across dynamic MyBatis XML elements")
+                .doesNotContain("MySQL outer/cross UPDATE JOIN could not be converted safely");
     }
 
     @Test
