@@ -8112,6 +8112,101 @@ class MapperMigratorTest {
     }
 
     @Test
+    void removesDynamicCreateTableCommentWithoutManualReview() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/ReportStaticMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.ReportStaticMapper">
+                    <update id="createTable">
+                        create table if not exists ${targetTable}(
+                            `Id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
+                            <trim suffixOverrides=",">
+                                <foreach collection="columnList" item="vo" separator=",">
+                                    `${vo.name}` ${vo.type}
+                                </foreach>
+                            </trim>
+                            <if test="indexes != null and indexes.size()>0">
+                                <foreach collection="indexes" item="item">
+                                    ${item}
+                                </foreach>
+                            </if>
+                        ) COMMENT '${comment}'
+                    </update>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/ReportStaticMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/ReportStaticMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("IDENTITY(1,1) COMMENT '主键'")
+                .doesNotContain("COMMENT '${comment}'");
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void retainsUnresolvedDynamicCreateTableOptionForManualReview() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/DynamicEngineMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.DynamicEngineMapper">
+                    <update id="createTable">
+                        create table ${targetTable}(
+                            id bigint
+                            <if test="includeName">
+                                ,name varchar(64)
+                            </if>
+                        ) ENGINE=${engine}
+                    </update>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/DynamicEngineMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/DynamicEngineMapper.xml")
+        );
+        assertThat(rewritten).contains("ENGINE=${engine}");
+        assertThat(result.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason())
+                        .contains("Dynamic CREATE TABLE trailing options")
+                        .contains("com.example.DynamicEngineMapper.createTable"));
+    }
+
+    @Test
     void retainsUnsupportedDynamicCreateTableCommentExpressionForManualReview() throws Exception {
         Path mapper = writeFile("src/main/resources/mapper/UnsafeTaskMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
