@@ -117,8 +117,8 @@ public class MapperXmlRewriter {
             "Dynamic CREATE TABLE column COMMENT uses a double-quoted runtime value that could not be "
                     + "rewritten safely for Dameng.";
     private static final String DYNAMIC_CREATE_TABLE_TRAILING_OPTIONS_REASON =
-            "Dynamic CREATE TABLE trailing options contain MyBatis nodes or placeholders and could not be "
-                    + "removed safely for Dameng.";
+            "Dynamic CREATE TABLE trailing options still contain MyBatis nodes or placeholders after supported "
+                    + "MySQL table options were removed and require manual review for Dameng.";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Set<String> RESULT_MAPPING_TAGS = Set.of(
@@ -1628,28 +1628,22 @@ public class MapperXmlRewriter {
         }
         int statementEnd = findStatementEndSkippingXml(body, bounds.closeParenIndex() + 1);
         String trailingOptions = body.substring(bounds.closeParenIndex() + 1, statementEnd);
-        if (containsDynamicSqlNodeOrPlaceholder(trailingOptions)) {
-            return new DynamicBodyConversion(
-                    body,
-                    body,
-                    List.of(),
-                    List.of(DYNAMIC_CREATE_TABLE_TRAILING_OPTIONS_REASON + " Statement: " + statementKey),
-                    false
-            );
-        }
         SqlConversionResult conversion = converter.convertCreateTableTrailingOptions(trailingOptions);
-        if (!conversion.changed()) {
-            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
-        }
-        String convertedBody = body.substring(0, bounds.closeParenIndex() + 1)
-                + conversion.convertedSql()
-                + body.substring(statementEnd);
+        String convertedTrailingOptions = conversion.convertedSql();
+        boolean unresolvedDynamicOptions = containsDynamicSqlNodeOrPlaceholder(convertedTrailingOptions);
+        String convertedBody = conversion.changed()
+                ? body.substring(0, bounds.closeParenIndex() + 1)
+                        + convertedTrailingOptions
+                        + body.substring(statementEnd)
+                : body;
         return new DynamicBodyConversion(
                 body,
                 convertedBody,
                 conversion.appliedRules(),
-                List.of(),
-                true
+                unresolvedDynamicOptions
+                        ? List.of(DYNAMIC_CREATE_TABLE_TRAILING_OPTIONS_REASON + " Statement: " + statementKey)
+                        : List.of(),
+                conversion.changed()
         );
     }
 
