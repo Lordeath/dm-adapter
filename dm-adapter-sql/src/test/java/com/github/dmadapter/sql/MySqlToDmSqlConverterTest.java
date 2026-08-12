@@ -801,16 +801,15 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table if not exists tmp_budget_payment_receipt (
-                  `id` bigint NOT NULL IDENTITY(1,1),
-                  `chargeItem` varchar(200) DEFAULT NULL,
+                  `id` bigint NOT NULL IDENTITY(1,1) COMMENT '自增id',
+                  `chargeItem` varchar(200) DEFAULT NULL COMMENT '收费科目',
                   PRIMARY KEY (`id`)
                 )
                 """);
         assertThat(result.appliedRules()).containsExactly(
                 MySqlToDmSqlConverter.MYSQL_COLLATE_CLAUSE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE,
-                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
-                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
+                MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE
         );
     }
 
@@ -915,12 +914,13 @@ class MySqlToDmSqlConverterTest {
                 .doesNotContainIgnoringCase("COLLATE")
                 .doesNotContainIgnoringCase("ON UPDATE CURRENT_TIMESTAMP")
                 .containsIgnoringCase("ON UPDATE NOW()")
-                .doesNotContainIgnoringCase("COMMENT");
+                .contains("COMMENT '类型'")
+                .contains("COMMENT '是否完成'")
+                .contains("COMMENT '更新时间'");
         assertThat(result.appliedRules()).contains(
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE,
                 MySqlToDmSqlConverter.MYSQL_AUTO_INCREMENT_TO_DM_IDENTITY_RULE,
-                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_USING_BTREE_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_KEY_REMOVAL_RULE,
                 MySqlToDmSqlConverter.MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE
@@ -1067,7 +1067,7 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
-    void capsMysqlDecimalPrecisionAndRemovesCommentsInCreateTable() {
+    void capsMysqlDecimalPrecisionAndKeepsColumnCommentsInCreateTable() {
         SqlConversionResult result = converter.convert("""
                 create table tmp_should_amortize_detail (
                   `chargeSum` DECIMAL(40,2) DEFAULT '0.00' COMMENT '合同金额',
@@ -1078,13 +1078,12 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.changed()).isTrue();
         assertThat(result.convertedSql()).isEqualTo("""
                 create table tmp_should_amortize_detail (
-                  `chargeSum` DECIMAL(38,2) DEFAULT '0.00',
-                  `ratio` numeric(38,38) DEFAULT NULL
+                  `chargeSum` DECIMAL(38,2) DEFAULT '0.00' COMMENT '合同金额',
+                  `ratio` numeric(38,38) DEFAULT NULL COMMENT '比例'
                 )
                 """);
         assertThat(result.appliedRules()).containsExactly(
-                MySqlToDmSqlConverter.MYSQL_DECIMAL_PRECISION_CAP_RULE,
-                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE
+                MySqlToDmSqlConverter.MYSQL_DECIMAL_PRECISION_CAP_RULE
         );
     }
 
@@ -1126,7 +1125,69 @@ class MySqlToDmSqlConverterTest {
         assertThat(result.convertedSql())
                 .doesNotContainIgnoringCase("CHARACTER SET")
                 .contains(") ;");
-        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_CHARACTER_SET_CLAUSE_REMOVAL_RULE);
+        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE);
+    }
+
+    @Test
+    void normalizesMysqlCreateTableColumnCommentSyntaxForDameng() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE demo_comment (
+                    id BIGINT COMMENT='自增id',
+                    name VARCHAR(64) COMMENT "O'Reilly"
+                );
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .contains("id BIGINT COMMENT '自增id'")
+                .contains("name VARCHAR(64) COMMENT 'O''Reilly'")
+                .doesNotContain("COMMENT=")
+                .doesNotContain("COMMENT \"");
+        assertThat(result.appliedRules()).containsExactly(
+                "DOUBLE_QUOTED_STRING_TO_SINGLE_QUOTED_STRING",
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_TO_DM_RULE
+        );
+    }
+
+    @Test
+    void keepsDamengCompatibleCreateTableColumnCommentsUnchanged() {
+        SqlConversionResult result = converter.convert(
+                "CREATE TABLE demo_comment (id BIGINT COMMENT '自增id')"
+        );
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.convertedSql()).contains("COMMENT '自增id'");
+        assertThat(result.appliedRules()).isEmpty();
+    }
+
+    @Test
+    void removesAllMysqlCreateTableTrailingOptionsWithoutLeavingDefaultKeyword() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE demo_options (
+                    id BIGINT COMMENT '自增id'
+                )ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC COMMENT='表备注';
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql()).isEqualTo("""
+                CREATE TABLE demo_options (
+                    id BIGINT COMMENT '自增id'
+                );
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE
+        );
+    }
+
+    @Test
+    void createTableTrailingOptionConversionStopsAtStatementTerminator() {
+        SqlConversionResult result = converter.convertCreateTableTrailingOptions(
+                "ENGINE=InnoDB; SELECT ENGINE, COMMENT FROM migration_config"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.convertedSql())
+                .isEqualTo("; SELECT ENGINE, COMMENT FROM migration_config");
     }
 
     @Test

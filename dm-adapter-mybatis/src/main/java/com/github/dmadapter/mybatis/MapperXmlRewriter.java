@@ -113,6 +113,12 @@ public class MapperXmlRewriter {
     private static final String MALFORMED_STATEMENT_REWRITE_REASON =
             "The automatic rewrite produced malformed mapper XML for this statement. The original statement was "
                     + "retained and other statements will continue to be processed.";
+    private static final String DYNAMIC_CREATE_TABLE_COLUMN_COMMENT_REASON =
+            "Dynamic CREATE TABLE column COMMENT uses a double-quoted runtime value that could not be "
+                    + "rewritten safely for Dameng.";
+    private static final String DYNAMIC_CREATE_TABLE_TRAILING_OPTIONS_REASON =
+            "Dynamic CREATE TABLE trailing options contain MyBatis nodes or placeholders and could not be "
+                    + "removed safely for Dameng.";
 
     private static final Set<String> SQL_TEXT_TAGS = Set.of("select", "insert", "update", "delete", "sql");
     private static final Set<String> RESULT_MAPPING_TAGS = Set.of(
@@ -171,6 +177,17 @@ public class MapperXmlRewriter {
             "([#$]\\{\\s*)([A-Za-z_][A-Za-z0-9_$]*)(\\s*(?:,[^}]*)?)\\}"
     );
     private static final Pattern IF_BODY_TRAILING_COMMA_PATTERN = Pattern.compile("(?is),\\s*</if\\s*>");
+    private static final Pattern DYNAMIC_CREATE_TABLE_COLUMN_COMMENT_PATTERN = Pattern.compile(
+            "(?is)(?<opening>'[^']*?\\bCOMMENT\\s+(?:\"|&quot;)')\\s*\\+\\s*"
+                    + "(?<value>[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*)\\s*\\+\\s*"
+                    + "(?<closing>'(?:\"|&quot;)')"
+    );
+    private static final Pattern DYNAMIC_CREATE_TABLE_DOUBLE_QUOTED_COMMENT_PATTERN = Pattern.compile(
+            "(?is)\\bCOMMENT\\s+(?:\"|&quot;)"
+    );
+    private static final Pattern DYNAMIC_SQL_NODE_PATTERN = Pattern.compile(
+            "(?is)<\\s*(?:if|choose|when|otherwise|foreach|trim|bind|include)\\b"
+    );
     private static final Pattern SET_ASSIGNMENT_START_PATTERN = Pattern.compile(
             "(?is)^\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)"
                     + "(?:\\s*\\.\\s*(?:`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*))?\\s*="
@@ -1600,6 +1617,157 @@ public class MapperXmlRewriter {
         return escapeXmlText(sql);
     }
 
+    private DynamicBodyConversion removeDynamicCreateTableTrailingOptions(
+            String statementKey,
+            String body,
+            MySqlToDmSqlConverter converter
+    ) {
+        DynamicCreateTableBounds bounds = dynamicCreateTableBounds(body);
+        if (bounds == null) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        int statementEnd = findStatementEndSkippingXml(body, bounds.closeParenIndex() + 1);
+        String trailingOptions = body.substring(bounds.closeParenIndex() + 1, statementEnd);
+        if (containsDynamicSqlNodeOrPlaceholder(trailingOptions)) {
+            return new DynamicBodyConversion(
+                    body,
+                    body,
+                    List.of(),
+                    List.of(DYNAMIC_CREATE_TABLE_TRAILING_OPTIONS_REASON + " Statement: " + statementKey),
+                    false
+            );
+        }
+        SqlConversionResult conversion = converter.convertCreateTableTrailingOptions(trailingOptions);
+        if (!conversion.changed()) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        String convertedBody = body.substring(0, bounds.closeParenIndex() + 1)
+                + conversion.convertedSql()
+                + body.substring(statementEnd);
+        return new DynamicBodyConversion(
+                body,
+                convertedBody,
+                conversion.appliedRules(),
+                List.of(),
+                true
+        );
+    }
+
+    private DynamicBodyConversion normalizeDynamicCreateTableColumnComments(
+            String statementKey,
+            String body
+    ) {
+        DynamicCreateTableBounds bounds = dynamicCreateTableBounds(body);
+        if (bounds == null) {
+            return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
+        }
+        List<TextReplacement> replacements = new ArrayList<>();
+        List<String> manualReviewReasons = new ArrayList<>();
+        int index = bounds.openParenIndex() + 1;
+        while (index < bounds.closeParenIndex()) {
+            int placeholderStart = body.indexOf("${", index);
+            if (placeholderStart < 0 || placeholderStart >= bounds.closeParenIndex()) {
+                break;
+            }
+            int placeholderEnd = skipMyBatisPlaceholder(body, placeholderStart);
+            if (placeholderEnd <= placeholderStart + 2 || placeholderEnd > bounds.closeParenIndex()) {
+                break;
+            }
+            String expression = body.substring(placeholderStart + 2, placeholderEnd - 1);
+            TextRewrite expressionRewrite = normalizeDynamicCreateTableColumnCommentExpression(expression);
+            String convertedExpression = expressionRewrite.text();
+            if (expressionRewrite.changed()) {
+                replacements.add(new TextReplacement(
+                        placeholderStart + 2,
+                        placeholderEnd - 1,
+                        convertedExpression
+                ));
+            }
+            if (DYNAMIC_CREATE_TABLE_DOUBLE_QUOTED_COMMENT_PATTERN.matcher(convertedExpression).find()) {
+                addManualReviewReasons(
+                        manualReviewReasons,
+                        List.of(DYNAMIC_CREATE_TABLE_COLUMN_COMMENT_REASON + " Statement: " + statementKey)
+                );
+            }
+            index = placeholderEnd;
+        }
+        TextRewrite rewrite = applyTextReplacements(body, replacements);
+        return new DynamicBodyConversion(
+                body,
+                rewrite.text(),
+                rewrite.changed()
+                        ? List.of(MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_TO_DM_RULE)
+                        : List.of(),
+                manualReviewReasons,
+                rewrite.changed()
+        );
+    }
+
+    private TextRewrite normalizeDynamicCreateTableColumnCommentExpression(String expression) {
+        Matcher matcher = DYNAMIC_CREATE_TABLE_COLUMN_COMMENT_PATTERN.matcher(expression);
+        List<TextReplacement> replacements = new ArrayList<>();
+        while (matcher.find()) {
+            String openingLiteral = matcher.group("opening");
+            String openingContent = openingLiteral.substring(1, openingLiteral.length() - 1);
+            int quoteLength = openingContent.regionMatches(
+                    true,
+                    Math.max(0, openingContent.length() - "&quot;".length()),
+                    "&quot;",
+                    0,
+                    "&quot;".length()
+            ) ? "&quot;".length() : 1;
+            openingContent = openingContent.substring(0, openingContent.length() - quoteLength)
+                    .replace("&quot;", "\"")
+                    + "'";
+            String valueExpression = matcher.group("value");
+            String replacement = toOgnlDoubleQuotedLiteral(openingContent)
+                    + " + ("
+                    + valueExpression
+                    + " == null ? \"\" : "
+                    + valueExpression
+                    + ".toString().replace(\"'\", \"''\")) + \"'\"";
+            replacements.add(new TextReplacement(matcher.start(), matcher.end(), replacement));
+        }
+        return applyTextReplacements(expression, replacements);
+    }
+
+    private String toOgnlDoubleQuotedLiteral(String value) {
+        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    private DynamicCreateTableBounds dynamicCreateTableBounds(String body) {
+        String view = sqlView(body).text();
+        int createIndex = findTopLevelKeyword(view, "CREATE", 0, view.length(), 0);
+        if (createIndex < 0) {
+            return null;
+        }
+        int tableIndex = findTopLevelKeyword(
+                view,
+                "TABLE",
+                createIndex + "CREATE".length(),
+                view.length(),
+                0
+        );
+        if (tableIndex < 0) {
+            return null;
+        }
+        int openParenIndex = view.indexOf('(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return null;
+        }
+        int closeParenIndex = findMatchingParen(view, openParenIndex);
+        return closeParenIndex < 0
+                ? null
+                : new DynamicCreateTableBounds(openParenIndex, closeParenIndex);
+    }
+
+    private boolean containsDynamicSqlNodeOrPlaceholder(String value) {
+        if (value.contains("${") || value.contains("#{")) {
+            return true;
+        }
+        return DYNAMIC_SQL_NODE_PATTERN.matcher(value).find();
+    }
+
     private DynamicBodyConversion convertDynamicXmlTextSegments(
             String statementTagName,
             String statementKey,
@@ -1611,60 +1779,74 @@ public class MapperXmlRewriter {
             String generatedKeyProperty,
             String generatedKeyColumn
     ) {
-        boolean damengNativeSingleTargetUpdateJoin =
-                sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
-                        && mySqlToDmSqlConverter.isDamengNativeSingleTargetUpdateJoin(sqlView(rawBody).text());
-        StringBuilder convertedBody = new StringBuilder(rawBody.length());
+        String workingBody = rawBody;
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
         boolean changed = false;
+        if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter) {
+            DynamicBodyConversion createTableTailConversion = removeDynamicCreateTableTrailingOptions(
+                    statementKey,
+                    workingBody,
+                    mySqlToDmSqlConverter
+            );
+            if (createTableTailConversion.changed()) {
+                workingBody = createTableTailConversion.convertedBody();
+                addAppliedRules(appliedRules, createTableTailConversion.appliedRules());
+                changed = true;
+            }
+            addManualReviewReasons(manualReviewReasons, createTableTailConversion.manualReviewReasons());
+        }
+        boolean damengNativeSingleTargetUpdateJoin =
+                sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                        && mySqlToDmSqlConverter.isDamengNativeSingleTargetUpdateJoin(sqlView(workingBody).text());
+        StringBuilder convertedBody = new StringBuilder(workingBody.length());
         int index = 0;
-        while (index < rawBody.length()) {
-            if (rawBody.startsWith("<![CDATA[", index)) {
-                int cdataEnd = rawBody.indexOf("]]>", index + "<![CDATA[".length());
+        while (index < workingBody.length()) {
+            if (workingBody.startsWith("<![CDATA[", index)) {
+                int cdataEnd = workingBody.indexOf("]]>", index + "<![CDATA[".length());
                 if (cdataEnd < 0) {
-                    convertedBody.append(rawBody, index, rawBody.length());
+                    convertedBody.append(workingBody, index, workingBody.length());
                     break;
                 }
-                String content = rawBody.substring(index + "<![CDATA[".length(), cdataEnd);
+                String content = workingBody.substring(index + "<![CDATA[".length(), cdataEnd);
                 TextSegmentConversion conversion = convertTextSegment(
                         content,
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        nextTagName(rawBody, cdataEnd + "]]>".length())
+                        nextTagName(workingBody, cdataEnd + "]]>".length())
                 );
                 convertedBody.append(toCdata(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
                 addManualReviewReasons(manualReviewReasons, conversion.manualReviewReasons());
                 changed = changed || conversion.changed();
                 index = cdataEnd + "]]>".length();
-            } else if (rawBody.startsWith("<!--", index)) {
-                int commentEnd = rawBody.indexOf("-->", index + "<!--".length());
+            } else if (workingBody.startsWith("<!--", index)) {
+                int commentEnd = workingBody.indexOf("-->", index + "<!--".length());
                 if (commentEnd < 0) {
-                    convertedBody.append(rawBody, index, rawBody.length());
+                    convertedBody.append(workingBody, index, workingBody.length());
                     break;
                 }
-                convertedBody.append(rawBody, index, commentEnd + "-->".length());
+                convertedBody.append(workingBody, index, commentEnd + "-->".length());
                 index = commentEnd + "-->".length();
-            } else if (rawBody.charAt(index) == '<') {
-                int tagEnd = findXmlTagEnd(rawBody, index);
+            } else if (workingBody.charAt(index) == '<') {
+                int tagEnd = findXmlTagEnd(workingBody, index);
                 if (tagEnd < 0) {
-                    convertedBody.append(rawBody, index, rawBody.length());
+                    convertedBody.append(workingBody, index, workingBody.length());
                     break;
                 }
-                convertedBody.append(rawBody, index, tagEnd + 1);
+                convertedBody.append(workingBody, index, tagEnd + 1);
                 index = tagEnd + 1;
             } else {
-                int nextTag = rawBody.indexOf('<', index);
-                int textEnd = nextTag < 0 ? rawBody.length() : nextTag;
-                String text = rawBody.substring(index, textEnd);
+                int nextTag = workingBody.indexOf('<', index);
+                int textEnd = nextTag < 0 ? workingBody.length() : nextTag;
+                String text = workingBody.substring(index, textEnd);
                 TextSegmentConversion conversion = convertTextSegment(
                         text,
                         statementKey,
                         sqlConverter,
                         rewriteConfig,
-                        nextTagName(rawBody, textEnd)
+                        nextTagName(workingBody, textEnd)
                 );
                 convertedBody.append(escapeBareXmlLessThan(conversion.convertedText()));
                 addAppliedRules(appliedRules, conversion.appliedRules());
@@ -1742,6 +1924,18 @@ public class MapperXmlRewriter {
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
         String converted = body;
+
+        if (sqlConverter instanceof MySqlToDmSqlConverter) {
+            DynamicBodyConversion columnCommentConversion = normalizeDynamicCreateTableColumnComments(
+                    statementKey,
+                    converted
+            );
+            if (columnCommentConversion.changed()) {
+                converted = columnCommentConversion.convertedBody();
+                addAppliedRules(appliedRules, columnCommentConversion.appliedRules());
+            }
+            addManualReviewReasons(manualReviewReasons, columnCommentConversion.manualReviewReasons());
+        }
 
         String commentSafe = neutralizeMyBatisPlaceholdersInSqlLineComments(converted);
         if (!commentSafe.equals(converted)) {
@@ -11500,6 +11694,9 @@ public class MapperXmlRewriter {
             appliedRules = List.copyOf(appliedRules == null ? List.of() : appliedRules);
             manualReviewReasons = List.copyOf(manualReviewReasons == null ? List.of() : manualReviewReasons);
         }
+    }
+
+    private record DynamicCreateTableBounds(int openParenIndex, int closeParenIndex) {
     }
 
     private record QuotedText(String value, int nextIndex, boolean closed) {
