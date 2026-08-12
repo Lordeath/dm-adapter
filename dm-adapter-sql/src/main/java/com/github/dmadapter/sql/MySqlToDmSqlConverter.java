@@ -118,6 +118,13 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_NUMERIC_TYPE_ATTRIBUTE_RULE = "MYSQL_NUMERIC_TYPE_ATTRIBUTE_TO_DM";
     public static final String MYSQL_TEXT_TYPE_TO_DM_CLOB_RULE = "MYSQL_TEXT_TYPE_TO_DM_CLOB";
     public static final String MYSQL_DECIMAL_PRECISION_CAP_RULE = "MYSQL_DECIMAL_PRECISION_CAP_TO_DM";
+    public static final String MYSQL_CREATE_TABLE_COLUMN_COMMENT_TO_DM_RULE =
+            "MYSQL_CREATE_TABLE_COLUMN_COMMENT_TO_DM";
+    /**
+     * @deprecated Dameng accepts single-quoted inline column comments in {@code CREATE TABLE}.
+     * Use {@link #MYSQL_CREATE_TABLE_COLUMN_COMMENT_TO_DM_RULE} for syntax normalization.
+     */
+    @Deprecated
     public static final String MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE =
             "MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVED";
     public static final String MYSQL_ON_UPDATE_TIMESTAMP_TO_DM_RULE = "MYSQL_ON_UPDATE_TIMESTAMP_TO_DM";
@@ -157,6 +164,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "整数算术表达式风险：MySQL `/` 会产生小数，达梦整数/整数可能截断；"
                     + "请确认是否需要在除法前 CAST 为 DECIMAL(38,10)，并用 NULLIF 处理分母 0。";
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
+    private static final Pattern CREATE_TABLE_CANDIDATE_PATTERN = Pattern.compile(
+            "(?is)\\bCREATE\\s+(?:TEMPORARY\\s+)?TABLE\\b"
+    );
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOW_PATTERN = Pattern.compile("\\bNOW\\s*\\(\\s*\\)", Pattern.CASE_INSENSITIVE);
     private static final Pattern SYSDATE_FUNCTION_PATTERN = Pattern.compile(
@@ -545,6 +555,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return SqlConversionResult.unchanged(original);
     }
 
+    /**
+     * Removes MySQL-only literal table options from the text following a CREATE TABLE closing parenthesis.
+     * The statement terminator and any following text are preserved.
+     */
+    public SqlConversionResult convertCreateTableTrailingOptions(String trailingOptions) {
+        String original = trailingOptions == null ? "" : trailingOptions;
+        GenericConversion conversion = removeMysqlCreateTableTrailingOptions(original);
+        return conversion.changed()
+                ? SqlConversionResult.changed(
+                        original,
+                        conversion.convertedSql(),
+                        List.of(MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE)
+                )
+                : SqlConversionResult.unchanged(original);
+    }
+
     public SqlConversionResult convertJoinedDelete(String sql) {
         if (sql == null || sql.isBlank()) {
             return SqlConversionResult.unchanged(sql == null ? "" : sql);
@@ -669,10 +695,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_DECIMAL_PRECISION_CAP_RULE);
         }
 
-        GenericConversion columnCommentConversion = removeMysqlCreateTableColumnComments(converted);
+        GenericConversion columnCommentConversion = normalizeMysqlCreateTableColumnComments(converted);
         if (columnCommentConversion.changed()) {
             converted = columnCommentConversion.convertedSql();
-            rules.add(MYSQL_CREATE_TABLE_COLUMN_COMMENT_REMOVAL_RULE);
+            rules.add(MYSQL_CREATE_TABLE_COLUMN_COMMENT_TO_DM_RULE);
         }
 
         GenericConversion usingBtreeConversion = removeMysqlUsingBtreeClauses(converted);
@@ -3027,48 +3053,100 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion removeMysqlCreateTableOptions(String sql) {
-        if (!Pattern.compile("(?is)\\bcreate\\s+(?:temporary\\s+)?table\\b").matcher(sql).find()) {
+        if (!isCreateTableCandidate(sql)) {
             return GenericConversion.unchanged(sql);
         }
-        StringBuilder converted = new StringBuilder(sql.length());
+        int createIndex = findTopLevelKeyword(sql, "CREATE", 0);
+        if (createIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
+        if (tableIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
+        if (openParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+        int closeParenIndex = findMatchingParen(sql, openParenIndex);
+        if (closeParenIndex < 0) {
+            return GenericConversion.unchanged(sql);
+        }
+
+        String trailingOptions = sql.substring(closeParenIndex + 1);
+        GenericConversion trailingConversion = removeMysqlCreateTableTrailingOptions(trailingOptions);
+        if (!trailingConversion.changed()) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(
+                sql.substring(0, closeParenIndex + 1) + trailingConversion.convertedSql(),
+                true
+        );
+    }
+
+    private boolean isCreateTableCandidate(String sql) {
+        int createIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, createIndex, "CREATE")) {
+            return startsLineComment(sql, createIndex) || startsBlockComment(sql, createIndex)
+                    ? CREATE_TABLE_CANDIDATE_PATTERN.matcher(sql).find()
+                    : false;
+        }
+        int cursor = skipWhitespace(sql, createIndex + "CREATE".length());
+        if (startsKeyword(sql, cursor, "TEMPORARY")) {
+            cursor = skipWhitespace(sql, cursor + "TEMPORARY".length());
+        }
+        if (startsKeyword(sql, cursor, "TABLE")) {
+            return true;
+        }
+        return startsLineComment(sql, cursor) || startsBlockComment(sql, cursor)
+                ? CREATE_TABLE_CANDIDATE_PATTERN.matcher(sql).find()
+                : false;
+    }
+
+    private GenericConversion removeMysqlCreateTableTrailingOptions(String trailingOptions) {
+        StringBuilder converted = new StringBuilder(trailingOptions.length());
         boolean changed = false;
         int index = 0;
-        while (index < sql.length()) {
-            char current = sql.charAt(index);
+        while (index < trailingOptions.length()) {
+            char current = trailingOptions.charAt(index);
             if (current == '\'') {
-                index = appendSingleQuotedString(sql, index, converted);
+                index = appendSingleQuotedString(trailingOptions, index, converted);
             } else if (current == '"') {
-                index = appendDoubleQuotedText(sql, index, converted);
-            } else if (startsMyBatisPlaceholder(sql, index)) {
-                index = appendMyBatisPlaceholder(sql, index, converted);
-            } else if (startsLineComment(sql, index)) {
-                index = appendUntilLineEnd(sql, index, converted);
-            } else if (startsBlockComment(sql, index)) {
-                index = appendUntilBlockCommentEnd(sql, index, converted);
+                index = appendDoubleQuotedText(trailingOptions, index, converted);
+            } else if (startsMyBatisPlaceholder(trailingOptions, index)) {
+                index = appendMyBatisPlaceholder(trailingOptions, index, converted);
+            } else if (startsLineComment(trailingOptions, index)) {
+                index = appendUntilLineEnd(trailingOptions, index, converted);
+            } else if (startsBlockComment(trailingOptions, index)) {
+                index = appendUntilBlockCommentEnd(trailingOptions, index, converted);
+            } else if (current == ';') {
+                converted.append(trailingOptions, index, trailingOptions.length());
+                break;
             } else {
-                int optionEnd = readMysqlCreateTableOptionEnd(sql, index);
+                int optionEnd = readMysqlCreateTableTrailingOptionEnd(trailingOptions, index);
                 if (optionEnd < 0) {
                     converted.append(current);
                     index++;
                 } else {
                     index = optionEnd;
                     changed = true;
-                    appendSpaceBeforeNextTokenIfNeeded(converted, sql, index);
+                    appendSpaceBeforeNextTokenIfNeeded(converted, trailingOptions, index);
                 }
             }
         }
-        return new GenericConversion(changed ? converted.toString() : sql, changed);
+        return new GenericConversion(changed ? converted.toString() : trailingOptions, changed);
     }
 
-    private int readMysqlCreateTableOptionEnd(String sql, int index) {
+    private int readMysqlCreateTableTrailingOptionEnd(String sql, int index) {
         if (startsKeyword(sql, index, "ENGINE")
                 || startsKeyword(sql, index, "ROW_FORMAT")
                 || startsKeyword(sql, index, "AUTO_INCREMENT")) {
             int cursor = skipWhitespace(sql, index + readIdentifierToken(sql, index).text().length());
             if (cursor < sql.length() && sql.charAt(cursor) == '=') {
-                return skipMysqlTableOptionValue(sql, cursor + 1);
+                cursor++;
             }
-            return -1;
+            int end = skipMysqlTableOptionValue(sql, cursor);
+            return end > skipWhitespace(sql, cursor) ? end : -1;
         }
         if (startsKeyword(sql, index, "DEFAULT")) {
             int cursor = skipWhitespace(sql, index + "DEFAULT".length());
@@ -3083,13 +3161,22 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
             return -1;
         }
-        if (startsKeyword(sql, index, "COMMENT") && previousNonWhitespace(sql, index) == ')') {
+        if (startsKeyword(sql, index, "CHARSET") || startsKeyword(sql, index, "CHARACTER")) {
+            return readMysqlCharacterSetClauseEnd(sql, index);
+        }
+        if (startsKeyword(sql, index, "COLLATE")) {
+            return readMysqlCollateClauseEnd(sql, index);
+        }
+        if (startsKeyword(sql, index, "COMMENT")) {
             int cursor = skipWhitespace(sql, index + "COMMENT".length());
             if (cursor < sql.length() && sql.charAt(cursor) == '=') {
                 cursor = skipWhitespace(sql, cursor + 1);
             }
             if (cursor < sql.length() && sql.charAt(cursor) == '\'') {
                 return skipWhitespace(sql, skipSingleQuotedString(sql, cursor));
+            }
+            if (cursor < sql.length() && sql.charAt(cursor) == '"') {
+                return skipWhitespace(sql, skipDoubleQuotedText(sql, cursor));
             }
         }
         return -1;
@@ -3337,9 +3424,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
     }
 
-    private GenericConversion removeMysqlCreateTableColumnComments(String sql) {
-        int createIndex = leadingWhitespaceLength(sql);
-        if (!startsKeyword(sql, createIndex, "CREATE")) {
+    private GenericConversion normalizeMysqlCreateTableColumnComments(String sql) {
+        if (!isCreateTableCandidate(sql)) {
+            return GenericConversion.unchanged(sql);
+        }
+        int createIndex = findTopLevelKeyword(sql, "CREATE", 0);
+        if (createIndex < 0) {
             return GenericConversion.unchanged(sql);
         }
         int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
@@ -3360,115 +3450,21 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         List<String> convertedDefinitions = new ArrayList<>();
         boolean changed = false;
         for (TopLevelArgument definition : definitions) {
-            GenericConversion conversion = removeMysqlColumnCommentClause(definition.text());
+            GenericConversion conversion = normalizeMysqlColumnCommentClause(definition.text());
             convertedDefinitions.add(conversion.convertedSql());
             changed = changed || conversion.changed();
         }
-        String convertedSql = changed
-                ? sql.substring(0, openParenIndex + 1)
-                        + String.join(",", convertedDefinitions)
-                        + sql.substring(closeParenIndex)
-                : sql;
-        GenericConversion tableCommentConversion = removeMysqlCreateTableTrailingComment(convertedSql);
-        if (tableCommentConversion.changed()) {
-            convertedSql = tableCommentConversion.convertedSql();
-            changed = true;
-        }
-        GenericConversion tableCharsetConversion = removeMysqlCreateTableTrailingCharset(convertedSql);
-        if (tableCharsetConversion.changed()) {
-            convertedSql = tableCharsetConversion.convertedSql();
-            changed = true;
-        }
-        return changed ? new GenericConversion(convertedSql, true) : GenericConversion.unchanged(sql);
+        return changed
+                ? new GenericConversion(
+                        sql.substring(0, openParenIndex + 1)
+                                + String.join(",", convertedDefinitions)
+                                + sql.substring(closeParenIndex),
+                        true
+                )
+                : GenericConversion.unchanged(sql);
     }
 
-    private GenericConversion removeMysqlCreateTableTrailingCharset(String sql) {
-        int createIndex = leadingWhitespaceLength(sql);
-        if (!startsKeyword(sql, createIndex, "CREATE")) {
-            return GenericConversion.unchanged(sql);
-        }
-        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
-        if (tableIndex < 0) {
-            return GenericConversion.unchanged(sql);
-        }
-        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
-        if (openParenIndex < 0) {
-            return GenericConversion.unchanged(sql);
-        }
-        int closeParenIndex = findMatchingParen(sql, openParenIndex);
-        if (closeParenIndex < 0) {
-            return GenericConversion.unchanged(sql);
-        }
-        int optionStart = skipWhitespace(sql, closeParenIndex + 1);
-        int optionEnd = readMysqlCreateTableTrailingCharsetEnd(sql, optionStart);
-        if (optionEnd < 0) {
-            return GenericConversion.unchanged(sql);
-        }
-        return new GenericConversion(sql.substring(0, optionStart) + sql.substring(optionEnd), true);
-    }
-
-    private int readMysqlCreateTableTrailingCharsetEnd(String sql, int index) {
-        if (startsKeyword(sql, index, "DEFAULT")) {
-            int cursor = skipWhitespace(sql, index + "DEFAULT".length());
-            if (startsKeyword(sql, cursor, "CHARSET") || startsKeyword(sql, cursor, "CHARACTER")) {
-                return readMysqlCharacterSetClauseEnd(sql, cursor);
-            }
-            if (startsKeyword(sql, cursor, "COLLATE")) {
-                return readMysqlCollateClauseEnd(sql, cursor);
-            }
-            return -1;
-        }
-        if (startsKeyword(sql, index, "CHARSET") || startsKeyword(sql, index, "CHARACTER")) {
-            return readMysqlCharacterSetClauseEnd(sql, index);
-        }
-        if (startsKeyword(sql, index, "COLLATE")) {
-            return readMysqlCollateClauseEnd(sql, index);
-        }
-        return -1;
-    }
-
-    private GenericConversion removeMysqlCreateTableTrailingComment(String sql) {
-        int createIndex = leadingWhitespaceLength(sql);
-        if (!startsKeyword(sql, createIndex, "CREATE")) {
-            return GenericConversion.unchanged(sql);
-        }
-        int tableIndex = findTopLevelKeyword(sql, "TABLE", createIndex + "CREATE".length());
-        if (tableIndex < 0) {
-            return GenericConversion.unchanged(sql);
-        }
-        int openParenIndex = findTopLevelChar(sql, '(', tableIndex + "TABLE".length());
-        if (openParenIndex < 0) {
-            return GenericConversion.unchanged(sql);
-        }
-        int closeParenIndex = findMatchingParen(sql, openParenIndex);
-        if (closeParenIndex < 0) {
-            return GenericConversion.unchanged(sql);
-        }
-        int commentIndex = skipWhitespace(sql, closeParenIndex + 1);
-        if (!startsKeyword(sql, commentIndex, "COMMENT")) {
-            return GenericConversion.unchanged(sql);
-        }
-        int cursor = skipWhitespace(sql, commentIndex + "COMMENT".length());
-        if (cursor < sql.length() && sql.charAt(cursor) == '=') {
-            cursor = skipWhitespace(sql, cursor + 1);
-        }
-        if (cursor >= sql.length()) {
-            return GenericConversion.unchanged(sql);
-        }
-        char quote = sql.charAt(cursor);
-        int commentEnd;
-        if (quote == '\'') {
-            commentEnd = skipSingleQuotedString(sql, cursor);
-        } else if (quote == '"') {
-            commentEnd = skipDoubleQuotedText(sql, cursor);
-        } else {
-            return GenericConversion.unchanged(sql);
-        }
-        int end = skipWhitespace(sql, commentEnd);
-        return new GenericConversion(sql.substring(0, commentIndex) + sql.substring(end), true);
-    }
-
-    private GenericConversion removeMysqlColumnCommentClause(String definition) {
+    private GenericConversion normalizeMysqlColumnCommentClause(String definition) {
         StringBuilder converted = new StringBuilder(definition.length());
         boolean changed = false;
         int index = 0;
@@ -3485,18 +3481,19 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             } else if (startsBlockComment(definition, index)) {
                 index = appendUntilBlockCommentEnd(definition, index, converted);
             } else if (startsKeyword(definition, index, "COMMENT")) {
-                int cursor = skipWhitespace(definition, index + "COMMENT".length());
+                int keywordEnd = index + "COMMENT".length();
+                int cursor = skipWhitespace(definition, keywordEnd);
                 if (cursor < definition.length() && definition.charAt(cursor) == '=') {
-                    cursor = skipWhitespace(definition, cursor + 1);
+                    int literalStart = skipWhitespace(definition, cursor + 1);
+                    if (literalStart < definition.length() && definition.charAt(literalStart) == '\'') {
+                        converted.append(definition, index, keywordEnd).append(' ');
+                        index = appendSingleQuotedString(definition, literalStart, converted);
+                        changed = true;
+                        continue;
+                    }
                 }
-                if (cursor < definition.length() && definition.charAt(cursor) == '\'') {
-                    trimTrailingWhitespace(converted);
-                    index = skipSingleQuotedString(definition, cursor);
-                    changed = true;
-                } else {
-                    converted.append(current);
-                    index++;
-                }
+                converted.append(current);
+                index++;
             } else {
                 converted.append(current);
                 index++;

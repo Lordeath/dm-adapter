@@ -6,12 +6,15 @@ import com.github.dmadapter.core.MapperXmlFile;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.sql.DamengReservedColumnRenamer;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
+import org.apache.ibatis.builder.xml.XMLMapperBuilder;
+import org.apache.ibatis.session.Configuration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -8014,6 +8017,143 @@ class MapperMigratorTest {
                 assertThat(change.appliedRules())
                         .contains(MapperXmlRewriter.MYBATIS_JOINED_SELECT_ALIAS_REFERENCE_QUALIFIED_RULE));
         assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void removesUnsupportedMysqlTableOptionsFromDynamicCreateTable() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/TaskMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.TaskMapper">
+                    <update id="createTable">
+                        create table if not exists ${taskTableName}(
+                            `Id` bigint NOT NULL AUTO_INCREMENT COMMENT '自增id',
+                            <foreach collection="columnList" item="item" separator=",">
+                                ${'`' + item.f0 + '`' + ' ' + item.f1
+                                    + ' DEFAULT NULL COMMENT &quot;' + item.f2 + '&quot;'}
+                            </foreach>
+                            ,`taskDate` varchar(25) COMMENT '定时任务日期'
+                        )ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='自动生成于定时任务';
+                    </update>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/TaskMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("COMMENT '自增id'")
+                .contains("\" DEFAULT NULL COMMENT '\"")
+                .contains("item.f2.toString().replace(\"'\", \"''\")) + \"'\"")
+                .contains("\n        );")
+                .doesNotContainIgnoringCase("ENGINE=InnoDB")
+                .doesNotContain("COMMENT='自动生成于定时任务'")
+                .doesNotContain("DEFAULT COMMENT");
+        Configuration configuration = new Configuration();
+        try (var input = Files.newInputStream(
+                tempDir.resolve("src/main/resources/mapper-dm/TaskMapper.xml")
+        )) {
+            new XMLMapperBuilder(
+                    input,
+                    configuration,
+                    "mapper-dm/TaskMapper.xml",
+                    configuration.getSqlFragments()
+            ).parse();
+        }
+        Map<String, Object> apostropheColumn = new HashMap<>();
+        apostropheColumn.put("f0", "customer_name");
+        apostropheColumn.put("f1", "varchar(64)");
+        apostropheColumn.put("f2", "O'Reilly");
+        Map<String, Object> nullColumn = new HashMap<>();
+        nullColumn.put("f0", "empty_comment");
+        nullColumn.put("f1", "varchar(64)");
+        nullColumn.put("f2", null);
+        Map<String, Object> numericColumn = new HashMap<>();
+        numericColumn.put("f0", "numeric_comment");
+        numericColumn.put("f1", "varchar(64)");
+        numericColumn.put("f2", 123);
+        String renderedSql = configuration
+                .getMappedStatement("com.example.TaskMapper.createTable")
+                .getBoundSql(Map.of(
+                        "taskTableName", "demo_task",
+                        "columnList", List.of(apostropheColumn, nullColumn, numericColumn)
+                ))
+                .getSql();
+        assertThat(renderedSql)
+                .contains("COMMENT 'O''Reilly'")
+                .contains("COMMENT ''")
+                .contains("COMMENT '123'")
+                .doesNotContainIgnoringCase("ENGINE")
+                .doesNotContainIgnoringCase("CHARSET")
+                .doesNotContain("自动生成于定时任务")
+                .doesNotContain("DEFAULT COMMENT");
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules()).contains(
+                        MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_OPTION_REMOVAL_RULE,
+                        MySqlToDmSqlConverter.MYSQL_CREATE_TABLE_COLUMN_COMMENT_TO_DM_RULE
+                ));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void retainsUnsupportedDynamicCreateTableCommentExpressionForManualReview() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/UnsafeTaskMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.UnsafeTaskMapper">
+                    <update id="createTable">
+                        create table ${taskTableName}(
+                            <foreach collection="columnList" item="item" separator=",">
+                                ${'`' + item.f0 + '` ' + item.f1
+                                    + ' COMMENT &quot;' + (item.f2 + item.f3) + '&quot;'}
+                            </foreach>
+                        );
+                    </update>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/UnsafeTaskMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/UnsafeTaskMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("' COMMENT &quot;' + (item.f2 + item.f3) + '&quot;'")
+                .doesNotContain("item.f2.toString().replace");
+        assertThat(result.manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason())
+                        .contains("Dynamic CREATE TABLE column COMMENT")
+                        .contains("com.example.UnsafeTaskMapper.createTable"));
     }
 
     private int countMatches(String value, String needle) {
