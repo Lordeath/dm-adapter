@@ -33,7 +33,7 @@ class ProjectScanner {
 
         PomAnalysis pomAnalysis = pomAnalyzer.analyze(context.pomPath(), context.dmDriverCoordinate());
         List<MapperXmlFile> mapperXmlFiles = mapperXmlScanner.scan(context.projectRoot());
-        boolean myBatisXmlProject = pomAnalysis.myBatisProject() && !mapperXmlFiles.isEmpty();
+        boolean myBatisXmlProject = !mapperXmlFiles.isEmpty();
 
         if (!pomAnalysis.mavenProject()) {
             warnings.add("pom.xml was not found at project root.");
@@ -41,7 +41,7 @@ class ProjectScanner {
         if (pomAnalysis.mavenProject() && !pomAnalysis.springBootProject()) {
             warnings.add("Spring Boot dependency or parent was not detected.");
         }
-        if (pomAnalysis.mavenProject() && !pomAnalysis.myBatisProject()) {
+        if (pomAnalysis.mavenProject() && !pomAnalysis.myBatisProject() && mapperXmlFiles.isEmpty()) {
             warnings.add("MyBatis dependency was not detected in pom.xml.");
         }
         if (mapperXmlFiles.isEmpty()) {

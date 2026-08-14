@@ -73,6 +73,118 @@ class PomAnalyzerTest {
         assertThat(analysis.hasDmJdbcDriver()).isTrue();
     }
 
+    @Test
+    void detectsDependenciesDeclaredByReactorModules() throws Exception {
+        Path childDir = Files.createDirectories(tempDir.resolve("application"));
+        Path rootPom = tempDir.resolve("pom.xml");
+        Files.writeString(rootPom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>demo-parent</artifactId>
+                    <version>1.0.0</version>
+                    <packaging>pom</packaging>
+                    <modules>
+                        <module>application</module>
+                    </modules>
+                </project>
+                """);
+        Files.writeString(childDir.resolve("pom.xml"), """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                    <modelVersion>4.0.0</modelVersion>
+                    <parent>
+                        <groupId>com.example</groupId>
+                        <artifactId>demo-parent</artifactId>
+                        <version>1.0.0</version>
+                    </parent>
+                    <artifactId>application</artifactId>
+                    <dependencies>
+                        <dependency>
+                            <groupId>org.springframework.boot</groupId>
+                            <artifactId>spring-boot-starter</artifactId>
+                            <version>3.3.2</version>
+                        </dependency>
+                        <dependency>
+                            <groupId>org.mybatis</groupId>
+                            <artifactId>mybatis</artifactId>
+                            <version>3.5.19</version>
+                        </dependency>
+                        <dependency>
+                            <groupId>com.dameng</groupId>
+                            <artifactId>DmJdbcDriver18</artifactId>
+                            <version>8.1.3.140</version>
+                        </dependency>
+                    </dependencies>
+                </project>
+                """);
+        DependencyTreeInspector dependencyTreeInspector = (projectRoot, dmDriverCoordinate) ->
+                DependencyTreeAnalysis.empty();
+
+        PomAnalysis analysis = new PomAnalyzer(dependencyTreeInspector)
+                .analyze(rootPom, DependencyCoordinate.defaultDmDriver());
+
+        assertThat(analysis.springBootProject()).isTrue();
+        assertThat(analysis.myBatisProject()).isTrue();
+        assertThat(analysis.hasDmJdbcDriver()).isTrue();
+    }
+
+    @Test
+    void ignoresMissingOutOfProjectAndCyclicModules() throws Exception {
+        Path projectDir = Files.createDirectories(tempDir.resolve("project"));
+        Path childDir = Files.createDirectories(projectDir.resolve("child"));
+        Path outsideDir = Files.createDirectories(tempDir.resolve("outside"));
+        Path rootPom = projectDir.resolve("pom.xml");
+        Files.writeString(rootPom, """
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>parent</artifactId>
+                    <version>1.0.0</version>
+                    <packaging>pom</packaging>
+                    <modules>
+                        <module> child </module>
+                        <module>missing</module>
+                        <module>../outside</module>
+                    </modules>
+                </project>
+                """);
+        Files.writeString(childDir.resolve("pom.xml"), """
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>child</artifactId>
+                    <version>1.0.0</version>
+                    <modules><module>..</module></modules>
+                </project>
+                """);
+        Files.writeString(outsideDir.resolve("pom.xml"), """
+                <project xmlns="http://maven.apache.org/POM/4.0.0">
+                    <modelVersion>4.0.0</modelVersion>
+                    <groupId>com.example</groupId>
+                    <artifactId>outside</artifactId>
+                    <version>1.0.0</version>
+                    <dependencies>
+                        <dependency>
+                            <groupId>org.mybatis</groupId>
+                            <artifactId>mybatis</artifactId>
+                            <version>3.5.19</version>
+                        </dependency>
+                    </dependencies>
+                </project>
+                """);
+        DependencyTreeInspector dependencyTreeInspector = (projectRoot, dmDriverCoordinate) ->
+                DependencyTreeAnalysis.empty();
+
+        PomAnalysis analysis = new PomAnalyzer(dependencyTreeInspector)
+                .analyze(rootPom, DependencyCoordinate.defaultDmDriver());
+
+        assertThat(analysis.springBootProject()).isFalse();
+        assertThat(analysis.myBatisProject()).isFalse();
+        assertThat(analysis.hasDmJdbcDriver()).isFalse();
+    }
+
     private Path writePomWithoutDmDriver() throws Exception {
         Path pom = tempDir.resolve("pom.xml");
         Files.writeString(pom, """
