@@ -48,6 +48,7 @@ final class MavenDependencyTreeInspector implements DependencyTreeInspector {
     @Override
     public DependencyTreeAnalysis analyze(Path projectRoot, DependencyCoordinate dmDriverCoordinate) {
         Process process = null;
+        StringBuffer capturedOutput = new StringBuffer();
         try {
             List<String> command = command(projectRoot);
             outputConsumer.accept("Running Maven dependency tree: " + command);
@@ -57,25 +58,32 @@ final class MavenDependencyTreeInspector implements DependencyTreeInspector {
             process = processStarter.start(processBuilder);
             Thread shutdownHook = registerShutdownHook(process);
             Process runningProcess = process;
-            CompletableFuture<String> output = CompletableFuture.supplyAsync(() -> readOutput(runningProcess.getInputStream()));
+            CompletableFuture<Void> output = CompletableFuture.runAsync(
+                    () -> readOutput(runningProcess.getInputStream(), capturedOutput)
+            );
             try {
                 boolean completed = process.waitFor(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
                 if (!completed) {
                     outputConsumer.accept("Maven dependency tree timed out after " + TIMEOUT.toSeconds()
-                            + " seconds; continuing with POM-only detection.");
+                            + " seconds; using dependencies detected in captured output and POM fallback.");
                     destroyProcessTree(process);
-                    output.cancel(true);
-                    return DependencyTreeAnalysis.empty();
+                    awaitOutput(output);
+                    DependencyTreeAnalysis analysis = parser.parse(capturedOutput.toString(), dmDriverCoordinate);
+                    logCapturedEvidence(analysis);
+                    return analysis;
                 }
-                String mavenOutput = output.get(1, TimeUnit.SECONDS);
+                awaitOutput(output);
+                DependencyTreeAnalysis analysis = parser.parse(capturedOutput.toString(), dmDriverCoordinate);
                 if (process.exitValue() != 0) {
-                    return DependencyTreeAnalysis.empty();
+                    outputConsumer.accept("Maven dependency tree exited with code " + process.exitValue()
+                            + "; using dependencies detected in captured output and POM fallback.");
+                    logCapturedEvidence(analysis);
                 }
-                return parser.parse(mavenOutput, dmDriverCoordinate);
+                return analysis;
             } finally {
                 removeShutdownHook(shutdownHook);
             }
-        } catch (IOException | ExecutionException | TimeoutException e) {
+        } catch (IOException e) {
             return DependencyTreeAnalysis.empty();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -166,17 +174,32 @@ final class MavenDependencyTreeInspector implements DependencyTreeInspector {
         return System.getProperty("os.name", "").toLowerCase().contains("win");
     }
 
-    private String readOutput(InputStream inputStream) {
-        StringBuilder output = new StringBuilder();
+    private void awaitOutput(CompletableFuture<Void> output) throws InterruptedException {
+        try {
+            output.get(1, TimeUnit.SECONDS);
+        } catch (ExecutionException | TimeoutException e) {
+            output.cancel(true);
+        }
+    }
+
+    private void logCapturedEvidence(DependencyTreeAnalysis analysis) {
+        outputConsumer.accept("Captured Maven dependency evidence: springBoot="
+                + analysis.springBootProject()
+                + ", myBatis="
+                + analysis.myBatisProject()
+                + ", dmJdbcDriver="
+                + analysis.hasDmJdbcDriver());
+    }
+
+    private void readOutput(InputStream inputStream, StringBuffer output) {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 output.append(line).append('\n');
                 outputConsumer.accept(line);
             }
-            return output.toString();
         } catch (IOException e) {
-            return "";
+            // Preserve any complete dependency lines captured before the stream was closed.
         }
     }
 }

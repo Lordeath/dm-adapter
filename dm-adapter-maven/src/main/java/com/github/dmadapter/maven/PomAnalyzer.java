@@ -13,8 +13,10 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.function.Consumer;
 
 public class PomAnalyzer {
@@ -36,18 +38,76 @@ public class PomAnalyzer {
         if (!Files.isRegularFile(pomPath)) {
             return new PomAnalysis(false, false, false, false);
         }
-        Model model = readModel(pomPath);
-        List<Dependency> dependencies = model.getDependencies();
-        boolean springBoot = hasSpringBootParent(model.getParent()) || dependencies.stream().anyMatch(this::isSpringBootDependency);
-        boolean myBatis = dependencies.stream().anyMatch(this::isMyBatisDependency);
-        boolean dmDriver = dependencies.stream().anyMatch(dependency -> isDmDriverDependency(dependency, dmDriverCoordinate));
+        Path projectRoot = pomPath.toAbsolutePath().normalize().getParent();
+        PomSignals signals = analyzeDeclaredModules(
+                pomPath.toAbsolutePath().normalize(),
+                projectRoot,
+                dmDriverCoordinate,
+                new HashSet<>(),
+                true
+        );
+        boolean springBoot = signals.springBoot();
+        boolean myBatis = signals.myBatis();
+        boolean dmDriver = signals.dmDriver();
         if (!springBoot || !myBatis) {
-            DependencyTreeAnalysis dependencyTreeAnalysis = dependencyTreeInspector.analyze(pomPath.getParent(), dmDriverCoordinate);
+            DependencyTreeAnalysis dependencyTreeAnalysis = dependencyTreeInspector.analyze(
+                    projectRoot,
+                    dmDriverCoordinate
+            );
             springBoot = springBoot || dependencyTreeAnalysis.springBootProject();
             myBatis = myBatis || dependencyTreeAnalysis.myBatisProject();
             dmDriver = dmDriver || dependencyTreeAnalysis.hasDmJdbcDriver();
         }
         return new PomAnalysis(true, springBoot, myBatis, dmDriver);
+    }
+
+    private PomSignals analyzeDeclaredModules(
+            Path pomPath,
+            Path projectRoot,
+            DependencyCoordinate dmDriverCoordinate,
+            Set<Path> visited,
+            boolean required
+    ) {
+        Path realPom;
+        try {
+            realPom = pomPath.toRealPath();
+            if (!realPom.startsWith(projectRoot.toRealPath()) || !visited.add(realPom)) {
+                return PomSignals.empty();
+            }
+        } catch (IOException e) {
+            return PomSignals.empty();
+        }
+        Model model;
+        try {
+            model = readModel(realPom);
+        } catch (DmAdapterException e) {
+            if (required) {
+                throw e;
+            }
+            return PomSignals.empty();
+        }
+        List<Dependency> dependencies = model.getDependencies();
+        PomSignals signals = new PomSignals(
+                hasSpringBootParent(model.getParent())
+                        || dependencies.stream().anyMatch(this::isSpringBootDependency),
+                dependencies.stream().anyMatch(this::isMyBatisDependency),
+                dependencies.stream().anyMatch(dependency -> isDmDriverDependency(dependency, dmDriverCoordinate))
+        );
+        for (String module : model.getModules()) {
+            if (module == null || module.isBlank()) {
+                continue;
+            }
+            Path modulePath = realPom.getParent().resolve(module.strip()).normalize();
+            Path modulePom = Files.isRegularFile(modulePath) ? modulePath : modulePath.resolve("pom.xml");
+            signals = signals.merge(analyzeDeclaredModules(
+                    modulePom,
+                    projectRoot,
+                    dmDriverCoordinate,
+                    visited,
+                    false
+            ));
+        }
+        return signals;
     }
 
     Model readModel(Path pomPath) {
@@ -93,5 +153,19 @@ public class PomAnalyzer {
 
     private String value(String value) {
         return value == null ? "" : value;
+    }
+
+    private record PomSignals(boolean springBoot, boolean myBatis, boolean dmDriver) {
+        private static PomSignals empty() {
+            return new PomSignals(false, false, false);
+        }
+
+        private PomSignals merge(PomSignals other) {
+            return new PomSignals(
+                    springBoot || other.springBoot,
+                    myBatis || other.myBatis,
+                    dmDriver || other.dmDriver
+            );
+        }
     }
 }

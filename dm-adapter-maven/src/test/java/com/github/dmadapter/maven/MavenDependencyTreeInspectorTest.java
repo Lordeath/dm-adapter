@@ -73,7 +73,12 @@ class MavenDependencyTreeInspectorTest {
     @Test
     void killsDependencyTreeProcessWhenTimeout() {
         List<String> streamedLines = new ArrayList<>();
-        RecordingProcess process = new RecordingProcess("", 0, false);
+        RecordingProcess process = new RecordingProcess("""
+                [INFO] com.example:demo:jar:0.0.1-SNAPSHOT
+                [INFO] +- org.springframework.boot:spring-boot-starter:jar:3.3.2:compile
+                [INFO] +- org.mybatis.spring.boot:mybatis-spring-boot-starter:jar:3.0.3:compile
+                [INFO] \\- com.dameng:DmJdbcDriver18:jar:8.1.3.140:compile
+                """, 0, false);
         MavenDependencyTreeInspector inspector = new MavenDependencyTreeInspector(
                 processBuilder -> process,
                 streamedLines::add
@@ -81,10 +86,35 @@ class MavenDependencyTreeInspectorTest {
 
         DependencyTreeAnalysis analysis = inspector.analyze(tempDir, DependencyCoordinate.defaultDmDriver());
 
-        assertThat(analysis.springBootProject()).isFalse();
+        assertThat(analysis.springBootProject()).isTrue();
+        assertThat(analysis.myBatisProject()).isTrue();
+        assertThat(analysis.hasDmJdbcDriver()).isTrue();
         assertThat(process.destroyForciblyCount).isGreaterThan(0);
         assertThat(streamedLines)
                 .anySatisfy(line -> assertThat(line).contains("Maven dependency tree timed out"));
+    }
+
+    @Test
+    void retainsDependenciesFromOutputWhenMavenExitsWithFailure() {
+        List<String> streamedLines = new ArrayList<>();
+        MavenDependencyTreeInspector inspector = new MavenDependencyTreeInspector(
+                processBuilder -> new RecordingProcess("""
+                        [INFO] com.example:demo:jar:0.0.1-SNAPSHOT
+                        [INFO] +- org.springframework.boot:spring-boot-starter:jar:3.3.2:compile
+                        [INFO] +- org.mybatis:mybatis:jar:3.5.19:compile
+                        [INFO] \\- com.dameng:DmJdbcDriver18:jar:8.1.3.140:compile
+                        [ERROR] A later reactor module could not be resolved.
+                        """, 1),
+                streamedLines::add
+        );
+
+        DependencyTreeAnalysis analysis = inspector.analyze(tempDir, DependencyCoordinate.defaultDmDriver());
+
+        assertThat(analysis.springBootProject()).isTrue();
+        assertThat(analysis.myBatisProject()).isTrue();
+        assertThat(analysis.hasDmJdbcDriver()).isTrue();
+        assertThat(streamedLines)
+                .anySatisfy(line -> assertThat(line).contains("exited with code 1"));
     }
 
     private static class RecordingProcess extends Process {

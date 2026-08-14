@@ -5026,6 +5026,127 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicTemporaryTableAsSelectFunctionIsNotMistakenForColumnDefinition() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.OwnerHouseResultMapper">
+                    <insert id="insertNewResultStep2">
+                        create TEMPORARY table tmp_relationship_owner
+                        SELECT SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT rs.owner_id), ',', 1) AS owner_id,
+                               rs.house_id
+                        FROM owner_house_relationship rs
+                        WHERE rs.house_id IN
+                        <foreach collection="list" item="houseId" open="(" separator="," close=")">
+                            #{houseId}
+                        </foreach>
+                        GROUP BY rs.house_id
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/OwnerHouseResultMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/OwnerHouseResultMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules()).contains(
+                        MySqlToDmSqlConverter.MYSQL_TEMPORARY_TABLE_AS_SELECT_RULE,
+                        MapperXmlRewriter.MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT_RULE
+                ));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicCreateTableAsSelectFunctionIsNotMistakenForColumnDefinition() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.OwnerHouseResultMapper">
+                    <insert id="insertNewResultStep4">
+                        create table tmp_insert_stage AS
+                        SELECT IFNULL(source.house_id, 0) AS house_id
+                        FROM owner_house source
+                        <if test="enterpriseId != null">
+                            WHERE source.enterprise_id = #{enterpriseId}
+                        </if>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/OwnerHouseResultMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/OwnerHouseResultMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.manualReviewItems()).noneSatisfy(item ->
+                assertThat(item.reason()).contains("Dynamic CREATE TABLE trailing options"));
+    }
+
+    @Test
+    void dynamicCreateTableColumnListAsSelectDoesNotTreatQueryAsTrailingOptions() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.OwnerHouseResultMapper">
+                    <insert id="createWithColumnList">
+                        create table tmp_insert_stage (house_id bigint) AS
+                        SELECT IFNULL(source.house_id, 0) AS house_id
+                        FROM owner_house source
+                        <if test="enterpriseId != null">
+                            WHERE source.enterprise_id = #{enterpriseId}
+                        </if>
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/OwnerHouseResultMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/OwnerHouseResultMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        assertThat(result.manualReviewItems()).noneSatisfy(item ->
+                assertThat(item.reason()).contains("Dynamic CREATE TABLE trailing options"));
+    }
+
+    @Test
     void dynamicTemporaryTableAsSelectSplitsObjectForeachBindingsIntoParameterizedInsert() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>

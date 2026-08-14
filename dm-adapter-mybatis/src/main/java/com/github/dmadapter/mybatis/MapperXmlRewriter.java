@@ -1627,14 +1627,36 @@ public class MapperXmlRewriter {
             return new DynamicBodyConversion(body, body, List.of(), List.of(), false);
         }
         int statementEnd = findStatementEndSkippingXml(body, bounds.closeParenIndex() + 1);
-        String trailingOptions = body.substring(bounds.closeParenIndex() + 1, statementEnd);
+        String view = sqlView(body).text();
+        int trailingOptionsEnd = statementEnd;
+        int asIndex = findTopLevelKeyword(
+                view,
+                "AS",
+                bounds.closeParenIndex() + 1,
+                statementEnd,
+                0
+        );
+        if (asIndex >= 0) {
+            trailingOptionsEnd = Math.min(trailingOptionsEnd, asIndex);
+        }
+        int selectIndex = findTopLevelKeyword(
+                view,
+                "SELECT",
+                bounds.closeParenIndex() + 1,
+                statementEnd,
+                0
+        );
+        if (selectIndex >= 0) {
+            trailingOptionsEnd = Math.min(trailingOptionsEnd, selectIndex);
+        }
+        String trailingOptions = body.substring(bounds.closeParenIndex() + 1, trailingOptionsEnd);
         SqlConversionResult conversion = converter.convertCreateTableTrailingOptions(trailingOptions);
         String convertedTrailingOptions = conversion.convertedSql();
         boolean unresolvedDynamicOptions = containsDynamicSqlNodeOrPlaceholder(convertedTrailingOptions);
         String convertedBody = conversion.changed()
                 ? body.substring(0, bounds.closeParenIndex() + 1)
                         + convertedTrailingOptions
-                        + body.substring(statementEnd)
+                        + body.substring(trailingOptionsEnd)
                 : body;
         return new DynamicBodyConversion(
                 body,
@@ -1745,8 +1767,24 @@ public class MapperXmlRewriter {
         if (tableIndex < 0) {
             return null;
         }
-        int openParenIndex = view.indexOf('(', tableIndex + "TABLE".length());
-        if (openParenIndex < 0) {
+        int tableNameStart = skipWhitespace(body, tableIndex + "TABLE".length());
+        if (isKeywordAt(body, tableNameStart, "IF")) {
+            int notIndex = skipWhitespace(body, tableNameStart + "IF".length());
+            if (!isKeywordAt(body, notIndex, "NOT")) {
+                return null;
+            }
+            int existsIndex = skipWhitespace(body, notIndex + "NOT".length());
+            if (!isKeywordAt(body, existsIndex, "EXISTS")) {
+                return null;
+            }
+            tableNameStart = skipWhitespace(body, existsIndex + "EXISTS".length());
+        }
+        int tableNameEnd = readCreateTableNameEnd(body, tableNameStart);
+        if (tableNameEnd <= tableNameStart) {
+            return null;
+        }
+        int openParenIndex = skipWhitespace(body, tableNameEnd);
+        if (openParenIndex >= body.length() || body.charAt(openParenIndex) != '(') {
             return null;
         }
         int closeParenIndex = findMatchingParen(view, openParenIndex);
