@@ -4,18 +4,103 @@
 
 - 达梦官方文档：MySQL 到 DM，https://eco.dameng.com/document/dm/zh-cn/start/mysql_dm
 - 达梦官方 FAQ：MySQL 迁移 DM8，https://eco.dameng.com/document/dm/zh-cn/faq/faq-mysql-dm8-migrate.html
-- 最后核对日期：2026-07-28
+- 达梦官方参数说明：https://eco.dameng.com/document/dm/zh-cn/pm/physical-storage
+- 达梦官方初始化参数 FAQ：https://eco.dameng.com/document/dm/zh-cn/faq/faq-dm-install
+- 最后核对日期：2026-08-18
 
 本文用于指导 dm-adapter 后续处理 Spring Boot + MyBatis 项目从 MySQL 迁移到达梦 8。修改代码前先按本文区分：应由 dm-adapter 自动转换的问题、业务 SQL 本身需要修正的问题、测试库缺对象的问题、必须人工提供参数或 `sql-rewrite.yml` 配置的问题。
 
 ## 实例和模式参数
 
-- 新建达梦实例时应按 MySQL 兼容场景确认实例参数，尤其是 `COMPATIBLE_MODE=4`、`CASE_SENSITIVE`、`LENGTH_IN_CHAR`、`BLANK_PAD_MODE`。实例参数不匹配时，SQL 转换正确也可能因为大小写、字符长度、空格比较等行为差异失败。
-- `COMPATIBLE_MODE=4` 只是 MySQL 兼容模式，不代表所有 MySQL 语法都能直接执行。官方 FAQ 明确要求迁移前修改兼容参数并重启数据库服务使其生效；兼容模式下仍可能需要手工重写表、视图、游标、系统包、函数、存储过程和非法数据。
-- `CASE_SENSITIVE` 是实例级参数，确定后不可随意修改。MySQL 可细到字段级大小写规则，达梦实例级大小写会同时影响对象名和数据比较；如果迁移时保留小写对象名，MyBatis SQL 往往需要双引号，若取消 DTS 的“保持对象名大小写”则对象名会转大写。
-- `LENGTH_IN_CHAR` 和 DTS 类型映射会影响 `VARCHAR`/`CHAR` 长度语义。MySQL 的 `VARCHAR(n)`/`CHAR(n)` 中 `n` 是字符数；达梦 BYTE 实例若直接使用 `VARCHAR(n)`/`CHAR(n)`，中文或 emoji 可能在未达到 `n` 个字符时就超长。
-- `BLANK_PAD_MODE` 会影响 `CHAR` 尾部空格补齐和比较行为。遇到字符列比较、唯一约束、迁移后数据尾部空格异常时，先确认实例参数和字段类型。
-- MySQL 兼容容错参数会影响数据超长、字符串转数值、除 0 等行为。验证失败如果是“字符串转数值失败”“除数为 0”“超出列长度”，不能只从 mapper SQL 判断，需要同时看实例容错策略和测试数据。
+达梦的 MySQL 兼容性不是只由 `COMPATIBLE_MODE` 决定。迁移前必须同时核对不可变的建库属性、通用兼容参数和业务功能参数；不能看到 `COMPATIBLE_MODE=4` 就认定实例已经与 MySQL 等价。
+
+### 参数核对方法
+
+先查询源 MySQL 的真实设置。大小写、严格模式、周编号、自增和加密算法都不应按“常见默认值”猜测：
+
+```sql
+SELECT @@character_set_server,
+       @@collation_server,
+       @@lower_case_table_names,
+       @@sql_mode,
+       @@default_week_format,
+       @@auto_increment_increment,
+       @@auto_increment_offset,
+       @@block_encryption_mode;
+```
+
+再查询目标达梦的建库属性和兼容参数：
+
+```sql
+SELECT SF_GET_CASE_SENSITIVE_FLAG() AS case_sensitive,
+       SF_GET_PAGE_SIZE() / 1024 AS page_size_kb,
+       SF_GET_EXTENT_SIZE() AS extent_size,
+       SF_GET_UNICODE_FLAG() AS charset,
+       SF_GET_LENGTH_IN_CHAR() AS length_in_char;
+
+SELECT PARA_NAME, PARA_VALUE, DEFAULT_VALUE,
+       SESS_VALUE, FILE_VALUE, PARA_TYPE
+FROM V$DM_INI
+WHERE PARA_NAME IN (
+    'BLANK_PAD_MODE', 'COMPATIBLE_MODE', 'ORDER_BY_NULLS_FLAG',
+    'MY_STRICT_TABLES', 'ERROR_COMPATIBLE_FLAG', 'CALC_AS_DECIMAL',
+    'COUNT_64BIT', 'BACKSLASH_ESCAPE', 'JSON_MODE',
+    'USE_JSON_DATATYPE', 'ENABLE_BLOB_CMP_FLAG', 'MD5_TYPE',
+    'NVARCHAR_LENGTH_IN_CHAR', 'SPACE_COMPARE_MODE',
+    'STR_LIKE_IGNORE_MATCH_END_SPACE', 'AUTO_INCREMENT_INCREMENT',
+    'AUTO_INCREMENT_OFFSET', 'NO_AUTO_VALUE_ON_ZERO', 'TIME_MODE',
+    'DEFAULT_WEEK_FORMAT', 'BLOCK_ENCRYPTION_MODE',
+    'NLS_TIMESTAMP_FORMAT', 'DATETIME_STRICT_FLAG'
+)
+ORDER BY PARA_NAME;
+```
+
+参数在当前版本不存在时，`V$DM_INI` 不会返回对应行，不能把“没有返回”当成默认值。升级达梦后应重新执行整组核对。
+
+### 不可变的建库属性
+
+| 参数 | MySQL 迁移重点 |
+| --- | --- |
+| `PAGE_SIZE` | 官方通用迁移示例建议 `32KB`。它不是 SQL 语法开关，但会限制普通列行长度；8KB 实例更容易在迁移宽表、长 `VARCHAR` 时出现“记录超长”。建库后不能修改。 |
+| `CHARSET`/`UNICODE_FLAG` | 通常使用 `1`（UTF-8），但仍要与源库实际字符集和数据核对。建库后不能修改。 |
+| `CASE_SENSITIVE` | 通常的 `_ci` MySQL 排序规则可考虑 `0`，但必须同时检查 `lower_case_table_names` 和字段级 collation。MySQL 能分别控制对象名和字段值，达梦在实例级统一控制，无法用一个值完整复刻混合规则。建库后不能修改。 |
+| `LENGTH_IN_CHAR` | MySQL 的 `VARCHAR(n)`/`CHAR(n)` 中 `n` 是字符数。值为 `0` 时，迁移 DDL 必须显式使用 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`；值为 `1` 时仍要验证 ASCII、中文和 emoji 混合数据以及行长上限。建库后不能修改。 |
+| `BLANK_PAD_MODE` | 影响尾部空格比较和唯一约束。官方 MySQL 迁移示例使用 `0`，但 MySQL 8 的 `PAD SPACE`/`NO PAD` 行为还取决于字段 collation，必须按真实字段和索引验证。建库后不能修改。 |
+
+### 通用 MySQL 兼容参数
+
+| 参数 | 建议和风险 |
+| --- | --- |
+| `COMPATIBLE_MODE=4` | MySQL 兼容的总开关，静态参数，修改后重启生效。它只提供部分兼容，不会自动修正所有函数、隐式转换、对象 DDL 和存储过程。 |
+| `ORDER_BY_NULLS_FLAG=2` | 使升序时 NULL 在前、降序时 NULL 在后，与 MySQL 排序方向一致。 |
+| `MY_STRICT_TABLES` | 仅在模式 4 生效的位掩码：`1` 数据超长报错、`2` 字符转数值失败报错、`4` 除 0 报错。官方通用建议为 `1`；若源端启用了 `STRICT_TRANS_TABLES`、`STRICT_ALL_TABLES`、`ERROR_FOR_DIVISION_BY_ZERO`，应按真实 DML 决定是否组合为 `3`、`5` 或 `7`，不能为了“像 MySQL”固定写死。 |
+| `CALC_AS_DECIMAL=1` | 使整数 `/` 按 DECIMAL 计算，更接近 MySQL 的小数除法。当前本地达梦在值为 `0` 时，`1/2` 实测返回 `0`，而 MySQL 8 返回 `0.5000`。MySQL 的 `DIV` 操作符仍可能需要 SQL 改写，不能只靠此参数。 |
+| `COUNT_64BIT=1` | 让 `COUNT`/`SUM` 使用 BIGINT，符合 MySQL `COUNT()` 返回 64 位整数的常见预期。 |
+| `ERROR_COMPATIBLE_FLAG=1` | 关闭派生表和 CTE 的同名列报错，可兼容分页插件等对 `SELECT a.*, b.*` 的外层包装。顶层查询本来就可返回同名列；视图仍不能定义重复列，MyBatis 按列名映射也仍有歧义。该开关应在确认调用方可按序号或唯一别名取值后启用。 |
+| `BACKSLASH_ESCAPE` | 源 MySQL 未启用 `NO_BACKSLASH_ESCAPES` 时，字符串字面量默认识别反斜杠转义，达梦通常应评估设为 `1`；源端启用了该 SQL mode 时应保持 `0`。只影响 SQL 字面量，不影响 JDBC 绑定值。 |
+
+### 按业务功能核对的参数
+
+- 使用 MySQL JSON 类型或 `JSON_*` 函数时，核对 `JSON_MODE=2` 和 `USE_JSON_DATATYPE=1`；即使参数正确，JSON 路径、返回类型和索引仍需数据库实测。
+- MySQL `MD5()` 返回十六进制字符串；达梦 `MD5_TYPE=0` 返回 `VARBINARY`，业务把 MD5 当字符串保存、比较或序列化时应评估 `MD5_TYPE=1`。这是静态参数，修改后重启生效。
+- `ENABLE_BLOB_CMP_FLAG` 控制 TEXT/BLOB 的比较、排序和聚合。`1` 会把大字段转为字符串，`2` 在 MySQL 模式下会把字符串转为大字段；两者在超长内容、索引和性能上的结果不同，不能为了消除报错盲目全局切换。
+- 使用 `AUTO_INCREMENT` 时，对照源端的 `auto_increment_increment`、`auto_increment_offset` 和 `NO_AUTO_VALUE_ON_ZERO` SQL mode，核对达梦的 `AUTO_INCREMENT_INCREMENT`、`AUTO_INCREMENT_OFFSET`、`NO_AUTO_VALUE_ON_ZERO`。达梦后一个参数为 `1` 表示插入 0 时生成下一个自增值，对应未开启 MySQL `NO_AUTO_VALUE_ON_ZERO` 的常见行为。
+- 使用 `WEEK()`/`YEARWEEK()` 时，对照源端 `default_week_format` 核对达梦 `DEFAULT_WEEK_FORMAT`。显式传入 mode 的 SQL 仍以 SQL 参数为准。
+- 使用 `AES_ENCRYPT`/`AES_DECRYPT` 时，对照源端 `block_encryption_mode` 核对达梦 `BLOCK_ENCRYPTION_MODE`；算法相同也不代表密钥派生、IV 和返回类型完全相同，必须用固定明文、密钥和密文做双端回归。
+- `SPACE_COMPARE_MODE`、`STR_LIKE_IGNORE_MATCH_END_SPACE` 会进一步影响尾部空格的比较和 LIKE 行为，应与 `BLANK_PAD_MODE`、字段类型及源 collation 一起验证，不能孤立调整。
+- 日期默认格式 `NLS_DATE_FORMAT`/`NLS_TIMESTAMP_FORMAT` 一次只能描述一种输入格式。它可以解决某一类隐式字符串转日期，但可能同时破坏另一类日期字面量；不能把它当成 MySQL 多格式日期容错总开关。
+
+### 当前本地容器基线
+
+2026-08-18 对本地 MySQL 8.0.34 和主达梦容器的只读核对结果如下：
+
+- 源 MySQL 为 `utf8mb4_0900_ai_ci`、`lower_case_table_names=0`，SQL mode 包含 `STRICT_TRANS_TABLES` 和 `ERROR_FOR_DIVISION_BY_ZERO`，`default_week_format=0`，自增步长和偏移均为 `1`，块加密算法为 `aes-128-ecb`。
+- 达梦建库属性为 `PAGE_SIZE=8KB`、`EXTENT_SIZE=16`、`CHARSET=1`、`CASE_SENSITIVE=0`、`LENGTH_IN_CHAR=0`、`BLANK_PAD_MODE=0`。其中字符集、大小写和尾空格已按常见 MySQL 场景调整；8KB 页与官方迁移示例的 32KB 不同，宽表要重点验证；`LENGTH_IN_CHAR=0` 依赖迁移 DDL 生成 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`。
+- 已匹配的主要参数包括 `COMPATIBLE_MODE=4`、`ORDER_BY_NULLS_FLAG=2`、`JSON_MODE=2`、`USE_JSON_DATATYPE=1`、`COUNT_64BIT=1`、自增步长/偏移 `1/1`、`DEFAULT_WEEK_FORMAT=0` 和 `BLOCK_ENCRYPTION_MODE=AES-128-ECB`。
+- 仍需决策或存在可见语义差异的参数包括 `ERROR_COMPATIBLE_FLAG=0`、`CALC_AS_DECIMAL=0`、`MD5_TYPE=0`、`BACKSLASH_ESCAPE=0`、`MY_STRICT_TABLES=1`。它们分别对应重复结果列、整数除法、MD5 返回类型、反斜杠字面量和严格模式，不能仅因其他参数已经调整就忽略。
+
+动态会话级参数修改后要重建应用连接并重新验证 PreparedStatement；涉及执行计划的参数还要注意旧计划缓存。静态或只读建库参数必须按 `PARA_TYPE` 判断是重启可生效，还是只能重新初始化实例。任何参数调整都应先在测试实例用代表性 SQL 和边界数据回归，不得直接照表修改生产库。
+
 - MySQL 的 `database` 通常迁移为达梦的 `schema`。验证 SQL 时不能默认所有对象都在当前 schema，跨库 SQL 要么映射到多个 schema，要么明确跳过缺失库表。
 - SQL 脚本中的 `USE database` 只在它与对应的 `--schema`/`--system-schema` 一致时自动替换为不含库名的说明注释，实际目标 schema 由运行参数选择；不一致或未配置时保留原语句并要求显式 database-to-schema 映射，不能把来源库名或当前验证 schema 固化为 `SET SCHEMA` 输出。
 - SQL 对象名中显式书写的来源库限定符，仅在它与当前脚本对应的 `--schema`/`--system-schema` 明确相同时去除，由外部执行上下文选择目标 schema；规则和输出都不能固化该配置值。未匹配的限定符可能是跨库依赖，必须保留并通过显式 database-to-schema 映射确认，不能猜测为当前 schema。
@@ -34,7 +119,9 @@
 - 以 2026-06-30 对 `192.168.1.53:5236` 的验证结果为基准，dm-adapter 默认不再改写达梦 53 兼容模式已可执行的 MySQL 语法。只有验证失败、语义明显不同、或无法安全推断的 SQL 才进入自动改写或人工确认。
 - MySQL 反引号标识符在达梦 53 兼容模式下可执行，默认保留。这个原则同样适用于带表别名的列（例如 ``a.`deleteFlag```）和使用达梦关键字的已引用别名（例如 `` `cluster` ``）；如果工具需要补齐该别名的裸引用，应沿用声明处原有的反引号，不得擅自改为双引号。只有目标库实例参数、大小写策略或旧版本达梦验证失败时，才考虑改为达梦双引号或统一对象名大小写。动态 `${column}`、`${table}` 仍必须依赖白名单参数或 `sql-rewrite.yml`。
 - `ROWID`、`ROWNUM`、`TRXID`、`PHYROWID`、`VERSIONS_*` 等达梦伪列或特殊名称如果原本是业务表物理列，迁移命名统一增加前缀下划线，例如 `trxid` -> `_trxid`。本地 DM 8.1.5.8 已验证 `_trxid AS "trxid"` 与 `_trxid AS trxid` 都会报 `-2113 Invalid alias`，因此 SELECT、WHERE、JOIN、DML、DDL、子查询和 CTE 均直接使用前缀物理名，并把 `mapper-dm` 中对应的 `resultMap column="trxid"` 同步改为 `column="_trxid"`。Java 属性、参数和 `keyProperty` 保持原名；没有显式 resultMap 的自动映射查询进入人工确认。`SELECT *` / `t.*` 不自动展开。
+- 顶层 `SELECT a.*, b.* FROM a JOIN b ...` 在本地 DM8 即使两表都有 `ID`、`NAME` 也能返回结果；真正触发 `-2112 Ambiguous column name` 的常见形态是分页、计数或框架生成的外层派生表和 CTE，例如 `SELECT * FROM (SELECT a.*, b.* ...) x`。`ERROR_COMPATIBLE_FLAG=1` 可关闭派生表/CTE 同名列检查，系统级持久修改可使用 `CALL SP_SET_PARA_VALUE(1, 'ERROR_COMPATIBLE_FLAG', 1)`；只放开单条语句时可在最外层 SELECT 使用 `/*+ ERROR_COMPATIBLE_FLAG(1) */`。创建视图仍会报 `-2114 Repetitive column name`，JDBC/MyBatis 按列名读取也仍有歧义，因此业务可控时优先显式列清单和唯一别名。MySQL 8 顶层同名列可执行，但外层派生表自身也会报 `Duplicate column name`，所以该参数是更宽松的达梦兼容策略，不是对 MySQL 行为的完全复制。
 - MySQL 用双引号表示字符串的写法应改为单引号；达梦双引号表示标识符。转换时必须区分字符串常量、对象名、动态 `${}` 片段，不能把未知业务字符串转成对象名。
+- 日期列与紧凑字符串的隐式比较不能只依赖 `COMPATIBLE_MODE=4`。本地 MySQL 8 可把 `DATETIME > '20260816235123'` 解析为 `2026-08-16 23:51:23`，同版本本地达梦会报 `-6118 Invalid datetime value`。`ALTER SESSION SET NLS_TIMESTAMP_FORMAT='YYYYMMDDHH24MISS'` 能让这类 SQL 执行，但随后普通的 `'2026-08-16 23:51:23'` 又会解析失败，因此仅适合某个连接的全部时间串都严格统一为 14 位紧凑格式的场景，不得作为混合格式应用的全局兼容开关。优先顺序是：Java/MyBatis 绑定 `LocalDateTime`/`Timestamp`；把常量写成两库都接受的标准格式；需要显式解析且原始 SQL 要同时兼容两库时使用 `STR_TO_DATE('20260816235123', '%Y%m%d%H%i%s')`；只修改 `mapper-dm` 时可使用 `TO_TIMESTAMP('20260816235123', 'YYYYMMDDHH24MISS')`。如果目标列本身是固定 14 位 `CHAR`/`VARCHAR`，比较属于字符串字典序而非日期转换，要另外校验长度和非法日期，不能套用日期列结论。`DATETIME_STRICT_FLAG` 在不同 DM8 构建中可能不存在，且官方说明它是总体时间容错策略，不应为一条紧凑日期 SQL 盲目切换。
 - MySQL 查询分页 `LIMIT offset,size`、`LIMIT size` 在达梦 53 兼容模式下可执行，默认保留。简单单表 `UPDATE`/`DELETE` 的无排序 `LIMIT row_count` 可把候选行限制改写为 `ROWID` 子查询和 `ROWNUM <= row_count`，保留 MySQL 未指定顺序时“任取不超过 N 行”的语义；带 `ORDER BY ... LIMIT 1` 的形态必须把排序保留在内层候选查询。含表别名、多表目标、offset 或无法解析计数的 DML 仍要人工确认。
 - MySQL `LIKE #{name} '%'`、`LIKE '%' #{name}` 这类参数与字符串字面量相邻拼接在达梦 53 仍会失败，应改为 `#{name} || '%'` 形式。`#{}` 参数可以安全拼接，`${}` 动态片段必须保守处理。
 - MySQL 表级索引提示 `USE INDEX(...)`、`FORCE INDEX(...)`、`IGNORE INDEX(...)` 不能原样交给达梦执行，工具应删除这些优化器提示；`PRIMARY` 也是索引提示参数，例如 `FORCE INDEX(PRIMARY)` 必须整体删除。`KEY` 同义写法以及可选的 `FOR JOIN`、`FOR ORDER BY`、`FOR GROUP BY` 作用域使用相同规则。
