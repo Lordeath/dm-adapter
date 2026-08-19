@@ -167,6 +167,50 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern CREATE_TABLE_CANDIDATE_PATTERN = Pattern.compile(
             "(?is)\\bCREATE\\s+(?:TEMPORARY\\s+)?TABLE\\b"
     );
+    private static final Pattern JSON_TABLE_JOIN_CANDIDATE_PATTERN = Pattern.compile(
+            "\\bJOIN\\s+JSON_TABLE\\s*\\(",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern SELECT_CANDIDATE_PATTERN = Pattern.compile(
+            "\\bSELECT\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern TABLE_ALIAS_CANDIDATE_PATTERN = Pattern.compile(
+            "\\b(?:FROM|JOIN)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern DIV_OPERATOR_CANDIDATE_PATTERN = Pattern.compile(
+            "\\bDIV\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern SINGLE_QUOTED_ALIAS_CANDIDATE_PATTERN = Pattern.compile(
+            "(?is)\\bAS\\s*'|[)A-Za-z0-9_.$}`']\\s*'"
+    );
+    private static final Pattern MYSQL_NUMERIC_TYPE_ATTRIBUTE_CANDIDATE_PATTERN = Pattern.compile(
+            "\\b(?:(?:TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT|FLOAT|DOUBLE|REAL)\\s*\\("
+                    + "|UNSIGNED\\b|ZEROFILL\\b)",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern DECIMAL_PRECISION_CANDIDATE_PATTERN = Pattern.compile(
+            "\\b(?:DECIMAL|NUMERIC)\\s*\\(",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern TIME_PART_FUNCTION_CANDIDATE_PATTERN = Pattern.compile(
+            "\\b(?:HOUR|MINUTE|SECOND)\\s*\\(",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern COUNT_FUNCTION_CANDIDATE_PATTERN = Pattern.compile(
+            "\\bCOUNT\\s*\\(",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern MYSQL_BIT_LITERAL_CANDIDATE_PATTERN = Pattern.compile(
+            "\\bB'[01]",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern SPECIAL_DAMENG_IDENTIFIER_CANDIDATE_PATTERN = Pattern.compile(
+            "\\b(?:AUDIT|DIMENSION|PERCENT|DESC|DISTINCT|REVERSE)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
     private static final Pattern IFNULL_PATTERN = Pattern.compile("\\bIFNULL\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOW_PATTERN = Pattern.compile("\\bNOW\\s*\\(\\s*\\)", Pattern.CASE_INSENSITIVE);
     private static final Pattern SYSDATE_FUNCTION_PATTERN = Pattern.compile(
@@ -176,6 +220,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern GROUP_CONCAT_PATTERN = Pattern.compile("\\bGROUP_CONCAT\\s*\\(", Pattern.CASE_INSENSITIVE);
     private static final Pattern INSERT_IGNORE_PATTERN = Pattern.compile(
             "\\bINSERT\\s+IGNORE\\s+INTO\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern ON_DUPLICATE_KEY_UPDATE_PATTERN = Pattern.compile(
+            "\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern REPLACE_INTO_PATTERN = Pattern.compile(
+            "\\bREPLACE\\s+INTO\\b",
             Pattern.CASE_INSENSITIVE
     );
     private static final Pattern CAST_UNSIGNED_BODY_PATTERN = Pattern.compile(
@@ -1296,6 +1348,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private ArithmeticConversion convertIntegerArithmeticExpressions(String sql) {
+        if (!hasPotentialSlashDivision(sql)
+                && !DIV_OPERATOR_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return ArithmeticConversion.unchanged(sql);
+        }
         ArithmeticConversion divConversion = convertMysqlDivOperators(sql);
         if (!divConversion.manualReviewReason().isBlank()) {
             return divConversion;
@@ -1853,19 +1909,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
             return "MySQL UPDATE JOIN shape could not be converted safely to Dameng UPDATE FROM.";
         }
-        if (containsPatternOutsideIgnoredText(sql, Pattern.compile("<=>"))) {
+        if (sql.contains("<=>")
+                && containsPatternOutsideIgnoredText(sql, Pattern.compile("<=>"))) {
             return "MySQL null-safe equality <=> could not be parsed safely for automatic Dameng rewrite.";
         }
-        if (containsPatternOutsideIgnoredText(
-                sql,
-                Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
-        )) {
+        if (ON_DUPLICATE_KEY_UPDATE_PATTERN.matcher(sql).find()
+                && containsPatternOutsideIgnoredText(sql, ON_DUPLICATE_KEY_UPDATE_PATTERN)) {
             return "ON DUPLICATE KEY UPDATE requires configured keyColumns for safe Dameng MERGE rewrite.";
         }
-        if (containsPatternOutsideIgnoredText(
-                sql,
-                Pattern.compile("(?is)\\bREPLACE\\s+INTO\\b")
-        )) {
+        if (REPLACE_INTO_PATTERN.matcher(sql).find()
+                && containsPatternOutsideIgnoredText(sql, REPLACE_INTO_PATTERN)) {
             return "REPLACE INTO has no safe automatic Dameng rewrite in MVP.";
         }
         if (GROUP_CONCAT_PATTERN.matcher(sql).find()) {
@@ -1877,7 +1930,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (containsKeywordOutsideIgnoredText(sql, "REGEXP")) {
             return "REGEXP requires manual confirmation because Dameng regular-expression syntax may differ from MySQL.";
         }
-        if (containsPatternOutsideIgnoredText(sql, INSERT_IGNORE_PATTERN)) {
+        if (INSERT_IGNORE_PATTERN.matcher(sql).find()
+                && containsPatternOutsideIgnoredText(sql, INSERT_IGNORE_PATTERN)) {
             return "INSERT IGNORE requires configured keyColumns for safe Dameng MERGE rewrite.";
         }
         String statefulUserVariableReason = interdependentUserVariableAssignmentReason(sql);
@@ -2315,6 +2369,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertSingleQuotedAliases(String sql) {
+        if (!SINGLE_QUOTED_ALIAS_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -2354,7 +2411,26 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
+    private boolean hasPotentialSlashDivision(String sql) {
+        int slash = sql.indexOf('/');
+        while (slash >= 0) {
+            int lineStart = Math.max(sql.lastIndexOf('\n', slash), sql.lastIndexOf('\r', slash)) + 1;
+            int lineEnd = sql.indexOf('\n', slash + 1);
+            if (lineEnd < 0) {
+                lineEnd = sql.length();
+            }
+            if (!sql.substring(lineStart, lineEnd).strip().equals("/")) {
+                return true;
+            }
+            slash = sql.indexOf('/', slash + 1);
+        }
+        return false;
+    }
+
     private GenericConversion quoteNumericLeadingSelectAliases(String sql) {
+        if (!SELECT_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -3183,6 +3259,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertMysqlNumericTypeAttributes(String sql) {
+        if (!MYSQL_NUMERIC_TYPE_ATTRIBUTE_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -3332,6 +3411,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion capMysqlDecimalPrecision(String sql) {
+        if (!DECIMAL_PRECISION_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -4868,6 +4950,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertTimePartTimeDiff(String sql) {
+        if (!TIME_PART_FUNCTION_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -8192,6 +8277,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion removeAsFromTableAliases(String sql) {
+        if (!TABLE_ALIAS_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -8848,6 +8936,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertJsonTableJoinWithoutCondition(String sql) {
+        if (!JSON_TABLE_JOIN_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -10058,6 +10149,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion quoteDamengKeywordIdentifiers(String sql) {
+        if (sql.indexOf('.') < 0
+                && !SPECIAL_DAMENG_IDENTIFIER_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -10463,6 +10558,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertCountDistinctIfToCase(String sql) {
+        if (!COUNT_FUNCTION_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -10887,6 +10985,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertGroupConcat(String sql) {
+        if (!GROUP_CONCAT_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -12224,6 +12325,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertMysqlBitLiterals(String sql) {
+        if (!MYSQL_BIT_LITERAL_CANDIDATE_PATTERN.matcher(sql).find()) {
+            return GenericConversion.unchanged(sql);
+        }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -12370,6 +12474,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
         private static ArithmeticConversion manual(String sql) {
             return new ArithmeticConversion(sql, false, INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON, List.of());
+        }
+
+        private static ArithmeticConversion unchanged(String sql) {
+            return new ArithmeticConversion(sql, false, "", List.of());
         }
     }
 

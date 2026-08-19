@@ -573,6 +573,10 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
         int timeoutSeconds = effectiveStatementTimeoutSeconds(environment);
         AtomicReference<Statement> activeStatement = new AtomicReference<>();
         Future<Boolean> execution = executor.submit(() -> {
+            String insertValueCountReason = onlineBareInsertValueCountReason(connection, sql);
+            if (!insertValueCountReason.isBlank()) {
+                throw new OriginalSqlInsertValueCountException(insertValueCountReason);
+            }
             try (Statement statement = connection.createStatement()) {
                 activeStatement.set(statement);
                 configureStatement(statement, environment);
@@ -609,6 +613,63 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
                     e
             );
         }
+    }
+
+    private String onlineBareInsertValueCountReason(Connection connection, String sql) throws SQLException {
+        SqlScriptSourceSyntaxInspector.InsertValuesShape shape =
+                SqlScriptSourceSyntaxInspector.bareInsertValuesShape(sql);
+        if (shape == null || shape.rowValueCounts().isEmpty()) {
+            return "";
+        }
+        String tableName = unqualifiedIdentifier(shape.tableName());
+        if (tableName.isBlank()) {
+            return "";
+        }
+        int expected;
+        PreparedStatement metadataStatement = connection.prepareStatement(
+                "SELECT COUNT(*) FROM ALL_TAB_COLUMNS "
+                        + "WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID) "
+                        + "AND TABLE_NAME IN (?, UPPER(?))"
+        );
+        if (metadataStatement == null) {
+            return "";
+        }
+        try (PreparedStatement statement = metadataStatement) {
+            statement.setString(1, tableName);
+            statement.setString(2, tableName);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                expected = resultSet.next() ? resultSet.getInt(1) : 0;
+            }
+        }
+        if (expected <= 0) {
+            return "";
+        }
+        for (int row = 0; row < shape.rowValueCounts().size(); row++) {
+            int actual = shape.rowValueCounts().get(row);
+            if (actual != expected) {
+                return SqlScriptSourceSyntaxInspector.INSERT_VALUE_COUNT_CODE
+                        + ": INSERT into " + shape.tableName() + " expects " + expected
+                        + " value(s), but VALUES row " + (row + 1) + " contains " + actual
+                        + "; name the intended target columns in the source SQL.";
+            }
+        }
+        return "";
+    }
+
+    private String unqualifiedIdentifier(String identifier) {
+        String value = identifier == null ? "" : identifier.strip();
+        int dot = value.lastIndexOf('.');
+        if (dot >= 0) {
+            value = value.substring(dot + 1).strip();
+        }
+        if (value.length() >= 2
+                && ((value.startsWith("`") && value.endsWith("`"))
+                || (value.startsWith("\"") && value.endsWith("\"")))) {
+            value = value.substring(1, value.length() - 1)
+                    .replace("``", "`")
+                    .replace("\"\"", "\"");
+        }
+        return value;
     }
 
     private void validateCreatedObject(
@@ -1168,6 +1229,9 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
         if (isDatabaseConnectionFailure(e)) {
             return "DATABASE_CONNECTION";
         }
+        if (e instanceof OriginalSqlInsertValueCountException) {
+            return "ORIGINAL_SQL";
+        }
         if (e instanceof InvalidCreatedObjectException) {
             String message = safeMessage(e).toLowerCase(Locale.ROOT);
             if (message.contains("无效的表") || message.contains("无效的视图")
@@ -1307,55 +1371,11 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
     }
 
     private boolean containsDuplicateColumnDefault(String sql) {
-        if (sql == null || sql.isBlank()) {
-            return false;
-        }
-        String uncommentedSql = sqlWithoutComments(sql);
-        Matcher createTable = Pattern.compile(
-                "(?is)\\bCREATE\\s+(?:(?:GLOBAL\\s+)?TEMPORARY\\s+)?TABLE\\b"
-        ).matcher(uncommentedSql);
-        while (createTable.find()) {
-            int openIndex = nextUnquotedCharacter(uncommentedSql, createTable.end(), '(');
-            if (openIndex < 0) {
-                continue;
-            }
-            int closeIndex = matchingParenthesis(uncommentedSql, openIndex);
-            if (closeIndex < 0) {
-                continue;
-            }
-            for (String definition : splitTopLevelComma(uncommentedSql.substring(openIndex + 1, closeIndex))) {
-                if (keywordCount(definition, "DEFAULT") > 1) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        return SqlScriptSourceSyntaxInspector.containsDuplicateColumnDefault(sql);
     }
 
     private boolean containsContradictoryColumnNullability(String sql) {
-        if (sql == null || sql.isBlank()) {
-            return false;
-        }
-        String uncommentedSql = sqlWithoutComments(sql);
-        Matcher createTable = Pattern.compile(
-                "(?is)\\bCREATE\\s+(?:(?:GLOBAL\\s+)?TEMPORARY\\s+)?TABLE\\b"
-        ).matcher(uncommentedSql);
-        while (createTable.find()) {
-            int openIndex = nextUnquotedCharacter(uncommentedSql, createTable.end(), '(');
-            if (openIndex < 0) {
-                continue;
-            }
-            int closeIndex = matchingParenthesis(uncommentedSql, openIndex);
-            if (closeIndex < 0) {
-                continue;
-            }
-            for (String definition : splitTopLevelComma(uncommentedSql.substring(openIndex + 1, closeIndex))) {
-                if (hasContradictoryNullability(definition)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+        return SqlScriptSourceSyntaxInspector.containsContradictoryColumnNullability(sql);
     }
 
     private boolean containsStraySelectEndBeforeInto(String sql) {
@@ -1609,6 +1629,12 @@ class SqlScriptValidator implements SqlScriptMigrator.Validator, SqlScriptMigrat
     }
 
     private record DdlLocation(String sourceFile, int statementIndex, String sqlSummary) {
+    }
+
+    private static final class OriginalSqlInsertValueCountException extends SQLException {
+        private OriginalSqlInsertValueCountException(String message) {
+            super(message);
+        }
     }
 
     private static final class InvalidCreatedObjectException extends SQLException {

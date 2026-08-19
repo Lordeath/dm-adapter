@@ -531,7 +531,7 @@ class SqlScriptMigratorTest {
         ));
 
         assertThat(Files.readString(sqlRootOut.resolve("20260423.sql")))
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_ipaas_interface")
+                .contains("EXECUTE IMMEDIATE ('ALTER TABLE ns_ipaas_interface")
                 .contains("ADD direction tinyint DEFAULT ''0'''")
                 .doesNotContainIgnoringCase("unsigned")
                 .doesNotContainIgnoringCase("zerofill");
@@ -872,7 +872,7 @@ class SqlScriptMigratorTest {
                 .contains("dm_tenant_entity_exists BIGINT;")
                 .contains("SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END INTO dm_tenant_entity_exists")
                 .contains("WHERE dm_tenant_entity_exists = 0")
-                .contains("EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS tenant_tag")
+                .contains("EXECUTE IMMEDIATE ('CREATE TABLE IF NOT EXISTS tenant_tag")
                 .contains("INSERT INTO unrelated_audit(id) VALUES (31);")
                 .doesNotContain("@tenant_entity_exists")
                 .doesNotContain("CREATE OR REPLACE PROCEDURE dm_adapter_snapshot_")
@@ -2174,9 +2174,8 @@ class SqlScriptMigratorTest {
                 .contains("DELETE FROM daily_result_bak")
                 .contains("INSERT INTO daily_result_bak (id, amount) SELECT id, amount FROM source_result")
                 .contains("EXECUTE IMMEDIATE 'TRUNCATE TABLE daily_result'")
-                .contains("EXECUTE IMMEDIATE 'INSERT INTO daily_result(id, amount)"
-                        + "\n"
-                        + "    SELECT id, amount FROM daily_result_bak'")
+                .contains("EXECUTE IMMEDIATE ('INSERT INTO daily_result(id, amount)")
+                .contains("' || CHR(10) || '    SELECT id, amount FROM daily_result_bak'")
                 .doesNotContain("#daily_result_bak");
     }
 
@@ -3383,7 +3382,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void wrapsExplicitAutoIncrementInsertAfterScriptAlterTableAddColumn() throws Exception {
+    void flagsBareInsertMissingAnAddedTableColumnBeforeIdentityRewrite() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE TABLE sample_seed_item (
                     id INT NOT NULL AUTO_INCREMENT,
@@ -3402,19 +3401,13 @@ class SqlScriptMigratorTest {
                 DELIMITER ;
                 """);
 
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).startsWith(SqlScriptSourceSyntaxInspector.INSERT_VALUE_COUNT_CODE));
         assertThat(converted.sql())
-                .contains("dm_adapter_identity_insert_enabled INT := 0")
-                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item ON';")
-                .contains("IF SQLCODE <> -2717 THEN")
-                .contains("INSERT INTO sample_seed_item (id, code, name) VALUES (2, 'A', 'Alpha');")
-                .contains("EXECUTE IMMEDIATE 'SET IDENTITY_INSERT sample_seed_item OFF';")
-                .contains("WHEN OTHERS THEN")
-                .doesNotContain("INSERT INTO sample_seed_item VALUES (2, 'A', 'Alpha');")
-                .doesNotContain("deleteFlag) VALUES");
-        assertThat(converted.report().files())
-                .singleElement()
-                .satisfies(file -> assertThat(file.appliedRules())
-                        .contains(SqlScriptMigrator.MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE));
+                .contains("INSERT INTO sample_seed_item VALUES (2, 'A', 'Alpha');")
+                .doesNotContain("dm_adapter_identity_insert_enabled")
+                .doesNotContain("SET IDENTITY_INSERT sample_seed_item ON");
     }
 
     @Test
@@ -4815,9 +4808,9 @@ class SqlScriptMigratorTest {
                 .contains("UPPER(INDEX_NAME) = UPPER('ns_message_idx_old')")
                 .contains("IF dm_adapter_drop_index_exists > 0 THEN")
                 .contains("EXECUTE IMMEDIATE 'DROP INDEX ns_message_idx_old'")
-                .contains("EXECUTE IMMEDIATE 'CREATE INDEX ns_message_idx_enter_org_seq")
+                .contains("EXECUTE IMMEDIATE ('CREATE INDEX ns_message_idx_enter_org_seq")
                 .contains("ON `ns_message` (`enterpriseId`, `organizationId`, `seqNumber`)'")
-                .contains("EXECUTE IMMEDIATE 'CREATE INDEX ns_message_idx_content")
+                .contains("EXECUTE IMMEDIATE ('CREATE INDEX ns_message_idx_content")
                 .contains("ON ns_message (CAST(SUBSTR(`content`, 1, 255) AS VARCHAR(255)))'")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_message MODIFY `text` CLOB'")
                 .doesNotContain("MODIFY `CLOB`")
@@ -6303,7 +6296,7 @@ class SqlScriptMigratorTest {
         assertThat(worker.isAlive()).isFalse();
         assertThat(failure.get()).isNull();
         assertThat(Files.readString(sqlRootOut.resolve("view.sql")))
-                .contains("EXECUTE IMMEDIATE 'CREATE VIEW ns_budget_plan_view AS")
+                .contains("EXECUTE IMMEDIATE ('CREATE VIEW ns_budget_plan_view AS")
                 .contains("ORDER BY p.id'");
     }
 
@@ -7176,6 +7169,48 @@ class SqlScriptMigratorTest {
             assertThat(failure.errorSummary())
                     .contains("without a target column list")
                     .contains("Fix the source SQL");
+        });
+    }
+
+    @Test
+    void detectsBareInsertValueCountFromConnectedDamengMetadataBeforeExecution() {
+        AtomicInteger insertExecutions = new AtomicInteger();
+        AtomicInteger resultRows = new AtomicInteger();
+        ResultSet resultSet = proxy(ResultSet.class, (ignored, method, args) -> switch (method.getName()) {
+            case "next" -> resultRows.getAndIncrement() == 0;
+            case "getInt" -> 3;
+            default -> defaultValue(method.getReturnType());
+        });
+        PreparedStatement metadata = proxy(PreparedStatement.class, (ignored, method, args) ->
+                method.getName().equals("executeQuery") ? resultSet : defaultValue(method.getReturnType()));
+        Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+            if (method.getName().equals("execute") && ((String) args[0]).contains("INSERT INTO")) {
+                insertExecutions.incrementAndGet();
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Connection connection = proxy(Connection.class, (ignored, method, args) -> switch (method.getName()) {
+            case "createStatement" -> statement;
+            case "prepareStatement" -> metadata;
+            default -> defaultValue(method.getReturnType());
+        });
+
+        SqlScriptValidationRun result = new SqlScriptValidator(env -> connection).validate(
+                List.of(plannedValidationFile(
+                        "bare-insert-metadata.sql",
+                        "sample-site",
+                        List.of("INSERT INTO ns_site VALUES (1, 'demo')")
+                )),
+                validationEnvironment()
+        );
+
+        assertThat(insertExecutions).hasValue(0);
+        assertThat(result.failures()).singleElement().satisfies(failure -> {
+            assertThat(failure.category()).isEqualTo("ORIGINAL_SQL");
+            assertThat(failure.errorSummary())
+                    .contains(SqlScriptSourceSyntaxInspector.INSERT_VALUE_COUNT_CODE)
+                    .contains("expects 3 value(s)")
+                    .contains("contains 2");
         });
     }
 
@@ -8913,7 +8948,7 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("C.NAME IN ('paramName', UPPER('paramName'))")
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_wms_parameter_setting")
+                .contains("EXECUTE IMMEDIATE ('ALTER TABLE ns_wms_parameter_setting")
                 .contains("ADD `paramName` varchar(255) DEFAULT NULL'")
                 .doesNotContain("CREATE OR REPLACE PROCEDURE")
                 .doesNotContain("CALL add_clo_ns_wms_parameter_setting_paramName")
@@ -9037,10 +9072,10 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ns_menu_version")
-                .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM (")
+                .contains("EXECUTE IMMEDIATE ('CREATE TABLE IF NOT EXISTS ns_menu_version")
+                .contains("EXECUTE IMMEDIATE ('SELECT COUNT(*) FROM (")
                 .contains("SELECT 1 FROM ns_menu_version")
-                .contains("' INTO dm_adapter_exists")
+                .contains("') INTO dm_adapter_exists")
                 .contains("EXECUTE IMMEDIATE 'INSERT INTO ns_menu_version(ver) VALUES (1)'");
     }
 
@@ -9067,7 +9102,7 @@ class SqlScriptMigratorTest {
                 .as("manual=%s%n%s", converted.report().manualReviewItems(), converted.sql())
                 .isZero();
         assertThat(converted.sql())
-                .contains("EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS ns_menu_version")
+                .contains("EXECUTE IMMEDIATE ('CREATE TABLE IF NOT EXISTS ns_menu_version")
                 .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM ns_menu_version' INTO dm_adapter_exists")
                 .contains("EXECUTE IMMEDIATE 'INSERT INTO ns_menu_version(ver) VALUES (1)'");
     }
@@ -9088,9 +9123,9 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("EXECUTE IMMEDIATE 'UPDATE demo")
+                .contains("EXECUTE IMMEDIATE ('UPDATE demo")
                 .contains("SET status = ?")
-                .contains("WHERE id = ? OR parent_id = ?' USING new_status, target_id, target_id")
+                .contains("WHERE id = ? OR parent_id = ?') USING new_status, target_id, target_id")
                 .doesNotContain("SET ? = ?");
     }
 
@@ -9111,9 +9146,9 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*)")
+                .contains("EXECUTE IMMEDIATE ('SELECT COUNT(*)")
                 .contains("FROM demo")
-                .contains("WHERE status = ?' INTO matching_count USING new_status")
+                .contains("WHERE status = ?') INTO matching_count USING new_status")
                 .doesNotContain("INTO ?")
                 .doesNotContain("WHERE status = new_status");
     }
@@ -9186,10 +9221,10 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("EXECUTE IMMEDIATE 'CREATE TABLE demo_snapshot AS SELECT id, status FROM demo_source'")
-                .contains("EXECUTE IMMEDIATE 'SELECT COUNT(*)")
+                .contains("EXECUTE IMMEDIATE ('SELECT COUNT(*)")
                 .contains("FROM demo_snapshot")
                 .contains("GROUP BY status")
-                .contains(") grouped_status' INTO matching_count")
+                .contains(") grouped_status') INTO matching_count")
                 .doesNotContain("grouped_status\n    INTO matching_count");
     }
 
@@ -9300,7 +9335,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo_target`")
+                .contains("EXECUTE IMMEDIATE ('ALTER TABLE `demo_target`")
                 .contains("DROP COLUMN `id`'")
                 .doesNotContain("DROP PRIMARY KEY")
                 .doesNotContain("CREATE INDEX demo_target_index_target_id")
@@ -9726,7 +9761,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("EXECUTE IMMEDIATE 'CREATE TABLE demo")
+                .contains("EXECUTE IMMEDIATE ('CREATE TABLE demo")
                 .contains("dm_equivalent_indexes")
                 .contains("CREATE INDEX demo_idx_status ON demo (`status`)")
                 .doesNotContainIgnoringCase("CHARSET")
@@ -10160,19 +10195,144 @@ class SqlScriptMigratorTest {
                 .doesNotContain("resignationSF_GET_SCHEMA_NAME_BY_ID");
     }
 
+    @Test
+    void encodesPhysicalLineBreaksInLongProcedureLiteralsWithoutChangingTheValue() throws Exception {
+        String value = "A".repeat(899) + "\r\n" + "B".repeat(900) + "\n"
+                + "第三行\r第四行🙂 O'Reilly C:\\archive\\2026 " + "长文本".repeat(700);
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE demo_multiline_clob()
+                BEGIN
+                    SET @payload = '%s';
+                    INSERT INTO demo_payload(id, payload) VALUES (1, @payload);
+                END;
+                /
+                CALL demo_multiline_clob();
+                """.formatted(value.replace("'", "''")));
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CHR(13)")
+                .contains("CHR(10)")
+                .doesNotContain("'" + "A".repeat(899) + "\r\n");
+        assertThat(SqlScriptParser.statements(converted.sql())).allSatisfy(statement ->
+                assertThat(GeneratedSqlStaticInspector.manualReviewReason(statement)).isEmpty());
+        assertThat(decodedClobAssignmentValue(converted.sql(), "dm_payload")).isEqualTo(value);
+    }
+
+    @Test
+    void projectsStatisticsSubPartNullnessFromDamengIndexExpressions() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT s.COLUMN_NAME
+                FROM information_schema.statistics s
+                WHERE s.TABLE_SCHEMA = DATABASE()
+                  AND s.TABLE_NAME = 'demo'
+                  AND s.SUB_PART IS NULL;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("FROM ALL_IND_EXPRESSIONS E")
+                .contains("E.COLUMN_POSITION = ABS(C.COLUMN_POSITION)")
+                .contains("THEN 1 ELSE NULL END AS SUB_PART")
+                .containsIgnoringCase("s.SUB_PART IS NULL");
+    }
+
+    @Test
+    void rejectsStatisticsSubPartConcreteLengthUsage() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT SUB_PART
+                FROM information_schema.statistics
+                WHERE TABLE_NAME = 'demo' AND SUB_PART = 16;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).startsWith(
+                        "MYSQL_INFORMATION_SCHEMA_STATISTICS_SUB_PART_UNSUPPORTED"
+                ));
+        assertThat(converted.sql()).contains("information_schema.statistics");
+    }
+
+    @Test
+    void rewritesConstantMultiCharacterTrimAssignmentWithRepeatedRemovalLoops() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE clean_configuration()
+                BEGIN
+                    DECLARE inspectType VARCHAR(4000);
+                    SET inspectType = TRIM(BOTH '\\n\\r\\t ' FROM inspectType);
+                END;
+                /
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("inspectType := inspectType;")
+                .contains("CHR(10) || CHR(13) || CHR(9) || ' '")
+                .contains("SUBSTR(inspectType, 1, LENGTH(")
+                .contains("SUBSTR(inspectType, LENGTH(inspectType) - LENGTH(")
+                .contains("END LOOP;");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.MYSQL_PROCEDURE_MULTI_CHARACTER_TRIM_TO_DM_RULE
+                ));
+    }
+
+    @Test
+    void keepsDynamicMultiCharacterTrimForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE clean_configuration()
+                BEGIN
+                    DECLARE inspectType VARCHAR(4000);
+                    DECLARE trimToken VARCHAR(20);
+                    SET inspectType = TRIM(BOTH trimToken FROM inspectType);
+                END;
+                /
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).startsWith("MYSQL_PROCEDURE_MULTI_CHARACTER_TRIM_UNSUPPORTED"));
+        assertThat(converted.sql()).contains("TRIM(BOTH trimToken FROM inspectType)");
+    }
+
+    @Test
+    void blocksOriginalDdlDefectsBeforeConversion() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE TABLE invalid_default (
+                    id BIGINT,
+                    status INT DEFAULT 0 DEFAULT 1
+                );
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).startsWith(SqlScriptSourceSyntaxInspector.DUPLICATE_DEFAULT_CODE));
+        assertThat(converted.sql()).contains("DEFAULT 0 DEFAULT 1");
+    }
+
+    @Test
+    void staticGateDoesNotRepairAnUnclosedSourceLiteral() throws Exception {
+        ConvertedScript converted = migrateSingleScript("SELECT 'broken\nvalue");
+
+        assertThat(converted.report().manualReviewSqlCount()).isEqualTo(1);
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).startsWith("DM_OUTPUT_STATIC_GATE:"));
+        assertThat(converted.sql()).contains("'broken\nvalue");
+    }
+
     private String decodedClobAssignmentValue(String sql, String variableName) {
         StringBuilder value = new StringBuilder();
         String marker = variableName + " := ";
         for (String line : sql.lines().toList()) {
             int assignment = line.indexOf(marker);
-            int toClob = line.indexOf("TO_CLOB('", assignment < 0 ? 0 : assignment);
+            int toClob = line.indexOf("TO_CLOB(", assignment < 0 ? 0 : assignment);
             if (assignment < 0 || toClob < 0) {
                 continue;
             }
             int literalStart = toClob + "TO_CLOB(".length();
             int literalEnd = line.lastIndexOf(");");
             assertThat(literalEnd).isGreaterThan(literalStart);
-            value.append(decodedDmSqlLiteral(line.substring(literalStart, literalEnd)));
+            value.append(decodedDmTextExpression(line.substring(literalStart, literalEnd)));
         }
         return value.toString();
     }
@@ -10197,6 +10357,24 @@ class SqlScriptMigratorTest {
     private String decodedDmSqlLiteral(String literal) {
         assertThat(literal).startsWith("'").endsWith("'");
         return literal.substring(1, literal.length() - 1).replace("''", "'");
+    }
+
+    private String decodedDmTextExpression(String expression) {
+        String stripped = expression.strip();
+        while (stripped.startsWith("(") && stripped.endsWith(")")) {
+            stripped = stripped.substring(1, stripped.length() - 1).strip();
+        }
+        StringBuilder value = new StringBuilder();
+        Matcher part = Pattern.compile("'(?:''|[^'])*'|CHR\\(\\d+\\)").matcher(stripped);
+        while (part.find()) {
+            String token = part.group();
+            if (token.startsWith("CHR(")) {
+                value.appendCodePoint(Integer.parseInt(token.substring(4, token.length() - 1)));
+            } else {
+                value.append(decodedDmSqlLiteral(token));
+            }
+        }
+        return value.toString();
     }
 
     private ConvertedScript migrateSingleScript(String content) throws Exception {
