@@ -6,7 +6,7 @@
 - 达梦官方 FAQ：MySQL 迁移 DM8，https://eco.dameng.com/document/dm/zh-cn/faq/faq-mysql-dm8-migrate.html
 - 达梦官方参数说明：https://eco.dameng.com/document/dm/zh-cn/pm/physical-storage
 - 达梦官方初始化参数 FAQ：https://eco.dameng.com/document/dm/zh-cn/faq/faq-dm-install
-- 最后核对日期：2026-08-18
+- 最后核对日期：2026-08-19
 
 本文用于指导 dm-adapter 后续处理 Spring Boot + MyBatis 项目从 MySQL 迁移到达梦 8。修改代码前先按本文区分：应由 dm-adapter 自动转换的问题、业务 SQL 本身需要修正的问题、测试库缺对象的问题、必须人工提供参数或 `sql-rewrite.yml` 配置的问题。
 
@@ -180,6 +180,10 @@ ORDER BY PARA_NAME;
 - 真实全量脚本耗时较长时，不应在每轮工具修改后立即重跑全部仓库。先选择系统库、共享过程依赖覆盖最全的仓库、最近暴露规则缺陷的仓库和至少一个正常基线仓库做代表性真实回归；这些项目的脚本与 MyBatis 均通过且已检查语义后，再基于最终候选版本运行一次全量。
 - 升级脚本可能由 Windows 工具保存为带 BOM 的 UTF-16LE/UTF-16BE，而不只是 UTF-8。读取时应按 BOM 解码，迁移输出统一写为 UTF-8；不能因固定按 UTF-8 读取而在全量执行中途抛出 `MalformedInputException`。
 - 达梦 JDBC 能执行超长字符串 SQL，不代表旧版 DIsql 通过 `START`/`@文件` 执行时也能接收同一条超长输入；单行 `UPDATE ... SET column = '<超长内容>'` 仍可能报 `DISQL-10033: 输入过长`。对最终达梦脚本中 UTF-8 超过 3000 字节、且能明确证明位于顶层 `UPDATE SET`、`INSERT VALUES` 或 `MERGE` 直接赋值位置的字符串，dm-adapter 使用规则 `DM_DISQL_LONG_DML_LITERAL_TO_CLOB_BLOCK` 生成匿名块：每段最多 900 UTF-8 字节，通过 `TO_CLOB` 逐段拼接后再执行原 DML。存储过程内已声明的 CLOB 直接赋值、已知 JSON/CLOB 过程参数，以及 `UPDATE SET`、`INSERT VALUES`、`INSERT ... SELECT` 直接投影和 `MERGE` 直接赋值，可使用规则 `DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE` 在原控制流位置生成局部 CLOB 变量并按相同规则分段拼接；未知过程参数不得猜测为大字段。存储过程内 `EXECUTE IMMEDIATE '<超长 SQL>'` 的直接字符串参数若 UTF-8 不超过 32767 字节，可使用规则 `DM_PROCEDURE_LONG_DYNAMIC_SQL_TO_VARCHAR_VARIABLE` 声明 `VARCHAR(32767)` 局部变量，并在原控制流分支内按最多 900 UTF-8 字节逐段赋值后执行，避免把不同分支的动态 SQL 提前初始化。超过 32767 字节、由表达式动态拼接或无法确认 `INTO`/`USING` 边界的动态 SQL 仍须人工处理。所有转换只折叠 SQL 的成对单引号，必须逐字符保留中文、emoji、单引号和反斜杠；原脚本不覆盖，只修改输出目录。其他位于 `WHERE`、函数表达式、`RETURNING` 等不安全位置的长字符串，以及单个超过 20MB 的字符串必须保留原 SQL 并进入人工确认，不能为了绕过客户端长度限制强行改写语义。
+- 所有生成的达梦字符串表达式都不得让单引号字面量跨物理行。长 JSON、HTML、动态 DDL 和过程变量中的 CRLF、LF、CR 必须分别用 `CHR(13) || CHR(10)`、`CHR(10)`、`CHR(13)` 重建；CRLF 按一个逻辑边界参与 900 字节分段，但原始两个字符必须完整保留。输出语句还要经过线性静态门禁：字符串、注释、括号和过程末尾必须闭合，且不得残留 `DELIMITER`、`$$`、脚本级 `@变量`、`ENGINE=`、列级 `COMMENT`、`AFTER` 或 `USING BTREE`。门禁失败时保留原 SQL 并生成人工确认项，批处理不得提交或推送。
+- `information_schema.statistics.SUB_PART` 当前只自动兼容空值判断：普通完整列索引投影为 `NULL`，在相同 owner、表、索引和列位置上存在 `ALL_IND_EXPRESSIONS` 记录时投影为非空标记。因此 `SUB_PART IS NULL`/`IS NOT NULL` 可自动转换；读取实际长度、数值比较、排序或分组必须人工确认，不能把非空标记冒充真实 MySQL 前缀长度。
+- MySQL 多字符 `TRIM([BOTH|LEADING|TRAILING] remstr FROM value)` 只有在过程内直接赋给已声明文本局部变量、`remstr` 是非空常量、来源是可完整解析且不含子查询的标量表达式时，才使用规则 `MYSQL_PROCEDURE_MULTI_CHARACTER_TRIM_TO_DM` 改成 `WHILE` 循环，重复移除完整 remstr。不得把 remstr 当成字符集合。动态或空 remstr、嵌套查询、非文本目标及其他上下文保留原 SQL 并阻断发布。
+- 原始 CREATE/ALTER 列定义中的重复 `DEFAULT`、同时出现 `NULL` 与 `NOT NULL`，以及可证明的 INSERT 列值数量不一致，分别以 `ORIGINAL_SQL_DUPLICATE_DEFAULT`、`ORIGINAL_SQL_CONTRADICTORY_NULLABILITY`、`ORIGINAL_SQL_INSERT_VALUE_COUNT` 报告。显式 INSERT 列清单和同一脚本已知表结构可离线检查；联网验证时，无列清单 INSERT 还要对照当前达梦表的可见列数。工具只分类并保留原文，不能擅自删除约束或值来猜业务意图。
 - 脚本级 `SET @变量`、`FOREIGN_KEY_CHECKS`、`PREPARE` 等 MySQL 控制语句被安全消解为审计注释时，写盘 SQL 必须同时生成可执行的达梦匿名 `NULL` 空操作块，使迁移结果、输出脚本和严格验证计划仍保持逐条对应。不能因解析器忽略纯注释而产生语句计数漂移，也不能因此跳过数据库验证。
 - 脚本级 `SELECT ... INTO @变量`、多列 `SELECT ... INTO @变量1,@变量2` 和 `SET @变量=(SELECT ...)` 若能证明查询来源表在最后一次引用前未被修改，可把查询转为达梦标量子查询并内联到后续普通 SQL 或临时过程中；未被使用的赋值可安全消解。来源表在引用区间内发生修改、查询仍依赖未解析用户变量或无法证明标量语义时必须保留人工确认，不能把“每次重新查询”冒充 MySQL 的赋值快照。
 - MyBatis 语句包含 `<if>`、`<foreach>`、`<include>`、`<where>` 等 XML 节点本身不是人工确认理由。只有转换后仍检测到明确的未解决兼容风险（例如未改写的 `ON DUPLICATE KEY UPDATE`、无法安全拼接的动态 `UPDATE JOIN` 或未支持的函数）才进入人工确认；成功改写后还必须移除由原始片段产生、但在最终 SQL 中已不存在的过期风险项。不能只按 `<insert>`、`<update>`、`<delete>` 标签决定转换类型，历史 mapper 可能在 `<delete>` 中实际书写 `UPDATE`，必须以 SQL 首关键字为准。
