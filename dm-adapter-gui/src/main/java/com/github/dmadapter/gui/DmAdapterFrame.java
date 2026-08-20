@@ -5,14 +5,12 @@ import com.github.dmadapter.core.DmAdapterSummary;
 import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SummaryIssue;
 import com.github.dmadapter.core.SummaryStage;
-import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.report.ReportReader;
 import com.github.dmadapter.report.ReportWriter;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
-import javax.swing.JComboBox;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -64,9 +62,6 @@ final class DmAdapterFrame extends JFrame {
     private final JTextField dmDriverField = new JTextField();
     private final JTextField rewriteConfigField = new JTextField();
     private final JTextField validationConfigField = new JTextField();
-    private final JComboBox<String> targetLengthSemanticsBox = new JComboBox<>(new String[]{
-            "自动探测", TargetLengthSemantics.CHAR.name(), TargetLengthSemantics.BYTE.name()
-    });
     private final JTextArea summaryArea = new JTextArea();
     private final JTextArea logArea = new JTextArea();
     private final JLabel statusLabel = new JLabel("就绪");
@@ -157,13 +152,11 @@ final class DmAdapterFrame extends JFrame {
         addTextRow(panel, 1, "达梦驱动坐标 (--dm-driver)", dmDriverField, "留空使用 CLI 默认坐标。");
         addPathRow(panel, 2, "SQL 重写配置 (--rewrite-config)", rewriteConfigField, false, null);
         addPathRow(panel, 3, "验证配置 (--config)", validationConfigField, false, null);
-        addComponentRow(panel, 4, "字符长度语义 (--target-length-semantics)", targetLengthSemanticsBox,
-                "离线迁移可显式选择 CHAR 或 BYTE；默认由目标库探测。");
         JLabel workspaceHint = new JLabel(
                 "工作目录留空时不传 --report-dir，由 CLI 使用 <启动目录>/.dm-adapter/<应用 artifactId>。"
         );
         workspaceHint.setBorder(BorderFactory.createEmptyBorder(2, 8, 2, 2));
-        addFullWidth(panel, 5, workspaceHint);
+        addFullWidth(panel, 4, workspaceHint);
         return panel;
     }
 
@@ -286,10 +279,6 @@ final class DmAdapterFrame extends JFrame {
     }
 
     private GuiRunConfiguration configuration() {
-        String selectedLength = (String) targetLengthSemanticsBox.getSelectedItem();
-        TargetLengthSemantics semantics = "自动探测".equals(selectedLength)
-                ? null
-                : TargetLengthSemantics.valueOf(selectedLength);
         return new GuiRunConfiguration(
                 pathValue(projectField),
                 pathValue(reportDirField),
@@ -302,7 +291,6 @@ final class DmAdapterFrame extends JFrame {
                 pathValue(sqlRootOutField),
                 sqlScriptsOnlyBox.isSelected(),
                 systemSchemaField.getText(),
-                semantics,
                 dmDriverField.getText(),
                 generateValidationTestBox.isSelected(),
                 databaseValidationBox.isSelected(),

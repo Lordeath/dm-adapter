@@ -5,8 +5,6 @@ import com.github.dmadapter.core.SqlScriptFileResult;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
-import com.github.dmadapter.core.DamengTargetCapabilities;
-import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import com.github.dmadapter.sql.SqlConverter;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -571,7 +569,6 @@ class SqlScriptMigrator {
                     schema,
                     systemSchema,
                     request.dryRun(),
-                    request.targetCapabilities(),
                     outerJoinSourceUniqueKeys,
                     projectIdentityColumns,
                     scriptSchemaStates,
@@ -656,12 +653,6 @@ class SqlScriptMigrator {
             validationFiles = loadedPlan.files();
             progress("SQL script validation plan written: " + writtenPlan);
         }
-        if (request.targetCapabilities().lengthSemantics() == null
-                && manualReviewItems.stream().anyMatch(item -> item.reason().contains("LENGTH_IN_CHAR 未知"))) {
-            warnings.add("Target LENGTH_IN_CHAR was not available. Length-sensitive DDL without an explicit "
-                    + "--target-length-semantics value was retained for manual review.");
-        }
-
         SqlScriptValidationRun validationRun;
         if (databaseValidationMuted) {
             validationRun = SqlScriptValidationRun.notAttempted(BATCH_VALIDATION_STATUS, List.of());
@@ -3076,7 +3067,6 @@ class SqlScriptMigrator {
             String schema,
             String systemSchema,
             boolean dryRun,
-            DamengTargetCapabilities targetCapabilities,
             Map<String, List<String>> outerJoinSourceUniqueKeys,
             Map<String, String> projectIdentityColumns,
             Map<String, ScriptSchemaState> scriptSchemaStates,
@@ -3119,7 +3109,6 @@ class SqlScriptMigrator {
                 copyScriptTableColumns(persistedSchemaState.ignoredCreateColumns());
         LinkedHashMap<String, String> scriptIdentityColumns =
                 new LinkedHashMap<>(projectIdentityColumns);
-        Map<String, Set<String>> sourceTableCharsets = sourceTableCharsets(originalStatements);
         long preparationStartedAt = System.nanoTime();
         LinkedHashMap<String, String> scriptProcedureRenames = procedureObjectNameConflictRenames(originalStatements);
         progress("Prepared SQL script conversion context: " + relative
@@ -3211,10 +3200,8 @@ class SqlScriptMigrator {
 
             for (StatementConversionPlan plan : conversionPlans) {
                 String originalStatement = plan.originalStatement();
-                ScriptStatementConversion conversion = applyTargetLengthSemantics(
-                        plan.conversion().join(),
-                        sourceTableCharsets,
-                        targetCapabilities
+                ScriptStatementConversion conversion = applyExplicitDdlCharacterSemantics(
+                        plan.conversion().join()
                 );
                 conversion = applyDisqlLongDmlLiteralCompatibility(conversion);
                 List<String> outputStatements = expandConvertedOutputStatements(conversion);
@@ -16411,62 +16398,15 @@ class SqlScriptMigrator {
         return false;
     }
 
-    private Map<String, Set<String>> sourceTableCharsets(List<String> statements) {
-        LinkedHashMap<String, Set<String>> charsets = new LinkedHashMap<>();
-        Pattern createTable = Pattern.compile(
-                "(?is)\\bCREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?<table>"
-                        + SQL_IDENTIFIER_TOKEN + ")"
-        );
-        for (String statement : statements == null ? List.<String>of() : statements) {
-            Matcher tableMatcher = createTable.matcher(statement == null ? "" : statement);
-            if (!tableMatcher.find()) {
-                continue;
-            }
-            Set<String> explicitCharsets = explicitSourceCharsets(statement);
-            if (!explicitCharsets.isEmpty()) {
-                charsets.put(normalizedTableKey(tableMatcher.group("table")), explicitCharsets);
-            }
-        }
-        return Map.copyOf(charsets);
-    }
-
-    private ScriptStatementConversion applyTargetLengthSemantics(
-            ScriptStatementConversion conversion,
-            Map<String, Set<String>> sourceTableCharsets,
-            DamengTargetCapabilities targetCapabilities
+    private ScriptStatementConversion applyExplicitDdlCharacterSemantics(
+            ScriptStatementConversion conversion
     ) {
+        if (conversion.manualReviewRequired()) {
+            return conversion;
+        }
         String sql = conversion.convertedSql();
         if (!containsLengthSensitiveDdl(sql)) {
             return conversion;
-        }
-        TargetLengthSemantics semantics = targetCapabilities == null
-                ? null
-                : targetCapabilities.lengthSemantics();
-        if (semantics == null) {
-            return lengthManualReview(
-                    conversion,
-                    "目标库 LENGTH_IN_CHAR 未知；涉及 VARCHAR/CHAR 长度的 DDL 已保留原文。"
-                            + "联网探测目标库，或离线迁移时显式传入 --target-length-semantics=CHAR|BYTE。"
-            );
-        }
-        if (semantics == TargetLengthSemantics.CHAR) {
-            return conversion;
-        }
-        Set<String> sourceCharsets = lengthDdlSourceCharsets(
-                conversion.originalSql(),
-                sourceTableCharsets
-        );
-        Set<String> unsupportedCharsets = sourceCharsets.stream()
-                .filter(charset -> !"utf8".equals(charset)
-                        && !"utf8mb3".equals(charset)
-                        && !"utf8mb4".equals(charset))
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-        if (!unsupportedCharsets.isEmpty()) {
-            return lengthManualReview(
-                    conversion,
-                    "目标库使用 BYTE 长度语义，但 SQL 明确声明了非 UTF-8 源字符集 "
-                            + unsupportedCharsets + "；请人工确认目标字段长度语义。"
-            );
         }
         LengthRewrite rewrite = rewriteDdlVarcharLengths(sql);
         if (!rewrite.changed()) {
@@ -17493,42 +17433,6 @@ class SqlScriptMigrator {
         return value.toString();
     }
 
-    private Set<String> lengthDdlSourceCharsets(
-            String sql,
-            Map<String, Set<String>> sourceTableCharsets
-    ) {
-        LinkedHashSet<String> charsets = new LinkedHashSet<>(explicitSourceCharsets(sql));
-        Matcher matcher = Pattern.compile(
-                "(?is)\\b(?:CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?|ALTER\\s+TABLE\\s+)"
-                        + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")"
-        ).matcher(sql == null ? "" : sql);
-        while (matcher.find()) {
-            charsets.addAll(sourceTableCharsets.getOrDefault(
-                    normalizedTableKey(matcher.group("table")),
-                    Set.of()
-            ));
-        }
-        return Set.copyOf(charsets);
-    }
-
-    private ScriptStatementConversion lengthManualReview(
-            ScriptStatementConversion conversion,
-            String reason
-    ) {
-        if (conversion.manualReviewRequired()) {
-            return conversion;
-        }
-        return new ScriptStatementConversion(
-                conversion.originalSql(),
-                conversion.convertedSql(),
-                conversion.originalSql(),
-                conversion.changed(),
-                true,
-                reason,
-                conversion.appliedRules()
-        );
-    }
-
     private boolean containsLengthSensitiveDdl(String sql) {
         if (sql == null || sql.isBlank()
                 || !Pattern.compile(
@@ -17537,18 +17441,6 @@ class SqlScriptMigrator {
             return false;
         }
         return Pattern.compile("(?is)\\b(?:CREATE|ALTER)\\s+TABLE\\b").matcher(sql).find();
-    }
-
-    private Set<String> explicitSourceCharsets(String sql) {
-        Matcher matcher = Pattern.compile(
-                "(?is)\\b(?:DEFAULT\\s+)?(?:CHARACTER\\s+SET|CHARSET)\\s*(?:=\\s*)?"
-                        + "(?<charsetQuote>['\"]?)(?<charset>[A-Za-z0-9_]+)\\k<charsetQuote>"
-        ).matcher(sql == null ? "" : sql);
-        LinkedHashSet<String> charsets = new LinkedHashSet<>();
-        while (matcher.find()) {
-            charsets.add(matcher.group("charset").toLowerCase(Locale.ROOT));
-        }
-        return Set.copyOf(charsets);
     }
 
     private LengthRewrite rewriteDdlVarcharLengths(String sql) {

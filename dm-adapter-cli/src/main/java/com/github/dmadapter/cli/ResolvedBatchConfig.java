@@ -1,7 +1,5 @@
 package com.github.dmadapter.cli;
 
-import com.github.dmadapter.core.TargetLengthSemantics;
-
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -86,7 +84,6 @@ record ResolvedBatchConfig(
             BatchSqlMode mode,
             Path sourceDir,
             Path outputDir,
-            TargetLengthSemantics targetLengthSemantics,
             List<Path> preserveSql
     ) {
         Sql {

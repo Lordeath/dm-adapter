@@ -10,7 +10,6 @@ import com.github.dmadapter.core.ProjectScanResult;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
 import com.github.dmadapter.core.DamengTargetCapabilities;
-import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.maven.PomModifier;
 import com.github.dmadapter.maven.PomTargetSelection;
 import com.github.dmadapter.maven.PomTargetSelector;
@@ -100,12 +99,6 @@ public class MigrateCommand implements Callable<Integer> {
             description = "Dameng schema for validating SQL files with a delimited 'system' filename token."
     )
     private String systemSchema;
-
-    @Option(
-            names = "--target-length-semantics",
-            description = "Dameng character length semantics for offline SQL migration: ${COMPLETION-CANDIDATES}."
-    )
-    private TargetLengthSemantics targetLengthSemantics;
 
     private final ProjectScanner projectScanner = new ProjectScanner();
     private final PomModifier pomModifier = new PomModifier();
@@ -912,7 +905,6 @@ public class MigrateCommand implements Callable<Integer> {
         migration.sqlRootOut = request.sqlRootOut();
         migration.preservedSqlPaths = new ArrayList<>(request.preservedSqlPaths());
         migration.sqlScriptsOnly = request.sqlScriptsOnly();
-        migration.targetLengthSemantics = request.targetLengthSemantics();
         migration.batchTableKeyColumns = request.tableKeyColumns();
         migration.batchMethodKeyColumns = request.methodKeyColumns();
         migration.batchMethodConflictKeyGroups = request.methodConflictKeyGroups();
@@ -936,49 +928,19 @@ public class MigrateCommand implements Callable<Integer> {
                                 TimeUnit.SECONDS,
                                 "Dameng target capability lookup"
                         ),
-                        targetCapabilityReadAttempts(targetLengthSemantics),
+                        DEFAULT_METADATA_READ_ATTEMPTS,
                         DEFAULT_METADATA_RETRY_DELAY_MILLIS
                 );
             } catch (Exception e) {
-                if (targetLengthSemantics == null) {
-                    throw new DmAdapterException(
-                            "Dameng target capability preflight failed before SQL execution. "
-                                    + "Verify the validation connection and V$DM_INI read permission, "
-                                    + "or explicitly pass --target-length-semantics. "
-                                    + "Cause: " + redactedMetadataFailure(e, environment),
-                            e
-                    );
-                }
-                CliLogger.info(
-                        "Dameng target capability lookup failed; continuing with explicit "
-                                + "--target-length-semantics="
-                                + targetLengthSemantics
-                                + ". Other target capabilities remain unknown. Cause: "
-                                + redactedMetadataFailure(e, environment)
+                throw new DmAdapterException(
+                        "Dameng target capability preflight failed before SQL execution. "
+                                + "Verify the validation connection and V$DM_INI read permission. "
+                                + "Cause: " + redactedMetadataFailure(e, environment),
+                        e
                 );
-                detected = DamengTargetCapabilities.offline(targetLengthSemantics);
             }
         }
-        if (detected.lengthSemantics() != null
-                && targetLengthSemantics != null
-                && detected.lengthSemantics() != targetLengthSemantics) {
-            throw new DmAdapterException(
-                    "--target-length-semantics=" + targetLengthSemantics
-                            + " conflicts with target database LENGTH_IN_CHAR="
-                            + (detected.lengthSemantics() == TargetLengthSemantics.CHAR ? "1" : "0")
-            );
-        }
-        if (detected.lengthSemantics() != null) {
-            return detected;
-        }
-        if (targetLengthSemantics != null) {
-            return DamengTargetCapabilities.offline(targetLengthSemantics);
-        }
         return detected;
-    }
-
-    static int targetCapabilityReadAttempts(TargetLengthSemantics explicitLengthSemantics) {
-        return explicitLengthSemantics == null ? DEFAULT_METADATA_READ_ATTEMPTS : 1;
     }
 
     static <T> T runWithMetadataRetries(

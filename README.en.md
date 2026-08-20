@@ -43,12 +43,12 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-valid
 # Unattended multi-repository conversion configured by one YAML file.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar batch --config /data/dm-batch/batch.yml
 
-# Declare the target length semantics when SQL scripts are converted offline.
-# BYTE targets use explicit VARCHAR(n CHAR)/CHAR(n CHAR) definitions.
+# Convert SQL scripts offline. Table columns always use explicit
+# VARCHAR(n CHAR)/CHAR(n CHAR) definitions without probing LENGTH_IN_CHAR.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
   --project ./demo --sql-scripts-only \
   --sql-root ./sql/v2 --sql-root-out ./sql/v2-dm \
-  --schema sample-system --target-length-semantics BYTE
+  --schema sample-system
 
 # --report-dir overrides the complete application workspace and does not append the artifactId.
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --report-dir /data/dm-work/demo-rest
@@ -113,8 +113,8 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar validate-sql \
 ```
 
 `validate-sql` has no arbitrary-directory execution mode. It rejects changed
-files, project/schema mismatches, and incompatible `LENGTH_IN_CHAR` or
-`COMPATIBLE_MODE` values before executing SQL. Manual-review statements are
+files, project/schema mismatches, and incompatible `COMPATIBLE_MODE` values
+before executing SQL. Manual-review statements are
 skipped while unrelated statements continue, and results are written to
 `sql-script-validation-report.md/json`.
 

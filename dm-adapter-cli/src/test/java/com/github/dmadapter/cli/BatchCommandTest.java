@@ -319,7 +319,6 @@ class BatchCommandTest {
                     mode: IF_PRESENT
                     sourceDir: sql/v2
                     outputDir: sql/v2-dm
-                    targetLengthSemantics: CHAR
                 repositories:
                 """);
         for (RemoteFixture repository : repositories) {

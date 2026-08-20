@@ -3,7 +3,6 @@ package com.github.dmadapter.cli;
 import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
-import com.github.dmadapter.core.TargetLengthSemantics;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -590,7 +589,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                        DamengTargetCapabilities.unknown(),
                         validationPlan
                 )
         );
@@ -1652,7 +1651,7 @@ class SqlScriptMigratorTest {
                 .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("LOWER(DATA_TYPE) IN ('char', 'varchar')")
                 .contains("CHAR_LENGTH < 1000")
-                .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` varchar(1000) DEFAULT NULL'");
+                .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` VARCHAR(1000 CHAR) DEFAULT NULL'");
     }
 
     @Test
@@ -5654,13 +5653,13 @@ class SqlScriptMigratorTest {
                 .contains("SELECT COUNT(*) INTO dm_adapter_exists FROM (")
                 .contains("IF dm_adapter_exists = 0 THEN")
                 .contains("IF dm_adapter_exists_5 > 0 THEN")
-                .contains("EXECUTE IMMEDIATE 'alter table demo add code varchar(128) null'")
+                .contains("EXECUTE IMMEDIATE 'alter table demo add code VARCHAR(128 CHAR) null'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_code"
                         + " ON demo (CAST(SUBSTR(code, 1, 32) AS VARCHAR(32)))'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title"
                         + " ON demo (CAST(SUBSTR(title, 1, 20) AS VARCHAR(20)))'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_amount ON demo (amount)'")
-                .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code varchar(256)'")
+                .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code VARCHAR(256 CHAR)'")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY tax decimal(14, 2) null';")
                 .doesNotContain("information_schema")
@@ -5852,7 +5851,7 @@ class SqlScriptMigratorTest {
         assertThat(report.manualReviewSqlCount()).isZero();
         assertThat(converted)
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` MODIFY `unitPrice` decimal(20,8) NULL'")
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` ADD `useProperties` varchar(20) DEFAULT NULL'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE `demo` ADD `useProperties` VARCHAR(20 CHAR) DEFAULT NULL'")
                 .doesNotContain("`unitPrice`decimal")
                 .doesNotContain("`useProperties`varchar");
     }
@@ -6561,7 +6560,7 @@ class SqlScriptMigratorTest {
         assertThat(converted)
                 .startsWith("-- business note")
                 .contains("`id` bigint NOT NULL IDENTITY(1,1)")
-                .contains("`code` varchar(64) DEFAULT NULL")
+                .contains("`code` VARCHAR(64 CHAR) DEFAULT NULL")
                 .contains("FROM ALL_INDEXES")
                 .contains("FROM ALL_IND_COLUMNS C")
                 .contains("FROM ALL_IND_EXPRESSIONS E")
@@ -7894,7 +7893,7 @@ class SqlScriptMigratorTest {
                 "",
                 List.of(),
                 DmValidationEnvironment.batchSilent(),
-                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                DamengTargetCapabilities.unknown(),
                 validationPlan
         ));
 
@@ -8658,7 +8657,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void usesExplicitCharacterSemanticsForUtf8mb4VarcharOnByteLengthTargets() throws Exception {
+    void alwaysUsesExplicitCharacterSemanticsForUtf8mb4Varchar() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("table.sql"), """
@@ -8678,7 +8677,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
@@ -8709,7 +8708,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
@@ -8722,7 +8721,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void usesExplicitCharacterSemanticsForUtf8VarcharOnByteLengthTargets() throws Exception {
+    void alwaysUsesExplicitCharacterSemanticsForUtf8Varchar() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("table.sql"), """
@@ -8741,7 +8740,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
@@ -8768,7 +8767,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
@@ -8779,7 +8778,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void usesExplicitCharacterSemanticsForMixedUtf8CharsetsOnByteLengthTarget() throws Exception {
+    void usesExplicitCharacterSemanticsForMixedUtf8Charsets() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         String original = """
@@ -8800,7 +8799,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
@@ -8812,7 +8811,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void keepsExplicitNonUtf8CharsetDdlForManualReviewOnByteLengthTarget() throws Exception {
+    void usesExplicitCharacterSemanticsForNonUtf8Charset() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         String original = """
@@ -8832,15 +8831,14 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
 
-        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
-        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
-                assertThat(item.reason()).contains("非 UTF-8 源字符集").contains("latin1"));
-        assertThat(Files.readString(sqlRootOut.resolve("table.sql"))).contains(original.strip());
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("legacy_name VARCHAR(100 CHAR)");
     }
 
     @Test
@@ -8864,7 +8862,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
@@ -8878,7 +8876,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void usesCharacterLengthGuardForDynamicDdlOnByteLengthTarget() throws Exception {
+    void usesCharacterLengthGuardForDynamicDdlWithoutTargetCapabilities() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         write(sqlRoot.resolve("procedure.sql"), """
@@ -8911,7 +8909,7 @@ class SqlScriptMigratorTest {
                         "",
                         List.of(),
                         DmValidationEnvironment.from(Map.of()),
-                        DamengTargetCapabilities.offline(TargetLengthSemantics.BYTE),
+                        DamengTargetCapabilities.unknown(),
                         null
                 )
         );
@@ -8921,6 +8919,58 @@ class SqlScriptMigratorTest {
                 .contains("CHAR_LENGTH < 100")
                 .contains("VARCHAR(100 CHAR)")
                 .doesNotContain("DATA_LENGTH = 400");
+    }
+
+    @Test
+    void convertsCustomerNameModifyToExplicitCharacterSemanticsWithoutTargetCapabilities() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260730.sql"), """
+                DROP PROCEDURE IF EXISTS pro_AddColumn;
+                DELIMITER $$
+                CREATE PROCEDURE pro_AddColumn()
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = database()
+                          AND table_name = 'ns_sr_services_custom_record'
+                          AND COLUMN_NAME = 'customer_name'
+                          AND COLUMN_TYPE != 'varchar(250)'
+                    ) THEN
+                        ALTER TABLE `ns_sr_services_custom_record`
+                            MODIFY COLUMN `customer_name` varchar(250)
+                            CHARACTER SET `utf8mb4` COLLATE `utf8mb4_0900_ai_ci`
+                            COMMENT '自定义变量名称';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL pro_AddColumn;
+                DROP PROCEDURE IF EXISTS pro_AddColumn;
+
+                UPDATE ns_sr_services_custom_record
+                SET customer_name = '工单信息调整内容(逗号分隔，1:工单分类,2:责任归属,3:维修区域)'
+                WHERE customer_code = 'updateServiceInfo';
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-app",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.unknown(),
+                        null
+                )
+        );
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("20260730.sql")))
+                .contains("MODIFY `customer_name` VARCHAR(250 CHAR)")
+                .contains("WHERE customer_code = 'updateServiceInfo'");
     }
 
     @Test
@@ -8949,7 +8999,7 @@ class SqlScriptMigratorTest {
         assertThat(converted.sql())
                 .contains("C.NAME IN ('paramName', UPPER('paramName'))")
                 .contains("EXECUTE IMMEDIATE ('ALTER TABLE ns_wms_parameter_setting")
-                .contains("ADD `paramName` varchar(255) DEFAULT NULL'")
+                .contains("ADD `paramName` VARCHAR(255 CHAR) DEFAULT NULL'")
                 .doesNotContain("CREATE OR REPLACE PROCEDURE")
                 .doesNotContain("CALL add_clo_ns_wms_parameter_setting_paramName")
                 .doesNotContain("DROP PROCEDURE IF EXISTS")
@@ -8957,7 +9007,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void keepsLengthSensitiveDdlForManualReviewWhenTargetSemanticsAreUnknown() throws Exception {
+    void convertsLengthSensitiveDdlWhenTargetCapabilitiesAreUnknown() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
         String original = "CREATE TABLE demo (display_name VARCHAR(100)) DEFAULT CHARSET=utf8mb4;";
@@ -8978,10 +9028,9 @@ class SqlScriptMigratorTest {
                 )
         );
 
-        assertThat(report.manualReviewSqlCount()).isEqualTo(1);
-        assertThat(report.manualReviewItems()).singleElement().satisfies(item ->
-                assertThat(item.reason()).contains("LENGTH_IN_CHAR 未知"));
-        assertThat(Files.readString(sqlRootOut.resolve("table.sql"))).contains(original);
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(sqlRootOut.resolve("table.sql")))
+                .contains("VARCHAR(100 CHAR)");
     }
 
     @Test
@@ -9040,7 +9089,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ADD status VARCHAR(20)'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ADD status VARCHAR(20 CHAR)'")
                 .contains("EXECUTE IMMEDIATE 'update demo")
                 .contains("from demo_source where demo.id = demo_source.id")
                 .contains("set status = ''ready''")
@@ -9440,7 +9489,7 @@ class SqlScriptMigratorTest {
                 .contains("T.SCHID = CURRENT_SCHID")
                 .contains("T.NAME IN ('demo_table', UPPER('demo_table'))")
                 .contains("C.NAME IN ('status', UPPER('status'))")
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo_table ADD status varchar(20) DEFAULT NULL'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo_table ADD status VARCHAR(20 CHAR) DEFAULT NULL'")
                 .contains("SELECT 1 FROM dual")
                 .doesNotContain("ALL_TAB_COLUMNS")
                 .doesNotContain("dm_adapter_schema")

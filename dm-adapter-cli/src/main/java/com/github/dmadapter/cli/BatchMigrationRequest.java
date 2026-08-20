@@ -1,7 +1,5 @@
 package com.github.dmadapter.cli;
 
-import com.github.dmadapter.core.TargetLengthSemantics;
-
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -18,7 +16,6 @@ record BatchMigrationRequest(
         Path sqlRootOut,
         List<Path> preservedSqlPaths,
         boolean sqlScriptsOnly,
-        TargetLengthSemantics targetLengthSemantics,
         Map<String, List<String>> tableKeyColumns,
         Map<String, List<String>> methodKeyColumns,
         Map<String, List<List<String>>> methodConflictKeyGroups

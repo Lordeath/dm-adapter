@@ -53,9 +53,6 @@ final class CliCommandBuilder {
         addPath(arguments, "--sql-root", configuration.sqlRoot());
         addPath(arguments, "--sql-root-out", configuration.sqlRootOut());
         addValue(arguments, "--system-schema", configuration.systemSchema());
-        if (configuration.targetLengthSemantics() != null) {
-            addValue(arguments, "--target-length-semantics", configuration.targetLengthSemantics().name());
-        }
         if (configuration.sqlScriptsOnly()) {
             arguments.add("--sql-scripts-only");
         }

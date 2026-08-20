@@ -33,7 +33,6 @@ class BatchConfigLoaderTest {
                     mode: IF_PRESENT
                     sourceDir: sql/v2
                     outputDir: sql/v2-dm
-                    targetLengthSemantics: CHAR
                 repositories:
                   - name: service-a
                     url: https://git.example.com/group/service-a.git
@@ -85,6 +84,33 @@ class BatchConfigLoaderTest {
         assertThatThrownBy(() -> new BatchConfigLoader().load(duplicate))
                 .isInstanceOf(DmAdapterException.class)
                 .hasMessageContaining("Duplicate repository name");
+    }
+
+    @Test
+    void rejectsRemovedTargetLengthSemanticsField() throws Exception {
+        Path config = tempDir.resolve("removed-length-semantics.yml");
+        Files.writeString(config, """
+                schemaVersion: 1
+                workspaceDir: workspace
+                reportDir: reports
+                git:
+                  authorName: Batch Bot
+                  authorEmail: batch@example.com
+                  commitMessage: Convert SQL
+                migrationDefaults:
+                  sql:
+                    mode: IF_PRESENT
+                    targetLengthSemantics: BYTE
+                repositories:
+                  - name: service-a
+                    url: file:///tmp/service-a.git
+                    branch: main
+                """);
+
+        assertThatThrownBy(() -> new BatchConfigLoader().load(config))
+                .isInstanceOf(DmAdapterException.class)
+                .hasMessageContaining("Could not parse batch YAML")
+                .hasMessageContaining("targetLengthSemantics");
     }
 
     @Test
@@ -159,7 +185,6 @@ class BatchConfigLoaderTest {
                         keyColumns: [default_id]
                   sql:
                     mode: IF_PRESENT
-                    targetLengthSemantics: CHAR
                 repositories:
                   - name: bill
                     url: file:///tmp/bill.git
@@ -200,7 +225,6 @@ class BatchConfigLoaderTest {
                         conflictKeyGroups: [[pk], [tenant_id, code]]
                   sql:
                     mode: IF_PRESENT
-                    targetLengthSemantics: CHAR
                 repositories:
                   - name: canal
                     url: file:///tmp/canal.git
@@ -277,7 +301,6 @@ class BatchConfigLoaderTest {
                 migrationDefaults:
                   sql:
                     mode: IF_PRESENT
-                    targetLengthSemantics: CHAR
                 repositories:
                 """ + repositories;
     }
@@ -295,7 +318,6 @@ class BatchConfigLoaderTest {
                 """ + migration.strip().indent(2) + """
                   sql:
                     mode: IF_PRESENT
-                    targetLengthSemantics: CHAR
                 repositories:
                   - name: service-a
                     url: file:///tmp/service-a.git

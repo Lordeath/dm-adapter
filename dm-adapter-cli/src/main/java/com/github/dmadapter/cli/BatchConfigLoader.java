@@ -168,15 +168,6 @@ final class BatchConfigLoader {
         if (mode != BatchSqlMode.DISABLED && sqlSource.equals(sqlOutput)) {
             throw new DmAdapterException("SQL sourceDir and outputDir must differ for repository " + repository + ".");
         }
-        var lengthSemantics = first(
-                overrideSql == null ? null : overrideSql.targetLengthSemantics(),
-                defaultSql == null ? null : defaultSql.targetLengthSemantics()
-        );
-        if (mode != BatchSqlMode.DISABLED && lengthSemantics == null) {
-            throw new DmAdapterException(
-                    "targetLengthSemantics is required when SQL migration is enabled for repository " + repository + "."
-            );
-        }
         List<String> configuredPreserve = overrideSql != null && overrideSql.preserveSql() != null
                 ? overrideSql.preserveSql()
                 : (defaultSql == null || defaultSql.preserveSql() == null ? List.of() : defaultSql.preserveSql());
@@ -200,7 +191,7 @@ final class BatchConfigLoader {
                                 Map.Entry::getKey,
                                 entry -> entry.getValue().conflictKeyGroups()
                         )),
-                new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, lengthSemantics, preserveSql)
+                new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, preserveSql)
         );
     }
 

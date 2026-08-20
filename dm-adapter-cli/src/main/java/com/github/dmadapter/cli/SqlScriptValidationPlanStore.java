@@ -1,5 +1,6 @@
 package com.github.dmadapter.cli;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
@@ -21,7 +22,7 @@ import java.util.Map;
 
 final class SqlScriptValidationPlanStore {
     static final String DEFAULT_FILE_NAME = "sql-script-validation-plan.json";
-    static final int FORMAT_VERSION = 1;
+    static final int FORMAT_VERSION = 2;
 
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
@@ -99,15 +100,14 @@ final class SqlScriptValidationPlanStore {
         if (!Files.isRegularFile(normalizedPlan)) {
             throw new IllegalArgumentException("SQL validation plan does not exist: " + normalizedPlan);
         }
-        SqlScriptValidationPlan plan = objectMapper.readValue(
-                normalizedPlan.toFile(),
-                SqlScriptValidationPlan.class
-        );
-        if (plan.formatVersion() != FORMAT_VERSION) {
+        JsonNode planNode = objectMapper.readTree(normalizedPlan.toFile());
+        int formatVersion = planNode.path("formatVersion").asInt(-1);
+        if (formatVersion != FORMAT_VERSION) {
             throw new IllegalArgumentException(
-                    "Unsupported SQL validation plan format version: " + plan.formatVersion()
+                    "Unsupported SQL validation plan format version: " + formatVersion
             );
         }
+        SqlScriptValidationPlan plan = objectMapper.treeToValue(planNode, SqlScriptValidationPlan.class);
         Path outputRoot = Path.of(plan.sqlRootOut()).toAbsolutePath().normalize();
         List<SqlScriptMigrator.PlannedSqlScriptFile> files = new ArrayList<>();
         int manualCount = 0;
@@ -192,25 +192,16 @@ final class SqlScriptValidationPlanStore {
             DamengTargetCapabilities actual,
             boolean containsBackticks
     ) {
-        if (actual == null || actual.lengthSemantics() == null) {
-            throw new IllegalArgumentException("Could not read target database LENGTH_IN_CHAR.");
-        }
-        if (expected != null
-                && expected.lengthSemantics() != null
-                && expected.lengthSemantics() != actual.lengthSemantics()) {
-            throw new IllegalArgumentException(
-                    "Target database LENGTH_IN_CHAR no longer matches the migration plan."
-            );
-        }
-        if (containsBackticks && !"4".equals(actual.compatibleMode())) {
+        String actualCompatibleMode = actual == null ? "" : actual.compatibleMode();
+        if (containsBackticks && !"4".equals(actualCompatibleMode)) {
             throw new IllegalArgumentException(
                     "Planned SQL contains MySQL backtick identifiers but target COMPATIBLE_MODE is "
-                            + actual.compatibleMode() + ", expected 4."
+                            + actualCompatibleMode + ", expected 4."
             );
         }
         if (expected != null
                 && !expected.compatibleMode().isBlank()
-                && !expected.compatibleMode().equals(actual.compatibleMode())) {
+                && !expected.compatibleMode().equals(actualCompatibleMode)) {
             throw new IllegalArgumentException(
                     "Target database COMPATIBLE_MODE no longer matches the migration plan."
             );

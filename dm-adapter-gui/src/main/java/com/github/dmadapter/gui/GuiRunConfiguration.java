@@ -1,7 +1,5 @@
 package com.github.dmadapter.gui;
 
-import com.github.dmadapter.core.TargetLengthSemantics;
-
 import java.nio.file.Path;
 
 record GuiRunConfiguration(
@@ -16,7 +14,6 @@ record GuiRunConfiguration(
         Path sqlRootOut,
         boolean sqlScriptsOnly,
         String systemSchema,
-        TargetLengthSemantics targetLengthSemantics,
         String dmDriver,
         boolean generateValidationTest,
         boolean databaseValidation,

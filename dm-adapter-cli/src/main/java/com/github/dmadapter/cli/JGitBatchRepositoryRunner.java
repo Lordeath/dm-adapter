@@ -448,7 +448,6 @@ final class JGitBatchRepositoryRunner {
                 sqlRootOut,
                 sql.preserveSql(),
                 migration.sqlScriptsOnly(),
-                sqlRoot == null ? null : sql.targetLengthSemantics(),
                 migration.tableKeyColumns(),
                 migration.methodKeyColumns(),
                 migration.methodConflictKeyGroups()

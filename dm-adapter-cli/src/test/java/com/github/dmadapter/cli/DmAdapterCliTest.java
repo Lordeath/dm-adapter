@@ -44,6 +44,13 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void doesNotExposeRemovedTargetLengthSemanticsOption() {
+        CommandLine migrate = new CommandLine(new DmAdapterCli()).getSubcommands().get("migrate");
+
+        assertThat(migrate.getCommandSpec().findOption("--target-length-semantics")).isNull();
+    }
+
+    @Test
     void sqlScriptMigrationWritesStrictValidationPlan() throws Exception {
         writeDemoProject();
         writeFile("sql/v2/demo.sql", "SELECT 1 FROM dual;\n");
@@ -58,16 +65,14 @@ class DmAdapterCliTest {
                 "--sql-root-out",
                 "sql/v2-dm",
                 "--schema",
-                "sample-system",
-                "--target-length-semantics",
-                "CHAR"
+                "sample-system"
         );
 
         Path plan = tempDir.resolve(".dm-adapter/sql-script-validation-plan.json");
         assertThat(exitCode).isZero();
         assertThat(plan).exists();
         assertThat(Files.readString(plan))
-                .contains("\"formatVersion\" : 1")
+                .contains("\"formatVersion\" : 2")
                 .contains("\"disposition\" : \"EXECUTE\"")
                 .contains("\"sha256\"")
                 .doesNotContain("SELECT 1 FROM dual");
