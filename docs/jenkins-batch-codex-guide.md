@@ -117,6 +117,7 @@ repositories:
 - batch 内联的表/方法键优先于 `rewriteConfig` 中的同名配置；值不一致时使用内联配置，并在当前仓库迁移报告中输出告警。运行时会把最终配置写入当前报告目录的 `sql-rewrite.yml`，便于审计和复现。
 - 表名比较忽略大小写、反引号和双引号，但不会移除 schema。`${schemaName}.table_name` 与 `table_name` 是不同配置键。
 - SQL 表字段统一生成显式 `VARCHAR(n CHAR)` / `CHAR(n CHAR)`，不访问数据库，也不依赖目标库的 `LENGTH_IN_CHAR`。
+- 旧配置中的 `targetLengthSemantics` 会继续被接受，但其值不再生效；每次加载配置最多输出一条弃用告警，建议后续清理该字段。
 - 仓库 URL 不允许内嵌凭据。HTTP(S) 仓库必须同时配置全局 `username` 和 `password`；`file` URL 可不配凭据。
 - 当前 batch 模式故意不提供 schema 参数。它不会访问数据库，也不会生成 SQL 验证清单、调用验证器或输出 system-schema、外部存储过程未验证等数据库验证告警。
 - Batch 仍会阻止包含真实转换人工确认项的仓库提交和推送；数据库验证被静默不代表自动放行不确定 SQL。

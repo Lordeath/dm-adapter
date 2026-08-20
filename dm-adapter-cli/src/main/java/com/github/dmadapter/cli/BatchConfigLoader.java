@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 
 final class BatchConfigLoader {
     private static final int SCHEMA_VERSION = 1;
@@ -30,6 +31,15 @@ final class BatchConfigLoader {
             .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
             .enable(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY);
+    private final Consumer<String> warningConsumer;
+
+    BatchConfigLoader() {
+        this(warning -> CliLogger.info("Warning: " + warning));
+    }
+
+    BatchConfigLoader(Consumer<String> warningConsumer) {
+        this.warningConsumer = warningConsumer;
+    }
 
     ResolvedBatchConfig load(Path configuredPath) {
         if (configuredPath == null) {
@@ -51,6 +61,7 @@ final class BatchConfigLoader {
         if (config.schemaVersion() == null || config.schemaVersion() != SCHEMA_VERSION) {
             throw new DmAdapterException("Unsupported batch schemaVersion: " + config.schemaVersion());
         }
+        warnIfLegacyTargetLengthSemanticsIsConfigured(config);
         Path baseDir = configPath.getParent() == null
                 ? Path.of("").toAbsolutePath().normalize()
                 : configPath.getParent();
@@ -125,6 +136,23 @@ final class BatchConfigLoader {
                 identity,
                 List.copyOf(repositories)
         );
+    }
+
+    private void warnIfLegacyTargetLengthSemanticsIsConfigured(BatchConfig config) {
+        boolean configuredInDefaults = config.migrationDefaults() != null
+                && config.migrationDefaults().sql() != null
+                && config.migrationDefaults().sql().targetLengthSemantics() != null;
+        boolean configuredInRepository = config.repositories() != null
+                && config.repositories().stream()
+                .filter(repository -> repository != null && repository.migration() != null)
+                .map(repository -> repository.migration().sql())
+                .anyMatch(sql -> sql != null && sql.targetLengthSemantics() != null);
+        if (configuredInDefaults || configuredInRepository) {
+            warningConsumer.accept(
+                    "Batch YAML field targetLengthSemantics is deprecated and ignored; "
+                            + "Dameng table DDL now always uses explicit VARCHAR(n CHAR)/CHAR(n CHAR) semantics."
+            );
+        }
     }
 
     private ResolvedBatchConfig.Migration resolveMigration(
