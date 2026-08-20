@@ -1651,7 +1651,7 @@ class SqlScriptMigratorTest {
                 .contains("dm_adapter_schema VARCHAR(128) := SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID);")
                 .contains("LOWER(DATA_TYPE) IN ('char', 'varchar')")
                 .contains("CHAR_LENGTH < 1000")
-                .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` VARCHAR(1000 CHAR) DEFAULT NULL'");
+                .contains("EXECUTE IMMEDIATE 'alter table `ns_payment_order_log` MODIFY `details` VARCHAR(1000 CHAR) NULL DEFAULT NULL'");
     }
 
     @Test
@@ -4811,7 +4811,7 @@ class SqlScriptMigratorTest {
                 .contains("ON `ns_message` (`enterpriseId`, `organizationId`, `seqNumber`)'")
                 .contains("EXECUTE IMMEDIATE ('CREATE INDEX ns_message_idx_content")
                 .contains("ON ns_message (CAST(SUBSTR(`content`, 1, 255) AS VARCHAR(255)))'")
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_message MODIFY `text` CLOB'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE ns_message MODIFY `text` CLOB NULL'")
                 .doesNotContain("MODIFY `CLOB`")
                 .doesNotContainIgnoringCase("USING BTREE");
     }
@@ -5850,7 +5850,7 @@ class SqlScriptMigratorTest {
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_idx_demo_title"
                         + " ON demo (CAST(SUBSTR(title, 1, 20) AS VARCHAR(20)))'")
                 .contains("EXECUTE IMMEDIATE 'CREATE INDEX demo_amount ON demo (amount)'")
-                .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code VARCHAR(256 CHAR)'")
+                .contains("EXECUTE IMMEDIATE 'alter table demo MODIFY code VARCHAR(256 CHAR) NULL'")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY amount decimal(14, 2) null';")
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY tax decimal(14, 2) null';")
                 .doesNotContain("information_schema")
@@ -5903,6 +5903,41 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().files()).singleElement().satisfies(file ->
                 assertThat(file.appliedRules())
                         .contains(SqlScriptMigrator.MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT_RULE));
+    }
+
+    @Test
+    void makesImplicitMysqlModifyNullabilityExplicitForDameng() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                ALTER TABLE demo
+                    MODIFY COLUMN default_value INT DEFAULT 7,
+                    MODIFY COLUMN default_null VARCHAR(255) DEFAULT NULL COMMENT 'DEFAULT NULL is not nullability',
+                    MODIFY COLUMN no_default TEXT,
+                    MODIFY COLUMN explicit_nullable VARCHAR(20) NULL DEFAULT NULL,
+                    MODIFY COLUMN required_name VARCHAR(20) NOT NULL DEFAULT 'NULL',
+                    MODIFY COLUMN quoted_default VARCHAR(20) DEFAULT 'NULL',
+                    MODIFY COLUMN already_explicit VARCHAR(20 CHAR) NULL;
+                ALTER TABLE demo
+                    CHANGE COLUMN legacy_name legacy_name VARCHAR(50)
+                    CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci DEFAULT NULL COMMENT 'legacy';
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("ALTER TABLE demo MODIFY default_null VARCHAR(255 CHAR) NULL DEFAULT NULL;")
+                .contains("ALTER TABLE demo MODIFY default_value INT NULL DEFAULT 7;")
+                .contains("ALTER TABLE demo MODIFY no_default CLOB NULL;")
+                .contains("ALTER TABLE demo MODIFY explicit_nullable VARCHAR(20 CHAR) NULL DEFAULT NULL;")
+                .contains("ALTER TABLE demo MODIFY required_name VARCHAR(20 CHAR) NOT NULL DEFAULT 'NULL';")
+                .contains("ALTER TABLE demo MODIFY quoted_default VARCHAR(20 CHAR) NULL DEFAULT 'NULL';")
+                .contains("ALTER TABLE demo MODIFY already_explicit VARCHAR(20 CHAR) NULL;")
+                .containsPattern("ALTER TABLE demo MODIFY legacy_name VARCHAR\\(50 CHAR\\) NULL\\s+DEFAULT NULL;")
+                .doesNotContain("NULL NULL DEFAULT")
+                .doesNotContain("MODIFY COLUMN")
+                .doesNotContain("CHANGE COLUMN")
+                .doesNotContain(" CHARACTER SET ")
+                .doesNotContain(" COLLATE ")
+                .doesNotContain(" COMMENT ")
+                .doesNotContain("CHAR CHAR");
     }
 
     @Test
@@ -6304,6 +6339,8 @@ class SqlScriptMigratorTest {
                 .contains("DELETE FROM tmp_menu_copy /* DM_ADAPTER_TMP_COLUMN tmp_menu_copy source_id */")
                 .contains("MERGE INTO tmp_menu_copy t")
                 .contains("ON (t.source_id = s.source_id)")
+                .doesNotContain("ALTER TABLE tmp_menu_copy MODIFY menu_id VARCHAR(100) NULL")
+                .doesNotContain("ALTER TABLE tmp_menu_copy MODIFY menu_id VARCHAR(100 CHAR) NULL")
                 .doesNotContain("target_ver BIGINT")
                 .doesNotContain("menu_id VARCHAR(200)")
                 .doesNotContain("roleid VARCHAR(200)");
@@ -9428,7 +9465,7 @@ class SqlScriptMigratorTest {
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ADD enterprise_id BIGINT DEFAULT NULL'")
-                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY enterprise_id BIGINT DEFAULT 107'")
+                .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo MODIFY enterprise_id BIGINT NULL DEFAULT 107'")
                 .contains("EXECUTE IMMEDIATE 'UPDATE demo SET enterprise_id = 107 WHERE enterprise_id IS NULL'")
                 .doesNotContain("CREATE OR REPLACE PROCEDURE add_demo_columns")
                 .doesNotContain("CALL add_demo_columns");

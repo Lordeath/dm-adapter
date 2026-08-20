@@ -8303,6 +8303,7 @@ class SqlScriptMigrator {
                 Pattern.compile("(?is)\\s+FIRST(?=\\s*(?:,|$))"),
                 matcher -> ""
         );
+        converted = makeImplicitMysqlModifyNullabilityExplicit(converted);
         return normalizeMysqlDataTypes(converted);
     }
 
@@ -8318,10 +8319,171 @@ class SqlScriptMigrator {
         if (!matcher.matches() || !sameIdentifier(matcher.group("old"), matcher.group("name"))) {
             return sql;
         }
+        String definition = makeImplicitMysqlColumnNullabilityExplicit(matcher.group("type").strip());
         return normalizeMysqlDataTypes(
                 "ALTER TABLE " + matcher.group("table") + " MODIFY " + matcher.group("name") + " "
-                        + matcher.group("type").strip()
+                        + definition
         );
+    }
+
+    private String makeImplicitMysqlModifyNullabilityExplicit(String sql) {
+        int start = skipWhitespace(sql, 0);
+        if (!startsKeyword(sql, start, "ALTER")) {
+            return sql;
+        }
+        int tableIndex = skipWhitespace(sql, start + "ALTER".length());
+        if (!startsKeyword(sql, tableIndex, "TABLE")) {
+            return sql;
+        }
+        SqlIdentifierReference table = sqlIdentifierReferenceAt(
+                sql,
+                skipWhitespace(sql, tableIndex + "TABLE".length())
+        );
+        if (table == null) {
+            return sql;
+        }
+        int bodyStart = skipWhitespace(sql, table.end());
+        if (bodyStart >= sql.length()) {
+            return sql;
+        }
+
+        List<String> parts = splitTopLevelComma(sql.substring(bodyStart));
+        List<String> convertedParts = new ArrayList<>(parts.size());
+        boolean changed = false;
+        for (String part : parts) {
+            int modifyIndex = skipWhitespace(part, 0);
+            if (!startsKeyword(part, modifyIndex, "MODIFY")) {
+                convertedParts.add(part);
+                continue;
+            }
+            SqlIdentifierReference column = sqlIdentifierReferenceAt(
+                    part,
+                    skipWhitespace(part, modifyIndex + "MODIFY".length())
+            );
+            if (column == null) {
+                convertedParts.add(part);
+                continue;
+            }
+            String definition = part.substring(column.end());
+            String convertedDefinition = makeImplicitMysqlColumnNullabilityExplicit(definition);
+            convertedParts.add(part.substring(0, column.end()) + convertedDefinition);
+            changed = changed || !convertedDefinition.equals(definition);
+        }
+        return changed
+                ? sql.substring(0, bodyStart) + String.join(",", convertedParts)
+                : sql;
+    }
+
+    private String makeImplicitMysqlColumnNullabilityExplicit(String definition) {
+        List<SqlTopLevelWord> words = topLevelWords(definition);
+        for (int index = 0; index < words.size(); index++) {
+            SqlTopLevelWord word = words.get(index);
+            if (!word.value().equals("NULL")) {
+                continue;
+            }
+            String previous = index == 0 ? "" : words.get(index - 1).value();
+            if (!previous.equals("DEFAULT")) {
+                return definition;
+            }
+        }
+
+        int attributeStart = mysqlColumnAttributeStart(words);
+        int insertion = attributeStart >= 0
+                ? attributeStart
+                : mysqlColumnDefinitionEnd(definition);
+        while (insertion > 0 && isSqlWhitespace(definition.charAt(insertion - 1))) {
+            insertion--;
+        }
+        if (insertion <= 0) {
+            return definition;
+        }
+        String suffix = definition.substring(insertion);
+        String separator = !suffix.isEmpty() && isIdentifierPart(suffix.charAt(0)) ? " " : "";
+        return definition.substring(0, insertion) + " NULL" + separator + suffix;
+    }
+
+    private int mysqlColumnAttributeStart(List<SqlTopLevelWord> words) {
+        Set<String> attributes = Set.of(
+                "AS",
+                "AFTER",
+                "AUTO_INCREMENT",
+                "CHECK",
+                "COLLATE",
+                "COLUMN_FORMAT",
+                "COMMENT",
+                "DEFAULT",
+                "FIRST",
+                "GENERATED",
+                "INVISIBLE",
+                "ON",
+                "PRIMARY",
+                "REFERENCES",
+                "STORAGE",
+                "UNIQUE",
+                "VISIBLE"
+        );
+        for (int index = 0; index < words.size(); index++) {
+            SqlTopLevelWord word = words.get(index);
+            if (attributes.contains(word.value())) {
+                return word.start();
+            }
+            if (word.value().equals("CHARACTER")
+                    && index + 1 < words.size()
+                    && words.get(index + 1).value().equals("SET")) {
+                return word.start();
+            }
+        }
+        return -1;
+    }
+
+    private int mysqlColumnDefinitionEnd(String definition) {
+        int end = definition.length();
+        while (end > 0 && isSqlWhitespace(definition.charAt(end - 1))) {
+            end--;
+        }
+        if (end > 0 && definition.charAt(end - 1) == ';') {
+            end--;
+        }
+        return end;
+    }
+
+    private List<SqlTopLevelWord> topLevelWords(String value) {
+        List<SqlTopLevelWord> words = new ArrayList<>();
+        int depth = 0;
+        int index = 0;
+        while (index < value.length()) {
+            char current = value.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(value, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(value, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(value, index);
+            } else if (startsLineComment(value, index)) {
+                index = skipUntilLineEnd(value, index);
+            } else if (startsBlockComment(value, index)) {
+                index = skipUntilBlockCommentEnd(value, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (depth == 0 && isIdentifierPart(current)) {
+                int end = index + 1;
+                while (end < value.length() && isIdentifierPart(value.charAt(end))) {
+                    end++;
+                }
+                words.add(new SqlTopLevelWord(
+                        value.substring(index, end).toUpperCase(Locale.ROOT),
+                        index
+                ));
+                index = end;
+            } else {
+                index++;
+            }
+        }
+        return List.copyOf(words);
     }
 
     private String normalizeMysqlProcedureIdentifiers(String sql) {
@@ -16658,26 +16820,44 @@ class SqlScriptMigrator {
         if (conversion.manualReviewRequired()) {
             return conversion;
         }
-        String sql = conversion.convertedSql();
-        if (!containsLengthSensitiveDdl(sql)) {
-            return conversion;
+        LengthRewrite convertedRewrite = rewriteExplicitDdlCharacterSemantics(conversion.convertedSql());
+        LengthRewrite outputRewrite = conversion.outputSql().equals(conversion.convertedSql())
+                ? convertedRewrite
+                : rewriteExplicitDdlCharacterSemantics(conversion.outputSql());
+        List<String> additionalOutputStatements = conversion.additionalOutputStatements();
+        boolean additionalOutputChanged = false;
+        if (containsLengthSensitiveDdl(conversion.originalSql())
+                && !conversion.additionalOutputStatements().isEmpty()) {
+            additionalOutputStatements = new ArrayList<>(conversion.additionalOutputStatements().size());
+            for (String additionalOutputStatement : conversion.additionalOutputStatements()) {
+                LengthRewrite additionalRewrite = rewriteExplicitDdlCharacterSemantics(additionalOutputStatement);
+                additionalOutputStatements.add(additionalRewrite.sql());
+                additionalOutputChanged |= additionalRewrite.changed();
+            }
         }
-        LengthRewrite rewrite = rewriteDdlVarcharLengths(sql);
-        if (!rewrite.changed()) {
+        if (!convertedRewrite.changed() && !outputRewrite.changed() && !additionalOutputChanged) {
             return conversion;
         }
         List<String> rules = new ArrayList<>(conversion.appliedRules());
-        rules.add(MYSQL_VARCHAR_LENGTH_SEMANTICS_RULE);
+        if (!rules.contains(MYSQL_VARCHAR_LENGTH_SEMANTICS_RULE)) {
+            rules.add(MYSQL_VARCHAR_LENGTH_SEMANTICS_RULE);
+        }
         return new ScriptStatementConversion(
                 conversion.originalSql(),
-                rewrite.sql(),
-                rewrite.sql(),
+                convertedRewrite.sql(),
+                outputRewrite.sql(),
                 true,
                 conversion.manualReviewRequired(),
                 conversion.reason(),
                 rules,
-                conversion.additionalOutputStatements()
+                additionalOutputStatements
         );
+    }
+
+    private LengthRewrite rewriteExplicitDdlCharacterSemantics(String sql) {
+        return containsLengthSensitiveDdl(sql)
+                ? rewriteDdlVarcharLengths(sql)
+                : new LengthRewrite(sql, false);
     }
 
     private ScriptStatementConversion applyDisqlLongDmlLiteralCompatibility(
@@ -18336,6 +18516,9 @@ class SqlScriptMigrator {
     }
 
     private record SqlIdentifierReference(String token, int end) {
+    }
+
+    private record SqlTopLevelWord(String value, int start) {
     }
 
     private record SingleQuotedStringRewrite(String value, int endIndex, boolean changed) {
