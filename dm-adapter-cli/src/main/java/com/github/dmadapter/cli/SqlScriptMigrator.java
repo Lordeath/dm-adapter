@@ -129,6 +129,8 @@ class SqlScriptMigrator {
             "MYSQL_CALL_ARGUMENT_LINE_COMMENT_REMOVED";
     static final String MYSQL_SIMPLE_DATE_END_TRIGGER_TO_DM_RULE =
             "MYSQL_SIMPLE_DATE_END_TRIGGER_TO_DM";
+    static final String MYSQL_SIMPLE_ROW_HISTORY_TRIGGER_TO_DM_RULE =
+            "MYSQL_SIMPLE_ROW_HISTORY_TRIGGER_TO_DM";
     static final String MYSQL_PROCEDURE_LOCAL_LABEL_TO_RETURN_RULE =
             "MYSQL_PROCEDURE_LOCAL_LABEL_TO_RETURN";
     static final String MYSQL_PROCEDURE_OBJECT_NAME_CONFLICT_RENAME_RULE =
@@ -288,6 +290,19 @@ class SqlScriptMigrator {
             "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TRIGGER\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
                     + "BEFORE\\s+(?:INSERT|UPDATE)\\s+ON\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
                     + "FOR\\s+EACH\\s+ROW\\b"
+    );
+    private static final Pattern MYSQL_SIMPLE_ROW_HISTORY_TRIGGER_PATTERN = Pattern.compile(
+            "(?is)^\\s*CREATE\\s+TRIGGER\\s+(?<name>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+"
+                    + "(?<timing>BEFORE|AFTER)\\s+(?<event>INSERT|UPDATE|DELETE)\\s+ON\\s+"
+                    + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+"
+                    + "FOR\\s+EACH\\s+ROW\\s+BEGIN\\s+(?<body>.*?)\\s+END\\s*;?\\s*$"
+    );
+    private static final Pattern CONVERTED_SIMPLE_ROW_HISTORY_TRIGGER_PATTERN = Pattern.compile(
+            "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TRIGGER\\s+"
+                    + "(?<name>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+"
+                    + "(?<timing>BEFORE|AFTER)\\s+(?<event>INSERT|UPDATE|DELETE)\\s+ON\\s+"
+                    + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+"
+                    + "FOR\\s+EACH\\s+ROW\\s+BEGIN\\s+(?<body>.*?)\\s+END\\s*;?\\s*$"
     );
     private static final Pattern MYSQL_PREFIX_INDEX_DDL_PATTERN = Pattern.compile(
             "(?is)\\b(?:"
@@ -3965,7 +3980,8 @@ class SqlScriptMigrator {
         timings.safeRulesNanos += System.nanoTime() - safeRulesStartedAt;
         long genericConverterStartedAt = System.nanoTime();
         SqlConversionResult sqlConversion;
-        if (isConvertedSimpleDateEndTrigger(safeRuleConversion.sql())) {
+        if (isConvertedSimpleDateEndTrigger(safeRuleConversion.sql())
+                || isConvertedSimpleRowHistoryTrigger(safeRuleConversion.sql())) {
             sqlConversion = SqlConversionResult.unchanged(safeRuleConversion.sql());
         } else if (converter instanceof MySqlToDmSqlConverter mySqlConverter
                 && outerJoinSourceUniqueKeys != null
@@ -6975,6 +6991,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_SIMPLE_DATE_END_TRIGGER_TO_DM_RULE);
         }
 
+        String simpleRowHistoryTriggerSql = convertMysqlSimpleRowHistoryTrigger(converted);
+        if (!simpleRowHistoryTriggerSql.equals(converted)) {
+            converted = simpleRowHistoryTriggerSql;
+            rules.add(MYSQL_SIMPLE_ROW_HISTORY_TRIGGER_TO_DM_RULE);
+        }
+
         String withoutDefiner = CREATE_DEFINER_PATTERN.matcher(converted).replaceFirst("CREATE ");
         if (!withoutDefiner.equals(converted)) {
             converted = withoutDefiner;
@@ -7510,6 +7532,237 @@ class SqlScriptMigrator {
                 && normalized.contains("TO_TIMESTAMP")
                 && normalized.contains("TO_CHAR")
                 && normalized.contains("23:59:59");
+    }
+
+    private String convertMysqlSimpleRowHistoryTrigger(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return sql == null ? "" : sql;
+        }
+        Matcher trigger = MYSQL_SIMPLE_ROW_HISTORY_TRIGGER_PATTERN.matcher(sql);
+        if (!trigger.matches()
+                || !isSimpleRowHistoryTriggerBody(trigger.group("body"), trigger.group("event"), false)) {
+            return sql;
+        }
+        Matcher create = Pattern.compile("(?is)\\bCREATE\\s+TRIGGER\\b").matcher(sql);
+        if (!create.find()) {
+            return sql;
+        }
+        String withDamengHeader = sql.substring(0, create.start())
+                + "CREATE OR REPLACE TRIGGER"
+                + sql.substring(create.end());
+        return rewriteSimpleRowHistoryTriggerSyntax(withDamengHeader);
+    }
+
+    boolean isConvertedSimpleRowHistoryTrigger(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return false;
+        }
+        Matcher trigger = CONVERTED_SIMPLE_ROW_HISTORY_TRIGGER_PATTERN.matcher(sql);
+        return trigger.matches()
+                && isSimpleRowHistoryTriggerBody(trigger.group("body"), trigger.group("event"), true);
+    }
+
+    private boolean isSimpleRowHistoryTriggerBody(
+            String body,
+            String event,
+            boolean requireDamengRowPrefix
+    ) {
+        if (body == null || body.isBlank()
+                || !rowReferencesMatchTriggerEvent(body, event, requireDamengRowPrefix)) {
+            return false;
+        }
+        String searchable = removeSqlCommentsPreservingLineBreaks(body);
+        int cursor = skipWhitespaceAndComments(body, 0);
+        if (!startsKeyword(searchable, cursor, "IF")) {
+            return false;
+        }
+        int conditionStart = skipWhitespaceAndComments(body, cursor + "IF".length());
+        int thenIndex = topLevelKeywordIndexOutsideCaseAfter(searchable, "THEN", conditionStart);
+        if (thenIndex < conditionStart
+                || !isSimpleRowHistoryCondition(
+                body.substring(conditionStart, thenIndex),
+                requireDamengRowPrefix
+        )) {
+            return false;
+        }
+
+        cursor = skipWhitespaceAndComments(body, thenIndex + "THEN".length());
+        int thenInsertEnd = findStatementTerminator(body, cursor);
+        if (thenInsertEnd >= body.length()
+                || !isSimpleRowHistoryInsert(
+                body.substring(cursor, thenInsertEnd),
+                requireDamengRowPrefix
+        )) {
+            return false;
+        }
+        cursor = skipWhitespaceAndComments(body, thenInsertEnd + 1);
+
+        if (startsKeyword(searchable, cursor, "ELSE")) {
+            cursor = skipWhitespaceAndComments(body, cursor + "ELSE".length());
+            int elseInsertEnd = findStatementTerminator(body, cursor);
+            if (elseInsertEnd >= body.length()
+                    || !isSimpleRowHistoryInsert(
+                    body.substring(cursor, elseInsertEnd),
+                    requireDamengRowPrefix
+            )) {
+                return false;
+            }
+            cursor = skipWhitespaceAndComments(body, elseInsertEnd + 1);
+        }
+
+        if (!startsKeyword(searchable, cursor, "END")) {
+            return false;
+        }
+        cursor = skipWhitespaceAndComments(body, cursor + "END".length());
+        if (!startsKeyword(searchable, cursor, "IF")) {
+            return false;
+        }
+        cursor = skipWhitespaceAndComments(body, cursor + "IF".length());
+        if (cursor < body.length() && body.charAt(cursor) == ';') {
+            cursor = skipWhitespaceAndComments(body, cursor + 1);
+        }
+        return cursor == body.length();
+    }
+
+    private boolean isSimpleRowHistoryCondition(String condition, boolean requireDamengRowPrefix) {
+        String withoutComments = removeSqlCommentsPreservingLineBreaks(condition).strip();
+        while (withoutComments.startsWith("(")) {
+            int closeParen = findMatchingParen(withoutComments, 0);
+            if (closeParen != withoutComments.length() - 1) {
+                break;
+            }
+            withoutComments = withoutComments.substring(1, closeParen).strip();
+        }
+        String valuePattern = simpleRowHistoryValuePattern(requireDamengRowPrefix);
+        String comparisonPattern = requireDamengRowPrefix ? "(?:=|<>)" : "(?:=|!=|<>)";
+        return Pattern.compile(
+                "(?is)^" + valuePattern + "\\s*" + comparisonPattern + "\\s*" + valuePattern + "$"
+        ).matcher(withoutComments).matches();
+    }
+
+    private boolean isSimpleRowHistoryInsert(String insert, boolean requireDamengRowPrefix) {
+        String withoutComments = removeSqlCommentsPreservingLineBreaks(insert).strip();
+        Matcher matcher = Pattern.compile(
+                "(?is)^INSERT\\s+INTO\\s+" + SQL_OBJECT_IDENTIFIER_TOKEN
+                        + "\\s*\\((?<columns>[^()]*)\\)\\s*"
+                        + "VALUES\\s*\\((?<values>.*)\\)\\s*$"
+        ).matcher(withoutComments);
+        if (!matcher.matches()) {
+            return false;
+        }
+        List<String> columns = splitTopLevelComma(matcher.group("columns"));
+        List<String> values = splitTopLevelComma(matcher.group("values"));
+        if (columns.isEmpty() || columns.size() != values.size()) {
+            return false;
+        }
+        Pattern columnPattern = Pattern.compile("(?is)^(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")$");
+        Pattern valuePattern = Pattern.compile(
+                "(?is)^" + simpleRowHistoryValuePattern(requireDamengRowPrefix) + "$"
+        );
+        return columns.stream().map(String::strip).allMatch(column -> columnPattern.matcher(column).matches())
+                && values.stream().map(String::strip).allMatch(value -> valuePattern.matcher(value).matches());
+    }
+
+    private String simpleRowHistoryValuePattern(boolean requireDamengRowPrefix) {
+        String rowPrefix = requireDamengRowPrefix ? ":" : "";
+        String rowReference = rowPrefix
+                + "(?:OLD|NEW)\\s*\\.\\s*(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")";
+        String literal = "(?:" + SQL_STRING_LITERAL_TOKEN
+                + "|[-+]?\\d+(?:\\.\\d+)?|NULL|TRUE|FALSE)";
+        return "(?:" + rowReference + "|" + literal + ")";
+    }
+
+    private boolean rowReferencesMatchTriggerEvent(
+            String sql,
+            String event,
+            boolean requireDamengRowPrefix
+    ) {
+        boolean found = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else {
+                String row = startsKeyword(sql, index, "OLD")
+                        ? "OLD"
+                        : startsKeyword(sql, index, "NEW") ? "NEW" : "";
+                int dot = row.isBlank()
+                        ? -1
+                        : skipWhitespace(sql, index + row.length());
+                if (dot >= 0 && dot < sql.length() && sql.charAt(dot) == '.') {
+                    boolean prefixed = index > 0 && sql.charAt(index - 1) == ':';
+                    if (prefixed != requireDamengRowPrefix
+                            || ("INSERT".equalsIgnoreCase(event) && "OLD".equals(row))
+                            || ("DELETE".equalsIgnoreCase(event) && "NEW".equals(row))) {
+                        return false;
+                    }
+                    found = true;
+                    index = dot + 1;
+                } else {
+                    index++;
+                }
+            }
+        }
+        return found;
+    }
+
+    private String rewriteSimpleRowHistoryTriggerSyntax(String sql) {
+        StringBuilder converted = new StringBuilder(sql.length() + 16);
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                int end = skipSingleQuotedString(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '"') {
+                int end = skipDoubleQuotedText(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (current == '`') {
+                int end = skipBacktickIdentifier(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                int end = skipUntilLineEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else if (startsBlockComment(sql, index)) {
+                int end = skipUntilBlockCommentEnd(sql, index);
+                converted.append(sql, index, end);
+                index = end;
+            } else {
+                String row = startsKeyword(sql, index, "OLD")
+                        ? "OLD"
+                        : startsKeyword(sql, index, "NEW") ? "NEW" : "";
+                int dot = row.isBlank()
+                        ? -1
+                        : skipWhitespace(sql, index + row.length());
+                if (dot >= 0 && dot < sql.length() && sql.charAt(dot) == '.') {
+                    if (index == 0 || sql.charAt(index - 1) != ':') {
+                        converted.append(':');
+                    }
+                    converted.append(row);
+                    index += row.length();
+                } else if (current == '!' && index + 1 < sql.length() && sql.charAt(index + 1) == '=') {
+                    converted.append("<>");
+                    index += 2;
+                } else {
+                    converted.append(current);
+                    index++;
+                }
+            }
+        }
+        return converted.toString();
     }
 
     private boolean startsWithKeywords(String sql, String... keywords) {
@@ -16022,7 +16275,8 @@ class SqlScriptMigrator {
     }
 
     private String manualReviewReason(String sql) {
-        if (isConvertedSimpleDateEndTrigger(sql)) {
+        if (isConvertedSimpleDateEndTrigger(sql)
+                || isConvertedSimpleRowHistoryTrigger(sql)) {
             return "";
         }
         String searchableSql = replaceIgnoredSqlWithSpaces(sql == null ? "" : sql);

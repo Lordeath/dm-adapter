@@ -4974,6 +4974,197 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsSimpleMysqlRowHistoryTriggersToDamengSyntax() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("trigger-history.sql"), """
+                DROP TRIGGER IF EXISTS after_update_projectStatusValue;
+                DELIMITER $$
+                CREATE TRIGGER after_update_projectStatusValue AFTER UPDATE ON ns_plan_project FOR EACH ROW
+                BEGIN
+                    if (Old.projectStatusValue != new.projectStatusValue) then
+                        insert into ns_plan_projectStatusChangeHistory(enterpriseId,organizationId,projectId,oldProjectStatus,newProjectStatus) VALUES(Old.enterpriseId,Old.organizationId,Old.projectVersionId,Old.projectStatusValue,new.projectStatusValue);
+                    end if;
+                END $$
+                DELIMITER ;
+
+                DROP TRIGGER IF EXISTS after_insert_projectStatusValue;
+                DELIMITER $$
+                CREATE TRIGGER after_insert_projectStatusValue AFTER INSERT ON ns_plan_project FOR EACH ROW
+                BEGIN
+                    if (new.projectVersionId = 0) then
+                        insert into ns_plan_projectStatusChangeHistory(enterpriseId,organizationId,projectId,oldProjectStatus,newProjectStatus) VALUES(new.enterpriseId,new.organizationId,new.id,0,new.projectStatusValue);
+                    else
+                        insert into ns_plan_projectStatusChangeHistory(enterpriseId,organizationId,projectId,oldProjectStatus,newProjectStatus) VALUES(new.enterpriseId,new.organizationId,new.projectVersionId,0,new.projectStatusValue);
+                    end if;
+                END $$
+                DELIMITER ;
+
+                DROP TRIGGER IF EXISTS after_update_signStatusValue;
+                DELIMITER $$
+                CREATE TRIGGER after_update_signStatusValue AFTER UPDATE ON ns_plan_project FOR EACH ROW
+                BEGIN
+                    if (Old.signStatusValue != new.signStatusValue) then insert into ns_plan_signStatusChangeHistory(enterpriseId,organizationId,projectId,oldSignStatus,newSignStatus) VALUES(Old.enterpriseId,Old.organizationId,Old.projectVersionId,Old.signStatusValue,new.signStatusValue); end if;
+                END $$
+                DELIMITER ;
+
+                DROP TRIGGER IF EXISTS after_insert_signStatusValue;
+                DELIMITER $$
+                CREATE TRIGGER after_insert_signStatusValue AFTER INSERT ON ns_plan_project FOR EACH ROW
+                BEGIN
+                    if (new.projectVersionId = 0) then
+                        insert into ns_plan_signStatusChangeHistory(enterpriseId,organizationId,projectId,oldSignStatus,newSignStatus) VALUES(new.enterpriseId,new.organizationId,new.id,0,new.signStatusValue);
+                    else
+                        insert into ns_plan_signStatusChangeHistory(enterpriseId,organizationId,projectId,oldSignStatus,newSignStatus) VALUES(new.enterpriseId,new.organizationId,new.projectVersionId,0,new.signStatusValue);
+                    end if;
+                END $$
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-owner",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("trigger-history.sql"));
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(converted)
+                .contains("CREATE OR REPLACE TRIGGER after_update_projectStatusValue")
+                .contains("CREATE OR REPLACE TRIGGER after_insert_projectStatusValue")
+                .contains("CREATE OR REPLACE TRIGGER after_update_signStatusValue")
+                .contains("CREATE OR REPLACE TRIGGER after_insert_signStatusValue")
+                .contains("if (:OLD.projectStatusValue <> :NEW.projectStatusValue) then")
+                .contains("if (:OLD.signStatusValue <> :NEW.signStatusValue) then")
+                .contains("if (:NEW.projectVersionId = 0) then")
+                .contains("VALUES(:OLD.enterpriseId,:OLD.organizationId,:OLD.projectVersionId")
+                .contains("VALUES(:NEW.enterpriseId,:NEW.organizationId,:NEW.id")
+                .contains("\n/")
+                .doesNotContain("DELIMITER", " != ");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .contains(SqlScriptMigrator.MYSQL_SIMPLE_ROW_HISTORY_TRIGGER_TO_DM_RULE));
+    }
+
+    @Test
+    void preservesTriggerCommentsAndLiteralsAndKeepsConvertedTriggerIdempotent() throws Exception {
+        Path firstRoot = tempDir.resolve("first/v2");
+        Path firstOutput = tempDir.resolve("first/v2-dm");
+        write(firstRoot.resolve("trigger.sql"), """
+                DELIMITER //
+                CREATE TRIGGER audit_status_update AFTER UPDATE ON source_table FOR EACH ROW
+                BEGIN
+                    IF OLD.status != NEW.status THEN
+                        /* OLD.comment != NEW.comment */
+                        INSERT INTO audit_table(message, old_status, new_status)
+                        VALUES('OLD.value != NEW.value', OLD.status, NEW.status);
+                    END IF;
+                END //
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport firstReport = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir.resolve("first"),
+                        firstRoot,
+                        firstOutput,
+                        false,
+                        "sample-owner",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+        String firstConverted = Files.readString(firstOutput.resolve("trigger.sql"));
+        assertThat(firstReport.manualReviewSqlCount()).isZero();
+        assertThat(firstConverted)
+                .contains("/* OLD.comment != NEW.comment */")
+                .contains("'OLD.value != NEW.value'")
+                .contains("IF :OLD.status <> :NEW.status THEN")
+                .contains("VALUES('OLD.value != NEW.value', :OLD.status, :NEW.status)")
+                .doesNotContain("::OLD", "::NEW");
+
+        Path secondRoot = tempDir.resolve("second/v2");
+        Path secondOutput = tempDir.resolve("second/v2-dm");
+        write(secondRoot.resolve("trigger.sql"), firstConverted);
+        SqlScriptMigrationReport secondReport = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir.resolve("second"),
+                        secondRoot,
+                        secondOutput,
+                        false,
+                        "sample-owner",
+                        "",
+                        DmValidationEnvironment.from(Map.of())
+                )
+        );
+
+        assertThat(secondReport.manualReviewSqlCount()).isZero();
+        assertThat(Files.readString(secondOutput.resolve("trigger.sql"))).isEqualTo(firstConverted);
+    }
+
+    @Test
+    void keepsUnsupportedRowTriggersForManualReview() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("unsafe-trigger.sql"), """
+                DELIMITER //
+                CREATE TRIGGER invalid_insert_history AFTER INSERT ON source_table FOR EACH ROW
+                BEGIN
+                    IF OLD.status != NEW.status THEN
+                        INSERT INTO audit_table(old_status, new_status) VALUES(OLD.status, NEW.status);
+                    END IF;
+                END //
+
+                CREATE TRIGGER mismatched_history AFTER UPDATE ON source_table FOR EACH ROW
+                BEGIN
+                    IF OLD.status != NEW.status THEN
+                        INSERT INTO audit_table(old_status, new_status) VALUES(NEW.status);
+                    END IF;
+                END //
+
+                CREATE TRIGGER complex_history AFTER UPDATE ON source_table FOR EACH ROW
+                BEGIN
+                    DECLARE audit_count INT;
+                    IF OLD.status != NEW.status THEN
+                        INSERT INTO audit_table(old_status, new_status) VALUES(OLD.status, NEW.status);
+                    END IF;
+                END //
+                DELIMITER ;
+                """);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir,
+                sqlRoot,
+                sqlRootOut,
+                false,
+                "sample-owner",
+                "",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        String converted = Files.readString(sqlRootOut.resolve("unsafe-trigger.sql"));
+        assertThat(report.manualReviewSqlCount()).isEqualTo(3);
+        assertThat(report.manualReviewItems()).hasSize(3);
+        assertThat(report.manualReviewItems().get(0).reason()).contains("Trigger syntax differs");
+        assertThat(report.manualReviewItems().get(1).reason()).contains("ORIGINAL_SQL_INSERT_VALUE_COUNT");
+        assertThat(report.manualReviewItems().get(2).reason()).contains("Trigger syntax differs");
+        assertThat(converted)
+                .contains("CREATE TRIGGER invalid_insert_history")
+                .contains("CREATE TRIGGER mismatched_history")
+                .contains("CREATE TRIGGER complex_history")
+                .doesNotContain("CREATE OR REPLACE TRIGGER");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules())
+                        .doesNotContain(SqlScriptMigrator.MYSQL_SIMPLE_ROW_HISTORY_TRIGGER_TO_DM_RULE));
+    }
+
+    @Test
     void synchronizesLegacyAndScopedNamesInsideMultiIndexAlterGuard() throws Exception {
         SqlScriptMigrator subject = migrator(new RecordingValidator());
         Method method = SqlScriptMigrator.class.getDeclaredMethod(
