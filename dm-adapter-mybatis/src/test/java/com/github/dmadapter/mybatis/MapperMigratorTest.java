@@ -4397,7 +4397,7 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicUpdateSetNormalizesPropertyTargetsFromResultMap() throws Exception {
+    void dynamicUpdateSetDoesNotInferPhysicalColumnsFromResultMap() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -4442,16 +4442,63 @@ class MapperMigratorTest {
         String rewritten = Files.readString(tempDir.resolve("src/main/resources/mapper-dm/FileMapper.xml"));
         assertThat(rewritten)
                 .contains("path = #{path}")
-                .contains("decrypted_after_date = #{decryptedAfterDate}")
-                .doesNotContain("decryptedAfterDate = #{decryptedAfterDate}");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE);
+                .contains("decryptedAfterDate = #{decryptedAfterDate}")
+                .doesNotContain("decrypted_after_date = #{decryptedAfterDate}");
+        assertThat(result.automaticConversions()).isEmpty();
         assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
-    void dynamicUpdateSetDoesNotRewriteExplicitColumnsFromResultMap() throws Exception {
+    void dynamicUpdateSetDoesNotReplaceExplicitColumnWithResultAlias() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.newsee.charge.dao.NsMeterUsedetailMapper">
+                    <resultMap id="BaseResultMap" type="com.newsee.charge.entity.NsMeterUsedetail">
+                        <id property="id" column="id"/>
+                        <result property="chargeStandardName" column="RefChargeStandardName" jdbcType="VARCHAR"/>
+                    </resultMap>
+                    <update id="updateById" parameterType="com.newsee.charge.entity.NsMeterUsedetail">
+                        update ns_meter_usedetail
+                        <set>
+                            <if test="chargeStandardName != null">
+                                chargeStandardName = #{chargeStandardName},
+                            </if>
+                        </set>
+                        where id = #{id}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/NsMeterUsedetailMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/NsMeterUsedetailMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/NsMeterUsedetailMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("chargeStandardName = #{chargeStandardName}")
+                .doesNotContain("RefChargeStandardName = #{chargeStandardName}");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void dynamicUpdateSetPreservesQuotedAndBareColumnsRegardlessOfResultMap() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
@@ -4501,12 +4548,11 @@ class MapperMigratorTest {
         assertThat(rewritten)
                 .contains("`classification` = #{classification}")
                 .contains("`treeCode` = #{treeCode}")
-                .contains("decrypted_after_date = #{decryptedAfterDate}")
+                .contains("decryptedAfterDate = #{decryptedAfterDate}")
                 .doesNotContain("treeCode = #{classification}")
-                .doesNotContain("decryptedAfterDate = #{decryptedAfterDate}");
-        assertThat(result.automaticConversions()).hasSize(1);
-        assertThat(result.automaticConversions().get(0).appliedRules())
-                .containsExactly(MapperXmlRewriter.MYBATIS_DYNAMIC_SET_PROPERTY_COLUMN_RULE);
+                .doesNotContain("decrypted_after_date = #{decryptedAfterDate}");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
     }
 
     @Test
