@@ -1,7 +1,6 @@
 package com.github.dmadapter.core;
 
 public record DamengTargetCapabilities(
-        TargetLengthSemantics lengthSemantics,
         String compatibleMode,
         String caseSensitive,
         String blankPadMode,
@@ -16,12 +15,8 @@ public record DamengTargetCapabilities(
         source = value(source);
     }
 
-    public static DamengTargetCapabilities offline(TargetLengthSemantics lengthSemantics) {
-        return new DamengTargetCapabilities(lengthSemantics, "", "", "", "", "CLI");
-    }
-
     public static DamengTargetCapabilities unknown() {
-        return new DamengTargetCapabilities(null, "", "", "", "", "UNKNOWN");
+        return new DamengTargetCapabilities("", "", "", "", "UNKNOWN");
     }
 
     private static String value(String value) {

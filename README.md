@@ -43,11 +43,11 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar generate-valid
 # 多仓库无人值守转换；仓库、分支、Git 身份和迁移参数均从 YAML 读取。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar batch --config /data/dm-batch/batch.yml
 
-# 离线转换 SQL 脚本时显式声明目标库字符长度语义；BYTE 会生成 VARCHAR(n CHAR)/CHAR(n CHAR)。
+# 离线转换 SQL 脚本；表字段始终生成 VARCHAR(n CHAR)/CHAR(n CHAR)，不依赖目标库 LENGTH_IN_CHAR。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate \
   --project ./demo --sql-scripts-only \
   --sql-root ./sql/v2 --sql-root-out ./sql/v2-dm \
-  --schema sample-system --target-length-semantics BYTE
+  --schema sample-system
 
 # 需要自定义完整应用工作目录时，--report-dir 的值就是最终目录，不会再追加 artifactId。
 java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --project ./demo --app-module demo-rest --report-dir /data/dm-work/demo-rest
@@ -76,7 +76,7 @@ GUI 表单标签会直接显示对应的 CLI 参数或环境变量，主要映�
 | 仅迁移 SQL 脚本 | `--sql-scripts-only` |
 | SQL 重写配置 / 验证配置 | `--rewrite-config` / `--config` |
 | 高级页工作目录覆盖 | `--report-dir`（可选；留空使用 `<启动目录>/.dm-adapter/<应用 artifactId>`） |
-| 达梦驱动坐标 / 字符长度语义 | `--dm-driver` / `--target-length-semantics` |
+| 达梦驱动坐标 | `--dm-driver` |
 | 生成 Mapper 验证测试 | `--generate-validation-test` |
 | 数据库验证、JDBC URL、用户名、密码 | `DM_SQL_VALIDATION`、`DM_JDBC_URL`、`DM_DB_USERNAME`、`DM_DB_PASSWORD` |
 
@@ -136,7 +136,7 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar validate-sql \
   --project /path/to/demo
 ```
 
-`validate-sql` 只接受该迁移清单，不提供执行任意 SQL 目录的旁路。文件内容、语句切分、项目目录、schema、`LENGTH_IN_CHAR` 或 `COMPATIBLE_MODE` 与清单不一致时，会在执行任何 SQL 前失败。清单中的人工确认项只跳过对应语句；其他互不依赖语句继续验证。结果写入 `sql-script-validation-report.md/json`。
+`validate-sql` 只接受该迁移清单，不提供执行任意 SQL 目录的旁路。文件内容、语句切分、项目目录、schema 或 `COMPATIBLE_MODE` 与清单不一致时，会在执行任何 SQL 前失败。清单中的人工确认项只跳过对应语句；其他互不依赖语句继续验证。结果写入 `sql-script-validation-report.md/json`。
 
 测试直接用应用工作目录中 `sql-validation.yml` 的 `datasource` 环境变量占位创建 MyBatis `SqlSessionFactory`，不会加载目标项目的 Spring Boot 配置。CLI 自动传递工作目录；手工 Maven 运行时需通过 `-Ddm.adapter.dir=...` 或 `DM_ADAPTER_DIR` 指定，并可通过 `dm.adapter.projectRoot` 指定业务项目根目录。配置 `--schema` 后，测试会先对全部 schema 做项目级前置检查；任一 schema 无效时只报告一次根因，不执行 Mapper SQL。前置检查通过后，仍会在每次 DAO 调用前执行 `set schema "<schema>"`。执行结果写入同一工作目录的 `sql-validation-report.md` 和 `sql-validation-report.json`。
 

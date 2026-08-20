@@ -1,7 +1,5 @@
 package com.github.dmadapter.cli;
 
-import com.github.dmadapter.core.TargetLengthSemantics;
-
 import java.util.List;
 import java.util.Map;
 
@@ -69,7 +67,6 @@ record BatchConfig(
             BatchSqlMode mode,
             String sourceDir,
             String outputDir,
-            TargetLengthSemantics targetLengthSemantics,
             List<String> preserveSql
     ) {
     }

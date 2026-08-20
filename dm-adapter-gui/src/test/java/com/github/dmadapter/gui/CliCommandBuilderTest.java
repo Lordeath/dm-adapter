@@ -1,6 +1,5 @@
 package com.github.dmadapter.gui;
 
-import com.github.dmadapter.core.TargetLengthSemantics;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -50,7 +49,6 @@ class CliCommandBuilderTest {
                 null,
                 false,
                 "",
-                null,
                 "",
                 false,
                 false,
@@ -84,7 +82,6 @@ class CliCommandBuilderTest {
                 null,
                 false,
                 "",
-                null,
                 "",
                 false,
                 true,
@@ -116,7 +113,6 @@ class CliCommandBuilderTest {
                 sqlRootOut,
                 true,
                 "SYSTEM_APP",
-                TargetLengthSemantics.BYTE,
                 "",
                 true,
                 true,
@@ -131,7 +127,6 @@ class CliCommandBuilderTest {
                 .contains("migrate", "--sql-root", sqlRoot.toAbsolutePath().normalize().toString())
                 .contains("--sql-root-out", sqlRootOut.toAbsolutePath().normalize().toString())
                 .contains("--schema", "APP", "--system-schema", "SYSTEM_APP")
-                .contains("--target-length-semantics", "BYTE")
                 .contains("--sql-scripts-only", "--generate-validation-test")
                 .doesNotContain("secret-value", "tester", "jdbc:dm://127.0.0.1:5236");
         assertThat(invocation.environment())
@@ -155,7 +150,6 @@ class CliCommandBuilderTest {
                 null,
                 false,
                 "",
-                null,
                 "",
                 false,
                 false,
@@ -183,7 +177,6 @@ class CliCommandBuilderTest {
                 null,
                 false,
                 "",
-                null,
                 "",
                 true,
                 false,
@@ -212,7 +205,6 @@ class CliCommandBuilderTest {
                 null,
                 false,
                 "",
-                null,
                 "",
                 false,
                 false,

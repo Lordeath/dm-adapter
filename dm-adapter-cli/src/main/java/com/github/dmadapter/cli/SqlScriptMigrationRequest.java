@@ -42,7 +42,7 @@ record SqlScriptMigrationRequest(
                 systemSchema,
                 List.of(),
                 validationEnvironment,
-                DamengTargetCapabilities.offline(com.github.dmadapter.core.TargetLengthSemantics.CHAR),
+                DamengTargetCapabilities.unknown(),
                 null
         );
     }
@@ -66,7 +66,7 @@ record SqlScriptMigrationRequest(
                 systemSchema,
                 preservedSqlPaths,
                 validationEnvironment,
-                DamengTargetCapabilities.offline(com.github.dmadapter.core.TargetLengthSemantics.CHAR),
+                DamengTargetCapabilities.unknown(),
                 null
         );
     }

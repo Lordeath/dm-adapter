@@ -2,7 +2,6 @@ package com.github.dmadapter.cli;
 
 import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
-import com.github.dmadapter.core.TargetLengthSemantics;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -17,6 +16,23 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SqlScriptValidationPlanStoreTest {
     @TempDir
     Path tempDir;
+
+    @Test
+    void rejectsLegacyLengthSemanticsValidationPlanFormat() throws Exception {
+        Path plan = tempDir.resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME);
+        Files.writeString(plan, """
+                {
+                  "formatVersion": 1,
+                  "targetCapabilities": {
+                    "lengthSemantics": "CHAR"
+                  }
+                }
+                """);
+
+        assertThatThrownBy(() -> new SqlScriptValidationPlanStore().load(plan))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported SQL validation plan format version: 1");
+    }
 
     @Test
     void roundTripsDmProcedureAfterCommentedMysqlProcedure() {
@@ -83,7 +99,6 @@ class SqlScriptValidationPlanStoreTest {
                 tempDir,
                 outputRoot,
                 new DamengTargetCapabilities(
-                        TargetLengthSemantics.CHAR,
                         "4",
                         "0",
                         "0",
@@ -140,7 +155,7 @@ class SqlScriptValidationPlanStoreTest {
                 plan,
                 tempDir,
                 outputRoot,
-                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                DamengTargetCapabilities.unknown(),
                 List.of(file),
                 List.of()
         );
@@ -182,7 +197,7 @@ class SqlScriptValidationPlanStoreTest {
                 plan,
                 tempDir,
                 outputRoot,
-                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                DamengTargetCapabilities.unknown(),
                 List.of(file),
                 List.of()
         );
@@ -207,9 +222,8 @@ class SqlScriptValidationPlanStoreTest {
         SqlScriptValidationPlanStore store = new SqlScriptValidationPlanStore();
 
         assertThatThrownBy(() -> store.verifyCapabilities(
-                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                DamengTargetCapabilities.unknown(),
                 new DamengTargetCapabilities(
-                        TargetLengthSemantics.CHAR,
                         "0",
                         "0",
                         "0",
@@ -245,7 +259,7 @@ class SqlScriptValidationPlanStoreTest {
                 tempDir.resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME),
                 tempDir,
                 outputRoot,
-                DamengTargetCapabilities.offline(TargetLengthSemantics.CHAR),
+                DamengTargetCapabilities.unknown(),
                 List.of(file),
                 List.of()
         ))

@@ -64,7 +64,7 @@ ORDER BY PARA_NAME;
 | `PAGE_SIZE` | 官方通用迁移示例建议 `32KB`。它不是 SQL 语法开关，但会限制普通列行长度；8KB 实例更容易在迁移宽表、长 `VARCHAR` 时出现“记录超长”。建库后不能修改。 |
 | `CHARSET`/`UNICODE_FLAG` | 通常使用 `1`（UTF-8），但仍要与源库实际字符集和数据核对。建库后不能修改。 |
 | `CASE_SENSITIVE` | 通常的 `_ci` MySQL 排序规则可考虑 `0`，但必须同时检查 `lower_case_table_names` 和字段级 collation。MySQL 能分别控制对象名和字段值，达梦在实例级统一控制，无法用一个值完整复刻混合规则。建库后不能修改。 |
-| `LENGTH_IN_CHAR` | MySQL 的 `VARCHAR(n)`/`CHAR(n)` 中 `n` 是字符数。值为 `0` 时，迁移 DDL 必须显式使用 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`；值为 `1` 时仍要验证 ASCII、中文和 emoji 混合数据以及行长上限。建库后不能修改。 |
+| `LENGTH_IN_CHAR` | MySQL 的 `VARCHAR(n)`/`CHAR(n)` 中 `n` 是字符数。dm-adapter 生成表 DDL 时始终显式使用 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`，因此输出不依赖该参数；已有表和其他工具生成的裸类型仍需核对。建库后不能修改。 |
 | `BLANK_PAD_MODE` | 影响尾部空格比较和唯一约束。官方 MySQL 迁移示例使用 `0`，但 MySQL 8 的 `PAD SPACE`/`NO PAD` 行为还取决于字段 collation，必须按真实字段和索引验证。建库后不能修改。 |
 
 ### 通用 MySQL 兼容参数
@@ -95,7 +95,7 @@ ORDER BY PARA_NAME;
 2026-08-18 对本地 MySQL 8.0.34 和主达梦容器的只读核对结果如下：
 
 - 源 MySQL 为 `utf8mb4_0900_ai_ci`、`lower_case_table_names=0`，SQL mode 包含 `STRICT_TRANS_TABLES` 和 `ERROR_FOR_DIVISION_BY_ZERO`，`default_week_format=0`，自增步长和偏移均为 `1`，块加密算法为 `aes-128-ecb`。
-- 达梦建库属性为 `PAGE_SIZE=8KB`、`EXTENT_SIZE=16`、`CHARSET=1`、`CASE_SENSITIVE=0`、`LENGTH_IN_CHAR=0`、`BLANK_PAD_MODE=0`。其中字符集、大小写和尾空格已按常见 MySQL 场景调整；8KB 页与官方迁移示例的 32KB 不同，宽表要重点验证；`LENGTH_IN_CHAR=0` 依赖迁移 DDL 生成 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`。
+- 达梦建库属性为 `PAGE_SIZE=8KB`、`EXTENT_SIZE=16`、`CHARSET=1`、`CASE_SENSITIVE=0`、`LENGTH_IN_CHAR=0`、`BLANK_PAD_MODE=0`。其中字符集、大小写和尾空格已按常见 MySQL 场景调整；8KB 页与官方迁移示例的 32KB 不同，宽表要重点验证；dm-adapter 表 DDL 固定生成 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`，不依赖该值。
 - 已匹配的主要参数包括 `COMPATIBLE_MODE=4`、`ORDER_BY_NULLS_FLAG=2`、`JSON_MODE=2`、`USE_JSON_DATATYPE=1`、`COUNT_64BIT=1`、自增步长/偏移 `1/1`、`DEFAULT_WEEK_FORMAT=0` 和 `BLOCK_ENCRYPTION_MODE=AES-128-ECB`。
 - 仍需决策或存在可见语义差异的参数包括 `ERROR_COMPATIBLE_FLAG=0`、`CALC_AS_DECIMAL=0`、`MD5_TYPE=0`、`BACKSLASH_ESCAPE=0`、`MY_STRICT_TABLES=1`。它们分别对应重复结果列、整数除法、MD5 返回类型、反斜杠字面量和严格模式，不能仅因其他参数已经调整就忽略。
 
@@ -109,7 +109,7 @@ ORDER BY PARA_NAME;
 
 ## 类型和对象差异
 
-- MySQL `VARCHAR(n)`/`CHAR(n)` 迁移到 `LENGTH_IN_CHAR=0` 的达梦实例时，应定义为 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`，保持原字符数上限。不要按 `utf8` 3 倍或 `utf8mb4` 4 倍修改 `n`：倍数扩长只能增加字节容量，还会允许写入超过 MySQL 上限的较短字节字符。达梦 DTS 的 MySQL 类型映射同样使用 `VARCHAR(n char)`/`CHAR(n char)`。
+- MySQL `VARCHAR(n)`/`CHAR(n)` 迁移到达梦时统一定义为 `VARCHAR(n CHAR)`/`CHAR(n CHAR)`，无论目标库 `LENGTH_IN_CHAR` 为何都保持原字符数上限。不要按 `utf8` 3 倍或 `utf8mb4` 4 倍修改 `n`：倍数扩长只能增加字节容量，还会允许写入超过 MySQL 上限的较短字节字符。达梦 DTS 的 MySQL 类型映射同样使用 `VARCHAR(n char)`/`CHAR(n char)`。
 - MySQL `TEXT`、`LONGTEXT`、`JSON` 等类型迁移到达梦时通常需要映射到大字段或字符串类型，并检查业务是否依赖 MySQL JSON 函数。
 - 自增列迁移后要特别处理。MySQL `AUTO_INCREMENT` 可对应达梦原生 `IDENTITY(start, increment)`，也可在 MySQL 兼容模式下保留为达梦 `AUTO_INCREMENT`；两者都是自增机制，但不能混用控制语法。只有目标表实际为原生 `IDENTITY` 时，显式插入 id 才能使用 `SET IDENTITY_INSERT ... ON/OFF`；达梦 `AUTO_INCREMENT` 表不需要也不接受该开关，省略 id 时直接由数据库生成，显式 id 则按兼容自增语义插入。脚本里无列清单的 `INSERT INTO t VALUES(NULL, ...)` / `VALUES(DEFAULT, ...)` 如果首列明确是自增列，可省略该列和值。原生 `IDENTITY` 的 MyBatis 批量插入可能同时包含空 id 和显式 id，不能按首个元素决定整批是否保留 id；达梦 8 已验证 `SET IDENTITY_INSERT ... ON WITH REPLACE NULL` 能让空值自动生成、同时保留显式值。dm-adapter 的 `identityInsertTables` 只能记录经目标达梦元数据确认的原生 `IDENTITY` 表；目标为 `AUTO_INCREMENT`、普通列，或验证明确报告“不存在 IDENTITY 列”时必须撤销错误记录，不能把具体表名写死在通用规则里。
 - 触发器、函数、存储过程、视图、事件、外键、索引等对象不能只靠 mapper SQL 验证判断完整性。缺对象导致的 `无效的表或视图名`、`无效的列名`、`无法解析成员访问表达式`，优先归类为测试库对象缺失或原始 SQL 引用错误。

@@ -3,7 +3,6 @@ package com.github.dmadapter.cli;
 import com.github.dmadapter.core.MapperMigrationResult;
 import com.github.dmadapter.core.SqlChange;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
-import com.github.dmadapter.core.TargetLengthSemantics;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -36,13 +35,6 @@ class MigrateCommandTest {
                 System.setProperty(propertyName, original);
             }
         }
-    }
-
-    @Test
-    void explicitLengthSemanticsLimitsCapabilityLookupToOneAttempt() {
-        assertThat(MigrateCommand.targetCapabilityReadAttempts(TargetLengthSemantics.BYTE)).isEqualTo(1);
-        assertThat(MigrateCommand.targetCapabilityReadAttempts(TargetLengthSemantics.CHAR)).isEqualTo(1);
-        assertThat(MigrateCommand.targetCapabilityReadAttempts(null)).isEqualTo(5);
     }
 
     @Test
