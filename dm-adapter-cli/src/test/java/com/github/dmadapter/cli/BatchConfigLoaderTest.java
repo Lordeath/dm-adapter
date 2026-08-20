@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -87,7 +88,7 @@ class BatchConfigLoaderTest {
     }
 
     @Test
-    void rejectsRemovedTargetLengthSemanticsField() throws Exception {
+    void acceptsRemovedTargetLengthSemanticsFieldAndWarnsOnce() throws Exception {
         Path config = tempDir.resolve("removed-length-semantics.yml");
         Files.writeString(config, """
                 schemaVersion: 1
@@ -105,12 +106,21 @@ class BatchConfigLoaderTest {
                   - name: service-a
                     url: file:///tmp/service-a.git
                     branch: main
+                    migration:
+                      sql:
+                        targetLengthSemantics: CHAR
                 """);
 
-        assertThatThrownBy(() -> new BatchConfigLoader().load(config))
-                .isInstanceOf(DmAdapterException.class)
-                .hasMessageContaining("Could not parse batch YAML")
-                .hasMessageContaining("targetLengthSemantics");
+        List<String> warnings = new ArrayList<>();
+        ResolvedBatchConfig loaded = new BatchConfigLoader(warnings::add).load(config);
+
+        assertThat(loaded.repositories()).singleElement();
+        assertThat(warnings)
+                .singleElement()
+                .asString()
+                .contains("targetLengthSemantics")
+                .contains("deprecated and ignored")
+                .contains("VARCHAR(n CHAR)/CHAR(n CHAR)");
     }
 
     @Test

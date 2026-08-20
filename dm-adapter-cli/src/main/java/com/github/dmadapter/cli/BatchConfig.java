@@ -67,7 +67,8 @@ record BatchConfig(
             BatchSqlMode mode,
             String sourceDir,
             String outputDir,
-            List<String> preserveSql
+            List<String> preserveSql,
+            String targetLengthSemantics
     ) {
     }
 }
