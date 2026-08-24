@@ -3,6 +3,7 @@ package com.github.dmadapter.cli;
 import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
+import com.github.dmadapter.mybatis.SqlRewriteConfig;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -22,6 +23,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -3177,6 +3179,160 @@ class SqlScriptMigratorTest {
                         .contains("不包含任何完整冲突键"));
         assertThat(Files.readString(sqlRootOut.resolve("20260618.sql")))
                 .contains("ON DUPLICATE KEY UPDATE cfgValue = VALUES(cfgValue)");
+    }
+
+    @Test
+    void convertsConfiguredInsertSelectUpsertInsideProcedureUsingItsOwnTargetTable() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("20260910.sql"), """
+                DELIMITER $$
+                CREATE PROCEDURE addOrUpdate_button()
+                BEGIN
+                    INSERT INTO tmp_aoub_enterprise (enterprise_id, organization_id)
+                    SELECT enterprise_id, MIN(organization_id)
+                    FROM ns_system_organization
+                    GROUP BY enterprise_id;
+
+                    INSERT INTO ns_core_resourcebutton (
+                        ENTERPRISE_ID,
+                        ORGANIZATION_ID,
+                        JE_CORE_RESOURCEBUTTON_ID,
+                        RESOURCEBUTTON_FUNCINFO_ID,
+                        RESOURCEBUTTON_NAME
+                    )
+                    SELECT eo.enterprise_id,
+                           eo.organization_id,
+                           v_button_id,
+                           v_func_id,
+                           v_button_name
+                    FROM tmp_aoub_enterprise eo
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM ns_core_resourcebutton rb
+                        WHERE rb.ENTERPRISE_ID = eo.enterprise_id
+                          AND rb.JE_CORE_RESOURCEBUTTON_ID = v_button_id
+                          AND rb.RESOURCEBUTTON_FUNCINFO_ID = v_func_id
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        ID = ns_core_resourcebutton.ID;
+
+                    UPDATE ns_core_resourcebutton
+                    SET RESOURCEBUTTON_NAME = v_button_name
+                    WHERE JE_CORE_RESOURCEBUTTON_ID = v_button_id
+                      AND RESOURCEBUTTON_FUNCINFO_ID = v_func_id;
+                END$$
+                DELIMITER ;
+                """);
+        SqlRewriteConfig rewriteConfig = new SqlRewriteConfig(
+                Map.of("ns_core_resourcebutton", List.of(
+                        "ENTERPRISE_ID",
+                        "JE_CORE_RESOURCEBUTTON_ID",
+                        "RESOURCEBUTTON_FUNCINFO_ID"
+                )),
+                Map.of()
+        );
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-system",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.unknown(),
+                        null,
+                        rewriteConfig
+                )
+        );
+
+        String converted = Files.readString(sqlRootOut.resolve("20260910.sql"));
+        assertThat(report.manualReviewSqlCount())
+                .as("manual review items: %s", report.manualReviewItems())
+                .isZero();
+        assertThat(converted)
+                .contains(
+                        "INSERT INTO tmp_aoub_enterprise (enterprise_id, organization_id)",
+                        "FOR dm_source IN (",
+                        "MERGE INTO ns_core_resourcebutton t",
+                        "ON (t.ENTERPRISE_ID = s.ENTERPRISE_ID "
+                                + "AND t.JE_CORE_RESOURCEBUTTON_ID = s.JE_CORE_RESOURCEBUTTON_ID "
+                                + "AND t.RESOURCEBUTTON_FUNCINFO_ID = s.RESOURCEBUTTON_FUNCINFO_ID)",
+                        "UPDATE ns_core_resourcebutton"
+                )
+                .doesNotContain("WHEN MATCHED")
+                .doesNotContainIgnoringCase("ON DUPLICATE KEY UPDATE");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules()).contains(
+                        MySqlToDmSqlConverter
+                                .MYSQL_INSERT_SELECT_ON_DUPLICATE_KEY_UPDATE_TO_DM_CURSOR_MERGE_RULE
+                ));
+    }
+
+    @Test
+    void convertsCompleteSystem20260910FixtureWithoutManualReview() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        Path fixture = Path.of(Objects.requireNonNull(
+                getClass().getResource("/fixtures/sql/20260910-insert-select-upsert.sql")
+        ).toURI());
+        write(sqlRoot.resolve("20260910.sql"), Files.readString(fixture));
+        SqlRewriteConfig rewriteConfig = new SqlRewriteConfig(
+                Map.of("ns_core_resourcebutton", List.of(
+                        "ENTERPRISE_ID",
+                        "JE_CORE_RESOURCEBUTTON_ID",
+                        "RESOURCEBUTTON_FUNCINFO_ID"
+                )),
+                Map.of()
+        );
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(
+                new SqlScriptMigrationRequest(
+                        tempDir,
+                        sqlRoot,
+                        sqlRootOut,
+                        false,
+                        "sample-system",
+                        "",
+                        List.of(),
+                        DmValidationEnvironment.from(Map.of()),
+                        DamengTargetCapabilities.unknown(),
+                        null,
+                        rewriteConfig
+                )
+        );
+
+        String converted = Files.readString(sqlRootOut.resolve("20260910.sql"));
+        assertThat(report.manualReviewSqlCount())
+                .as("manual review items: %s", report.manualReviewItems())
+                .isZero();
+        assertThat(converted)
+                .contains(
+                        "CREATE OR REPLACE PROCEDURE addOrUpdate_button",
+                        "MERGE INTO ns_core_resourcebutton t",
+                        "ON (t.ENTERPRISE_ID = s.ENTERPRISE_ID "
+                                + "AND t.JE_CORE_RESOURCEBUTTON_ID = s.JE_CORE_RESOURCEBUTTON_ID "
+                                + "AND t.RESOURCEBUTTON_FUNCINFO_ID = s.RESOURCEBUTTON_FUNCINFO_ID)",
+                        "update ns_core_resourcebutton rb",
+                        "INSERT INTO ns_core_permission",
+                        "INSERT INTO ns_core_role_perm",
+                        "EXCEPTION",
+                        "WHEN OTHERS THEN",
+                        "RAISE;"
+                )
+                .doesNotContain("WHEN MATCHED")
+                .doesNotContain("DECLARE EXIT HANDLER", "RESIGNAL")
+                .doesNotContainIgnoringCase("ON DUPLICATE KEY UPDATE");
+        assertThat(report.files())
+                .singleElement()
+                .satisfies(file -> assertThat(file.appliedRules()).contains(
+                        MySqlToDmSqlConverter
+                                .MYSQL_INSERT_SELECT_ON_DUPLICATE_KEY_UPDATE_TO_DM_CURSOR_MERGE_RULE
+                ));
     }
 
     @Test

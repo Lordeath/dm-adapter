@@ -5,6 +5,7 @@ import com.github.dmadapter.core.SqlScriptFileResult;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
 import com.github.dmadapter.core.SqlScriptValidationFailure;
+import com.github.dmadapter.mybatis.SqlRewriteConfig;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import com.github.dmadapter.sql.SqlConverter;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -587,6 +588,7 @@ class SqlScriptMigrator {
                     outerJoinSourceUniqueKeys,
                     projectIdentityColumns,
                     scriptSchemaStates,
+                    request.rewriteConfig(),
                     manualReviewItems,
                     warnings
             );
@@ -2240,7 +2242,8 @@ class SqlScriptMigrator {
             Map<String, String> scriptIdentityColumns,
             Map<String, String> scriptProcedureRenames,
             String targetSchema,
-            Map<String, List<String>> outerJoinSourceUniqueKeys
+            Map<String, List<String>> outerJoinSourceUniqueKeys,
+            SqlRewriteConfig rewriteConfig
     ) {
         long startedAt = System.nanoTime();
         boolean largeStatement = originalStatement.length() >= 100_000;
@@ -2261,6 +2264,7 @@ class SqlScriptMigrator {
                 scriptProcedureRenames,
                 targetSchema,
                 outerJoinSourceUniqueKeys,
+                rewriteConfig,
                 timings
         );
         long elapsedMillis = elapsedMillis(startedAt);
@@ -3085,6 +3089,7 @@ class SqlScriptMigrator {
             Map<String, List<String>> outerJoinSourceUniqueKeys,
             Map<String, String> projectIdentityColumns,
             Map<String, ScriptSchemaState> scriptSchemaStates,
+            SqlRewriteConfig rewriteConfig,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -3179,7 +3184,8 @@ class SqlScriptMigrator {
                                     identityColumnsSnapshot,
                                     scriptProcedureRenames,
                                     targetSchema,
-                                    outerJoinSourceUniqueKeys
+                                    outerJoinSourceUniqueKeys,
+                                    rewriteConfig
                             ),
                             conversionExecutor
                     );
@@ -3196,7 +3202,8 @@ class SqlScriptMigrator {
                             scriptIdentityColumns,
                             scriptProcedureRenames,
                             targetSchema,
-                            outerJoinSourceUniqueKeys
+                            outerJoinSourceUniqueKeys,
+                            rewriteConfig
                     ));
                 }
                 conversionPlans.add(new StatementConversionPlan(statementIndex, originalStatement, conversion));
@@ -3891,6 +3898,7 @@ class SqlScriptMigrator {
             Map<String, String> scriptProcedureRenames,
             String targetSchema,
             Map<String, List<String>> outerJoinSourceUniqueKeys,
+            SqlRewriteConfig rewriteConfig,
             ConversionTimings timings
     ) {
         long preparationStartedAt = System.nanoTime();
@@ -3973,7 +3981,8 @@ class SqlScriptMigrator {
                 sqlBody,
                 scriptTableColumns,
                 scriptIdentityColumns,
-                targetSchema
+                targetSchema,
+                rewriteConfig
         );
         InlineCreateTableIndexConversion inlineCreateTableIndexes =
                 convertMysqlCreateTableInlineIndexes(safeRuleConversion.sql());
@@ -6891,7 +6900,8 @@ class SqlScriptMigrator {
             String sql,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptIdentityColumns,
-            String targetSchema
+            String targetSchema,
+            SqlRewriteConfig rewriteConfig
     ) {
         if (sql == null || sql.isBlank()) {
             return new SafeRuleConversion(sql == null ? "" : sql, false, List.of(), "");
@@ -7252,6 +7262,18 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_DYNAMIC_INSERT_IGNORE_TO_MERGE_RULE);
         }
 
+        SafeRuleConversion configuredUpsertSql = convertConfiguredScriptUpserts(
+                converted,
+                rewriteConfig
+        );
+        if (manualReviewReason.isBlank() && !configuredUpsertSql.manualReviewReason().isBlank()) {
+            manualReviewReason = configuredUpsertSql.manualReviewReason();
+        }
+        if (configuredUpsertSql.changed()) {
+            converted = configuredUpsertSql.sql();
+            rules.addAll(configuredUpsertSql.appliedRules());
+        }
+
         String deleteAliasStarSql = convertMysqlProcedureDeleteAliasStar(converted);
         if (!deleteAliasStarSql.equals(converted)) {
             converted = deleteAliasStarSql;
@@ -7321,7 +7343,8 @@ class SqlScriptMigrator {
             rules.add(DM_EMPTY_PROCEDURE_BODY_NOOP_RULE);
         }
 
-        String sqlExceptionHandlerSql = convertMysqlSqlExceptionContinueHandler(converted);
+        String sqlExceptionHandlerSql = convertMysqlSqlExceptionExitHandler(converted);
+        sqlExceptionHandlerSql = convertMysqlSqlExceptionContinueHandler(sqlExceptionHandlerSql);
         if (!sqlExceptionHandlerSql.equals(converted)) {
             converted = sqlExceptionHandlerSql;
             rules.add(MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE);
@@ -7333,6 +7356,115 @@ class SqlScriptMigrator {
                 rules,
                 manualReviewReason
         );
+    }
+
+    private SafeRuleConversion convertConfiguredScriptUpserts(
+            String sql,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        if (sql == null || sql.isBlank() || !containsOnDuplicateKeyUpdate(sql)) {
+            return new SafeRuleConversion(sql == null ? "" : sql, false, List.of(), "");
+        }
+        SqlRewriteConfig effectiveConfig = rewriteConfig == null
+                ? SqlRewriteConfig.empty()
+                : rewriteConfig;
+        String body = splitLeadingSqlPrefix(sql).body().stripLeading();
+        if (startsKeyword(body, 0, "INSERT")) {
+            SqlConversionResult conversion = convertConfiguredUpsertStatement(body, effectiveConfig);
+            if (conversion.manualReviewRequired()) {
+                return new SafeRuleConversion(sql, false, List.of(), conversion.reason());
+            }
+            if (!conversion.changed()) {
+                return new SafeRuleConversion(sql, false, List.of(), "");
+            }
+            int bodyIndex = sql.indexOf(body);
+            String converted = bodyIndex < 0
+                    ? conversion.convertedSql()
+                    : sql.substring(0, bodyIndex) + conversion.convertedSql();
+            return new SafeRuleConversion(
+                    converted,
+                    true,
+                    conversion.appliedRules(),
+                    ""
+            );
+        }
+        if (!isCreateProcedureStatement(body)) {
+            return new SafeRuleConversion(sql, false, List.of(), "");
+        }
+
+        List<RoutineTextReplacement> replacements = new ArrayList<>();
+        LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
+        String manualReviewReason = "";
+        for (RoutineSqlStatement routineStatement : routineSqlStatements(sql)) {
+            String statement = sql.substring(routineStatement.start(), routineStatement.end());
+            int statementStart = skipWhitespace(statement, 0);
+            if (!startsKeyword(statement, statementStart, "INSERT")
+                    || !containsOnDuplicateKeyUpdate(statement)) {
+                continue;
+            }
+            SqlConversionResult conversion = convertConfiguredUpsertStatement(
+                    statement,
+                    effectiveConfig
+            );
+            if (manualReviewReason.isBlank() && conversion.manualReviewRequired()) {
+                manualReviewReason = conversion.reason();
+            }
+            if (conversion.changed() && !conversion.manualReviewRequired()) {
+                replacements.add(new RoutineTextReplacement(
+                        routineStatement.start(),
+                        routineStatement.end(),
+                        conversion.convertedSql()
+                ));
+                appliedRules.addAll(conversion.appliedRules());
+            }
+        }
+        if (replacements.isEmpty()) {
+            return new SafeRuleConversion(sql, false, List.of(), manualReviewReason);
+        }
+        StringBuilder converted = new StringBuilder(sql);
+        for (int index = replacements.size() - 1; index >= 0; index--) {
+            RoutineTextReplacement replacement = replacements.get(index);
+            converted.replace(replacement.start(), replacement.end(), replacement.replacement());
+        }
+        return new SafeRuleConversion(
+                converted.toString(),
+                true,
+                List.copyOf(appliedRules),
+                manualReviewReason
+        );
+    }
+
+    private SqlConversionResult convertConfiguredUpsertStatement(
+            String statement,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        String tableName = insertTargetTable(statement);
+        List<String> keyColumns = rewriteConfig.keyColumnsFor("", tableName);
+        return converter.convert(statement, keyColumns);
+    }
+
+    private String insertTargetTable(String statement) {
+        int index = skipWhitespace(statement, 0);
+        if (!startsKeyword(statement, index, "INSERT")) {
+            return "";
+        }
+        index = skipWhitespace(statement, index + "INSERT".length());
+        if (startsKeyword(statement, index, "IGNORE")) {
+            index = skipWhitespace(statement, index + "IGNORE".length());
+        }
+        if (!startsKeyword(statement, index, "INTO")) {
+            return "";
+        }
+        index = skipWhitespace(statement, index + "INTO".length());
+        SqlIdentifierReference reference = sqlIdentifierReferenceAt(statement, index);
+        return reference == null ? "" : reference.token();
+    }
+
+    private boolean containsOnDuplicateKeyUpdate(String sql) {
+        String searchable = replaceIgnoredSqlWithSpaces(sql == null ? "" : sql);
+        return Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
+                .matcher(searchable)
+                .find();
     }
 
     private SafeRuleConversion convertEmbeddedSqlLiterals(String sql, String targetSchema) {
@@ -9709,6 +9841,81 @@ class SqlScriptMigrator {
             converted.replace(statement.start(), statement.end(), replacement);
         }
         return converted.toString();
+    }
+
+    private String convertMysqlSqlExceptionExitHandler(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        Pattern handlerPattern = Pattern.compile(
+                "(?is)[\\t ]*DECLARE\\s+EXIT\\s+HANDLER\\s+FOR\\s+SQLEXCEPTION\\s*"
+                        + "BEGIN\\b(?<body>.*?)\\bRESIGNAL\\s*;\\s*END\\s*;"
+        );
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        Matcher handler = handlerPattern.matcher(searchable);
+        if (!handler.find()) {
+            return sql;
+        }
+        int handlerStart = handler.start();
+        int handlerEnd = handler.end();
+        int handlerBodyStart = handler.start("body");
+        int handlerBodyEnd = handler.end("body");
+        if (handler.find()) {
+            return sql;
+        }
+
+        String handlerBody = sql.substring(handlerBodyStart, handlerBodyEnd).strip();
+        for (String unsupported : List.of(
+                "DECLARE",
+                "HANDLER",
+                "BEGIN",
+                "END",
+                "IF",
+                "LOOP",
+                "WHILE",
+                "FOR",
+                "RETURN",
+                "RESIGNAL",
+                "SIGNAL",
+                "COMMIT",
+                "ROLLBACK"
+        )) {
+            if (containsKeywordOutsideIgnoredText(handlerBody, unsupported)) {
+                return sql;
+            }
+        }
+
+        String withoutHandler = sql.substring(0, handlerStart) + sql.substring(handlerEnd);
+        if (containsKeywordOutsideIgnoredText(withoutHandler, "HANDLER")
+                || containsKeywordOutsideIgnoredText(withoutHandler, "RESIGNAL")
+                || containsKeywordOutsideIgnoredText(withoutHandler, "EXCEPTION")) {
+            return sql;
+        }
+        String withoutHandlerSearchable = replaceIgnoredSqlWithSpaces(withoutHandler);
+        Matcher procedureEnd = Pattern.compile("(?is)\\bEND\\b\\s*;?\\s*$")
+                .matcher(withoutHandlerSearchable);
+        if (!procedureEnd.find()) {
+            return sql;
+        }
+
+        int procedureEndIndex = procedureEnd.start();
+        String outerIndent = lineIndentBefore(withoutHandler, procedureEndIndex);
+        String clauseIndent = outerIndent + "    ";
+        String bodyIndent = clauseIndent + "    ";
+        StringBuilder exceptionClause = new StringBuilder()
+                .append(outerIndent).append("EXCEPTION\n")
+                .append(clauseIndent).append("WHEN OTHERS THEN\n");
+        if (!handlerBody.isBlank()) {
+            String normalizedHandlerBody = handlerBody.replaceAll(
+                    "\\R[\\t ]*",
+                    "\n" + Matcher.quoteReplacement(bodyIndent)
+            );
+            exceptionClause.append(bodyIndent).append(normalizedHandlerBody).append('\n');
+        }
+        exceptionClause.append(bodyIndent).append("RAISE;\n");
+        return withoutHandler.substring(0, procedureEndIndex)
+                + exceptionClause
+                + withoutHandler.substring(procedureEndIndex);
     }
 
     private String convertMysqlCursorHandlerLoops(String sql) {
