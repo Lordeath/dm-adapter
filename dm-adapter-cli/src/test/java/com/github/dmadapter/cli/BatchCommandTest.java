@@ -106,6 +106,57 @@ class BatchCommandTest {
     }
 
     @Test
+    void batchUsesGlobalTableKeyColumnsForSqlScriptInsertSelectUpsert() throws Exception {
+        RemoteFixture remote = createRemote("configured-script-upsert", false);
+        pushRemoteChange(remote, "sql/v2/20260910.sql", """
+                DELIMITER $$
+                CREATE PROCEDURE addOrUpdate_button()
+                BEGIN
+                    INSERT INTO ns_core_resourcebutton (
+                        ENTERPRISE_ID,
+                        JE_CORE_RESOURCEBUTTON_ID,
+                        RESOURCEBUTTON_FUNCINFO_ID,
+                        RESOURCEBUTTON_NAME
+                    )
+                    SELECT enterprise_id, v_button_id, v_func_id, v_button_name
+                    FROM tmp_aoub_enterprise
+                    ON DUPLICATE KEY UPDATE
+                        ID = ns_core_resourcebutton.ID;
+                END$$
+                DELIMITER ;
+                """);
+        Path config = writeConfig(remote);
+        Files.writeString(config, Files.readString(config).replace(
+                "migrationDefaults:\n",
+                """
+                migrationDefaults:
+                  upsertKeys:
+                    tables:
+                      "ns_core_resourcebutton":
+                        keyColumns: [ENTERPRISE_ID, JE_CORE_RESOURCEBUTTON_ID, RESOURCEBUTTON_FUNCINFO_ID]
+                """
+        ));
+
+        int exitCode = execute(config);
+
+        assertThat(exitCode).isZero();
+        assertThat(readRemoteFile(remote.remote(), "sql/v2-dm/20260910.sql"))
+                .contains("FOR dm_source IN (")
+                .contains("MERGE INTO ns_core_resourcebutton t")
+                .contains("ON (t.ENTERPRISE_ID = s.ENTERPRISE_ID "
+                        + "AND t.JE_CORE_RESOURCEBUTTON_ID = s.JE_CORE_RESOURCEBUTTON_ID "
+                        + "AND t.RESOURCEBUTTON_FUNCINFO_ID = s.RESOURCEBUTTON_FUNCINFO_ID)")
+                .doesNotContainIgnoringCase("ON DUPLICATE KEY UPDATE");
+        Path reportDir = latestReportDir().resolve("configured-script-upsert");
+        assertThat(Files.readString(reportDir.resolve("dm-adapter-sql-script-report.md")))
+                .contains("需人工确认 SQL 数：`0`");
+        assertThat(Files.readString(reportDir.resolve("sql-rewrite.yml")))
+                .contains("\"ns_core_resourcebutton\":")
+                .contains("keyColumns: [\"ENTERPRISE_ID\", \"JE_CORE_RESOURCEBUTTON_ID\", "
+                        + "\"RESOURCEBUTTON_FUNCINFO_ID\"]");
+    }
+
+    @Test
     void batchUsesGlobalTableKeyColumnsForDynamicSchemaInsertIgnore() throws Exception {
         RemoteFixture remote = createRemote("configured-upsert", false);
         pushRemoteChange(remote, "src/main/resources/mapper/UserMapper.xml", """

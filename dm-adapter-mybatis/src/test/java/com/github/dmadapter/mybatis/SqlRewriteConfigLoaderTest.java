@@ -26,6 +26,39 @@ class SqlRewriteConfigLoaderTest {
     }
 
     @Test
+    void resolvesQualifiedTableThroughUniqueLeafName() {
+        SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
+                "upsertKeys:",
+                "  tables:",
+                "    \"ns_core_resourcebutton\":",
+                "      keyColumns: [ENTERPRISE_ID, JE_CORE_RESOURCEBUTTON_ID, RESOURCEBUTTON_FUNCINFO_ID]"
+        ));
+
+        assertThat(config.keyColumnsFor("", "SAMPLE_SYSTEM.`ns_core_resourcebutton`"))
+                .containsExactly(
+                        "ENTERPRISE_ID",
+                        "JE_CORE_RESOURCEBUTTON_ID",
+                        "RESOURCEBUTTON_FUNCINFO_ID"
+                );
+    }
+
+    @Test
+    void doesNotGuessLeafTableKeyWhenMultipleSchemasMatch() {
+        SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
+                "upsertKeys:",
+                "  tables:",
+                "    \"schema_a.shared_table\":",
+                "      keyColumns: [id]",
+                "    \"schema_b.shared_table\":",
+                "      keyColumns: [tenant_id, id]"
+        ));
+
+        assertThat(config.keyColumnsFor("", "shared_table")).isEmpty();
+        assertThat(config.keyColumnsFor("", "schema_b.shared_table"))
+                .containsExactly("tenant_id", "id");
+    }
+
+    @Test
     void parsesValidationMissingTableIgnoresAndSkipsComments() {
         SqlRewriteConfig config = new SqlRewriteConfigLoader().parse(List.of(
                 "identityInsertTables:",

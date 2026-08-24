@@ -87,6 +87,47 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void sqlScriptsOnlyUsesConfiguredTableKeysForInsertSelectUpsert() throws Exception {
+        writeDemoProject();
+        writeFile("sql/v2/upsert.sql", """
+                INSERT INTO sample_target(id, name)
+                SELECT source_id, source_name
+                FROM sample_source
+                ON DUPLICATE KEY UPDATE name = VALUES(name);
+                """);
+        Path rewriteConfig = tempDir.resolve("script-rewrite.yml");
+        Files.writeString(rewriteConfig, """
+                upsertKeys:
+                  tables:
+                    "sample_target":
+                      keyColumns: [id]
+                  methods: {}
+                """);
+
+        int exitCode = execute(
+                "migrate",
+                "--project",
+                tempDir.toString(),
+                "--sql-scripts-only",
+                "--sql-root",
+                "sql/v2",
+                "--sql-root-out",
+                "sql/v2-dm",
+                "--rewrite-config",
+                rewriteConfig.toString()
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(Files.readString(tempDir.resolve("sql/v2-dm/upsert.sql")))
+                .contains("FOR dm_source IN (")
+                .contains("MERGE INTO sample_target t")
+                .contains("ON (t.id = s.id)")
+                .doesNotContainIgnoringCase("ON DUPLICATE KEY UPDATE");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-sql-script-report.md")))
+                .contains("需人工确认 SQL 数：`0`");
+    }
+
+    @Test
     void migrateDryRunWritesReportWithoutChangingProjectFiles() throws Exception {
         writeDemoProject();
         String pomBefore = Files.readString(tempDir.resolve("pom.xml"));

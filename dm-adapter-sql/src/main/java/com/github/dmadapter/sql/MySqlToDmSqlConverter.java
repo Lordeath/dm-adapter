@@ -146,6 +146,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     public static final String MYSQL_DELETE_LIMIT_RULE = "MYSQL_DELETE_LIMIT_TO_ROWID";
     public static final String MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE =
             "MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE";
+    public static final String MYSQL_INSERT_SELECT_ON_DUPLICATE_KEY_UPDATE_TO_DM_CURSOR_MERGE_RULE =
+            "MYSQL_INSERT_SELECT_ON_DUPLICATE_KEY_UPDATE_TO_DM_CURSOR_MERGE";
+    public static final String MISSING_UPSERT_KEY_COLUMNS = "MISSING_UPSERT_KEY_COLUMNS";
+    public static final String UNSUPPORTED_INSERT_SELECT_UPSERT = "UNSUPPORTED_INSERT_SELECT_UPSERT";
+    public static final String UPSERT_KEY_NOT_IN_INSERT_COLUMNS = "UPSERT_KEY_NOT_IN_INSERT_COLUMNS";
+    public static final String UNSAFE_UPSERT_UPDATE_ASSIGNMENT = "UNSAFE_UPSERT_UPDATE_ASSIGNMENT";
     public static final String MYSQL_HOUR_SECOND_INTERVAL_RULE =
             "MYSQL_HOUR_SECOND_INTERVAL_TO_DATEADD_SECOND";
     public static final String MYSQL_TIME_TO_SEC_TIMEDIFF_RULE =
@@ -1189,10 +1195,17 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE);
         }
 
-        GenericConversion onDuplicateKeyUpdateConversion = convertOnDuplicateKeyUpdate(converted, upsertKeyColumns);
+        UpsertConversion onDuplicateKeyUpdateConversion = convertOnDuplicateKeyUpdate(converted, upsertKeyColumns);
         if (onDuplicateKeyUpdateConversion.changed()) {
             converted = onDuplicateKeyUpdateConversion.convertedSql();
-            rules.add(MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
+            rules.add(onDuplicateKeyUpdateConversion.ruleName());
+        } else if (!onDuplicateKeyUpdateConversion.manualReviewReason().isBlank()) {
+            return manualReviewResult(
+                    original,
+                    converted,
+                    rules,
+                    onDuplicateKeyUpdateConversion.manualReviewReason()
+            );
         }
 
         GenericConversion unusedUserVariableSelectItemConversion = removeUnusedUserVariableSelectItems(converted);
@@ -9647,19 +9660,109 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return valuesInsert == null ? readInsertIgnoreSelectWithoutFrom(sql) : valuesInsert;
     }
 
-    private GenericConversion convertOnDuplicateKeyUpdate(String sql, List<String> keyColumns) {
-        OnDuplicateKeyInsert insert = readOnDuplicateKeyInsert(sql);
-        if (insert == null || normalizedKeyColumns(keyColumns).isEmpty()) {
-            return GenericConversion.unchanged(sql);
+    private UpsertConversion convertOnDuplicateKeyUpdate(String sql, List<String> keyColumns) {
+        if (!containsPatternOutsideIgnoredText(sql, ON_DUPLICATE_KEY_UPDATE_PATTERN)) {
+            return UpsertConversion.unchanged(sql);
+        }
+        List<String> normalizedKeys = normalizedKeyColumns(keyColumns);
+        OnDuplicateKeyInsert valuesInsert = readOnDuplicateKeyInsert(sql);
+        OnDuplicateKeySelectInsert selectInsert = valuesInsert == null
+                ? readOnDuplicateKeySelectInsert(sql)
+                : null;
+        String tableName = valuesInsert != null
+                ? valuesInsert.tableName()
+                : selectInsert == null ? readOnDuplicateKeyTargetTable(sql) : selectInsert.tableName();
+        if (normalizedKeys.isEmpty()) {
+            return UpsertConversion.manual(
+                    sql,
+                    MISSING_UPSERT_KEY_COLUMNS + ": ON DUPLICATE KEY UPDATE on table `"
+                            + displayTableName(tableName)
+                            + "` requires configured table-level keyColumns for a safe Dameng MERGE rewrite."
+            );
+        }
+        if (valuesInsert == null && selectInsert == null) {
+            return UpsertConversion.manual(
+                    sql,
+                    UNSUPPORTED_INSERT_SELECT_UPSERT + ": ON DUPLICATE KEY UPDATE on table `"
+                            + displayTableName(tableName)
+                            + "` has configured keyColumns " + keyColumns
+                            + " but its INSERT source cannot be parsed as a supported single-row VALUES "
+                            + "or INSERT ... SELECT statement."
+            );
         }
 
-        List<UpdateAssignment> updateAssignments = readOnDuplicateKeyUpdateAssignments(insert.updateClause());
+        List<InsertColumn> insertColumns = valuesInsert != null
+                ? valuesInsert.columns()
+                : selectInsert.columns();
+        List<String> missingKeys = missingKeyColumns(insertColumns, normalizedKeys, keyColumns);
+        if (!missingKeys.isEmpty()) {
+            return UpsertConversion.manual(
+                    sql,
+                    UPSERT_KEY_NOT_IN_INSERT_COLUMNS + ": table `" + displayTableName(tableName)
+                            + "` has configured keyColumns " + keyColumns
+                            + " but the INSERT column list does not contain " + missingKeys + "."
+            );
+        }
+
+        String updateClause = valuesInsert != null
+                ? valuesInsert.updateClause()
+                : selectInsert.updateClause();
+        List<UpdateAssignment> updateAssignments = readOnDuplicateKeyUpdateAssignments(
+                updateClause,
+                tableName
+        );
         if (updateAssignments.isEmpty()) {
-            return GenericConversion.unchanged(sql);
+            return UpsertConversion.manual(
+                    sql,
+                    UNSAFE_UPSERT_UPDATE_ASSIGNMENT + ": ON DUPLICATE KEY UPDATE on table `"
+                            + displayTableName(tableName)
+                            + "` contains an assignment that cannot be mapped safely to Dameng MERGE."
+            );
         }
 
-        String converted = mergeSql(insert.toInsertValues(), updateAssignments, keyColumns);
-        return converted == null ? GenericConversion.unchanged(sql) : new GenericConversion(converted, true);
+        String converted = valuesInsert != null
+                ? mergeSql(valuesInsert.toInsertValues(), updateAssignments, keyColumns)
+                : mergeSelectCursorSql(selectInsert, updateAssignments, keyColumns);
+        if (converted == null) {
+            return UpsertConversion.manual(
+                    sql,
+                    valuesInsert == null
+                            ? UNSUPPORTED_INSERT_SELECT_UPSERT + ": INSERT ... SELECT upsert on table `"
+                                    + displayTableName(tableName)
+                                    + "` with keyColumns " + keyColumns
+                                    + " could not be converted without changing source-row semantics."
+                            : UNSAFE_UPSERT_UPDATE_ASSIGNMENT + ": VALUES upsert on table `"
+                                    + displayTableName(tableName)
+                                    + "` could not be mapped safely to Dameng MERGE."
+            );
+        }
+        return UpsertConversion.changed(
+                converted,
+                valuesInsert == null
+                        ? MYSQL_INSERT_SELECT_ON_DUPLICATE_KEY_UPDATE_TO_DM_CURSOR_MERGE_RULE
+                        : MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE
+        );
+    }
+
+    private List<String> missingKeyColumns(
+            List<InsertColumn> insertColumns,
+            List<String> normalizedKeys,
+            List<String> configuredKeys
+    ) {
+        List<String> missing = new ArrayList<>();
+        for (int index = 0; index < normalizedKeys.size(); index++) {
+            String normalizedKey = normalizedKeys.get(index);
+            boolean present = insertColumns.stream()
+                    .anyMatch(column -> column.name().key().equals(normalizedKey));
+            if (!present) {
+                missing.add(index < configuredKeys.size() ? configuredKeys.get(index) : normalizedKey);
+            }
+        }
+        return List.copyOf(missing);
+    }
+
+    private String displayTableName(String tableName) {
+        return tableName == null || tableName.isBlank() ? "<unknown>" : tableName;
     }
 
     private String mergeSql(InsertValues insert, List<UpdateAssignment> updateAssignments, List<String> keyColumns) {
@@ -9705,6 +9808,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 .flatMap(List::stream)
                 .collect(java.util.stream.Collectors.toSet());
         List<UpdateAssignment> effectiveAssignments = updateAssignments.stream()
+                .filter(assignment -> !assignment.noOp())
                 .filter(assignment -> !normalizedKeys.contains(assignment.column().key()))
                 .toList();
         if (effectiveAssignments.stream().anyMatch(assignment -> assignment.valuesReference()
@@ -9788,6 +9892,117 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return converted.toString();
     }
 
+    private String mergeSelectCursorSql(
+            OnDuplicateKeySelectInsert insert,
+            List<UpdateAssignment> updateAssignments,
+            List<String> keyColumns
+    ) {
+        List<String> normalizedKeys = normalizedKeyColumns(keyColumns);
+        if (normalizedKeys.isEmpty() || insert.columns().isEmpty()) {
+            return null;
+        }
+        List<InsertColumn> matchColumns = new ArrayList<>();
+        for (String keyColumn : normalizedKeys) {
+            InsertColumn matchColumn = insert.columns().stream()
+                    .filter(column -> column.name().key().equals(keyColumn))
+                    .findFirst()
+                    .orElse(null);
+            if (matchColumn == null) {
+                return null;
+            }
+            matchColumns.add(matchColumn);
+        }
+        List<UpdateAssignment> effectiveAssignments = updateAssignments.stream()
+                .filter(assignment -> !assignment.noOp())
+                .filter(assignment -> !normalizedKeys.contains(assignment.column().key()))
+                .toList();
+        if (effectiveAssignments.stream().anyMatch(assignment -> assignment.valuesReference()
+                && insert.columns().stream()
+                .noneMatch(column -> column.name().key().equals(identifierKey(assignment.sourceExpression()))))) {
+            return null;
+        }
+
+        StringBuilder converted = new StringBuilder(insert.statementEnd() + 384);
+        converted.append(insert.prefix())
+                .append("DECLARE\n")
+                .append("BEGIN\n")
+                .append("    FOR dm_source IN (\n")
+                .append("        SELECT ")
+                .append(insert.selectModifier());
+        for (int index = 0; index < insert.columns().size(); index++) {
+            InsertColumn column = insert.columns().get(index);
+            if (index > 0) {
+                converted.append(", ");
+            }
+            converted.append(column.value())
+                    .append(" AS ")
+                    .append(dmIdentifier(column.name().text()));
+        }
+        if (!insert.sourceTail().isBlank()) {
+            converted.append("\n").append(insert.sourceTail().strip());
+        }
+        converted.append("\n")
+                .append("    ) LOOP\n")
+                .append("        MERGE INTO ")
+                .append(insert.tableName())
+                .append(" t\n")
+                .append("        USING (SELECT ");
+        for (int index = 0; index < insert.columns().size(); index++) {
+            InsertColumn column = insert.columns().get(index);
+            if (index > 0) {
+                converted.append(", ");
+            }
+            converted.append(qualifiedIdentifier("dm_source", column.name()))
+                    .append(" AS ")
+                    .append(dmIdentifier(column.name().text()));
+        }
+        converted.append(" FROM dual) s\n")
+                .append("        ON (");
+        for (int index = 0; index < matchColumns.size(); index++) {
+            if (index > 0) {
+                converted.append(" AND ");
+            }
+            converted.append(qualifiedIdentifier("t", matchColumns.get(index).name()))
+                    .append(" = ")
+                    .append(qualifiedIdentifier("s", matchColumns.get(index).name()));
+        }
+        converted.append(")\n");
+        if (!effectiveAssignments.isEmpty()) {
+            converted.append("        WHEN MATCHED THEN UPDATE SET ");
+            for (int index = 0; index < effectiveAssignments.size(); index++) {
+                UpdateAssignment assignment = effectiveAssignments.get(index);
+                if (index > 0) {
+                    converted.append(", ");
+                }
+                converted.append(qualifiedIdentifier("t", assignment.column()))
+                        .append(" = ")
+                        .append(assignment.valuesReference()
+                                ? "s." + dmIdentifier(assignment.sourceExpression())
+                                : assignment.sourceExpression());
+            }
+            converted.append("\n");
+        }
+        converted.append("        WHEN NOT MATCHED THEN INSERT (");
+        for (int index = 0; index < insert.columns().size(); index++) {
+            if (index > 0) {
+                converted.append(", ");
+            }
+            converted.append(dmIdentifier(insert.columns().get(index).name().text()));
+        }
+        converted.append(") VALUES (");
+        for (int index = 0; index < insert.columns().size(); index++) {
+            if (index > 0) {
+                converted.append(", ");
+            }
+            converted.append(qualifiedIdentifier("s", insert.columns().get(index).name()));
+        }
+        converted.append(");\n")
+                .append("    END LOOP;\n")
+                .append("END")
+                .append(insert.suffix());
+        return converted.toString();
+    }
+
     private List<String> normalizedKeyColumns(List<String> keyColumns) {
         if (keyColumns == null || keyColumns.isEmpty()) {
             return List.of();
@@ -9838,6 +10053,218 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return new OnDuplicateKeyInsert(insert, sql.substring(index, statementEnd));
+    }
+
+    private OnDuplicateKeySelectInsert readOnDuplicateKeySelectInsert(String sql) {
+        int insertIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, insertIndex, "INSERT")) {
+            return null;
+        }
+        int index = skipWhitespace(sql, insertIndex + "INSERT".length());
+        if (startsKeyword(sql, index, "IGNORE")) {
+            return null;
+        }
+        if (!startsKeyword(sql, index, "INTO")) {
+            return null;
+        }
+        index = skipWhitespace(sql, index + "INTO".length());
+        int columnOpenIndex = findTopLevelChar(sql, '(', index);
+        if (columnOpenIndex < 0) {
+            return null;
+        }
+        String tableName = sql.substring(index, columnOpenIndex).trim();
+        if (tableName.isBlank()
+                || containsMyBatisPlaceholder(tableName)
+                || containsWhitespaceOutsideQuotedText(tableName)) {
+            return null;
+        }
+        int columnCloseIndex = findMatchingParen(sql, columnOpenIndex);
+        if (columnCloseIndex < 0) {
+            return null;
+        }
+        List<IdentifierName> columnNames = readInsertColumns(
+                sql.substring(columnOpenIndex + 1, columnCloseIndex)
+        );
+        if (columnNames.isEmpty()) {
+            return null;
+        }
+
+        int selectIndex = skipWhitespace(sql, columnCloseIndex + 1);
+        if (!startsKeyword(sql, selectIndex, "SELECT")) {
+            return null;
+        }
+        int onDuplicateIndex = findTopLevelOnDuplicateKeyUpdate(
+                sql,
+                selectIndex + "SELECT".length()
+        );
+        if (onDuplicateIndex < 0) {
+            return null;
+        }
+        int statementEnd = stripTrailingSemicolon(sql);
+        int updateClauseStart = skipOnDuplicateKeyUpdate(sql, onDuplicateIndex);
+        if (updateClauseStart < 0 || updateClauseStart >= statementEnd) {
+            return null;
+        }
+
+        int projectionStart = skipWhitespace(sql, selectIndex + "SELECT".length());
+        String selectModifier = "";
+        if (startsKeyword(sql, projectionStart, "DISTINCT")) {
+            selectModifier = "DISTINCT ";
+            projectionStart = skipWhitespace(sql, projectionStart + "DISTINCT".length());
+        }
+        int fromIndex = findTopLevelKeyword(sql, "FROM", projectionStart);
+        if (fromIndex < 0 || fromIndex >= onDuplicateIndex) {
+            return null;
+        }
+        int unionIndex = findTopLevelKeyword(sql, "UNION", projectionStart);
+        if (unionIndex >= 0 && unionIndex < onDuplicateIndex) {
+            return null;
+        }
+        String sourceTail = sql.substring(fromIndex, onDuplicateIndex).stripTrailing();
+        int forIndex = findTopLevelKeyword(sourceTail, "FOR", 0);
+        if (forIndex >= 0
+                && startsKeyword(sourceTail, skipWhitespace(sourceTail, forIndex + "FOR".length()), "UPDATE")) {
+            return null;
+        }
+
+        List<TopLevelArgument> projections = splitTopLevelArguments(
+                sql.substring(projectionStart, fromIndex)
+        );
+        if (projections.size() != columnNames.size()) {
+            return null;
+        }
+        List<InsertColumn> columns = new ArrayList<>();
+        for (int projectionIndex = 0; projectionIndex < columnNames.size(); projectionIndex++) {
+            String expression = selectProjectionExpression(projections.get(projectionIndex).text());
+            if (expression == null || expression.isBlank()) {
+                return null;
+            }
+            columns.add(new InsertColumn(columnNames.get(projectionIndex), expression));
+        }
+        return new OnDuplicateKeySelectInsert(
+                insertIndex,
+                statementEnd,
+                sql.substring(0, insertIndex),
+                sql.substring(statementEnd),
+                tableName,
+                columns,
+                selectModifier,
+                sourceTail,
+                sql.substring(updateClauseStart, statementEnd)
+        );
+    }
+
+    private int findTopLevelOnDuplicateKeyUpdate(String sql, int start) {
+        int depth = 0;
+        int index = Math.max(0, start);
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+                index = identifier.closed() ? identifier.nextIndex() : sql.length();
+            } else if (startsMyBatisPlaceholder(sql, index)) {
+                index = skipMyBatisPlaceholder(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (depth == 0 && startsKeyword(sql, index, "ON")) {
+                int updateStart = skipOnDuplicateKeyUpdate(sql, index);
+                if (updateStart >= 0) {
+                    return index;
+                }
+                index += "ON".length();
+            } else {
+                index++;
+            }
+        }
+        return -1;
+    }
+
+    private int skipOnDuplicateKeyUpdate(String sql, int onIndex) {
+        if (!startsKeyword(sql, onIndex, "ON")) {
+            return -1;
+        }
+        int index = skipWhitespace(sql, onIndex + "ON".length());
+        if (!startsKeyword(sql, index, "DUPLICATE")) {
+            return -1;
+        }
+        index = skipWhitespace(sql, index + "DUPLICATE".length());
+        if (!startsKeyword(sql, index, "KEY")) {
+            return -1;
+        }
+        index = skipWhitespace(sql, index + "KEY".length());
+        if (!startsKeyword(sql, index, "UPDATE")) {
+            return -1;
+        }
+        return skipWhitespace(sql, index + "UPDATE".length());
+    }
+
+    private String selectProjectionExpression(String projection) {
+        String trimmed = projection == null ? "" : projection.trim();
+        if (trimmed.isBlank()
+                || "*".equals(trimmed)
+                || Pattern.compile("(?is)^.+\\.\\s*\\*$").matcher(trimmed).matches()) {
+            return null;
+        }
+        int aliasIndex = -1;
+        int searchIndex = 0;
+        while (searchIndex < trimmed.length()) {
+            int next = findTopLevelKeyword(trimmed, "AS", searchIndex);
+            if (next < 0) {
+                break;
+            }
+            aliasIndex = next;
+            searchIndex = next + "AS".length();
+        }
+        if (aliasIndex >= 0) {
+            IdentifierName alias = readIdentifierName(
+                    trimmed.substring(aliasIndex + "AS".length()),
+                    false
+            );
+            if (alias == null) {
+                return null;
+            }
+            String expression = trimmed.substring(0, aliasIndex).stripTrailing();
+            return expression.isBlank() ? null : expression;
+        }
+        Matcher implicitAlias = Pattern.compile(
+                "(?is)^(?<expression>.+\\S)\\s+(?<alias>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)$"
+        ).matcher(trimmed);
+        if (implicitAlias.matches()
+                && !Set.of("END", "NULL", "TRUE", "FALSE", "CURRENT_TIMESTAMP")
+                .contains(implicitAlias.group("alias").toUpperCase(Locale.ROOT))
+                && !implicitAlias.group("expression").matches("(?is).*[+\\-*/%<>=|]\\s*$")) {
+            return implicitAlias.group("expression").stripTrailing();
+        }
+        return trimmed;
+    }
+
+    private String readOnDuplicateKeyTargetTable(String sql) {
+        int insertIndex = leadingWhitespaceLength(sql);
+        if (!startsKeyword(sql, insertIndex, "INSERT")) {
+            return "<unknown>";
+        }
+        int index = skipWhitespace(sql, insertIndex + "INSERT".length());
+        if (startsKeyword(sql, index, "IGNORE")) {
+            index = skipWhitespace(sql, index + "IGNORE".length());
+        }
+        if (!startsKeyword(sql, index, "INTO")) {
+            return "<unknown>";
+        }
+        index = skipWhitespace(sql, index + "INTO".length());
+        int columnOpenIndex = findTopLevelChar(sql, '(', index);
+        return columnOpenIndex < 0 ? "<unknown>" : sql.substring(index, columnOpenIndex).trim();
     }
 
     private InsertValues readInsertIgnoreSelectWithoutFrom(String sql) {
@@ -9996,10 +10423,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return columns;
     }
 
-    private List<UpdateAssignment> readOnDuplicateKeyUpdateAssignments(String updateClause) {
+    private List<UpdateAssignment> readOnDuplicateKeyUpdateAssignments(
+            String updateClause,
+            String tableName
+    ) {
         List<UpdateAssignment> assignments = new ArrayList<>();
         for (TopLevelArgument assignment : splitTopLevelArguments(updateClause)) {
-            UpdateAssignment parsed = readOnDuplicateKeyUpdateAssignment(assignment.text());
+            UpdateAssignment parsed = readOnDuplicateKeyUpdateAssignment(
+                    assignment.text(),
+                    tableName
+            );
             if (parsed == null
                     || assignments.stream().anyMatch(existing -> existing.column().key().equals(parsed.column().key()))) {
                 return List.of();
@@ -10009,7 +10442,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return assignments;
     }
 
-    private UpdateAssignment readOnDuplicateKeyUpdateAssignment(String assignment) {
+    private UpdateAssignment readOnDuplicateKeyUpdateAssignment(
+            String assignment,
+            String tableName
+    ) {
         int equalsIndex = findTopLevelChar(assignment, '=', 0);
         if (equalsIndex < 0) {
             return null;
@@ -10030,14 +10466,18 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             if (sourceColumn == null || !sourceColumn.key().equals(targetColumn.key())) {
                 return null;
             }
-            return new UpdateAssignment(targetColumn, sourceColumn.text(), true);
+            return new UpdateAssignment(targetColumn, sourceColumn.text(), true, false);
+        }
+
+        if (isNoOpUpsertAssignment(source, targetColumn, tableName)) {
+            return new UpdateAssignment(targetColumn, targetColumn.text(), false, true);
         }
 
         if (source.matches(
                 "(?is)NULL|[-+]?\\d+(?:\\.\\d+)?|N?'(?:''|[^'])*'|"
                         + "NOW\\s*\\(\\s*\\)|CURRENT_TIMESTAMP(?:\\s*\\(\\s*\\))?"
         )) {
-            return new UpdateAssignment(targetColumn, source, false);
+            return new UpdateAssignment(targetColumn, source, false, false);
         }
 
         Matcher selfArithmetic = Pattern.compile(
@@ -10056,8 +10496,47 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 "t." + dmIdentifier(sourceColumn.text())
                         + " " + selfArithmetic.group("operator")
                         + " " + selfArithmetic.group("amount"),
+                false,
                 false
         );
+    }
+
+    private boolean isNoOpUpsertAssignment(
+            String source,
+            IdentifierName targetColumn,
+            String tableName
+    ) {
+        List<String> parts = identifierReferenceKeys(source);
+        if (parts.isEmpty() || !parts.get(parts.size() - 1).equals(targetColumn.key())) {
+            return false;
+        }
+        if (parts.size() == 1) {
+            return true;
+        }
+        String tableKey = identifierKey(tableLeaf(tableName));
+        return parts.size() == 2 && parts.get(0).equals(tableKey);
+    }
+
+    private List<String> identifierReferenceKeys(String expression) {
+        String trimmed = expression == null ? "" : expression.trim();
+        List<String> parts = new ArrayList<>();
+        int index = 0;
+        while (index < trimmed.length()) {
+            IdentifierToken token = readIdentifierToken(trimmed, index);
+            if (token == null) {
+                return List.of();
+            }
+            parts.add(identifierKey(token.text()));
+            index = skipWhitespace(trimmed, token.endIndex());
+            if (index == trimmed.length()) {
+                break;
+            }
+            if (trimmed.charAt(index) != '.') {
+                return List.of();
+            }
+            index = skipWhitespace(trimmed, index + 1);
+        }
+        return List.copyOf(parts);
     }
 
     private IdentifierName readIdentifierName(String expression, boolean allowQualifier) {
@@ -12577,7 +13056,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private record UpdateAssignment(
             IdentifierName column,
             String sourceExpression,
-            boolean valuesReference
+            boolean valuesReference,
+            boolean noOp
     ) {
     }
 
@@ -12605,6 +13085,48 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
         private InsertValues toInsertValues() {
             return insertValues;
+        }
+
+        private String tableName() {
+            return insertValues.tableName();
+        }
+    }
+
+    private record OnDuplicateKeySelectInsert(
+            int insertIndex,
+            int statementEnd,
+            String prefix,
+            String suffix,
+            String tableName,
+            List<InsertColumn> columns,
+            String selectModifier,
+            String sourceTail,
+            String updateClause
+    ) {
+        private OnDuplicateKeySelectInsert {
+            columns = List.copyOf(columns == null ? List.of() : columns);
+            selectModifier = selectModifier == null ? "" : selectModifier;
+            sourceTail = sourceTail == null ? "" : sourceTail;
+            updateClause = updateClause == null ? "" : updateClause;
+        }
+    }
+
+    private record UpsertConversion(
+            String convertedSql,
+            boolean changed,
+            String ruleName,
+            String manualReviewReason
+    ) {
+        private static UpsertConversion unchanged(String sql) {
+            return new UpsertConversion(sql, false, "", "");
+        }
+
+        private static UpsertConversion changed(String sql, String ruleName) {
+            return new UpsertConversion(sql, true, ruleName, "");
+        }
+
+        private static UpsertConversion manual(String sql, String reason) {
+            return new UpsertConversion(sql, false, "", reason);
         }
     }
 

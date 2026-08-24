@@ -160,7 +160,14 @@ public class MigrateCommand implements Callable<Integer> {
                 }
                 summaryTracker.skipMigration("--sql-scripts-only 模式未执行 Maven、Mapper 和应用文件迁移。");
                 summaryTracker.startSqlScriptValidation(true);
-                SqlScriptReportResult sqlScriptResult = migrateSqlScripts(context, validationEnvironment);
+                SqlRewriteConfig scriptRewriteConfig = withBatchUpsertKeys(
+                        sqlRewriteConfigLoader.load(rewriteConfigPath(context))
+                );
+                SqlScriptReportResult sqlScriptResult = migrateSqlScripts(
+                        context,
+                        validationEnvironment,
+                        scriptRewriteConfig
+                );
                 CliLogger.info("SQL script migration report written: " + sqlScriptResult.reportPaths().markdownPath());
                 summaryTracker.sqlScriptCompleted(sqlScriptResult.report(), sqlScriptResult.reportPaths());
                 summaryTracker.skipMapperValidation("--sql-scripts-only 模式未请求 Mapper 数据库验证。");
@@ -322,7 +329,11 @@ public class MigrateCommand implements Callable<Integer> {
                 CliLogger.info("SQL script migration skipped: --sql-root not provided.");
             }
             summaryTracker.startSqlScriptValidation(sqlScriptMigrationRequested());
-            SqlScriptReportResult sqlScriptReportResult = migrateSqlScripts(context, validationEnvironment);
+            SqlScriptReportResult sqlScriptReportResult = migrateSqlScripts(
+                    context,
+                    validationEnvironment,
+                    rewriteConfigUpdate.rewriteConfig()
+            );
             if (sqlScriptReportResult != null) {
                 CliLogger.info("SQL script migration report written: "
                         + sqlScriptReportResult.reportPaths().markdownPath());
@@ -871,7 +882,8 @@ public class MigrateCommand implements Callable<Integer> {
 
     private SqlScriptReportResult migrateSqlScripts(
             AdapterContext context,
-            DmValidationEnvironment validationEnvironment
+            DmValidationEnvironment validationEnvironment,
+            SqlRewriteConfig rewriteConfig
     ) throws Exception {
         if (!sqlScriptMigrationRequested()) {
             return null;
@@ -887,7 +899,8 @@ public class MigrateCommand implements Callable<Integer> {
                 preservedSqlPaths,
                 validationEnvironment,
                 targetCapabilities,
-                context.reportDir().resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME)
+                context.reportDir().resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME),
+                rewriteConfig
         ));
         lastSqlScriptMigrationReport = report;
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());

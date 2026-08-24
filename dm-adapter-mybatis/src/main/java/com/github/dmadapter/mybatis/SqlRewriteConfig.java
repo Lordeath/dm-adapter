@@ -131,7 +131,17 @@ public record SqlRewriteConfig(
         if (tableName == null || tableName.isBlank()) {
             return List.of();
         }
-        return tableKeyColumns.getOrDefault(normalizeTableName(tableName), List.of());
+        String normalized = normalizeTableName(tableName);
+        List<String> exact = tableKeyColumns.get(normalized);
+        if (exact != null && !exact.isEmpty()) {
+            return exact;
+        }
+        String leaf = tableLeaf(normalized);
+        List<List<String>> leafMatches = tableKeyColumns.entrySet().stream()
+                .filter(entry -> tableLeaf(entry.getKey()).equals(leaf))
+                .map(Map.Entry::getValue)
+                .toList();
+        return leafMatches.size() == 1 ? leafMatches.get(0) : List.of();
     }
 
     public List<String> methodKeyColumns(String methodKey) {

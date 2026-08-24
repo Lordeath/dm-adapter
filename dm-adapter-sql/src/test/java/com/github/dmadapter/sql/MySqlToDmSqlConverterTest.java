@@ -3914,6 +3914,97 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsInsertSelectOnDuplicateKeyUpdateToOrderedCursorMerge() {
+        SqlConversionResult result = converter.convert("""
+                INSERT INTO ns_core_resourcebutton (
+                    ENTERPRISE_ID,
+                    ORGANIZATION_ID,
+                    JE_CORE_RESOURCEBUTTON_ID,
+                    RESOURCEBUTTON_FUNCINFO_ID,
+                    RESOURCEBUTTON_NAME
+                )
+                SELECT eo.enterprise_id,
+                       eo.organization_id,
+                       v_button_id,
+                       v_func_id,
+                       v_button_name AS old_name
+                FROM tmp_aoub_enterprise eo
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM ns_core_resourcebutton rb
+                    WHERE rb.ENTERPRISE_ID = eo.enterprise_id
+                )
+                ON DUPLICATE KEY UPDATE
+                    ID = ns_core_resourcebutton.ID;
+                """, List.of(
+                "ENTERPRISE_ID",
+                "JE_CORE_RESOURCEBUTTON_ID",
+                "RESOURCEBUTTON_FUNCINFO_ID"
+        ));
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains(
+                        "FOR dm_source IN (",
+                        "v_button_name AS RESOURCEBUTTON_NAME",
+                        "MERGE INTO ns_core_resourcebutton t",
+                        "ON (t.ENTERPRISE_ID = s.ENTERPRISE_ID "
+                                + "AND t.JE_CORE_RESOURCEBUTTON_ID = s.JE_CORE_RESOURCEBUTTON_ID "
+                                + "AND t.RESOURCEBUTTON_FUNCINFO_ID = s.RESOURCEBUTTON_FUNCINFO_ID)",
+                        "WHEN NOT MATCHED THEN INSERT"
+                )
+                .doesNotContain("old_name AS RESOURCEBUTTON_NAME")
+                .doesNotContain("WHEN MATCHED")
+                .doesNotContainIgnoringCase("ON DUPLICATE KEY UPDATE");
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_INSERT_SELECT_ON_DUPLICATE_KEY_UPDATE_TO_DM_CURSOR_MERGE_RULE
+        );
+    }
+
+    @Test
+    void classifiesMissingInsertSelectUpsertKeysPrecisely() {
+        SqlConversionResult result = converter.convert("""
+                INSERT INTO sample_target(id, name)
+                SELECT source_id, source_name FROM sample_source
+                ON DUPLICATE KEY UPDATE name = VALUES(name)
+                """);
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason())
+                .startsWith(MySqlToDmSqlConverter.MISSING_UPSERT_KEY_COLUMNS + ":")
+                .contains("sample_target", "ON DUPLICATE KEY UPDATE");
+    }
+
+    @Test
+    void classifiesInsertSelectUpsertKeyMissingFromInsertColumns() {
+        SqlConversionResult result = converter.convert("""
+                INSERT INTO sample_target(id, name)
+                SELECT source_id, source_name FROM sample_source
+                ON DUPLICATE KEY UPDATE name = VALUES(name)
+                """, List.of("tenant_id"));
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason())
+                .startsWith(MySqlToDmSqlConverter.UPSERT_KEY_NOT_IN_INSERT_COLUMNS + ":")
+                .contains("sample_target", "tenant_id");
+    }
+
+    @Test
+    void classifiesUnsafeInsertSelectUpdateAssignment() {
+        SqlConversionResult result = converter.convert("""
+                INSERT INTO sample_target(id, score)
+                SELECT source_id, source_score FROM sample_source
+                ON DUPLICATE KEY UPDATE score = score + VALUES(score)
+                """, List.of("id"));
+
+        assertThat(result.manualReviewRequired()).isTrue();
+        assertThat(result.reason())
+                .startsWith(MySqlToDmSqlConverter.UNSAFE_UPSERT_UPDATE_ASSIGNMENT + ":")
+                .contains("sample_target");
+    }
+
+    @Test
     void marksOnDuplicateKeyUpdateWithMultipleCandidateKeysForManualReview() {
         SqlConversionResult result = converter.convert("""
                 insert into user(id, tenant_id, name) values(1, 2, 'a')
