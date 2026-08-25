@@ -287,6 +287,13 @@ class SqlScriptMigrator {
                     + "\\((?<columns>[^()]*)\\)"
                     + "(?:(?!;).)*?\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b"
     );
+    private static final Pattern MYSQL_ON_DUPLICATE_KEY_UPDATE_PATTERN = Pattern.compile(
+            "(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b"
+    );
+    private static final Pattern MYSQL_SQL_EXCEPTION_EXIT_HANDLER_PATTERN = Pattern.compile(
+            "(?is)\\bDECLARE\\s+EXIT\\s+HANDLER\\s+FOR\\s+SQLEXCEPTION\\s*"
+                    + "BEGIN\\b(?<body>.*?)\\bRESIGNAL\\s*;\\s*END\\s*;"
+    );
     private static final Pattern CONVERTED_SIMPLE_DATE_END_TRIGGER_PATTERN = Pattern.compile(
             "(?is)^\\s*CREATE\\s+OR\\s+REPLACE\\s+TRIGGER\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
                     + "BEFORE\\s+(?:INSERT|UPDATE)\\s+ON\\s+" + SQL_IDENTIFIER_TOKEN + "\\s+"
@@ -5634,6 +5641,18 @@ class SqlScriptMigrator {
         return false;
     }
 
+    private boolean containsIgnoreCase(String value, String candidate) {
+        if (value == null || candidate == null || candidate.length() > value.length()) {
+            return false;
+        }
+        for (int index = 0; index <= value.length() - candidate.length(); index++) {
+            if (value.regionMatches(true, index, candidate, 0, candidate.length())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean shouldApplyDefaultTemporaryColumns(String tableName, LinkedHashSet<String> columns) {
         if (columns.isEmpty()) {
             return true;
@@ -7461,10 +7480,12 @@ class SqlScriptMigrator {
     }
 
     private boolean containsOnDuplicateKeyUpdate(String sql) {
-        String searchable = replaceIgnoredSqlWithSpaces(sql == null ? "" : sql);
-        return Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
-                .matcher(searchable)
-                .find();
+        String candidate = sql == null ? "" : sql;
+        if (!containsIgnoreCase(candidate, "DUPLICATE")) {
+            return false;
+        }
+        String searchable = replaceIgnoredSqlWithSpaces(candidate);
+        return MYSQL_ON_DUPLICATE_KEY_UPDATE_PATTERN.matcher(searchable).find();
     }
 
     private SafeRuleConversion convertEmbeddedSqlLiterals(String sql, String targetSchema) {
@@ -9844,19 +9865,19 @@ class SqlScriptMigrator {
     }
 
     private String convertMysqlSqlExceptionExitHandler(String sql) {
-        if (!isCreateProcedureStatement(sql)) {
+        if (!isCreateProcedureStatement(sql)
+                || !containsIgnoreCase(sql, "DECLARE")
+                || !containsIgnoreCase(sql, "EXIT")
+                || !containsIgnoreCase(sql, "HANDLER")
+                || !containsIgnoreCase(sql, "SQLEXCEPTION")) {
             return sql;
         }
-        Pattern handlerPattern = Pattern.compile(
-                "(?is)[\\t ]*DECLARE\\s+EXIT\\s+HANDLER\\s+FOR\\s+SQLEXCEPTION\\s*"
-                        + "BEGIN\\b(?<body>.*?)\\bRESIGNAL\\s*;\\s*END\\s*;"
-        );
         String searchable = replaceIgnoredSqlWithSpaces(sql);
-        Matcher handler = handlerPattern.matcher(searchable);
+        Matcher handler = MYSQL_SQL_EXCEPTION_EXIT_HANDLER_PATTERN.matcher(searchable);
         if (!handler.find()) {
             return sql;
         }
-        int handlerStart = handler.start();
+        int handlerStart = horizontalWhitespaceStartOnSameLine(sql, handler.start());
         int handlerEnd = handler.end();
         int handlerBodyStart = handler.start("body");
         int handlerBodyEnd = handler.end("body");
@@ -9916,6 +9937,18 @@ class SqlScriptMigrator {
         return withoutHandler.substring(0, procedureEndIndex)
                 + exceptionClause
                 + withoutHandler.substring(procedureEndIndex);
+    }
+
+    private int horizontalWhitespaceStartOnSameLine(String value, int index) {
+        int cursor = Math.min(index, value.length());
+        while (cursor > 0) {
+            char previous = value.charAt(cursor - 1);
+            if (previous != ' ' && previous != '\t') {
+                break;
+            }
+            cursor--;
+        }
+        return cursor;
     }
 
     private String convertMysqlCursorHandlerLoops(String sql) {

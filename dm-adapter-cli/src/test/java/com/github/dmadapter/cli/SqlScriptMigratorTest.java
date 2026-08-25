@@ -35,6 +35,7 @@ import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 class SqlScriptMigratorTest {
     @TempDir
@@ -8177,6 +8178,94 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void skipsLargeIgnoredSqlExceptionExitHandlerTextWithinTimeLimit() {
+        String ignoredHandler = "x".repeat(150_000)
+                + " DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN RESIGNAL; END; "
+                + "x".repeat(150_000);
+        String procedure = """
+                CREATE PROCEDURE large_dynamic_sql()
+                BEGIN
+                    SET v_sql = '%s';
+                    -- DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN RESIGNAL; END;
+                    SELECT 1;
+                END;
+                """.formatted(ignoredHandler);
+
+        String converted = assertTimeoutPreemptively(
+                Duration.ofSeconds(3),
+                () -> convertMysqlSqlExceptionExitHandler(procedure)
+        );
+
+        assertThat(converted).isSameAs(procedure);
+    }
+
+    @Test
+    void convertsIndentedSqlExceptionExitHandlerAndPreservesItsBody() throws Exception {
+        String procedure = """
+                CREATE PROCEDURE refresh_summary()
+                BEGIN
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        INSERT INTO migration_log(message) VALUES ('refresh failed');
+                        RESIGNAL;
+                    END;
+                    INSERT INTO summary_result(id) VALUES (1);
+                END;
+                """;
+
+        String converted = convertMysqlSqlExceptionExitHandler(procedure);
+
+        assertThat(converted)
+                .contains(
+                        "INSERT INTO summary_result(id) VALUES (1);",
+                        "EXCEPTION\n",
+                        "WHEN OTHERS THEN",
+                        "INSERT INTO migration_log(message) VALUES ('refresh failed');",
+                        "RAISE;"
+                )
+                .doesNotContain("DECLARE EXIT HANDLER", "RESIGNAL");
+    }
+
+    @Test
+    void keepsAmbiguousOrUnsupportedSqlExceptionExitHandlersUnchanged() throws Exception {
+        String multipleHandlers = """
+                CREATE PROCEDURE multiple_handlers()
+                BEGIN
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN RESIGNAL; END;
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN RESIGNAL; END;
+                    SELECT 1;
+                END;
+                """;
+        String missingResignal = """
+                CREATE PROCEDURE handler_without_resignal()
+                BEGIN
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        INSERT INTO migration_log(message) VALUES ('failed');
+                    END;
+                    SELECT 1;
+                END;
+                """;
+        String unsupportedControlFlow = """
+                CREATE PROCEDURE handler_with_if()
+                BEGIN
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        IF retry_count > 0 THEN
+                            SET retry_count = retry_count - 1;
+                        END IF;
+                        RESIGNAL;
+                    END;
+                    SELECT 1;
+                END;
+                """;
+
+        assertThat(convertMysqlSqlExceptionExitHandler(multipleHandlers)).isSameAs(multipleHandlers);
+        assertThat(convertMysqlSqlExceptionExitHandler(missingResignal)).isSameAs(missingResignal);
+        assertThat(convertMysqlSqlExceptionExitHandler(unsupportedControlFlow)).isSameAs(unsupportedControlFlow);
+    }
+
+    @Test
     void keepsSqlExceptionContinueHandlerWithProcedureCallForManualReview() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE PROCEDURE refresh_summary()
@@ -10824,6 +10913,16 @@ class SqlScriptMigratorTest {
                 DmValidationEnvironment.from(Map.of())
         ));
         return new ConvertedScript(report, Files.readString(sqlRootOut.resolve("procedure.sql")));
+    }
+
+    private String convertMysqlSqlExceptionExitHandler(String sql) throws Exception {
+        SqlScriptMigrator subject = migrator(new RecordingValidator());
+        Method method = SqlScriptMigrator.class.getDeclaredMethod(
+                "convertMysqlSqlExceptionExitHandler",
+                String.class
+        );
+        method.setAccessible(true);
+        return (String) method.invoke(subject, sql);
     }
 
     private SqlScriptMigrationReport migrateScriptRoot(Path sqlRoot, Path sqlRootOut) throws Exception {
