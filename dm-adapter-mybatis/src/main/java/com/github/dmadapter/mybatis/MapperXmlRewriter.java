@@ -1882,6 +1882,10 @@ public class MapperXmlRewriter {
                 && !containsMysqlMetadataSql(rewrittenBody)) {
             manualReviewReasons.removeIf(this::isMysqlMetadataManualReviewReason);
         }
+        if (appliedRules.contains(MySqlToDmSqlConverter.MYSQL_REGEXP_OPERATOR_RULE)
+                && !containsKeyword(rewrittenBody, "REGEXP")) {
+            manualReviewReasons.removeIf(this::isMysqlRegexpManualReviewReason);
+        }
         if (!containsMysqlOnDuplicateKeyUpdate(rewrittenBody)) {
             manualReviewReasons.removeIf(this::isMysqlOnDuplicateKeyUpdateManualReviewReason);
         }
@@ -1943,6 +1947,13 @@ public class MapperXmlRewriter {
             if (dynamicGbkOrder.changed()) {
                 converted = dynamicGbkOrder.text();
                 appliedRules.add(MySqlToDmSqlConverter.MYSQL_CONVERT_GBK_ORDER_RULE);
+            }
+
+            SqlConversionResult dynamicRegexp =
+                    mySqlToDmSqlConverter.convertRegexpOperatorExpressions(converted);
+            if (dynamicRegexp.changed()) {
+                converted = dynamicRegexp.convertedSql();
+                addAppliedRules(appliedRules, dynamicRegexp.appliedRules());
             }
         }
 
@@ -3130,6 +3141,10 @@ public class MapperXmlRewriter {
                 && (reason.contains("MySQL metadata SQL")
                 || reason.contains("information_schema")
                 || reason.contains("database()"));
+    }
+
+    private boolean isMysqlRegexpManualReviewReason(String reason) {
+        return reason != null && reason.contains("REGEXP requires manual confirmation");
     }
 
     private boolean containsMysqlOnDuplicateKeyUpdate(String value) {

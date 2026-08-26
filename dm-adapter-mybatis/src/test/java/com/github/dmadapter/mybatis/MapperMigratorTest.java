@@ -8331,6 +8331,96 @@ class MapperMigratorTest {
     }
 
     @Test
+    void convertsRegexpOperatorWhosePatternContainsDynamicForeach() throws Exception {
+        Path mapper = writeFile("src/main/resources/mapper/EventManagementMapper.xml", """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.EventManagementMapper">
+                    <select id="listPageForMap">
+                        select a.id
+                        from ns_event_management a
+                        left join ns_meeting_room_management c on a.meetingRoom = c.id
+                        <where>
+                            a.`deleteFlag` = 0
+                            <if test="seeOrganizationIdList != null and seeOrganizationIdList.size() > 0">
+                                AND CONCAT(',', c.`department`, ',') REGEXP
+                                CONCAT(',(', CONCAT(
+                                <foreach collection="seeOrganizationIdList" item="item" separator=",'|',">
+                                    #{item}
+                                </foreach>
+                                ), '),')
+                            </if>
+                        </where>
+                    </select>
+                </mapper>
+                """);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/EventManagementMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path rewrittenMapper = tempDir.resolve(
+                "src/main/resources/mapper-dm/EventManagementMapper.xml"
+        );
+        String rewritten = Files.readString(rewrittenMapper);
+        assertThat(rewritten)
+                .contains("AND REGEXP_LIKE(CONCAT(',', c.`department`, ','), CONCAT(',(',")
+                .contains("<foreach collection=\"seeOrganizationIdList\" item=\"item\" separator=\",'|',\">")
+                .contains(", '),'))")
+                .doesNotContain("CONCAT(',(', CONCAT(")
+                .doesNotContain(" REGEXP\n");
+        Configuration configuration = new Configuration();
+        try (var input = Files.newInputStream(rewrittenMapper)) {
+            new XMLMapperBuilder(
+                    input,
+                    configuration,
+                    "mapper-dm/EventManagementMapper.xml",
+                    configuration.getSqlFragments()
+            ).parse();
+        }
+        String singletonSql = configuration
+                .getMappedStatement("com.example.EventManagementMapper.listPageForMap")
+                .getBoundSql(Map.of("seeOrganizationIdList", List.of(2L)))
+                .getSql()
+                .replaceAll("\\s+", " ");
+        assertThat(singletonSql)
+                .contains("REGEXP_LIKE")
+                .contains("CONCAT(',(', ?")
+                .contains("'),'))")
+                .doesNotContain("CONCAT(?)", "'|'");
+        assertThat(countMatches(singletonSql, "?")).isEqualTo(1);
+        String multipleSql = configuration
+                .getMappedStatement("com.example.EventManagementMapper.listPageForMap")
+                .getBoundSql(Map.of("seeOrganizationIdList", List.of(2L, 5L)))
+                .getSql()
+                .replaceAll("\\s+", " ");
+        assertThat(multipleSql)
+                .contains("REGEXP_LIKE")
+                .contains("'|'")
+                .doesNotContain("CONCAT(?)");
+        assertThat(countMatches(multipleSql, "?")).isEqualTo(2);
+        assertThat(result.automaticConversions()).singleElement().satisfies(change ->
+                assertThat(change.appliedRules())
+                        .contains(
+                                MySqlToDmSqlConverter.MYSQL_REGEXP_OPERATOR_RULE,
+                                MySqlToDmSqlConverter.MYSQL_SINGLE_ARGUMENT_CONCAT_RULE
+                        ));
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void retainsUnresolvedDynamicCreateTableOptionForManualReview() throws Exception {
         Path mapper = writeFile("src/main/resources/mapper/DynamicEngineMapper.xml", """
                 <?xml version="1.0" encoding="UTF-8"?>
