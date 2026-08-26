@@ -2723,6 +2723,34 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsOnlyRegexpOperatorAcrossDynamicForeachWithoutChangingXmlTags() {
+        SqlConversionResult result = converter.convertRegexpOperatorExpressions("""
+                <if test="seeOrganizationIdList != null and seeOrganizationIdList.size() > 0">
+                    AND CONCAT(',', c.`department`, ',') REGEXP
+                    CONCAT(',(', CONCAT(
+                    <foreach collection="seeOrganizationIdList" item="item" separator=",'|',">
+                        #{item}
+                    </foreach>
+                    ), '),')
+                </if>
+                """);
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo("""
+                <if test="seeOrganizationIdList != null and seeOrganizationIdList.size() > 0">
+                    AND REGEXP_LIKE(CONCAT(',', c.`department`, ','), CONCAT(',(', <foreach collection="seeOrganizationIdList" item="item" separator=",'|',">
+                        #{item}
+                    </foreach>, '),'))
+                </if>
+                """);
+        assertThat(result.appliedRules()).containsExactly(
+                MySqlToDmSqlConverter.MYSQL_REGEXP_OPERATOR_RULE,
+                MySqlToDmSqlConverter.MYSQL_SINGLE_ARGUMENT_CONCAT_RULE
+        );
+    }
+
+    @Test
     void convertsUnsignedCastAndAddsRecursiveCteColumnAliases() {
         SqlConversionResult result = converter.convert("""
                 WITH RECURSIVE OrganizationHierarchy AS (

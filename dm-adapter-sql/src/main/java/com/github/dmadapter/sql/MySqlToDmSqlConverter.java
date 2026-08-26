@@ -639,6 +639,25 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 : SqlConversionResult.unchanged(sql);
     }
 
+    public SqlConversionResult convertRegexpOperatorExpressions(String sql) {
+        if (sql == null || sql.isBlank()) {
+            return SqlConversionResult.unchanged(sql == null ? "" : sql);
+        }
+        GenericConversion regexpConversion = convertRegexpOperators(sql);
+        if (!regexpConversion.changed()) {
+            return SqlConversionResult.unchanged(sql);
+        }
+        String converted = regexpConversion.convertedSql();
+        List<String> rules = new ArrayList<>();
+        rules.add(MYSQL_REGEXP_OPERATOR_RULE);
+        GenericConversion singleArgumentConcatConversion = convertSingleArgumentConcat(converted);
+        if (singleArgumentConcatConversion.changed()) {
+            converted = singleArgumentConcatConversion.convertedSql();
+            rules.add(MYSQL_SINGLE_ARGUMENT_CONCAT_RULE);
+        }
+        return SqlConversionResult.changed(sql, converted, rules);
+    }
+
     @Override
     public SqlConversionResult convert(String sql, List<String> upsertKeyColumns) {
         return convert(sql, upsertKeyColumns, List.of());
@@ -1903,12 +1922,31 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         ).contains(tagName)) {
             return false;
         }
-        return sql.indexOf('>', cursor) >= 0;
+        return findMyBatisXmlTagEnd(sql, cursor) >= 0;
     }
 
     private int skipMyBatisXmlTag(String sql, int index) {
-        int end = sql.indexOf('>', index + 1);
+        int end = findMyBatisXmlTagEnd(sql, index + 1);
         return end < 0 ? index + 1 : end + 1;
+    }
+
+    private int findMyBatisXmlTagEnd(String sql, int start) {
+        char quote = '\0';
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (quote != '\0') {
+                if (current == quote) {
+                    quote = '\0';
+                }
+            } else if (current == '\'' || current == '"') {
+                quote = current;
+            } else if (current == '>') {
+                return index;
+            }
+            index++;
+        }
+        return -1;
     }
 
     private String unsupportedReason(String sql) {
@@ -6674,6 +6712,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = skipUntilLineEnd(sql, index);
             } else if (startsBlockComment(sql, index)) {
                 index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsMyBatisXmlTag(sql, index)) {
+                index = skipMyBatisXmlTag(sql, index);
             } else if (startsKeyword(sql, index, "REGEXP")) {
                 RegexpExpression expression = readRegexpExpression(sql, index);
                 if (expression != null && expression.startIndex() >= lastCopiedIndex) {
