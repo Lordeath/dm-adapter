@@ -2388,6 +2388,69 @@ class MapperMigratorTest {
     }
 
     @Test
+    void configuredBatchUpsertReportsKeyColumnMissingFromInsertInChinese() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.newsee.charge.dao.NsMeterUseDailyDetailMapper">
+                    <insert id="insertBatch" parameterType="java.util.List">
+                        insert into ns_meter_use_daily_detail (
+                            precinct_id, meter_id, use_date
+                        )
+                        values
+                        <foreach collection="list" item="item" separator=",">
+                            (#{item.precinctId}, #{item.meterId}, #{item.useDate})
+                        </foreach>
+                        on duplicate key update
+                            precinct_id = values(precinct_id)
+                    </insert>
+                </mapper>
+                """;
+        Path mapper = writeFile(
+                "src/main/resources/mapper/NsMeterUseDailyDetailMapper.xml",
+                originalXml
+        );
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(
+                        mapper.toString(),
+                        "mapper/NsMeterUseDailyDetailMapper.xml"
+                )),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter(),
+                new SqlRewriteConfig(
+                        Map.of(
+                                "ns_meter_use_daily_detail",
+                                List.of("meter_id", "use_date", "is_delete")
+                        ),
+                        Map.of()
+                )
+        );
+
+        assertThat(result.manualReviewItems())
+                .singleElement()
+                .satisfies(item -> assertThat(item.reason())
+                        .contains(MySqlToDmSqlConverter.UPSERT_KEY_NOT_IN_INSERT_COLUMNS)
+                        .contains("表 `ns_meter_use_daily_detail`")
+                        .contains("[meter_id, use_date, is_delete]")
+                        .contains("冲突键列 [is_delete] 未出现在 INSERT 列表中")
+                        .contains("如果缺失列定义了默认值，MySQL 会使用该默认值参与唯一键判断")
+                        .doesNotContain(MySqlToDmSqlConverter.MISSING_UPSERT_KEY_COLUMNS)
+                        .doesNotContain("<unknown>")
+                        .doesNotContain("Statement contains dynamic XML elements"));
+    }
+
+    @Test
     void configuredBatchUpsertWithCurrentTimestampIsRewrittenToMerge() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
