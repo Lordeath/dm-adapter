@@ -811,8 +811,8 @@ public class MapperXmlRewriter {
     }
 
     private String dynamicXmlManualReviewReason(List<String> manualReviewReasons) {
-        return "Statement contains dynamic XML elements with unresolved compatibility risks. "
-                + "Additional SQL review: " + String.join("; ", manualReviewReasons);
+        return "动态 Mapper SQL 存在尚未解决的兼容性风险。具体原因："
+                + String.join("；", manualReviewReasons);
     }
 
     private String statementKey(String namespace, String statementId) {
@@ -1871,6 +1871,13 @@ public class MapperXmlRewriter {
             changed = true;
         }
         addManualReviewReasons(manualReviewReasons, structuralConversion.manualReviewReasons());
+        if (manualReviewReasons.stream().anyMatch(reason -> reason.startsWith(
+                MySqlToDmSqlConverter.UPSERT_KEY_NOT_IN_INSERT_COLUMNS
+        ))) {
+            manualReviewReasons.removeIf(reason -> reason.contains(
+                    MySqlToDmSqlConverter.MISSING_UPSERT_KEY_COLUMNS
+            ));
+        }
         if ((appliedRules.contains(MySqlToDmSqlConverter.MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE)
                 || appliedRules.contains(
                         MySqlToDmSqlConverter.MYSQL_HIERARCHY_USER_VARIABLE_TO_DM_CONNECT_BY_RULE
@@ -2085,6 +2092,15 @@ public class MapperXmlRewriter {
         if (!batchMerge.equals(converted)) {
             appliedRules.add(MYBATIS_DYNAMIC_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
             converted = batchMerge;
+        } else {
+            String missingKeyReason = configuredBatchUpsertMissingKeyReason(
+                    converted,
+                    statementKey,
+                    rewriteConfig
+            );
+            if (!missingKeyReason.isBlank()) {
+                addManualReviewReasons(manualReviewReasons, List.of(missingKeyReason));
+            }
         }
 
         String foreachMerge = convertForeachOnDuplicateKeyUpdate(converted, statementKey, sqlConverter, rewriteConfig);
@@ -6060,6 +6076,63 @@ public class MapperXmlRewriter {
             return body;
         }
         return wrapper == null ? converted : wrapper.wrap(converted);
+    }
+
+    private String configuredBatchUpsertMissingKeyReason(
+            String body,
+            String statementKey,
+            SqlRewriteConfig rewriteConfig
+    ) {
+        IfWrapper wrapper = readWrappingIf(body);
+        String candidate = wrapper == null ? body : wrapper.body();
+        Matcher matcher = BATCH_ON_DUPLICATE_KEY_UPDATE_PATTERN.matcher(candidate);
+        if (!matcher.matches()) {
+            return "";
+        }
+        String table = matcher.group("table").trim();
+        List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, table);
+        if (keyColumns.isEmpty()) {
+            return "";
+        }
+
+        Set<String> insertColumns = splitTopLevelComma(matcher.group("columns")).stream()
+                .map(String::trim)
+                .filter(column -> !column.isBlank())
+                .map(this::normalizeIdentifier)
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        List<BatchUpdateAssignment> updateAssignments = updateAssignments(matcher.group("updates"));
+        if (updateAssignments == null) {
+            return "";
+        }
+        Map<String, BatchUpdateAssignment> assignmentsByTarget = new LinkedHashMap<>();
+        for (BatchUpdateAssignment assignment : updateAssignments) {
+            assignmentsByTarget.put(normalizeIdentifier(assignment.target()), assignment);
+        }
+
+        List<String> missingKeyColumns = new ArrayList<>();
+        for (String keyColumn : keyColumns) {
+            String normalizedKey = normalizeIdentifier(keyColumn);
+            if (insertColumns.contains(normalizedKey)) {
+                continue;
+            }
+            BatchUpdateAssignment assignment = assignmentsByTarget.get(normalizedKey);
+            if (assignment == null || assignment.valuesReference()) {
+                missingKeyColumns.add(keyColumn);
+            }
+        }
+        if (missingKeyColumns.isEmpty()) {
+            return "";
+        }
+
+        String displayTable = table.replace("`", "").replace("\"", "")
+                .replaceAll("\\s*\\.\\s*", ".");
+        return MySqlToDmSqlConverter.UPSERT_KEY_NOT_IN_INSERT_COLUMNS
+                + "：表 `" + displayTable + "` 已配置冲突键 " + keyColumns
+                + "，但冲突键列 " + missingKeyColumns
+                + " 未出现在 INSERT 列表中，也未在 ON DUPLICATE KEY UPDATE 中提供可用于达梦 MERGE 的固定值。"
+                + "如果缺失列定义了默认值，MySQL 会使用该默认值参与唯一键判断；当前 Mapper SQL 未显式提供这些值，"
+                + "dm-adapter 无法安全构造等价的 MERGE 条件。请对照真实 DDL，"
+                + "在 INSERT 中显式提供这些冲突键列及其实际值或默认值。";
     }
 
     private String convertBatchInsertIgnoreToDuplicateHandlerBlock(
