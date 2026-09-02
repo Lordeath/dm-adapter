@@ -4619,6 +4619,63 @@ class MapperMigratorTest {
     }
 
     @Test
+    void dynamicUpdateSetIgnoresAssignmentsInsideXmlComments() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.CertificateManagementMapper">
+                    <update id="updateBatchSelective">
+                        update ns_certificate_management
+                        <set>
+                            <if test="item.certificateAttachment != null">
+                                certificateAttachment = #{item.certificateAttachment, jdbcType=VARCHAR },
+                            </if>
+                            <!--<if test="item.certificateAttachment != null">
+                                certificateAttachment =
+                                CASE
+                                WHEN certificateAttachment IS NULL OR certificateAttachment = ''
+                                THEN #{item.certificateAttachment, jdbcType=VARCHAR}
+                                ELSE CONCAT(certificateAttachment, ',', #{item.certificateAttachment, jdbcType=VARCHAR})
+                                END,
+                            </if>-->
+                            <if test="item.remarks != null">
+                                remarks = #{item.remarks, jdbcType=VARCHAR },
+                            </if>
+                        </set>
+                        where id = #{item.id}
+                    </update>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/CertificateManagementMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true,
+                true,
+                true,
+                false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/CertificateManagementMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        String rewritten = Files.readString(
+                tempDir.resolve("src/main/resources/mapper-dm/CertificateManagementMapper.xml")
+        );
+        assertThat(rewritten)
+                .contains("<if test=\"item.certificateAttachment != null\">")
+                .doesNotContain("item.certificateAttachment == null")
+                .contains("<!--<if test=\"item.certificateAttachment != null\">");
+        assertThat(result.automaticConversions()).isEmpty();
+        assertThat(result.manualReviewItems()).isEmpty();
+    }
+
+    @Test
     void dynamicUpdateSetRemovesDuplicateAssignments() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
