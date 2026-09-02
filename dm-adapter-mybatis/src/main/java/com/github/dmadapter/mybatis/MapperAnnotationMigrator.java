@@ -201,7 +201,7 @@ public class MapperAnnotationMigrator {
             fileChanges.add(FileChange.planned(
                     source.toString(),
                     Files.exists(source) ? "UPDATE" : "CREATE",
-                    "Extract MyBatis annotation SQL to mapper XML"
+                    "计划将 MyBatis 注解 SQL 提取到 Mapper XML"
             ));
         }
         for (List<AnnotationStatement> statements : existingStatementsBySource.values()) {
@@ -209,7 +209,7 @@ public class MapperAnnotationMigrator {
                 fileChanges.add(FileChange.planned(
                         javaSource.toString(),
                         "UPDATE",
-                        "Remove extracted MyBatis annotation SQL from Java mapper"
+                        "计划从 Java Mapper 中移除已提取的 MyBatis 注解 SQL"
                 ));
             }
         }
@@ -231,11 +231,11 @@ public class MapperAnnotationMigrator {
                     fileChanges.add(FileChange.applied(
                             source.toString(),
                             "UPDATE",
-                            "Fixed extracted MyBatis annotation SQL in mapper XML"
+                            "已修复 Mapper XML 中提取出的 MyBatis 注解 SQL"
                     ));
                 }
             } catch (Exception e) {
-                warnings.add("Failed to fix extracted MyBatis annotation SQL in " + source + ": " + e.getMessage());
+                warnings.add("修复 Mapper XML 中提取出的 MyBatis 注解 SQL 失败：" + source + "：" + e.getMessage());
             }
         }
         for (Map.Entry<Path, List<AnnotationStatement>> entry : statementsBySource.entrySet()) {
@@ -248,11 +248,11 @@ public class MapperAnnotationMigrator {
                 fileChanges.add(FileChange.applied(
                         source.toString(),
                         existed ? "UPDATE" : "CREATE",
-                        "Extracted MyBatis annotation SQL to mapper XML"
+                        "已将 MyBatis 注解 SQL 提取到 Mapper XML"
                 ));
                 statementsToClean.computeIfAbsent(source, ignored -> new ArrayList<>()).addAll(entry.getValue());
             } catch (Exception e) {
-                warnings.add("Failed to extract MyBatis annotation SQL into " + source + ": " + e.getMessage());
+                warnings.add("将 MyBatis 注解 SQL 提取到 Mapper XML 失败：" + source + "：" + e.getMessage());
             }
         }
         try {
@@ -260,7 +260,7 @@ public class MapperAnnotationMigrator {
                     .flatMap(List::stream)
                     .toList()));
         } catch (Exception e) {
-            warnings.add("Failed to remove extracted MyBatis annotation SQL from Java mapper: " + e.getMessage());
+            warnings.add("从 Java Mapper 中移除已提取的 MyBatis 注解 SQL 失败：" + e.getMessage());
         }
         return new MapperMigrationResult(fileChanges, List.of(), List.of(), warnings);
     }
@@ -326,7 +326,7 @@ public class MapperAnnotationMigrator {
             fileChanges.add(FileChange.planned(
                     target.toString(),
                     Files.exists(target) ? "UPDATE" : "CREATE",
-                    "Extract MyBatis annotation SQL to mapper-dm XML"
+                    "计划将 MyBatis 注解 SQL 提取到 mapper-dm XML"
             ));
             for (AnnotationStatement statement : entry.getValue()) {
                 SqlConversionResult conversion = sqlConverter.convert(
@@ -397,7 +397,7 @@ public class MapperAnnotationMigrator {
                 fileChanges.add(FileChange.applied(
                         target.toString(),
                         existed ? "UPDATE" : "CREATE",
-                        "Extracted MyBatis annotation SQL to mapper-dm XML"
+                        "已将 MyBatis 注解 SQL 提取到 mapper-dm XML"
                 ));
                 MapperRewriteResult rewriteResult = mapperXmlRewriter.rewrite(
                         target,
@@ -411,7 +411,7 @@ public class MapperAnnotationMigrator {
                 manualReviewItems.addAll(annotationConversions(rewriteResult.manualReviewItems(), statements));
                 warnings.addAll(rewriteResult.warnings());
             } catch (Exception e) {
-                warnings.add("Failed to extract MyBatis annotation SQL into " + target + ": " + e.getMessage());
+                warnings.add("将 MyBatis 注解 SQL 提取到 Mapper XML 失败：" + target + "：" + e.getMessage());
             }
         }
 
@@ -442,7 +442,7 @@ public class MapperAnnotationMigrator {
                 fileChanges.add(FileChange.applied(
                         javaFile.toString(),
                         "UPDATE",
-                        "Removed extracted MyBatis annotation SQL from Java mapper"
+                        "已从 Java Mapper 中移除提取后的 MyBatis 注解 SQL"
                 ));
             }
         }

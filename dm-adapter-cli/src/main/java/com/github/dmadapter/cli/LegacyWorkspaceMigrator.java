@@ -38,7 +38,7 @@ class LegacyWorkspaceMigrator {
         try {
             Files.createDirectories(target.getParent());
             Files.copy(source, target);
-            return Optional.of("Copied legacy dm-adapter config from " + source + " to " + target + ".");
+            return Optional.of("已将旧版 dm-adapter 配置从 " + source + " 复制到 " + target + "。");
         } catch (IOException e) {
             throw new DmAdapterException("Failed to copy legacy dm-adapter config from "
                     + source + " to " + target, e);

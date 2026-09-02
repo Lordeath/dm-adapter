@@ -25,7 +25,7 @@ class UpsertKeyInferenceTest {
 
         assertThat(result.inferred()).isTrue();
         assertThat(result.keyColumns()).containsExactly("user_id");
-        assertThat(result.source()).contains("primary key");
+        assertThat(result.source()).contains("主键");
     }
 
     @Test
@@ -44,7 +44,7 @@ class UpsertKeyInferenceTest {
 
         assertThat(result.inferred()).isTrue();
         assertThat(result.keyColumns()).containsExactly("tenant_id", "user_account");
-        assertThat(result.source()).contains("unique key");
+        assertThat(result.source()).contains("唯一键");
     }
 
     @Test
@@ -85,7 +85,7 @@ class UpsertKeyInferenceTest {
         assertThat(result.inferred()).isFalse();
         assertThat(result.resolutionCode())
                 .isEqualTo(UpsertKeyInference.RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED);
-        assertThat(result.reason()).contains("Multiple unique keys");
+        assertThat(result.reason()).contains("匹配到多个唯一键");
     }
 
     @Test
@@ -171,7 +171,7 @@ class UpsertKeyInferenceTest {
         assertThat(result.inferred()).isFalse();
         assertThat(result.resolutionCode())
                 .isEqualTo(UpsertKeyInference.RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY);
-        assertThat(result.reason()).contains("No primary key or unique key columns are fully present");
+        assertThat(result.reason()).contains("未完整包含任一主键或唯一键");
     }
 
     @Test
@@ -198,7 +198,7 @@ class UpsertKeyInferenceTest {
         assertThat(result.inferred()).isFalse();
         assertThat(result.resolutionCode())
                 .isEqualTo(UpsertKeyInference.RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT);
-        assertThat(result.reason()).contains("plain INSERT");
+        assertThat(result.reason()).contains("普通 INSERT");
     }
 
     @Test

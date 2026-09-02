@@ -69,14 +69,14 @@ class DmSqlValidationTestGenerator {
                         schema,
                         existingConfigOverrides
                 ),
-                "Generate Dameng SQL validation parameter configuration",
+                "生成达梦 SQL 验证参数配置",
                 fileChanges,
                 true
         );
         writeGeneratedFile(
                 testTarget.path(),
                 javaTestSource(testTarget.packageName()),
-                "Generate framework-independent Dameng SQL validation runner",
+                "生成不依赖框架的达梦 SQL 验证运行器",
                 fileChanges,
                 true
         );

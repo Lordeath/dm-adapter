@@ -157,9 +157,9 @@ class SqlRewriteConfigUpdater {
             if (staleConflictKeyGroups) {
                 model.removeMethodConflictKeyGroups(candidate.methodKey());
                 model.removeMethodResolution(candidate.methodKey());
-                warnings.add("Discarded stale conflictKeyGroups for " + candidate.methodKey()
-                        + " because they no longer match the reachable primary/unique keys "
-                        + "in current project DDL metadata.");
+                warnings.add("已丢弃 " + candidate.methodKey()
+                        + " 的过期 conflictKeyGroups，因为它们已与当前项目 DDL 元数据中"
+                        + "可触发的主键/唯一键不匹配。");
             }
             boolean configured = candidate.outerJoinSource()
                     ? hasConfiguredKeyColumns(model.tableColumns(candidate.tableName()))
@@ -185,29 +185,29 @@ class SqlRewriteConfigUpdater {
                                 inferenceResult.conflictKeyGroups()
                         );
                         model.removeMethodResolution(candidate.methodKey());
-                        warnings.add("Inferred INSERT IGNORE conflictKeyGroups "
+                        warnings.add("已推断 INSERT IGNORE 的 conflictKeyGroups "
                                 + inferenceResult.conflictKeyGroups()
-                                + " for " + candidate.methodKey()
-                                + " from " + inferenceResult.source() + ".");
+                                + "，方法为 " + candidate.methodKey()
+                                + "，来源：" + inferenceResult.source() + "。");
                     } else if (inferenceResult.inferred()) {
                         if (candidate.outerJoinSource()) {
                             model.putTable(candidate.tableName(), inferenceResult.keyColumns());
-                            warnings.add("Inferred source keyColumns " + inferenceResult.keyColumns()
-                                    + " for outer UPDATE JOIN table " + candidate.tableName()
-                                    + " from " + inferenceResult.source() + ".");
+                            warnings.add("已推断外连接 UPDATE JOIN 表 " + candidate.tableName()
+                                    + " 的源 keyColumns " + inferenceResult.keyColumns()
+                                    + "，来源：" + inferenceResult.source() + "。");
                         } else {
                             inferredMethodKeys.put(candidate.methodKey(), inferenceResult.keyColumns());
                             model.putMethod(candidate.methodKey(), inferenceResult.keyColumns());
                             model.removeMethodConflictKeyGroups(candidate.methodKey());
                             model.removeMethodResolution(candidate.methodKey());
-                            warnings.add("Inferred keyColumns " + inferenceResult.keyColumns()
-                                    + " for " + candidate.methodKey()
-                                    + " from " + inferenceResult.source() + ".");
+                            warnings.add("已推断 " + candidate.methodKey() + " 的 keyColumns "
+                                    + inferenceResult.keyColumns()
+                                    + "，来源：" + inferenceResult.source() + "。");
                         }
                     } else {
                         if (candidate.outerJoinSource()) {
-                            warnings.add("Could not prove source keyColumns for outer UPDATE JOIN table "
-                                    + candidate.tableName() + ": " + inferenceResult.reason());
+                            warnings.add("无法证明外连接 UPDATE JOIN 表 "
+                                    + candidate.tableName() + " 的源 keyColumns：" + inferenceResult.reason());
                         } else {
                             model.ensureMethod(candidate.methodKey(), List.of());
                             model.removeMethodConflictKeyGroups(candidate.methodKey());
@@ -215,11 +215,11 @@ class SqlRewriteConfigUpdater {
                             if (UpsertKeyInference.RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT.equals(
                                     inferenceResult.resolutionCode()
                             )) {
-                                warnings.add("Resolved " + candidate.methodKey()
-                                        + " as a plain INSERT: " + inferenceResult.reason());
+                                warnings.add("已将 " + candidate.methodKey()
+                                        + " 解析为普通 INSERT：" + inferenceResult.reason());
                             } else {
-                                warnings.add("Could not infer keyColumns for " + candidate.methodKey()
-                                        + ": " + inferenceResult.reason());
+                                warnings.add("无法推断 " + candidate.methodKey()
+                                        + " 的 keyColumns：" + inferenceResult.reason());
                             }
                         }
                     }
@@ -256,8 +256,8 @@ class SqlRewriteConfigUpdater {
         for (Map.Entry<String, List<String>> entry : normalized.entrySet()) {
             List<String> existing = model.tableColumns(entry.getKey());
             if (!existing.isEmpty() && !normalizedColumns(existing).equals(normalizedColumns(entry.getValue()))) {
-                warnings.add("Batch upsert keyColumns override rewriteConfig for table "
-                        + entry.getKey() + ": " + existing + " -> " + entry.getValue() + ".");
+                warnings.add("批处理 upsert keyColumns 覆盖了表 "
+                        + entry.getKey() + " 的 rewriteConfig：" + existing + " -> " + entry.getValue() + "。");
             }
             if (!normalizedColumns(existing).equals(normalizedColumns(entry.getValue()))) {
                 model.putTable(entry.getKey(), entry.getValue());
@@ -291,8 +291,8 @@ class SqlRewriteConfigUpdater {
             List<String> existingKeys = model.methodColumns(method);
             if (!normalizedColumns(existingKeys).equals(normalizedColumns(configuredKeys))) {
                 if (!existingKeys.isEmpty()) {
-                    warnings.add("Batch upsert keyColumns override rewriteConfig for method "
-                            + method + ": " + existingKeys + " -> " + configuredKeys + ".");
+                    warnings.add("批处理 upsert keyColumns 覆盖了方法 "
+                            + method + " 的 rewriteConfig：" + existingKeys + " -> " + configuredKeys + "。");
                 }
                 model.putMethod(method, configuredKeys);
                 changed = true;
@@ -301,8 +301,8 @@ class SqlRewriteConfigUpdater {
             List<List<String>> existingGroups = model.methodConflictKeyGroups(method);
             if (!existingGroups.equals(configuredGroups)) {
                 if (!existingGroups.isEmpty()) {
-                    warnings.add("Batch upsert conflictKeyGroups override rewriteConfig for method "
-                            + method + ": " + existingGroups + " -> " + configuredGroups + ".");
+                    warnings.add("批处理 upsert conflictKeyGroups 覆盖了方法 "
+                            + method + " 的 rewriteConfig：" + existingGroups + " -> " + configuredGroups + "。");
                 }
                 if (configuredGroups.isEmpty()) {
                     model.removeMethodConflictKeyGroups(method);
@@ -357,7 +357,7 @@ class SqlRewriteConfigUpdater {
             TableConstraint primaryKey = metadata.primaryKeys().get(0);
             return Optional.of(UpsertKeyInference.InferenceResult.inferred(
                     primaryKey.columns(),
-                    "primary key " + primaryKey.name()
+                    "主键 " + primaryKey.name()
             ));
         }
         return inference.infer(candidate, metadata);
@@ -398,8 +398,8 @@ class SqlRewriteConfigUpdater {
                 }
                 if (model.addIdentityInsertTable(tableName)) {
                     changed = true;
-                    warnings.add("Learned identityInsertTables entry " + tableName
-                            + " from the previous Dameng validation failure.");
+                    warnings.add("根据上次达梦验证失败结果，已学习 identityInsertTables 条目 "
+                            + tableName + "。");
                 }
             }
         } catch (IOException ignored) {
@@ -440,10 +440,10 @@ class SqlRewriteConfigUpdater {
             if (model.removeIdentityInsertTable(tableName)) {
                 changed = true;
                 String reason = kind == DamengMetadataReader.AutoIncrementKind.AUTO_INCREMENT
-                        ? "uses AUTO_INCREMENT rather than IDENTITY"
-                        : "does not contain an IDENTITY column";
-                warnings.add("Removed identityInsertTables entry " + tableName
-                        + " because the target Dameng table " + reason + ".");
+                        ? "使用 AUTO_INCREMENT 而非 IDENTITY"
+                        : "不包含 IDENTITY 列";
+                warnings.add("已移除 identityInsertTables 条目 " + tableName
+                        + "，因为目标达梦表" + reason + "。");
             }
         }
 
@@ -472,9 +472,8 @@ class SqlRewriteConfigUpdater {
                     nonIdentityTables.add(normalizedTable);
                     if (model.removeIdentityInsertTable(tableName)) {
                         changed = true;
-                        warnings.add("Removed identityInsertTables entry " + tableName
-                                + " because the previous Dameng validation reported that the target table "
-                                + "has no IDENTITY column.");
+                        warnings.add("已移除 identityInsertTables 条目 " + tableName
+                                + "，因为上次达梦验证报告目标表不包含 IDENTITY 列。");
                     }
                 }
             }
@@ -507,8 +506,8 @@ class SqlRewriteConfigUpdater {
             if (allSame) {
                 model.putTable(table, first);
             } else {
-                warnings.add("Table-level keyColumns for " + table
-                        + " were left empty because mapper methods inferred different keys.");
+                warnings.add("表 " + table
+                        + " 的表级 keyColumns 保持为空，因为各 Mapper 方法推断出了不同的键。");
             }
         }
     }
@@ -582,7 +581,7 @@ class SqlRewriteConfigUpdater {
             return Optional.of(FileChange.planned(
                     rewriteConfigPath.toString(),
                     action,
-                    "Maintain SQL rewrite config keyColumns for upsert/insert-ignore rewrites"
+                    "计划维护 SQL 重写配置中的 keyColumns，用于 upsert/insert-ignore 重写"
             ));
         }
         try {
@@ -592,7 +591,7 @@ class SqlRewriteConfigUpdater {
             return Optional.of(FileChange.applied(
                     rewriteConfigPath.toString(),
                     action,
-                    "Maintained SQL rewrite config keyColumns for upsert/insert-ignore rewrites"
+                    "已维护 SQL 重写配置中的 keyColumns，用于 upsert/insert-ignore 重写"
             ));
         } catch (IOException e) {
             throw new IllegalStateException("Failed to write SQL rewrite config: " + rewriteConfigPath, e);

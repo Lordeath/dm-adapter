@@ -65,10 +65,10 @@ class MapperJavaParamFixer {
             try {
                 content = Files.readString(source, StandardCharsets.UTF_8);
             } catch (CharacterCodingException e) {
-                warnings.add("Skipped Java mapper @Param fix for encrypted or non-UTF-8 source " + source + ".");
+                warnings.add("已跳过加密或非 UTF-8 源文件的 Java Mapper @Param 修复：" + source + "。");
                 continue;
             } catch (Exception e) {
-                warnings.add("Skipped Java mapper @Param fix for " + source + ": " + e.getMessage());
+                warnings.add("已跳过 Java Mapper @Param 修复：" + source + "：" + e.getMessage());
                 continue;
             }
             JavaRewrite rewrite = rewriteMapperSource(content, namespaceEntry.getValue());
@@ -80,10 +80,10 @@ class MapperJavaParamFixer {
                 fileChanges.add(FileChange.applied(
                         source.toString(),
                         "UPDATE",
-                        "Fixed Java mapper @Param annotations from mapper XML parameter names"
+                        "已根据 Mapper XML 参数名修复 Java Mapper 的 @Param 注解"
                 ));
             } catch (Exception e) {
-                warnings.add("Failed to write Java mapper @Param fixes to " + source + ": " + e.getMessage());
+                warnings.add("写入 Java Mapper @Param 修复失败：" + source + "：" + e.getMessage());
             }
         }
         return new MapperJavaParamFixResult(fileChanges, warnings);

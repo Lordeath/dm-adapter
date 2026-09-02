@@ -22,25 +22,25 @@ public class PomTargetSelector {
         List<Path> applicationPoms = findSpringBootApplicationPoms(normalizedRoot);
         if (!applicationPoms.isEmpty()) {
             if (applicationPoms.size() > 1) {
-                warnings.add("Multiple Spring Boot application module pom.xml files were detected; Dameng JDBC dependency will be checked in each one: "
+                warnings.add("检测到多个 Spring Boot 应用模块 pom.xml；将在每个文件中检查达梦 JDBC 依赖："
                         + describe(normalizedRoot, applicationPoms));
             }
-            return new PomTargetSelection(applicationPoms, "Spring Boot application module", warnings);
+            return new PomTargetSelection(applicationPoms, "Spring Boot 应用模块", warnings);
         }
 
         List<Path> mapperPoms = findMapperModulePoms(normalizedRoot, mapperXmlFiles);
         if (!mapperPoms.isEmpty()) {
             if (mapperPoms.size() > 1) {
-                warnings.add("Multiple mapper module pom.xml files were detected; Dameng JDBC dependency will be checked in each one: "
+                warnings.add("检测到多个 Mapper 模块 pom.xml；将在每个文件中检查达梦 JDBC 依赖："
                         + describe(normalizedRoot, mapperPoms));
             }
-            return new PomTargetSelection(mapperPoms, "mapper XML module", warnings);
+            return new PomTargetSelection(mapperPoms, "Mapper XML 模块", warnings);
         }
 
         Path rootPom = normalizedRoot.resolve("pom.xml");
         if (Files.isRegularFile(rootPom)) {
-            warnings.add("No Spring Boot application module or mapper module pom.xml was detected; falling back to project root pom.xml.");
-            return new PomTargetSelection(List.of(rootPom), "project root", warnings);
+            warnings.add("未检测到 Spring Boot 应用模块或 Mapper 模块 pom.xml；将使用项目根目录 pom.xml。");
+            return new PomTargetSelection(List.of(rootPom), "项目根目录", warnings);
         }
         return new PomTargetSelection(List.of(), "", warnings);
     }

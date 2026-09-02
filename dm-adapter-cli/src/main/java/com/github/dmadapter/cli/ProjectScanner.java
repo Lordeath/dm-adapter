@@ -27,7 +27,7 @@ class ProjectScanner {
     ProjectScanResult scan(AdapterContext context) {
         List<String> warnings = new ArrayList<>();
         if (!Files.isDirectory(context.projectRoot())) {
-            warnings.add("Project path is not a directory: " + context.projectRoot());
+            warnings.add("项目路径不是目录：" + context.projectRoot());
             return new ProjectScanResult(false, false, false, false, context.pomPath().toString(), List.of(), warnings);
         }
 
@@ -36,19 +36,19 @@ class ProjectScanner {
         boolean myBatisXmlProject = !mapperXmlFiles.isEmpty();
 
         if (!pomAnalysis.mavenProject()) {
-            warnings.add("pom.xml was not found at project root.");
+            warnings.add("项目根目录下未找到 pom.xml。");
         }
         if (pomAnalysis.mavenProject() && !pomAnalysis.springBootProject()) {
-            warnings.add("Spring Boot dependency or parent was not detected.");
+            warnings.add("未检测到 Spring Boot 依赖或父 POM。");
         }
         if (pomAnalysis.mavenProject() && !pomAnalysis.myBatisProject() && mapperXmlFiles.isEmpty()) {
-            warnings.add("MyBatis dependency was not detected in pom.xml.");
+            warnings.add("pom.xml 中未检测到 MyBatis 依赖。");
         }
         if (mapperXmlFiles.isEmpty()) {
-            warnings.add("No MyBatis mapper XML files were detected under src/main/resources.");
+            warnings.add("src/main/resources 下未检测到 MyBatis Mapper XML。");
         }
         if (pomAnalysis.mavenProject() && !pomAnalysis.hasDmJdbcDriver()) {
-            warnings.add("Dameng JDBC driver dependency was not detected.");
+            warnings.add("未检测到达梦 JDBC 驱动依赖。");
         }
 
         return new ProjectScanResult(

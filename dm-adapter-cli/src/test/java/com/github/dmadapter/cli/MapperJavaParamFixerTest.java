@@ -198,7 +198,7 @@ class MapperJavaParamFixerTest {
 
         assertThat(result.fileChanges()).isEmpty();
         assertThat(result.warnings()).anySatisfy(warning ->
-                assertThat(warning).contains("Skipped Java mapper @Param fix"));
+                assertThat(warning).contains("已跳过加密或非 UTF-8 源文件的 Java Mapper @Param 修复"));
     }
 
     private Path writeMapper(String name, String content) throws Exception {

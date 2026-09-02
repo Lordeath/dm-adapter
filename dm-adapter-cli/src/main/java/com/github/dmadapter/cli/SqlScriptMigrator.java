@@ -37,7 +37,7 @@ import java.util.stream.Stream;
 
 class SqlScriptMigrator {
     static final String BATCH_VALIDATION_STATUS =
-            "Batch mode; SQL script database validation was not requested.";
+            "Batch 模式未请求达梦 SQL 脚本试执行。";
     private static final String MISSING_SYSTEM_SCHEMA_WARNING_PREFIX =
             "System SQL script has no --system-schema and will use the current connection schema: ";
     private static final Path DEFAULT_PRESERVED_SQL_PATH = Path.of("00000000.sql");
@@ -553,7 +553,7 @@ class SqlScriptMigrator {
             Path sourceFile = sqlRoot.resolve(preservedPath);
             Path outputFile = sqlRootOut.resolve(preservedPath);
             if (Files.isRegularFile(sourceFile) && !Files.isRegularFile(outputFile)) {
-                warnings.add("Preserved SQL source was not converted because no manual Dameng output exists: "
+                warnings.add("保留的 SQL 源文件未转换，因为不存在人工维护的达梦输出："
                         + preservedPath);
             }
         }
@@ -828,7 +828,7 @@ class SqlScriptMigrator {
                         .forEach(metadata::putIfAbsent);
             }
         } catch (IOException e) {
-            warnings.add("Project DDL metadata inference for outer UPDATE JOIN was skipped: "
+            warnings.add("已跳过外连接 UPDATE JOIN 的项目 DDL 元数据推断："
                     + e.getMessage());
             return Map.of();
         }
@@ -876,7 +876,7 @@ class SqlScriptMigrator {
         try {
             metadata = projectDdlKeyMetadataReader.readTableKeys(projectRoot, List.copyOf(tables));
         } catch (IOException e) {
-            warnings.add("Project DDL metadata inference for SQL script upserts was skipped: " + e.getMessage());
+            warnings.add("已跳过 SQL 脚本 upsert 的项目 DDL 元数据推断：" + e.getMessage());
             return;
         }
         candidates.forEach((itemIndex, shapes) -> {
@@ -2440,7 +2440,7 @@ class SqlScriptMigrator {
         boolean systemScript = isSystemScript(outputFile);
         String targetSchema = systemScript ? systemSchema : schema;
         if (systemScript && targetSchema.isBlank()) {
-            warnings.add("Output-only system SQL script has no --system-schema and will use the current connection schema: "
+            warnings.add("仅存在于输出目录的系统 SQL 脚本未指定 --system-schema，将使用当前连接 schema："
                     + relative);
         }
         String content = readSqlScriptContent(outputFile);
@@ -3105,7 +3105,7 @@ class SqlScriptMigrator {
         boolean systemScript = isSystemScript(sqlFile);
         String targetSchema = systemScript ? systemSchema : schema;
         if (systemScript && targetSchema.isBlank()) {
-            warnings.add("System SQL script has no --system-schema and will use the current connection schema: " + relative);
+            warnings.add("系统 SQL 脚本未指定 --system-schema，将使用当前连接 schema：" + relative);
         }
 
         String originalContent = readSqlScriptContent(sqlFile);
@@ -5453,7 +5453,7 @@ class SqlScriptMigrator {
                     .filter(path -> !path.startsWith(sqlRootOut))
                     .toList();
         } catch (IOException exception) {
-            warnings.add("Unable to scan project SQL definitions for identity columns: "
+            warnings.add("无法扫描项目 SQL 定义中的自增列："
                     + exception.getMessage());
             return identityColumns;
         }
@@ -5468,7 +5468,7 @@ class SqlScriptMigrator {
                     );
                 }
             } catch (IOException | RuntimeException exception) {
-                warnings.add("Unable to inspect SQL definitions for identity columns: "
+                warnings.add("无法检查 SQL 定义中的自增列："
                         + metadataRoot.relativize(metadataFile) + " (" + exception.getMessage() + ")");
             }
         }
@@ -18227,7 +18227,7 @@ class SqlScriptMigrator {
             return "";
         }
         if (schemas.size() > 1) {
-            warnings.add("SQL script validation uses the first schema from " + option + ": " + schemas.get(0));
+            warnings.add("SQL 脚本验证使用 " + option + " 中的第一个 schema：" + schemas.get(0));
         }
         return schemas.get(0);
     }

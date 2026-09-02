@@ -25,32 +25,32 @@ final class GeneratedSqlStaticInspector {
         }
         String searchable = scan.searchableSql();
         if (DELIMITER.matcher(searchable).find()) {
-            return REASON_PREFIX + "generated SQL still contains DELIMITER.";
+            return REASON_PREFIX + "生成的 SQL 仍包含 DELIMITER。";
         }
         if (searchable.contains("$$") || searchable.contains("//")) {
-            return REASON_PREFIX + "generated SQL still contains a MySQL routine delimiter.";
+            return REASON_PREFIX + "生成的 SQL 仍包含 MySQL 存储过程分隔符。";
         }
         if (SCRIPT_VARIABLE.matcher(searchable).find()) {
-            return REASON_PREFIX + "generated SQL still contains a script-level @variable.";
+            return REASON_PREFIX + "生成的 SQL 仍包含脚本级 @变量。";
         }
         if (ENGINE.matcher(searchable).find()) {
-            return REASON_PREFIX + "generated SQL still contains an ENGINE table option.";
+            return REASON_PREFIX + "生成的 SQL 仍包含 ENGINE 表选项。";
         }
         if (USING_BTREE.matcher(searchable).find()) {
-            return REASON_PREFIX + "generated SQL still contains USING BTREE.";
+            return REASON_PREFIX + "生成的 SQL 仍包含 USING BTREE。";
         }
         String upper = searchable.stripLeading().toUpperCase(Locale.ROOT);
         if (upper.startsWith("ALTER TABLE") && ALTER_AFTER.matcher(searchable).find()) {
-            return REASON_PREFIX + "generated ALTER TABLE still contains AFTER.";
+            return REASON_PREFIX + "生成的 ALTER TABLE 仍包含 AFTER。";
         }
         if ((upper.startsWith("CREATE TABLE") || upper.startsWith("ALTER TABLE"))
                 && INLINE_COMMENT.matcher(searchable).find()) {
-            return REASON_PREFIX + "generated table DDL still contains an inline COMMENT clause.";
+            return REASON_PREFIX + "生成的表 DDL 仍包含行内 COMMENT 子句。";
         }
         if (isRoutineOrAnonymousBlock(upper) && !Pattern.compile("(?is)\\bEND\\s*;?\\s*$")
                 .matcher(searchable)
                 .find()) {
-            return REASON_PREFIX + "generated procedure or anonymous block is not closed by END.";
+            return REASON_PREFIX + "生成的存储过程或匿名块没有以 END 结束。";
         }
         return "";
     }
@@ -77,8 +77,8 @@ final class GeneratedSqlStaticInspector {
                 while (index < sql.length()) {
                     current = sql.charAt(index);
                     if (current == '\r' || current == '\n') {
-                        return new Scan("a single-quoted literal crosses a physical line at offset "
-                                + index + ".", searchable.toString());
+                        return new Scan("单引号字符串跨越了物理行，位置偏移量："
+                                + index + "。", searchable.toString());
                     }
                     searchable.append(' ');
                     if (current == '\\' && index + 1 < sql.length()) {
@@ -97,7 +97,7 @@ final class GeneratedSqlStaticInspector {
                     }
                 }
                 if (!closed) {
-                    return new Scan("single-quoted literal starting at offset " + start + " is not closed.",
+                    return new Scan("从位置偏移量 " + start + " 开始的单引号字符串未闭合。",
                             searchable.toString());
                 }
                 continue;
@@ -122,7 +122,7 @@ final class GeneratedSqlStaticInspector {
                     }
                 }
                 if (!closed) {
-                    return new Scan("quoted identifier starting at offset " + start + " is not closed.",
+                    return new Scan("从位置偏移量 " + start + " 开始的带引号标识符未闭合。",
                             searchable.toString());
                 }
                 continue;
@@ -144,7 +144,7 @@ final class GeneratedSqlStaticInspector {
                     index++;
                 }
                 if (!closed) {
-                    return new Scan("block comment starting at offset " + start + " is not closed.",
+                    return new Scan("从位置偏移量 " + start + " 开始的块注释未闭合。",
                             searchable.toString());
                 }
                 continue;
@@ -162,15 +162,15 @@ final class GeneratedSqlStaticInspector {
             } else if (current == ')') {
                 parentheses--;
                 if (parentheses < 0) {
-                    return new Scan("generated SQL contains an unmatched closing parenthesis at offset "
-                            + index + ".", searchable.toString());
+                    return new Scan("生成的 SQL 在位置偏移量 " + index + " 处存在无法匹配的右括号。",
+                            searchable.toString());
                 }
             }
             searchable.append(current);
             index++;
         }
         if (parentheses != 0) {
-            return new Scan("generated SQL contains " + parentheses + " unmatched opening parenthesis(es).",
+            return new Scan("生成的 SQL 存在 " + parentheses + " 个未闭合的左括号。",
                     searchable.toString());
         }
         return new Scan("", searchable.toString());

@@ -192,7 +192,7 @@ public class MigrateCommand implements Callable<Integer> {
             List<String> warnings = new ArrayList<>(scanResult.warnings());
             warnings.addAll(workspaceWarnings);
             if (!scanResult.mavenProject()) {
-                warnings.add("Migration was not applied because the project root does not contain pom.xml.");
+                warnings.add("项目根目录不包含 pom.xml，因此未应用迁移。");
                 CliLogger.info("Writing migration report...");
                 MigrationReportResult reportResult = writeReport(
                         context, scanResult, fileChanges, List.of(), List.of(), warnings
@@ -203,10 +203,10 @@ public class MigrateCommand implements Callable<Integer> {
             }
 
             if (!scanResult.springBootProject()) {
-                warnings.add("Spring Boot dependency was not detected; generated configuration may need manual integration.");
+                warnings.add("未检测到 Spring Boot 依赖；生成的配置可能需要人工接入。");
             }
             if (!scanResult.myBatisProject()) {
-                warnings.add("MyBatis XML mapper usage was not fully detected; mapper migration may be incomplete.");
+                warnings.add("未完整检测到 MyBatis XML Mapper 用法；Mapper 迁移结果可能不完整。");
             }
 
             CliLogger.info("Selecting Maven POM targets...");
@@ -215,7 +215,7 @@ public class MigrateCommand implements Callable<Integer> {
                     + pomTargetSelection.pomPaths().size());
             warnings.addAll(pomTargetSelection.warnings());
             if (pomTargetSelection.pomPaths().isEmpty()) {
-                warnings.add("No pom.xml target was found for adding Dameng JDBC driver dependency.");
+                warnings.add("未找到可添加达梦 JDBC 驱动依赖的 pom.xml。");
             }
             for (Path pomPath : pomTargetSelection.pomPaths()) {
                 CliLogger.info("Ensuring Dameng JDBC dependency in " + pomPath + "...");
@@ -606,7 +606,7 @@ public class MigrateCommand implements Callable<Integer> {
             return new MetadataLookupResult(ddlMetadata, !ddlMetadata.isEmpty(), warnings);
         }
         if (!environment.ready()) {
-            warnings.add("DM_SQL_VALIDATION is true but metadata inference was skipped because required variables are missing: "
+            warnings.add("DM_SQL_VALIDATION=true，但因缺少必要变量而跳过元数据推断："
                     + environment.missingVariables());
             return new MetadataLookupResult(
                     ddlMetadata,
@@ -636,7 +636,7 @@ public class MigrateCommand implements Callable<Integer> {
             );
             return new MetadataLookupResult(metadata, !metadata.isEmpty(), warnings);
         } catch (Exception e) {
-            warnings.add("Dameng metadata inference was skipped: " + redact(e.getMessage(), environment));
+            warnings.add("已跳过达梦元数据推断：" + redact(e.getMessage(), environment));
             return new MetadataLookupResult(
                     ddlMetadata,
                     !ddlMetadata.isEmpty(),
@@ -657,8 +657,8 @@ public class MigrateCommand implements Callable<Integer> {
         if (!environment.ready()) {
             return new AutoIncrementKindLookupResult(
                     Map.of(),
-                    List.of("Dameng auto-increment metadata reconciliation was skipped because required "
-                            + "validation variables are missing: " + environment.missingVariables())
+                    List.of("因缺少必要的验证变量，已跳过达梦自增列元数据校正："
+                            + environment.missingVariables())
             );
         }
         try {
@@ -677,7 +677,7 @@ public class MigrateCommand implements Callable<Integer> {
         } catch (Exception e) {
             return new AutoIncrementKindLookupResult(
                     Map.of(),
-                    List.of("Dameng auto-increment metadata reconciliation was skipped: "
+                    List.of("已跳过达梦自增列元数据校正："
                             + redact(e.getMessage(), environment))
             );
         }
@@ -709,7 +709,7 @@ public class MigrateCommand implements Callable<Integer> {
                     metadata
             );
         } catch (Exception e) {
-            warnings.add("Project DDL metadata inference was skipped: " + e.getMessage());
+            warnings.add("已跳过项目 DDL 元数据推断：" + e.getMessage());
             return Map.of();
         }
     }

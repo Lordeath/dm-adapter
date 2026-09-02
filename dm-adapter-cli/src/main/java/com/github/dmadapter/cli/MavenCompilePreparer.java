@@ -73,7 +73,7 @@ class MavenCompilePreparer {
                     ? new ApplicationModule(normalizedRoot, normalizedRoot.resolve("pom.xml"), null, "")
                     : applicationModuleSelector.select(normalizedRoot, configuredAppModule);
         } catch (DmAdapterException e) {
-            return List.of("Skipped Maven compile before annotation SQL class scan: " + e.getMessage());
+            return List.of("在注解 SQL 类扫描前跳过 Maven 编译：" + e.getMessage());
         }
 
         MavenCompileInvocation invocation = invocation(normalizedRoot, module.moduleRoot());
@@ -91,23 +91,23 @@ class MavenCompilePreparer {
             if (!completed) {
                 destroyProcessTree(process);
                 output.cancel(true);
-                return List.of("Maven compile before annotation SQL class scan timed out after "
-                        + timeout.toSeconds() + " seconds; class-file annotation SQL extraction may be incomplete.");
+                return List.of("注解 SQL 类扫描前的 Maven 编译在 "
+                        + timeout.toSeconds() + " 秒后超时；从 class 文件提取注解 SQL 的结果可能不完整。");
             }
             String processOutput = output.get(5, TimeUnit.SECONDS);
             if (process.exitValue() == 0) {
                 return List.of();
             }
             List<String> warnings = new ArrayList<>();
-            warnings.add("Maven compile before annotation SQL class scan exited with code "
-                    + process.exitValue() + "; class-file annotation SQL extraction may be incomplete.");
+            warnings.add("注解 SQL 类扫描前的 Maven 编译退出码为 "
+                    + process.exitValue() + "；从 class 文件提取注解 SQL 的结果可能不完整。");
             warnings.addAll(tail(processOutput, OUTPUT_TAIL_LINES));
             return warnings;
         } catch (IOException | ExecutionException | TimeoutException e) {
-            return List.of("Failed to run Maven compile before annotation SQL class scan: " + message(e));
+            return List.of("运行注解 SQL 类扫描前的 Maven 编译失败：" + message(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return List.of("Maven compile before annotation SQL class scan was interrupted; class-file annotation SQL extraction may be incomplete.");
+            return List.of("注解 SQL 类扫描前的 Maven 编译被中断；从 class 文件提取注解 SQL 的结果可能不完整。");
         } finally {
             if (process != null && process.isAlive()) {
                 destroyProcessTree(process);
