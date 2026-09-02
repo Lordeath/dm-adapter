@@ -92,8 +92,8 @@ final class JGitBatchRepositoryRunner {
                     if (migration.hasManualReview()) {
                         resetAndClean(git, remoteRef(configured));
                         String message = migration.containsUseStatement()
-                                ? "Source SQL contains USE <database>; remove it from the MySQL source script before batch conversion."
-                                : "Migration contains manual-review items; no commit was created.";
+                                ? "源 SQL 包含 USE <database>；请在批量转换前从 MySQL 源脚本中移除。"
+                                : "迁移结果包含需人工确认项，因此未创建提交。";
                         return execution(
                                 configured,
                                 reportDir,
@@ -120,7 +120,7 @@ final class JGitBatchRepositoryRunner {
                                 attempts,
                                 List.of(),
                                 "migration",
-                                "Offline migration failed with exit code " + migration.exitCode() + ".",
+                                "离线迁移失败，退出码为 " + migration.exitCode() + "。",
                                 migration
                         );
                     }
@@ -135,7 +135,7 @@ final class JGitBatchRepositoryRunner {
                                 attempts,
                                 List.of(),
                                 "",
-                                "Remote head requires no additional Dameng adaptation changes.",
+                                "远端最新版本无需额外的达梦适配变更。",
                                 migration
                         );
                     }
@@ -162,7 +162,7 @@ final class JGitBatchRepositoryRunner {
                                 attempts,
                                 changedFiles,
                                 "remote-race",
-                                "Remote branch moved during both conversion attempts; no commit was pushed.",
+                                "两次转换期间远端分支均发生更新，因此未推送提交。",
                                 migration
                         );
                     }
@@ -187,7 +187,7 @@ final class JGitBatchRepositoryRunner {
                                 attempts,
                                 changedFiles,
                                 "",
-                                "Conversion changes were committed and pushed.",
+                                "转换变更已提交并推送。",
                                 migration
                         );
                     }
@@ -203,7 +203,7 @@ final class JGitBatchRepositoryRunner {
                                 attempts,
                                 changedFiles,
                                 "",
-                                "Push result was uncertain, but the remote branch points at the created commit.",
+                                "推送结果无法确认，但远端分支已指向本次创建的提交。",
                                 migration
                         );
                     }
@@ -223,7 +223,7 @@ final class JGitBatchRepositoryRunner {
                             attempts,
                             changedFiles,
                             "push",
-                            "JGit push failed: " + redactor.redact(push.message()),
+                            "JGit 推送失败：" + redactor.redact(push.message()),
                             migration
                     );
                 }
@@ -231,7 +231,7 @@ final class JGitBatchRepositoryRunner {
             throw new BatchRepositoryFailure(
                     BatchExitCodes.GIT_ERROR,
                     "remote-race",
-                    "Batch attempts were exhausted."
+                    "批处理重试次数已用尽。"
             );
         } catch (BatchRepositoryFailure failure) {
             cleanCacheQuietly(configured);
@@ -283,14 +283,14 @@ final class JGitBatchRepositoryRunner {
                 throw new BatchRepositoryFailure(
                         BatchExitCodes.GIT_ERROR,
                         "cache-safety",
-                        "Managed cache path is a symbolic link and will not be modified: " + cacheDir
+                        "受管缓存路径是符号链接，工具不会修改该路径：" + cacheDir
                 );
             }
             if (cacheExists && !markerOwned) {
                 throw new BatchRepositoryFailure(
                         BatchExitCodes.GIT_ERROR,
                         "cache-safety",
-                        "Cache directory lacks the expected dm-adapter ownership marker: " + cacheDir
+                        "缓存目录缺少预期的 dm-adapter 所有权标记：" + cacheDir
                 );
             }
             if (cacheExists && !markerMatches) {
@@ -331,7 +331,7 @@ final class JGitBatchRepositoryRunner {
                 throw new BatchRepositoryFailure(
                         BatchExitCodes.GIT_ERROR,
                         "clone",
-                        "Could not clone repository " + configured.name() + ": " + redactor.message(e),
+                        "无法克隆仓库 " + configured.name() + "：" + redactor.message(e),
                         e
                 );
             }
@@ -341,7 +341,7 @@ final class JGitBatchRepositoryRunner {
             throw new BatchRepositoryFailure(
                     BatchExitCodes.GIT_ERROR,
                     "cache",
-                    "Could not prepare managed cache for " + configured.name() + ": " + redactor.message(e),
+                    "无法为仓库 " + configured.name() + " 准备受管缓存：" + redactor.message(e),
                     e
             );
         }
@@ -389,7 +389,7 @@ final class JGitBatchRepositoryRunner {
             throw new BatchRepositoryFailure(
                     BatchExitCodes.GIT_ERROR,
                     "fetch",
-                    "Remote branch does not exist: " + configured.branch()
+                    "远端分支不存在：" + configured.branch()
             );
         }
         return commit;
@@ -406,7 +406,7 @@ final class JGitBatchRepositoryRunner {
             throw new BatchRepositoryFailure(
                     BatchExitCodes.INTERNAL_ERROR,
                     "project",
-                    "Maven pom.xml does not exist at configured projectSubdir: " + configured.projectSubdir()
+                    "配置的 projectSubdir 下不存在 Maven pom.xml：" + configured.projectSubdir()
             );
         }
         Path mapperDir = migration.mapperDir() == null
@@ -427,7 +427,7 @@ final class JGitBatchRepositoryRunner {
                 throw new BatchRepositoryFailure(
                         BatchExitCodes.INTERNAL_ERROR,
                         "sql-source",
-                        "Required SQL source directory does not exist: " + sql.sourceDir()
+                        "必需的 SQL 源目录不存在：" + sql.sourceDir()
                 );
             }
         }
@@ -435,7 +435,7 @@ final class JGitBatchRepositoryRunner {
             throw new BatchRepositoryFailure(
                     BatchExitCodes.INTERNAL_ERROR,
                     "sql-source",
-                    "sqlScriptsOnly requires an available SQL source directory."
+                    "sqlScriptsOnly 模式要求存在可用的 SQL 源目录。"
             );
         }
         return MigrateCommand.runOffline(new BatchMigrationRequest(
@@ -465,7 +465,7 @@ final class JGitBatchRepositoryRunner {
             throw new BatchRepositoryFailure(
                     BatchExitCodes.INTERNAL_ERROR,
                     "path-validation",
-                    field + " escapes the managed repository."
+                    field + " 超出了受管仓库目录。"
             );
         }
         return normalized;

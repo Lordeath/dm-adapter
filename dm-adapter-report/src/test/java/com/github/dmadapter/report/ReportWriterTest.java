@@ -64,11 +64,24 @@ class ReportWriterTest {
         ReportPaths runPaths = writer.writeBatchRunReport(run, tempDir);
 
         assertThat(Files.readString(repositoryPaths.markdownPath()))
+                .contains("# dm-adapter 批处理仓库报告")
+                .contains("- 仓库：`service-a`")
+                .contains("- 状态：`成功`")
+                .contains("- 结果：转换变更已提交并推送。")
+                .contains("## 变更文件")
+                .contains("## 详细报告")
                 .contains("service-a")
                 .contains("pushed-commit")
-                .contains("mapper-dm/UserMapper.xml");
+                .contains("mapper-dm/UserMapper.xml")
+                .doesNotContain("Batch Repository Report")
+                .doesNotContain("Conversion changes were committed and pushed.");
         assertThat(Files.readString(runPaths.markdownPath()))
-                .contains("[details](service-a/dm-adapter-batch-report.md)");
+                .contains("# dm-adapter 批处理运行报告")
+                .contains("- 状态：`成功`")
+                .contains("| 仓库 | 状态 | 分支 | 尝试次数 | 结果 | 报告 |")
+                .contains("[详情](service-a/dm-adapter-batch-report.md)")
+                .doesNotContain("Batch Run Report")
+                .doesNotContain("Conversion changes were committed and pushed.");
         assertThat(Files.readString(runPaths.jsonPath()))
                 .contains("\"exitCode\" : 0")
                 .contains("\"pushedCommit\" : \"pushed-commit\"");
@@ -139,7 +152,9 @@ class ReportWriterTest {
 
         assertThat(new ReportReader().readSummary(tempDir)).isEqualTo(summary);
         assertThat(Files.readString(paths.markdownPath()))
-                .contains("FULL_MUTATING_SHARED_DATABASE")
+                .contains("完整执行（会修改共享数据库）")
+                .contains("总体状态：`完成但存在问题`")
+                .contains("| SQL 脚本数据库验证 | `失败` | 是 |")
                 .contains("SQL_EXECUTION")
                 .contains("级联阻塞");
         assertThat(tempDir.resolve(ReportWriter.SUMMARY_MARKDOWN + ".tmp")).doesNotExist();
@@ -182,9 +197,13 @@ class ReportWriterTest {
 
         assertThat(Files.exists(reportPaths.jsonPath())).isTrue();
         assertThat(Files.readString(reportPaths.markdownPath()))
-                .contains("Manual Review SQL Items")
+                .contains("# dm-adapter 迁移报告")
+                .contains("## 需人工确认的 SQL")
                 .contains("mapper/UserMapper.xml")
-                .contains("JSON_SET requires manual confirmation");
+                .contains("`JSON_SET` 需要人工确认")
+                .doesNotContain("Migration Report")
+                .doesNotContain("Manual Review SQL Items")
+                .doesNotContain("JSON_SET requires manual confirmation");
     }
 
     @Test

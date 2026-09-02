@@ -83,8 +83,8 @@ class SqlRewriteConfigUpdaterTest {
                 .containsEntry("sample_organization", List.of("id"));
         assertThat(update.rewriteConfig().methodKeyColumns()).isEmpty();
         assertThat(update.warnings())
-                .containsExactly("Inferred source keyColumns [id] for outer UPDATE JOIN table "
-                        + "sample_organization from primary key PK_SAMPLE_ORGANIZATION.");
+                .containsExactly("已推断外连接 UPDATE JOIN 表 sample_organization 的源 keyColumns [id]，"
+                        + "来源：主键 PK_SAMPLE_ORGANIZATION。");
         assertThat(Files.readString(config))
                 .contains("\"sample_organization\":")
                 .contains("keyColumns: [\"id\"]")
@@ -119,7 +119,7 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(update.rewriteConfig().tableKeyColumns())
                 .containsEntry("${schemaname}.charge_customerchargedetail_ext", List.of("chargeDetailId"));
         assertThat(update.warnings()).singleElement().asString()
-                .contains("Batch upsert keyColumns override rewriteConfig")
+                .contains("批处理 upsert keyColumns 覆盖了表")
                 .contains("[legacy_id] -> [chargeDetailId]");
         assertThat(Files.readString(config))
                 .contains("keyColumns: [\"chargeDetailId\"]")
@@ -372,8 +372,8 @@ class SqlRewriteConfigUpdaterTest {
         );
 
         assertThat(update.warnings())
-                .containsExactly("Learned identityInsertTables entry ns_bill_openbill_interface_log_history "
-                        + "from the previous Dameng validation failure.");
+                .containsExactly("根据上次达梦验证失败结果，已学习 identityInsertTables 条目 "
+                        + "ns_bill_openbill_interface_log_history。");
         assertThat(update.fileChange()).isPresent();
         assertThat(update.rewriteConfig().requiresIdentityInsert("ns_bill_openbill_interface_log_history")).isTrue();
         assertThat(Files.readString(config))
@@ -420,10 +420,8 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(update.rewriteConfig().requiresIdentityInsert("identity_table")).isTrue();
         assertThat(update.warnings())
                 .containsExactly(
-                        "Removed identityInsertTables entry auto_table because the target Dameng table "
-                                + "uses AUTO_INCREMENT rather than IDENTITY.",
-                        "Removed identityInsertTables entry ordinary_table because the target Dameng table "
-                                + "does not contain an IDENTITY column."
+                        "已移除 identityInsertTables 条目 auto_table，因为目标达梦表使用 AUTO_INCREMENT 而非 IDENTITY。",
+                        "已移除 identityInsertTables 条目 ordinary_table，因为目标达梦表不包含 IDENTITY 列。"
                 );
         assertThat(Files.readString(config))
                 .contains("identityInsertTables:")
@@ -478,10 +476,10 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(update.fileChange()).isPresent();
         assertThat(update.rewriteConfig().identityInsertTables()).isEmpty();
         assertThat(update.warnings()).containsExactly(
-                "Removed identityInsertTables entry owner_house_relationship because the previous Dameng "
-                        + "validation reported that the target table has no IDENTITY column.",
-                "Removed identityInsertTables entry owner_customer_precinct_relation because the previous "
-                        + "Dameng validation reported that the target table has no IDENTITY column."
+                "已移除 identityInsertTables 条目 owner_house_relationship，"
+                        + "因为上次达梦验证报告目标表不包含 IDENTITY 列。",
+                "已移除 identityInsertTables 条目 owner_customer_precinct_relation，"
+                        + "因为上次达梦验证报告目标表不包含 IDENTITY 列。"
         );
         assertThat(Files.readString(config))
                 .doesNotContain("identityInsertTables:")
@@ -597,7 +595,8 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(update.rewriteConfig().keyColumnsFor(candidate.methodKey(), candidate.tableName())).isEmpty();
         assertThat(update.warnings())
                 .anySatisfy(warning -> assertThat(warning)
-                        .contains("Could not determine INSERT columns")
+                        .contains("无法确定")
+                        .contains("必须手工配置 keyColumns")
                         .contains("com.example.RecentlyUsedMapper.insertOrUpdate"));
         assertThat(Files.readString(config))
                 .contains("\"ns_recently_used\":")
@@ -639,8 +638,8 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(update.rewriteConfig().convertsInsertIgnoreToPlainInsert(candidate.methodKey())).isTrue();
         assertThat(update.warnings())
                 .anySatisfy(warning -> assertThat(warning)
-                        .contains("Resolved")
-                        .contains("plain INSERT"));
+                        .contains("已将")
+                        .contains("普通 INSERT"));
         assertThat(Files.readString(config))
                 .contains("upsertKeyResolutions:")
                 .contains("\"com.example.BankFileMapper.insertIgnore\": "
@@ -735,7 +734,7 @@ class SqlRewriteConfigUpdaterTest {
         assertThat(update.rewriteConfig().conflictKeyGroupsFor(candidate.methodKey())).isEmpty();
         assertThat(update.rewriteConfig().convertsInsertIgnoreToPlainInsert(candidate.methodKey())).isTrue();
         assertThat(update.warnings()).anySatisfy(warning ->
-                assertThat(warning).contains("Discarded stale conflictKeyGroups"));
+                assertThat(warning).contains("已丢弃").contains("过期 conflictKeyGroups"));
         assertThat(Files.readString(config))
                 .doesNotContain("conflictKeyGroups:")
                 .contains("\"com.example.FlinkMapper.insertTableStatus\": "

@@ -36,7 +36,7 @@ public class PomModifier {
             return Optional.of(FileChange.planned(
                     pomPath.toString(),
                     "MODIFY",
-                    "Add dependency " + coordinate.toGav()
+                    "计划添加依赖 " + coordinate.toGav()
             ));
         }
 
@@ -51,7 +51,7 @@ public class PomModifier {
         return Optional.of(FileChange.applied(
                 pomPath.toString(),
                 "MODIFY",
-                "Added dependency " + coordinate.toGav()
+                "已添加依赖 " + coordinate.toGav()
         ));
     }
 

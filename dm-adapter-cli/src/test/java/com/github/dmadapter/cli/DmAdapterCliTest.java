@@ -148,8 +148,8 @@ class DmAdapterCliTest {
                 .contains("dm-adapter 项目摘要")
                 .contains("人工确认降噪");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
-                .contains("Automatic SQL Conversions")
-                .contains("Manual Review SQL Items");
+                .contains("自动转换的 SQL")
+                .contains("需人工确认的 SQL");
 
         int reportExitCode = execute("report", "--project", tempDir.toString());
 
@@ -286,8 +286,8 @@ class DmAdapterCliTest {
                 .contains("NOW()")
                 .contains("limit 1");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
-                .contains("Extracted MyBatis annotation SQL to mapper-dm XML")
-                .contains("rules `MYSQL_TEMPORARY_TABLE_AS_SELECT_TO_DM, "
+                .contains("已将 MyBatis 注解 SQL 提取到 mapper-dm XML")
+                .contains("规则 `MYSQL_TEMPORARY_TABLE_AS_SELECT_TO_DM, "
                         + "MYBATIS_DYNAMIC_TEMPORARY_TABLE_BIND_SELECT_TO_INSERT`");
     }
 
@@ -462,8 +462,8 @@ class DmAdapterCliTest {
                 .contains("insert ignore into role_perm")
                 .doesNotContain("MERGE INTO");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
-                .contains("requires configured keyColumns")
-                .contains("INSERT IGNORE requires configured keyColumns");
+                .contains("由于无法从 --project、--sql-root 或达梦获取权威的主键/唯一键元数据")
+                .contains("INSERT IGNORE 需要配置 keyColumns");
     }
 
     @Test
@@ -594,8 +594,9 @@ class DmAdapterCliTest {
                 .doesNotContain("\"com.example.ScoreRuleMapper.insertOrUpdateBatch\": "
                         + "\"KEY_METADATA_UNAVAILABLE\"");
         assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
-                .contains("Original ON DUPLICATE KEY UPDATE")
-                .contains("UPDATE branch cannot be reached")
+                .contains("原始 ON DUPLICATE KEY UPDATE")
+                .contains("UPDATE 分支按现有写法无法触发")
+                .doesNotContain("Original ON DUPLICATE KEY UPDATE")
                 .doesNotContain("ON DUPLICATE KEY UPDATE requires configured keyColumns");
     }
 

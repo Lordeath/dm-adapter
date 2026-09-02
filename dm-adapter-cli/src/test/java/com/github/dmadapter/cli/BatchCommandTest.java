@@ -72,7 +72,7 @@ class BatchCommandTest {
         assertThat(summary.path("repositories").get(0).path("failureStage").asText())
                 .isEqualTo("source-use-statement");
         assertThat(summary.path("repositories").get(0).path("message").asText())
-                .contains("remove it from the MySQL source script");
+                .contains("从 MySQL 源脚本中移除");
     }
 
     @Test

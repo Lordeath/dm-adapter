@@ -64,7 +64,7 @@ public class MapperMigrator {
             Path source = Paths.get(mapperXmlFile.path());
             Path target = mapperTargetDir(context, mapperXmlFile).resolve(toMapperDmRelativePath(mapperXmlFile.resourcesRelativePath()));
             fileChanges.add(context.dryRun()
-                    ? FileChange.planned(target.toString(), "CREATE", "Copy mapper XML from " + source)
+                    ? FileChange.planned(target.toString(), "CREATE", "计划复制 Mapper XML，来源：" + source)
                     : copyMapper(source, target));
 
             Path rewriteInput = context.dryRun() ? source : target;
@@ -110,7 +110,7 @@ public class MapperMigrator {
         try {
             Files.createDirectories(target.getParent());
             Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
-            return FileChange.applied(target.toString(), "CREATE", "Copied mapper XML from " + source);
+            return FileChange.applied(target.toString(), "CREATE", "已复制 Mapper XML，来源：" + source);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to copy mapper XML from " + source + " to " + target, e);
         }

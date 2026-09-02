@@ -199,7 +199,7 @@ class MapperAnnotationMigratorTest {
                 .contains("String selectNow();");
         assertThat(result.fileChanges())
                 .extracting(change -> change.description())
-                .containsExactly("Removed extracted MyBatis annotation SQL from Java mapper");
+                .containsExactly("已从 Java Mapper 中移除提取后的 MyBatis 注解 SQL");
         assertThat(Files.exists(tempDir.resolve("src/main/resources/mapper-dm/VoucherTaskMapper.xml"))).isFalse();
     }
 
@@ -254,8 +254,8 @@ class MapperAnnotationMigratorTest {
         assertThat(result.fileChanges())
                 .extracting(change -> change.description())
                 .contains(
-                        "Fixed extracted MyBatis annotation SQL in mapper XML",
-                        "Removed extracted MyBatis annotation SQL from Java mapper"
+                        "已修复 Mapper XML 中提取出的 MyBatis 注解 SQL",
+                        "已从 Java Mapper 中移除提取后的 MyBatis 注解 SQL"
                 );
     }
 
@@ -303,7 +303,7 @@ class MapperAnnotationMigratorTest {
                 .contains("int updateTask(Task task);");
         assertThat(result.fileChanges())
                 .extracting(change -> change.description())
-                .contains("Removed extracted MyBatis annotation SQL from Java mapper");
+                .contains("已从 Java Mapper 中移除提取后的 MyBatis 注解 SQL");
     }
 
     @Test

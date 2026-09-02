@@ -24,30 +24,27 @@ final class UpsertKeyInference {
         if (metadata == null || !metadata.tableFound()) {
             return Optional.of(InferenceResult.unresolved(
                     RESOLUTION_METADATA_UNAVAILABLE,
-                    "No table key metadata was available for table "
-                            + candidate.tableName() + "."
+                    "没有表 " + candidate.tableName() + " 的键元数据。"
             ));
         }
         if (normalizedColumns(candidate.insertColumns()).isEmpty()) {
             return Optional.of(InferenceResult.unresolved(
                     RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED,
-                    "Could not determine INSERT columns for "
-                            + candidate.methodKey() + "; keyColumns must be configured manually."
+                    "无法确定 " + candidate.methodKey() + " 的 INSERT 列；必须手工配置 keyColumns。"
             ));
         }
         if (candidate.insertIgnore() && hasNoReachableConflictKey(candidate, metadata)) {
             return Optional.of(InferenceResult.unresolved(
                     RESOLUTION_INSERT_IGNORE_AS_PLAIN_INSERT,
-                    "INSERT IGNORE has no reachable primary or unique key conflict for "
+                    "INSERT IGNORE 在 "
                             + candidate.methodKey()
-                            + "; it can be converted to a plain INSERT."
+                            + " 中没有可触发的主键或唯一键冲突；可转换为普通 INSERT。"
             ));
         }
         if (metadata.constraints().isEmpty()) {
             return Optional.of(InferenceResult.unresolved(
                     RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY,
-                    "No primary key or unique key metadata was found for table "
-                            + candidate.tableName() + "."
+                    "未找到表 " + candidate.tableName() + " 的主键或唯一键元数据。"
             ));
         }
 
@@ -67,48 +64,46 @@ final class UpsertKeyInference {
             if (reachableConflictKeys.size() > 1) {
                 return Optional.of(InferenceResult.multipleConflictKeys(
                         reachableConflictKeys.stream().map(TableConstraint::columns).toList(),
-                        "conflict keys " + describe(reachableConflictKeys)
+                        "冲突键 " + describe(reachableConflictKeys)
                 ));
             }
         }
         if (usablePrimaryKeys.size() == 1) {
             return Optional.of(InferenceResult.inferred(
                     usablePrimaryKeys.get(0).columns(),
-                    "primary key " + usablePrimaryKeys.get(0).name()
+                    "主键 " + usablePrimaryKeys.get(0).name()
             ));
         }
         if (usablePrimaryKeys.size() > 1) {
             return Optional.of(InferenceResult.unresolved(
                     RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED,
-                    "Multiple primary key metadata rows matched table "
-                            + candidate.tableName() + "."
+                    "表 " + candidate.tableName() + " 匹配到多条主键元数据。"
             ));
         }
 
         if (usableUniqueKeys.size() == 1) {
             return Optional.of(InferenceResult.inferred(
                     usableUniqueKeys.get(0).columns(),
-                    "unique key " + usableUniqueKeys.get(0).name()
+                    "唯一键 " + usableUniqueKeys.get(0).name()
             ));
         }
         if (usableUniqueKeys.size() > 1) {
             if (candidate.insertIgnore()) {
                 return Optional.of(InferenceResult.multipleConflictKeys(
                         usableUniqueKeys.stream().map(TableConstraint::columns).toList(),
-                        "unique keys " + describe(usableUniqueKeys)
+                        "唯一键 " + describe(usableUniqueKeys)
                 ));
             }
             return Optional.of(InferenceResult.unresolved(
                     RESOLUTION_MANUAL_KEY_COLUMNS_REQUIRED,
-                    "Multiple unique keys matched INSERT columns for table "
-                            + candidate.tableName() + ": " + describe(usableUniqueKeys) + "."
+                    "表 " + candidate.tableName() + " 的 INSERT 列匹配到多个唯一键："
+                            + describe(usableUniqueKeys) + "。"
             ));
         }
 
         return Optional.of(InferenceResult.unresolved(
                 RESOLUTION_ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY,
-                "No primary key or unique key columns are fully present in INSERT columns for "
-                        + candidate.methodKey() + "."
+                candidate.methodKey() + " 的 INSERT 列中未完整包含任一主键或唯一键的所有列。"
         ));
     }
 
@@ -183,8 +178,8 @@ final class UpsertKeyInference {
 
     private String describeConstraint(TableConstraint constraint) {
         return (constraint.type() == TableConstraint.ConstraintType.PRIMARY_KEY
-                ? "primary key "
-                : "unique key ") + constraint.name();
+                ? "主键 "
+                : "唯一键 ") + constraint.name();
     }
 
     record InferenceResult(

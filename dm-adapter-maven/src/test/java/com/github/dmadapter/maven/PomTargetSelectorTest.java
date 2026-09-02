@@ -24,7 +24,7 @@ class PomTargetSelectorTest {
 
         PomTargetSelection selection = new PomTargetSelector().select(tempDir, List.of(mapperXmlFile));
 
-        assertThat(selection.reason()).isEqualTo("Spring Boot application module");
+        assertThat(selection.reason()).isEqualTo("Spring Boot 应用模块");
         assertThat(selection.pomPaths()).containsExactly(restPom.toAbsolutePath().normalize());
     }
 
@@ -36,7 +36,7 @@ class PomTargetSelectorTest {
 
         PomTargetSelection selection = new PomTargetSelector().select(tempDir, List.of(mapperXmlFile));
 
-        assertThat(selection.reason()).isEqualTo("mapper XML module");
+        assertThat(selection.reason()).isEqualTo("Mapper XML 模块");
         assertThat(selection.pomPaths()).containsExactly(mapperPom.toAbsolutePath().normalize());
     }
 
@@ -46,7 +46,7 @@ class PomTargetSelectorTest {
 
         PomTargetSelection selection = new PomTargetSelector().select(tempDir, List.of());
 
-        assertThat(selection.reason()).isEqualTo("project root");
+        assertThat(selection.reason()).isEqualTo("项目根目录");
         assertThat(selection.pomPaths()).containsExactly(rootPom.toAbsolutePath().normalize());
         assertThat(selection.warnings()).hasSize(1);
     }

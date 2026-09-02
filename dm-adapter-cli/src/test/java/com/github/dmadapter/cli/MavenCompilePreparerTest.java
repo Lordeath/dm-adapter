@@ -65,7 +65,7 @@ class MavenCompilePreparerTest {
 
         assertThat(commands).hasSize(1);
         assertThat(warnings)
-                .anySatisfy(warning -> assertThat(warning).contains("exited with code 1"))
+                .anySatisfy(warning -> assertThat(warning).contains("退出码为 1"))
                 .anySatisfy(warning -> assertThat(warning).contains("compile failed"));
     }
 
