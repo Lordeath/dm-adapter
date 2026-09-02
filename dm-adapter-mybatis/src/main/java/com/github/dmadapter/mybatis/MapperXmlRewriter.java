@@ -10239,6 +10239,10 @@ public class MapperXmlRewriter {
             if (tagStart < 0) {
                 break;
             }
+            if (body.startsWith("<!--", tagStart)) {
+                index = xmlSpecialSectionEnd(body, tagStart);
+                continue;
+            }
             XmlTag tag = readXmlTag(body, tagStart);
             if (tag == null) {
                 index = tagStart + 1;
@@ -10296,6 +10300,10 @@ public class MapperXmlRewriter {
                         conditionGuards,
                         removedAssignments
                 );
+            }
+            if (body.startsWith("<!--", tagStart)) {
+                index = Math.min(end, xmlSpecialSectionEnd(body, tagStart));
+                continue;
             }
             XmlTag tag = readXmlTag(body, tagStart);
             if (tag == null) {
