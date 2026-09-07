@@ -1905,6 +1905,22 @@ public class MapperXmlRewriter {
         if (damengNativeSingleTargetUpdateJoin) {
             manualReviewReasons.removeIf(this::isMysqlUpdateJoinManualReviewReason);
         }
+        if (manualReviewReasons.contains(MySqlToDmSqlConverter.INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON)
+                && sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter) {
+            // Text segments can split SUM(CASE ... <choose> ... END) from its opening parenthesis.
+            // Clear that segment warning only after every division in the complete body is safe.
+            SqlConversionResult arithmetic = mySqlToDmSqlConverter.convertArithmeticExpressions(rewrittenBody);
+            if (!arithmetic.manualReviewRequired()) {
+                if (arithmetic.changed()) {
+                    rewrittenBody = arithmetic.convertedSql();
+                    addAppliedRules(appliedRules, arithmetic.appliedRules());
+                    changed = true;
+                }
+                manualReviewReasons.removeIf(
+                        MySqlToDmSqlConverter.INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON::equals
+                );
+            }
+        }
         return new DynamicBodyConversion(
                 rawBody,
                 changed ? rewrittenBody : rawBody,

@@ -166,7 +166,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final String DM_CURRENT_SCHEMA_EXPRESSION =
             "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)";
     private static final String DECIMAL_ARITHMETIC_TYPE = "DECIMAL(38,10)";
-    private static final String INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON =
+    public static final String INTEGER_ARITHMETIC_MANUAL_REVIEW_REASON =
             "整数算术表达式风险：MySQL `/` 会产生小数，达梦整数/整数可能截断；"
                     + "请确认是否需要在除法前 CAST 为 DECIMAL(38,10)，并用 NULLIF 处理分母 0。";
     private static final String TOKEN = "(?:\\d+|#\\{[^}]+}|\\$\\{[^}]+})";
@@ -656,6 +656,32 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_SINGLE_ARGUMENT_CONCAT_RULE);
         }
         return SqlConversionResult.changed(sql, converted, rules);
+    }
+
+    /** Rechecks arithmetic with the complete expression, including preserved MyBatis XML nodes. */
+    public SqlConversionResult convertArithmeticExpressions(String sql) {
+        String original = sql == null ? "" : sql;
+        String converted = original;
+        List<String> rules = new ArrayList<>();
+        while (true) {
+            ArithmeticConversion conversion = convertIntegerArithmeticExpressions(converted);
+            for (String rule : conversion.appliedRules()) {
+                if (!rules.contains(rule)) {
+                    rules.add(rule);
+                }
+            }
+            if (!conversion.manualReviewReason().isBlank()) {
+                return manualReviewResult(original, conversion.convertedSql(), rules,
+                        conversion.manualReviewReason());
+            }
+            if (converted.equals(conversion.convertedSql())) {
+                break;
+            }
+            // An outer replacement can enclose another division; recheck the actual output.
+            converted = conversion.convertedSql();
+        }
+        return converted.equals(original) ? SqlConversionResult.unchanged(original)
+                : SqlConversionResult.changed(original, converted, rules);
     }
 
     @Override
@@ -1408,22 +1434,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         int protectedEnd = -1;
         int index = 0;
         while (index < sql.length()) {
-            char current = sql.charAt(index);
-            if (current == '\'') {
-                index = skipSingleQuotedString(sql, index);
-            } else if (current == '"') {
-                index = skipDoubleQuotedText(sql, index);
-            } else if (current == '`') {
-                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
-                index = identifier.closed() ? identifier.nextIndex() : index + 1;
-            } else if (startsMyBatisPlaceholder(sql, index)) {
-                index = skipMyBatisPlaceholder(sql, index);
-            } else if (startsLineComment(sql, index)) {
-                index = skipUntilLineEnd(sql, index);
-            } else if (startsBlockComment(sql, index)) {
-                index = skipUntilBlockCommentEnd(sql, index);
-            } else if (startsMyBatisXmlTag(sql, index)) {
-                index = skipMyBatisXmlTag(sql, index);
+            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            if (ignoredEnd > index) {
+                index = ignoredEnd;
             } else if (startsKeyword(sql, index, "DIV")) {
                 ArithmeticOperand left = readArithmeticLeftOperand(sql, index);
                 ArithmeticOperand right = readArithmeticRightOperand(sql, index + "DIV".length());
@@ -1456,21 +1469,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         int index = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
-            if (current == '\'') {
-                index = skipSingleQuotedString(sql, index);
-            } else if (current == '"') {
-                index = skipDoubleQuotedText(sql, index);
-            } else if (current == '`') {
-                BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
-                index = identifier.closed() ? identifier.nextIndex() : index + 1;
-            } else if (startsMyBatisPlaceholder(sql, index)) {
-                index = skipMyBatisPlaceholder(sql, index);
-            } else if (startsLineComment(sql, index)) {
-                index = skipUntilLineEnd(sql, index);
-            } else if (startsBlockComment(sql, index)) {
-                index = skipUntilBlockCommentEnd(sql, index);
-            } else if (startsMyBatisXmlTag(sql, index)) {
-                index = skipMyBatisXmlTag(sql, index);
+            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            if (ignoredEnd > index) {
+                index = ignoredEnd;
             } else if (current == '/') {
                 ArithmeticOperand left = readArithmeticLeftOperand(sql, index);
                 ArithmeticOperand right = readArithmeticRightOperand(sql, index + 1);
@@ -1529,6 +1530,136 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 && isSimpleArithmeticOperand(right.text());
     }
 
+    private int skipArithmeticIgnoredText(String sql, int index) {
+        char current = sql.charAt(index);
+        if (sql.startsWith("<!--", index)) {
+            int end = sql.indexOf("-->", index + 4);
+            return end < 0 ? sql.length() : end + 3;
+        }
+        if (sql.startsWith("<![CDATA[", index)) {
+            return index + 9;
+        }
+        if (sql.startsWith("]]>", index)) {
+            return index + 3;
+        }
+        if (current == '\'') {
+            return skipSingleQuotedString(sql, index);
+        }
+        if (current == '"') {
+            return skipDoubleQuotedText(sql, index);
+        }
+        if (current == '`') {
+            BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
+            return identifier.closed() ? identifier.nextIndex() : index + 1;
+        }
+        if (startsMyBatisPlaceholder(sql, index)) {
+            return skipMyBatisPlaceholder(sql, index);
+        }
+        if (startsLineComment(sql, index)) {
+            return skipUntilLineEnd(sql, index);
+        }
+        if (startsBlockComment(sql, index)) {
+            return skipUntilBlockCommentEnd(sql, index);
+        }
+        return startsMyBatisXmlTag(sql, index) ? skipMyBatisXmlTag(sql, index) : index;
+    }
+
+    private int findArithmeticOpenParen(String sql, int closeIndex) {
+        List<Integer> opens = new ArrayList<>();
+        int index = 0;
+        while (index <= closeIndex) {
+            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            if (ignoredEnd > index) {
+                index = ignoredEnd;
+                continue;
+            }
+            char current = sql.charAt(index);
+            if (current == '(') {
+                opens.add(index);
+            } else if (current == ')' && !opens.isEmpty()) {
+                int open = opens.remove(opens.size() - 1);
+                if (index == closeIndex) {
+                    return open;
+                }
+            }
+            index++;
+        }
+        return -1;
+    }
+
+    private int findArithmeticCloseParen(String sql, int openIndex) {
+        int depth = 0;
+        int index = openIndex;
+        while (index < sql.length()) {
+            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            if (ignoredEnd > index) {
+                index = ignoredEnd;
+                continue;
+            }
+            char current = sql.charAt(index);
+            if (current == '(') {
+                depth++;
+            } else if (current == ')' && --depth == 0) {
+                return index;
+            }
+            index++;
+        }
+        return -1;
+    }
+
+    private boolean hasSafeArithmeticXmlStructure(String expression) {
+        List<ArithmeticXmlBoundary> tags = new ArrayList<>();
+        int depth = 0;
+        int index = 0;
+        boolean hasXml = false;
+        boolean hasDynamicFragment = false;
+        while (index < expression.length()) {
+            if (startsMyBatisXmlTag(expression, index)) {
+                hasXml = true;
+                boolean closing = expression.charAt(index + 1) == '/';
+                int nameStart = index + (closing ? 2 : 1);
+                int nameEnd = nameStart;
+                while (Character.isLetter(expression.charAt(nameEnd))) {
+                    nameEnd++;
+                }
+                String name = expression.substring(nameStart, nameEnd).toLowerCase(Locale.ROOT);
+                if (!Set.of("if", "choose", "when", "otherwise").contains(name)) {
+                    return false;
+                }
+                int end = skipMyBatisXmlTag(expression, index);
+                if (closing) {
+                    if (tags.isEmpty()) {
+                        return false;
+                    }
+                    ArithmeticXmlBoundary open = tags.remove(tags.size() - 1);
+                    if (!open.name().equals(name) || open.parenthesisDepth() != depth) {
+                        return false;
+                    }
+                } else if (expression.charAt(end - 2) != '/') {
+                    tags.add(new ArithmeticXmlBoundary(name, depth));
+                }
+                index = end;
+                continue;
+            }
+            hasDynamicFragment |= expression.startsWith("${", index);
+            int ignoredEnd = skipArithmeticIgnoredText(expression, index);
+            if (ignoredEnd > index) {
+                index = ignoredEnd;
+                continue;
+            }
+            if (expression.charAt(index) == '(') {
+                depth++;
+            } else if (expression.charAt(index) == ')') {
+                depth--;
+            }
+            index++;
+        }
+        return tags.isEmpty() && (!hasXml || (!hasDynamicFragment
+                && !containsKeywordOutsideIgnoredText(expression, "SELECT")
+                && !containsKeywordOutsideIgnoredText(expression, "FROM")
+                && !containsKeywordOutsideIgnoredText(expression, "JOIN")));
+    }
+
     private ArithmeticOperand readArithmeticLeftOperand(String sql, int operatorIndex) {
         int end = skipWhitespaceBackward(sql, operatorIndex);
         if (end <= 0) {
@@ -1561,7 +1692,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         char previous = sql.charAt(end - 1);
         if (previous == ')') {
-            int openParenIndex = findMatchingOpenParenBackward(sql, end - 1);
+            int openParenIndex = findArithmeticOpenParen(sql, end - 1);
             if (openParenIndex < 0) {
                 return -1;
             }
@@ -1596,7 +1727,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return signedEnd > start + 1 ? signedEnd : -1;
         }
         if (sql.charAt(start) == '(') {
-            int closeParenIndex = findMatchingParen(sql, start);
+            int closeParenIndex = findArithmeticCloseParen(sql, start);
             return closeParenIndex < 0 ? -1 : closeParenIndex + 1;
         }
         if (startsHashMyBatisPlaceholder(sql, start)) {
@@ -1616,7 +1747,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
             int cursor = skipWhitespace(sql, token.endIndex());
             if (cursor < sql.length() && sql.charAt(cursor) == '(') {
-                int closeParenIndex = findMatchingParen(sql, cursor);
+                int closeParenIndex = findArithmeticCloseParen(sql, cursor);
                 return closeParenIndex < 0 ? -1 : closeParenIndex + 1;
             }
             return extendQualifiedIdentifierEnd(sql, token.endIndex());
@@ -1758,7 +1889,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
     private boolean isSimpleArithmeticOperand(String expression) {
         String trimmed = expression.trim();
-        if (trimmed.isEmpty()) {
+        if (trimmed.isEmpty() || !hasSafeArithmeticXmlStructure(trimmed)) {
             return false;
         }
         if (trimmed.startsWith("${") || trimmed.startsWith("'") || trimmed.startsWith("\"")) {
@@ -1798,7 +1929,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (openParenIndex >= expression.length() || expression.charAt(openParenIndex) != '(') {
             return null;
         }
-        int closeParenIndex = findMatchingParen(expression, openParenIndex);
+        int closeParenIndex = findArithmeticCloseParen(expression, openParenIndex);
         if (closeParenIndex < 0 || !expression.substring(closeParenIndex + 1).isBlank()) {
             return null;
         }
@@ -13001,6 +13132,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private record ArithmeticOperand(int startIndex, int endIndex, String text) {
+    }
+
+    private record ArithmeticXmlBoundary(String name, int parenthesisDepth) {
     }
 
     private record IdentifierToken(String text, int endIndex) {
