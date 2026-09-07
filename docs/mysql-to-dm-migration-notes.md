@@ -161,6 +161,7 @@ ORDER BY PARA_NAME;
 - MySQL `information_schema.TABLES/COLUMNS` 不应原样迁移。表存在性检查可映射到 `ALL_TABLES`，列清单可映射到 `ALL_TAB_COLUMNS`，需要创建时间或 schema 名的表详情可映射到 `ALL_OBJECTS`，并按当前 schema 过滤。业务代码同时读取 `COLUMN_TYPE`、注释和默认值时，可从 `SYS.SYSCOLUMNS`、`SYS.SYSOBJECTS`、`SYS.SYSCOLUMNCOMMENTS` 按运行时 schema 和表名重建相同投影；不得把某个项目的 schema 固化到转换规则。
 - `AES_ENCRYPT`、`AES_DECRYPT`、`MD5`、`TO_BASE64` 等加密/编码函数要逐项确认。当前不再把 Base64 包裹 AES 密码场景改写为达梦 `SF_*` 函数，优先通过系统库兼容函数保持 MySQL 调用形态，避免修改业务 SQL。
 - MySQL `/` 具有小数除法语义，达梦的整数/整数可能先截断；对可完整识别的数值、列、日期数值函数、聚合和无子查询括号表达式，应把分子转为 `DECIMAL(38,10)`，并把分母转为 `NULLIF(CAST(... AS DECIMAL(38,10)), 0)`。分母为 0 的容错和达梦参数相关，不能依赖实例容错；无法完整识别表达式边界时仍须人工确认。
+- MyBatis 的 `SUM(CASE ... END) / 10000` 等聚合除法即使内部包含 `<if>` 或 `<choose>`，也应在完整表达式层面重试转换，保留原动态节点和参数。只有各分支的括号独立平衡、操作数不含未知 `${}` 片段、未展开的 `<include>/<foreach>` 或子查询时，才可自动添加数值转换；字符串、注释、XML 属性中的括号和斜杠不得参与 SQL 边界判断。嵌套除法须复查最终输出，整条语句仍存在不安全除法时不得清除人工确认项。
 - SQL Server 风格 `+` 只能在一侧是字符串字面量、`CONCAT`，或 `CAST/CONVERT` 明确声明字符返回类型时改为达梦 `||`。`CAST(... AS DECIMAL)`、`CONVERT(..., DECIMAL)` 等数值结果之间的 `+` 必须保留算术加法，不能仅凭函数名推断为字符串拼接。
 - MySQL 中常见 `SUM(varchar_col)` 依赖隐式转换，达梦可能报类型转换失败。应优先修业务 SQL，显式 `CAST` 且清洗非数字数据。
 
