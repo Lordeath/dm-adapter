@@ -14,6 +14,11 @@
 
     <dependencies>
         <dependency>
+            <groupId>com.github.albfernandez</groupId>
+            <artifactId>juniversalchardet</artifactId>
+            <version>2.5.0</version>
+        </dependency>
+        <dependency>
             <groupId>com.github.dmadapter</groupId>
             <artifactId>dm-adapter-core</artifactId>
             <version>${project.version}</version>
