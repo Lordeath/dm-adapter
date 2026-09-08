@@ -2,7 +2,10 @@ package com.github.dmadapter.cli;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -16,6 +19,24 @@ class ProjectDdlKeyMetadataReaderTest {
     Path tempDir;
 
     private final ProjectDdlKeyMetadataReader reader = new ProjectDdlKeyMetadataReader();
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GBK", "GB18030", "Big5", "UTF-16LE", "UTF-32BE"})
+    void readsChineseTableAndKeyNamesFromEncodedDdl(String encoding) throws Exception {
+        Path ddl = tempDir.resolve("tables.sql");
+        Files.writeString(ddl, """
+                CREATE TABLE `中文` (
+                    `姓名` varchar(100) NOT NULL,
+                    PRIMARY KEY (`姓名`)
+                );
+                """, Charset.forName(encoding));
+
+        Map<String, TableKeyMetadata> metadata = reader.readTableKeys(tempDir, List.of("中文"));
+
+        assertThat(metadata).containsKey("中文");
+        assertThat(metadata.get("中文").primaryKeys()).singleElement()
+                .satisfies(key -> assertThat(key.columns()).containsExactly("姓名"));
+    }
 
     @Test
     void readsPrimaryAndUniqueKeysFromCreateTableDdl() throws Exception {

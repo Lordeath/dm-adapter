@@ -7,11 +7,14 @@ import com.github.dmadapter.mybatis.SqlRewriteConfig;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.nio.charset.StandardCharsets;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -1226,6 +1229,49 @@ class SqlScriptMigratorTest {
                 .contains("update ns_core_menu")
                 .contains("menu_menusubname = 'budgetParameterSetting'")
                 .doesNotContain("\u0000");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "GB2312, 中文测试：用户名称和部门信息，迁移成功。, false",
+            "GBK, 中文测试：用户名称和部门信息，迁移成功。, false",
+            "GB18030, 中文测试：用户名称和部门信息，迁移成功。𠮷😀, false",
+            "Big5, 中文測試：使用者名稱和部門資訊，遷移成功。, false",
+            "UTF-8, 中文测试𠮷😀, false",
+            "UTF-8, 中文测试𠮷😀, true",
+            "UTF-16LE, 中文测试𠮷😀, false",
+            "UTF-16LE, 中文测试𠮷😀, true",
+            "UTF-16BE, 中文测试𠮷😀, false",
+            "UTF-16BE, 中文测试𠮷😀, true",
+            "UTF-32LE, 中文测试𠮷😀, false",
+            "UTF-32LE, 中文测试𠮷😀, true",
+            "UTF-32BE, 中文测试𠮷😀, false",
+            "UTF-32BE, 中文测试𠮷😀, true",
+            "windows-1252, café déjà vu – résumé, false",
+            "Shift_JIS, 日本語の文字コードを正しく読み込みます。, false"
+    })
+    void migratesEncodedSqlWithoutChangingTextAndWritesUtf8(
+            String encoding, String value, boolean bom
+    ) throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        Path source = sqlRoot.resolve("中文脚本.sql");
+        Files.createDirectories(sqlRoot);
+        String sql = "UPDATE sample_menu SET name = '" + value + "' WHERE id = 1;\r\n";
+        byte[] original = (bom ? "\uFEFF" + sql : sql).getBytes(Charset.forName(encoding));
+        Files.write(source, original);
+
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir, sqlRoot, sqlRootOut, false, "sample-bill", "sample-system",
+                DmValidationEnvironment.from(Map.of())
+        ));
+
+        assertThat(report.manualReviewSqlCount()).isZero();
+        assertThat(report.files()).singleElement().satisfies(file ->
+                assertThat(file.statementCount()).isEqualTo(1));
+        assertThat(Files.readString(sqlRootOut.resolve(source.getFileName()), StandardCharsets.UTF_8))
+                .isEqualTo(sql.replace("\r\n", "\n"));
+        assertThat(Files.readAllBytes(source)).isEqualTo(original);
     }
 
     @Test

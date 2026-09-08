@@ -11,7 +11,6 @@ import com.github.dmadapter.sql.SqlConverter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -3340,31 +3339,7 @@ class SqlScriptMigrator {
     }
 
     private String readSqlScriptContent(Path sqlFile) throws IOException {
-        byte[] bytes = Files.readAllBytes(sqlFile);
-        String content;
-        if (startsWith(bytes, 0xFF, 0xFE)) {
-            content = new String(bytes, 2, bytes.length - 2, StandardCharsets.UTF_16LE);
-        } else if (startsWith(bytes, 0xFE, 0xFF)) {
-            content = new String(bytes, 2, bytes.length - 2, StandardCharsets.UTF_16BE);
-        } else {
-            int offset = startsWith(bytes, 0xEF, 0xBB, 0xBF) ? 3 : 0;
-            content = StandardCharsets.UTF_8.newDecoder()
-                    .decode(ByteBuffer.wrap(bytes, offset, bytes.length - offset))
-                    .toString();
-        }
-        return stripLeadingBom(content);
-    }
-
-    private boolean startsWith(byte[] bytes, int... prefix) {
-        if (bytes == null || bytes.length < prefix.length) {
-            return false;
-        }
-        for (int index = 0; index < prefix.length; index++) {
-            if (Byte.toUnsignedInt(bytes[index]) != prefix[index]) {
-                return false;
-            }
-        }
-        return true;
+        return stripLeadingBom(SqlScriptReader.read(sqlFile));
     }
 
     private String stripLeadingBom(String content) {

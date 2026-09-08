@@ -124,6 +124,10 @@ DM_ADAPTER_DIR=/path/to/dm-adapter/.dm-adapter/demo-rest \
 mvn -Ddm.adapter.projectRoot=/path/to/demo -Dtest=DmSqlValidationTest test
 ```
 
+SQL 文件按文件分别识别编码，支持常见的 GB2312、GBK、GB18030、Big5，以及 UTF-8、UTF-16LE/BE、UTF-32LE/BE；Unicode 文件优先按 BOM 识别，也支持具有可识别字节排列的无 BOM UTF-16/32。其他旧编码使用编码检测器识别。同一目录可以混用编码，本次生成的达梦 SQL 一律为**无 BOM 的 UTF-8**，源 SQL 文件保持不变。
+
+无 BOM 的旧编码无法在所有内容上唯一识别，尤其是极短文本；遇到识别歧义时，可设置 `DM_SQL_SCRIPT_FALLBACK_ENCODING=GBK`（PowerShell：`$env:DM_SQL_SCRIPT_FALLBACK_ENCODING = "GBK"`），或在 `java -jar` 前添加 `-Ddm.adapter.sqlScriptFallbackEncoding=GBK`，指定非 Unicode 文件的实际编码。该设置优先于旧编码自动检测，UTF-8 和已识别的 UTF-16/32 仍正常读取。指定其他编码时使用 Java 支持的字符集名称。解码失败会在日志和迁移摘要中显示文件路径、编码及底层原因，不会用替代字符掩盖非法字节；文件本身损坏时需修复源文件后重试。
+
 SQL 脚本迁移的非 dry-run 会在应用工作目录生成
 `sql-script-validation-plan.json`。清单固化输出文件、目标 schema、数据库能力快照、人工确认项以及文件/语句 SHA-256。需要稍后单独执行时，使用：
 

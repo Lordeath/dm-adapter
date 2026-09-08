@@ -2,6 +2,8 @@ package com.github.dmadapter.cli;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import picocli.CommandLine;
 
 import javax.tools.JavaCompiler;
@@ -9,6 +11,7 @@ import javax.tools.ToolProvider;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -34,6 +37,67 @@ class DmAdapterCliTest {
         int exitCode = new CommandLine(new DmAdapterCli()).execute("validate-sql", "--help");
 
         assertThat(exitCode).isZero();
+    }
+
+    @Test
+    void sqlDecodingFailureShowsFileEncodingAndReasonInLogAndSummary() throws Exception {
+        writeDemoProject();
+        Path source = writeFile("sql/v2/损坏的脚本.sql", "");
+        Files.write(source, new byte[] {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF, (byte) 0xC3});
+        PrintStream originalErr = System.err;
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        int exitCode;
+        try (PrintStream capturedErr = new PrintStream(stderr, true, StandardCharsets.UTF_8)) {
+            System.setErr(capturedErr);
+            exitCode = execute(
+                    "migrate", "--project", tempDir.toString(), "--sql-scripts-only",
+                    "--sql-root", "sql/v2", "--sql-root-out", "sql/v2-dm"
+            );
+        } finally {
+            System.setErr(originalErr);
+        }
+
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(stderr.toString(StandardCharsets.UTF_8))
+                .contains("读取 SQL 文件失败", source.toString(), "UTF-8", "MalformedInputException");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-summary.md")))
+                .contains("读取 SQL 文件失败", "损坏的脚本.sql", "UTF-8", "MalformedInputException");
+        assertThat(tempDir.resolve("sql/v2-dm/损坏的脚本.sql")).doesNotExist();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void sqlMigrationHandlesMixedEncodingsAndHonorsDryRun(boolean dryRun) throws Exception {
+        writeDemoProject();
+        List<String> encodings = List.of("GBK", "GB18030", "Big5", "UTF-8", "UTF-16BE", "UTF-32LE");
+        String sql = "UPDATE sample_menu SET name = '中文姓名' WHERE id = 1;\n";
+        for (String encoding : encodings) {
+            Path file = writeFile("sql/v2/" + encoding + ".sql", "");
+            Files.writeString(file, sql, Charset.forName(encoding));
+        }
+        List<String> args = new ArrayList<>(List.of(
+                "migrate", "--project", tempDir.toString(), "--sql-scripts-only",
+                "--sql-root", "sql/v2", "--sql-root-out", "sql/v2-dm"
+        ));
+        if (dryRun) {
+            args.add("--dry-run");
+        }
+
+        assertThat(execute(args.toArray(String[]::new))).isZero();
+
+        for (String encoding : encodings) {
+            assertThat(Files.readAllBytes(tempDir.resolve("sql/v2/" + encoding + ".sql")))
+                    .isEqualTo(sql.getBytes(Charset.forName(encoding)));
+            Path output = tempDir.resolve("sql/v2-dm/" + encoding + ".sql");
+            if (dryRun) {
+                assertThat(output).doesNotExist();
+            } else {
+                assertThat(Files.readAllBytes(output)).isEqualTo(sql.getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        if (!dryRun) {
+            assertThat(tempDir.resolve(".dm-adapter/sql-script-validation-plan.json")).exists();
+        }
     }
 
     @Test
