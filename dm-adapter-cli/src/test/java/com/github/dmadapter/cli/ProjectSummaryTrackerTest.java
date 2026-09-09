@@ -70,7 +70,7 @@ class ProjectSummaryTrackerTest {
                         "20260205_system.sql",
                         "20260205_system.sql",
                         2,
-                        "依赖需要人工确认的存储过程 `demo`；请先修正该存储过程后再执行这个 CALL。",
+                        "依赖需要人工确认的存储过程 `demo`；请先完成该存储过程的达梦适配后再执行这个 CALL。",
                         "CALL demo()",
                         "CALL demo()"
                 )

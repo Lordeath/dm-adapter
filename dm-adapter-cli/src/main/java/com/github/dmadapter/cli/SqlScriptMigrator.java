@@ -119,6 +119,8 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_CURSOR_HANDLER_TO_LOOP";
     static final String MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE =
             "MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK";
+    static final String MYSQL_PROCEDURE_START_TRANSACTION_TO_DM_RULE =
+            "MYSQL_PROCEDURE_START_TRANSACTION_TO_DM";
     static final String MYSQL_PROCEDURE_DYNAMIC_PREPARE_TO_EXECUTE_IMMEDIATE_RULE =
             "MYSQL_PROCEDURE_DYNAMIC_PREPARE_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_PROCEDURE_SIGNAL_TO_RAISE_APPLICATION_ERROR_RULE =
@@ -1014,7 +1016,7 @@ class SqlScriptMigrator {
                             if (manualReviewProcedures.contains(calledProcedure.key())) {
                                 dependencyReason = "依赖当前迁移队列中需要人工确认的存储过程 `"
                                         + calledProcedure.displayName()
-                                        + "`；请先修正该存储过程后再验证。";
+                                        + "`；请先完成该存储过程的达梦适配后再验证。";
                                 break;
                             }
                             if (declaredProcedures.contains(calledProcedure.key())) {
@@ -1034,7 +1036,7 @@ class SqlScriptMigrator {
                                 dependencyReason = manuallyDeclaredInFile.contains(calledProcedure.key())
                                         ? "依赖当前迁移队列中需要人工确认的存储过程 `"
                                                 + calledProcedure.displayName()
-                                                + "`；请先修正该存储过程后再验证。"
+                                                + "`；请先完成该存储过程的达梦适配后再验证。"
                                         : "存储过程依赖顺序错误：`"
                                                 + calledProcedure.displayName()
                                                 + "` 在当前迁移队列中尚未创建；请调整脚本顺序后再验证。";
@@ -1077,7 +1079,7 @@ class SqlScriptMigrator {
                 if (manualReviewProcedures.contains(calledProcedure.key())) {
                     dependencyReason = "依赖需要人工确认的存储过程 `"
                             + calledProcedure.displayName()
-                            + "`；请先修正该存储过程后再执行这个 CALL。";
+                            + "`；请先完成该存储过程的达梦适配后再执行这个 CALL。";
                 } else if (declaredProcedures.contains(calledProcedure.key())
                         && !availableProcedures.contains(calledProcedure.key())) {
                     dependencyReason = "存储过程调用顺序错误：`"
@@ -3253,7 +3255,7 @@ class SqlScriptMigrator {
                     }
                     String reason = conversion.manualReviewRequired()
                             ? conversion.reason()
-                            : "依赖需要人工确认的存储过程 `" + calledProcedureName + "`；请先修正该存储过程后再执行这个 CALL。";
+                            : "依赖需要人工确认的存储过程 `" + calledProcedureName + "`；请先完成该存储过程的达梦适配后再执行这个 CALL。";
                     manualReviewItems.add(new SqlScriptManualReviewItem(
                             relative.toString(),
                             outputFile.toString(),
@@ -7344,6 +7346,12 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE);
         }
 
+        String transactionSql = convertMysqlProcedureStartTransaction(converted);
+        if (!transactionSql.equals(converted)) {
+            converted = transactionSql;
+            rules.add(MYSQL_PROCEDURE_START_TRANSACTION_TO_DM_RULE);
+        }
+
         return new SafeRuleConversion(
                 converted,
                 !rules.isEmpty(),
@@ -9839,6 +9847,29 @@ class SqlScriptMigrator {
         return converted.toString();
     }
 
+    private String convertMysqlProcedureStartTransaction(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return sql;
+        }
+        // MySQL implicitly commits before START TRANSACTION. DM rejects START
+        // while the CALL already has an active transaction (-6510), so perform
+        // that commit explicitly and retain the start of the new transaction.
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        Matcher start = Pattern.compile("(?is)\\bSTART\\s+TRANSACTION\\s*;").matcher(searchable);
+        Pattern precedingCommit = Pattern.compile("(?is)\\bCOMMIT\\s*;\\s*$");
+        StringBuilder converted = new StringBuilder();
+        int cursor = 0;
+        while (start.find()) {
+            if (precedingCommit.matcher(searchable).region(0, start.start()).find()) {
+                continue;
+            }
+            converted.append(sql, cursor, start.start()).append("COMMIT;\n")
+                    .append(lineIndentBefore(sql, start.start()));
+            cursor = start.start();
+        }
+        return cursor == 0 ? sql : converted.append(sql.substring(cursor)).toString();
+    }
+
     private String convertMysqlSqlExceptionExitHandler(String sql) {
         if (!isCreateProcedureStatement(sql)
                 || !containsIgnoreCase(sql, "DECLARE")
@@ -9852,6 +9883,9 @@ class SqlScriptMigrator {
         if (!handler.find()) {
             return sql;
         }
+        if (!isOuterProcedureHandlerDeclaration(sql, handler.start())) {
+            return sql;
+        }
         int handlerStart = horizontalWhitespaceStartOnSameLine(sql, handler.start());
         int handlerEnd = handler.end();
         int handlerBodyStart = handler.start("body");
@@ -9861,6 +9895,12 @@ class SqlScriptMigrator {
         }
 
         String handlerBody = sql.substring(handlerBodyStart, handlerBodyEnd).strip();
+        int rollbackStart = skipWhitespaceAndComments(handlerBody, 0);
+        int rollbackEnd = startsKeyword(handlerBody, rollbackStart, "ROLLBACK")
+                ? skipWhitespaceAndComments(handlerBody, rollbackStart + "ROLLBACK".length()) : -1;
+        boolean rollbackAndRethrow = rollbackEnd >= 0 && rollbackEnd < handlerBody.length()
+                && handlerBody.charAt(rollbackEnd) == ';'
+                && skipWhitespaceAndComments(handlerBody, rollbackEnd + 1) == handlerBody.length();
         for (String unsupported : List.of(
                 "DECLARE",
                 "HANDLER",
@@ -9876,7 +9916,8 @@ class SqlScriptMigrator {
                 "COMMIT",
                 "ROLLBACK"
         )) {
-            if (containsKeywordOutsideIgnoredText(handlerBody, unsupported)) {
+            if (containsKeywordOutsideIgnoredText(handlerBody, unsupported)
+                    && !(rollbackAndRethrow && "ROLLBACK".equals(unsupported))) {
                 return sql;
             }
         }
@@ -9912,6 +9953,26 @@ class SqlScriptMigrator {
         return withoutHandler.substring(0, procedureEndIndex)
                 + exceptionClause
                 + withoutHandler.substring(procedureEndIndex);
+    }
+
+    private boolean isOuterProcedureHandlerDeclaration(String sql, int handlerStart) {
+        int begin = firstProcedureBegin(sql);
+        if (begin < 0 || begin >= handlerStart) {
+            return false;
+        }
+        int cursor = skipWhitespaceAndComments(sql, begin + "BEGIN".length());
+        while (cursor < handlerStart) {
+            if (!startsKeyword(sql, cursor, "DECLARE")) {
+                return false;
+            }
+            int end = findStatementTerminator(sql, cursor);
+            if (end >= handlerStart
+                    || convertMysqlProcedureDeclaration(sql.substring(cursor, end).strip()) == null) {
+                return false;
+            }
+            cursor = skipWhitespaceAndComments(sql, end + 1);
+        }
+        return cursor == handlerStart;
     }
 
     private int horizontalWhitespaceStartOnSameLine(String value, int index) {
@@ -16657,6 +16718,16 @@ class SqlScriptMigrator {
             return "";
         }
         String searchableSql = replaceIgnoredSqlWithSpaces(sql == null ? "" : sql);
+        if (isCreateProcedureStatement(sql)) {
+            Matcher transaction = Pattern.compile("(?is)\\bSTART\\s+TRANSACTION\\b").matcher(searchableSql);
+            while (transaction.find()) {
+                int end = findStatementTerminator(sql, transaction.end());
+                if (!searchableSql.substring(transaction.end(), end).isBlank()) {
+                    return "MySQL procedure START TRANSACTION options need manual confirmation for Dameng; "
+                            + "only an unqualified transaction start is converted automatically.";
+                }
+            }
+        }
         if (Pattern.compile("(?is)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b")
                 .matcher(searchableSql)
                 .find()) {

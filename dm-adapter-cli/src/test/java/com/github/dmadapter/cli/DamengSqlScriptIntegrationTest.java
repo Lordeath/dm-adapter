@@ -12,6 +12,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
 import java.util.Locale;
@@ -24,6 +25,93 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class DamengSqlScriptIntegrationTest {
     @TempDir
     Path tempDir;
+
+    @Test
+    void convertedRollbackHandlerCommitsSuccessAndRethrowsAfterRollingBackAllChanges() throws Exception {
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "DM_HANDLER_T_" + suffix;
+        String procedure = "DM_HANDLER_P_" + suffix;
+        Path source = tempDir.resolve("sql/v2");
+        Path output = tempDir.resolve("sql/v2-dm");
+        Files.createDirectories(source);
+        Files.writeString(source.resolve("handler.sql"), """
+                CREATE PROCEDURE %s(IN p_fail INT)
+                proc: BEGIN
+                    DECLARE v_count INT DEFAULT 0;
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        ROLLBACK;
+                        RESIGNAL;
+                    END;
+                    SELECT COUNT(*) INTO v_count FROM %s;
+                    IF v_count > 0 THEN
+                        START TRANSACTION;
+                        UPDATE %s SET value = 20 WHERE id = 1;
+                        UPDATE %s SET value = 30 WHERE id = 2;
+                        IF p_fail = 1 THEN
+                            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'rollback integration failure';
+                        END IF;
+                        IF p_fail = 2 THEN
+                            INSERT INTO %s (id, value) VALUES (1, 99);
+                        END IF;
+                        COMMIT;
+                    END IF;
+                END;
+                /
+                """.formatted(procedure, table, table, table, table));
+        var report = new SqlScriptMigrator(new MySqlToDmSqlConverter(),
+                (files, environment) -> SqlScriptValidationRun.notAttempted("integration fixture", List.of()))
+                .migrate(new SqlScriptMigrationRequest(tempDir, source, output, false, "", "",
+                        DmValidationEnvironment.from(Map.of())));
+        assertThat(report.manualReviewItems()).isEmpty();
+
+        Class.forName("dm.jdbc.driver.DmDriver");
+        try (Connection connection = DriverManager.getConnection(requiredEnvironment("DM_JDBC_URL"),
+                requiredEnvironment("DM_DB_USERNAME"), requiredEnvironment("DM_DB_PASSWORD"));
+             Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA") + "\"");
+            try {
+                statement.execute("CREATE TABLE " + table + " (id INT PRIMARY KEY, value INT)");
+                statement.execute("INSERT INTO " + table + " VALUES (1, 10), (2, 10)");
+                connection.commit();
+                executeStatements(statement, SqlScriptParser.statements(
+                        Files.readString(output.resolve("handler.sql"))));
+                statement.execute("ALTER PROCEDURE " + procedure + " COMPILE");
+                connection.setAutoCommit(false);
+                statement.execute("INSERT INTO " + table + " VALUES (99, 10)");
+                assertThatThrownBy(() -> statement.execute("CALL " + procedure + "(1)"))
+                        .isInstanceOf(SQLException.class).hasMessageContaining("rollback integration failure")
+                        .satisfies(error -> assertThat(((SQLException) error).getErrorCode()).isEqualTo(-20000));
+                // START TRANSACTION commits preceding caller work in MySQL as well.
+                try (ResultSet rows = statement.executeQuery("SELECT value FROM " + table + " ORDER BY id")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getInt(1)).isEqualTo(10);
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getInt(1)).isEqualTo(10);
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getInt(1)).isEqualTo(10);
+                    assertThat(rows.next()).isFalse();
+                }
+                assertThatThrownBy(() -> statement.execute("CALL " + procedure + "(2)"))
+                        .isInstanceOf(SQLException.class)
+                        .satisfies(error -> assertThat(((SQLException) error).getErrorCode()).isEqualTo(-6602));
+                try (ResultSet rows = statement.executeQuery("SELECT SUM(value) FROM " + table)) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getInt(1)).isEqualTo(30);
+                }
+                statement.execute("CALL " + procedure + "(0)");
+                connection.rollback();
+                try (ResultSet rows = statement.executeQuery("SELECT SUM(value) FROM " + table)) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getInt(1)).isEqualTo(60);
+                }
+            } finally {
+                connection.rollback();
+                dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + procedure);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
 
     @Test
     void executesAnonymousConditionalDdlBlock() throws Exception {
