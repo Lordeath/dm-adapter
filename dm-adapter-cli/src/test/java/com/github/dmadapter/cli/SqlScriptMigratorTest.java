@@ -8273,6 +8273,143 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsOuterRollbackResignalHandlerAndUnblocksDependentCall() throws Exception {
+        String original = """
+                DELIMITER $$
+                CREATE PROCEDURE apply_change(IN p_fail INT)
+                proc: BEGIN
+                    DECLARE v_count INT DEFAULT 0;
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        -- Preserve the transaction rollback before rethrowing.
+                        ROLLBACK;
+                        RESIGNAL;
+                    END;
+                    SELECT COUNT(*) INTO v_count FROM change_rows;
+                    IF v_count = 1 THEN
+                        START TRANSACTION;
+                        UPDATE change_rows SET value = 20 WHERE id = 1;
+                        IF p_fail = 1 THEN
+                            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'change failed';
+                        END IF;
+                        COMMIT;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL apply_change(0);
+                """;
+
+        ConvertedScript converted = migrateSingleScript(original);
+
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+        assertThat(converted.sql())
+                .contains("EXCEPTION\n", "WHEN OTHERS THEN", "ROLLBACK;\n", "RAISE;",
+                        "-- Preserve the transaction rollback before rethrowing.",
+                        "RAISE_APPLICATION_ERROR(-20000, 'change failed')", "CALL apply_change(0)")
+                .doesNotContain("DECLARE EXIT HANDLER", "RESIGNAL", "proc:");
+        assertThat(converted.sql()).contains("COMMIT;\n        START TRANSACTION;\n        UPDATE");
+        assertThat(converted.report().files()).flatExtracting(file -> file.appliedRules())
+                .contains(SqlScriptMigrator.MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE);
+        assertThat(Files.readString(tempDir.resolve("sql/v2/procedure.sql"))).isEqualTo(original);
+    }
+
+    @Test
+    void doesNotDuplicateExplicitCommitBeforeTransactionStart() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE start_again()
+                BEGIN
+                    COMMIT;
+                    -- already explicitly ends the preceding transaction
+                    START TRANSACTION;
+                    INSERT INTO change_log(message) VALUES ('changed');
+                    COMMIT;
+                END;
+                /
+                """);
+        assertThat(converted.sql().split("COMMIT;", -1)).hasSize(3);
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void preservesCommentsInTransactionStartsAndKeepsOptionsForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE two_transactions()
+                BEGIN
+                    START /* first transaction */ TRANSACTION;
+                    INSERT INTO change_log(message) VALUES ('first');
+                    START TRANSACTION;
+                    INSERT INTO change_log(message) VALUES ('second');
+                    COMMIT;
+                END;
+                /
+                """);
+        assertThat(converted.sql()).contains("COMMIT;\n    START /* first transaction */ TRANSACTION;",
+                "COMMIT;\n    START TRANSACTION;");
+        assertThat(converted.sql().split("COMMIT;", -1)).hasSize(4);
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+
+        ConvertedScript withOptions = migrateSingleScript("""
+                CREATE PROCEDURE read_only_transaction()
+                BEGIN
+                    START TRANSACTION READ ONLY;
+                    COMMIT;
+                END;
+                /
+                """);
+        assertThat(withOptions.report().manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("START TRANSACTION options"));
+        assertThat(withOptions.sql()).contains("START TRANSACTION READ ONLY;");
+    }
+
+    @Test
+    void preservesTransactionKeywordsInsideIgnoredText() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                CREATE PROCEDURE ignored_transaction()
+                BEGIN
+                    DECLARE v_message VARCHAR(100);
+                    -- START TRANSACTION; ROW_COUNT()
+                    SET v_message = 'START TRANSACTION; ROW_COUNT()';
+                    INSERT INTO change_log(message) VALUES (v_message);
+                END;
+                /
+                """);
+        assertThat(converted.sql()).contains("-- START TRANSACTION; ROW_COUNT()",
+                "v_message := 'START TRANSACTION; ROW_COUNT()'");
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+    }
+
+    @Test
+    void keepsNestedAndNontrivialTransactionExitHandlersForManualReview() throws Exception {
+        for (String body : List.of("COMMIT;", "ROLLBACK TO SAVEPOINT s1;", "ROLLBACK 'invalid';",
+                "ROLLBACK; INSERT INTO change_log VALUES (1);",
+                "IF 1 = 1 THEN ROLLBACK; END IF;")) {
+            String original = """
+                    CREATE PROCEDURE unsafe_handler()
+                    BEGIN
+                        DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN %s RESIGNAL; END;
+                        UPDATE change_rows SET value = 20;
+                    END;
+                    """.formatted(body);
+            assertThat(convertMysqlSqlExceptionExitHandler(original)).isSameAs(original);
+        }
+        String nested = """
+                CREATE PROCEDURE nested_handler()
+                BEGIN
+                    BEGIN
+                        DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; RESIGNAL; END;
+                        UPDATE change_rows SET value = 20;
+                    END;
+                    INSERT INTO change_log VALUES (1);
+                END;
+                """;
+        assertThat(convertMysqlSqlExceptionExitHandler(nested)).isSameAs(nested);
+        ConvertedScript converted = migrateSingleScript(nested);
+        assertThat(converted.report().manualReviewItems()).singleElement()
+                .satisfies(item -> assertThat(item.reason()).contains("HANDLER"));
+        assertThat(converted.sql()).contains("DECLARE EXIT HANDLER FOR SQLEXCEPTION");
+    }
+
+    @Test
     void keepsAmbiguousOrUnsupportedSqlExceptionExitHandlersUnchanged() throws Exception {
         String multipleHandlers = """
                 CREATE PROCEDURE multiple_handlers()
