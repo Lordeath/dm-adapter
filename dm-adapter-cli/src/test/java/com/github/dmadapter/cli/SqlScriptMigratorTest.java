@@ -1056,6 +1056,133 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void inlinesScriptExpressionVariablesThroughStableQueriesAndCallArguments() throws Exception {
+        String source = """
+                SET @parent_name = 'board';
+                SET @leaf_name = 'detail';
+                SET @parent_id = (SELECT id FROM demo_menu WHERE code = @parent_name LIMIT 1);
+                SET @parent_path = (SELECT path FROM demo_menu WHERE id = @parent_id LIMIT 1);
+                -- Keep @route_path in comments and strings.
+                SET @route_path = CONCAT(COALESCE(NULLIF(@parent_path, ''), CONCAT('/', @parent_name)),
+                                         '/', @leaf_name);
+                SELECT @route_path AS preview, '@route_path' AS literal_text;
+                CALL seed_demo_menu(JSON_OBJECT('route', @route_path, 'parent', @parent_id));
+                """;
+        ConvertedScript converted = migrateSingleScript(source);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CONCAT(COALESCE(NULLIF(")
+                .contains("SELECT path FROM demo_menu")
+                .contains("CONCAT('/', 'board')")
+                .contains("'/', 'detail'")
+                .contains("CALL seed_demo_menu(JSON_OBJECT('route',")
+                .contains("'@route_path' AS literal_text")
+                .contains("-- Keep @route_path in comments and strings.")
+                .doesNotContain("SET @route_path")
+                .doesNotContain("SELECT @route_path")
+                .doesNotContain("'route', @route_path");
+        assertThat(SqlScriptParser.statements(converted.sql())).hasSize(7);
+        assertThat(Files.readString(tempDir.resolve("sql/v2/procedure.sql"))).isEqualTo(source);
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains("MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE"));
+    }
+
+    @Test
+    void freezesScriptExpressionDependenciesBeforeReassignment() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @base = 'old';
+                SET @saved := CONCAT(@base, '/', IFNULL(NULL, 'fallback'));
+                SET @base = 'new';
+                SET @saved_copy = COALESCE(NULLIF(@SAVED, ''), 'empty');
+                SET @saved = CONCAT(@base, '/later');
+                SELECT @saved_copy AS previous_value, @saved AS current_value;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        String last = SqlScriptParser.statements(converted.sql()).get(5);
+        assertThat(last)
+                .contains("CONCAT('old', '/', IFNULL(NULL, 'fallback'))")
+                .contains("CONCAT('new', '/later')")
+                .doesNotContain("@saved")
+                .doesNotContain("@base");
+    }
+
+    @Test
+    void keepsUnsafeScriptExpressionVariablesForReview() throws Exception {
+        for (String expression : List.of(
+                "CONCAT(@missing, '/leaf')",
+                "CONCAT(@result, '/leaf')",
+                "CONCAT(UUID(), '/leaf')",
+                "CONCAT(NOW(), '/leaf')",
+                "CONCAT(CURRENT_TIMESTAMP, '/leaf')",
+                "CONCAT(unknown_function(), '/leaf')",
+                "CONCAT((SELECT UUID() FROM demo_menu LIMIT 1), '/leaf')",
+                "CONCAT((SELECT path FROM demo_menu), '/leaf')"
+        )) {
+            ConvertedScript converted = migrateSingleScript(
+                    "SET @result = " + expression + ";\nSELECT @result;\n");
+            assertThat(converted.report().manualReviewSqlCount()).as(expression).isPositive();
+            assertThat(converted.sql()).contains("SET @result").contains("SELECT @result");
+        }
+    }
+
+    @Test
+    void keepsScriptExpressionQueriesWhenSourcesChangeOrCallsIntervene() throws Exception {
+        for (String barrier : List.of(
+                "UPDATE demo_menu SET path = '/changed' WHERE id = 1;",
+                "CALL refresh_menu();",
+                "CALL consume_route(@route_path);"
+        )) {
+            ConvertedScript converted = migrateSingleScript("""
+                    SET @parent = (SELECT path FROM demo_menu WHERE id = 1 LIMIT 1);
+                    SET @route_path = CONCAT(@parent, '/leaf');
+                    %s
+                    SELECT @route_path;
+                    """.formatted(barrier));
+            assertThat(converted.report().manualReviewSqlCount()).as(barrier).isPositive();
+            assertThat(converted.sql()).contains("SET @route_path").contains("SELECT @route_path");
+        }
+    }
+
+    @Test
+    void keepsScriptExpressionAssignmentWhenReassignedUsingItsPreviousValue() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @result = CONCAT('base', '/first');
+                SET @result = CONCAT(@result, '/next');
+                SELECT @result;
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isPositive();
+        assertThat(converted.sql()).contains("SET @result").contains("SELECT @result");
+    }
+
+    @Test
+    void keepsScriptExpressionVariablesAcrossUnknownCallsAndRoutineScopes() throws Exception {
+        for (String uses : List.of(
+                "CALL change_session_variables(); SELECT @result;",
+                "CREATE PROCEDURE later_use() BEGIN SELECT @result; END;",
+                "BEGIN SELECT @result; END;"
+        )) {
+            ConvertedScript converted = migrateSingleScript(
+                    "SET @result = CONCAT('base', '/leaf');\n" + uses);
+            assertThat(converted.report().manualReviewSqlCount()).as(uses).isPositive();
+            assertThat(converted.sql()).contains("SET @result");
+        }
+    }
+
+    @Test
+    void keepsScriptExpressionVariablesWhenDependenciesCrossUnknownCalls() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @base = 'before';
+                CALL change_session_variables();
+                SET @result = CONCAT(@base, '/leaf');
+                SELECT @result;
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isPositive();
+        assertThat(converted.sql()).contains("SET @result").contains("SELECT @result");
+    }
+
+    @Test
     void inlinesSetQueryBackedScriptVariableAcrossStoredRoutine() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SET @tenant_id := (
@@ -4659,6 +4786,97 @@ class SqlScriptMigratorTest {
                         .contains("UPDATE SET")
                         .contains("INSERT VALUES")
                         .contains("MERGE"));
+    }
+
+    @Test
+    void convertsTopLevelLongInsertSelectProjectionsWithoutChangingContent() throws Exception {
+        String value = "中文🙂 O'Reilly C:\\archive\\2026\r\n" + "json-value".repeat(420);
+        for (String select : List.of(
+                "SELECT 1, '%s' WHERE NOT EXISTS (SELECT 1 FROM demo WHERE id = 1)",
+                "SELECT ALL 1, '%s' AS payload FROM dual WHERE NOT EXISTS (SELECT 1 FROM demo WHERE id = 1)",
+                "SELECT 1, /* FROM, WHERE */ '%s' `payload` WHERE NOT EXISTS (SELECT 1 FROM demo WHERE id = 1)",
+                "SELECT source.id, '%s' FROM demo_source source WHERE source.active = 1"
+        )) {
+            String source = "INSERT INTO demo(id, payload)\n"
+                    + select.formatted(value.replace("'", "''")) + ";\n";
+            ConvertedScript converted = migrateSingleScript(source);
+            assertThat(converted.report().manualReviewSqlCount()).as(select).isZero();
+            assertThat(decodedClobAssignmentValue(converted.sql(), "dm_adapter_clob_value_1"))
+                    .isEqualTo(value);
+            assertThat(converted.sql())
+                    .contains("dm_adapter_clob_value_1 CLOB;")
+                    .contains("INSERT INTO demo(id, payload)")
+                    .contains(select.contains("WHERE NOT EXISTS")
+                            ? "WHERE NOT EXISTS (SELECT 1 FROM demo WHERE id = 1)"
+                            : "WHERE source.active = 1");
+            assertThat(Files.readString(tempDir.resolve("sql/v2/procedure.sql"))).isEqualTo(source);
+            assertThat(SqlScriptParser.statements(converted.sql())).hasSize(1);
+            assertThat(converted.sql().lines().mapToInt(line -> line.getBytes(StandardCharsets.UTF_8).length).max()
+                    .orElse(0)).isLessThan(2_048);
+        }
+    }
+
+    @Test
+    void convertsMultipleLongInsertSelectValuesAndKeepsAliases() throws Exception {
+        String first = "A".repeat(3_001);
+        String last = "末列".repeat(1_001);
+        ConvertedScript converted = migrateSingleScript("""
+                INSERT INTO demo(first_value, last_value)
+                SELECT '%s' AS first_value, '%s' last_value FROM dual;
+                """.formatted(first, last));
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(decodedClobAssignmentValue(converted.sql(), "dm_adapter_clob_value_1")).isEqualTo(first);
+        assertThat(decodedClobAssignmentValue(converted.sql(), "dm_adapter_clob_value_2")).isEqualTo(last);
+        assertThat(converted.sql())
+                .contains("dm_adapter_clob_value_1 AS first_value")
+                .contains("dm_adapter_clob_value_2 last_value FROM dual");
+    }
+
+    @Test
+    void keepsUnsafeTopLevelLongInsertSelectShapesForReview() throws Exception {
+        String value = "X".repeat(3_001);
+        for (String select : List.of(
+                "SELECT 1, 'short' FROM demo_source WHERE marker = '%s'",
+                "SELECT 1, CONCAT('%s', 'suffix') FROM dual",
+                "SELECT 1, (SELECT '%s' FROM dual) FROM dual",
+                "SELECT DISTINCT 1, '%s' FROM dual",
+                "SELECT 1, '%s' FROM dual ORDER BY 2",
+                "SELECT 1, '%s' FROM dual GROUP BY 1",
+                "SELECT 1, '%s' FROM dual UNION ALL SELECT 2, 'short' FROM dual",
+                "SELECT 1, '%s' FROM dual RETURNING id"
+        )) {
+            ConvertedScript converted = migrateSingleScript("INSERT INTO demo(id, payload) "
+                    + select.formatted(value) + ";\n");
+            assertThat(converted.report().manualReviewSqlCount()).as(select).isPositive();
+            assertThat(converted.sql()).contains(value).doesNotContain("dm_adapter_clob_value_");
+        }
+    }
+
+    @Test
+    void convertsTopLevelLongInsertSelectOnlyAboveThresholdAndWithoutDryRunWrites() throws Exception {
+        Path root = tempDir.resolve("sql/v2");
+        Path output = tempDir.resolve("sql/v2-dm");
+        String small = "x".repeat(3_000);
+        String large = "y".repeat(3_001);
+        String source = "INSERT INTO demo(payload) SELECT '" + small + "';\n"
+                + "INSERT INTO demo(payload) SELECT '" + large + "';\n";
+        write(root.resolve("seed.sql"), source);
+        SqlScriptMigrationReport dryRun = migrator(new FailingValidator()).migrate(
+                new SqlScriptMigrationRequest(tempDir, root, output, true, "", "",
+                        DmValidationEnvironment.batchSilent()));
+        assertThat(dryRun.manualReviewSqlCount()).isZero();
+        assertThat(output).doesNotExist();
+        RecordingValidator validator = new RecordingValidator();
+        SqlScriptMigrationReport written = migrator(validator).migrate(
+                new SqlScriptMigrationRequest(tempDir, root, output, false, "", "",
+                        DmValidationEnvironment.from(Map.of())));
+        assertThat(written.manualReviewSqlCount()).isZero();
+        assertThat(written.files().get(0).appliedRules()).containsExactlyElementsOf(dryRun.files().get(0).appliedRules());
+        assertThat(validator.files).singleElement().satisfies(file -> assertThat(file.statements()).hasSize(2));
+        List<String> statements = SqlScriptParser.statements(Files.readString(output.resolve("seed.sql")));
+        assertThat(statements.get(0)).contains(small).doesNotContain("DECLARE");
+        assertThat(decodedClobAssignmentValue(statements.get(1), "dm_adapter_clob_value_1")).isEqualTo(large);
+        assertThat(Files.readString(root.resolve("seed.sql"))).isEqualTo(source);
     }
 
     @Test
