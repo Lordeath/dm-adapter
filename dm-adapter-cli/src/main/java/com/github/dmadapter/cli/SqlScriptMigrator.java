@@ -103,6 +103,8 @@ class SqlScriptMigrator {
             "MYSQL_SCRIPT_USER_VARIABLE_LITERAL";
     static final String MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE =
             "MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE";
+    static final String MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE_RULE =
+            "MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE";
     static final String MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE =
             "MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK";
     static final String MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE =
@@ -2477,6 +2479,10 @@ class SqlScriptMigrator {
         int inlineCount = 0;
         for (int index = 0; index < converted.size(); index++) {
             String statement = converted.get(index);
+            if (startsKeyword(splitLeadingSqlPrefix(statement).body().strip(), 0, "CALL")) {
+                // A called routine may reassign any MySQL session variable.
+                knownExpressions.clear();
+            }
             ScriptUserVariableAssignment literalAssignment =
                     scriptUserVariableAssignment(splitLeadingSqlPrefix(statement).body());
             if (literalAssignment != null) {
@@ -2489,6 +2495,13 @@ class SqlScriptMigrator {
 
             List<QueryBackedUserVariableAssignment> assignments =
                     queryBackedUserVariableAssignments(statement, knownExpressions);
+            if (assignments.isEmpty()) {
+                QueryBackedUserVariableAssignment expressionAssignment =
+                        scriptExpressionVariableAssignment(statement, knownExpressions);
+                if (expressionAssignment != null) {
+                    assignments = List.of(expressionAssignment);
+                }
+            }
             if (assignments.isEmpty()) {
                 for (String assignedName : topLevelAssignedUserVariableNames(statement)) {
                     knownExpressions.remove(assignedName.toLowerCase(Locale.ROOT));
@@ -2506,6 +2519,11 @@ class SqlScriptMigrator {
                         assignment.name()
                 );
                 lastReferences.put(assignment, lastReference);
+                if (assignment.appliedRules().contains(MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE_RULE)
+                        && scriptExpressionUsageHasUnknownEffects(converted, index, lastReference)) {
+                    unsafeInlining = true;
+                    break;
+                }
                 if (lastReference > index
                         && queryUserVariableSourceChanges(
                         converted,
@@ -2528,10 +2546,15 @@ class SqlScriptMigrator {
             String variableNames = assignments.stream()
                     .map(assignment -> "@" + assignment.name())
                     .collect(Collectors.joining(", "));
+            boolean expressionAssignment = assignments.stream().anyMatch(assignment ->
+                    assignment.appliedRules().contains(MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE_RULE));
             converted.set(
                     index,
                     prefix.prefix()
-                            + (assignments.size() == 1
+                            + (expressionAssignment
+                            ? "-- DM_ADAPTER: script expression variable " + variableNames
+                            + " was inlined after dependency analysis"
+                            : assignments.size() == 1
                             ? "-- DM_ADAPTER: query-backed script variable "
                             + variableNames
                             + " was inlined from a stable scalar query"
@@ -2560,7 +2583,9 @@ class SqlScriptMigrator {
                 );
                 appliedRules.addAll(assignment.appliedRules());
             }
-            appliedRules.add(MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE);
+            if (!expressionAssignment) {
+                appliedRules.add(MYSQL_SCRIPT_QUERY_USER_VARIABLE_INLINE_RULE);
+            }
             inlineCount += assignments.size();
         }
         return new QueryUserVariableInlining(
@@ -2569,6 +2594,138 @@ class SqlScriptMigrator {
                 inlineCount,
                 Set.copyOf(appliedRules)
         );
+    }
+
+    private boolean scriptExpressionUsageHasUnknownEffects(
+            List<String> statements,
+            int assignmentIndex,
+            int lastReference
+    ) {
+        for (int index = assignmentIndex + 1; index <= lastReference; index++) {
+            String body = splitLeadingSqlPrefix(statements.get(index)).body().strip();
+            if (body.isEmpty()) {
+                continue;
+            }
+            if (startsKeyword(body, 0, "CALL") && index < lastReference) {
+                return true;
+            }
+            // Routine definitions and unanalysed control flow do not share the
+            // assignment's execution point or necessarily preserve session state.
+            if (List.of("SET", "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "CALL")
+                    .stream().noneMatch(keyword -> startsKeyword(body, 0, keyword))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private QueryBackedUserVariableAssignment scriptExpressionVariableAssignment(
+            String statement,
+            Map<String, String> knownExpressions
+    ) {
+        String body = splitLeadingSqlPrefix(statement).body().strip();
+        Matcher assignment = Pattern.compile(
+                "(?is)^SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*(?<expression>.+)$"
+        ).matcher(body);
+        if (!assignment.matches()) {
+            return null;
+        }
+        String name = assignment.group("name");
+        String expression = assignment.group("expression");
+        if (referencesUserVariable(expression, name)) {
+            return null;
+        }
+        String resolved = inlineScriptUserVariables(expression, new LinkedHashMap<>(knownExpressions)).sql();
+        if (!mysqlUserVariableReferences(resolved).isEmpty()
+                || !safeScriptVariableExpression(resolved, knownExpressions, 0)) {
+            return null;
+        }
+        return new QueryBackedUserVariableAssignment(
+                name,
+                "(" + resolved.strip() + ")",
+                capturedTableKeysOutsideIgnoredText(resolved, SCRIPT_QUERY_SOURCE_TABLE_PATTERN),
+                List.of(MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE_RULE)
+        );
+    }
+
+    private boolean safeScriptVariableExpression(
+            String expression,
+            Map<String, String> knownExpressions,
+            int depth
+    ) {
+        if (depth > 64) {
+            return false;
+        }
+        String value = removeSqlCommentsPreservingLineBreaks(expression).strip();
+        if (!scriptUserVariableLiteral(value).isBlank()) {
+            return true;
+        }
+        if (value.startsWith("(") && findMatchingParen(value, 0) == value.length() - 1) {
+            String inner = value.substring(1, value.length() - 1).strip();
+            if (startsKeyword(inner, 0, "SELECT")) {
+                // Only reuse scalar queries already accepted by the query-variable pass.
+                // Arbitrary subqueries must not acquire scalar/purity guarantees here.
+                return knownExpressions.containsValue(value) && deterministicScriptVariableQuery(inner);
+            }
+            return safeScriptVariableExpression(inner, knownExpressions, depth + 1);
+        }
+        Matcher function = Pattern.compile("(?is)^(CONCAT|COALESCE|NULLIF|IFNULL)\\s*\\(").matcher(value);
+        if (!function.find()) {
+            return false;
+        }
+        int openParen = function.end() - 1;
+        if (findMatchingParen(value, openParen) != value.length() - 1) {
+            return false;
+        }
+        List<String> arguments = splitTopLevelComma(value.substring(openParen + 1, value.length() - 1));
+        String functionName = function.group(1).toUpperCase(Locale.ROOT);
+        if (arguments.size() < 2
+                || (Set.of("NULLIF", "IFNULL").contains(functionName) && arguments.size() != 2)) {
+            return false;
+        }
+        return arguments.stream().allMatch(argument ->
+                safeScriptVariableExpression(argument, knownExpressions, depth + 1));
+    }
+
+    private boolean deterministicScriptVariableQuery(String query) {
+        Set<String> allowedCalls = Set.of(
+                "CONCAT", "COALESCE", "NULLIF", "IFNULL", "MIN", "MAX", "SUM", "AVG", "COUNT",
+                "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "EXISTS"
+        );
+        Set<String> volatileKeywords = Set.of(
+                "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP", "SYSDATE"
+        );
+        for (int index = 0; index < query.length();) {
+            char current = query.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(query, index);
+            } else if (current == '"' || current == '`') {
+                index = current == '"' ? skipDoubleQuotedText(query, index) : skipBacktickIdentifier(query, index);
+                int next = skipWhitespaceAndComments(query, index);
+                if (next < query.length() && query.charAt(next) == '(') {
+                    return false;
+                }
+            } else if (startsLineComment(query, index) || startsBlockComment(query, index)) {
+                index = skipWhitespaceAndComments(query, index);
+            } else if (Character.isLetter(current) || current == '_') {
+                int end = index + 1;
+                while (end < query.length() && isIdentifierPart(query.charAt(end))) {
+                    end++;
+                }
+                String word = query.substring(index, end).toUpperCase(Locale.ROOT);
+                int next = skipWhitespaceAndComments(query, end);
+                if (volatileKeywords.contains(word)
+                        || (next < query.length() && query.charAt(next) == '(' && !allowedCalls.contains(word))) {
+                    return false;
+                }
+                index = end;
+            } else if (current == '@' || current == ':' || current == ';') {
+                return false;
+            } else {
+                index++;
+            }
+        }
+        return true;
     }
 
     private List<QueryBackedUserVariableAssignment> queryBackedUserVariableAssignments(
@@ -2828,6 +2985,10 @@ class SqlScriptMigrator {
             Set<String> sourceTables
     ) {
         for (int index = assignmentIndex + 1; index <= lastReference; index++) {
+            if (!sourceTables.isEmpty() && index < lastReference
+                    && !procedureNameFromCall(statements.get(index)).isBlank()) {
+                return true;
+            }
             Set<String> mutationTargets = capturedTableKeysOutsideIgnoredText(
                     statements.get(index),
                     SCRIPT_TABLE_MUTATION_PATTERN
@@ -17698,6 +17859,10 @@ class SqlScriptMigrator {
     }
 
     private void collectDirectInsertSelectLiteralRanges(String sql, Set<TextRange> ranges) {
+        collectDirectInsertSelectLiteralRanges(sql, ranges, false);
+    }
+
+    private void collectDirectInsertSelectLiteralRanges(String sql, Set<TextRange> ranges, boolean topLevel) {
         int start = skipWhitespace(sql, 0);
         if (!startsKeyword(sql, start, "INSERT")) {
             return;
@@ -17706,21 +17871,50 @@ class SqlScriptMigrator {
         if (selectIndex < 0) {
             return;
         }
-        int projectionStart = skipWhitespace(sql, selectIndex + "SELECT".length());
+        if (topLevel && (dmTopLevelKeywordIndexAfter(sql, "WITH", start) >= 0
+                || firstDmTopLevelKeywordAfter(sql, selectIndex + "SELECT".length(), List.of(
+                "DISTINCT", "GROUP", "HAVING", "UNION", "INTERSECT", "EXCEPT", "MINUS",
+                "ORDER", "RETURNING", "INTO", "FOR"
+        )) < sql.length())) {
+            return;
+        }
+        int projectionStart = skipWhitespaceAndComments(sql, selectIndex + "SELECT".length());
         for (String modifier : List.of("DISTINCT", "ALL")) {
             if (startsKeyword(sql, projectionStart, modifier)) {
-                projectionStart = skipWhitespace(sql, projectionStart + modifier.length());
+                projectionStart = skipWhitespaceAndComments(sql, projectionStart + modifier.length());
                 break;
             }
         }
-        int fromIndex = dmTopLevelKeywordIndexAfter(sql, "FROM", projectionStart);
-        int projectionEnd = fromIndex < 0 ? sql.length() : fromIndex;
+        int projectionEnd = firstDmTopLevelKeywordAfter(sql, projectionStart, List.of(
+                "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH",
+                "UNION", "INTERSECT", "EXCEPT", "MINUS", "RETURNING", "FOR"
+        ));
         for (TextRange projection : splitDmTopLevelRanges(sql, projectionStart, projectionEnd)) {
-            TextRange literal = directDmStringLiteralRange(sql, projection.start(), projection.end());
+            TextRange literal = topLevel
+                    ? directDmSelectStringLiteralRange(sql, projection)
+                    : directDmStringLiteralRange(sql, projection.start(), projection.end());
             if (literal != null) {
                 ranges.add(literal);
             }
         }
+    }
+
+    private TextRange directDmSelectStringLiteralRange(String sql, TextRange projection) {
+        int start = skipWhitespaceAndComments(sql, projection.start());
+        if (start >= projection.end() || sql.charAt(start) != '\'') {
+            return null;
+        }
+        int end = skipDmSingleQuotedString(sql, start);
+        if (end > projection.end()) {
+            return null;
+        }
+        String suffix = removeSqlCommentsPreservingLineBreaks(sql.substring(end, projection.end())).strip();
+        if (!suffix.isEmpty() && !Pattern.compile(
+                "(?is)^(?:AS\\s+)?(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")$"
+        ).matcher(suffix).matches()) {
+            return null;
+        }
+        return new TextRange(start, end);
     }
 
     private String clobAssignmentContinuation(String variableName, String literal, String indent) {
@@ -17818,6 +18012,9 @@ class SqlScriptMigrator {
         }
         if (insert || merge) {
             collectDirectInsertValuesLiteralRanges(body, directLiteralRanges);
+        }
+        if (insert) {
+            collectDirectInsertSelectLiteralRanges(body, directLiteralRanges, true);
         }
         for (DmStringLiteral literal : longLiterals) {
             if (literal.utf8Bytes() > DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES) {
