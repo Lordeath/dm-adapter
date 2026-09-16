@@ -2474,14 +2474,22 @@ class SqlScriptMigrator {
             );
         }
         List<String> converted = new ArrayList<>(statements);
+        // Analyse original definitions before variable replacement can hide assignments.
+        Map<Integer, ScriptProcedureEffects> callEffects = scriptProcedureCallEffects(statements);
         LinkedHashMap<String, String> knownExpressions = new LinkedHashMap<>();
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
         int inlineCount = 0;
         for (int index = 0; index < converted.size(); index++) {
             String statement = converted.get(index);
             if (startsKeyword(splitLeadingSqlPrefix(statement).body().strip(), 0, "CALL")) {
-                // A called routine may reassign any MySQL session variable.
-                knownExpressions.clear();
+                ScriptProcedureEffects effects = callEffects.get(index);
+                if (effects == null || !effects.known()) {
+                    knownExpressions.clear();
+                } else {
+                    knownExpressions.entrySet().removeIf(entry -> capturedTableKeysOutsideIgnoredText(
+                            entry.getValue(), SCRIPT_QUERY_SOURCE_TABLE_PATTERN
+                    ).stream().anyMatch(effects.mutationTargets()::contains));
+                }
             }
             ScriptUserVariableAssignment literalAssignment =
                     scriptUserVariableAssignment(splitLeadingSqlPrefix(statement).body());
@@ -2520,7 +2528,7 @@ class SqlScriptMigrator {
                 );
                 lastReferences.put(assignment, lastReference);
                 if (assignment.appliedRules().contains(MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE_RULE)
-                        && scriptExpressionUsageHasUnknownEffects(converted, index, lastReference)) {
+                        && scriptExpressionUsageHasUnknownEffects(converted, index, lastReference, callEffects)) {
                     unsafeInlining = true;
                     break;
                 }
@@ -2529,7 +2537,8 @@ class SqlScriptMigrator {
                         converted,
                         index,
                         lastReference,
-                        assignment.sourceTables()
+                        assignment.sourceTables(),
+                        callEffects
                 )) {
                     unsafeInlining = true;
                     break;
@@ -2599,14 +2608,16 @@ class SqlScriptMigrator {
     private boolean scriptExpressionUsageHasUnknownEffects(
             List<String> statements,
             int assignmentIndex,
-            int lastReference
+            int lastReference,
+            Map<Integer, ScriptProcedureEffects> callEffects
     ) {
         for (int index = assignmentIndex + 1; index <= lastReference; index++) {
             String body = splitLeadingSqlPrefix(statements.get(index)).body().strip();
             if (body.isEmpty()) {
                 continue;
             }
-            if (startsKeyword(body, 0, "CALL") && index < lastReference) {
+            if (startsKeyword(body, 0, "CALL") && index < lastReference
+                    && !callEffects.getOrDefault(index, ScriptProcedureEffects.unknown()).known()) {
                 return true;
             }
             // Routine definitions and unanalysed control flow do not share the
@@ -2617,6 +2628,150 @@ class SqlScriptMigrator {
             }
         }
         return false;
+    }
+
+    private Map<Integer, ScriptProcedureEffects> scriptProcedureCallEffects(List<String> statements) {
+        if (statements.stream().noneMatch(sql ->
+                startsKeyword(splitLeadingSqlPrefix(sql).body().strip(), 0, "CALL"))) {
+            return Map.of();
+        }
+        Map<ProcedureKey, Integer> definitions = new LinkedHashMap<>();
+        Map<Integer, ScriptProcedureEffects> analyzedDefinitions = new LinkedHashMap<>();
+        Map<Integer, ScriptProcedureEffects> calls = new LinkedHashMap<>();
+        for (int index = 0; index < statements.size(); index++) {
+            String sql = statements.get(index);
+            ProcedureReference create = procedureReferenceFromCreateProcedure(sql, "");
+            if (create != null) {
+                definitions.put(create.key(), index);
+                continue;
+            }
+            ProcedureReference drop = procedureReferenceFromDropProcedure(sql, "");
+            if (drop != null) {
+                definitions.remove(drop.key());
+                continue;
+            }
+            String body = splitLeadingSqlPrefix(sql).body().strip();
+            if (startsKeyword(body, 0, "CALL")) {
+                ProcedureReference call = procedureReferenceFromCall(sql, "");
+                Integer definition = call == null ? null : definitions.get(call.key());
+                ScriptProcedureEffects effects = definition != null && hasEmptyCallArguments(sql)
+                        ? analyzedDefinitions.computeIfAbsent(definition,
+                        definitionIndex -> scriptProcedureEffects(statements.get(definitionIndex)))
+                        : ScriptProcedureEffects.unknown();
+                calls.put(index, effects);
+                if (!effects.known()) {
+                    // An opaque call may also replace a previously defined routine.
+                    definitions.clear();
+                }
+            } else if (startsKeyword(body, 0, "USE")
+                    || startsKeyword(body, 0, "EXECUTE")
+                    || Pattern.compile("(?is)^SET\\s+(?:CURRENT\\s+)?SCHEMA\\b").matcher(body).find()) {
+                definitions.clear();
+            }
+        }
+        return Map.copyOf(calls);
+    }
+
+    private ScriptProcedureEffects scriptProcedureEffects(String sql) {
+        String clean = removeSqlCommentsPreservingLineBreaks(sql);
+        int begin = firstProcedureBegin(clean);
+        if (!hasEmptyProcedureParameters(clean) || begin < 0
+                || !clean.stripTrailing().matches("(?is).*\\bEND\\s*;?")) {
+            return ScriptProcedureEffects.unknown();
+        }
+        String searchable = replaceIgnoredSqlWithSpaces(clean.substring(begin));
+        if (Pattern.compile("(?is)\\b(?:CALL|PREPARE|EXECUTE|DEALLOCATE|DO|DECLARE|OPEN|FETCH|CLOSE"
+                + "|HANDLER|LOOP|WHILE|REPEAT|GOTO|CREATE|ALTER|DROP|TRUNCATE|RENAME|USE|COMMIT|ROLLBACK"
+                + "|REPLACE|MERGE|LOAD|LOCK|UNLOCK)\\b|:=|\\bSET\\s+@")
+                .matcher(searchable).find()) {
+            return ScriptProcedureEffects.unknown();
+        }
+        for (UserVariableReference variable : mysqlUserVariableReferences(clean)) {
+            int next = skipWhitespaceAndComments(clean, variable.end());
+            if (next < clean.length() && clean.charAt(next) == '=') {
+                return ScriptProcedureEffects.unknown();
+            }
+        }
+        Set<String> targets = new LinkedHashSet<>();
+        Set<Integer> tableEnds = new LinkedHashSet<>();
+        StringBuilder outsideDml = new StringBuilder(clean);
+        for (RoutineSqlStatement statement : routineSqlStatements(clean)) {
+            String dml = clean.substring(statement.start(), statement.end());
+            for (int index = statement.start(); index < statement.end(); index++) {
+                outsideDml.setCharAt(index, ' ');
+            }
+            if (startsKeyword(dml, 0, "SELECT")) {
+                if (topLevelKeywordIndex(dml, "INTO") >= 0) {
+                    return ScriptProcedureEffects.unknown();
+                }
+                continue;
+            }
+            Matcher target = Pattern.compile("(?is)^(?:INSERT\\s+(?:IGNORE\\s+)?INTO|UPDATE|DELETE\\s+FROM)"
+                    + "\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")").matcher(dml);
+            if (!target.find()) {
+                return ScriptProcedureEffects.unknown();
+            }
+            if (startsKeyword(dml, 0, "UPDATE")) {
+                int set = topLevelKeywordIndex(dml, "SET");
+                if (set < target.end() || !simpleScriptDmlAlias(dml.substring(target.end(), set))) {
+                    return ScriptProcedureEffects.unknown();
+                }
+            } else if (startsKeyword(dml, 0, "DELETE")) {
+                int end = firstDmTopLevelKeywordAfter(dml, target.end(), List.of("WHERE", "ORDER", "LIMIT"));
+                if (!simpleScriptDmlAlias(dml.substring(target.end(), end))) {
+                    return ScriptProcedureEffects.unknown();
+                }
+            }
+            targets.add(normalizedTableKey(target.group("table")));
+            tableEnds.add(statement.start() + target.end("table"));
+        }
+        if (containsKeywordOutsideIgnoredText(outsideDml.toString(), "SET")
+                || scriptProcedureHasUnknownFunction(clean, begin, tableEnds)) {
+            return ScriptProcedureEffects.unknown();
+        }
+        return new ScriptProcedureEffects(true, Set.copyOf(targets));
+    }
+
+    private boolean simpleScriptDmlAlias(String sql) {
+        return sql.isBlank() || Pattern.compile("(?is)\\s*(?:AS\\s+)?(?:"
+                + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*").matcher(sql).matches();
+    }
+
+    private boolean scriptProcedureHasUnknownFunction(String sql, int start, Set<Integer> tableEnds) {
+        Set<String> allowed = Set.of(
+                "EXISTS", "IN", "VALUES", "IF", "NOT", "AND", "OR", "SELECT", "FROM", "WHERE",
+                "CONCAT", "CONCAT_WS", "COALESCE", "NULLIF", "IFNULL", "MIN", "MAX", "COUNT", "SUM", "AVG",
+                "NOW", "UUID", "CURRENT_TIMESTAMP", "LENGTH", "CHAR_LENGTH", "UPPER", "LOWER"
+        );
+        int index = start;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (startsLineComment(sql, index) || startsBlockComment(sql, index)) {
+                index = skipWhitespaceAndComments(sql, index);
+            } else if (Character.isLetter(current) || current == '_' || current == '`' || current == '"') {
+                SqlIdentifierReference identifier = sqlIdentifierReferenceAt(sql, index);
+                if (identifier == null) {
+                    return true;
+                }
+                int next = skipWhitespaceAndComments(sql, identifier.end());
+                if (next < sql.length() && sql.charAt(next) == '(' && !tableEnds.contains(identifier.end())
+                        && !allowed.contains(identifier.token().toUpperCase(Locale.ROOT))) {
+                    return true;
+                }
+                index = identifier.end();
+            } else {
+                index++;
+            }
+        }
+        return false;
+    }
+
+    private record ScriptProcedureEffects(boolean known, Set<String> mutationTargets) {
+        static ScriptProcedureEffects unknown() {
+            return new ScriptProcedureEffects(false, Set.of());
+        }
     }
 
     private QueryBackedUserVariableAssignment scriptExpressionVariableAssignment(
@@ -2982,12 +3137,16 @@ class SqlScriptMigrator {
             List<String> statements,
             int assignmentIndex,
             int lastReference,
-            Set<String> sourceTables
+            Set<String> sourceTables,
+            Map<Integer, ScriptProcedureEffects> callEffects
     ) {
         for (int index = assignmentIndex + 1; index <= lastReference; index++) {
             if (!sourceTables.isEmpty() && index < lastReference
                     && !procedureNameFromCall(statements.get(index)).isBlank()) {
-                return true;
+                ScriptProcedureEffects effects = callEffects.getOrDefault(index, ScriptProcedureEffects.unknown());
+                if (!effects.known() || effects.mutationTargets().stream().anyMatch(sourceTables::contains)) {
+                    return true;
+                }
             }
             Set<String> mutationTargets = capturedTableKeysOutsideIgnoredText(
                     statements.get(index),

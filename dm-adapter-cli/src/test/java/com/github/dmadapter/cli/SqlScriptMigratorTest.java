@@ -1183,6 +1183,172 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void inlinesQueryVariablesAcrossKnownScriptProcedureCalls() throws Exception {
+        String source = """
+                SET @enterprise_id = (SELECT MIN(enterprise_id) FROM organization);
+                SET @organization_id = (SELECT MIN(id) FROM organization WHERE enterprise_id = @enterprise_id);
+                SELECT MIN(id) INTO @role_id FROM role_registry WHERE enterprise_id = @enterprise_id;
+                DROP PROCEDURE IF EXISTS seed_module;
+                DELIMITER $$
+                CREATE PROCEDURE seed_module()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM module_menu WHERE id = 1) THEN
+                        -- CALL unknown_proc(); UPDATE organization; SET @enterprise_id = 0;
+                        INSERT INTO module_menu(id, enterprise_id, organization_id, note)
+                        VALUES (1, @enterprise_id, @organization_id, 'CALL unknown_proc(); UPDATE organization;');
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL seed_module();
+                DROP PROCEDURE IF EXISTS seed_module;
+                DROP PROCEDURE IF EXISTS seed_permission;
+                DELIMITER $$
+                CREATE PROCEDURE seed_permission()
+                BEGIN
+                    INSERT INTO role_permission(role_id, enterprise_id, organization_id, note, created_at)
+                    VALUES (@role_id, @enterprise_id, @organization_id, CONCAT_WS('/', 'a', 'b'), NOW());
+                END$$
+                DELIMITER ;
+                CALL seed_permission();
+                DROP PROCEDURE IF EXISTS seed_permission;
+                """;
+        ConvertedScript converted = migrateSingleScript(source);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT MIN(enterprise_id) FROM organization")
+                .contains("SELECT MIN(id) FROM role_registry")
+                .contains("'CALL unknown_proc(); UPDATE organization;'")
+                .contains("INSERT INTO module_menu")
+                .contains("INSERT INTO role_permission")
+                .doesNotContain("SET @enterprise_id = (SELECT")
+                .doesNotContain("INTO @role_id")
+                .doesNotContain("VALUES (@role_id");
+        assertThat(Files.readString(tempDir.resolve("sql/v2/procedure.sql"))).isEqualTo(source);
+    }
+
+    @Test
+    void preservesExpressionDependenciesAcrossKnownScriptProcedureCalls() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE seed_unrelated()
+                BEGIN
+                    INSERT INTO menu_a(id) VALUES (1);
+                END$$
+                DELIMITER ;
+                SET @base = 'parent';
+                SET @parent = (SELECT path FROM menu_source WHERE id = 1 LIMIT 1);
+                CALL seed_unrelated();
+                SET @route = CONCAT(COALESCE(@parent, @base), '/leaf');
+                CALL seed_unrelated();
+                SELECT @route;
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("SELECT path FROM menu_source")
+                .contains("'parent'")
+                .doesNotContain("SET @route")
+                .doesNotContain("SELECT @route");
+    }
+
+    @Test
+    void keepsQueryVariablesWhenKnownScriptProcedureCallsHaveUnsafeEffects() throws Exception {
+        for (String body : List.of(
+                "UPDATE tenant SET id = 2 WHERE id = 1;",
+                "UPDATE /* comment */ tenant SET id = 2 WHERE id = 1;",
+                "UPDATE audit a JOIN tenant t ON a.id = t.id SET t.id = 2;",
+                "DELETE t FROM tenant t JOIN audit a ON a.id = t.id;",
+                "SET @tenant_id = 2;",
+                "SET NAMES utf8;",
+                "SELECT 2 INTO @unused, @tenant_id;",
+                "SELECT @tenant_id := 2;",
+                "CALL external_effect();",
+                "CALL local_effect();",
+                "PREPARE stmt FROM 'UPDATE tenant SET id = 2'; EXECUTE stmt;",
+                "INSERT INTO audit(id) VALUES (unknown_function());"
+        )) {
+            ConvertedScript converted = migrateSingleScript("""
+                    DELIMITER $$
+                    CREATE PROCEDURE local_effect()
+                    BEGIN
+                        %s
+                    END$$
+                    DELIMITER ;
+                    SET @tenant_id = (SELECT MIN(id) FROM tenant);
+                    CALL local_effect();
+                    SELECT @tenant_id;
+                    """.formatted(body));
+            assertThat(converted.report().manualReviewSqlCount()).as(body).isPositive();
+            assertThat(converted.sql()).contains("SET @tenant_id").contains("SELECT @tenant_id");
+        }
+    }
+
+    @Test
+    void keepsQueryVariablesWhenKnownScriptProcedureCallDefinitionIsNotInScope() throws Exception {
+        for (String beforeCall : List.of(
+                "DROP PROCEDURE IF EXISTS seed_local;",
+                "DROP PROCEDURE seed_local;",
+                "DROP PROCEDURE IF EXISTS seed_local;\n"
+                        + "DELIMITER $$\nCREATE PROCEDURE seed_local() BEGIN CALL external_effect(); END$$\nDELIMITER ;"
+        )) {
+            ConvertedScript converted = migrateSingleScript("""
+                    DELIMITER $$
+                    CREATE PROCEDURE seed_local() BEGIN INSERT INTO audit(id) VALUES (1); END$$
+                    DELIMITER ;
+                    SET @tenant_id = (SELECT MIN(id) FROM tenant);
+                    %s
+                    CALL seed_local();
+                    SELECT @tenant_id;
+                    """.formatted(beforeCall));
+            assertThat(converted.report().manualReviewSqlCount()).as(beforeCall).isPositive();
+            assertThat(converted.sql()).contains("SET @tenant_id").contains("SELECT @tenant_id");
+        }
+        ConvertedScript forward = migrateSingleScript("""
+                SET @tenant_id = (SELECT MIN(id) FROM tenant);
+                CALL seed_local();
+                SELECT @tenant_id;
+                DELIMITER $$
+                CREATE PROCEDURE seed_local() BEGIN INSERT INTO audit(id) VALUES (1); END$$
+                DELIMITER ;
+                """);
+        assertThat(forward.report().manualReviewSqlCount()).isPositive();
+        assertThat(forward.sql()).contains("SET @tenant_id").contains("SELECT @tenant_id");
+    }
+
+    @Test
+    void distinguishesSchemasForKnownScriptProcedureCalls() throws Exception {
+        for (String call : List.of("CALL beta.seed_local();", "CALL seed_local();")) {
+            ConvertedScript converted = migrateSingleScript("""
+                    DELIMITER $$
+                    CREATE PROCEDURE alpha.seed_local() BEGIN INSERT INTO audit(id) VALUES (1); END$$
+                    DELIMITER ;
+                    SET @tenant_id = (SELECT MIN(id) FROM tenant);
+                    %s
+                    SELECT @tenant_id;
+                    """.formatted(call));
+            assertThat(converted.report().manualReviewSqlCount()).as(call).isPositive();
+            assertThat(converted.sql()).contains("SET @tenant_id").contains("SELECT @tenant_id");
+        }
+    }
+
+    @Test
+    void usesCurrentDefinitionForKnownScriptProcedureCalls() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE seed_local() BEGIN CALL external_effect(); END$$
+                DELIMITER ;
+                DROP PROCEDURE IF EXISTS seed_local;
+                DELIMITER $$
+                CREATE PROCEDURE seed_local() BEGIN INSERT INTO audit(id) VALUES (1); END$$
+                DELIMITER ;
+                SET @tenant_id = (SELECT MIN(id) FROM tenant);
+                CALL seed_local();
+                SELECT @tenant_id;
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).doesNotContain("SET @tenant_id").doesNotContain("SELECT @tenant_id");
+    }
+
+    @Test
     void inlinesSetQueryBackedScriptVariableAcrossStoredRoutine() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SET @tenant_id := (
