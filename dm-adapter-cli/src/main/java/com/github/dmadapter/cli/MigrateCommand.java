@@ -91,6 +91,9 @@ public class MigrateCommand implements Callable<Integer> {
     @Option(names = "--preserve-sql", description = "Relative SQL path to preserve in --sql-root-out instead of converting; repeat for multiple files. Top-level 00000000.sql is always preserved.")
     private List<Path> preservedSqlPaths = new ArrayList<>();
 
+    @Option(names = "--sql-procedure-source", description = "SQL file containing explicitly supplied shared procedure definitions for effect analysis only; repeat for multiple files. Relative paths resolve against --project.")
+    private List<Path> procedureSources = new ArrayList<>();
+
     @Option(names = "--sql-scripts-only", description = "Only migrate SQL scripts; do not scan or modify Maven, mapper, or application files.")
     private boolean sqlScriptsOnly;
 
@@ -900,7 +903,8 @@ public class MigrateCommand implements Callable<Integer> {
                 validationEnvironment,
                 targetCapabilities,
                 context.reportDir().resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME),
-                rewriteConfig
+                rewriteConfig,
+                procedureSources
         ));
         lastSqlScriptMigrationReport = report;
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
@@ -917,6 +921,7 @@ public class MigrateCommand implements Callable<Integer> {
         migration.sqlRoot = request.sqlRoot();
         migration.sqlRootOut = request.sqlRootOut();
         migration.preservedSqlPaths = new ArrayList<>(request.preservedSqlPaths());
+        migration.procedureSources = new ArrayList<>(request.procedureSources());
         migration.sqlScriptsOnly = request.sqlScriptsOnly();
         migration.batchTableKeyColumns = request.tableKeyColumns();
         migration.batchMethodKeyColumns = request.methodKeyColumns();

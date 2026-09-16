@@ -18,9 +18,21 @@ record BatchMigrationRequest(
         boolean sqlScriptsOnly,
         Map<String, List<String>> tableKeyColumns,
         Map<String, List<String>> methodKeyColumns,
-        Map<String, List<List<String>>> methodConflictKeyGroups
+        Map<String, List<List<String>>> methodConflictKeyGroups,
+        List<Path> procedureSources
 ) {
+    BatchMigrationRequest(
+            Path projectRoot, Path reportDir, String dmDriver, Path mapperDir, Path rewriteConfig,
+            Path sqlRoot, Path sqlRootOut, List<Path> preservedSqlPaths, boolean sqlScriptsOnly,
+            Map<String, List<String>> tableKeyColumns, Map<String, List<String>> methodKeyColumns,
+            Map<String, List<List<String>>> methodConflictKeyGroups
+    ) {
+        this(projectRoot, reportDir, dmDriver, mapperDir, rewriteConfig, sqlRoot, sqlRootOut, preservedSqlPaths,
+                sqlScriptsOnly, tableKeyColumns, methodKeyColumns, methodConflictKeyGroups, List.of());
+    }
+
     BatchMigrationRequest {
+        procedureSources = List.copyOf(procedureSources == null ? List.of() : procedureSources);
         preservedSqlPaths = List.copyOf(preservedSqlPaths == null ? List.of() : preservedSqlPaths);
         LinkedHashMap<String, List<String>> copied = new LinkedHashMap<>();
         if (tableKeyColumns != null) {

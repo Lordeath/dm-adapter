@@ -84,9 +84,15 @@ record ResolvedBatchConfig(
             BatchSqlMode mode,
             Path sourceDir,
             Path outputDir,
-            List<Path> preserveSql
+            List<Path> preserveSql,
+            List<Path> procedureSources
     ) {
+        Sql(BatchSqlMode mode, Path sourceDir, Path outputDir, List<Path> preserveSql) {
+            this(mode, sourceDir, outputDir, preserveSql, List.of());
+        }
+
         Sql {
+            procedureSources = List.copyOf(procedureSources == null ? List.of() : procedureSources);
             preserveSql = List.copyOf(preserveSql == null ? List.of() : preserveSql);
         }
     }

@@ -59,6 +59,12 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 `batch` 的完整 YAML 示例、Jenkins 配置、IntelliJ IDEA 调试参数、退出码和缓存恢复规则见
 [Jenkins 无人值守 Batch 模式部署说明](docs/jenkins-batch-codex-guide.md)。
 
+脚本中的查询变量需要跨越公共过程调用时，可重复传入 `--sql-procedure-source <定义文件.sql>`，
+相对路径以 `--project` 为基准。Batch 对应 `migration.sql.procedureSources`，相对路径以 YAML 所在目录为基准。
+这些文件须与已部署的过程定义一致，仅用于分析调用是否修改变量或查询来源表，不会因此执行或部署。
+定义缺失或影响不能确定时仍进入人工确认；无参数的 `CALL p` / `CALL p()`、可分析的 IN 参数和嵌套调用、
+静态建表改表及无关变量赋值不再一律阻断查询变量转换。
+
 ## GUI 与 Windows EXE
 
 `dm-adapter-gui` 提供 Java 17 Swing 桌面界面。GUI 不复制迁移逻辑，而是在独立 JVM

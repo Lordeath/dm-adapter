@@ -68,7 +68,8 @@ record BatchConfig(
             String sourceDir,
             String outputDir,
             List<String> preserveSql,
-            String targetLengthSemantics
+            String targetLengthSemantics,
+            List<String> procedureSources
     ) {
     }
 }

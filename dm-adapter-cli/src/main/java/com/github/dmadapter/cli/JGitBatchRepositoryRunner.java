@@ -450,7 +450,8 @@ final class JGitBatchRepositoryRunner {
                 migration.sqlScriptsOnly(),
                 migration.tableKeyColumns(),
                 migration.methodKeyColumns(),
-                migration.methodConflictKeyGroups()
+                migration.methodConflictKeyGroups(),
+                sql.procedureSources()
         ));
     }
 
