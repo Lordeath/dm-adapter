@@ -59,6 +59,24 @@ class BatchConfigLoaderTest {
     }
 
     @Test
+    void acceptsExplicitProcedureSourcesRelativeToBatchConfig() throws Exception {
+        Path config = tempDir.resolve("batch.yml");
+        Files.writeString(config, baseConfig("""
+                  - name: service-a
+                    url: file:///tmp/service-a.git
+                    branch: main
+                    migration:
+                      sql:
+                        procedureSources:
+                          - definitions/shared.sql
+                """));
+        ResolvedBatchConfig loaded = new BatchConfigLoader().load(config);
+        assertThat(loaded.repositories()).singleElement().satisfies(repository ->
+                assertThat(repository.migration().sql().procedureSources())
+                        .containsExactly(tempDir.resolve("definitions/shared.sql")));
+    }
+
+    @Test
     void rejectsUnknownFieldsAndDuplicateRepositoryNames() throws Exception {
         Path unknown = tempDir.resolve("unknown.yml");
         Files.writeString(unknown, baseConfig("""

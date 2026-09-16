@@ -124,7 +124,7 @@ final class BatchConfigLoader {
                     url,
                     branch,
                     projectSubdir,
-                    resolveMigration(config.migrationDefaults(), repository.migration(), name)
+                    resolveMigration(config.migrationDefaults(), repository.migration(), name, baseDir)
             ));
         }
         return new ResolvedBatchConfig(
@@ -158,7 +158,8 @@ final class BatchConfigLoader {
     private ResolvedBatchConfig.Migration resolveMigration(
             BatchConfig.MigrationConfig defaults,
             BatchConfig.MigrationConfig override,
-            String repository
+            String repository,
+            Path baseDir
     ) {
         String dmDriver = first(override == null ? null : override.dmDriver(), defaults == null ? null : defaults.dmDriver());
         String mapperDir = first(override == null ? null : override.mapperDir(), defaults == null ? null : defaults.mapperDir());
@@ -202,6 +203,12 @@ final class BatchConfigLoader {
         List<Path> preserveSql = configuredPreserve.stream()
                 .map(path -> relativePath(path, "repositories[" + repository + "].migration.sql.preserveSql"))
                 .toList();
+        List<String> configuredSources = overrideSql != null && overrideSql.procedureSources() != null
+                ? overrideSql.procedureSources()
+                : (defaultSql == null || defaultSql.procedureSources() == null ? List.of() : defaultSql.procedureSources());
+        List<Path> procedureSources = configuredSources.stream()
+                .map(path -> absoluteConfigPath(baseDir, path, "repositories[" + repository + "].migration.sql.procedureSources"))
+                .toList();
         Map<String, MethodKeySettings> methodKeys = resolveMethodKeys(defaults, override, repository);
         return new ResolvedBatchConfig.Migration(
                 value(dmDriver),
@@ -219,7 +226,7 @@ final class BatchConfigLoader {
                                 Map.Entry::getKey,
                                 entry -> entry.getValue().conflictKeyGroups()
                         )),
-                new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, preserveSql)
+                new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, preserveSql, procedureSources)
         );
     }
 

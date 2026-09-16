@@ -1,5 +1,6 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.cli.ScriptProcedureEffectAnalyzer.Effects;
 import com.github.dmadapter.core.SqlConversionResult;
 import com.github.dmadapter.core.SqlScriptFileResult;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
@@ -545,6 +546,24 @@ class SqlScriptMigrator {
         }
 
         List<String> warnings = new ArrayList<>();
+        List<String> procedureSourceStatements = new ArrayList<>();
+        for (Path configured : request.procedureSources()) {
+            Path source = resolvePath(projectRoot, configured);
+            if (!Files.isRegularFile(source)) {
+                throw new IllegalStateException("公共过程定义文件不存在：" + source);
+            }
+            // Explicit analysis inputs must never be generated or overwritten by this migration.
+            if (source.startsWith(sqlRootOut)) {
+                Path relativeSource = sqlRootOut.relativize(source);
+                if (Files.isRegularFile(sqlRoot.resolve(relativeSource))
+                        && !preservedSqlPaths(request).contains(relativeSource)) {
+                    throw new IllegalStateException("公共过程定义不能引用本轮将覆盖的输出文件：" + source);
+                }
+            }
+            procedureSourceStatements.addAll(SqlScriptParser.statements(readSqlScriptContent(source)));
+            warnings.add("公共过程定义仅用于静态影响分析，未执行或部署：" + source);
+        }
+        ScriptProcedureEffectAnalyzer procedureAnalyzer = new ScriptProcedureEffectAnalyzer(procedureSourceStatements);
         Set<Path> preservedPaths = preservedSqlPaths(request);
         List<Path> discoveredSqlFiles = sqlFiles(sqlRoot);
         List<Path> sqlFiles = discoveredSqlFiles.stream()
@@ -599,6 +618,7 @@ class SqlScriptMigrator {
                     projectIdentityColumns,
                     scriptSchemaStates,
                     request.rewriteConfig(),
+                    procedureAnalyzer,
                     manualReviewItems,
                     warnings
             );
@@ -2464,31 +2484,36 @@ class SqlScriptMigrator {
         );
     }
 
-    private QueryUserVariableInlining inlineStableQueryBackedScriptVariables(List<String> statements) {
+    private QueryUserVariableInlining inlineStableQueryBackedScriptVariables(
+            List<String> statements, ScriptProcedureEffectAnalyzer procedureAnalyzer, String schema, String scope
+    ) {
+        // Use original definitions; even a single DROP/CALL changes the next file's context.
+        Map<Integer, Effects> callEffects = procedureAnalyzer.analyze(
+                statements == null ? List.of() : statements, schema, scope);
         if (statements == null || statements.size() < 2) {
             return new QueryUserVariableInlining(
                     statements == null ? List.of() : statements,
                     false,
                     0,
-                    Set.of()
+                    Set.of(),
+                    Map.of()
             );
         }
         List<String> converted = new ArrayList<>(statements);
-        // Analyse original definitions before variable replacement can hide assignments.
-        Map<Integer, ScriptProcedureEffects> callEffects = scriptProcedureCallEffects(statements);
         LinkedHashMap<String, String> knownExpressions = new LinkedHashMap<>();
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
         int inlineCount = 0;
+        Map<Integer, String> blockedReasons = new LinkedHashMap<>();
         for (int index = 0; index < converted.size(); index++) {
             String statement = converted.get(index);
             if (startsKeyword(splitLeadingSqlPrefix(statement).body().strip(), 0, "CALL")) {
-                ScriptProcedureEffects effects = callEffects.get(index);
+                Effects effects = callEffects.get(index);
                 if (effects == null || !effects.known()) {
                     knownExpressions.clear();
                 } else {
-                    knownExpressions.entrySet().removeIf(entry -> capturedTableKeysOutsideIgnoredText(
-                            entry.getValue(), SCRIPT_QUERY_SOURCE_TABLE_PATTERN
-                    ).stream().anyMatch(effects.mutationTargets()::contains));
+                    knownExpressions.entrySet().removeIf(entry -> effects.assignedVariables().contains(entry.getKey())
+                            || capturedTableKeysOutsideIgnoredText(entry.getValue(), SCRIPT_QUERY_SOURCE_TABLE_PATTERN)
+                            .stream().anyMatch(effects.mutationTargets()::contains));
                 }
             }
             ScriptUserVariableAssignment literalAssignment =
@@ -2524,7 +2549,8 @@ class SqlScriptMigrator {
                 int lastReference = queryUserVariableLastReference(
                         converted,
                         index,
-                        assignment.name()
+                        assignment.name(),
+                        callEffects
                 );
                 lastReferences.put(assignment, lastReference);
                 if (assignment.appliedRules().contains(MYSQL_SCRIPT_EXPRESSION_USER_VARIABLE_INLINE_RULE)
@@ -2532,14 +2558,16 @@ class SqlScriptMigrator {
                     unsafeInlining = true;
                     break;
                 }
-                if (lastReference > index
-                        && queryUserVariableSourceChanges(
-                        converted,
-                        index,
-                        lastReference,
-                        assignment.sourceTables(),
-                        callEffects
-                )) {
+                String blocker = lastReference > index ? queryUserVariableSourceChangeReason(
+                        converted, index, lastReference, assignment.name(), assignment.sourceTables(), callEffects) : "";
+                if (!blocker.isBlank()) {
+                    String reason = "脚本变量 @" + assignment.name() + " 无法保持赋值时的取值：" + blocker;
+                    blockedReasons.putIfAbsent(index, reason);
+                    for (int reference = index + 1; reference <= lastReference; reference++) {
+                        if (referencesUserVariable(converted.get(reference), assignment.name())) {
+                            blockedReasons.putIfAbsent(reference, reason);
+                        }
+                    }
                     unsafeInlining = true;
                     break;
                 }
@@ -2597,11 +2625,14 @@ class SqlScriptMigrator {
             }
             inlineCount += assignments.size();
         }
+        Map<String, String> manualReasons = new LinkedHashMap<>();
+        blockedReasons.forEach((index, reason) -> manualReasons.put(converted.get(index), reason));
         return new QueryUserVariableInlining(
                 List.copyOf(converted),
                 inlineCount > 0,
                 inlineCount,
-                Set.copyOf(appliedRules)
+                Set.copyOf(appliedRules),
+                Map.copyOf(manualReasons)
         );
     }
 
@@ -2609,7 +2640,7 @@ class SqlScriptMigrator {
             List<String> statements,
             int assignmentIndex,
             int lastReference,
-            Map<Integer, ScriptProcedureEffects> callEffects
+            Map<Integer, Effects> callEffects
     ) {
         for (int index = assignmentIndex + 1; index <= lastReference; index++) {
             String body = splitLeadingSqlPrefix(statements.get(index)).body().strip();
@@ -2617,7 +2648,7 @@ class SqlScriptMigrator {
                 continue;
             }
             if (startsKeyword(body, 0, "CALL") && index < lastReference
-                    && !callEffects.getOrDefault(index, ScriptProcedureEffects.unknown()).known()) {
+                    && !callEffects.getOrDefault(index, Effects.unknown("缺少调用前生效的过程定义")).known()) {
                 return true;
             }
             // Routine definitions and unanalysed control flow do not share the
@@ -2628,150 +2659,6 @@ class SqlScriptMigrator {
             }
         }
         return false;
-    }
-
-    private Map<Integer, ScriptProcedureEffects> scriptProcedureCallEffects(List<String> statements) {
-        if (statements.stream().noneMatch(sql ->
-                startsKeyword(splitLeadingSqlPrefix(sql).body().strip(), 0, "CALL"))) {
-            return Map.of();
-        }
-        Map<ProcedureKey, Integer> definitions = new LinkedHashMap<>();
-        Map<Integer, ScriptProcedureEffects> analyzedDefinitions = new LinkedHashMap<>();
-        Map<Integer, ScriptProcedureEffects> calls = new LinkedHashMap<>();
-        for (int index = 0; index < statements.size(); index++) {
-            String sql = statements.get(index);
-            ProcedureReference create = procedureReferenceFromCreateProcedure(sql, "");
-            if (create != null) {
-                definitions.put(create.key(), index);
-                continue;
-            }
-            ProcedureReference drop = procedureReferenceFromDropProcedure(sql, "");
-            if (drop != null) {
-                definitions.remove(drop.key());
-                continue;
-            }
-            String body = splitLeadingSqlPrefix(sql).body().strip();
-            if (startsKeyword(body, 0, "CALL")) {
-                ProcedureReference call = procedureReferenceFromCall(sql, "");
-                Integer definition = call == null ? null : definitions.get(call.key());
-                ScriptProcedureEffects effects = definition != null && hasEmptyCallArguments(sql)
-                        ? analyzedDefinitions.computeIfAbsent(definition,
-                        definitionIndex -> scriptProcedureEffects(statements.get(definitionIndex)))
-                        : ScriptProcedureEffects.unknown();
-                calls.put(index, effects);
-                if (!effects.known()) {
-                    // An opaque call may also replace a previously defined routine.
-                    definitions.clear();
-                }
-            } else if (startsKeyword(body, 0, "USE")
-                    || startsKeyword(body, 0, "EXECUTE")
-                    || Pattern.compile("(?is)^SET\\s+(?:CURRENT\\s+)?SCHEMA\\b").matcher(body).find()) {
-                definitions.clear();
-            }
-        }
-        return Map.copyOf(calls);
-    }
-
-    private ScriptProcedureEffects scriptProcedureEffects(String sql) {
-        String clean = removeSqlCommentsPreservingLineBreaks(sql);
-        int begin = firstProcedureBegin(clean);
-        if (!hasEmptyProcedureParameters(clean) || begin < 0
-                || !clean.stripTrailing().matches("(?is).*\\bEND\\s*;?")) {
-            return ScriptProcedureEffects.unknown();
-        }
-        String searchable = replaceIgnoredSqlWithSpaces(clean.substring(begin));
-        if (Pattern.compile("(?is)\\b(?:CALL|PREPARE|EXECUTE|DEALLOCATE|DO|DECLARE|OPEN|FETCH|CLOSE"
-                + "|HANDLER|LOOP|WHILE|REPEAT|GOTO|CREATE|ALTER|DROP|TRUNCATE|RENAME|USE|COMMIT|ROLLBACK"
-                + "|REPLACE|MERGE|LOAD|LOCK|UNLOCK)\\b|:=|\\bSET\\s+@")
-                .matcher(searchable).find()) {
-            return ScriptProcedureEffects.unknown();
-        }
-        for (UserVariableReference variable : mysqlUserVariableReferences(clean)) {
-            int next = skipWhitespaceAndComments(clean, variable.end());
-            if (next < clean.length() && clean.charAt(next) == '=') {
-                return ScriptProcedureEffects.unknown();
-            }
-        }
-        Set<String> targets = new LinkedHashSet<>();
-        Set<Integer> tableEnds = new LinkedHashSet<>();
-        StringBuilder outsideDml = new StringBuilder(clean);
-        for (RoutineSqlStatement statement : routineSqlStatements(clean)) {
-            String dml = clean.substring(statement.start(), statement.end());
-            for (int index = statement.start(); index < statement.end(); index++) {
-                outsideDml.setCharAt(index, ' ');
-            }
-            if (startsKeyword(dml, 0, "SELECT")) {
-                if (topLevelKeywordIndex(dml, "INTO") >= 0) {
-                    return ScriptProcedureEffects.unknown();
-                }
-                continue;
-            }
-            Matcher target = Pattern.compile("(?is)^(?:INSERT\\s+(?:IGNORE\\s+)?INTO|UPDATE|DELETE\\s+FROM)"
-                    + "\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")").matcher(dml);
-            if (!target.find()) {
-                return ScriptProcedureEffects.unknown();
-            }
-            if (startsKeyword(dml, 0, "UPDATE")) {
-                int set = topLevelKeywordIndex(dml, "SET");
-                if (set < target.end() || !simpleScriptDmlAlias(dml.substring(target.end(), set))) {
-                    return ScriptProcedureEffects.unknown();
-                }
-            } else if (startsKeyword(dml, 0, "DELETE")) {
-                int end = firstDmTopLevelKeywordAfter(dml, target.end(), List.of("WHERE", "ORDER", "LIMIT"));
-                if (!simpleScriptDmlAlias(dml.substring(target.end(), end))) {
-                    return ScriptProcedureEffects.unknown();
-                }
-            }
-            targets.add(normalizedTableKey(target.group("table")));
-            tableEnds.add(statement.start() + target.end("table"));
-        }
-        if (containsKeywordOutsideIgnoredText(outsideDml.toString(), "SET")
-                || scriptProcedureHasUnknownFunction(clean, begin, tableEnds)) {
-            return ScriptProcedureEffects.unknown();
-        }
-        return new ScriptProcedureEffects(true, Set.copyOf(targets));
-    }
-
-    private boolean simpleScriptDmlAlias(String sql) {
-        return sql.isBlank() || Pattern.compile("(?is)\\s*(?:AS\\s+)?(?:"
-                + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*").matcher(sql).matches();
-    }
-
-    private boolean scriptProcedureHasUnknownFunction(String sql, int start, Set<Integer> tableEnds) {
-        Set<String> allowed = Set.of(
-                "EXISTS", "IN", "VALUES", "IF", "NOT", "AND", "OR", "SELECT", "FROM", "WHERE",
-                "CONCAT", "CONCAT_WS", "COALESCE", "NULLIF", "IFNULL", "MIN", "MAX", "COUNT", "SUM", "AVG",
-                "NOW", "UUID", "CURRENT_TIMESTAMP", "LENGTH", "CHAR_LENGTH", "UPPER", "LOWER"
-        );
-        int index = start;
-        while (index < sql.length()) {
-            char current = sql.charAt(index);
-            if (current == '\'') {
-                index = skipSingleQuotedString(sql, index);
-            } else if (startsLineComment(sql, index) || startsBlockComment(sql, index)) {
-                index = skipWhitespaceAndComments(sql, index);
-            } else if (Character.isLetter(current) || current == '_' || current == '`' || current == '"') {
-                SqlIdentifierReference identifier = sqlIdentifierReferenceAt(sql, index);
-                if (identifier == null) {
-                    return true;
-                }
-                int next = skipWhitespaceAndComments(sql, identifier.end());
-                if (next < sql.length() && sql.charAt(next) == '(' && !tableEnds.contains(identifier.end())
-                        && !allowed.contains(identifier.token().toUpperCase(Locale.ROOT))) {
-                    return true;
-                }
-                index = identifier.end();
-            } else {
-                index++;
-            }
-        }
-        return false;
-    }
-
-    private record ScriptProcedureEffects(boolean known, Set<String> mutationTargets) {
-        static ScriptProcedureEffects unknown() {
-            return new ScriptProcedureEffects(false, Set.of());
-        }
     }
 
     private QueryBackedUserVariableAssignment scriptExpressionVariableAssignment(
@@ -3051,7 +2938,8 @@ class SqlScriptMigrator {
     private int queryUserVariableLastReference(
             List<String> statements,
             int assignmentIndex,
-            String variableName
+            String variableName,
+            Map<Integer, Effects> callEffects
     ) {
         int lastReference = -1;
         for (int index = assignmentIndex + 1; index < statements.size(); index++) {
@@ -3061,7 +2949,9 @@ class SqlScriptMigrator {
                     || assignsUserVariableOutsideSetOrSelectInto(statement, variableName)) {
                 break;
             }
-            if (referencesUserVariable(statement, variableName)) {
+            if (referencesUserVariable(statement, variableName)
+                    || callEffects.containsKey(index) && callEffects.get(index).readVariables()
+                    .contains(variableName.toLowerCase(Locale.ROOT))) {
                 lastReference = index;
             }
         }
@@ -3133,30 +3023,38 @@ class SqlScriptMigrator {
         return hasUnsafeUserVariableAssignment(statement, references);
     }
 
-    private boolean queryUserVariableSourceChanges(
+    private String queryUserVariableSourceChangeReason(
             List<String> statements,
             int assignmentIndex,
             int lastReference,
+            String variableName,
             Set<String> sourceTables,
-            Map<Integer, ScriptProcedureEffects> callEffects
+            Map<Integer, Effects> callEffects
     ) {
+        String normalizedVariable = variableName.toLowerCase(Locale.ROOT);
         for (int index = assignmentIndex + 1; index <= lastReference; index++) {
-            if (!sourceTables.isEmpty() && index < lastReference
-                    && !procedureNameFromCall(statements.get(index)).isBlank()) {
-                ScriptProcedureEffects effects = callEffects.getOrDefault(index, ScriptProcedureEffects.unknown());
-                if (!effects.known() || effects.mutationTargets().stream().anyMatch(sourceTables::contains)) {
-                    return true;
+            Effects effects = callEffects.get(index);
+            if (effects != null && (index < lastReference || effects.readVariables().contains(normalizedVariable))) {
+                String call = "第 " + (index + 1) + " 条 CALL " + procedureNameFromCall(statements.get(index));
+                if (!effects.known()) {
+                    return call + " 的影响未确定（" + effects.reason() + "）；请提供完整的公共过程定义或检查该调用。";
+                }
+                if (effects.assignedVariables().contains(normalizedVariable)) {
+                    return call + " 会重新赋值 @" + variableName + "，不能用原查询替换后续引用。";
+                }
+                Set<String> changedSources = new LinkedHashSet<>(effects.mutationTargets());
+                changedSources.retainAll(sourceTables);
+                if (!changedSources.isEmpty()) {
+                    return call + " 会修改查询来源表 " + changedSources + "，不能将赋值快照替换为重复查询。";
                 }
             }
             Set<String> mutationTargets = capturedTableKeysOutsideIgnoredText(
-                    statements.get(index),
-                    SCRIPT_TABLE_MUTATION_PATTERN
-            );
+                    statements.get(index), SCRIPT_TABLE_MUTATION_PATTERN);
             if (mutationTargets.stream().anyMatch(sourceTables::contains)) {
-                return true;
+                return "第 " + (index + 1) + " 条 SQL 修改了查询来源表，不能将赋值快照替换为重复查询。";
             }
         }
-        return false;
+        return "";
     }
 
     private Set<String> capturedTableKeysOutsideIgnoredText(String sql, Pattern pattern) {
@@ -3418,6 +3316,7 @@ class SqlScriptMigrator {
             Map<String, String> projectIdentityColumns,
             Map<String, ScriptSchemaState> scriptSchemaStates,
             SqlRewriteConfig rewriteConfig,
+            ScriptProcedureEffectAnalyzer procedureAnalyzer,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -3433,7 +3332,8 @@ class SqlScriptMigrator {
         long parseStartedAt = System.nanoTime();
         List<String> parsedStatements = SqlScriptParser.statements(originalContent);
         QueryUserVariableInlining queryUserVariableInlining =
-                inlineStableQueryBackedScriptVariables(parsedStatements);
+                inlineStableQueryBackedScriptVariables(parsedStatements, procedureAnalyzer, targetSchema,
+                        (systemScript ? "system:" : "application:") + targetSchema.toLowerCase(Locale.ROOT));
         SnapshotUserVariableGrouping snapshotUserVariableGrouping =
                 groupSnapshotUserVariableSequences(queryUserVariableInlining.statements());
         List<String> originalStatements = snapshotUserVariableGrouping.statements();
@@ -3574,7 +3474,9 @@ class SqlScriptMigrator {
                         manualReviewStatementIndexes.add(firstOutputStatementIndex + offset);
                     }
                     String reason = conversion.manualReviewRequired()
-                            ? conversion.reason()
+                            ? (conversion.reason().contains("MySQL user variables")
+                            ? queryUserVariableInlining.manualReasons().getOrDefault(originalStatement, conversion.reason())
+                            : conversion.reason())
                             : "依赖需要人工确认的存储过程 `" + calledProcedureName + "`；请先完成该存储过程的达梦适配后再执行这个 CALL。";
                     manualReviewItems.add(new SqlScriptManualReviewItem(
                             relative.toString(),
@@ -18838,7 +18740,8 @@ class SqlScriptMigrator {
             List<String> statements,
             boolean changed,
             int inlineCount,
-            Set<String> appliedRules
+            Set<String> appliedRules,
+            Map<String, String> manualReasons
     ) {
         private QueryUserVariableInlining {
             statements = List.copyOf(statements == null ? List.of() : statements);

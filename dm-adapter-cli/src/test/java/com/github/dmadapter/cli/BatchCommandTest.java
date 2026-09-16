@@ -76,6 +76,33 @@ class BatchCommandTest {
     }
 
     @Test
+    void batchUsesExplicitSharedProcedureDefinitionsFromConfigDirectory() throws Exception {
+        RemoteFixture remote = createRemote("shared-sql", false);
+        pushRemoteChange(remote, "sql/v2/seed.sql", """
+                SET @tenant = (SELECT MIN(id) FROM organization);
+                CALL shared_seed(1);
+                INSERT INTO module_menu(id) VALUES (@tenant);
+                """);
+        String definitions = """
+                CREATE OR REPLACE PROCEDURE shared_seed(item_id IN INT) AS
+                BEGIN
+                    INSERT INTO module_menu(id) VALUES (item_id);
+                END;
+                /
+                """;
+        Files.writeString(tempDir.resolve("shared.sql"), definitions);
+        Path config = writeConfig(remote);
+        Files.writeString(config, Files.readString(config).replace("    mode: IF_PRESENT",
+                "    procedureSources: [shared.sql]\n    mode: IF_PRESENT"));
+
+        assertThat(execute(config)).isZero();
+        assertThat(readRemoteFile(remote.remote(), "sql/v2-dm/seed.sql"))
+                .contains("SELECT MIN(id) FROM organization").doesNotContain("VALUES (@tenant)");
+        assertThat(Files.readString(tempDir.resolve("shared.sql"))).isEqualTo(definitions);
+        assertThat(tempDir.resolve("workspace/repositories/shared-sql/shared.sql")).doesNotExist();
+    }
+
+    @Test
     void batchSilentlySkipsDatabaseValidationForSqlScripts() throws Exception {
         RemoteFixture remote = createRemote("offline-sql", false);
         pushRemoteChange(remote, "sql/v2/20260807_system.sql", """

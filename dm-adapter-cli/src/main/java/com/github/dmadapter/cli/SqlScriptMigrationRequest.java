@@ -17,14 +17,25 @@ record SqlScriptMigrationRequest(
         DmValidationEnvironment validationEnvironment,
         DamengTargetCapabilities targetCapabilities,
         Path validationPlan,
-        SqlRewriteConfig rewriteConfig
+        SqlRewriteConfig rewriteConfig,
+        List<Path> procedureSources
 ) {
     SqlScriptMigrationRequest {
+        procedureSources = List.copyOf(procedureSources == null ? List.of() : procedureSources);
         preservedSqlPaths = List.copyOf(preservedSqlPaths == null ? List.of() : preservedSqlPaths);
         targetCapabilities = targetCapabilities == null
                 ? DamengTargetCapabilities.unknown()
                 : targetCapabilities;
         rewriteConfig = rewriteConfig == null ? SqlRewriteConfig.empty() : rewriteConfig;
+    }
+
+    SqlScriptMigrationRequest(
+            Path projectRoot, Path sqlRoot, Path sqlRootOut, boolean dryRun, String schema, String systemSchema,
+            List<Path> preservedSqlPaths, DmValidationEnvironment validationEnvironment,
+            DamengTargetCapabilities targetCapabilities, Path validationPlan, SqlRewriteConfig rewriteConfig
+    ) {
+        this(projectRoot, sqlRoot, sqlRootOut, dryRun, schema, systemSchema, preservedSqlPaths,
+                validationEnvironment, targetCapabilities, validationPlan, rewriteConfig, List.of());
     }
 
     SqlScriptMigrationRequest(

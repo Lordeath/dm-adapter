@@ -1227,6 +1227,136 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void inlinesQueryVariablesAcrossCallsWithoutParentheses() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT MIN(id) INTO @templateId FROM template_registry;
+                DELIMITER $$
+                CREATE PROCEDURE seed_fields() BEGIN INSERT INTO fields(id) VALUES (1); END$$
+                DELIMITER ;
+                CALL seed_fields;
+                INSERT INTO fields(id) VALUES (@templateId);
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).contains("SELECT MIN(id) FROM template_registry")
+                .doesNotContain("VALUES (@templateId)");
+    }
+
+    @Test
+    void inlinesQueryVariablesAcrossStaticDdlAndUnrelatedVariableAssignments() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SELECT MIN(id) INTO @templateId FROM template_registry;
+                DELIMITER $$
+                CREATE PROCEDURE add_fields()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = DATABASE() AND table_name = 'fields' AND column_name = 'note') THEN
+                        ALTER TABLE fields ADD COLUMN note VARCHAR(80);
+                    END IF;
+                    CREATE TABLE IF NOT EXISTS field_audit(id INT, parent_id INT,
+                        KEY idx_parent(parent_id), FOREIGN KEY(parent_id) REFERENCES fields(id));
+                    CREATE INDEX idx_field_note ON fields(note);
+                    UPDATE fields a, fields b SET a.note = b.note WHERE a.id = b.id;
+                    SET @fieldType = (SELECT MIN(id) FROM field_type);
+                    INSERT INTO fields(id) VALUES (@fieldType);
+                END$$
+                DELIMITER ;
+                CALL add_fields;
+                INSERT INTO fields(id) VALUES (@templateId);
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).contains("SELECT MIN(id) FROM template_registry")
+                .doesNotContain("VALUES (@templateId)");
+    }
+
+    @Test
+    void inlinesQueryVariablesAcrossNestedCallsWithInputParameters() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE seed_leaf(IN item_id INT)
+                BEGIN
+                    INSERT INTO fields(id) VALUES (item_id);
+                END$$
+                CREATE PROCEDURE seed_wrapper()
+                BEGIN
+                    CALL seed_leaf(1);
+                END$$
+                DELIMITER ;
+                SET @templateId = (SELECT MIN(id) FROM template_registry);
+                CALL seed_wrapper();
+                CALL seed_leaf(2);
+                INSERT INTO fields(id) VALUES (@templateId);
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).doesNotContain("VALUES (@templateId)");
+    }
+
+    @Test
+    void doesNotInlineQueryVariableUsedAsTheLastCallOutputArgument() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE read_tenant(OUT result INT) BEGIN SET result = 2; END$$
+                DELIMITER ;
+                SET @tenant = (SELECT MIN(id) FROM organization);
+                CALL read_tenant(@tenant);
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isPositive();
+        assertThat(converted.sql()).contains("CALL read_tenant(@tenant)");
+        assertThat(converted.report().manualReviewItems()).anySatisfy(item ->
+                assertThat(item.reason()).contains("OUT/INOUT"));
+    }
+
+    @Test
+    void checksQueryVariableSourcesUntilTheRoutineIsActuallyCalled() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE change_org() BEGIN UPDATE organization SET id = 2; END$$
+                DELIMITER ;
+                SET @tenant = (SELECT MIN(id) FROM organization);
+                DELIMITER $$
+                CREATE PROCEDURE seed_menu() BEGIN INSERT INTO menu(id) VALUES (@tenant); END$$
+                DELIMITER ;
+                CALL change_org();
+                CALL seed_menu();
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isPositive();
+        assertThat(converted.sql()).contains("SET @tenant").contains("VALUES (@tenant)");
+        assertThat(converted.report().manualReviewItems()).anySatisfy(item ->
+                assertThat(item.reason()).contains("change_org", "查询来源表"));
+    }
+
+    @Test
+    void doesNotRestoreDroppedExternalDefinitionsInTheNextFile() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlOut = tempDir.resolve("sql/v2-dm");
+        Path shared = tempDir.resolve("shared.sql");
+        write(shared, "CREATE PROCEDURE shared_seed() BEGIN SELECT 1; END;\n/\n");
+        write(sqlRoot.resolve("01.sql"), "DROP PROCEDURE shared_seed;");
+        write(sqlRoot.resolve("02.sql"), """
+                SET @tenant = (SELECT MIN(id) FROM organization);
+                CALL shared_seed();
+                SELECT @tenant;
+                """);
+        SqlScriptMigrationReport report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir, sqlRoot, sqlOut, false, "", "", List.of(), DmValidationEnvironment.batchSilent(),
+                DamengTargetCapabilities.unknown(), null, SqlRewriteConfig.empty(), List.of(shared)));
+        assertThat(report.manualReviewSqlCount()).isPositive();
+        assertThat(Files.readString(sqlOut.resolve("02.sql"))).contains("SELECT @tenant");
+    }
+
+    @Test
+    void reportsWhichCallPreventsQueryVariableInlining() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @templateId = (SELECT MIN(id) FROM template_registry);
+                CALL external_seed();
+                INSERT INTO fields(id) VALUES (@templateId);
+                """);
+        assertThat(converted.report().manualReviewItems()).anySatisfy(item -> {
+            assertThat(item.reason()).contains("@templateId", "external_seed", "第 2 条", "定义");
+            assertThat(item.reason()).doesNotContain("ROW_NUMBER");
+        });
+    }
+
+    @Test
     void preservesExpressionDependenciesAcrossKnownScriptProcedureCalls() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DELIMITER $$
