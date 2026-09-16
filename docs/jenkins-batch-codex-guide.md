@@ -115,8 +115,8 @@ repositories:
 - `name` 只允许字母、数字、点、下划线和连字符，且忽略大小写后不能重复。
 - `projectSubdir` 指向仓库内 Maven 项目根目录，必须存在 `pom.xml`。
 - `mapperDir`、`rewriteConfig`、SQL 输入输出目录均相对仓库检出根目录，而不是相对 `projectSubdir`。
-- `sql.procedureSources` 可配置多个 MySQL/达梦 SQL 定义文件，路径可为绝对路径或相对 YAML 所在目录的路径。仓库级列表覆盖默认列表，`[]` 可取消继承。文件必须在该仓库开始转换前就存在，且内容与运行环境实际部署的过程一致；若引用其他仓库的检出文件，应先准备该仓库，不能依赖历史缓存碰巧存在。该配置不会克隆依赖仓库，也不会执行、部署或复制这些文件。
-- 公共定义按列表顺序建立分析上下文，之后以脚本执行顺序跟踪 CREATE、DROP 和重建。未限定 schema 的公共定义属于当前脚本 schema，显式限定的名称仍按 schema 区分。缺少定义、递归、动态 SQL、未知函数、OUT/INOUT 参数或相关变量/来源表发生修改时，仍保留人工确认；报告会指出变量和阻断它的 CALL。仅确认外部过程存在，不足以证明变量可安全内联。
+- `sql.procedureSources` 可选配多个 MySQL/达梦 SQL 定义文件，用于增强公共过程的静态影响分析；路径可为绝对路径或相对 YAML 所在目录的路径。仓库级列表覆盖默认列表，`[]` 可取消继承。文件必须在该仓库开始转换前就存在，且内容与运行环境实际部署的过程一致；若引用其他仓库的检出文件，应先准备该仓库，不能依赖历史缓存碰巧存在。该配置不会克隆依赖仓库，也不会执行、部署或复制这些文件。未配置时，查询赋值变量不会仅因缺少外部过程定义而进入人工确认。
+- 公共定义按列表顺序建立分析上下文，之后以脚本执行顺序跟踪 CREATE、DROP 和重建。未限定 schema 的公共定义属于当前脚本 schema，显式限定的名称仍按 schema 区分。查询赋值变量遇到单纯缺少外部定义的 CALL 时沿用兼容行为；显式删除或失效的本地定义、递归、动态 SQL、未知函数、OUT/INOUT 参数及已确认的相关变量/来源表修改仍保留人工确认。普通表达式变量仍把未知 CALL 作为阻断项。仅确认外部过程存在，不足以证明变量可安全内联。
 - `upsertKeys` 支持 `tables` 和 `methods`。表配置用于静态表名；方法配置键必须是 `namespace.statementId`，用于 `${tableName}` 等无法静态绑定 DDL 的动态写入。两者都只能填写已由业务 DDL 或业务约束确认的真实键，不能根据 `id`、`pk` 等字段名猜测。
 - `tables` 中每个表必须配置非空 `keyColumns`。`methods` 中的 `keyColumns` 表示普通 upsert 的唯一匹配键，`conflictKeyGroups` 表示 `INSERT IGNORE` 需要覆盖的全部可达主键/唯一键，组内为 AND、组间为 OR；每个方法必须至少配置其中一项。列名和键组不得为空或重复。
 - `migrationDefaults.upsertKeys.tables/methods` 对所有仓库生效；仓库自己的 `migration.upsertKeys.tables/methods` 分别按表或完整方法名覆盖全局配置。

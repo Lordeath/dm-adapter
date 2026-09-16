@@ -113,14 +113,38 @@ class ScriptProcedureEffectAnalyzerTest {
     }
 
     @Test
-    void retainsDropsAndOpaqueCallInvalidationAcrossFilesButSeparatesScriptScopes() {
+    void retainsDropsAndOpaqueCallInvalidationAcrossFilesButKeepsDefinitionsAfterMissingCalls() {
         var analyzer = new ScriptProcedureEffectAnalyzer(List.of(
                 "CREATE PROCEDURE shared() BEGIN SELECT 1; END"));
         analyzer.analyze(List.of("DROP PROCEDURE shared"), "", "application");
-        assertThat(analyzer.analyze(List.of("CALL shared()"), "", "application").get(0).known()).isFalse();
+        var dropped = analyzer.analyze(List.of("CALL shared()"), "", "application").get(0);
+        assertThat(dropped.known()).isFalse();
+        assertThat(dropped.missingDefinition()).isFalse();
         assertThat(analyzer.analyze(List.of("CALL shared()"), "", "system").get(0).known()).isTrue();
-        analyzer.analyze(List.of("CALL unknown()"), "", "system");
+        var missing = analyzer.analyze(List.of("CALL unknown()"), "", "system").get(0);
+        assertThat(missing.missingDefinition()).isTrue();
+        assertThat(analyzer.analyze(List.of("CALL shared()"), "", "system").get(0).known()).isTrue();
+        analyzer.analyze(List.of(
+                "CREATE PROCEDURE opaque() BEGIN EXECUTE IMMEDIATE 'DROP PROCEDURE shared'; END",
+                "CALL opaque()"
+        ), "", "system");
         assertThat(analyzer.analyze(List.of("CALL shared()"), "", "system").get(0).known()).isFalse();
+    }
+
+    @Test
+    void defersDefinitionAnalysisUntilAFileContainsQueryVariables() {
+        var analyzer = new ScriptProcedureEffectAnalyzer(List.of());
+
+        assertThat(analyzer.analyzeForQueryVariables(List.of(
+                "CREATE PROCEDURE shared() BEGIN UPDATE tenant SET id = 2; END"
+        ), "", "application")).isEmpty();
+
+        var results = analyzer.analyzeForQueryVariables(List.of(
+                "SET @tenant = 1",
+                "CALL shared()"
+        ), "", "application");
+        assertThat(results.get(1).known()).isTrue();
+        assertThat(results.get(1).mutationTargets()).containsExactly("tenant");
     }
 
     @Test

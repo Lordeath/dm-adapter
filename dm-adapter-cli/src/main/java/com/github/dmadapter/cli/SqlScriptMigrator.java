@@ -2488,7 +2488,7 @@ class SqlScriptMigrator {
             List<String> statements, ScriptProcedureEffectAnalyzer procedureAnalyzer, String schema, String scope
     ) {
         // Use original definitions; even a single DROP/CALL changes the next file's context.
-        Map<Integer, Effects> callEffects = procedureAnalyzer.analyze(
+        Map<Integer, Effects> callEffects = procedureAnalyzer.analyzeForQueryVariables(
                 statements == null ? List.of() : statements, schema, scope);
         if (statements == null || statements.size() < 2) {
             return new QueryUserVariableInlining(
@@ -3036,9 +3036,6 @@ class SqlScriptMigrator {
             Effects effects = callEffects.get(index);
             if (effects != null && (index < lastReference || effects.readVariables().contains(normalizedVariable))) {
                 String call = "第 " + (index + 1) + " 条 CALL " + procedureNameFromCall(statements.get(index));
-                if (!effects.known()) {
-                    return call + " 的影响未确定（" + effects.reason() + "）；请提供完整的公共过程定义或检查该调用。";
-                }
                 if (effects.assignedVariables().contains(normalizedVariable)) {
                     return call + " 会重新赋值 @" + variableName + "，不能用原查询替换后续引用。";
                 }
@@ -3046,6 +3043,9 @@ class SqlScriptMigrator {
                 changedSources.retainAll(sourceTables);
                 if (!changedSources.isEmpty()) {
                     return call + " 会修改查询来源表 " + changedSources + "，不能将赋值快照替换为重复查询。";
+                }
+                if (!effects.known() && !effects.missingDefinition()) {
+                    return call + " 的影响未确定（" + effects.reason() + "）；请提供完整的公共过程定义或检查该调用。";
                 }
             }
             Set<String> mutationTargets = capturedTableKeysOutsideIgnoredText(
