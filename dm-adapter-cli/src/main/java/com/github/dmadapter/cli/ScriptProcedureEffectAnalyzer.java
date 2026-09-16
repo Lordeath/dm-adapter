@@ -26,7 +26,14 @@ final class ScriptProcedureEffectAnalyzer {
             "SELECT", "FROM", "JOIN", "WHERE", "ON", "AS", "KEY", "PRIMARY", "UNIQUE", "INDEX", "CHECK",
             "REFERENCES", "USING", "DEFAULT", "CASE", "WHEN", "THEN", "ELSE", "OVER");
 
-    record Effects(boolean known, Set<String> mutationTargets, Set<String> assignedVariables,
+    private enum Resolution {
+        KNOWN,
+        MISSING_DEFINITION,
+        INVALIDATED_DEFINITION,
+        UNKNOWN
+    }
+
+    record Effects(Resolution resolution, Set<String> mutationTargets, Set<String> assignedVariables,
                    Set<String> readVariables, String reason) {
         Effects {
             mutationTargets = Set.copyOf(mutationTargets);
@@ -34,8 +41,26 @@ final class ScriptProcedureEffectAnalyzer {
             readVariables = Set.copyOf(readVariables);
         }
 
+        boolean known() {
+            return resolution == Resolution.KNOWN;
+        }
+
+        boolean missingDefinition() {
+            return resolution == Resolution.MISSING_DEFINITION;
+        }
+
         static Effects unknown(String reason) {
-            return new Effects(false, Set.of(), Set.of(), Set.of(), reason);
+            return new Effects(Resolution.UNKNOWN, Set.of(), Set.of(), Set.of(), reason);
+        }
+
+        static Effects missingDefinition(Name name) {
+            return new Effects(Resolution.MISSING_DEFINITION, Set.of(), Set.of(), Set.of(),
+                    "缺少调用前生效的过程定义：" + name.display());
+        }
+
+        static Effects invalidatedDefinition(Name name) {
+            return new Effects(Resolution.INVALIDATED_DEFINITION, Set.of(), Set.of(), Set.of(),
+                    "过程定义已删除或分析上下文已失效：" + name.display());
         }
     }
 
@@ -46,10 +71,17 @@ final class ScriptProcedureEffectAnalyzer {
     private record Definition(Name name, List<Token> tokens, int body, Set<String> locals,
                               int arity, String unsupported) { }
     private record Direct(Effects effects, List<Call> calls) { }
+    private record Scope(Map<Name, Definition> definitions, Set<Name> invalidated, List<String> pendingStatements) {
+        void invalidateDefinitions() {
+            invalidated.addAll(definitions.keySet());
+            definitions.clear();
+        }
+    }
 
     private final Map<Name, Definition> initialDefinitions = new LinkedHashMap<>();
+    private final Set<Name> initialInvalidated = new LinkedHashSet<>();
     private final Map<Definition, Direct> directCache = new HashMap<>();
-    private final Map<String, Map<Name, Definition>> scopes = new HashMap<>();
+    private final Map<String, Scope> scopes = new HashMap<>();
 
     ScriptProcedureEffectAnalyzer(List<String> sources) {
         for (String source : sources) {
@@ -57,9 +89,13 @@ final class ScriptProcedureEffectAnalyzer {
             Definition definition = definition(tokens, "");
             if (definition != null) {
                 initialDefinitions.put(definition.name(), definition);
+                initialInvalidated.remove(definition.name());
             } else {
                 Name drop = dropped(tokens, "");
-                if (drop != null) initialDefinitions.remove(drop);
+                if (drop != null) {
+                    initialDefinitions.remove(drop);
+                    initialInvalidated.add(drop);
+                }
             }
         }
     }
@@ -69,56 +105,99 @@ final class ScriptProcedureEffectAnalyzer {
     }
 
     Map<Integer, Effects> analyze(List<String> statements, String schema, String scope) {
-        Map<Name, Definition> definitions = scopes.computeIfAbsent(scope, ignored -> {
+        return analyze(statements, schema, scope, true);
+    }
+
+    Map<Integer, Effects> analyzeForQueryVariables(List<String> statements, String schema, String scope) {
+        return analyze(statements, schema, scope,
+                statements.stream().anyMatch(statement -> statement.indexOf('@') >= 0));
+    }
+
+    private Map<Integer, Effects> analyze(
+            List<String> statements, String schema, String scope, boolean analyzeCurrentStatements
+    ) {
+        Scope state = scopes.computeIfAbsent(scope, ignored -> {
             Map<Name, Definition> seeded = new LinkedHashMap<>();
             initialDefinitions.forEach((key, definition) -> {
                 Definition scoped = definition(definition.tokens(), schema);
                 seeded.put(scoped.name(), scoped);
             });
-            return seeded;
+            Set<Name> invalidated = new LinkedHashSet<>();
+            initialInvalidated.forEach(name -> invalidated.add(scopedName(name, schema)));
+            return new Scope(seeded, invalidated, new ArrayList<>());
         });
+        if (!analyzeCurrentStatements) {
+            state.pendingStatements().addAll(statements);
+            return Map.of();
+        }
+        int pendingStatementCount = state.pendingStatements().size();
+        List<String> effectiveStatements = new ArrayList<>(pendingStatementCount + statements.size());
+        effectiveStatements.addAll(state.pendingStatements());
+        effectiveStatements.addAll(statements);
+        state.pendingStatements().clear();
+
+        List<List<Token>> statementTokens = new ArrayList<>(effectiveStatements.size());
+        List<Definition> statementDefinitions = new ArrayList<>(effectiveStatements.size());
+        Map<Name, Integer> futureDefinitions = new HashMap<>();
+        for (String statement : effectiveStatements) {
+            List<Token> tokens = lex(statement);
+            statementTokens.add(tokens);
+            Definition future = definition(tokens, schema);
+            statementDefinitions.add(future);
+            if (future != null) futureDefinitions.merge(future.name(), 1, Integer::sum);
+        }
         Map<Integer, Effects> result = new LinkedHashMap<>();
-        for (int i = 0; i < statements.size(); i++) {
-            List<Token> tokens = lex(statements.get(i));
-            Definition created = definition(tokens, schema);
+        for (int i = 0; i < effectiveStatements.size(); i++) {
+            List<Token> tokens = statementTokens.get(i);
+            Definition created = statementDefinitions.get(i);
             if (created != null) {
-                definitions.put(created.name(), created);
+                futureDefinitions.computeIfPresent(created.name(), (name, remaining) ->
+                        remaining == 1 ? null : remaining - 1);
+                state.definitions().put(created.name(), created);
+                state.invalidated().remove(created.name());
                 continue;
             }
             Name drop = dropped(tokens, schema);
             if (drop != null) {
-                definitions.remove(drop);
+                state.definitions().remove(drop);
+                state.invalidated().add(drop);
                 continue;
             }
             if (keyword(tokens, 0, "CALL")) {
                 Call call = call(tokens, schema);
                 Effects effects = call == null ? Effects.unknown("无法解析 CALL 的名称或参数")
-                        : resolve(call, definitions, new HashSet<>());
-                result.put(i, effects);
+                        : resolve(call, state, futureDefinitions.keySet(), new HashSet<>());
+                if (i >= pendingStatementCount) result.put(i - pendingStatementCount, effects);
                 // An opaque routine may replace a previously defined routine too.
-                if (!effects.known()) definitions.clear();
+                // A merely missing external definition keeps locally tracked definitions usable in
+                // compatibility mode; other opaque effects still invalidate the analysis context.
+                if (!effects.known() && !effects.missingDefinition()) state.invalidateDefinitions();
             } else if (keyword(tokens, 0, "USE") || keyword(tokens, 0, "EXECUTE")
                     || keyword(tokens, 0, "EXECUTABLE_COMMENT") || keyword(tokens, 0, "UNCLOSED_COMMENT")
                     || keyword(tokens, 0, "UNCLOSED_QUOTE")
                     || keyword(tokens, 0, "SET") && (keyword(tokens, 1, "SCHEMA")
                     || keyword(tokens, 1, "CURRENT"))) {
-                definitions.clear();
+                state.invalidateDefinitions();
             }
         }
         return Map.copyOf(result);
     }
 
-    private Effects resolve(Call call, Map<Name, Definition> definitions, Set<Name> visiting) {
-        Definition definition = definitions.get(call.name());
-        if (definition == null) return Effects.unknown("缺少调用前生效的过程定义：" + call.name().display());
+    private Effects resolve(Call call, Scope state, Set<Name> futureDefinitions, Set<Name> visiting) {
+        Definition definition = state.definitions().get(call.name());
+        if (definition == null) {
+            return state.invalidated().contains(call.name()) || futureDefinitions.contains(call.name())
+                    ? Effects.invalidatedDefinition(call.name())
+                    : Effects.missingDefinition(call.name());
+        }
         Direct direct = directCache.computeIfAbsent(definition, this::analyzeDefinition);
         if (!definition.unsupported().isEmpty()) {
             // In particular an OUT/INOUT argument must remain an assignable variable,
             // even when this CALL is its last textual use in the script.
             Set<String> reads = new LinkedHashSet<>(direct.effects().readVariables());
             call.arguments().stream().filter(Token::variable).forEach(token -> reads.add(token.value()));
-            return new Effects(false, direct.effects().mutationTargets(), direct.effects().assignedVariables(),
-                    reads, direct.effects().reason());
+            return new Effects(direct.effects().resolution(), direct.effects().mutationTargets(),
+                    direct.effects().assignedVariables(), reads, direct.effects().reason());
         }
         if (call.arity() != definition.arity()) return Effects.unknown("CALL 参数数量与定义不一致：" + call.name().display());
         if (!pure(call.arguments(), Set.of(), false)) return Effects.unknown("CALL 参数含未知函数或赋值：" + call.name().display());
@@ -128,17 +207,18 @@ final class ScriptProcedureEffectAnalyzer {
         Set<String> writes = new LinkedHashSet<>(direct.effects().assignedVariables());
         Set<String> reads = new LinkedHashSet<>(direct.effects().readVariables());
         for (Call nested : direct.calls()) {
-            Effects child = resolve(nested, definitions, visiting);
+            Effects child = resolve(nested, state, futureDefinitions, visiting);
             tables.addAll(child.mutationTargets());
             writes.addAll(child.assignedVariables());
             reads.addAll(child.readVariables());
             if (!child.known()) {
                 visiting.remove(call.name());
-                return new Effects(false, tables, writes, reads, call.name().display() + " -> " + child.reason());
+                return new Effects(child.resolution(), tables, writes, reads,
+                        call.name().display() + " -> " + child.reason());
             }
         }
         visiting.remove(call.name());
-        return new Effects(true, tables, writes, reads, "");
+        return new Effects(Resolution.KNOWN, tables, writes, reads, "");
     }
 
     private Direct analyzeDefinition(Definition definition) {
@@ -150,11 +230,18 @@ final class ScriptProcedureEffectAnalyzer {
             body.block();
             body.cursor.take(";");
             if (!body.cursor.end()) throw new Unsupported("过程结束后的未知内容");
-            return new Direct(new Effects(true, body.tables, body.writes, reads, ""), List.copyOf(body.calls));
+            return new Direct(new Effects(Resolution.KNOWN, body.tables, body.writes, reads, ""),
+                    List.copyOf(body.calls));
         } catch (Unsupported e) {
-            return new Direct(new Effects(false, body.tables, body.writes, reads,
+            return new Direct(new Effects(Resolution.UNKNOWN, body.tables, body.writes, reads,
                     definition.name().display() + "：" + e.getMessage()), List.of());
         }
+    }
+
+    private static Name scopedName(Name name, String schema) {
+        return name.schema().isEmpty()
+                ? new Name(schema.toLowerCase(Locale.ROOT), name.name())
+                : name;
     }
 
     private final class Body {

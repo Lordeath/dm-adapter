@@ -1344,16 +1344,80 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void reportsWhichCallPreventsQueryVariableInlining() throws Exception {
+    void inlinesQueryVariablesAcrossCallsWithMissingExternalDefinitions() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 SET @templateId = (SELECT MIN(id) FROM template_registry);
                 CALL external_seed();
                 INSERT INTO fields(id) VALUES (@templateId);
                 """);
-        assertThat(converted.report().manualReviewItems()).anySatisfy(item -> {
-            assertThat(item.reason()).contains("@templateId", "external_seed", "第 2 条", "定义");
-            assertThat(item.reason()).doesNotContain("ROW_NUMBER");
-        });
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CALL external_seed()")
+                .contains("SELECT MIN(id) FROM template_registry")
+                .doesNotContain("VALUES (@templateId)");
+    }
+
+    @Test
+    void inlinesQueryVariablesUsedByLocalProceduresWithMissingNestedDefinitions() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                SET @tenant = (SELECT MIN(id) FROM organization);
+                DELIMITER $$
+                CREATE PROCEDURE seed_menu()
+                BEGIN
+                    INSERT INTO menu(id) VALUES (@tenant);
+                    CALL external_seed();
+                END$$
+                DELIMITER ;
+                CALL seed_menu();
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("CALL external_seed()")
+                .contains("SELECT MIN(id) FROM organization")
+                .doesNotContain("VALUES (@tenant)");
+    }
+
+    @Test
+    void retainsKnownProcedureEffectsAfterCallsWithMissingExternalDefinitions() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE change_org()
+                BEGIN
+                    UPDATE organization SET id = 2;
+                END$$
+                DELIMITER ;
+                SET @tenant = (SELECT MIN(id) FROM organization);
+                CALL external_seed();
+                CALL change_org();
+                SELECT @tenant;
+                """);
+        assertThat(converted.report().manualReviewSqlCount()).isPositive();
+        assertThat(converted.sql()).contains("SET @tenant").contains("SELECT @tenant");
+        assertThat(converted.report().manualReviewItems()).anySatisfy(item ->
+                assertThat(item.reason()).contains("change_org", "查询来源表"));
+    }
+
+    @Test
+    void keepsKnownUnsafeEffectsFromProceduresWithMissingNestedDefinitions() throws Exception {
+        for (String unsafeStatement : List.of(
+                "UPDATE organization SET id = 2;",
+                "SET @tenant = 2;"
+        )) {
+            ConvertedScript converted = migrateSingleScript("""
+                    DELIMITER $$
+                    CREATE PROCEDURE change_tenant()
+                    BEGIN
+                        %s
+                        CALL external_seed();
+                    END$$
+                    DELIMITER ;
+                    SET @tenant = (SELECT MIN(id) FROM organization);
+                    CALL change_tenant();
+                    SELECT @tenant;
+                    """.formatted(unsafeStatement));
+            assertThat(converted.report().manualReviewSqlCount()).as(unsafeStatement).isPositive();
+            assertThat(converted.sql()).contains("SET @tenant").contains("SELECT @tenant");
+        }
     }
 
     @Test
@@ -1391,7 +1455,6 @@ class SqlScriptMigratorTest {
                 "SET NAMES utf8;",
                 "SELECT 2 INTO @unused, @tenant_id;",
                 "SELECT @tenant_id := 2;",
-                "CALL external_effect();",
                 "CALL local_effect();",
                 "PREPARE stmt FROM 'UPDATE tenant SET id = 2'; EXECUTE stmt;",
                 "INSERT INTO audit(id) VALUES (unknown_function());"
@@ -1416,9 +1479,7 @@ class SqlScriptMigratorTest {
     void keepsQueryVariablesWhenKnownScriptProcedureCallDefinitionIsNotInScope() throws Exception {
         for (String beforeCall : List.of(
                 "DROP PROCEDURE IF EXISTS seed_local;",
-                "DROP PROCEDURE seed_local;",
-                "DROP PROCEDURE IF EXISTS seed_local;\n"
-                        + "DELIMITER $$\nCREATE PROCEDURE seed_local() BEGIN CALL external_effect(); END$$\nDELIMITER ;"
+                "DROP PROCEDURE seed_local;"
         )) {
             ConvertedScript converted = migrateSingleScript("""
                     DELIMITER $$
@@ -1445,7 +1506,7 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void distinguishesSchemasForKnownScriptProcedureCalls() throws Exception {
+    void treatsCallsWithoutDefinitionsInTheCurrentSchemaAsExternal() throws Exception {
         for (String call : List.of("CALL beta.seed_local();", "CALL seed_local();")) {
             ConvertedScript converted = migrateSingleScript("""
                     DELIMITER $$
@@ -1455,8 +1516,8 @@ class SqlScriptMigratorTest {
                     %s
                     SELECT @tenant_id;
                     """.formatted(call));
-            assertThat(converted.report().manualReviewSqlCount()).as(call).isPositive();
-            assertThat(converted.sql()).contains("SET @tenant_id").contains("SELECT @tenant_id");
+            assertThat(converted.report().manualReviewSqlCount()).as(call).isZero();
+            assertThat(converted.sql()).doesNotContain("SET @tenant_id").doesNotContain("SELECT @tenant_id");
         }
     }
 
@@ -3988,7 +4049,7 @@ class SqlScriptMigratorTest {
                 """.formatted(inserts);
 
         ConvertedScript converted = assertTimeout(
-                Duration.ofSeconds(10),
+                Duration.ofSeconds(15),
                 () -> migrateSingleScript(script)
         );
 

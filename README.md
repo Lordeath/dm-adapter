@@ -59,11 +59,13 @@ java -jar dm-adapter-cli/target/dm-adapter-cli-0.1.0-SNAPSHOT.jar migrate --proj
 `batch` 的完整 YAML 示例、Jenkins 配置、IntelliJ IDEA 调试参数、退出码和缓存恢复规则见
 [Jenkins 无人值守 Batch 模式部署说明](docs/jenkins-batch-codex-guide.md)。
 
-脚本中的查询变量需要跨越公共过程调用时，可重复传入 `--sql-procedure-source <定义文件.sql>`，
+需要进一步静态确认公共过程影响时，可重复传入 `--sql-procedure-source <定义文件.sql>`，
 相对路径以 `--project` 为基准。Batch 对应 `migration.sql.procedureSources`，相对路径以 YAML 所在目录为基准。
 这些文件须与已部署的过程定义一致，仅用于分析调用是否修改变量或查询来源表，不会因此执行或部署。
-定义缺失或影响不能确定时仍进入人工确认；无参数的 `CALL p` / `CALL p()`、可分析的 IN 参数和嵌套调用、
-静态建表改表及无关变量赋值不再一律阻断查询变量转换。
+仅缺少外部过程定义时，`SELECT ... INTO @变量` / `SET @变量=(SELECT ...)` 沿用兼容行为，不因此新增人工确认；
+已知会修改变量或查询来源表的过程，以及 OUT/INOUT、动态 SQL、递归、参数异常等仍会阻断转换。
+普通表达式变量继续严格检查未知 CALL。无参数的 `CALL p` / `CALL p()`、可分析的 IN 参数和嵌套调用、
+静态建表改表及无关变量赋值可通过过程定义进一步确认。
 
 ## GUI 与 Windows EXE
 
