@@ -8697,14 +8697,25 @@ class SqlScriptMigratorTest {
     }
 
     @Test
-    void classifiesBlockedSchemaPreflightAsValidationTimeout() {
+    void classifiesBlockedSchemaPreflightAsValidationTimeout() throws Exception {
         String property = "dm.adapter.sqlScriptStatementTimeoutSeconds";
         String previous = System.getProperty(property);
         CountDownLatch releaseSchemaSelection = new CountDownLatch(1);
+        CountDownLatch schemaSelectionStarted = new CountDownLatch(1);
+        CountDownLatch cancellationRequested = new CountDownLatch(1);
+        CountDownLatch connectionAbortRequested = new CountDownLatch(1);
+        AtomicInteger executedStatementCount = new AtomicInteger();
         try {
             System.setProperty(property, "1");
             Statement statement = proxy(Statement.class, (ignored, method, args) -> {
+                if (method.getName().equals("cancel")) {
+                    cancellationRequested.countDown();
+                }
+                if (method.getName().equals("execute")) {
+                    executedStatementCount.incrementAndGet();
+                }
                 if (method.getName().equals("setQueryTimeout")) {
+                    schemaSelectionStarted.countDown();
                     while (releaseSchemaSelection.getCount() > 0) {
                         try {
                             releaseSchemaSelection.await(50, TimeUnit.MILLISECONDS);
@@ -8715,13 +8726,19 @@ class SqlScriptMigratorTest {
                 }
                 return defaultValue(method.getReturnType());
             });
-            Connection connection = proxy(Connection.class, (ignored, method, args) ->
-                    method.getName().equals("createStatement")
-                            ? statement
-                            : defaultValue(method.getReturnType()));
+            Connection connection = proxy(Connection.class, (ignored, method, args) -> {
+                if (method.getName().equals("abort")) {
+                    connectionAbortRequested.countDown();
+                }
+                return method.getName().equals("createStatement")
+                        ? statement
+                        : defaultValue(method.getReturnType());
+            });
 
-            SqlScriptValidationRun result = assertTimeout(
-                    Duration.ofSeconds(3),
+            // Keep the adapter timeout at one second; allow scheduling and cleanup overhead
+            // in the full suite, and interrupt the test if the hard timeout stops working.
+            SqlScriptValidationRun result = assertTimeoutPreemptively(
+                    Duration.ofSeconds(10),
                     () -> new SqlScriptValidator(env -> connection).validate(
                             List.of(plannedValidationFile(
                                     "schema-timeout.sql",
@@ -8732,6 +8749,11 @@ class SqlScriptMigratorTest {
                     )
             );
 
+            assertThat(schemaSelectionStarted.getCount()).isZero();
+            assertThat(releaseSchemaSelection.getCount()).isEqualTo(1);
+            assertThat(executedStatementCount).hasValue(0);
+            assertThat(cancellationRequested.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(connectionAbortRequested.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(result.status()).contains("timed out");
             assertThat(result.successCount()).isZero();
             assertThat(result.failures()).singleElement().satisfies(failure -> {
