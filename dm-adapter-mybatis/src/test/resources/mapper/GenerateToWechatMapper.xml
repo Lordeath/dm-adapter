@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.newsee.system.dao.NsSystemOrganizationToWechatMapper"><update id="generateToWechat">
+        INSERT ns_system_organization_to_wechat (enterprise_id,organization_id, organization_parent_id,dept_id, NAME,level, parentid, `organization_ordercolumn`, create_time, update_time )
+        SELECT
+            org.enterprise_id,
+            org.organization_id,
+            org.organization_parent_id,
+            org.organization_id,
+            org.organization_name,
+            (LENGTH(org.organization_path) - LENGTH(REPLACE(org.organization_path, '/', ''))-1),
+            CASE
+                porg.organization_parent_id
+                WHEN 0 THEN
+                    1 ELSE org.organization_parent_id
+                END,
+            org.organization_ordercolumn,
+            now(),
+            NOW()
+        FROM
+            ns_system_organization org
+            LEFT JOIN ns_system_organization porg on org.organization_parent_id = porg.organization_id
+        WHERE
+            1=1
+            <if test="enterpriseId != null">
+                AND org.enterprise_id = #{enterpriseId}
+            </if>
+          AND org.is_deleted = 0
+          AND  LOCATE('adm',org.organization_dimension)>0
+          AND porg.organization_parent_id is not null
+          AND NOT EXISTS (
+                SELECT
+                    1
+                FROM
+                    ns_system_organization_to_wechat chat
+                WHERE
+                    chat.organization_id = org.organization_id);
+
+        UPDATE ns_system_organization_to_wechat chat
+        INNER JOIN ns_system_organization org ON org.organization_id = chat.organization_id
+        LEFT JOIN ns_system_organization porg on org.organization_parent_id = porg.organization_id
+            SET chat.flag = 0,
+                chat.des = null,
+                chat.NAME = org.organization_name,
+                chat.parentid = ( CASE porg.organization_parent_id WHEN 0 THEN 1 ELSE org.organization_parent_id END ),
+                chat.sync_type = ( CASE org.is_deleted WHEN 0 THEN 1 ELSE 2 END ),
+                chat.`level` = (LENGTH(org.organization_path) - LENGTH(REPLACE(org.organization_path, '/', ''))-1),
+                chat.organization_ordercolumn = org.organization_ordercolumn,
+                chat.update_time = NOW(),
+                chat.organization_parent_id = org.organization_parent_id
+        WHERE 1=1
+        <if test="enterpriseId != null">
+          AND  org.enterprise_id = #{enterpriseId}
+        </if>
+          AND org.update_time > chat.update_time;
+
+        <!--通过 organization_id / organization_parent_id 自关联，修正企微维度的 parentid -->
+        UPDATE ns_system_organization_to_wechat chat
+        LEFT JOIN ns_system_organization_to_wechat pchat ON pchat.organization_id = chat.organization_parent_id
+        SET chat.parentid = IFNULL(pchat.dept_id, 1)
+        WHERE 1=1
+        <if test="enterpriseId != null">
+          AND chat.enterprise_id = #{enterpriseId}
+        </if>
+          AND chat.parentid != IFNULL(pchat.dept_id, 1);
+
+        UPDATE ns_system_organization_to_wechat o
+        JOIN (
+        SELECT organization_id, `name`, `level`,
+        ROW_NUMBER() OVER (PARTITION BY `level`,`parentid` ORDER BY organization_ordercolumn desc) AS `order`,organization_ordercolumn
+        FROM ns_system_organization_to_wechat
+        ) AS r
+        ON o.organization_id = r.organization_id
+        SET o.`order` = r.`order`;
+
+    </update></mapper>

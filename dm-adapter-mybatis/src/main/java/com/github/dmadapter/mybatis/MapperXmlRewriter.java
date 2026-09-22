@@ -1773,6 +1773,24 @@ public class MapperXmlRewriter {
             String generatedKeyProperty,
             String generatedKeyColumn
     ) {
+        List<String> statements = DynamicSqlStatementSplitter.split(rawBody);
+        if (!statements.isEmpty()) {
+            StringBuilder converted = new StringBuilder(rawBody.length());
+            List<String> rules = new ArrayList<>();
+            List<String> reasons = new ArrayList<>();
+            for (String body : statements) {
+                DynamicBodyConversion conversion = convertDynamicXmlTextSegments(
+                        statementTagName, statementKey, body, sqlConverter, rewriteConfig,
+                        useGeneratedKeys, generatedKeyProperty, generatedKeyColumn);
+                converted.append(conversion.convertedBody());
+                addAppliedRules(rules, conversion.appliedRules());
+                addManualReviewReasons(reasons, conversion.manualReviewReasons());
+            }
+            // Risk cleanup belongs to each SQL statement, never to the combined method body.
+            String convertedBody = converted.toString();
+            return new DynamicBodyConversion(rawBody, convertedBody, rules, reasons,
+                    !convertedBody.equals(rawBody));
+        }
         String workingBody = rawBody;
         List<String> appliedRules = new ArrayList<>();
         List<String> manualReviewReasons = new ArrayList<>();
@@ -1790,9 +1808,13 @@ public class MapperXmlRewriter {
             }
             addManualReviewReasons(manualReviewReasons, createTableTailConversion.manualReviewReasons());
         }
+        // XML comparison operators are not SQL statement terminators. Keep entity decoding
+        // limited to operators here; sqlView has already masked tags, comments and literals.
+        String updateJoinSqlView = sqlView(workingBody).text()
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
         boolean damengNativeSingleTargetUpdateJoin =
                 sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
-                        && mySqlToDmSqlConverter.isDamengNativeSingleTargetUpdateJoin(sqlView(workingBody).text());
+                        && mySqlToDmSqlConverter.isDamengNativeSingleTargetUpdateJoin(updateJoinSqlView);
         StringBuilder convertedBody = new StringBuilder(workingBody.length());
         int index = 0;
         while (index < workingBody.length()) {
@@ -1835,7 +1857,11 @@ public class MapperXmlRewriter {
                 int nextTag = workingBody.indexOf('<', index);
                 int textEnd = nextTag < 0 ? workingBody.length() : nextTag;
                 String text = workingBody.substring(index, textEnd);
-                TextSegmentConversion conversion = convertTextSegment(
+                // A split method can contain a complete static statement. It is not a
+                // JOIN prefix awaiting dynamic WHERE/SET nodes and may use all plain SQL rules.
+                TextSegmentConversion conversion = index == 0 && textEnd == workingBody.length()
+                        ? convertPlainTextSegment(text, statementKey, sqlConverter, rewriteConfig)
+                        : convertTextSegment(
                         text,
                         statementKey,
                         sqlConverter,
