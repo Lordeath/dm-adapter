@@ -2099,6 +2099,10 @@ class SqlScriptMigrator {
         if (procedureNameFromCreateProcedure(sql).isBlank()) {
             return List.of();
         }
+        return calledProceduresInSql(sql, defaultSchema);
+    }
+
+    private List<ProcedureReference> calledProceduresInSql(String sql, String defaultSchema) {
         LinkedHashMap<ProcedureKey, ProcedureReference> procedures = new LinkedHashMap<>();
         int index = 0;
         while (index < sql.length()) {
@@ -2162,6 +2166,11 @@ class SqlScriptMigrator {
         String body = leadingSqlPrefix.body();
         int start = skipWhitespace(body, 0);
         if (!startsKeyword(body, start, "CALL")) {
+            if (Pattern.compile("(?is)^\\s*DECLARE\\s+dm_adapter_clob_arg_\\d+\\s+CLOB\\s*;")
+                    .matcher(body).find()) {
+                List<ProcedureReference> calls = calledProceduresInSql(body, defaultSchema);
+                return calls.size() == 1 ? calls.get(0) : null;
+            }
             return null;
         }
         int procedureStart = skipWhitespace(body, start + "CALL".length());
@@ -3349,7 +3358,7 @@ class SqlScriptMigrator {
                 + targetSchema.toLowerCase(Locale.ROOT);
         ScriptSchemaState persistedSchemaState = scriptSchemaStates.computeIfAbsent(
                 schemaScope,
-                ignored -> new ScriptSchemaState(new LinkedHashMap<>(), new LinkedHashMap<>())
+                ignored -> new ScriptSchemaState(new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>())
         );
         LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns =
                 copyScriptTableColumns(persistedSchemaState.tableColumns());
@@ -3453,6 +3462,8 @@ class SqlScriptMigrator {
                 ScriptStatementConversion conversion = applyExplicitDdlCharacterSemantics(
                         plan.conversion().join()
                 );
+                updateProcedureSignature(originalStatement, targetSchema, persistedSchemaState.procedureSignatures());
+                conversion = applyLongCallArguments(conversion, targetSchema, persistedSchemaState.procedureSignatures());
                 conversion = applyDisqlLongDmlLiteralCompatibility(conversion);
                 List<String> outputStatements = expandConvertedOutputStatements(conversion);
                 String calledProcedureName = procedureNameFromCall(originalStatement);
@@ -5309,6 +5320,7 @@ class SqlScriptMigrator {
             if (!reconciliation.isBlank()) {
                 placeholders.add(reconciliation);
             }
+            placeholders.addAll(procedureTemporaryConstraintIndexes(exactDefinition));
         }
         Set<String> exactDefinitionTables = exactDefinitions.stream()
                 .map(this::globalTemporaryTableName)
@@ -7207,12 +7219,6 @@ class SqlScriptMigrator {
             rules.add(MYSQL_CALL_ARGUMENT_LINE_COMMENT_REMOVAL_RULE);
         }
 
-        String clobCallBlockSql = convertLongClobCallArgumentsToBlock(converted);
-        if (!clobCallBlockSql.equals(converted)) {
-            converted = clobCallBlockSql;
-            rules.add(DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE);
-        }
-
         String simpleDateEndTriggerSql = convertMysqlSimpleDateEndTrigger(converted);
         if (!simpleDateEndTriggerSql.equals(converted)) {
             converted = simpleDateEndTriggerSql;
@@ -7229,6 +7235,13 @@ class SqlScriptMigrator {
         if (!withoutDefiner.equals(converted)) {
             converted = withoutDefiner;
             rules.add(MYSQL_CREATE_DEFINER_REMOVAL_RULE);
+        }
+
+        // Inspect ownership before temporary DDL is rewritten or declarations moved.
+        String cleanupHandlerSql = convertMysqlRollbackCleanupHandler(converted);
+        if (!cleanupHandlerSql.equals(converted)) {
+            converted = cleanupHandlerSql;
+            rules.add(MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE);
         }
 
         String routineParameterCommentSql = removeMysqlRoutineParameterComments(converted);
@@ -7462,6 +7475,16 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_VARIADIC_CONCAT_TO_DM_RULE);
         }
 
+        // Local CREATE definitions still contain their original conflict keys here.
+        SafeRuleConversion configuredUpsertSql = convertConfiguredScriptUpserts(converted, rewriteConfig);
+        if (manualReviewReason.isBlank() && !configuredUpsertSql.manualReviewReason().isBlank()) {
+            manualReviewReason = configuredUpsertSql.manualReviewReason();
+        }
+        if (configuredUpsertSql.changed()) {
+            converted = configuredUpsertSql.sql();
+            rules.addAll(configuredUpsertSql.appliedRules());
+        }
+
         String localTemporaryTableSql = convertMysqlProcedureLocalTemporaryTables(converted);
         if (!localTemporaryTableSql.equals(converted)) {
             converted = localTemporaryTableSql;
@@ -7478,18 +7501,6 @@ class SqlScriptMigrator {
         if (!dynamicInsertIgnoreSql.equals(converted)) {
             converted = dynamicInsertIgnoreSql;
             rules.add(MYSQL_PROCEDURE_DYNAMIC_INSERT_IGNORE_TO_MERGE_RULE);
-        }
-
-        SafeRuleConversion configuredUpsertSql = convertConfiguredScriptUpserts(
-                converted,
-                rewriteConfig
-        );
-        if (manualReviewReason.isBlank() && !configuredUpsertSql.manualReviewReason().isBlank()) {
-            manualReviewReason = configuredUpsertSql.manualReviewReason();
-        }
-        if (configuredUpsertSql.changed()) {
-            converted = configuredUpsertSql.sql();
-            rules.addAll(configuredUpsertSql.appliedRules());
         }
 
         String deleteAliasStarSql = convertMysqlProcedureDeleteAliasStar(converted);
@@ -7619,6 +7630,7 @@ class SqlScriptMigrator {
         List<RoutineTextReplacement> replacements = new ArrayList<>();
         LinkedHashSet<String> appliedRules = new LinkedHashSet<>();
         String manualReviewReason = "";
+        List<TemporaryTableEvent> temporaryEvents = procedureTemporaryTableEvents(sql);
         for (RoutineSqlStatement routineStatement : routineSqlStatements(sql)) {
             String statement = sql.substring(routineStatement.start(), routineStatement.end());
             int statementStart = skipWhitespace(statement, 0);
@@ -7626,10 +7638,40 @@ class SqlScriptMigrator {
                     || !containsOnDuplicateKeyUpdate(statement)) {
                 continue;
             }
-            SqlConversionResult conversion = convertConfiguredUpsertStatement(
-                    statement,
-                    effectiveConfig
-            );
+            String table = insertTargetTable(statement);
+            TemporaryTableEvent localTable = null;
+            for (TemporaryTableEvent event : temporaryEvents) {
+                if (event.position() < routineStatement.start()
+                        && event.tableKey().equals(normalizedTableKey(table))) {
+                    localTable = event;
+                }
+            }
+            List<String> keys = effectiveConfig.keyColumnsFor("", table);
+            if (localTable != null) {
+                String localName = localTable.tableKey();
+                long shapes = temporaryEvents.stream().filter(event -> event.created()
+                                && event.tableKey().equals(localName))
+                        .map(TemporaryTableEvent::definition).distinct().count();
+                if (shapes > 1) {
+                    if (manualReviewReason.isBlank()) {
+                        manualReviewReason = "TEMPORARY_TABLE_REDEFINITION: table `" + table
+                                + "` changes definition within the procedure; one global temporary table cannot preserve these lifetimes.";
+                    }
+                    continue;
+                }
+                List<List<String>> constraints = localTable.keys();
+                if (!localTable.created() || constraints.size() != 1
+                        || !isDirectProcedureBodyStatement(sql, localTable.position())
+                        || (!keys.isEmpty() && !normalizedColumnSet(keys).equals(normalizedColumnSet(constraints.get(0))))) {
+                    if (manualReviewReason.isBlank()) {
+                        manualReviewReason = "TEMPORARY_UPSERT_KEY_CONFLICT: table `" + table
+                                + "` has unavailable or ambiguous local keys, or conflicting keyColumns.";
+                    }
+                    continue;
+                }
+                keys = constraints.get(0);
+            }
+            SqlConversionResult conversion = converter.convert(statement, keys);
             if (manualReviewReason.isBlank() && conversion.manualReviewRequired()) {
                 manualReviewReason = conversion.reason();
             }
@@ -7665,6 +7707,131 @@ class SqlScriptMigrator {
         String tableName = insertTargetTable(statement);
         List<String> keyColumns = rewriteConfig.keyColumnsFor("", tableName);
         return converter.convert(statement, keyColumns);
+    }
+
+    private Set<String> normalizedColumnSet(List<String> columns) {
+        LinkedHashSet<String> result = new LinkedHashSet<>();
+        for (String column : columns) {
+            result.add(unquoteIdentifier(column).toLowerCase(Locale.ROOT));
+        }
+        return result;
+    }
+
+    /** Statement-local metadata, never persisted as a key of a permanent table. */
+    private List<TemporaryTableEvent> procedureTemporaryTableEvents(String sql) {
+        List<TemporaryTableEvent> events = new ArrayList<>();
+        Set<String> localTables = new LinkedHashSet<>();
+        int index = firstProcedureBegin(sql);
+        while (index >= 0 && index < sql.length()) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (startsKeyword(sql, index, "CREATE") || startsKeyword(sql, index, "DROP")
+                    || startsKeyword(sql, index, "ALTER")) {
+                int end = findStatementTerminator(sql, index);
+                String ddl = removeSqlCommentsPreservingLineBreaks(sql.substring(index, end));
+                Matcher create = Pattern.compile("(?is)^CREATE\\s+TEMPORARY\\s+TABLE\\s+"
+                        + "(?<optional>IF\\s+NOT\\s+EXISTS\\s+)?(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s*\\(")
+                        .matcher(ddl);
+                if (create.find()) {
+                    String table = normalizedTableKey(create.group("table"));
+                    int open = create.end() - 1;
+                    int close = findMatchingParen(ddl, open);
+                    List<List<String>> keys = close > open && create.group("optional") == null
+                            ? allTemporaryConflictKeys(ddl.substring(open + 1, close)) : List.of();
+                    events.add(new TemporaryTableEvent(index, table, true, keys,
+                            close > open ? ddl.substring(open, close + 1) : ddl));
+                    localTables.add(table);
+                } else {
+                    Matcher drop = Pattern.compile("(?is)^DROP\\s+(?:TEMPORARY\\s+)?TABLE\\s+"
+                            + "(?:IF\\s+EXISTS\\s+)?(?<tables>.+)$").matcher(ddl);
+                    Matcher alter = Pattern.compile("(?is)^ALTER\\s+TABLE\\s+(?<table>"
+                            + SQL_IDENTIFIER_TOKEN + ")(?=\\s|$)").matcher(ddl);
+                    if (drop.matches()) {
+                        for (String table : splitTopLevelComma(drop.group("tables"))) {
+                            String key = normalizedTableKey(table.strip());
+                            if (localTables.contains(key)) {
+                                events.add(new TemporaryTableEvent(index, key, false, List.of(), ""));
+                            }
+                        }
+                    } else if (alter.find() && localTables.contains(normalizedTableKey(alter.group("table")))) {
+                        events.add(new TemporaryTableEvent(index, normalizedTableKey(alter.group("table")), false, List.of(), ""));
+                    }
+                }
+                index = end < sql.length() ? end + 1 : end;
+            } else {
+                index++;
+            }
+        }
+        return List.copyOf(events);
+    }
+
+    private List<List<String>> allTemporaryConflictKeys(String body) {
+        List<List<String>> keys = new ArrayList<>();
+        for (String part : splitTopLevelComma(body)) {
+            String definition = part.strip().replaceFirst("(?is)^CONSTRAINT\\s+(?:"
+                    + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+", "");
+            int keyOpen = findTopLevelChar(definition, '(', 0);
+            if ((startsKeyword(definition, 0, "PRIMARY") || startsKeyword(definition, 0, "UNIQUE"))
+                    && keyOpen >= 0) {
+                int keyClose = findMatchingParen(definition, keyOpen);
+                if (keyClose <= keyOpen || splitTopLevelComma(definition.substring(keyOpen + 1, keyClose))
+                        .stream().anyMatch(column -> !isSimpleIdentifier(column.strip()
+                                .replaceFirst("(?is)\\s+(ASC|DESC)$", "")))) {
+                    return List.of();
+                }
+            }
+            List<String> columns = temporaryTablePrimaryKeyColumns(definition);
+            if (columns.isEmpty()) {
+                columns = temporaryTableUniqueKeyColumns(definition);
+            }
+            if (columns.isEmpty()) {
+                SqlIdentifierReference column = sqlIdentifierReferenceAt(definition, 0);
+                if (column != null && containsKeywordOutsideIgnoredText(definition.substring(column.end()), "UNIQUE")) {
+                    columns = List.of(unquoteIdentifier(column.token()));
+                }
+            }
+            if (!columns.isEmpty()) {
+                Set<String> normalized = normalizedColumnSet(columns);
+                if (keys.stream().noneMatch(key -> normalizedColumnSet(key).equals(normalized))) {
+                    keys.add(List.copyOf(columns));
+                }
+            } else if (containsKeywordOutsideIgnoredText(definition, "PRIMARY")
+                    || containsKeywordOutsideIgnoredText(definition, "UNIQUE")) {
+                return List.of();
+            }
+        }
+        return List.copyOf(keys);
+    }
+
+    private record TemporaryTableEvent(
+            int position, String tableKey, boolean created, List<List<String>> keys, String definition
+    ) {
+    }
+
+    private List<String> procedureTemporaryConstraintIndexes(String ddl) {
+        String table = globalTemporaryTableName(ddl);
+        int open = findTopLevelChar(ddl, '(', 0);
+        int close = open < 0 ? -1 : findMatchingParen(ddl, open);
+        if (table.isBlank() || close <= open) {
+            return List.of();
+        }
+        List<String> indexes = new ArrayList<>();
+        for (List<String> columns : allTemporaryConflictKeys(ddl.substring(open + 1, close))) {
+            String indexName = dmSchemaScopedIndexName(table, "dm_temp_uk_" + (indexes.size() + 1));
+            String sql = "CREATE UNIQUE INDEX " + indexName + " ON " + table + " ("
+                    + columns.stream().map(this::dmSimpleIdentifier).collect(Collectors.joining(", ")) + ")";
+            indexes.add(guardStandaloneCreateIndexForDameng(sql));
+        }
+        return List.copyOf(indexes);
     }
 
     private String insertTargetTable(String statement) {
@@ -8972,7 +9139,9 @@ class SqlScriptMigrator {
                 + sql.substring(closeParen);
     }
 
-    private String convertLongClobCallArgumentsToBlock(String sql) {
+    private String convertLongClobCallArgumentsToBlock(
+            String sql, Set<Integer> clobArgumentIndexes, int parameterCount, String literalSource
+    ) {
         if (sql == null || sql.isBlank()) {
             return sql == null ? "" : sql;
         }
@@ -8987,8 +9156,6 @@ class SqlScriptMigrator {
         if (procedure == null) {
             return sql;
         }
-        String procedureName = unquoteIdentifier(lastIdentifierPart(procedure.token())).toLowerCase(Locale.ROOT);
-        Set<Integer> clobArgumentIndexes = DM_CALL_CLOB_ARGUMENT_INDEXES.get(procedureName);
         if (clobArgumentIndexes == null || clobArgumentIndexes.isEmpty()) {
             return sql;
         }
@@ -9001,14 +9168,34 @@ class SqlScriptMigrator {
             return sql;
         }
         List<String> arguments = splitTopLevelComma(body.substring(openParen + 1, closeParen));
+        if (parameterCount >= 0 && parameterCount != arguments.size()) {
+            return sql;
+        }
+        // Decode the MySQL source exactly once, even if other rules have already
+        // normalized JSON escapes in the converted CALL.
+        String sourceBody = splitLeadingSqlPrefix(removeMysqlCallArgumentLineComments(literalSource)).body();
+        int sourceOpen = firstTopLevelParen(sourceBody);
+        int sourceClose = sourceOpen < 0 ? -1 : findMatchingParen(sourceBody, sourceOpen);
+        if (sourceClose <= sourceOpen) {
+            return sql;
+        }
+        List<String> sourceArguments = splitTopLevelComma(sourceBody.substring(sourceOpen + 1, sourceClose));
+        if (sourceArguments.size() != arguments.size()) {
+            return sql;
+        }
         List<String> convertedArguments = new ArrayList<>(arguments.size());
         List<ClobCallArgument> clobArguments = new ArrayList<>();
         for (int i = 0; i < arguments.size(); i++) {
             String argument = arguments.get(i);
             String variableName = "dm_adapter_clob_arg_" + (i + 1);
-            if (clobArgumentIndexes.contains(i) && isLongSingleQuotedLiteral(argument)) {
+            String sourceArgument = sourceArguments.get(i).strip();
+            if (clobArgumentIndexes.contains(i) && isLongSingleQuotedLiteral(sourceArgument)) {
+                if (decodeMysqlSingleQuotedLiteral(sourceArgument).getBytes(StandardCharsets.UTF_8).length
+                        > DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES) {
+                    return sql;
+                }
                 convertedArguments.add(variableName);
-                clobArguments.add(new ClobCallArgument(variableName, decodeMysqlSingleQuotedLiteral(argument.strip())));
+                clobArguments.add(new ClobCallArgument(variableName, decodeMysqlSingleQuotedLiteral(sourceArgument)));
             } else {
                 convertedArguments.add(argument.strip());
             }
@@ -9033,6 +9220,70 @@ class SqlScriptMigrator {
                 .append(");\n");
         block.append("END;");
         return block.toString();
+    }
+
+    private void updateProcedureSignature(String sql, String schema, Map<ProcedureKey, ProcedureSignature> signatures) {
+        ProcedureReference dropped = procedureReferenceFromDropProcedure(sql, schema);
+        if (dropped != null) {
+            signatures.put(dropped.key(), new ProcedureSignature(-1, Set.of()));
+        }
+        ProcedureReference created = procedureReferenceFromCreateProcedure(sql, schema);
+        if (created == null) {
+            return;
+        }
+        String header = removeSqlCommentsPreservingLineBreaks(sql);
+        int begin = firstProcedureBegin(header);
+        int procedureIndex = keywordIndex(header, "PROCEDURE");
+        int open = procedureIndex < 0 ? -1 : header.indexOf('(', procedureIndex);
+        int close = open < 0 ? -1 : findMatchingParen(header, open);
+        ProcedureSignature signature = new ProcedureSignature(-1, Set.of());
+        if (begin >= 0 && close > open && close < begin) {
+            List<String> parameters = splitTopLevelComma(header.substring(open + 1, close));
+            Set<Integer> indexes = new LinkedHashSet<>();
+            boolean valid = true;
+            for (int index = 0; index < parameters.size(); index++) {
+                ProcedureParameter parameter = parseProcedureParameterWithMode(parameters.get(index));
+                if (parameter == null) {
+                    valid = false;
+                    break;
+                }
+                if ("IN".equals(parameter.mode())
+                        && parameter.type().matches("(?i)JSON|CLOB|TEXT|LONGTEXT|MEDIUMTEXT")) {
+                    indexes.add(index);
+                }
+            }
+            if (valid) {
+                signature = new ProcedureSignature(parameters.size(), Set.copyOf(indexes));
+            }
+        }
+        signatures.put(created.key(), signature);
+    }
+
+    private ScriptStatementConversion applyLongCallArguments(
+            ScriptStatementConversion conversion, String schema, Map<ProcedureKey, ProcedureSignature> signatures
+    ) {
+        if (conversion.manualReviewRequired()) {
+            return conversion;
+        }
+        ProcedureReference call = procedureReferenceFromCall(conversion.originalSql(), schema);
+        if (call == null) {
+            return conversion;
+        }
+        ProcedureSignature signature = signatures.get(call.key());
+        Set<Integer> indexes = signature == null
+                ? DM_CALL_CLOB_ARGUMENT_INDEXES.get(call.key().name()) : signature.clobIndexes();
+        String rewritten = convertLongClobCallArgumentsToBlock(conversion.outputSql(), indexes,
+                signature == null ? -1 : signature.parameterCount(), conversion.originalSql());
+        if (rewritten.equals(conversion.outputSql())) {
+            return conversion;
+        }
+        List<String> rules = new ArrayList<>(conversion.appliedRules());
+        rules.add(DM_LONG_CLOB_CALL_ARGUMENT_BLOCK_RULE);
+        return new ScriptStatementConversion(conversion.originalSql(), rewritten, rewritten, true, false, "",
+                rules, conversion.additionalOutputStatements());
+    }
+
+    private record ProcedureSignature(int parameterCount, Set<Integer> clobIndexes) {
     }
 
     private boolean isLongSingleQuotedLiteral(String value) {
@@ -10092,7 +10343,16 @@ class SqlScriptMigrator {
         return cursor == 0 ? sql : converted.append(sql.substring(cursor)).toString();
     }
 
+    private String convertMysqlRollbackCleanupHandler(String sql) {
+        return containsIgnoreCase(sql, "DROP") && containsIgnoreCase(sql, "TEMPORARY")
+                ? convertMysqlSqlExceptionExitHandler(sql, true) : sql;
+    }
+
     private String convertMysqlSqlExceptionExitHandler(String sql) {
+        return convertMysqlSqlExceptionExitHandler(sql, false);
+    }
+
+    private String convertMysqlSqlExceptionExitHandler(String sql, boolean allowTemporaryCleanup) {
         if (!isCreateProcedureStatement(sql)
                 || !containsIgnoreCase(sql, "DECLARE")
                 || !containsIgnoreCase(sql, "EXIT")
@@ -10123,6 +10383,15 @@ class SqlScriptMigrator {
         boolean rollbackAndRethrow = rollbackEnd >= 0 && rollbackEnd < handlerBody.length()
                 && handlerBody.charAt(rollbackEnd) == ';'
                 && skipWhitespaceAndComments(handlerBody, rollbackEnd + 1) == handlerBody.length();
+        String withoutHandler = sql.substring(0, handlerStart) + sql.substring(handlerEnd);
+        if (allowTemporaryCleanup && !rollbackAndRethrow && rollbackEnd >= 0
+                && rollbackEnd < handlerBody.length() && handlerBody.charAt(rollbackEnd) == ';') {
+            String cleanup = verifiedRollbackTemporaryCleanup(withoutHandler, handlerBody, rollbackEnd + 1);
+            if (cleanup != null) {
+                handlerBody = cleanup;
+                rollbackAndRethrow = true;
+            }
+        }
         for (String unsupported : List.of(
                 "DECLARE",
                 "HANDLER",
@@ -10144,7 +10413,6 @@ class SqlScriptMigrator {
             }
         }
 
-        String withoutHandler = sql.substring(0, handlerStart) + sql.substring(handlerEnd);
         if (containsKeywordOutsideIgnoredText(withoutHandler, "HANDLER")
                 || containsKeywordOutsideIgnoredText(withoutHandler, "RESIGNAL")
                 || containsKeywordOutsideIgnoredText(withoutHandler, "EXCEPTION")) {
@@ -10175,6 +10443,65 @@ class SqlScriptMigrator {
         return withoutHandler.substring(0, procedureEndIndex)
                 + exceptionClause
                 + withoutHandler.substring(procedureEndIndex);
+    }
+
+    private String verifiedRollbackTemporaryCleanup(String procedure, String body, int afterRollback) {
+        List<TemporaryTableEvent> definitions = procedureTemporaryTableEvents(procedure).stream()
+                .filter(TemporaryTableEvent::created).toList();
+        StringBuilder rewritten = new StringBuilder(body.substring(0, afterRollback));
+        int cursor = afterRollback;
+        boolean cleaned = false;
+        while (skipWhitespaceAndComments(body, cursor) < body.length()) {
+            int start = skipWhitespaceAndComments(body, cursor);
+            int end = findStatementTerminator(body, start);
+            if (end >= body.length()) {
+                return null;
+            }
+            String statement = removeSqlCommentsPreservingLineBreaks(body.substring(start, end));
+            Matcher drop = Pattern.compile("(?is)^DROP\\s+TEMPORARY\\s+TABLE\\s+IF\\s+EXISTS\\s+"
+                    + "(?<table>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*$").matcher(statement);
+            if (!drop.matches()) {
+                return null;
+            }
+            String table = drop.group("table");
+            List<TemporaryTableEvent> owned = definitions.stream()
+                    .filter(event -> event.tableKey().equals(normalizedTableKey(table))).toList();
+            if (owned.size() != 1 || !isDirectProcedureBodyStatement(procedure, owned.get(0).position())) {
+                return null;
+            }
+            // GTT placeholders are emitted before compilation, so cleanup also works
+            // when validation raises an exception before the first CREATE is reached.
+            rewritten.append(body, cursor, start).append("DELETE FROM ").append(table);
+            rewritten.append(extractSqlComments(body.substring(start, end))).append(';');
+            cursor = end + 1;
+            cleaned = true;
+        }
+        return cleaned ? rewritten.append(body.substring(cursor)).toString() : null;
+    }
+
+    private String extractSqlComments(String sql) {
+        StringBuilder comments = new StringBuilder();
+        int index = 0;
+        while (index < sql.length()) {
+            if (startsBlockComment(sql, index)) {
+                int end = skipUntilBlockCommentEnd(sql, index);
+                comments.append(' ').append(sql, index, end);
+                index = end;
+            } else if (startsLineComment(sql, index)) {
+                int end = skipUntilLineEnd(sql, index);
+                comments.append('\n').append(sql, index, end).append('\n');
+                index = end;
+            } else if (sql.charAt(index) == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (sql.charAt(index) == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (sql.charAt(index) == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else {
+                index++;
+            }
+        }
+        return comments.toString();
     }
 
     private boolean isOuterProcedureHandlerDeclaration(String sql, int handlerStart) {
@@ -15010,11 +15337,10 @@ class SqlScriptMigrator {
         if (!tableMatcher.find() || !isProcedureTemporaryTableName(tableMatcher.group("table"))) {
             return "";
         }
-        String withoutInlineKeys = removeMysqlCreateTableInlineKeyDefinitions(createTable);
+        String withoutInlineKeys = normalizeTemporaryUniqueConstraints(createTable);
         String converted = converter.convert(withoutInlineKeys).convertedSql().strip();
         converted = normalizeMysqlDynamicDdlForDameng(converted);
         converted = removeMysqlCreateTableInlineKeyDefinitions(converted);
-        converted = removeDmLocalTemporaryTablePrimaryKey(converted);
         converted = normalizeProcedureDynamicDdlSpacing(converted).strip();
         if (converted.endsWith(";")) {
             converted = converted.substring(0, converted.length() - 1).stripTrailing();
@@ -15031,6 +15357,34 @@ class SqlScriptMigrator {
                 + convertedTable.group("table").strip()
                 + converted.substring(convertedTable.end())
                 + " ON COMMIT PRESERVE ROWS";
+    }
+
+    private String normalizeTemporaryUniqueConstraints(String ddl) {
+        int open = findTopLevelChar(ddl, '(', 0);
+        int close = open < 0 ? -1 : findMatchingParen(ddl, open);
+        if (close <= open) {
+            return ddl;
+        }
+        List<String> definitions = new ArrayList<>();
+        for (String part : splitTopLevelComma(ddl.substring(open + 1, close))) {
+            String definition = part.strip();
+            String keyDefinition = definition.replaceFirst("(?is)^CONSTRAINT\\s+(?:"
+                    + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+", "");
+            List<String> columns = temporaryTableUniqueKeyColumns(keyDefinition);
+            if (!columns.isEmpty()) {
+                int keyOpen = findTopLevelChar(keyDefinition, '(', 0);
+                int keyClose = findMatchingParen(keyDefinition, keyOpen);
+                if (splitTopLevelComma(keyDefinition.substring(keyOpen + 1, keyClose)).stream()
+                        .allMatch(column -> isSimpleIdentifier(column.strip()
+                                .replaceFirst("(?is)\\s+(ASC|DESC)$", "")))) {
+                    definition = "UNIQUE (" + columns.stream().map(this::dmSimpleIdentifier)
+                            .collect(Collectors.joining(", ")) + ")";
+                }
+            }
+            definitions.add(definition);
+        }
+        return removeMysqlCreateTableInlineKeyDefinitions(ddl.substring(0, open + 1)
+                + String.join(", ", definitions) + ddl.substring(close));
     }
 
     private ProcedureStatement convertTemporaryAlterTableAddColumnToNoop(String ddl) {
@@ -15467,13 +15821,18 @@ class SqlScriptMigrator {
             suffix = " AS " + suffix.stripLeading();
         }
         String candidate = "CREATE TABLE " + placeholder + suffix;
+        boolean identityTable = containsKeywordOutsideIgnoredText(candidate, "AUTO_INCREMENT")
+                || containsKeywordOutsideIgnoredText(candidate, "IDENTITY");
+        candidate = normalizeTemporaryUniqueConstraints(candidate);
         String converted = converter.convert(candidate).convertedSql().strip();
         converted = Pattern.compile("(?i)\\b" + Pattern.quote(placeholder) + "\\b")
                 .matcher(converted)
                 .replaceFirst(Matcher.quoteReplacement(table));
         converted = normalizeMysqlDynamicDdlForDameng(converted);
         converted = removeMysqlCreateTableInlineKeyDefinitions(converted);
-        converted = removeDmLocalTemporaryTablePrimaryKey(converted);
+        if (identityTable) {
+            converted = removeDmLocalTemporaryTablePrimaryKey(converted);
+        }
         converted = normalizeProcedureDynamicDdlSpacing(converted);
         ProcedureStatement definition = convertTemporaryCreateTableDefinitionToDml(converted);
         if (definition != null) {
@@ -18709,7 +19068,8 @@ class SqlScriptMigrator {
 
     private record ScriptSchemaState(
             LinkedHashMap<String, LinkedHashSet<String>> tableColumns,
-            LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumns
+            LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumns,
+            LinkedHashMap<ProcedureKey, ProcedureSignature> procedureSignatures
     ) {
     }
 
