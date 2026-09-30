@@ -9891,6 +9891,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             );
         }
 
+        if (updateAssignments.stream().anyMatch(assignment ->
+                !assignment.requiredSourceColumn().isBlank()
+                        && insertColumns.stream().noneMatch(column ->
+                        column.name().key().equals(identifierKey(assignment.requiredSourceColumn()))))) {
+            return UpsertConversion.manual(sql, UNSAFE_UPSERT_UPDATE_ASSIGNMENT
+                    + ": update requires an incoming column missing from the INSERT column list.");
+        }
+
         String converted = valuesInsert != null
                 ? mergeSql(valuesInsert.toInsertValues(), updateAssignments, keyColumns)
                 : mergeSelectCursorSql(selectInsert, updateAssignments, keyColumns);
@@ -10642,6 +10650,29 @@ public class MySqlToDmSqlConverter implements SqlConverter {
 
         if (isNoOpUpsertAssignment(source, targetColumn, tableName)) {
             return new UpdateAssignment(targetColumn, targetColumn.text(), false, true);
+        }
+
+        FunctionCall greatest = readOnlyFunctionCall(source, "GREATEST");
+        if (greatest != null) {
+            List<TopLevelArgument> arguments = splitTopLevelArguments(greatest.body());
+            if (arguments.size() != 2) {
+                return null;
+            }
+            for (int oldIndex = 0; oldIndex < 2; oldIndex++) {
+                String oldValue = arguments.get(oldIndex).text().strip();
+                FunctionCall incoming = readOnlyFunctionCall(arguments.get(1 - oldIndex).text().strip(), "VALUES");
+                if (isNoOpUpsertAssignment(oldValue, targetColumn, tableName) && incoming != null) {
+                    IdentifierName column = readIdentifierName(incoming.body(), false);
+                    if (column != null && column.key().equals(targetColumn.key())) {
+                        String oldReference = "t." + dmIdentifier(targetColumn.text());
+                        String newReference = "s." + dmIdentifier(column.text());
+                        return new UpdateAssignment(targetColumn, "GREATEST("
+                                + (oldIndex == 0 ? oldReference : newReference) + ", "
+                                + (oldIndex == 0 ? newReference : oldReference) + ")", false, false, column.text());
+                    }
+                }
+            }
+            return null;
         }
 
         if (source.matches(
@@ -13231,8 +13262,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             IdentifierName column,
             String sourceExpression,
             boolean valuesReference,
-            boolean noOp
+            boolean noOp,
+            String requiredSourceColumn
     ) {
+        private UpdateAssignment(IdentifierName column, String sourceExpression, boolean valuesReference, boolean noOp) {
+            this(column, sourceExpression, valuesReference, noOp, valuesReference ? sourceExpression : "");
+        }
     }
 
     private record InsertValues(
