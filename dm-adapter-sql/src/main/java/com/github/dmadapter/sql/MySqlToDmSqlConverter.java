@@ -6457,7 +6457,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         String schema = schemaMatcher.group("value").trim();
         Matcher typeMatcher = METADATA_TABLE_TYPE_CONDITION.matcher(whereClause);
         if (!typeMatcher.find()) {
-            return GenericConversion.unchanged(sql);
+            if (!schemaMatcher.matches()) {
+                return GenericConversion.unchanged(sql);
+            }
+            // Without TABLE_TYPE, MySQL lists both tables and views. Match the whole
+            // predicate so unsupported filters are never discarded by this conversion.
+            String converted = "SELECT OBJECT_NAME AS TABLE_NAME FROM ALL_OBJECTS"
+                    + " WHERE OWNER = " + metadataOwnerExpression(schema)
+                    + " AND OBJECT_TYPE IN ('TABLE', 'VIEW')";
+            return new GenericConversion(converted, true);
         }
         String tableTypeLiteral = typeMatcher.group("value");
         String tableType = tableTypeLiteral.substring(1, tableTypeLiteral.length() - 1)

@@ -2800,6 +2800,61 @@ class MapperMigratorTest {
     }
 
     @Test
+    void tableNamesByDatabaseAreRewrittenWithoutChangingSourceOrParameterBinding() throws Exception {
+        String originalXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.MetadataMapper">
+                    <select id="selectTableNamesByDatabase" resultType="java.lang.String">
+                        SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = #{databaseName}
+                    </select>
+                    <select id="selectValue" resultType="int">SELECT 1</select>
+                </mapper>
+                """;
+        Path mapper = writeFile("src/main/resources/mapper/MetadataMapper.xml", originalXml);
+        ProjectScanResult scanResult = new ProjectScanResult(
+                true, true, true, false,
+                tempDir.resolve("pom.xml").toString(),
+                List.of(new MapperXmlFile(mapper.toString(), "mapper/MetadataMapper.xml")),
+                List.of()
+        );
+
+        MapperMigrationResult result = new MapperMigrator().migrate(
+                scanResult,
+                AdapterContext.builder(tempDir).dryRun(false).build(),
+                new MySqlToDmSqlConverter()
+        );
+
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/MetadataMapper.xml");
+        assertThat(Files.readString(mapper)).isEqualTo(originalXml);
+        assertThat(Files.readString(output))
+                .contains("SELECT OBJECT_NAME AS TABLE_NAME FROM ALL_OBJECTS")
+                .contains("WHERE OWNER = UPPER(#{databaseName}) AND OBJECT_TYPE IN ('TABLE', 'VIEW')")
+                .doesNotContain("information_schema");
+        assertThat(result.automaticConversions()).hasSize(1);
+        assertThat(result.automaticConversions().get(0).appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+        assertThat(result.manualReviewItems()).isEmpty();
+
+        Configuration configuration = new Configuration();
+        try (var input = Files.newInputStream(output)) {
+            new XMLMapperBuilder(input, configuration, output.toString(), configuration.getSqlFragments()).parse();
+        }
+        var statement = configuration.getMappedStatement("com.example.MetadataMapper.selectTableNamesByDatabase");
+        var boundSql = statement.getBoundSql(Map.of("databaseName", "tenant_alpha"));
+        assertThat(boundSql.getSql()).isEqualTo(
+                "SELECT OBJECT_NAME AS TABLE_NAME FROM ALL_OBJECTS"
+                        + " WHERE OWNER = UPPER(?) AND OBJECT_TYPE IN ('TABLE', 'VIEW')"
+        );
+        assertThat(boundSql.getParameterMappings()).singleElement()
+                .satisfies(parameter -> assertThat(parameter.getProperty()).isEqualTo("databaseName"));
+        assertThat(statement.getResultMaps().get(0).getType()).isEqualTo(String.class);
+        assertThat(configuration.getMappedStatement("com.example.MetadataMapper.selectValue")
+                .getBoundSql(null).getSql()).isEqualTo("SELECT 1");
+    }
+
+    @Test
     void tableExistenceMetadataQueryIsRewrittenWithoutManualReview() throws Exception {
         Path mapper = writeMapper("src/main/resources/mapper/NoticeMapper.xml", """
                 select 1 from information_schema.tables
