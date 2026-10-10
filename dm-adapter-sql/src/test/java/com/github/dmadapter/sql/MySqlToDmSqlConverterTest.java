@@ -4540,6 +4540,68 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void convertsMysqlTableNamesByDatabaseIncludingViews() {
+        SqlConversionResult result = converter.convert(
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = #{databaseName}"
+        );
+
+        assertThat(result.changed()).isTrue();
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).isEqualTo(
+                "SELECT OBJECT_NAME AS TABLE_NAME FROM ALL_OBJECTS"
+                        + " WHERE OWNER = UPPER(#{databaseName}) AND OBJECT_TYPE IN ('TABLE', 'VIEW')"
+        );
+        assertThat(result.appliedRules())
+                .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+    }
+
+    @Test
+    void convertsMysqlTableNamesForRuntimeSchemaExpressions() {
+        Map<String, String> schemaExpressions = Map.of(
+                "#{schemaName,jdbcType=VARCHAR}", "UPPER(#{schemaName,jdbcType=VARCHAR})",
+                "?", "UPPER(?)",
+                "'tenant_alpha'", "UPPER('tenant_alpha')",
+                "DATABASE()", "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)",
+                "(select database())", "SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)"
+        );
+        schemaExpressions.forEach((source, target) -> {
+            SqlConversionResult result = converter.convert("""
+                    select table_name from INFORMATION_SCHEMA.tables
+                    where table_schema = %s;
+                    """.formatted(source));
+
+            assertThat(result.changed()).as(source).isTrue();
+            assertThat(result.manualReviewRequired()).as(source).isFalse();
+            assertThat(result.convertedSql()).as(source).isEqualTo(
+                    "SELECT OBJECT_NAME AS TABLE_NAME FROM ALL_OBJECTS"
+                            + " WHERE OWNER = " + target + " AND OBJECT_TYPE IN ('TABLE', 'VIEW')"
+            );
+            assertThat(result.appliedRules())
+                    .containsExactly(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_TABLES_RULE);
+        });
+    }
+
+    @Test
+    void leavesUnsupportedTableNameListConditionsForManualReview() {
+        for (String condition : List.of(
+                "TABLE_SCHEMA = #{databaseName} OR TABLE_SCHEMA = #{otherDatabase}",
+                "TABLE_SCHEMA = #{databaseName} AND TABLE_SCHEMA = #{otherDatabase}",
+                "TABLE_SCHEMA = #{databaseName} AND ENGINE = 'InnoDB'",
+                "TABLE_SCHEMA = #{databaseName} AND TABLE_TYPE = 'SYSTEM VIEW'",
+                "TABLE_SCHEMA = #{databaseName} ORDER BY TABLE_NAME",
+                "TABLE_SCHEMA = CONCAT(#{databaseName}, '_archive')"
+        )) {
+            String sql = "SELECT TABLE_NAME FROM information_schema.TABLES WHERE " + condition;
+            SqlConversionResult result = converter.convert(sql);
+
+            assertThat(result.changed()).as(condition).isFalse();
+            assertThat(result.convertedSql()).as(condition).isEqualTo(sql);
+            assertThat(result.manualReviewRequired()).as(condition).isTrue();
+            assertThat(result.appliedRules()).isEmpty();
+        }
+    }
+
+    @Test
     void convertsMysqlInformationSchemaBaseTableAndViewLists() {
         SqlConversionResult baseTableResult = converter.convert("""
                 SELECT TABLE_NAME
