@@ -10466,7 +10466,9 @@ class SqlScriptMigrator {
             String table = drop.group("table");
             List<TemporaryTableEvent> owned = definitions.stream()
                     .filter(event -> event.tableKey().equals(normalizedTableKey(table))).toList();
-            if (owned.size() != 1 || !isDirectProcedureBodyStatement(procedure, owned.get(0).position())) {
+            boolean outerDefinition = owned.size() == 1
+                    && isDirectProcedureBodyStatement(procedure, owned.get(0).position());
+            if (!outerDefinition && !(owned.isEmpty() && ownsResetSelectTemporaryTable(procedure, table))) {
                 return null;
             }
             // GTT placeholders are emitted before compilation, so cleanup also works
@@ -10477,6 +10479,96 @@ class SqlScriptMigrator {
             cleaned = true;
         }
         return cleaned ? rewritten.append(body.substring(cursor)).toString() : null;
+    }
+
+    private boolean ownsResetSelectTemporaryTable(String procedure, String table) {
+        // A conditional CTAS is safe only when its one definition can produce a
+        // compile-time GTT and each execution explicitly resets that same table.
+        // Do not infer ownership from a tmp_ name, quoted SQL, or dynamic DDL.
+        if (!unquoteIdentifier(table).matches("[A-Za-z_][A-Za-z0-9_$]*")
+                || containsKeywordOutsideIgnoredText(procedure, "PREPARE")
+                || containsKeywordOutsideIgnoredText(procedure, "EXECUTE")
+                || containsKeywordOutsideIgnoredText(procedure, "RENAME")) {
+            return false;
+        }
+        Pattern tableDdl = Pattern.compile(
+                "(?is)^(?<operation>CREATE|DROP|ALTER)\\s+(?<temporary>TEMPORARY\\s+)?TABLE\\s+"
+                        + "(?<guard>IF\\s+(?:NOT\\s+)?EXISTS\\s+)?"
+                        + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")(?<suffix>.*)$"
+        );
+        boolean created = false;
+        int resetEnd = -1;
+        int index = firstProcedureBegin(procedure);
+        while (index >= 0 && index < procedure.length()) {
+            char current = procedure.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(procedure, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(procedure, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(procedure, index);
+            } else if (startsLineComment(procedure, index)) {
+                index = skipUntilLineEnd(procedure, index);
+            } else if (startsBlockComment(procedure, index)) {
+                index = skipUntilBlockCommentEnd(procedure, index);
+            } else if (startsKeyword(procedure, index, "CREATE")
+                    || startsKeyword(procedure, index, "DROP")
+                    || startsKeyword(procedure, index, "ALTER")) {
+                int end = findStatementTerminator(procedure, index);
+                String originalDdl = procedure.substring(index, end);
+                String ddl = removeSqlCommentsPreservingLineBreaks(originalDdl);
+                Matcher declaration = tableDdl.matcher(ddl.strip());
+                if (declaration.matches()
+                        && normalizedTableKey(declaration.group("table")).equals(normalizedTableKey(table))) {
+                    if (end >= procedure.length() || declaration.group("temporary") == null
+                            || !isSimpleIdentifier(declaration.group("table"))
+                            // Later DDL converters do not support interleaved comments.
+                            || !originalDdl.equals(ddl)) {
+                        return false;
+                    }
+                    String operation = declaration.group("operation");
+                    String suffix = declaration.group("suffix").strip();
+                    if ("DROP".equalsIgnoreCase(operation)) {
+                        if (declaration.group("guard") == null
+                                || !declaration.group("guard").strip().matches("(?is)IF\\s+EXISTS")
+                                || !suffix.isBlank()) {
+                            return false;
+                        }
+                        resetEnd = end + 1;
+                    } else if ("CREATE".equalsIgnoreCase(operation)) {
+                        if (created || declaration.group("guard") != null || resetEnd < 0
+                                || skipWhitespaceAndComments(procedure, resetEnd) != index
+                                || !hasCompleteTemporarySelectProjection(suffix)) {
+                            return false;
+                        }
+                        created = true;
+                    } else {
+                        return false;
+                    }
+                }
+                index = end < procedure.length() ? end + 1 : end;
+            } else {
+                index++;
+            }
+        }
+        return created;
+    }
+
+    private boolean hasCompleteTemporarySelectProjection(String suffix) {
+        int selectStart = startsKeyword(suffix, 0, "AS")
+                ? skipWhitespace(suffix, "AS".length()) : 0;
+        if (!startsKeyword(suffix, selectStart, "SELECT")) {
+            return false;
+        }
+        String selectTail = suffix.substring(selectStart + "SELECT".length());
+        int fromIndex = topLevelKeywordIndex(selectTail, "FROM");
+        if (fromIndex < 0 || topLevelKeywordIndex(selectTail, "INTO") >= 0) {
+            return false;
+        }
+        List<String> columns = selectListColumns(selectTail.substring(0, fromIndex));
+        return !columns.isEmpty()
+                && columns.stream().allMatch(column -> column.matches("[A-Za-z_][A-Za-z0-9_$]*"))
+                && normalizedColumnSet(columns).size() == columns.size();
     }
 
     private String extractSqlComments(String sql) {
@@ -15778,8 +15870,17 @@ class SqlScriptMigrator {
                     index++;
                     continue;
                 }
-                converted.append("NULL /* DM_ADAPTER: local temporary tables start empty and are released "
-                        + "when the routine exits */");
+                List<String> tables = splitTopLevelComma(matcher.group("tables")).stream()
+                        .map(String::strip).toList();
+                if (tables.size() == 1 && ownsResetSelectTemporaryTable(sql, tables.get(0))) {
+                    // These CTAS tables use ON COMMIT PRESERVE ROWS placeholders.
+                    // Keep successful-path cleanup as well as exception cleanup.
+                    converted.append("DELETE FROM ").append(tables.get(0));
+                    converted.append(extractSqlComments(ddl));
+                } else {
+                    converted.append("NULL /* DM_ADAPTER: local temporary tables start empty and are released "
+                            + "when the routine exits */");
+                }
                 index = end;
                 changed = true;
             } else {

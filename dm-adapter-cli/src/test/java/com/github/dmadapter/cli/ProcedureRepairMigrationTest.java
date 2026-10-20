@@ -245,6 +245,190 @@ class ProcedureRepairMigrationTest {
     }
 
     @Test
+    void convertsRollbackCleanupOfConditionallyResetSelectTemporaryTable() throws Exception {
+        var report = migrate(conditionalSelectCleanupProcedure("tmp_candidates"));
+
+        assertThat(report.manualReviewItems()).isEmpty();
+        String sql = output();
+        assertThat(sql).contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_candidates",
+                        "ON COMMIT PRESERVE ROWS", "IF v_count > 0 THEN",
+                        "INSERT INTO tmp_candidates (tenant_id, old_perid, match_count, skip_flag) SELECT",
+                        "COUNT(DISTINCT s.target_id) AS match_count",
+                        "MAX(CASE WHEN s.enabled = '0' THEN 1 ELSE 0 END) AS skip_flag",
+                        "WHERE s.tenant_id = 7", "GROUP BY s.tenant_id, s.perid",
+                        "INSERT INTO target_grants (tenant_id, perid)",
+                        "WHERE match_count = 1 AND skip_flag = 0",
+                        "CALL refresh_grants(1)", "-- clean only this session after rollback")
+                .doesNotContain("DECLARE EXIT HANDLER", "RESIGNAL", "CREATE TEMPORARY TABLE",
+                        "DROP TEMPORARY TABLE");
+        assertThat(sql.indexOf("CREATE GLOBAL TEMPORARY TABLE"))
+                .isLessThan(sql.indexOf("CREATE OR REPLACE PROCEDURE"));
+        assertThat(sql.indexOf("IF v_count > 0 THEN"))
+                .isLessThan(sql.indexOf("INSERT INTO tmp_candidates"));
+        String handler = sql.substring(sql.lastIndexOf("EXCEPTION"));
+        assertThat(handler.indexOf("ROLLBACK;")).isGreaterThanOrEqualTo(0)
+                .isLessThan(handler.indexOf("DELETE FROM tmp_candidates"));
+        assertThat(handler.indexOf("DELETE FROM tmp_candidates")).isLessThan(handler.indexOf("RAISE;"));
+        assertThat(report.files()).flatExtracting(file -> file.appliedRules())
+                .contains(SqlScriptMigrator.MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE);
+    }
+
+    @Test
+    void convertsConditionalSelectCleanupWithoutRelyingOnTemporaryNamePrefix() throws Exception {
+        var report = migrate(conditionalSelectCleanupProcedure("work_candidates"));
+
+        assertThat(report.manualReviewItems()).isEmpty();
+        assertThat(output()).contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS work_candidates",
+                        "INSERT INTO work_candidates",
+                        "DELETE FROM work_candidates",
+                        "EXCEPTION", "RAISE;", "CALL refresh_grants(1)")
+                .doesNotContain("DECLARE EXIT HANDLER", "RESIGNAL", "CREATE TEMPORARY TABLE");
+        String successfulPath = output().substring(0, output().lastIndexOf("EXCEPTION"));
+        assertThat(successfulPath.lastIndexOf("DELETE FROM work_candidates"))
+                .isGreaterThan(successfulPath.lastIndexOf("COMMIT;"));
+    }
+
+    @Test
+    void convertsQuotedSelectTemporaryCleanupAndPreservesLiteralHandlerText() throws Exception {
+        String original = conditionalSelectCleanupProcedure("`tmp_candidates`")
+                .replace("DECLARE v_count INT DEFAULT 0;", """
+                        DECLARE v_count INT DEFAULT 0;
+                            DECLARE v_note VARCHAR(200);
+                        """.stripTrailing())
+                .replace("SELECT COUNT(1) INTO v_count", """
+                        SET v_note = 'DROP TEMPORARY TABLE IF EXISTS unknown_table; RESIGNAL;';
+                            SELECT COUNT(1) INTO v_count""");
+        var report = migrate(original);
+
+        assertThat(report.manualReviewItems()).isEmpty();
+        assertThat(output()).contains("CREATE GLOBAL TEMPORARY TABLE IF NOT EXISTS tmp_candidates",
+                        "DELETE FROM `tmp_candidates`", "WHEN OTHERS THEN", "RAISE;",
+                        "'DROP TEMPORARY TABLE IF EXISTS unknown_table; RESIGNAL;'")
+                .doesNotContain("DECLARE EXIT HANDLER");
+    }
+
+    @Test
+    void keepsUnprovenSelectTemporaryCleanupAndDependentCallForReview() throws Exception {
+        String original = conditionalSelectCleanupProcedure("tmp_candidates");
+        String reset = "DROP TEMPORARY TABLE IF EXISTS tmp_candidates;\n        -- reset before creating the snapshot";
+        String create = "CREATE TEMPORARY TABLE tmp_candidates AS";
+        List<String> unsupported = List.of(
+                original.replace(reset, "-- no reset"),
+                original.replace(reset, "DROP TABLE IF EXISTS tmp_candidates;"),
+                original.replace(reset, "IF p_apply = 1 THEN DROP TEMPORARY TABLE IF EXISTS tmp_candidates; END IF;"),
+                original.replace(create, "CREATE TABLE tmp_candidates AS"),
+                original.replace(create, "CREATE TEMPORARY TABLE IF NOT EXISTS tmp_candidates AS"),
+                original.replace("s.tenant_id, s.perid AS old_perid,", "s.*,"),
+                original.replace("AS old_perid", "AS tenant_id"),
+                original.replace(create, "CREATE TEMPORARY TABLE tmp_candidates(id INT);\n        " + create),
+                original.replace("COMMIT;", "CREATE TEMPORARY TABLE tmp_candidates AS SELECT id FROM source_rows;\n        COMMIT;"),
+                original.replace("COMMIT;", "ALTER TABLE tmp_candidates ADD extra_col INT;\n        COMMIT;"),
+                original.replace("FROM source_rows s", "INTO @snapshot FROM source_rows s"),
+                original.replace("COMMIT;", "PREPARE stmt FROM 'SELECT 1';\n        COMMIT;"),
+                original.replace("BEGIN\n    DECLARE", "BEGIN\n    BEGIN\n    DECLARE")
+                        .replace("END$$", "END;\nEND$$"),
+                original.replace("DROP /* cleanup */ TEMPORARY TABLE IF EXISTS tmp_candidates;",
+                        "DROP TEMPORARY TABLE IF EXISTS unknown_table;")
+        );
+        for (int i = 0; i < unsupported.size(); i++) {
+            var report = migrate(unsupported.get(i));
+            assertThat(report.manualReviewItems()).as("unsupported cleanup case %s", i).hasSize(2);
+            assertThat(report.manualReviewItems()).anySatisfy(item ->
+                    assertThat(item.reason()).contains("依赖需要人工确认的存储过程", "refresh_grants"));
+            assertThat(output()).contains("DECLARE EXIT HANDLER", "RESIGNAL");
+        }
+    }
+
+    @Test
+    void doesNotTreatCommentedOrQuotedSelectDefinitionsAsCleanupOwnership() throws Exception {
+        for (String fakeDefinition : List.of(
+                "-- CREATE TEMPORARY TABLE tmp_candidates AS SELECT id FROM source_rows;",
+                "SET v_text = 'CREATE TEMPORARY TABLE tmp_candidates AS SELECT id FROM source_rows;';")) {
+            var report = migrate("""
+                    DELIMITER $$
+                    CREATE PROCEDURE refresh_grants()
+                    BEGIN
+                        DECLARE v_text VARCHAR(200);
+                        DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN
+                            ROLLBACK; DROP TEMPORARY TABLE IF EXISTS tmp_candidates; RESIGNAL;
+                        END;
+                        DROP TEMPORARY TABLE IF EXISTS tmp_candidates;
+                        %s
+                    END$$
+                    DELIMITER ;
+                    CALL refresh_grants();
+                    """.formatted(fakeDefinition));
+            assertThat(report.manualReviewItems()).hasSize(2);
+            assertThat(output()).contains("DECLARE EXIT HANDLER", "RESIGNAL");
+        }
+    }
+
+    @Test
+    void doesNotUseAnotherSchemasSelectTableAsCleanupOwnership() throws Exception {
+        for (String table : List.of("other_schema.tmp_candidates", "`other_schema`.`tmp_candidates`")) {
+            String original = conditionalSelectCleanupProcedure("tmp_candidates")
+                    .replace("CREATE TEMPORARY TABLE tmp_candidates AS", "CREATE TEMPORARY TABLE " + table + " AS");
+            var report = migrate(original);
+            assertThat(report.manualReviewItems()).isNotEmpty();
+            assertThat(output()).contains("DECLARE EXIT HANDLER", "RESIGNAL");
+        }
+    }
+
+    @Test
+    void keepsSelectCleanupForReviewWhenCommentedDdlCannotBeFullyConverted() throws Exception {
+        for (String keyword : List.of("CREATE", "DROP")) {
+            String original = conditionalSelectCleanupProcedure("tmp_candidates")
+                    .replace(keyword + " TEMPORARY TABLE", keyword + " /* keep this comment */ TEMPORARY TABLE");
+            var report = migrate(original);
+            assertThat(report.manualReviewItems()).as(keyword).hasSize(2);
+            assertThat(output()).contains("DECLARE EXIT HANDLER", "RESIGNAL", "/* keep this comment */");
+        }
+    }
+
+    private String conditionalSelectCleanupProcedure(String table) {
+        return """
+                DELIMITER $$
+                CREATE PROCEDURE refresh_grants(IN p_apply INT)
+                BEGIN
+                    DECLARE v_count INT DEFAULT 0;
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        -- clean only this session after rollback
+                        ROLLBACK;
+                        DROP /* cleanup */ TEMPORARY TABLE IF EXISTS %1$s;
+                        RESIGNAL;
+                    END;
+                    IF p_apply IS NULL THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid apply argument';
+                    END IF;
+                    SELECT COUNT(1) INTO v_count FROM source_rows WHERE tenant_id = 7;
+                    IF v_count > 0 THEN
+                        START TRANSACTION;
+                        DROP TEMPORARY TABLE IF EXISTS %1$s;
+                        -- reset before creating the snapshot
+                        CREATE TEMPORARY TABLE %1$s AS
+                        SELECT s.tenant_id, s.perid AS old_perid,
+                               COUNT(DISTINCT s.target_id) AS match_count,
+                               MAX(CASE WHEN s.enabled = '0' THEN 1 ELSE 0 END) AS skip_flag
+                        FROM source_rows s
+                        WHERE s.tenant_id = 7
+                        GROUP BY s.tenant_id, s.perid;
+                        INSERT INTO target_grants (tenant_id, perid)
+                        SELECT tenant_id, old_perid FROM %1$s
+                        WHERE match_count = 1 AND skip_flag = 0;
+                        IF p_apply = 0 THEN
+                            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'rollback requested';
+                        END IF;
+                        COMMIT;
+                        DROP TEMPORARY TABLE IF EXISTS %1$s;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL refresh_grants(1);
+                """.formatted(table);
+    }
+
+    @Test
     void reconstructsUnicodeJsonQuotesBackslashesAndNewlinesExactly() throws Exception {
         String value = "中文😀\\path\\\"quote\" O'Brien\r\n\t${defaultRoutePath}".repeat(90);
         String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(Map.of("value", value));
