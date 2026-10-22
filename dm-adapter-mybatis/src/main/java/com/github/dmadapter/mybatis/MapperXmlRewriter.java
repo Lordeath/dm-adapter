@@ -521,6 +521,13 @@ public class MapperXmlRewriter {
             int occurrenceIndex = statementOccurrenceIndex(statementOccurrences, tagName, statementId);
             String statementKey = statementKey(namespace, statementId);
             String originalSql = statement.getTextContent();
+            String includedSql = hasElementChild(statement)
+                    ? staticIncludedSql(statement, document, namespace, new LinkedHashSet<>()) : null;
+            boolean expandedIncludes = includedSql != null
+                    && (containsMysqlOnDuplicateKeyUpdate(includedSql) || containsMysqlInsertIgnore(includedSql));
+            if (expandedIncludes) {
+                originalSql = includedSql;
+            }
             if (statementId.isBlank()) {
                 if (restricted) {
                     continue;
@@ -560,7 +567,7 @@ public class MapperXmlRewriter {
                         ""
                 ));
             }
-            if (hasElementChild(statement)) {
+            if (hasElementChild(statement) && !expandedIncludes) {
                 StatementBody statementBody = findStatementBody(sourceXml, tagName, statementId, occurrenceIndex);
                 DynamicBodyConversion dynamicBodyConversion =
                         convertDynamicXmlTextSegments(
@@ -646,6 +653,9 @@ public class MapperXmlRewriter {
             String tableName = extractInsertTableNameLenient(originalSql);
             String commentSafeSql = neutralizeMyBatisPlaceholdersInSqlLineComments(originalSql);
             List<String> staticRules = new ArrayList<>();
+            if (expandedIncludes) {
+                staticRules.add("MYBATIS_STATIC_INCLUDE_EXPANSION");
+            }
             if (!commentSafeSql.equals(originalSql)) {
                 staticRules.add(MYBATIS_SQL_LINE_COMMENT_PLACEHOLDER_NEUTRALIZED_RULE);
             }
@@ -1387,6 +1397,47 @@ public class MapperXmlRewriter {
             columns.add(column);
         }
         return List.copyOf(columns);
+    }
+
+    // Only resolve literal local fragments. MyBatis properties, databaseId selection,
+    // cross-mapper references and dynamic elements need their runtime context.
+    private String staticIncludedSql(Element element, Document document, String namespace, Set<String> visiting) {
+        StringBuilder sql = new StringBuilder();
+        NodeList children = element.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (child instanceof Element include) {
+                if (!"include".equals(include.getTagName()) || hasElementChild(include)
+                        || include.getAttributes().getLength() != 1) {
+                    return null;
+                }
+                String ref = include.getAttribute("refid");
+                if (ref.startsWith(namespace + ".")) {
+                    ref = ref.substring(namespace.length() + 1);
+                }
+                if (!ref.matches("[A-Za-z_][A-Za-z0-9_]*") || !visiting.add(ref)) {
+                    return null;
+                }
+                Element fragment = null;
+                for (Element candidate : statementElements(document)) {
+                    if ("sql".equals(candidate.getTagName()) && ref.equals(candidate.getAttribute("id"))) {
+                        if (fragment != null || candidate.hasAttribute("databaseId")) {
+                            return null;
+                        }
+                        fragment = candidate;
+                    }
+                }
+                String expanded = fragment == null ? null : staticIncludedSql(fragment, document, namespace, visiting);
+                visiting.remove(ref);
+                if (expanded == null || expanded.contains("${")) {
+                    return null;
+                }
+                sql.append(' ').append(expanded).append(' ');
+            } else if (child.getNodeType() == Node.TEXT_NODE || child.getNodeType() == Node.CDATA_SECTION_NODE) {
+                sql.append(child.getNodeValue());
+            }
+        }
+        return sql.toString();
     }
 
     private boolean hasElementChild(Element statement) {

@@ -2293,19 +2293,22 @@ class SqlScriptMigrator {
                     + ", chars=" + originalStatement.length());
         }
         ConversionTimings timings = new ConversionTimings();
-        ScriptStatementConversion conversion = convertStatement(
-                originalStatement,
-                scriptUserVariables,
-                scriptDynamicDdlState,
-                scriptTableColumns,
-                ignoredCreateColumns,
-                scriptIdentityColumns,
-                scriptProcedureRenames,
-                targetSchema,
-                outerJoinSourceUniqueKeys,
-                rewriteConfig,
-                timings
-        );
+        ScriptStatementConversion conversion = scriptDynamicDdlState.conditionalPreparedConversions.get(statementIndex);
+        if (conversion == null) {
+            conversion = convertStatement(
+                    originalStatement,
+                    scriptUserVariables,
+                    scriptDynamicDdlState,
+                    scriptTableColumns,
+                    ignoredCreateColumns,
+                    scriptIdentityColumns,
+                    scriptProcedureRenames,
+                    targetSchema,
+                    outerJoinSourceUniqueKeys,
+                    rewriteConfig,
+                    timings
+            );
+        }
         long elapsedMillis = elapsedMillis(startedAt);
         if (largeStatement || elapsedMillis >= 1_000L) {
             progress("Converted slow SQL script statement: file=" + relative
@@ -2362,6 +2365,7 @@ class SqlScriptMigrator {
         copy.indexDdlAssignments.putAll(source.indexDdlAssignments);
         copy.handledIndexExistenceVariables.addAll(source.handledIndexExistenceVariables);
         copy.combinedIndexDdlAssignments.addAll(source.combinedIndexDdlAssignments);
+        copy.conditionalPreparedConversions.putAll(source.conditionalPreparedConversions);
         return copy;
     }
 
@@ -4369,6 +4373,7 @@ class SqlScriptMigrator {
         if (statements == null || statements.isEmpty()) {
             return state;
         }
+        planConditionalPreparedStatements(statements, state);
         ScriptDynamicDdlState analysisState = new ScriptDynamicDdlState();
         List<ScriptIndexDdlAssignment> candidates = new ArrayList<>();
         LinkedHashMap<String, Integer> existenceVariableCounts = new LinkedHashMap<>();
@@ -4438,12 +4443,16 @@ class SqlScriptMigrator {
             int prepareIndex,
             ScriptIndexDdlAssignment assignment
     ) {
+        return hasCompletePreparedExecutionSequence(statements, prepareIndex, assignment.sqlVariable());
+    }
+
+    private boolean hasCompletePreparedExecutionSequence(List<String> statements, int prepareIndex, String variable) {
         if (prepareIndex < 0 || prepareIndex + 2 >= statements.size()) {
             return false;
         }
         Matcher prepare = Pattern.compile(
                 "(?is)^\\s*PREPARE\\s+(?<statement>[A-Za-z_][A-Za-z0-9_$]*)\\s+FROM\\s+@"
-                        + Pattern.quote(assignment.sqlVariable())
+                        + Pattern.quote(variable)
                         + "\\s*$"
         ).matcher(splitLeadingSqlPrefix(statements.get(prepareIndex)).body().strip());
         if (!prepare.matches()) {
@@ -4458,6 +4467,153 @@ class SqlScriptMigrator {
                 && Pattern.compile(
                 "(?is)^\\s*DEALLOCATE\\s+PREPARE\\s+" + Pattern.quote(statementName) + "\\s*$"
         ).matcher(deallocate).matches();
+    }
+
+    private void planConditionalPreparedStatements(List<String> statements, ScriptDynamicDdlState state) {
+        Pattern assignment = Pattern.compile("(?is)^SET\\s+@(?<variable>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*IF\\s*\\(");
+        for (int index = 0; index + 3 < statements.size(); index++) {
+            String body = splitLeadingSqlPrefix(statements.get(index)).body().strip();
+            Matcher set = assignment.matcher(body);
+            if (!set.find() || findMatchingParen(body, set.end() - 1) != body.length() - 1) {
+                continue;
+            }
+            String variable = set.group("variable");
+            if (!hasCompletePreparedExecutionSequence(statements, index + 1, variable)
+                    || conditionalPreparedVariableEscapes(statements, index + 4, variable)) {
+                continue;
+            }
+            List<String> arguments = splitTopLevelComma(body.substring(set.end(), body.length() - 1));
+            if (arguments.size() != 3) {
+                continue;
+            }
+            ConditionalPreparedGuard guard = conditionalPreparedGuard(arguments.get(0).strip());
+            String whenTrue = conditionalPreparedAction(arguments.get(1).strip());
+            String whenFalse = conditionalPreparedAction(arguments.get(2).strip());
+            if (guard == null || whenTrue == null || whenFalse == null) {
+                continue;
+            }
+            String block = "DECLARE\n    dm_adapter_guard_count BIGINT;\nBEGIN\n    "
+                    + guard.countQuery() + ";\n    IF dm_adapter_guard_count " + guard.comparison()
+                    + " THEN\n        " + whenTrue + "\n    ELSE\n        " + whenFalse + "\n    END IF;\nEND";
+            if (!manualReviewReason(block).isBlank() || !GeneratedSqlStaticInspector.manualReviewReason(block).isBlank()) {
+                continue;
+            }
+            for (int offset = 0; offset < 4; offset++) {
+                String original = statements.get(index + offset);
+                LeadingSqlPrefix prefix = splitLeadingSqlPrefix(original);
+                // The whole sequence is contiguous. Evaluate the guard once at EXECUTE,
+                // with no intervening SQL, and keep all four validation-plan entries.
+                ScriptStatementConversion conversion = offset == 2
+                        ? new ScriptStatementConversion(original, prefix.prefix() + block, prefix.prefix() + block,
+                                true, false, "", List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE))
+                        : dynamicDdlNoopConversion(original, prefix,
+                                "conditional prepared SQL is handled by its EXECUTE block");
+                state.conditionalPreparedConversions.put(index + offset + 1, conversion);
+            }
+            index += 3;
+        }
+    }
+
+    private boolean conditionalPreparedVariableEscapes(List<String> statements, int start, String variable) {
+        Pattern reassignment = Pattern.compile("(?is)^SET\\s+@" + Pattern.quote(variable)
+                + "\\s*(?::=|=)(?<value>.*)$");
+        for (int index = start; index < statements.size(); index++) {
+            String body = splitLeadingSqlPrefix(statements.get(index)).body().strip();
+            Matcher set = reassignment.matcher(body);
+            if (set.matches()) {
+                return referencesUserVariable(set.group("value"), variable);
+            }
+            if (referencesUserVariable(body, variable)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private ConditionalPreparedGuard conditionalPreparedGuard(String condition) {
+        String query;
+        String comparison;
+        Matcher exists = Pattern.compile("(?is)^(NOT\\s+)?EXISTS\\s*\\(").matcher(condition);
+        if (exists.find() && findMatchingParen(condition, exists.end() - 1) == condition.length() - 1) {
+            query = condition.substring(exists.end(), condition.length() - 1).strip();
+            if (!Pattern.compile("(?is)^SELECT\\s+1\\s+FROM\\b").matcher(query).find()) {
+                return null;
+            }
+            comparison = exists.group(1) == null ? "> 0" : "= 0";
+        } else {
+            int close = condition.startsWith("(") ? findMatchingParen(condition, 0) : -1;
+            if (close < 0 || !condition.substring(close + 1).matches("\\s*=\\s*0\\s*")) {
+                return null;
+            }
+            query = condition.substring(1, close).strip();
+            if (!Pattern.compile("(?is)^SELECT\\s+COUNT\\s*\\(\\s*\\*\\s*\\)\\s+FROM\\b").matcher(query).find()) {
+                return null;
+            }
+            comparison = "= 0";
+        }
+        // Preserve every predicate; restrict this rule to simple literal equality
+        // guards. Grouped, limited, volatile and multi-table queries stay manual.
+        String value = "(?:" + SQL_STRING_LITERAL_TOKEN + "|[-+]?\\d+|DATABASE\\s*\\(\\s*\\))";
+        String predicate = "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*=\\s*" + value;
+        Matcher select = Pattern.compile("(?is)^SELECT\\s+(?:1|COUNT\\s*\\(\\s*\\*\\s*\\))\\s+FROM\\s+"
+                + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+WHERE\\s+"
+                + "(?<where>" + predicate + "(?:\\s+AND\\s+" + predicate + ")*)\\s*$").matcher(query);
+        if (!select.matches() || containsIgnoreCase(query, "dm_adapter_guard_count")) {
+            return null;
+        }
+        String countQuery = "SELECT COUNT(*) INTO dm_adapter_guard_count FROM "
+                + select.group("table") + " WHERE " + select.group("where");
+        if (select.group("table").equalsIgnoreCase("information_schema.COLUMNS")) {
+            countQuery = replaceOutsideIgnoredText(countQuery, SCRIPT_METADATA_REPLACEMENTS);
+            countQuery = normalizeDamengMetadataIdentifierComparisons(countQuery);
+        } else if (containsIgnoreCase(select.group("table"), "information_schema")) {
+            return null;
+        }
+        countQuery = replaceOutsideIgnoredText(countQuery,
+                Pattern.compile("(?i)\\bDATABASE\\s*\\(\\s*\\)"), matcher -> DM_CURRENT_SCHEMA_EXPRESSION);
+        return new ConditionalPreparedGuard(countQuery, comparison);
+    }
+
+    private String conditionalPreparedAction(String expression) {
+        // Nested literals depend on the source SQL mode; never guess backslash decoding.
+        if (!expression.startsWith("'") || expression.indexOf('\\') >= 0
+                || skipSingleQuotedString(expression, 0) != expression.length()) {
+            return null;
+        }
+        String sql = singleQuotedSqlLiteralValue(expression).strip();
+        if (sql.matches("(?is)(?:SELECT\\s+1|DO\\s+0)")) {
+            return "NULL;";
+        }
+        Matcher call = Pattern.compile("(?is)^CALL\\s+" + SQL_OBJECT_IDENTIFIER_TOKEN
+                + "\\s*\\((?<args>.*)\\)$").matcher(sql);
+        if (call.matches()) {
+            if (!call.group("args").isBlank() && splitTopLevelComma(call.group("args")).stream()
+                    .anyMatch(arg -> scriptUserVariableLiteral(arg.strip()).isBlank())) {
+                return null;
+            }
+            return sql + ";";
+        }
+        String type = "(?:(?:VAR)?CHAR\\s*\\(\\s*\\d+\\s*\\)|(?:TINY|SMALL|BIG)?INT(?:EGER)?"
+                + "|DECIMAL\\s*\\(\\s*\\d+\\s*(?:,\\s*\\d+\\s*)?\\)|DATETIME|TIMESTAMP|DATE)";
+        String literal = "(?:" + SQL_STRING_LITERAL_TOKEN + "|[-+]?\\d+(?:\\.\\d+)?|NULL)";
+        Matcher add = Pattern.compile("(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN
+                + ")\\s+ADD\\s+(?:COLUMN\\s+)?(?<column>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+"
+                + type + "(?:\\s+(?:NOT\\s+NULL|NULL|DEFAULT\\s+" + literal + "))*"
+                + "(?:\\s+COMMENT\\s+(?<comment>" + SQL_STRING_LITERAL_TOKEN + "))?\\s*$").matcher(sql);
+        if (!add.matches() || !originalSqlSyntaxManualReviewReason(sql).isBlank()) {
+            return null;
+        }
+        String ddl = rewritePlainDdlVarcharLengths(normalizeMysqlDynamicDdlForDameng(sql)).sql();
+        String result = "EXECUTE IMMEDIATE " + sqlStringLiteral(ddl) + ";";
+        if (add.group("comment") != null) {
+            String comment = "COMMENT ON COLUMN " + add.group("table") + "." + add.group("column")
+                    + " IS " + add.group("comment");
+            result += "\n        EXECUTE IMMEDIATE " + sqlStringLiteral(comment) + ";";
+        }
+        return result;
+    }
+
+    private record ConditionalPreparedGuard(String countQuery, String comparison) {
     }
 
     private ScriptIndexExistenceCheck scriptIndexExistenceCheck(
@@ -10384,6 +10540,9 @@ class SqlScriptMigrator {
                 && handlerBody.charAt(rollbackEnd) == ';'
                 && skipWhitespaceAndComments(handlerBody, rollbackEnd + 1) == handlerBody.length();
         String withoutHandler = sql.substring(0, handlerStart) + sql.substring(handlerEnd);
+        boolean conditionalRollback = Pattern.compile(
+                "(?is)^\\s*IF\\s+[A-Za-z_][A-Za-z0-9_$]*\\s*=\\s*[01]\\s+THEN\\s+ROLLBACK\\s*;\\s*END\\s+IF\\s*;\\s*$")
+                .matcher(replaceIgnoredSqlWithSpaces(handlerBody)).matches();
         if (allowTemporaryCleanup && !rollbackAndRethrow && rollbackEnd >= 0
                 && rollbackEnd < handlerBody.length() && handlerBody.charAt(rollbackEnd) == ';') {
             String cleanup = verifiedRollbackTemporaryCleanup(withoutHandler, handlerBody, rollbackEnd + 1);
@@ -10408,7 +10567,8 @@ class SqlScriptMigrator {
                 "ROLLBACK"
         )) {
             if (containsKeywordOutsideIgnoredText(handlerBody, unsupported)
-                    && !(rollbackAndRethrow && "ROLLBACK".equals(unsupported))) {
+                    && !(rollbackAndRethrow && "ROLLBACK".equals(unsupported))
+                    && !(conditionalRollback && List.of("IF", "END", "ROLLBACK").contains(unsupported))) {
                 return sql;
             }
         }
@@ -10459,22 +10619,26 @@ class SqlScriptMigrator {
             }
             String statement = removeSqlCommentsPreservingLineBreaks(body.substring(start, end));
             Matcher drop = Pattern.compile("(?is)^DROP\\s+TEMPORARY\\s+TABLE\\s+IF\\s+EXISTS\\s+"
-                    + "(?<table>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*$").matcher(statement);
+                    + "(?<tables>(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?:\\s*,\\s*(?:"
+                    + SQL_SIMPLE_IDENTIFIER_TOKEN + "))*)\\s*$").matcher(statement);
             if (!drop.matches()) {
                 return null;
             }
-            String table = drop.group("table");
-            List<TemporaryTableEvent> owned = definitions.stream()
-                    .filter(event -> event.tableKey().equals(normalizedTableKey(table))).toList();
-            boolean outerDefinition = owned.size() == 1
-                    && isDirectProcedureBodyStatement(procedure, owned.get(0).position());
-            if (!outerDefinition && !(owned.isEmpty() && ownsResetSelectTemporaryTable(procedure, table))) {
-                return null;
+            rewritten.append(body, cursor, start);
+            for (String item : splitTopLevelComma(drop.group("tables"))) {
+                String table = item.strip();
+                List<TemporaryTableEvent> owned = definitions.stream()
+                        .filter(event -> event.tableKey().equals(normalizedTableKey(table))).toList();
+                boolean outerDefinition = owned.size() == 1
+                        && isDirectProcedureBodyStatement(procedure, owned.get(0).position());
+                if (!outerDefinition && !(owned.isEmpty() && ownsResetSelectTemporaryTable(procedure, table))) {
+                    return null;
+                }
+                // GTT placeholders are emitted before compilation, so cleanup also works
+                // when validation raises an exception before the first CREATE is reached.
+                rewritten.append("DELETE FROM ").append(table).append(';').append('\n');
             }
-            // GTT placeholders are emitted before compilation, so cleanup also works
-            // when validation raises an exception before the first CREATE is reached.
-            rewritten.append(body, cursor, start).append("DELETE FROM ").append(table);
-            rewritten.append(extractSqlComments(body.substring(start, end))).append(';');
+            rewritten.append(extractSqlComments(body.substring(start, end)));
             cursor = end + 1;
             cleaned = true;
         }
@@ -17441,6 +17605,10 @@ class SqlScriptMigrator {
         if (!subPartReason.isBlank()) {
             return subPartReason;
         }
+        String engineReason = mysqlEngineMetadataManualReviewReason(sql);
+        if (!engineReason.isBlank()) {
+            return engineReason;
+        }
         if (hasAmbiguousUpdateAndAssignment(sql)) {
             return ORIGINAL_SQL_AMBIGUOUS_UPDATE_AND_ASSIGNMENT_REASON;
         }
@@ -17458,6 +17626,35 @@ class SqlScriptMigrator {
         return "";
     }
 
+    private String mysqlEngineMetadataManualReviewReason(String sql) {
+        String searchable = replaceIgnoredSqlWithSpaces((sql == null ? "" : sql)
+                .replaceAll("(?i)[`\"](ENGINE|TABLES|information_schema)[`\"]", "$1"));
+        Pattern tables = Pattern.compile("(?i)\\b(?:FROM|JOIN)\\s+information_schema\\s*\\.\\s*TABLES\\b");
+        Pattern engine = Pattern.compile("(?i)\\bENGINE\\b");
+        Pattern context = Pattern.compile("(?i)\\b(SELECT|CREATE|ALTER)\\b");
+        for (String statement : searchable.split(";")) {
+            if (!tables.matcher(statement).find()) {
+                continue;
+            }
+            Matcher reference = engine.matcher(statement);
+            while (reference.find()) {
+                // An IF metadata guard can precede CREATE TABLE in the same
+                // procedural statement. Its ENGINE option is handled by DDL rules.
+                Matcher keyword = context.matcher(statement.substring(0, reference.start()));
+                String last = "";
+                while (keyword.find()) {
+                    last = keyword.group(1);
+                }
+                if ("SELECT".equalsIgnoreCase(last)) {
+                    return "MYSQL_INFORMATION_SCHEMA_TABLES_ENGINE_UNSUPPORTED: "
+                            + "information_schema.TABLES.ENGINE has no direct Dameng equivalent; "
+                            + "preserve the original guard until its storage/transaction capability check is adapted.";
+                }
+            }
+        }
+        return "";
+    }
+
     private String mysqlStatisticsSubPartManualReviewReason(String sql) {
         if (sql == null || sql.isBlank()
                 || !Pattern.compile(
@@ -17469,12 +17666,16 @@ class SqlScriptMigrator {
                 .replaceAll("(?i)`SUB_PART`", "SUB_PART")
                 .replaceAll("(?i)\"SUB_PART\"", "SUB_PART");
         String searchable = replaceIgnoredSqlWithSpaces(normalizedIdentifiers);
+        // COUNT(expr) observes only nullness. DISTINCT, arithmetic and other
+        // aggregates need the real prefix length, which the DM projection lacks.
+        searchable = searchable.replaceAll(
+                "(?i)\\bCOUNT\\s*\\(\\s*(?:[A-Za-z_][A-Za-z0-9_$]*\\s*\\.\\s*)?SUB_PART\\s*\\)", " ");
         Matcher matcher = Pattern.compile("(?i)\\bSUB_PART\\b").matcher(searchable);
         while (matcher.find()) {
             String tail = searchable.substring(matcher.end());
             if (!Pattern.compile("(?is)^\\s+IS\\s+(?:NOT\\s+)?NULL\\b").matcher(tail).find()) {
                 return "MYSQL_INFORMATION_SCHEMA_STATISTICS_SUB_PART_UNSUPPORTED: "
-                        + "dm-adapter only supports SUB_PART IS NULL/IS NOT NULL; "
+                        + "dm-adapter only supports SUB_PART IS NULL/IS NOT NULL and COUNT(SUB_PART); "
                         + "reading or comparing the concrete prefix length needs manual confirmation.";
             }
         }
@@ -19414,6 +19615,7 @@ class SqlScriptMigrator {
     }
 
     private static final class ScriptDynamicDdlState {
+        private final Map<Integer, ScriptStatementConversion> conditionalPreparedConversions = new LinkedHashMap<>();
         private final LinkedHashSet<String> currentSchemaVariables = new LinkedHashSet<>();
         private final LinkedHashSet<String> dynamicDdlVariables = new LinkedHashSet<>();
         private final LinkedHashSet<String> preparedDynamicDdlStatements = new LinkedHashSet<>();

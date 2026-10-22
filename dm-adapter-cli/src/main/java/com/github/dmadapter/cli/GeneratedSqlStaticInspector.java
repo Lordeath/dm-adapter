@@ -33,7 +33,7 @@ final class GeneratedSqlStaticInspector {
         if (SCRIPT_VARIABLE.matcher(searchable).find()) {
             return REASON_PREFIX + "生成的 SQL 仍包含脚本级 @变量。";
         }
-        if (ENGINE.matcher(searchable).find()) {
+        if (hasEngineTableOption(searchable)) {
             return REASON_PREFIX + "生成的 SQL 仍包含 ENGINE 表选项。";
         }
         if (USING_BTREE.matcher(searchable).find()) {
@@ -53,6 +53,31 @@ final class GeneratedSqlStaticInspector {
             return REASON_PREFIX + "生成的存储过程或匿名块没有以 END 结束。";
         }
         return "";
+    }
+
+    private static boolean hasEngineTableOption(String sql) {
+        var ddl = Pattern.compile("(?is)\\b(?:CREATE\\s+(?:GLOBAL\\s+)?(?:TEMPORARY\\s+)?TABLE|ALTER\\s+TABLE)\\b[^;]*")
+                .matcher(sql);
+        while (ddl.find()) {
+            String statement = ddl.group();
+            var engine = ENGINE.matcher(statement);
+            while (engine.find()) {
+                String prefix = statement.substring(0, engine.start());
+                int depth = 0;
+                for (int i = 0; i < prefix.length(); i++) {
+                    if (prefix.charAt(i) == '(') {
+                        depth++;
+                    }
+                    if (prefix.charAt(i) == ')') {
+                        depth--;
+                    }
+                }
+                if (depth == 0 && !Pattern.compile("(?i)\\bSELECT\\b").matcher(prefix).find()) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static boolean isRoutineOrAnonymousBlock(String upper) {

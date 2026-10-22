@@ -32,6 +32,8 @@ class ReportedSqlScriptCompatibilityTest {
         assertThat(converted.sql()).containsIgnoringCase("IF")
                 .containsIgnoringCase("ALTER TABLE").containsIgnoringCase("EXECUTE IMMEDIATE");
         assertThat(converted.sql()).doesNotContainIgnoringCase("information_schema");
+        assertThat(converted.sql()).contains("VARCHAR(64 CHAR)", "VARCHAR(200 CHAR)", "COMMENT ON COLUMN")
+                .containsPattern("(?is)IF\\s+\\w+\\s*>\\s*0\\s+THEN\\s+NULL;\\s+ELSE\\s+EXECUTE IMMEDIATE");
     }
 
     @Test
@@ -43,6 +45,8 @@ class ReportedSqlScriptCompatibilityTest {
                 "DICTIONARY_ID", "ITEM_CODE")
                 .containsIgnoringCase("IF").containsIgnoringCase("THEN")
                 .containsIgnoringCase("upsert_sample_item");
+        assertThat(converted.sql()).containsPattern(
+                "(?is)IF\\s+\\w+\\s*>\\s*0\\s+THEN\\s+NULL;\\s+ELSE\\s+CALL upsert_sample_item");
         assertThat(converted.report().files()).singleElement().satisfies(file -> {
             assertThat(file.systemScript()).isTrue();
             assertThat(file.schema()).isEqualTo("test-system");
@@ -58,6 +62,8 @@ class ReportedSqlScriptCompatibilityTest {
                 "revision", "recordState", "ACTIVE", "INACTIVE")
                 .containsIgnoringCase("IF").containsIgnoringCase("EXECUTE IMMEDIATE")
                 .doesNotContainIgnoringCase("information_schema");
+        assertThat(converted.sql()).contains("VARCHAR(36 CHAR)", "VARCHAR(16 CHAR)")
+                .containsPattern("(?is)IF\\s+\\w+\\s*=\\s*0\\s+THEN\\s+EXECUTE IMMEDIATE");
     }
 
     @Test
@@ -171,6 +177,66 @@ class ReportedSqlScriptCompatibilityTest {
         assertThat(report.files()).singleElement().satisfies(file ->
                 assertThat(file.sourceFile()).isEqualTo("(output-only) 001.sql"));
         assertThat(report.validationAttempted()).isFalse();
+    }
+
+    @Test
+    void leavesIncompleteOrInterleavedPreparedSequencesForManualReview() throws Exception {
+        String source = fixture("conditional-columns.sql");
+        for (String unsafe : List.of(
+                source.replace("DEALLOCATE PREPARE sample_ddl_stmt;", ""),
+                source + "SELECT @sample_ddl_sql;",
+                source.replace("EXECUTE sample_ddl_stmt;", "UPDATE accounts SET amount=0; EXECUTE sample_ddl_stmt;"),
+                source + source.substring(0, source.indexOf("PREPARE sample_ddl_stmt FROM")),
+                source.replace("PREPARE sample_ddl_stmt FROM", "PREPARE different_stmt FROM"))) {
+            assertThat(migrate(unsafe, "unsafe.sql").report().manualReviewItems()).isNotEmpty();
+        }
+    }
+
+    @Test
+    void countsQualifiedQuotedSubPartButRejectsValueDependentAggregates() throws Exception {
+        String query = "SELECT %s FROM information_schema.statistics s WHERE s.table_name='demo';";
+        assertFullyConverted(migrate(query.formatted("COUNT(s.`SUB_PART`)"), "count.sql"));
+        for (String expression : List.of("COUNT(DISTINCT sub_part)", "SUM(sub_part)", "COUNT(sub_part+1)")) {
+            assertThat(migrate(query.formatted(expression), "unsafe.sql").report().manualReviewItems())
+                    .extracting(SqlScriptManualReviewItem::reason)
+                    .anySatisfy(reason -> assertThat(reason).contains("SUB_PART_UNSUPPORTED"));
+        }
+    }
+
+    @Test
+    void refusesCleanupWhenAnyTableIsNotOwnedByTheProcedure() throws Exception {
+        String sql = seedCleanupProcedure(true).replace(
+                "tmpMissingSeed,tmpBindingSeed,",
+                "unknown_table,tmpBindingSeed,");
+        assertThat(migrate(sql, "unsafe.sql").report().manualReviewItems()).isNotEmpty();
+    }
+
+    @Test
+    void engineColumnExpressionsAreNotTableOptions() {
+        for (String sql : List.of("UPDATE jobs SET engine='InnoDB' WHERE id=1",
+                "CREATE TABLE copy AS SELECT engine FROM jobs WHERE engine='InnoDB'",
+                "CREATE TABLE jobs (engine VARCHAR(20), CHECK (engine='InnoDB'))")) {
+            assertThat(GeneratedSqlStaticInspector.manualReviewReason(sql)).isEmpty();
+        }
+        assertThat(GeneratedSqlStaticInspector.manualReviewReason("ALTER TABLE jobs ENGINE=InnoDB"))
+                .contains("ENGINE 表选项");
+    }
+
+    @Test
+    void engineMetadataStillRequiresAnExplicitDamengEquivalent() throws Exception {
+        Converted converted = migrate("""
+                SELECT COUNT(*) FROM information_schema.TABLES
+                WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' AND ENGINE='InnoDB';
+                """, "engine.sql");
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("ENGINE").doesNotContain("ENGINE 表选项"));
+        assertThat(converted.sql()).contains("information_schema.TABLES");
+    }
+
+    @Test
+    void doesNotGuessBackslashDecodingInNestedPreparedSqlLiterals() throws Exception {
+        String source = fixture("conditional-calls.sql").replace("不必填", "不\\n必填");
+        assertThat(migrate(source, "escape_system.sql").report().manualReviewItems()).isNotEmpty();
     }
 
     private String seedCleanupProcedure(boolean combinedDrop) {

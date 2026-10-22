@@ -90,6 +90,35 @@ class ReportedMapperCompatibilityTest {
                 .satisfies(candidate -> assertThat(candidate.insertColumns()).containsExactlyElementsOf(COLUMNS));
     }
 
+    @Test
+    void resolvesNestedLocalQualifiedIncludesWithoutChangingBindings() throws Exception {
+        String original = ReportedSqlScriptCompatibilityTest.fixture("SampleRecordMapper.xml")
+                .replace("<sql id=\"insertColumns\">", "<sql id=\"insertColumns\"><include refid=\"com.example.mapper.SampleRecordMapper.actualColumns\"/></sql><sql id=\"actualColumns\">");
+        assertThat(boundSql(original).getParameterMappings()).hasSize(COLUMNS.size());
+        MapperMigrationResult result = migrate(original,
+                new SqlRewriteConfig(Map.of(), Map.of(METHOD, List.of("id"))));
+        assertThat(result.manualReviewItems()).isEmpty();
+        BoundSql converted = boundSql(Files.readString(output()));
+        assertThat(converted.getParameterMappings()).extracting(mapping -> mapping.getProperty())
+                .containsExactlyElementsOf(COLUMNS);
+        assertThat(converted.getSql()).containsIgnoringCase("MERGE INTO");
+    }
+
+    @Test
+    void leavesUnresolvableOrParameterizedIncludesForManualReview() throws Exception {
+        String original = ReportedSqlScriptCompatibilityTest.fixture("SampleRecordMapper.xml");
+        for (String xml : List.of(
+                original.replace("refid=\"insertColumns\"", "refid=\"other.Mapper.columns\""),
+                original.replace("<sql id=\"insertColumns\">", "<sql id=\"insertColumns\"><include refid=\"insertColumns\"/>"),
+                original.replace("<include refid=\"insertColumns\"/>", "<include refid=\"insertColumns\"><property name=\"alias\" value=\"x\"/></include>"),
+                original.replace("<sql id=\"insertColumns\">", "<sql id=\"insertColumns\" databaseId=\"mysql\">"))) {
+            MapperMigrationResult result = migrate(xml,
+                    new SqlRewriteConfig(Map.of(), Map.of(METHOD, List.of("id"))));
+            assertThat(result.manualReviewItems()).isNotEmpty();
+            assertThat(Files.readString(output())).doesNotContain("MERGE INTO");
+        }
+    }
+
     private MapperMigrationResult migrate(String xml, SqlRewriteConfig config) throws Exception {
         Path source = root.resolve("src/main/resources/mapper/SampleRecordMapper.xml");
         Files.createDirectories(source.getParent());
