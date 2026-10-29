@@ -2743,6 +2743,10 @@ class SqlScriptMigrator {
     }
 
     private boolean deterministicScriptVariableQuery(String query) {
+        return scriptVariableQueryHasKnownFunctions(query, false);
+    }
+
+    private boolean scriptVariableQueryHasKnownFunctions(String query, boolean allowCurrentTime) {
         Set<String> allowedCalls = Set.of(
                 "CONCAT", "COALESCE", "NULLIF", "IFNULL", "MIN", "MAX", "SUM", "AVG", "COUNT",
                 "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "EXISTS"
@@ -2750,16 +2754,21 @@ class SqlScriptMigrator {
         Set<String> volatileKeywords = Set.of(
                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP", "SYSDATE"
         );
+        Set<String> currentTimeCalls = Set.of("NOW", "CURDATE", "CURTIME", "CURRENT_TIMESTAMP",
+                "CURRENT_DATE", "CURRENT_TIME", "LOCALTIME", "LOCALTIMESTAMP", "SYSDATE");
+        boolean afterQualifier = false;
         for (int index = 0; index < query.length();) {
             char current = query.charAt(index);
             if (current == '\'') {
                 index = skipSingleQuotedString(query, index);
+                afterQualifier = false;
             } else if (current == '"' || current == '`') {
                 index = current == '"' ? skipDoubleQuotedText(query, index) : skipBacktickIdentifier(query, index);
                 int next = skipWhitespaceAndComments(query, index);
                 if (next < query.length() && query.charAt(next) == '(') {
                     return false;
                 }
+                afterQualifier = false;
             } else if (startsLineComment(query, index) || startsBlockComment(query, index)) {
                 index = skipWhitespaceAndComments(query, index);
             } else if (Character.isLetter(current) || current == '_') {
@@ -2769,14 +2778,20 @@ class SqlScriptMigrator {
                 }
                 String word = query.substring(index, end).toUpperCase(Locale.ROOT);
                 int next = skipWhitespaceAndComments(query, end);
-                if (volatileKeywords.contains(word)
-                        || (next < query.length() && query.charAt(next) == '(' && !allowedCalls.contains(word))) {
+                if ((!allowCurrentTime && volatileKeywords.contains(word))
+                        || (next < query.length() && query.charAt(next) == '('
+                        && (afterQualifier || (!allowedCalls.contains(word)
+                        && !(allowCurrentTime && currentTimeCalls.contains(word)))))) {
                     return false;
                 }
+                afterQualifier = false;
                 index = end;
             } else if (current == '@' || current == ':' || current == ';') {
                 return false;
             } else {
+                if (!Character.isWhitespace(current)) {
+                    afterQualifier = current == '.';
+                }
                 index++;
             }
         }
@@ -3199,6 +3214,79 @@ class SqlScriptMigrator {
         );
     }
 
+    private CountSnapshotCandidate adjacentCountSnapshot(List<String> statements, int index) {
+        if (index + 1 >= statements.size()) {
+            return null;
+        }
+        String assignment = splitLeadingSqlPrefix(statements.get(index)).body().strip();
+        Matcher set = Pattern.compile("(?is)^SET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*(?<value>\\(.*\\))$")
+                .matcher(assignment);
+        if (!set.matches() || findMatchingParen(set.group("value"), 0) != set.group("value").length() - 1) {
+            return null;
+        }
+        String name = set.group("name");
+        for (int later = index + 2; later < statements.size(); later++) {
+            // A local variable cannot represent a session value used outside this block.
+            String body = splitLeadingSqlPrefix(statements.get(later)).body().strip();
+            if (referencesUserVariable(body, name) || startsKeyword(body, 0, "CALL")
+                    || startsKeyword(body, 0, "EXECUTE")) {
+                return null;
+            }
+        }
+        LinkedHashMap<String, String> literals = snapshotLiteralParameters(statements, index);
+        literals.remove(name.toLowerCase(Locale.ROOT));
+        String value = set.group("value");
+        String query = inlineScriptUserVariables(value.substring(1, value.length() - 1), literals).sql().strip();
+        Matcher count = Pattern.compile("(?is)^SELECT\\s+(?<count>COUNT\\s*\\(\\s*(?:1|\\*)\\s*\\))\\s+"
+                + "(?<from>FROM\\s+" + SQL_OBJECT_IDENTIFIER_TOKEN + "(?:\\s+WHERE\\s+.+)?)$").matcher(query);
+        if (!count.matches() || !deterministicScriptVariableQuery(query)) {
+            return null;
+        }
+        for (String keyword : List.of("GROUP", "HAVING", "ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT", "FOR", "INTO")) {
+            if (topLevelKeywordIndexAfter(query, keyword, "SELECT".length()) >= 0) {
+                return null;
+            }
+        }
+        String insert = statements.get(index + 1);
+        String insertBody = splitLeadingSqlPrefix(insert).body().strip();
+        if (!Pattern.compile("(?is)^INSERT\\s+INTO\\s+").matcher(insertBody).find()
+                || topLevelKeywordIndexAfter(insertBody, "SELECT", 0) < 0
+                || topLevelKeywordIndexAfter(insertBody, "DUPLICATE", 0) >= 0
+                || !referencesUserVariable(insert, name)
+                || hasUnsafeUserVariableAssignment(insert, mysqlUserVariableReferences(insert))) {
+            return null;
+        }
+        String localName = "dm_adapter_count_snapshot";
+        if (containsIgnoreCase(query + insert, localName)) {
+            return null;
+        }
+        insert = inlineScriptUserVariables(insert, literals).sql();
+        insert = replaceScriptUserVariable(insert, name, localName);
+        if (!mysqlUserVariableReferences(insert).isEmpty()) {
+            return null;
+        }
+        return new CountSnapshotCandidate(name, query, insert);
+    }
+
+    private LinkedHashMap<String, String> snapshotLiteralParameters(List<String> statements, int end) {
+        LinkedHashMap<String, String> literals = new LinkedHashMap<>();
+        for (int index = 0; index < end; index++) {
+            String body = splitLeadingSqlPrefix(statements.get(index)).body().strip();
+            ScriptUserVariableAssignment assignment = scriptUserVariableAssignment(body);
+            if (assignment != null) {
+                literals.put(assignment.name().toLowerCase(Locale.ROOT), assignment.literal());
+            } else if (!(startsKeyword(body, 0, "UPDATE") || startsKeyword(body, 0, "INSERT")
+                    || startsKeyword(body, 0, "DELETE"))
+                    || hasUnsafeUserVariableAssignment(body, mysqlUserVariableReferences(body))
+                    || !scriptVariableQueryHasKnownFunctions(inlineScriptUserVariables(body, literals).sql(), true)) {
+                // Current-time functions cannot assign session variables; unknown
+                // functions, CALL and control SQL may invalidate captured constants.
+                literals.clear();
+            }
+        }
+        return literals;
+    }
+
     private SnapshotUserVariableAssignment snapshotUserVariableAssignment(String statement) {
         LeadingSqlPrefix prefix = splitLeadingSqlPrefix(statement);
         Matcher matcher = Pattern.compile(
@@ -3398,12 +3486,52 @@ class SqlScriptMigrator {
                     + ", statements=" + parallelStatementCount);
         }
         List<StatementConversionPlan> conversionPlans = new ArrayList<>(originalStatements.size());
+        Map<Integer, ScriptStatementConversion> countSnapshotConversions = new LinkedHashMap<>();
         try {
             for (int i = 0; i < originalStatements.size(); i++) {
                 String originalStatement = originalStatements.get(i);
                 int statementIndex = i + 1;
                 CompletableFuture<ScriptStatementConversion> conversion;
-                if (conversionExecutor != null && parallelSafeProcedureStatement(originalStatement)) {
+                CountSnapshotCandidate snapshot = countSnapshotConversions.containsKey(i) ? null
+                        : adjacentCountSnapshot(originalStatements, i);
+                if (snapshot != null && originalSqlSchemaShapeManualReviewReason(
+                        splitLeadingSqlPrefix(snapshot.insert()).body(), scriptTableColumns, ignoredCreateColumns).isBlank()) {
+                    // Convert both SQL statements before wrapping them: a whole-block
+                    // SQL rewrite can misclassify DML keywords after a comment.
+                    ScriptStatementConversion query = convertStatement(snapshot.query(), new LinkedHashMap<>(),
+                            copyScriptDynamicDdlState(scriptDynamicDdlState), copyScriptTableColumns(scriptTableColumns),
+                            copyScriptTableColumns(ignoredCreateColumns), new LinkedHashMap<>(scriptIdentityColumns),
+                            scriptProcedureRenames, targetSchema, outerJoinSourceUniqueKeys, rewriteConfig,
+                            new ConversionTimings());
+                    ScriptStatementConversion insert = convertStatement(snapshot.insert(), new LinkedHashMap<>(),
+                            copyScriptDynamicDdlState(scriptDynamicDdlState), copyScriptTableColumns(scriptTableColumns),
+                            copyScriptTableColumns(ignoredCreateColumns), new LinkedHashMap<>(scriptIdentityColumns),
+                            scriptProcedureRenames, targetSchema, outerJoinSourceUniqueKeys, rewriteConfig,
+                            new ConversionTimings());
+                    String convertedQuery = query.outputSql().strip();
+                    int from = topLevelKeywordIndexAfter(convertedQuery, "FROM", 0);
+                    String block = from < 0 ? "" : "DECLARE\n    dm_adapter_count_snapshot BIGINT;\nBEGIN\n    "
+                            + convertedQuery.substring(0, from) + "INTO dm_adapter_count_snapshot "
+                            + convertedQuery.substring(from) + ";\n" + insert.outputSql().strip() + ";\nEND";
+                    if (!query.manualReviewRequired() && !insert.manualReviewRequired() && !block.isBlank()
+                            && SqlScriptParser.statements(query.outputSql()).size() == 1
+                            && SqlScriptParser.statements(insert.outputSql()).size() == 1
+                            && GeneratedSqlStaticInspector.manualReviewReason(block).isBlank()) {
+                        List<String> rules = new ArrayList<>(query.appliedRules());
+                        rules.addAll(insert.appliedRules());
+                        rules.add(MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE);
+                        String noop = splitLeadingSqlPrefix(originalStatement).prefix()
+                                + "-- DM_ADAPTER: count captured once in the adjacent INSERT block\nBEGIN\n    NULL;\nEND";
+                        countSnapshotConversions.put(i, new ScriptStatementConversion(originalStatement,
+                                noop, noop, true, false, "", List.of(MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK_RULE)));
+                        countSnapshotConversions.put(i + 1, new ScriptStatementConversion(originalStatements.get(i + 1),
+                                block, block, true, false, "", rules));
+                        scriptUserVariables.remove(snapshot.name().toLowerCase(Locale.ROOT));
+                    }
+                }
+                if (countSnapshotConversions.containsKey(i)) {
+                    conversion = CompletableFuture.completedFuture(countSnapshotConversions.get(i));
+                } else if (conversionExecutor != null && parallelSafeProcedureStatement(originalStatement)) {
                     LinkedHashMap<String, String> userVariablesSnapshot = new LinkedHashMap<>(scriptUserVariables);
                     ScriptDynamicDdlState dynamicDdlStateSnapshot = copyScriptDynamicDdlState(scriptDynamicDdlState);
                     LinkedHashMap<String, LinkedHashSet<String>> tableColumnsSnapshot =
@@ -19515,6 +19643,9 @@ class SqlScriptMigrator {
     }
 
     private record SnapshotUserVariableAssignment(String name, String existsQuery) {
+    }
+
+    private record CountSnapshotCandidate(String name, String query, String insert) {
     }
 
     private record MetadataSchemaBinding(List<String> statements, boolean changed) {
