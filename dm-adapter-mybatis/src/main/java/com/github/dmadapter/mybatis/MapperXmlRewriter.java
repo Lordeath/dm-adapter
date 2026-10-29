@@ -569,17 +569,26 @@ public class MapperXmlRewriter {
             }
             if (hasElementChild(statement) && !expandedIncludes) {
                 StatementBody statementBody = findStatementBody(sourceXml, tagName, statementId, occurrenceIndex);
+                DynamicBodyConversion aggregateConversion = convertCompleteAggregateFunctions(
+                        statementBody.rawBody(), document, namespace, sqlConverter);
                 DynamicBodyConversion dynamicBodyConversion =
                         convertDynamicXmlTextSegments(
                                 tagName,
                                 statementKey,
-                                statementBody.rawBody(),
+                                aggregateConversion.convertedBody(),
                                 sqlConverter,
                                 rewriteConfig,
                                 "true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys")),
                                 statement.getAttribute("keyProperty"),
                                 statement.getAttribute("keyColumn")
                         );
+                if (aggregateConversion.changed()) {
+                    List<String> rules = new ArrayList<>(aggregateConversion.appliedRules());
+                    addAppliedRules(rules, dynamicBodyConversion.appliedRules());
+                    dynamicBodyConversion = new DynamicBodyConversion(statementBody.rawBody(),
+                            dynamicBodyConversion.convertedBody(), rules,
+                            dynamicBodyConversion.manualReviewReasons(), true);
+                }
                 if (!dynamicBodyConversion.manualReviewReasons().isEmpty()) {
                     manualReviewItems.add(new SqlChange(
                             reportPath,
@@ -1448,6 +1457,119 @@ public class MapperXmlRewriter {
             }
         }
         return false;
+    }
+
+    private DynamicBodyConversion convertCompleteAggregateFunctions(
+            String body, Document document, String namespace, SqlConverter converter
+    ) {
+        List<TextReplacement> replacements = new ArrayList<>();
+        List<String> rules = new ArrayList<>();
+        String view = sqlView(body).text();
+        Matcher functions = Pattern.compile("(?i)\\b(?:PERIOD_DIFF|GROUP_CONCAT)\\s*\\(").matcher(view);
+        int cursor = 0;
+        while (functions.find(cursor)) {
+            int close = findMatchingParen(view, functions.end() - 1);
+            if (close < 0) {
+                break;
+            }
+            cursor = close + 1;
+            String expression = body.substring(functions.start(), cursor);
+            if (expression.contains("${") || expression.contains("dm_adapter_xml_")) {
+                continue;
+            }
+            try {
+                Element root = XmlSupport.parse("<sql>" + expression + "</sql>").getDocumentElement();
+                if (!hasElementChild(root)) {
+                    continue;
+                }
+                Map<String, String> markup = new LinkedHashMap<>();
+                String sql = aggregateSqlWithProtectedMarkup(root, document, namespace, markup);
+                if (sql == null) {
+                    continue;
+                }
+                SqlConversionResult result = converter.convert(sql);
+                if (!result.changed() || result.manualReviewRequired()) {
+                    continue;
+                }
+                String converted = escapeXmlText(result.convertedSql());
+                for (Map.Entry<String, String> entry : markup.entrySet()) {
+                    converted = converted.replace(entry.getKey(), entry.getValue());
+                }
+                XmlSupport.parse("<sql>" + converted + "</sql>");
+                replacements.add(new TextReplacement(functions.start(), cursor, converted));
+                addAppliedRules(rules, result.appliedRules());
+            } catch (Exception ignored) {
+                // A function crossing XML boundaries remains on the normal conservative path.
+            }
+        }
+        TextRewrite rewrite = applyTextReplacements(body, replacements);
+        return new DynamicBodyConversion(body, rewrite.text(), rules, List.of(), rewrite.changed());
+    }
+
+    private String aggregateSqlWithProtectedMarkup(
+            Element parent, Document document, String namespace, Map<String, String> markup
+    ) {
+        StringBuilder sql = new StringBuilder();
+        NodeList nodes = parent.getChildNodes();
+        for (int index = 0; index < nodes.getLength(); index++) {
+            Node node = nodes.item(index);
+            if (node instanceof Element element) {
+                if ("include".equals(element.getTagName())) {
+                    Element wrapper = document.createElement("sql");
+                    wrapper.appendChild(document.importNode(element, true));
+                    String included = staticIncludedSql(wrapper, document, namespace, new LinkedHashSet<>());
+                    if (included == null) {
+                        return null;
+                    }
+                    sql.append(included);
+                    continue;
+                }
+                if (!Set.of("if", "choose", "when", "otherwise").contains(element.getTagName())) {
+                    return null;
+                }
+                String content = aggregateSqlWithProtectedMarkup(element, document, namespace, markup);
+                if (content == null || !balancedAggregateBranch(content)) {
+                    return null;
+                }
+                StringBuilder opening = new StringBuilder("<").append(element.getTagName());
+                for (int attributeIndex = 0; attributeIndex < element.getAttributes().getLength(); attributeIndex++) {
+                    Node attribute = element.getAttributes().item(attributeIndex);
+                    opening.append(' ').append(attribute.getNodeName()).append("=\"")
+                            .append(escapeXmlText(attribute.getNodeValue()).replace("\"", "&quot;"))
+                            .append('"');
+                }
+                opening.append('>');
+                sql.append(protectAggregateMarkup(markup, opening.toString())).append(content)
+                        .append(protectAggregateMarkup(markup, "</" + element.getTagName() + ">"));
+            } else if (node.getNodeType() == Node.COMMENT_NODE) {
+                sql.append(protectAggregateMarkup(markup, "<!--" + node.getNodeValue() + "-->"));
+            } else if (node.getNodeType() == Node.TEXT_NODE || node.getNodeType() == Node.CDATA_SECTION_NODE) {
+                sql.append(node.getNodeValue());
+            }
+        }
+        return sql.toString();
+    }
+
+    private String protectAggregateMarkup(Map<String, String> markup, String xml) {
+        String marker = "/*dm_adapter_xml_" + markup.size() + "*/";
+        markup.put(marker, xml);
+        return marker;
+    }
+
+    private boolean balancedAggregateBranch(String sql) {
+        String view = sqlView(escapeXmlText(sql)).text();
+        int depth = 0;
+        for (int index = 0; index < view.length(); index++) {
+            if (view.charAt(index) == '(') {
+                depth++;
+            } else if (view.charAt(index) == ')' && --depth < 0) {
+                return false;
+            } else if (view.charAt(index) == ',' && depth == 0) {
+                return false;
+            }
+        }
+        return depth == 0 && !sql.contains("${")
+                && !Pattern.compile("(?i)\\b(?:SELECT|FROM|JOIN|ORDER|SEPARATOR)\\b").matcher(view).find();
     }
 
     private void writeReplacements(
@@ -3588,6 +3710,17 @@ public class MapperXmlRewriter {
         Map<String, SelectAlias> unsafeAggregateAliases = unsafeAggregateSelectAliases(selectList);
         Map<String, DynamicAggregateAlias> dynamicAggregateAliases = dynamicAggregateSelectAliases(selectList);
         Map<String, SelectAlias> selectAliases = nonAggregateSelectAliases(selectList);
+        XmlBlock havingBranch = enclosingHavingBranch(body, scope.havingIndex());
+        if (havingBranch != null) {
+            String condition = body.substring(scope.havingIndex() + "HAVING".length(),
+                    Math.min(scope.havingEnd(), havingBranch.closingStart()));
+            if (isSafeAggregateHavingExpression(condition)) {
+                return ScopeHavingConversion.unchanged(body);
+            }
+            return ScopeHavingConversion.manualReview(body,
+                    "HAVING inside a MyBatis <when>/<otherwise> branch cannot be moved without proving "
+                            + "complete branch and aggregate semantics. The original XML was retained.");
+        }
         XmlBlock enclosingHavingIf = enclosingXmlBlock(body, scope.havingIndex(), "if");
         boolean havingStartsEnclosingIf = enclosingHavingIf != null
                 && sqlView(body.substring(enclosingHavingIf.openingEnd(), scope.havingIndex())).text().isBlank();
@@ -3728,7 +3861,9 @@ public class MapperXmlRewriter {
             Map<String, SelectAlias> aggregateAliases = aggregateSelectAliases(
                     body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex())
             );
-            if (aggregateAliases.isEmpty()) {
+            Map<String, DynamicAggregateAlias> dynamicAliases = dynamicAggregateSelectAliases(
+                    body.substring(scope.selectIndex() + "SELECT".length(), scope.fromIndex()));
+            if (aggregateAliases.isEmpty() && dynamicAliases.isEmpty()) {
                 continue;
             }
             int cursor = scope.fromIndex() + "FROM".length();
@@ -3750,6 +3885,17 @@ public class MapperXmlRewriter {
                         scope.scopeEnd(),
                         scope.depth()
                 );
+                XmlBlock branch = enclosingHavingBranch(body, havingIndex);
+                if (branch != null) {
+                    contentEnd = Math.min(contentEnd, branch.closingStart());
+                    DynamicHavingAliasRewrite dynamicRewrite = rewriteDynamicAggregateHavingAlias(
+                            body, scope, body.substring(contentStart, contentEnd), aggregateAliases, dynamicAliases);
+                    if (dynamicRewrite.changed()) {
+                        replacements.add(new TextReplacement(havingIndex, contentEnd, dynamicRewrite.text()));
+                        cursor = contentEnd;
+                        continue;
+                    }
+                }
                 TextRewrite aliasRewrite = replaceAggregateAliases(
                         body.substring(contentStart, contentEnd),
                         aggregateAliases
@@ -3779,6 +3925,15 @@ public class MapperXmlRewriter {
                 expandedEnclosedHavingContents,
                 rewrite.changed()
         );
+    }
+
+    private XmlBlock enclosingHavingBranch(String body, int index) {
+        XmlBlock when = enclosingXmlBlock(body, index, "when");
+        XmlBlock otherwise = enclosingXmlBlock(body, index, "otherwise");
+        if (when == null) {
+            return otherwise;
+        }
+        return otherwise == null || when.openingEnd() > otherwise.openingEnd() ? when : otherwise;
     }
 
     private int findDynamicHavingClauseEnd(String view, int start, int end, int targetDepth) {
@@ -4427,6 +4582,7 @@ public class MapperXmlRewriter {
         DynamicAggregateAlias dynamicAlias = referenced.values().iterator().next();
         String staticRewrittenHaving = replaceAggregateAliases(havingContent, aggregateAliases).text();
         String baseIndent = indentationOfLastLine(body.substring(0, scope.havingIndex()));
+        baseIndent = baseIndent.substring(0, leadingWhitespaceLength(baseIndent));
         String branchIndent = baseIndent + "    ";
         String conditionIndent = branchIndent + "    ";
         String trailingWhitespace = trailingWhitespace(havingContent);
@@ -5199,12 +5355,66 @@ public class MapperXmlRewriter {
                 return;
             }
             int chooseEnd = closingTagEnd(selectList, chooseClosingStart);
-            DynamicAggregateAlias alias = dynamicAggregateSelectAlias(selectList.substring(chooseStart, chooseEnd));
-            if (alias != null) {
-                aliases.putIfAbsent(identifierKey(alias.alias()), alias);
-            }
+            aggregateAliasesInChoose(selectList.substring(chooseStart, chooseEnd)).forEach(aliases::putIfAbsent);
             index = chooseEnd;
         }
+    }
+
+    private Map<String, DynamicAggregateAlias> aggregateAliasesInChoose(String value) {
+        XmlTag choose = readXmlTag(value, 0);
+        if (choose == null) {
+            return Map.of();
+        }
+        int end = findClosingTag(value, choose.endIndex(), "choose", value.length());
+        Map<String, List<DynamicAggregateAliasBranch>> expressions = new LinkedHashMap<>();
+        Map<String, String> names = new LinkedHashMap<>();
+        int branchCount = 0;
+        boolean fallback = false;
+        int index = choose.endIndex();
+        while (index < end) {
+            int start = nextXmlTagStart(value, index, end);
+            if (start < 0) {
+                break;
+            }
+            XmlTag tag = readXmlTag(value, start);
+            if (tag == null || tag.closing() || tag.selfClosing() || fallback
+                    || !Set.of("when", "otherwise").contains(tag.name())
+                    || !value.substring(index, start).isBlank()) {
+                return Map.of();
+            }
+            int close = findClosingTag(value, tag.endIndex(), tag.name(), end);
+            if (close < 0) {
+                return Map.of();
+            }
+            branchCount++;
+            fallback = "otherwise".equals(tag.name());
+            Set<String> seen = new LinkedHashSet<>();
+            for (String item : splitTopLevelComma(value.substring(tag.endIndex(), close))) {
+                SelectAlias alias = selectAliasAllowingSqlFragments(item);
+                if (alias == null || !isSafeAggregateHavingExpression(alias.expression())) {
+                    continue;
+                }
+                String key = identifierKey(alias.alias());
+                if (!seen.add(key)) {
+                    return Map.of();
+                }
+                names.putIfAbsent(key, alias.alias());
+                expressions.computeIfAbsent(key, ignored -> new ArrayList<>()).add(new DynamicAggregateAliasBranch(
+                        value.substring(start, tag.endIndex()), alias.expression(),
+                        value.substring(close, closingTagEnd(value, close))));
+            }
+            index = closingTagEnd(value, close);
+        }
+        if (!fallback || !value.substring(index, end).isBlank()) {
+            return Map.of();
+        }
+        Map<String, DynamicAggregateAlias> aliases = new LinkedHashMap<>();
+        for (Map.Entry<String, List<DynamicAggregateAliasBranch>> entry : expressions.entrySet()) {
+            if (entry.getValue().size() == branchCount) {
+                aliases.put(entry.getKey(), new DynamicAggregateAlias(names.get(entry.getKey()), entry.getValue()));
+            }
+        }
+        return aliases;
     }
 
     private DynamicAggregateAlias dynamicAggregateSelectAlias(String selectItem) {
@@ -5225,6 +5435,7 @@ public class MapperXmlRewriter {
         }
         List<DynamicAggregateAliasBranch> branches = new ArrayList<>();
         String alias = "";
+        boolean hasFallback = false;
         int index = chooseTag.endIndex();
         while (index < chooseClosingStart) {
             int nextTagStart = nextXmlTagStart(value, index, chooseClosingStart);
@@ -5238,7 +5449,7 @@ public class MapperXmlRewriter {
                 return null;
             }
             XmlTag branchTag = readXmlTag(value, nextTagStart);
-            if (branchTag == null || branchTag.closing() || branchTag.selfClosing()
+            if (branchTag == null || branchTag.closing() || branchTag.selfClosing() || hasFallback
                     || (!"when".equalsIgnoreCase(branchTag.name())
                     && !"otherwise".equalsIgnoreCase(branchTag.name()))) {
                 return null;
@@ -5247,6 +5458,7 @@ public class MapperXmlRewriter {
             if (branchClosingStart < 0) {
                 return null;
             }
+            hasFallback = "otherwise".equalsIgnoreCase(branchTag.name());
             String branchBody = value.substring(branchTag.endIndex(), branchClosingStart);
             SelectAlias branchAlias = selectAliasAllowingSqlFragments(branchBody);
             if (branchAlias == null || !isSafeAggregateHavingExpression(branchAlias.expression())) {
@@ -5264,7 +5476,7 @@ public class MapperXmlRewriter {
             ));
             index = closingTagEnd(value, branchClosingStart);
         }
-        if (alias.isBlank() || branches.isEmpty()) {
+        if (alias.isBlank() || branches.isEmpty() || !hasFallback) {
             return null;
         }
         return new DynamicAggregateAlias(alias, branches);

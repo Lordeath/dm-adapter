@@ -4486,14 +4486,24 @@ class SqlScriptMigrator {
             if (arguments.size() != 3) {
                 continue;
             }
-            ConditionalPreparedGuard guard = conditionalPreparedGuard(arguments.get(0).strip());
+            List<ConditionalPreparedGuard> guards = conditionalPreparedGuards(arguments.get(0).strip());
             String whenTrue = conditionalPreparedAction(arguments.get(1).strip());
             String whenFalse = conditionalPreparedAction(arguments.get(2).strip());
-            if (guard == null || whenTrue == null || whenFalse == null) {
+            if (guards.isEmpty() || whenTrue == null || whenFalse == null) {
                 continue;
             }
-            String block = "DECLARE\n    dm_adapter_guard_count BIGINT;\nBEGIN\n    "
-                    + guard.countQuery() + ";\n    IF dm_adapter_guard_count " + guard.comparison()
+            List<String> declarations = new ArrayList<>();
+            List<String> queries = new ArrayList<>();
+            List<String> comparisons = new ArrayList<>();
+            for (int guardIndex = 0; guardIndex < guards.size(); guardIndex++) {
+                ConditionalPreparedGuard guard = guards.get(guardIndex);
+                String name = "dm_adapter_guard_count" + (guardIndex == 0 ? "" : "_" + guardIndex);
+                declarations.add(name + " BIGINT;");
+                queries.add(guard.countQuery().replace("INTO dm_adapter_guard_count FROM", "INTO " + name + " FROM") + ";");
+                comparisons.add(name + " " + guard.comparison());
+            }
+            String block = "DECLARE\n    " + String.join("\n    ", declarations) + "\nBEGIN\n    "
+                    + String.join("\n    ", queries) + "\n    IF " + String.join(" AND ", comparisons)
                     + " THEN\n        " + whenTrue + "\n    ELSE\n        " + whenFalse + "\n    END IF;\nEND";
             if (!manualReviewReason(block).isBlank() || !GeneratedSqlStaticInspector.manualReviewReason(block).isBlank()) {
                 continue;
@@ -4566,12 +4576,56 @@ class SqlScriptMigrator {
         if (select.group("table").equalsIgnoreCase("information_schema.COLUMNS")) {
             countQuery = replaceOutsideIgnoredText(countQuery, SCRIPT_METADATA_REPLACEMENTS);
             countQuery = normalizeDamengMetadataIdentifierComparisons(countQuery);
+        } else if (select.group("table").equalsIgnoreCase("information_schema.TABLES")) {
+            // Only existence checks have a portable meaning. ENGINE and other storage
+            // properties cannot be inferred from a Dameng table catalog.
+            for (String part : select.group("where").split("(?i)\\s+AND\\s+")) {
+                if (!part.matches("(?is)(?:TABLE_SCHEMA|TABLE_NAME)\\s*=.*")) {
+                    return null;
+                }
+            }
+            countQuery = replaceOutsideIgnoredText(countQuery, SCRIPT_METADATA_REPLACEMENTS);
+            countQuery = normalizeDamengMetadataIdentifierComparisons(countQuery);
         } else if (containsIgnoreCase(select.group("table"), "information_schema")) {
             return null;
         }
         countQuery = replaceOutsideIgnoredText(countQuery,
                 Pattern.compile("(?i)\\bDATABASE\\s*\\(\\s*\\)"), matcher -> DM_CURRENT_SCHEMA_EXPRESSION);
-        return new ConditionalPreparedGuard(countQuery, comparison);
+        return new ConditionalPreparedGuard(countQuery, comparison,
+                select.group("table").equalsIgnoreCase("information_schema.COLUMNS")
+                        || select.group("table").equalsIgnoreCase("information_schema.TABLES"));
+    }
+
+    private List<ConditionalPreparedGuard> conditionalPreparedGuards(String condition) {
+        List<ConditionalPreparedGuard> guards = new ArrayList<>();
+        int start = 0;
+        int depth = 0;
+        for (int index = 0; index <= condition.length(); index++) {
+            if (index < condition.length()) {
+                if (condition.charAt(index) == '\'') {
+                    index = skipSingleQuotedString(condition, index) - 1;
+                    continue;
+                }
+                if (condition.charAt(index) == '(') {
+                    depth++;
+                } else if (condition.charAt(index) == ')') {
+                    depth--;
+                }
+            }
+            if (index == condition.length() || (depth == 0 && startsKeyword(condition, index, "AND"))) {
+                ConditionalPreparedGuard guard = conditionalPreparedGuard(condition.substring(start, index).strip());
+                if (guard == null) {
+                    return List.of();
+                }
+                guards.add(guard);
+                start = index + 3;
+                index += 2;
+            }
+        }
+        // Both metadata views are safe to read even when the first check is false.
+        // Ordinary tables may not exist, so eagerly evaluating a second query could
+        // violate the original AND short-circuit behavior.
+        return guards.size() > 1 && guards.stream().anyMatch(guard -> !guard.metadata()) ? List.of() : guards;
     }
 
     private String conditionalPreparedAction(String expression) {
@@ -4613,7 +4667,7 @@ class SqlScriptMigrator {
         return result;
     }
 
-    private record ConditionalPreparedGuard(String countQuery, String comparison) {
+    private record ConditionalPreparedGuard(String countQuery, String comparison, boolean metadata) {
     }
 
     private ScriptIndexExistenceCheck scriptIndexExistenceCheck(

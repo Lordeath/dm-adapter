@@ -2103,7 +2103,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 && containsPatternOutsideIgnoredText(sql, REPLACE_INTO_PATTERN)) {
             return "REPLACE INTO has no safe automatic Dameng rewrite in MVP.";
         }
-        if (GROUP_CONCAT_PATTERN.matcher(sql).find()) {
+        if (containsFunction(sql, "GROUP_CONCAT")) {
             return "GROUP_CONCAT requires manual confirmation for Dameng aggregate syntax.";
         }
         if (containsMysqlMetadataOutsideIgnoredText(sql)) {
@@ -3879,6 +3879,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         int index = 0;
         while (index < value.length()) {
             index = skipWhitespace(value, index);
+            if (index == value.length()) {
+                return index;
+            }
             if (startsLineComment(value, index)) {
                 index = skipUntilLineEnd(value, index);
             } else if (startsBlockComment(value, index)) {
@@ -4998,7 +5001,72 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 || isSimpleQualifiedIdentifier(trimmed)) {
             return trimmed;
         }
+        for (String aggregate : List.of("MIN", "MAX")) {
+            FunctionCall call = readFunctionCall(trimmed, 0, aggregate);
+            if (call == null || call.endIndex() != trimmed.length()) {
+                continue;
+            }
+            String argument = call.body().strip();
+            if (isSimpleQualifiedIdentifier(argument)) {
+                return trimmed;
+            }
+            Matcher conditional = Pattern.compile("(?is)^CASE\\s+WHEN\\s+(.+)\\s+THEN\\s+(.+?)"
+                    + "\\s+(?:ELSE\\s+NULL\\s+)?END$").matcher(argument);
+            if (conditional.matches() && isSimpleQualifiedIdentifier(conditional.group(2))
+                    && repeatablePeriodCondition(conditional.group(1))) {
+                return trimmed;
+            }
+        }
         return null;
+    }
+
+    private boolean repeatablePeriodCondition(String condition) {
+        if (condition.contains("${") || condition.contains(";") || condition.contains("@")
+                || containsKeywordOutsideIgnoredText(condition, "SELECT")) {
+            return false;
+        }
+        // The month-index expression repeats its operand. Never repeat unknown or
+        // volatile functions while expanding a conditional MIN/MAX.
+        Set<String> functions = Set.of("IFNULL", "COALESCE", "NULLIF", "REGEXP_LIKE",
+                "DATE_FORMAT", "CURRENT_DATE", "CURDATE");
+        int index = 0;
+        boolean afterQualifier = false;
+        while (index < condition.length()) {
+            int ignored = skipArithmeticIgnoredText(condition, index);
+            if (ignored > index) {
+                char first = condition.charAt(index);
+                if (first == '"' || first == '`' || first == '\'') {
+                    int next = ignored + skipLeadingWhitespaceAndComments(condition.substring(ignored));
+                    if (next < condition.length() && condition.charAt(next) == '(') {
+                        return false;
+                    }
+                    afterQualifier = false;
+                } else if (startsMyBatisPlaceholder(condition, index)) {
+                    afterQualifier = false;
+                }
+                index = ignored;
+            } else if (isIdentifierStart(condition.charAt(index))) {
+                int end = index + 1;
+                while (end < condition.length() && isIdentifierPart(condition.charAt(end))) {
+                    end++;
+                }
+                String word = condition.substring(index, end).toUpperCase(Locale.ROOT);
+                int next = end + skipLeadingWhitespaceAndComments(condition.substring(end));
+                if (next < condition.length() && condition.charAt(next) == '('
+                        && (afterQualifier
+                        || (!functions.contains(word) && !Set.of("IN", "NOT", "AND", "OR", "WHEN").contains(word)))) {
+                    return false;
+                }
+                afterQualifier = false;
+                index = end;
+            } else {
+                if (!Character.isWhitespace(condition.charAt(index))) {
+                    afterQualifier = condition.charAt(index) == '.';
+                }
+                index++;
+            }
+        }
+        return true;
     }
 
     private String yearMonthExtractExpression(String expression) {

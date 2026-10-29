@@ -23,6 +23,48 @@ class ReportedSqlScriptCompatibilityTest {
     Path root;
 
     @Test
+    void convertsCombinedTableAndColumnGuardsWithoutDroppingEitherCheck() throws Exception {
+        Converted converted = migrate("""
+                SET @sample_sql = IF(
+                    EXISTS (SELECT 1 FROM information_schema.tables
+                        WHERE table_schema=DATABASE() AND table_name='sample_archive')
+                    AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema=DATABASE() AND table_name='sample_archive' AND column_name='sample_note'),
+                    'ALTER TABLE sample_archive ADD COLUMN sample_note VARCHAR(200) NULL DEFAULT '''' COMMENT ''示例备注''',
+                    'DO 0');
+                PREPARE sample_stmt FROM @sample_sql;
+                EXECUTE sample_stmt;
+                DEALLOCATE PREPARE sample_stmt;
+                """, "001.sql");
+
+        assertFullyConverted(converted);
+        assertThat(SqlScriptParser.statements(converted.sql())).hasSize(4);
+        assertThat(converted.sql()).contains("ALL_TABLES", "ALL_TAB_COLUMNS", "sample_archive", "sample_note")
+                .contains("VARCHAR(200 CHAR)", "COMMENT ON COLUMN", "示例备注")
+                .doesNotContain("information_schema", "test-app");
+        assertThat(converted.sql()).containsPattern("(?is)IF\\s+.+>\\s*0\\s+AND\\s+.+?=\\s*0\\s+THEN")
+                .containsPattern("(?is)THEN\\s+EXECUTE IMMEDIATE.+?ELSE\\s+NULL;");
+    }
+
+    @Test
+    void keepsUnsupportedCompoundMetadataGuardsForReview() throws Exception {
+        Converted converted = migrate("""
+                SET @sample_sql = IF(
+                    EXISTS (SELECT 1 FROM information_schema.tables
+                        WHERE table_schema=DATABASE() AND table_name='sample_archive' AND engine='InnoDB')
+                    AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema=DATABASE() AND table_name='sample_archive' AND column_name='sample_note'),
+                    'ALTER TABLE sample_archive ADD COLUMN sample_note VARCHAR(200) NULL', 'DO 0');
+                PREPARE sample_stmt FROM @sample_sql;
+                EXECUTE sample_stmt;
+                DEALLOCATE PREPARE sample_stmt;
+                """, "001.sql");
+
+        assertThat(converted.report().manualReviewItems()).isNotEmpty();
+        assertThat(converted.sql()).contains("InnoDB", "@sample_sql");
+    }
+
+    @Test
     void convertsConditionalColumnDdlWithoutLosingExistenceChecks() throws Exception {
         Converted converted = migrate(fixture("conditional-columns.sql"), "001.sql");
 
