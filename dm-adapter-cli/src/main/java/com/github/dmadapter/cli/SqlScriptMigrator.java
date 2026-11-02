@@ -4598,11 +4598,12 @@ class SqlScriptMigrator {
     }
 
     private void planConditionalPreparedStatements(List<String> statements, ScriptDynamicDdlState state) {
-        Pattern assignment = Pattern.compile("(?is)^SET\\s+@(?<variable>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*IF\\s*\\(");
+        Pattern assignment = Pattern.compile("(?is)^SET\\s+@(?<variable>[A-Za-z_][A-Za-z0-9_$]*)"
+                + "\\s*(?::=|=)\\s*(?<expression>.+)$");
         for (int index = 0; index + 3 < statements.size(); index++) {
             String body = splitLeadingSqlPrefix(statements.get(index)).body().strip();
             Matcher set = assignment.matcher(body);
-            if (!set.find() || findMatchingParen(body, set.end() - 1) != body.length() - 1) {
+            if (!set.matches()) {
                 continue;
             }
             String variable = set.group("variable");
@@ -4610,7 +4611,7 @@ class SqlScriptMigrator {
                     || conditionalPreparedVariableEscapes(statements, index + 4, variable)) {
                 continue;
             }
-            List<String> arguments = splitTopLevelComma(body.substring(set.end(), body.length() - 1));
+            List<String> arguments = conditionalPreparedArguments(set.group("expression").strip());
             if (arguments.size() != 3) {
                 continue;
             }
@@ -4650,6 +4651,39 @@ class SqlScriptMigrator {
             }
             index += 3;
         }
+    }
+
+    private List<String> conditionalPreparedArguments(String expression) {
+        boolean scalarQuery = expression.startsWith("(");
+        if (scalarQuery) {
+            if (findMatchingParen(expression, 0) != expression.length() - 1) {
+                return List.of();
+            }
+            expression = expression.substring(1, expression.length() - 1).strip();
+        }
+        Matcher function = Pattern.compile(scalarQuery ? "(?is)^SELECT\\s+IF\\s*\\(" : "(?is)^IF\\s*\\(")
+                .matcher(expression);
+        if (!function.find()) {
+            return List.of();
+        }
+        int close = findMatchingParen(expression, function.end() - 1);
+        if (close < 0 || (!scalarQuery && close != expression.length() - 1)) {
+            return List.of();
+        }
+        List<String> arguments = new ArrayList<>(splitTopLevelComma(expression.substring(function.end(), close)));
+        if (arguments.size() != 3) {
+            return List.of();
+        }
+        if (scalarQuery) {
+            // COUNT(*) and COUNT(1) have the same row-count semantics. The guard
+            // parser below must still accept the entire FROM/WHERE tail, so GROUP,
+            // HAVING, LIMIT, joins and extra projections cannot slip through.
+            if (!arguments.get(0).strip().matches("(?is)COUNT\\s*\\(\\s*(?:\\*|1)\\s*\\)\\s*=\\s*0")) {
+                return List.of();
+            }
+            arguments.set(0, "(SELECT COUNT(*) " + expression.substring(close + 1).strip() + ") = 0");
+        }
+        return arguments;
     }
 
     private boolean conditionalPreparedVariableEscapes(List<String> statements, int start, String variable) {
@@ -4776,7 +4810,7 @@ class SqlScriptMigrator {
             return sql + ";";
         }
         String type = "(?:(?:VAR)?CHAR\\s*\\(\\s*\\d+\\s*\\)|(?:TINY|SMALL|BIG)?INT(?:EGER)?"
-                + "|DECIMAL\\s*\\(\\s*\\d+\\s*(?:,\\s*\\d+\\s*)?\\)|DATETIME|TIMESTAMP|DATE)";
+                + "|DECIMAL\\s*\\(\\s*\\d+\\s*(?:,\\s*\\d+\\s*)?\\)|DATETIME|TIMESTAMP|DATE|TEXT)";
         String literal = "(?:" + SQL_STRING_LITERAL_TOKEN + "|[-+]?\\d+(?:\\.\\d+)?|NULL)";
         Matcher add = Pattern.compile("(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN
                 + ")\\s+ADD\\s+(?:COLUMN\\s+)?(?<column>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+"
