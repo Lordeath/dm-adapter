@@ -4723,14 +4723,22 @@ class SqlScriptMigrator {
             }
             comparison = "= 0";
         }
-        // Preserve every predicate; restrict this rule to simple literal equality
-        // guards. Grouped, limited, volatile and multi-table queries stay manual.
-        String value = "(?:" + SQL_STRING_LITERAL_TOKEN + "|[-+]?\\d+|DATABASE\\s*\\(\\s*\\))";
-        String predicate = "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*=\\s*" + value;
         Matcher select = Pattern.compile("(?is)^SELECT\\s+(?:1|COUNT\\s*\\(\\s*\\*\\s*\\))\\s+FROM\\s+"
                 + "(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+WHERE\\s+"
-                + "(?<where>" + predicate + "(?:\\s+AND\\s+" + predicate + ")*)\\s*$").matcher(query);
+                + "(?<where>.+?)\\s*$").matcher(query);
         if (!select.matches() || containsIgnoreCase(query, "dm_adapter_guard_count")) {
+            return null;
+        }
+        // Preserve every predicate. Explicit case folding is limited to column
+        // metadata names; other function expressions stay manual.
+        String value = "(?:" + SQL_STRING_LITERAL_TOKEN + "|[-+]?\\d+|DATABASE\\s*\\(\\s*\\))";
+        String predicate = "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*=\\s*" + value;
+        if (select.group("table").equalsIgnoreCase("information_schema.COLUMNS")) {
+            predicate = "(?:" + predicate + "|(?:LOWER|UPPER)\\s*\\(\\s*(?:TABLE_NAME|COLUMN_NAME)\\s*\\)"
+                    + "\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN + ")";
+        }
+        if (!Pattern.compile("(?is)^" + predicate + "(?:\\s+AND\\s+" + predicate + ")*\\s*$")
+                .matcher(select.group("where")).matches()) {
             return null;
         }
         String countQuery = "SELECT COUNT(*) INTO dm_adapter_guard_count FROM "
