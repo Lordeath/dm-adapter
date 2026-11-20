@@ -692,8 +692,20 @@ public class MapperXmlRewriter {
                         rewriteConfig.tableKeyColumns()
                 );
             } else {
-                conversionResult =
-                        sqlConverter.convert(commentSafeSql, rewriteConfig.keyColumnsFor(statementKey, tableName));
+                List<String> keyColumns = rewriteConfig.keyColumnsFor(statementKey, tableName);
+                List<String> verifiedKeys = rewriteConfig.verifiedSingleConflictKeys().getOrDefault(statementKey, List.of());
+                conversionResult = sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter
+                        && "insert".equals(tagName)
+                        && !"true".equalsIgnoreCase(statement.getAttribute("useGeneratedKeys"))
+                        && statement.getElementsByTagName("selectKey").getLength() == 0
+                        && !verifiedKeys.isEmpty()
+                        && new LinkedHashSet<>(normalizeIdentifiers(verifiedKeys))
+                                .equals(new LinkedHashSet<>(normalizeIdentifiers(keyColumns)))
+                        ? mySqlToDmSqlConverter.convertVerifiedSingleConflictUpsert(commentSafeSql, verifiedKeys)
+                        : SqlConversionResult.unchanged(commentSafeSql);
+                if (!conversionResult.changed()) {
+                    conversionResult = sqlConverter.convert(commentSafeSql, keyColumns);
+                }
             }
             if (sqlConverter instanceof MySqlToDmSqlConverter mySqlToDmSqlConverter) {
                 List<String> recursiveColumns = recursiveCteFallbackColumns(document, statement);
@@ -6405,7 +6417,7 @@ public class MapperXmlRewriter {
                 .filter(column -> !column.isBlank())
                 .map(this::normalizeIdentifier)
                 .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
-        List<BatchUpdateAssignment> updateAssignments = updateAssignments(matcher.group("updates"));
+        List<BatchUpdateAssignment> updateAssignments = updateAssignments(matcher.group("updates"), true);
         if (updateAssignments == null) {
             return "";
         }
@@ -7343,7 +7355,7 @@ public class MapperXmlRewriter {
 
         List<BatchUpdateAssignment> updateAssignments = updateClause.isBlank()
                 ? List.of()
-                : updateAssignments(updateClause);
+                : updateAssignments(updateClause, true);
         if (updateAssignments == null) {
             return null;
         }
@@ -7353,7 +7365,9 @@ public class MapperXmlRewriter {
 
         Map<String, BatchUpdateAssignment> assignmentsByTarget = new LinkedHashMap<>();
         for (BatchUpdateAssignment assignment : updateAssignments) {
-            assignmentsByTarget.put(normalizeIdentifier(assignment.target()), assignment);
+            if (assignmentsByTarget.put(normalizeIdentifier(assignment.target()), assignment) != null) {
+                return null;
+            }
         }
         List<MergeSourceColumn> keySourceColumns = new ArrayList<>();
         for (int i = 0; i < normalizedKeys.size(); i++) {
@@ -7371,12 +7385,17 @@ public class MapperXmlRewriter {
             keySourceColumns.add(sourceColumn);
         }
 
+        boolean preserveFirstValue = updateAssignments.stream().anyMatch(
+                assignment -> !assignment.valuesReference() && !assignment.requiredSourceColumn().isEmpty());
+        if (preserveFirstValue && normalizedKeys.stream().anyMatch(assignmentsByTarget::containsKey)) {
+            return null;
+        }
         updateAssignments = updateAssignments.stream()
                 .filter(assignment -> !normalizedKeys.contains(normalizeIdentifier(assignment.target())))
                 .toList();
         for (BatchUpdateAssignment assignment : updateAssignments) {
-            if (assignment.valuesReference()
-                    && !sourceColumnsByName.containsKey(normalizeIdentifier(assignment.sourceExpression()))) {
+            if (!assignment.requiredSourceColumn().isEmpty()
+                    && !sourceColumnsByName.containsKey(normalizeIdentifier(assignment.requiredSourceColumn()))) {
                 return null;
             }
         }
@@ -7385,8 +7404,19 @@ public class MapperXmlRewriter {
         String childIndent = baseIndent + "    ";
         String nestedIndent = childIndent + "    ";
         StringBuilder converted = new StringBuilder();
+        String loop = foreach.openingWithSeparator(";");
+        if (preserveFirstValue) {
+            Matcher foreachTag = FOREACH_TAG_PATTERN.matcher(foreachXml);
+            Pattern rowBinding = Pattern.compile("#\\{\\s*" + Pattern.quote(foreach.item()) + "\\.[^}]+}");
+            if (!",".equals(foreach.separator()) || !foreach.open().isEmpty() || !foreachTag.matches()
+                    || !defaultString(xmlAttribute(foreachTag.group("opening"), "close")).isEmpty()
+                    || values.stream().anyMatch(value -> !rowBinding.matcher(value).matches())) {
+                return null;
+            }
+            loop = withXmlAttribute(withXmlAttribute(loop, "open", "BEGIN"), "close", "; END;");
+        }
         converted.append(leading)
-                .append(foreach.openingWithSeparator(";"))
+                .append(loop)
                 .append("\n")
                 .append(childIndent)
                 .append("MERGE INTO ")
@@ -9278,8 +9308,30 @@ public class MapperXmlRewriter {
     }
 
     private List<BatchUpdateAssignment> updateAssignments(String updateClause) {
+        return updateAssignments(updateClause, false);
+    }
+
+    private List<BatchUpdateAssignment> updateAssignments(String updateClause, boolean supportIfNull) {
         List<BatchUpdateAssignment> assignments = new ArrayList<>();
         for (String assignment : splitTopLevelComma(updateClause)) {
+            if (supportIfNull) {
+                Matcher ifNull = Pattern.compile("(?is)^\\s*(?<target>" + DM_IDENTIFIER + ")\\s*=\\s*"
+                        + "IFNULL\\s*\\(\\s*(?<old>" + DM_IDENTIFIER + ")\\s*,\\s*VALUES"
+                        + "\\s*\\(\\s*(?<incoming>" + DM_IDENTIFIER + ")\\s*\\)\\s*\\)\\s*$")
+                        .matcher(assignment);
+                if (ifNull.matches()) {
+                    String target = ifNull.group("target");
+                    String key = normalizeIdentifier(target);
+                    if (!key.equals(normalizeIdentifier(ifNull.group("old")))
+                            || !key.equals(normalizeIdentifier(ifNull.group("incoming")))) {
+                        return null;
+                    }
+                    String column = dmIdentifier(target);
+                    assignments.add(new BatchUpdateAssignment(
+                            target, "IFNULL(t." + column + ", s." + column + ")", false, target));
+                    continue;
+                }
+            }
             Matcher valuesMatcher = Pattern.compile(
                     "(?is)^\\s*(?<target>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*values\\s*\\(\\s*(?<source>`[^`]+`|\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_$]*)\\s*\\)\\s*$"
             ).matcher(assignment);
@@ -11659,7 +11711,12 @@ public class MapperXmlRewriter {
     private record MergeSourceColumn(String name, String expression) {
     }
 
-    private record BatchUpdateAssignment(String target, String sourceExpression, boolean valuesReference) {
+    private record BatchUpdateAssignment(
+            String target, String sourceExpression, boolean valuesReference, String requiredSourceColumn
+    ) {
+        private BatchUpdateAssignment(String target, String sourceExpression, boolean valuesReference) {
+            this(target, sourceExpression, valuesReference, valuesReference ? sourceExpression : "");
+        }
     }
 
     private record ConditionalTrimItem(String opening, String test, String content) {

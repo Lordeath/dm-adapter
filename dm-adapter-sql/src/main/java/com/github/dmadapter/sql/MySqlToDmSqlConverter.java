@@ -38,10 +38,14 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "MYSQL_INFORMATION_SCHEMA_COLUMNS_TO_ALL_TAB_COLUMNS";
     public static final String MYSQL_INFORMATION_SCHEMA_TABLES_RULE =
             "MYSQL_INFORMATION_SCHEMA_TABLES_TO_ALL_TABLES";
+    public static final String MYSQL_INFORMATION_SCHEMA_PARTITIONS_RULE =
+            "MYSQL_INFORMATION_SCHEMA_PARTITIONS_TO_ALL_TAB_PARTITIONS";
     public static final String MYSQL_INFORMATION_SCHEMA_STATISTICS_RULE =
             "MYSQL_INFORMATION_SCHEMA_STATISTICS_TO_ALL_INDEXES";
     public static final String MYSQL_DESCRIBE_TABLE_RULE = "MYSQL_DESCRIBE_TABLE_TO_USER_TAB_COLUMNS";
     public static final String MYSQL_INSERT_IGNORE_TO_DM_MERGE_RULE = "MYSQL_INSERT_IGNORE_TO_DM_MERGE";
+    public static final String MYSQL_UPSERT_TO_DM_DUPLICATE_HANDLER_RULE =
+            "MYSQL_UPSERT_TO_DM_DUPLICATE_HANDLER";
     public static final String MYSQL_WITH_RECURSIVE_ALIAS_RULE = "MYSQL_WITH_RECURSIVE_COLUMN_ALIAS";
     public static final String MYSQL_UPDATE_JOIN_RULE = "MYSQL_UPDATE_JOIN_TO_DM_UPDATE_FROM";
     public static final String MYSQL_TABLE_ALIAS_AS_RULE = "MYSQL_TABLE_ALIAS_AS_TO_DM";
@@ -1163,6 +1167,12 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if (informationSchemaStatisticsConversion.changed()) {
             converted = informationSchemaStatisticsConversion.convertedSql();
             rules.add(MYSQL_INFORMATION_SCHEMA_STATISTICS_RULE);
+        }
+
+        GenericConversion partitions = convertInformationSchemaPartitionCount(converted);
+        if (partitions.changed()) {
+            converted = partitions.convertedSql();
+            rules.add(MYSQL_INFORMATION_SCHEMA_PARTITIONS_RULE);
         }
 
         GenericConversion currentSchemaFunctionConversion = convertMysqlCurrentSchemaFunctions(converted);
@@ -5964,6 +5974,47 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         return end > start + 3 ? new IdentifierToken(sql.substring(start, end), end) : null;
     }
 
+    private GenericConversion convertInformationSchemaPartitionCount(String sql) {
+        Matcher query = Pattern.compile(
+                "(?is)^(?<prefix>\\s*SELECT\\s+COUNT\\s*\\(\\s*(?:\\*|1)\\s*\\)\\s+FROM\\s+)"
+                        + "information_schema\\s*\\.\\s*partitions\\s+WHERE\\s+"
+                        + "(?<conditions>.+?)(?<suffix>\\s*;?\\s*)$"
+        ).matcher(sql);
+        if (!query.matches()) {
+            return GenericConversion.unchanged(sql);
+        }
+        List<String> predicates = new ArrayList<>();
+        Set<String> fields = new LinkedHashSet<>();
+        for (String condition : splitStrictTopLevelAndPredicates(query.group("conditions"))) {
+            Matcher filter = Pattern.compile("(?is)^\\s*(TABLE_SCHEMA|TABLE_NAME|PARTITION_NAME)"
+                    + "\\s*=\\s*(.+?)\\s*$").matcher(condition);
+            if (!filter.matches()) {
+                return GenericConversion.unchanged(sql);
+            }
+            String field = filter.group(1).toUpperCase(Locale.ROOT);
+            String value = filter.group(2);
+            if (!fields.add(field)) {
+                return GenericConversion.unchanged(sql);
+            }
+            if ("TABLE_SCHEMA".equals(field)) {
+                if (!value.matches("(?is)(?:SCHEMA|DATABASE)\\s*\\(\\s*\\)")) {
+                    return GenericConversion.unchanged(sql);
+                }
+                predicates.add("TABLE_OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID())");
+            } else if (value.matches("'(?:''|[^'\\\\])*'")
+                    || ("PARTITION_NAME".equals(field) && value.matches(MYBATIS_PARAMETER))) {
+                predicates.add(field + " = " + value);
+            } else {
+                return GenericConversion.unchanged(sql);
+            }
+        }
+        if (fields.size() != 3) {
+            return GenericConversion.unchanged(sql);
+        }
+        return new GenericConversion(query.group("prefix") + "ALL_TAB_PARTITIONS WHERE "
+                + String.join(" AND ", predicates) + query.group("suffix"), true);
+    }
+
     private GenericConversion convertInformationSchemaColumns(String sql) {
         GenericConversion descriptorConversion = convertInformationSchemaColumnDescriptors(sql);
         if (descriptorConversion.changed()) {
@@ -9905,6 +9956,86 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private InsertValues readInsertIgnoreSingleSource(String sql) {
         InsertValues valuesInsert = readInsertValues(sql, true);
         return valuesInsert == null ? readInsertIgnoreSelectWithoutFrom(sql) : valuesInsert;
+    }
+
+    public SqlConversionResult convertVerifiedSingleConflictUpsert(String sql, List<String> keyColumns) {
+        OnDuplicateKeyInsert upsert = readOnDuplicateKeyInsert(sql);
+        List<String> keys = normalizedKeyColumns(keyColumns);
+        if (upsert == null || keys.isEmpty()) {
+            return SqlConversionResult.unchanged(sql);
+        }
+        Map<String, InsertColumn> incoming = new LinkedHashMap<>();
+        for (InsertColumn column : upsert.columns()) {
+            if (!column.value().matches(MYBATIS_PARAMETER) || incoming.put(column.name().key(), column) != null) {
+                return SqlConversionResult.unchanged(sql);
+            }
+        }
+        if (!incoming.keySet().containsAll(keys)) {
+            return SqlConversionResult.unchanged(sql);
+        }
+
+        List<String> assignments = new ArrayList<>();
+        Set<String> assigned = new LinkedHashSet<>();
+        Set<String> caseInputs = new LinkedHashSet<>();
+        for (TopLevelArgument raw : splitTopLevelArguments(upsert.updateClause())) {
+            String text = raw.text();
+            UpdateAssignment assignment = readOnDuplicateKeyUpdateAssignment(text, upsert.tableName());
+            if (assignment == null) {
+                Matcher keepOld = Pattern.compile("(?is)^\\s*(?<target>" + DM_IDENTIFIER + ")\\s*=\\s*CASE\\s+WHEN\\s+"
+                        + "(?<status>" + DM_IDENTIFIER + ")\\s+IN\\s*\\((?<states>[^()]*)\\)\\s+THEN\\s+"
+                        + "(?<old>" + DM_IDENTIFIER + ")\\s+ELSE\\s+NULL\\s+END\\s*$").matcher(text);
+                if (!keepOld.matches()) {
+                    return SqlConversionResult.unchanged(sql);
+                }
+                IdentifierName target = readIdentifierName(keepOld.group("target"), false);
+                IdentifierName status = readIdentifierName(keepOld.group("status"), false);
+                List<TopLevelArgument> states = splitTopLevelArguments(keepOld.group("states"));
+                if (target == null || status == null || !target.key().equals(identifierKey(keepOld.group("old")))
+                        || states.isEmpty() || states.stream().anyMatch(state ->
+                                !state.text().strip().matches("'(?:''|[^'\\\\])*'"))) {
+                    return SqlConversionResult.unchanged(sql);
+                }
+                caseInputs.add(status.key());
+                assignment = new UpdateAssignment(target, "CASE WHEN " + qualifiedIdentifier("t", status)
+                        + " IN (" + keepOld.group("states") + ") THEN "
+                        + qualifiedIdentifier("t", target) + " ELSE NULL END", false, false);
+            }
+            if (!assigned.add(assignment.column().key())) {
+                return SqlConversionResult.unchanged(sql);
+            }
+            // Only direct VALUES references or expressions that use the current row are supported here.
+            if (!assignment.valuesReference() && !assignment.requiredSourceColumn().isBlank()) {
+                return SqlConversionResult.unchanged(sql);
+            }
+            if (assignment.noOp()) {
+                continue;
+            }
+            String expression = assignment.sourceExpression();
+            if (assignment.valuesReference()) {
+                InsertColumn source = incoming.get(identifierKey(expression));
+                if (source == null) {
+                    return SqlConversionResult.unchanged(sql);
+                }
+                expression = source.value();
+            }
+            assignments.add(dmIdentifier(assignment.column().text()) + " = " + expression);
+        }
+        if (caseInputs.isEmpty() || caseInputs.stream().anyMatch(assigned::contains) || assignments.isEmpty()) {
+            return SqlConversionResult.unchanged(sql);
+        }
+
+        InsertValues insert = upsert.toInsertValues();
+        String predicates = keys.stream().map(incoming::get)
+                .map(column -> qualifiedIdentifier("t", column.name()) + " = " + column.value())
+                .collect(java.util.stream.Collectors.joining(" AND "));
+        String converted = insert.prefix() + "BEGIN\n    "
+                + sql.substring(insert.insertIndex(), insert.valuesCloseIndex() + 1) + ";\n"
+                + "EXCEPTION\n    WHEN DUP_VAL_ON_INDEX THEN\n"
+                + "        UPDATE " + upsert.tableName() + " t SET " + String.join(", ", assignments) + "\n"
+                + "        WHERE " + predicates + ";\n"
+                + "        IF SQL%ROWCOUNT <> 1 THEN\n            RAISE;\n        END IF;\nEND;";
+        return new SqlConversionResult(sql, converted, true, false, "",
+                List.of(MYSQL_UPSERT_TO_DM_DUPLICATE_HANDLER_RULE));
     }
 
     private UpsertConversion convertOnDuplicateKeyUpdate(String sql, List<String> keyColumns) {

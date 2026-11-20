@@ -7618,7 +7618,7 @@ class SqlScriptMigrator {
         }
 
         // Inspect ownership before temporary DDL is rewritten or declarations moved.
-        String cleanupHandlerSql = convertMysqlRollbackCleanupHandler(converted);
+        String cleanupHandlerSql = convertMysqlTemporaryCleanupHandler(converted);
         if (!cleanupHandlerSql.equals(converted)) {
             converted = cleanupHandlerSql;
             rules.add(MYSQL_PROCEDURE_SQL_EXCEPTION_HANDLER_TO_DM_BLOCK_RULE);
@@ -10723,7 +10723,7 @@ class SqlScriptMigrator {
         return cursor == 0 ? sql : converted.append(sql.substring(cursor)).toString();
     }
 
-    private String convertMysqlRollbackCleanupHandler(String sql) {
+    private String convertMysqlTemporaryCleanupHandler(String sql) {
         return containsIgnoreCase(sql, "DROP") && containsIgnoreCase(sql, "TEMPORARY")
                 ? convertMysqlSqlExceptionExitHandler(sql, true) : sql;
     }
@@ -10764,6 +10764,8 @@ class SqlScriptMigrator {
                 && handlerBody.charAt(rollbackEnd) == ';'
                 && skipWhitespaceAndComments(handlerBody, rollbackEnd + 1) == handlerBody.length();
         String withoutHandler = sql.substring(0, handlerStart) + sql.substring(handlerEnd);
+        ConditionalTemporaryCleanup conditionalCleanup = allowTemporaryCleanup
+                ? verifiedConditionalTemporaryCleanup(withoutHandler, handlerBody) : null;
         boolean conditionalRollback = Pattern.compile(
                 "(?is)^\\s*IF\\s+[A-Za-z_][A-Za-z0-9_$]*\\s*=\\s*[01]\\s+THEN\\s+ROLLBACK\\s*;\\s*END\\s+IF\\s*;\\s*$")
                 .matcher(replaceIgnoredSqlWithSpaces(handlerBody)).matches();
@@ -10774,6 +10776,10 @@ class SqlScriptMigrator {
                 handlerBody = cleanup;
                 rollbackAndRethrow = true;
             }
+        }
+        if (conditionalCleanup != null) {
+            withoutHandler = conditionalCleanup.procedure();
+            handlerBody = conditionalCleanup.handler();
         }
         for (String unsupported : List.of(
                 "DECLARE",
@@ -10792,7 +10798,8 @@ class SqlScriptMigrator {
         )) {
             if (containsKeywordOutsideIgnoredText(handlerBody, unsupported)
                     && !(rollbackAndRethrow && "ROLLBACK".equals(unsupported))
-                    && !(conditionalRollback && List.of("IF", "END", "ROLLBACK").contains(unsupported))) {
+                    && !(conditionalRollback && List.of("IF", "END", "ROLLBACK").contains(unsupported))
+                    && !(conditionalCleanup != null && List.of("IF", "END").contains(unsupported))) {
                 return sql;
             }
         }
@@ -10827,6 +10834,69 @@ class SqlScriptMigrator {
         return withoutHandler.substring(0, procedureEndIndex)
                 + exceptionClause
                 + withoutHandler.substring(procedureEndIndex);
+    }
+
+    private ConditionalTemporaryCleanup verifiedConditionalTemporaryCleanup(String procedure, String body) {
+        Matcher cleanup = Pattern.compile(
+                "(?is)^\\s*IF\\s+(?<flag>[A-Za-z_][A-Za-z0-9_$]*)\\s*=\\s*1\\s+THEN\\s+"
+                        + "(?<drop>DROP\\s+TEMPORARY\\s+TABLE\\s+IF\\s+EXISTS\\s+(?<table>"
+                        + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*;)\\s*END\\s+IF\\s*;\\s*$"
+        ).matcher(removeSqlCommentsPreservingLineBreaks(body));
+        if (!cleanup.matches()) {
+            return null;
+        }
+        String flag = Pattern.quote(cleanup.group("flag"));
+        String declarations = replaceIgnoredSqlWithSpaces(procedure);
+        if (!Pattern.compile("(?is)\\bDECLARE\\s+" + flag
+                        + "\\s+(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT)\\s+DEFAULT\\s+0\\s*;")
+                .matcher(declarations).find()) {
+            return null;
+        }
+        String table = normalizedTableKey(cleanup.group("table"));
+        List<TemporaryTableEvent> tableEvents = procedureTemporaryTableEvents(procedure).stream()
+                .filter(event -> event.tableKey().equals(table))
+                .toList();
+        if (tableEvents.size() != 2 || !tableEvents.get(0).created() || tableEvents.get(1).created()
+                || !isDirectProcedureBodyStatement(procedure, tableEvents.get(0).position())
+                || !isDirectProcedureBodyStatement(procedure, tableEvents.get(1).position())) {
+            return null;
+        }
+        int afterCreate = findStatementTerminator(procedure, tableEvents.get(0).position()) + 1;
+        if (afterCreate >= procedure.length()) {
+            return null;
+        }
+        int flagAssignment = skipWhitespaceAndComments(procedure, afterCreate);
+        if (!Pattern.compile("(?is)SET\\s+" + flag + "\\s*=\\s*1\\s*;")
+                .matcher(procedure).region(flagAssignment, procedure.length()).lookingAt()) {
+            return null;
+        }
+        int dropStart = tableEvents.get(1).position();
+        int dropEnd = findStatementTerminator(procedure, dropStart);
+        if (dropEnd >= procedure.length()) {
+            return null;
+        }
+        String dropSql = procedure.substring(dropStart, dropEnd);
+        Matcher successDrop = Pattern.compile("(?is)^DROP\\s+TEMPORARY\\s+TABLE\\s+"
+                + "(?:IF\\s+EXISTS\\s+)?(?<table>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*$")
+                .matcher(removeSqlCommentsPreservingLineBreaks(dropSql));
+        int reset = skipWhitespaceAndComments(procedure, dropEnd + 1);
+        if (!successDrop.matches() || !table.equals(normalizedTableKey(successDrop.group("table")))
+                || !Pattern.compile("(?is)SET\\s+" + flag + "\\s*=\\s*0\\s*;\\s*END\\s*;?\\s*")
+                        .matcher(declarations).region(reset, procedure.length()).matches()) {
+            return null;
+        }
+        String delete = verifiedRollbackTemporaryCleanup(procedure, cleanup.group("drop"), 0);
+        if (delete == null) {
+            return null;
+        }
+        String procedureWithCleanup = procedure.substring(0, dropStart) + "DELETE FROM "
+                + successDrop.group("table") + extractSqlComments(dropSql) + procedure.substring(dropEnd);
+        String handler = "IF " + cleanup.group("flag") + " = 1 THEN\n    "
+                + delete.strip() + "\nEND IF;\n" + extractSqlComments(body);
+        return new ConditionalTemporaryCleanup(procedureWithCleanup, handler);
+    }
+
+    private record ConditionalTemporaryCleanup(String procedure, String handler) {
     }
 
     private String verifiedRollbackTemporaryCleanup(String procedure, String body, int afterRollback) {
@@ -13349,45 +13419,10 @@ class SqlScriptMigrator {
         if (!isCreateRoutineStatement(sql)) {
             return sql;
         }
-        Pattern pattern = Pattern.compile(
-                "(?im)^(?<indent>[\\t ]*)SELECT\\s+"
-                        + "(?<expression>[^;\\r\\n]+?)\\s+FROM\\s+"
-                        + "(?<from>[^;\\r\\n]+?)\\s+"
-                        + "(?:\"into\"|INTO)\\s+"
-                        + "(?<variables>[A-Za-z_][A-Za-z0-9_$]*"
-                        + "(?:\\s*,\\s*[A-Za-z_][A-Za-z0-9_$]*)*)\\s*(?=;)"
-        );
-        Matcher matcher = pattern.matcher(sql);
-        StringBuilder converted = new StringBuilder(sql.length());
-        boolean changed = false;
-        while (matcher.find()) {
-            matcher.appendReplacement(
-                    converted,
-                    Matcher.quoteReplacement(
-                            matcher.group("indent")
-                                    + "SELECT "
-                                    + matcher.group("expression").strip()
-                                    + " INTO "
-                                    + matcher.group("variables").strip()
-                                    + " FROM "
-                                    + matcher.group("from").strip()
-                    )
-            );
-            changed = true;
-        }
-        if (!changed) {
-            converted.append(sql);
-        } else {
-            matcher.appendTail(converted);
-        }
-        return convertMultilineMysqlTrailingSelectInto(converted.toString());
-    }
-
-    private String convertMultilineMysqlTrailingSelectInto(String sql) {
         StringBuilder converted = new StringBuilder(sql.length());
         int copyStart = 0;
         int index = 0;
-        boolean changed = false;
+        int depth = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
             if (current == '\'') {
@@ -13400,23 +13435,52 @@ class SqlScriptMigrator {
                 index = skipUntilLineEnd(sql, index);
             } else if (startsBlockComment(sql, index)) {
                 index = skipUntilBlockCommentEnd(sql, index);
-            } else if (startsKeyword(sql, index, "SELECT")) {
+            } else if (current == '(') {
+                depth++;
+                index++;
+            } else if (current == ')') {
+                depth = Math.max(0, depth - 1);
+                index++;
+            } else if (depth == 0 && startsKeyword(sql, index, "SELECT")) {
                 int terminator = findStatementTerminator(sql, index);
                 String query = sql.substring(index, terminator);
-                int fromIndex = topLevelKeywordIndex(query, "FROM");
-                int intoIndex = topLevelKeywordIndex(query, "INTO");
-                if (fromIndex >= 0 && intoIndex > fromIndex) {
-                    String variables = query.substring(intoIndex + "INTO".length()).strip();
-                    if (Pattern.compile(
-                            "(?is)^[A-Za-z_][A-Za-z0-9_$]*(?:\\s*,\\s*[A-Za-z_][A-Za-z0-9_$]*)*$"
-                    ).matcher(variables).matches()) {
-                        String replacement = query.substring(0, fromIndex).stripTrailing()
-                                + " INTO " + variables + " "
-                                + query.substring(fromIndex, intoIndex).strip();
-                        converted.append(sql, copyStart, index).append(replacement);
+                String withoutComments = removeSqlCommentsPreservingLineBreaks(query);
+                String searchable = replaceIgnoredSqlWithSpaces(withoutComments);
+                int fromIndex = topLevelKeywordIndex(searchable, "FROM");
+                Matcher output = Pattern.compile(
+                        "(?is)(?<into>\\bINTO\\b|\"into\")\\s+"
+                                + "(?<variables>[A-Za-z_][A-Za-z0-9_$]*(?:\\s*,\\s*[A-Za-z_][A-Za-z0-9_$]*)*)\\s*$"
+                ).matcher(withoutComments);
+                if (output.find()) {
+                    int intoIndex = output.start("into");
+                    int intoLength = output.group("into").length();
+                    // Keep the old quoted INTO compatibility while still checking nesting.
+                    if (intoLength == 6) {
+                        searchable = searchable.substring(0, intoIndex) + " INTO "
+                                + searchable.substring(intoIndex + intoLength);
+                        intoIndex++;
+                    }
+                    if (topLevelKeywordIndex(searchable, "INTO") == intoIndex
+                            && (fromIndex < 0 || fromIndex < intoIndex)) {
+                        int projectionEnd = fromIndex < 0 ? output.start("into") : fromIndex;
+                        String projection = query.substring(0, projectionEnd).stripTrailing();
+                        boolean projectionEndsInComment = projection.length()
+                                > withoutComments.substring(0, projectionEnd).stripTrailing().length();
+                        String source = fromIndex < 0
+                                ? "FROM DUAL" : query.substring(fromIndex, output.start("into")).strip();
+                        boolean sourceEndsInComment = fromIndex >= 0 && source.length()
+                                > withoutComments.substring(fromIndex, output.start("into")).strip().length();
+                        String arguments = query.substring(output.end("into"), output.end("variables")).strip();
+                        converted.append(sql, copyStart, index)
+                                .append(projection).append(projectionEndsInComment ? "\n" : " ")
+                                .append("INTO ").append(arguments).append(' ').append(source);
+                        String trailing = query.substring(output.end("variables")).stripTrailing();
+                        converted.append(sourceEndsInComment ? "\n" : "").append(trailing);
+                        if (!trailing.isBlank()) {
+                            converted.append('\n');
+                        }
                         copyStart = terminator;
                         index = terminator;
-                        changed = true;
                         continue;
                     }
                 }
@@ -13425,7 +13489,7 @@ class SqlScriptMigrator {
                 index++;
             }
         }
-        if (!changed) {
+        if (copyStart == 0) {
             return sql;
         }
         return converted.append(sql.substring(copyStart)).toString();

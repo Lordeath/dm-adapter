@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -33,6 +34,86 @@ class ReportedMapperCompatibilityTest {
 
     @TempDir
     Path root;
+
+    @Test
+    void preservesConflictKeyAssignmentAndExistingStatusAfterAVerifiedDuplicate() throws Exception {
+        String xml = mapper("""
+                <insert id="upsertRecord">
+                    INSERT INTO sample_record (unique_code, hit_count, result_text)
+                    VALUES (#{code}, #{hits}, #{result})
+                    ON DUPLICATE KEY UPDATE
+                        unique_code = VALUES(unique_code), hit_count = hit_count + 1,
+                        result_text = CASE WHEN state_code IN ('DONE', 'IGNORED') THEN result_text ELSE NULL END
+                </insert>
+                """);
+        MapperMigrationResult preview = migrate(xml,
+                new SqlRewriteConfig(Map.of(), Map.of(METHOD, List.of("unique_code"))));
+        assertThat(preview.manualReviewItems()).hasSize(1);
+        List<RewriteConfigCandidate> candidates = new MigrateCommand().rewriteConfigCandidates(preview);
+        TableConstraint primary = new TableConstraint("sample_pk", TableConstraint.ConstraintType.PRIMARY_KEY,
+                List.of("generated_id"));
+        TableConstraint business = new TableConstraint("sample_uk", TableConstraint.ConstraintType.UNIQUE_KEY,
+                List.of("unique_code"));
+        var context = AdapterContext.builder(root).dryRun(true).build();
+        Path cfg = root.resolve("sample-rewrite.yml");
+        var metadata = new TableKeyMetadata("sample_record", List.of(primary, business), true,
+                Set.of("generated_id"));
+        var update = new SqlRewriteConfigUpdater().update(context, cfg, SqlRewriteConfig.empty(),
+                candidates, Map.of("sample_record", metadata), true);
+        assertThat(update.rewriteConfig().verifiedSingleConflictKeys()).containsKey(METHOD);
+        MapperMigrationResult result = migrate(xml, update.rewriteConfig());
+        assertThat(result.manualReviewItems()).isEmpty();
+        BoundSql sql = boundSql(Files.readString(output()));
+        assertThat(sql.getSql()).containsIgnoringCase("WHEN DUP_VAL_ON_INDEX")
+                .containsIgnoringCase("unique_code = ?")
+                .containsIgnoringCase("CASE WHEN t.state_code IN")
+                .containsIgnoringCase("SQL%ROWCOUNT <> 1");
+        assertThat(sql.getParameterMappings()).extracting(mapping -> mapping.getProperty())
+                .containsExactly("code", "hits", "result", "code", "code");
+
+        TableConstraint other = new TableConstraint("sample_other", TableConstraint.ConstraintType.UNIQUE_KEY,
+                List.of("result_text"));
+        metadata = new TableKeyMetadata("sample_record", List.of(primary, business, other), true,
+                Set.of("generated_id"));
+        update = new SqlRewriteConfigUpdater().update(context, cfg, SqlRewriteConfig.empty(),
+                candidates, Map.of("sample_record", metadata), true);
+        assertThat(update.rewriteConfig().verifiedSingleConflictKeys()).isEmpty();
+        assertThat(migrate(xml, update.rewriteConfig()).manualReviewItems()).hasSize(1);
+    }
+
+    @Test
+    void rendersOrderedBatchWithTheOldOrFirstNonNullValue() throws Exception {
+        String xml = mapper("""
+                <insert id="upsertRecord">
+                    INSERT INTO sample_record (sample_id, created_at, hit_count) VALUES
+                    <foreach collection="rows" item="row" separator=",">
+                        (#{row.id}, #{row.createdAt,jdbcType=TIMESTAMP}, #{row.hits})
+                    </foreach>
+                    ON DUPLICATE KEY UPDATE
+                        created_at = IFNULL(created_at, VALUES(created_at)), hit_count = VALUES(hit_count)
+                </insert>
+                """);
+        MapperMigrationResult result = migrate(xml,
+                new SqlRewriteConfig(Map.of(), Map.of(METHOD, List.of("sample_id"))));
+        assertThat(result.manualReviewItems()).isEmpty();
+        var row = Map.of("id", 1, "hits", 2, "createdAt", java.sql.Timestamp.valueOf("2000-01-01 10:00:00"));
+        BoundSql sql = boundSql(Files.readString(output()), Map.of("rows", List.of(row, row)));
+        assertThat(sql.getSql().trim()).startsWith("BEGIN").endsWith("END;")
+                .containsIgnoringCase("IFNULL(t.created_at, s.created_at)")
+                .doesNotContainIgnoringCase("ON DUPLICATE KEY UPDATE");
+        assertThat(Pattern.compile("(?i)MERGE INTO").matcher(sql.getSql()).results().count()).isEqualTo(2);
+        assertThat(sql.getParameterMappings()).hasSize(6);
+    }
+
+    private String mapper(String statement) {
+        return """
+                <?xml version="1.0" encoding="UTF-8" ?>
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.mapper.SampleRecordMapper">
+                %s
+                </mapper>
+                """.formatted(statement);
+    }
 
     @Test
     void extractsUpsertCandidateColumnsFromStaticIncludes() throws Exception {
@@ -132,10 +213,14 @@ class ReportedMapperCompatibilityTest {
     }
 
     private BoundSql boundSql(String xml) {
+        return boundSql(xml, Map.of());
+    }
+
+    private BoundSql boundSql(String xml, Map<String, ?> args) {
         Configuration configuration = new Configuration();
         new XMLMapperBuilder(new StringReader(xml), configuration, "SampleRecordMapper.xml",
                 configuration.getSqlFragments()).parse();
-        return configuration.getMappedStatement(METHOD).getBoundSql(Map.of());
+        return configuration.getMappedStatement(METHOD).getBoundSql(args);
     }
 
     private Path output() {

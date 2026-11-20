@@ -23,6 +23,70 @@ class ReportedSqlScriptCompatibilityTest {
     Path root;
 
     @Test
+    void assignsScalarSubqueryAtTheOuterSelect() throws Exception {
+        Converted converted = migrate("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_assign()
+                BEGIN
+                    DECLARE sample_value BIGINT;
+                    SELECT COALESCE((SELECT value_no FROM sample_versions LIMIT 1), 1) INTO sample_value;
+                    SELECT COALESCE((SELECT value_no FROM sample_versions LIMIT 1), 1)
+                    FROM sample_records WHERE id = 1 INTO sample_value;
+                END$$
+                DELIMITER ;
+                """, "001.sql");
+
+        assertFullyConverted(converted);
+        assertThat(converted.sql())
+                .contains("COALESCE((SELECT value_no FROM sample_versions LIMIT 1), 1) INTO sample_value FROM DUAL")
+                .contains("COALESCE((SELECT value_no FROM sample_versions LIMIT 1), 1) INTO sample_value FROM sample_records")
+                .doesNotContain("SELECT value_no INTO");
+    }
+
+    @Test
+    void preservesConditionalOwnedTemporaryCleanupAndRethrows() throws Exception {
+        Converted converted = migrate(conditionalCleanup("sample_work"), "001.sql");
+
+        assertFullyConverted(converted);
+        assertThat(converted.sql())
+                .containsPattern("(?is)EXCEPTION\\s+WHEN OTHERS THEN\\s+IF initialized = 1 THEN\\s+DELETE FROM sample_work;\\s+END IF;\\s+RAISE;")
+                .containsPattern("(?is)INSERT INTO sample_work.+?;\\s+DELETE FROM sample_work;\\s+initialized := 0;")
+                .doesNotContainIgnoringCase("ROLLBACK");
+    }
+
+    @Test
+    void retainsHandlerWhenExceptionWouldDropAnUnownedTable() throws Exception {
+        Converted converted = migrate(conditionalCleanup("sample_other"), "001.sql");
+
+        assertThat(converted.report().manualReviewItems()).isNotEmpty();
+        assertThat(converted.sql()).contains("DROP TEMPORARY TABLE IF EXISTS sample_other");
+    }
+
+    private String conditionalCleanup(String cleanupTable) {
+        return """
+                DELIMITER $$
+                CREATE PROCEDURE sample_cleanup()
+                BEGIN
+                    DECLARE initialized TINYINT DEFAULT 0;
+                    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+                    BEGIN
+                        IF initialized = 1 THEN
+                            DROP TEMPORARY TABLE IF EXISTS %s;
+                        END IF;
+                        RESIGNAL;
+                    END;
+                    DROP TEMPORARY TABLE IF EXISTS sample_work;
+                    CREATE TEMPORARY TABLE sample_work (sample_id BIGINT NOT NULL PRIMARY KEY);
+                    SET initialized = 1;
+                    INSERT INTO sample_work (sample_id) VALUES (1);
+                    DROP TEMPORARY TABLE sample_work;
+                    SET initialized = 0;
+                END$$
+                DELIMITER ;
+                """.formatted(cleanupTable);
+    }
+
+    @Test
     void convertsCombinedTableAndColumnGuardsWithoutDroppingEitherCheck() throws Exception {
         Converted converted = migrate("""
                 SET @sample_sql = IF(

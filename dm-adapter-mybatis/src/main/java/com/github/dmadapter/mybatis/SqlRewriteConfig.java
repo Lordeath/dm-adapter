@@ -15,7 +15,8 @@ public record SqlRewriteConfig(
         Set<String> ignoredMissingSchemas,
         Set<String> identityInsertTables,
         Map<String, String> upsertKeyResolutions,
-        Map<String, List<List<String>>> methodConflictKeyGroups
+        Map<String, List<List<String>>> methodConflictKeyGroups,
+        Map<String, List<String>> verifiedSingleConflictKeys
 ) {
     public static final String ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY =
             "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
@@ -23,6 +24,20 @@ public record SqlRewriteConfig(
             "KEY_METADATA_UNAVAILABLE";
     public static final String MANUAL_KEY_COLUMNS_REQUIRED =
             "MANUAL_KEY_COLUMNS_REQUIRED";
+
+    public SqlRewriteConfig(
+            Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Set<String> ignoredMissingTables,
+            Set<String> ignoredMissingColumns,
+            Set<String> ignoredMissingSchemas,
+            Set<String> identityInsertTables,
+            Map<String, String> upsertKeyResolutions,
+            Map<String, List<List<String>>> methodConflictKeyGroups
+    ) {
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, ignoredMissingColumns,
+                ignoredMissingSchemas, identityInsertTables, upsertKeyResolutions, methodConflictKeyGroups, Map.of());
+    }
 
     public SqlRewriteConfig(
             Map<String, List<String>> tableKeyColumns,
@@ -104,6 +119,7 @@ public record SqlRewriteConfig(
         identityInsertTables = normalizeTables(identityInsertTables);
         upsertKeyResolutions = normalizeMethodResolutions(upsertKeyResolutions);
         methodConflictKeyGroups = normalizeMethodConflictKeyGroups(methodConflictKeyGroups);
+        verifiedSingleConflictKeys = normalizeMethodKeys(verifiedSingleConflictKeys);
     }
 
     public static SqlRewriteConfig empty() {
@@ -118,7 +134,8 @@ public record SqlRewriteConfig(
                 && ignoredMissingSchemas.isEmpty()
                 && identityInsertTables.isEmpty()
                 && upsertKeyResolutions.isEmpty()
-                && methodConflictKeyGroups.isEmpty();
+                && methodConflictKeyGroups.isEmpty()
+                && verifiedSingleConflictKeys.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {

@@ -12,6 +12,22 @@ class MySqlToDmSqlConverterTest {
     private final MySqlToDmSqlConverter converter = new MySqlToDmSqlConverter();
 
     @Test
+    void rewritesPartitionExistenceForCurrentSchemaAndKeepsBinding() {
+        String sql = "select count(*) from information_schema.partitions where table_schema = schema()"
+                + " and table_name = 'SAMPLE_RECORD' and partition_name = #{partitionName,jdbcType=VARCHAR}";
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_INFORMATION_SCHEMA_PARTITIONS_RULE);
+        assertThat(result.convertedSql()).contains("ALL_TAB_PARTITIONS",
+                "TABLE_OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID())",
+                "TABLE_NAME = 'SAMPLE_RECORD'", "PARTITION_NAME = #{partitionName,jdbcType=VARCHAR}");
+
+        assertThat(converter.convert(sql + " OR PARTITION_NAME IS NULL").manualReviewRequired()).isTrue();
+        assertThat(converter.convert(sql.replace("schema()", "'ANOTHER_SCHEMA'")).manualReviewRequired()).isTrue();
+    }
+
+    @Test
     void leavesIfnullAndNowNative() {
         SqlConversionResult result = converter.convert("select IFNULL(name, 'n/a'), NOW() from user");
 
