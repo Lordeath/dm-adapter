@@ -544,6 +544,103 @@ class DamengSqlScriptIntegrationTest {
     }
 
     @Test
+    void updatesChildOnlyWhenExactlyOneParentMatches() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String table = "SAMPLE_RELATION_" + Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        List<String> converted = migrateIntegrationFixture("relation.sql", """
+                UPDATE %1$s
+                SET parent_id = (SELECT p.id FROM
+                    (SELECT MIN(id) AS id FROM %1$s WHERE kind = 'sample_parent' AND active = 1
+                     HAVING COUNT(1) = 1) p),
+                    note = 'sample updated'
+                WHERE kind = 'sample_child' AND tenant_id = 7
+                  AND EXISTS (SELECT 1 FROM
+                    (SELECT MIN(id) AS id FROM %1$s WHERE kind = 'sample_parent' AND active = 1
+                     HAVING COUNT(1) = 1) p);
+                """.formatted(table), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute("CREATE TABLE " + table + " (id INT PRIMARY KEY, parent_id INT, "
+                        + "kind VARCHAR(40 CHAR), active INT, tenant_id INT, note VARCHAR(40 CHAR))");
+                statement.execute("INSERT INTO " + table + " VALUES (1, 99, 'sample_child', 1, 7, 'sample old'),"
+                        + " (2, 99, 'sample_child', 1, 8, 'sample unrelated'),"
+                        + " (3, NULL, 'sample_parent', 0, 7, NULL)");
+                executeStatements(statement, converted);
+                assertThat(childRelations(statement, table)).containsExactly(
+                        tuple(1, 99, "sample old"), tuple(2, 99, "sample unrelated"));
+
+                statement.execute("INSERT INTO " + table + " VALUES (4, NULL, 'sample_parent', 1, 7, NULL)");
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+                assertThat(childRelations(statement, table)).containsExactly(
+                        tuple(1, 4, "sample updated"), tuple(2, 99, "sample unrelated"));
+
+                statement.execute("UPDATE " + table + " SET parent_id = 99, note = 'sample old' WHERE id = 1");
+                statement.execute("INSERT INTO " + table + " VALUES (5, NULL, 'sample_parent', 1, 7, NULL)");
+                executeStatements(statement, converted);
+                assertThat(childRelations(statement, table)).containsExactly(
+                        tuple(1, 99, "sample old"), tuple(2, 99, "sample unrelated"));
+            } finally {
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
+    void insertsGuardedExplicitIdentitySelectsAndRestoresSessionState() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String first = "SAMPLE_TREE_A_" + suffix;
+        String second = "SAMPLE_TREE_B_" + suffix;
+        String seed = """
+                CREATE TABLE IF NOT EXISTS %1$s (
+                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    label VARCHAR(40) NOT NULL UNIQUE,
+                    PRIMARY KEY (id)
+                );
+                INSERT INTO %1$s (label, id)
+                SELECT '样例', 1 FROM DUAL
+                WHERE NOT EXISTS (SELECT 1 FROM %1$s WHERE id = 1);
+                """;
+        List<String> converted = migrateIntegrationFixture("trees.sql", seed.formatted(first) + seed.formatted(second), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+                for (String table : List.of(first, second)) {
+                    try (ResultSet rows = statement.executeQuery("SELECT id, label FROM " + table)) {
+                        assertThat(rows.next()).isTrue();
+                        assertThat(rows.getLong(1)).isEqualTo(1);
+                        assertThat(rows.getString(2)).isEqualTo("样例");
+                        assertThat(rows.next()).isFalse();
+                    }
+                }
+
+                statement.execute("DELETE FROM " + first + " WHERE id = 1");
+                statement.execute("SET IDENTITY_INSERT " + first + " ON");
+                statement.execute("INSERT INTO " + first + " (label, id) VALUES ('样例', 2)");
+                statement.execute("SET IDENTITY_INSERT " + first + " OFF");
+                String firstSeed = converted.get(1);
+                assertThatThrownBy(() -> statement.execute(firstSeed))
+                        .isInstanceOf(SQLException.class)
+                        .satisfies(error -> assertThat(((SQLException) error).getErrorCode()).isEqualTo(-6602));
+                assertThatThrownBy(() -> statement.execute("INSERT INTO " + first + " (label, id) VALUES ('other', 70)"))
+                        .isInstanceOf(SQLException.class)
+                        .satisfies(error -> assertThat(((SQLException) error).getErrorCode()).isEqualTo(-2723));
+            } finally {
+                dropQuietly(statement, "SET IDENTITY_INSERT " + first + " OFF");
+                dropQuietly(statement, "SET IDENTITY_INSERT " + second + " OFF");
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + first);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + second);
+            }
+        }
+    }
+
+    @Test
     void executesMixedIdentityValuesTwiceWithExplicitAndGeneratedIds() throws Exception {
         String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
         String username = requiredEnvironment("DM_DB_USERNAME");
@@ -609,6 +706,17 @@ class DamengSqlScriptIntegrationTest {
                 dropQuietly(statement, "SET IDENTITY_INSERT " + table + " OFF");
                 dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
             }
+        }
+    }
+
+    private List<Tuple> childRelations(Statement statement, String table) throws SQLException {
+        try (ResultSet rows = statement.executeQuery("SELECT id, parent_id, note FROM " + table
+                + " WHERE kind = 'sample_child' ORDER BY id")) {
+            List<Tuple> relations = new ArrayList<>();
+            while (rows.next()) {
+                relations.add(tuple(rows.getInt(1), rows.getObject(2), rows.getString(3)));
+            }
+            return relations;
         }
     }
 

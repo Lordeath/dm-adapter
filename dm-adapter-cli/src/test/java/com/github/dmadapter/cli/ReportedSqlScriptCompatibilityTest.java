@@ -23,6 +23,84 @@ class ReportedSqlScriptCompatibilityTest {
     Path root;
 
     @Test
+    void movesTheSingleMatchCountFilterOutsideEachDerivedQuery() throws Exception {
+        Converted converted = migrate("""
+                -- sample parent update
+                UPDATE sample_relation
+                SET parent_id = (SELECT p.dm_adapter_match_count FROM
+                    (SELECT MIN(id) AS dm_adapter_match_count FROM sample_relation
+                     WHERE kind = 'sample_parent' -- keep this filter
+                     HAVING COUNT(*) = 1) AS p), note = 'sample HAVING COUNT(1) = 1'
+                WHERE kind = 'sample_child'
+                  AND EXISTS (SELECT 1 FROM
+                    (SELECT MIN(id) AS id FROM sample_relation WHERE kind = 'sample_parent'
+                     HAVING COUNT(1) = 1) q);
+                """, "sample_parent.sql");
+
+        assertFullyConverted(converted);
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(SqlScriptMigrator.MYSQL_UPDATE_SINGLE_MATCH_AGGREGATE_RULE));
+        assertThat(converted.sql()).containsSubsequence("-- sample parent update",
+                "MIN(id) AS dm_adapter_match_count, COUNT(*) AS dm_adapter_match_count_2",
+                "-- keep this filter\n", ") p WHERE p.dm_adapter_match_count_2 = 1)",
+                "note = 'sample HAVING COUNT(1) = 1'", "WHERE kind = 'sample_child'",
+                "MIN(id) AS id, COUNT(1) AS dm_adapter_match_count", ") q WHERE q.dm_adapter_match_count = 1)");
+        assertThat(Pattern.compile("HAVING COUNT").matcher(converted.sql()).results().count()).isEqualTo(1);
+    }
+
+    @Test
+    void retainsTheWholeUpdateWhenOneMatchCountCannotBeSafelyRewritten() throws Exception {
+        String original = """
+                UPDATE sample_relation SET parent_id = (SELECT p.id FROM
+                    (SELECT MIN(id) AS id FROM sample_relation HAVING COUNT(1) = 1) p)
+                WHERE EXISTS (SELECT 1 FROM
+                    (SELECT MIN(id) AS id FROM sample_relation HAVING COUNT(1) > 1) p);
+                """;
+        Converted converted = migrate(original, "sample_parent.sql");
+
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("HAVING"));
+        assertThat(SqlScriptParser.statements(converted.sql())).isEqualTo(SqlScriptParser.statements(original));
+    }
+
+    @Test
+    void enablesIdentityInsertOnlyForASelectWritingTheKnownIdentityColumn() throws Exception {
+        Converted converted = migrate("""
+                CREATE TABLE sample_seed (id BIGINT IDENTITY(1,1), label VARCHAR(40), PRIMARY KEY (id));
+                CREATE TABLE sample_plain (id BIGINT, label VARCHAR(40), PRIMARY KEY (id));
+                INSERT INTO sample_seed (label, id) SELECT '样例', 1 FROM DUAL
+                WHERE NOT EXISTS (SELECT 1 FROM sample_seed WHERE id = 1) -- sample seed guard
+                ;
+                INSERT INTO sample_seed (label) SELECT '生成' FROM DUAL;
+                INSERT INTO sample_plain (id, label) SELECT 1, '普通' FROM DUAL;
+                """, "sample_seed.sql");
+
+        assertFullyConverted(converted);
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(SqlScriptMigrator.MYSQL_INSERT_EXPLICIT_IDENTITY_SELECT_RULE));
+        List<String> statements = SqlScriptParser.statements(converted.sql());
+        assertThat(statements).hasSize(5);
+        assertThat(statements.get(2)).containsSubsequence("SET IDENTITY_INSERT sample_seed ON",
+                "INSERT INTO sample_seed (label, id) SELECT '样例', 1 FROM DUAL",
+                "WHERE NOT EXISTS (SELECT 1 FROM sample_seed WHERE id = 1) -- sample seed guard\n    ;",
+                "SET IDENTITY_INSERT sample_seed OFF", "WHEN OTHERS THEN", "SET IDENTITY_INSERT sample_seed OFF", "RAISE;");
+        assertThat(statements.subList(3, 5)).noneSatisfy(sql -> assertThat(sql).contains("IDENTITY_INSERT"));
+    }
+
+    @Test
+    void retainsIdentitySelectWithUnresolvedProjectionForReview() throws Exception {
+        String insert = "INSERT INTO sample_seed (id, label) SELECT source_id, label FROM sample_source";
+        String insertZero = "INSERT INTO sample_seed (id, label) SELECT 0, 'sample text' FROM DUAL";
+        Converted converted = migrate("""
+                CREATE TABLE sample_seed (id BIGINT IDENTITY(1,1), label VARCHAR(40), PRIMARY KEY (id));
+                """ + insert + ";\n" + insertZero + ";", "sample_seed.sql");
+
+        assertThat(converted.report().manualReviewItems()).hasSize(2).allSatisfy(item ->
+                assertThat(item.reason()).contains("INSERT SELECT", "IDENTITY"));
+        assertThat(SqlScriptParser.statements(converted.sql())).endsWith(insert, insertZero);
+    }
+
+    @Test
     void convertsSingleConditionalInsertSelectAndPreservesItsVersionPredicate() throws Exception {
         String original = conditionalCopyScript("7");
         Converted converted = migrate(original, "001_system.sql");

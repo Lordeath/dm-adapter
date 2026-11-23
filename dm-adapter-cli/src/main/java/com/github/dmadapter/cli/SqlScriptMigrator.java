@@ -212,6 +212,8 @@ class SqlScriptMigrator {
             "MYSQL_INSERT_NULL_IDENTITY_VALUES_COLUMN_LIST";
     static final String MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST_RULE =
             "MYSQL_INSERT_EXPLICIT_IDENTITY_VALUES_COLUMN_LIST";
+    static final String MYSQL_INSERT_EXPLICIT_IDENTITY_SELECT_RULE = "MYSQL_INSERT_EXPLICIT_IDENTITY_SELECT";
+    static final String MYSQL_UPDATE_SINGLE_MATCH_AGGREGATE_RULE = "MYSQL_UPDATE_SINGLE_MATCH_AGGREGATE";
     static final String DM_RESOURCECOLUMN_INSERT_ONLY_MERGE_RULE =
             "DM_RESOURCECOLUMN_INSERT_ONLY_MERGE";
     static final String ORIGINAL_SQL_DANGLING_INSERT_VALUES_REASON =
@@ -275,6 +277,22 @@ class SqlScriptMigrator {
             "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?:\\s*\\.\\s*(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
+    private static final Pattern UPDATE_DERIVED_SELECT = Pattern.compile(
+            "(?is)\\(\\s*SELECT\\s+(?<value>1|" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+FROM\\s*\\("
+    );
+    private static final Pattern MIN_DERIVED_PROJECTION = Pattern.compile(
+            "(?is)^\\s*SELECT\\s+MIN\\s*\\(\\s*" + SQL_OBJECT_IDENTIFIER_TOKEN + "\\s*\\)\\s+AS\\s+"
+                    + "(?<column>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?=\\s+FROM\\b)"
+    );
+    private static final Pattern SINGLE_MATCH_COUNT = Pattern.compile(
+            "(?is)^HAVING\\s+(?<count>COUNT\\s*\\(\\s*(?:1|\\*)\\s*\\))\\s*=\\s*1\\s*$"
+    );
+    private static final Pattern DERIVED_SELECT_END = Pattern.compile(
+            "(?is)\\s*(?:AS\\s+)?(?<alias>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s*\\)"
+    );
+    private static final Pattern EXPLICIT_IDENTITY_INTEGER_PROJECTION = Pattern.compile(
+            "(?is)^[+-]?0*[1-9]\\d*(?:\\s+(?:AS\\s+)?(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?$"
+    );
     private static final Pattern ALTER_TABLE_BODY_PATTERN = Pattern.compile(
             "(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+(?<body>.+)$"
     );
@@ -4402,6 +4420,11 @@ class SqlScriptMigrator {
                 .contains(MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM_RULE)) {
             convertedBody = restoreDmLocalTemporaryTableNames(convertedBody);
         }
+        RoutineStaticSqlConversion identitySelect = convertExplicitIdentityInsertSelect(convertedBody, scriptIdentityColumns);
+        if (identitySelect.supported() && !identitySelect.sql().equals(convertedBody)) {
+            convertedBody = identitySelect.sql();
+            rules.add(MYSQL_INSERT_EXPLICIT_IDENTITY_SELECT_RULE);
+        }
         String procedureUpdateJoinSql = convertMysqlProcedureUpdateJoins(convertedBody);
         if (!procedureUpdateJoinSql.equals(convertedBody)) {
             convertedBody = procedureUpdateJoinSql;
@@ -4439,6 +4462,8 @@ class SqlScriptMigrator {
             manualReason = safeRuleConversion.manualReviewReason();
         } else if (sqlConversion.manualReviewRequired()) {
             manualReason = sqlConversion.reason();
+        } else if (!identitySelect.supported()) {
+            manualReason = identitySelect.reason();
         } else if (!inlineCreateTableIndexes.manualReviewReason().isBlank()) {
             manualReason = inlineCreateTableIndexes.manualReviewReason();
         } else {
@@ -7099,6 +7124,56 @@ class SqlScriptMigrator {
         return wrapRuntimeCompatibleIdentityInsert(tableToken, statement, replaceNull);
     }
 
+    private RoutineStaticSqlConversion convertExplicitIdentityInsertSelect(
+            String sql,
+            Map<String, String> identityColumns
+    ) {
+        Matcher insert = Pattern.compile("(?is)^\\s*INSERT\\s+INTO\\s+").matcher(sql);
+        if (identityColumns.isEmpty() || !insert.find()) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        SqlIdentifierReference table = sqlIdentifierReferenceAt(sql, insert.end());
+        if (table == null || lastIdentifierSeparator(table.token()) >= 0) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        String identity = identityColumn(identityColumns, table.token());
+        int openParen = skipWhitespaceAndComments(sql, table.end());
+        int closeParen = findMatchingParen(sql, openParen);
+        if (identity == null || closeParen < 0) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        int select = skipWhitespaceAndComments(sql, closeParen + 1);
+        if (!startsKeyword(sql, select, "SELECT")) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        List<String> columns = insertTargetColumns(removeSqlCommentsPreservingLineBreaks(
+                sql.substring(openParen + 1, closeParen)));
+        int identityIndex = identifierIndex(columns, identity);
+        if (identityIndex < 0) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+
+        int projectionStart = skipWhitespaceAndComments(sql, select + "SELECT".length());
+        int projectionEnd = firstDmTopLevelKeywordAfter(sql, projectionStart, List.of(
+                "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH",
+                "UNION", "INTERSECT", "EXCEPT", "MINUS", "INTO", "RETURNING", "FOR"));
+        List<TextRange> projections = splitDmTopLevelRanges(sql, projectionStart, projectionEnd);
+        if (columns.size() == projections.size() && firstDmTopLevelKeywordAfter(sql, select, List.of(
+                "DISTINCT", "UNION", "INTERSECT", "EXCEPT", "MINUS", "RETURNING", "INTO", "FOR")) == sql.length()) {
+            TextRange idProjection = projections.get(identityIndex);
+            String expression = removeSqlCommentsPreservingLineBreaks(
+                    sql.substring(idProjection.start(), idProjection.end())).strip();
+            if (EXPLICIT_IDENTITY_INTEGER_PROJECTION.matcher(expression).matches()) {
+                String uncommented = removeSqlCommentsPreservingLineBreaks(sql);
+                String statement = uncommented.stripTrailing().length() < sql.stripTrailing().length()
+                        ? sql + "\n" : sql;
+                return RoutineStaticSqlConversion.supported(wrapExplicitIdentityInsert(table.token(), statement, false));
+            }
+        }
+        return RoutineStaticSqlConversion.unsupported(
+                "INSERT SELECT 写入已知 IDENTITY 列，但无法确认该列投影是非零整数字面量及其列位置，需人工确认。");
+    }
+
     private String wrapRuntimeCompatibleIdentityInsert(
             String tableToken,
             String statement,
@@ -7702,6 +7777,71 @@ class SqlScriptMigrator {
         return "VARCHAR(4000)";
     }
 
+    private RoutineStaticSqlConversion convertUpdateSingleMatchAggregate(String sql) {
+        Matcher select = UPDATE_DERIVED_SELECT.matcher(sql);
+        if (!startsKeyword(sql, skipWhitespace(sql, 0), "UPDATE") || !select.find()) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        StringBuilder converted = new StringBuilder(sql.length());
+        int copied = 0;
+        for (int index = 0; index < sql.length(); ) {
+            char current = sql.charAt(index);
+            if (current == '\'') {
+                index = skipSingleQuotedString(sql, index);
+            } else if (current == '"') {
+                index = skipDoubleQuotedText(sql, index);
+            } else if (current == '`') {
+                index = skipBacktickIdentifier(sql, index);
+            } else if (startsLineComment(sql, index)) {
+                index = skipUntilLineEnd(sql, index);
+            } else if (startsBlockComment(sql, index)) {
+                index = skipUntilBlockCommentEnd(sql, index);
+            } else if (current == '(' && select.region(index, sql.length()).lookingAt()) {
+                int open = select.end() - 1;
+                int close = findMatchingParen(sql, open);
+                if (close < 0) {
+                    break;
+                }
+                String query = sql.substring(open + 1, close);
+                Matcher projection = MIN_DERIVED_PROJECTION.matcher(query);
+                int having = dmTopLevelKeywordIndexAfter(query, "HAVING", 0);
+                if (having >= 0 && projection.find() && dmTopLevelKeywordIndexAfter(query, "GROUP", 0) < 0) {
+                    Matcher count = SINGLE_MATCH_COUNT.matcher(query.substring(having));
+                    Matcher alias = DERIVED_SELECT_END.matcher(sql).region(close + 1, sql.length());
+                    String projectedValue = select.group("value");
+                    String minColumn = unquoteIdentifier(projection.group("column"));
+                    boolean knownProjection = "1".equals(projectedValue)
+                            || minColumn.equalsIgnoreCase(unquoteIdentifier(lastIdentifierPart(projectedValue)));
+                    if (!count.matches() || !alias.lookingAt() || !knownProjection || firstDmTopLevelKeywordAfter(
+                            query, projection.end(), List.of("UNION", "INTERSECT", "EXCEPT", "MINUS", "INTO"))
+                            < query.length()) {
+                        return RoutineStaticSqlConversion.unsupported(
+                                "UPDATE 派生查询的 HAVING 无法安全改写为单行计数筛选，需人工确认。");
+                    }
+                    String countColumn = "dm_adapter_match_count";
+                    if (countColumn.equalsIgnoreCase(minColumn)) {
+                        countColumn += "_2";
+                    }
+                    int filterStart = open + 1 + projection.end();
+                    int havingStart = open + 1 + having;
+                    converted.append(sql, copied, filterStart)
+                            .append(", ").append(count.group("count")).append(" AS ").append(countColumn)
+                            .append(sql, filterStart, havingStart)
+                            .append(sql, close, alias.end() - 1)
+                            .append(" WHERE ").append(alias.group("alias")).append('.').append(countColumn)
+                            .append(" = 1)");
+                    copied = alias.end();
+                    index = copied;
+                    continue;
+                }
+                index++;
+            } else {
+                index++;
+            }
+        }
+        return RoutineStaticSqlConversion.supported(converted.append(sql, copied, sql.length()).toString());
+    }
+
     private SafeRuleConversion applyScriptSafeRules(
             String sql,
             Map<String, LinkedHashSet<String>> scriptTableColumns,
@@ -7714,6 +7854,15 @@ class SqlScriptMigrator {
         }
         String converted = sql;
         List<String> rules = new ArrayList<>();
+
+        RoutineStaticSqlConversion countGuardUpdate = convertUpdateSingleMatchAggregate(converted);
+        if (!countGuardUpdate.supported()) {
+            return new SafeRuleConversion(sql, false, List.of(), countGuardUpdate.reason());
+        }
+        if (!countGuardUpdate.sql().equals(converted)) {
+            converted = countGuardUpdate.sql();
+            rules.add(MYSQL_UPDATE_SINGLE_MATCH_AGGREGATE_RULE);
+        }
 
         String sourceIndexNameSql = synchronizeSchemaScopedIndexNames(converted);
         if (!sourceIndexNameSql.equals(converted)) {
