@@ -6814,6 +6814,79 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsGuardedIntegerColumnChangesWithRenameLast() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS sample_rename_columns;
+                DELIMITER $$
+                CREATE PROCEDURE sample_rename_columns()
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_receipt'
+                          AND COLUMN_NAME = 'sampleOldFlag')
+                      AND NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_receipt'
+                          AND COLUMN_NAME = 'sampleNewFlag') THEN
+                        ALTER TABLE sample_receipt
+                            CHANGE COLUMN `sampleOldFlag` `sampleNewFlag` TINYINT(1) DEFAULT '0'
+                            COMMENT 'sample flag';
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_receipt'
+                          AND COLUMN_NAME = 'sampleOldId')
+                      AND NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_receipt'
+                          AND COLUMN_NAME = 'sampleNewId') THEN
+                        ALTER TABLE sample_receipt
+                            CHANGE COLUMN `sampleOldId` `sampleNewId` BIGINT DEFAULT NULL
+                            COMMENT 'sample owner''s id';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_rename_columns();
+                DROP PROCEDURE IF EXISTS sample_rename_columns;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).containsSubsequence("DECLARE",
+                        "IF dm_adapter_exists > 0 AND dm_adapter_exists_2 = 0 THEN",
+                        "MODIFY `sampleOldFlag` TINYINT NULL DEFAULT ''0''",
+                        "COMMENT ON COLUMN sample_receipt.`sampleOldFlag` IS ''sample flag''",
+                        "RENAME COLUMN `sampleOldFlag` TO `sampleNewFlag`", "END IF;",
+                        "IF dm_adapter_exists_3 > 0 AND dm_adapter_exists_4 = 0 THEN",
+                        "MODIFY `sampleOldId` BIGINT NULL DEFAULT NULL",
+                        "COMMENT ON COLUMN sample_receipt.`sampleOldId` IS ''sample owner''''s id''",
+                        "RENAME COLUMN `sampleOldId` TO `sampleNewId`", "END IF;")
+                .doesNotContain("CHANGE COLUMN", "CREATE OR REPLACE PROCEDURE", "TINYINT(1)");
+    }
+
+    @Test
+    void keepsUnguardedAndMismatchedColumnChangesForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                ALTER TABLE sample_receipt CHANGE COLUMN sampleOldId sampleNewId BIGINT DEFAULT NULL COMMENT 'sample';
+                DELIMITER $$
+                CREATE PROCEDURE sample_rename_columns()
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_receipt'
+                          AND COLUMN_NAME = 'sampleOldId')
+                      AND NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_receipt'
+                          AND COLUMN_NAME = 'sampleOtherId') THEN
+                        ALTER TABLE sample_receipt
+                            CHANGE COLUMN sampleOldId sampleNewId BIGINT DEFAULT NULL COMMENT 'sample';
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).hasSize(2).allSatisfy(item ->
+                assertThat(item.reason()).contains("CHANGE COLUMN", "存在性检查"));
+        assertThat(converted.sql())
+                .contains("CHANGE COLUMN sampleOldId sampleNewId BIGINT DEFAULT NULL COMMENT 'sample'")
+                .doesNotContain("RENAME COLUMN", "EXECUTE IMMEDIATE");
+    }
+
+    @Test
     void makesImplicitMysqlModifyNullabilityExplicitForDameng() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 ALTER TABLE demo

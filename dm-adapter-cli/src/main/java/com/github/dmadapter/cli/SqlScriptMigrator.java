@@ -162,6 +162,7 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_IDENTIFIER_TO_DM";
     static final String MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE =
             "MYSQL_ALTER_MODIFY_COLUMN_TO_DM";
+    static final String MYSQL_GUARDED_COLUMN_CHANGE_TO_DM_RULE = "MYSQL_GUARDED_COLUMN_CHANGE_TO_DM";
     static final String MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT_RULE =
             "MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT";
     static final String MYSQL_VARCHAR_LENGTH_SEMANTICS_RULE =
@@ -273,6 +274,25 @@ class SqlScriptMigrator {
             "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?:\\s*\\.\\s*(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
+    private static final String MYSQL_ALTER_COLUMN_CHANGE_HEAD =
+            "\\bALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+"
+                    + "CHANGE(?:\\s+COLUMN)?\\s+(?<old>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+"
+                    + "(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")";
+    private static final Pattern MYSQL_ALTER_COLUMN_CHANGE_PATTERN =
+            Pattern.compile("(?is)" + MYSQL_ALTER_COLUMN_CHANGE_HEAD + "(?=\\s)");
+    private static final String MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP =
+            "\\s*SELECT\\s+1\\s+FROM\\s+information_schema\\s*\\.\\s*COLUMNS\\s+"
+                    + "WHERE\\s+TABLE_SCHEMA\\s*=\\s*DATABASE\\s*\\(\\s*\\)\\s+"
+                    + "AND\\s+TABLE_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN + "\\s+"
+                    + "AND\\s+COLUMN_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN + "\\s*";
+    private static final Pattern MYSQL_GUARDED_COLUMN_CHANGE_PATTERN = Pattern.compile(
+            "(?is)\\bIF\\s+EXISTS\\s*\\((?<oldCheck>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s+"
+                    + "AND\\s+NOT\\s+EXISTS\\s*\\((?<newCheck>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s+"
+                    + "THEN\\s+(?<change>" + MYSQL_ALTER_COLUMN_CHANGE_HEAD + "\\s+"
+                    + "(?<definition>(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT)(?:\\s*\\(\\s*\\d+\\s*\\))?"
+                    + "(?:\\s+(?:NOT\\s+)?NULL)?\\s+DEFAULT\\s+(?:NULL|[-+]?\\d+|'[-+]?\\d+'))"
+                    + "\\s+COMMENT\\s+(?<comment>" + SQL_STRING_LITERAL_TOKEN + ")\\s*);(?=\\s*END\\s+IF\\b)"
+    );
     private static final Pattern SCRIPT_QUERY_SOURCE_TABLE_PATTERN = Pattern.compile(
             "(?is)\\b(?:FROM|JOIN)\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
     );
@@ -7900,6 +7920,14 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_DYNAMIC_PREPARE_TO_EXECUTE_IMMEDIATE_RULE);
         }
 
+        RoutineStaticSqlConversion guardedColumnChange = convertGuardedMysqlColumnChanges(converted);
+        if (guardedColumnChange.supported() && !guardedColumnChange.sql().equals(converted)) {
+            converted = guardedColumnChange.sql();
+            rules.add(MYSQL_GUARDED_COLUMN_CHANGE_TO_DM_RULE);
+        } else if (!guardedColumnChange.supported() && manualReviewReason.isBlank()) {
+            manualReviewReason = guardedColumnChange.reason();
+        }
+
         String metadataSql = replaceOutsideIgnoredText(converted, SCRIPT_METADATA_REPLACEMENTS);
         if (!metadataSql.equals(converted)) {
             converted = metadataSql;
@@ -9408,6 +9436,54 @@ class SqlScriptMigrator {
                 "ALTER TABLE " + matcher.group("table") + " MODIFY " + matcher.group("name") + " "
                         + definition
         );
+    }
+
+    private RoutineStaticSqlConversion convertGuardedMysqlColumnChanges(String sql) {
+        if (!MYSQL_ALTER_COLUMN_CHANGE_PATTERN.matcher(sql).find()) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        String converted = isCreateProcedureStatement(sql)
+                ? replaceOutsideIgnoredText(sql, MYSQL_GUARDED_COLUMN_CHANGE_PATTERN,
+                        matcher -> renderGuardedMysqlColumnChange(sql, matcher))
+                : sql;
+        Matcher remaining = MYSQL_ALTER_COLUMN_CHANGE_PATTERN.matcher(replaceIgnoredSqlWithSpaces(converted));
+        while (remaining.find()) {
+            if (!sameIdentifier(remaining.group("old"), remaining.group("name"))) {
+                return RoutineStaticSqlConversion.unsupported(
+                        "MySQL CHANGE COLUMN 改名缺少可验证的当前模式列存在性检查，或列定义超出安全转换范围，需人工确认。");
+            }
+        }
+        return RoutineStaticSqlConversion.supported(converted);
+    }
+
+    private String renderGuardedMysqlColumnChange(String sql, Matcher matcher) {
+        String table = matcher.group("table");
+        String oldColumn = matcher.group("old");
+        String newColumn = matcher.group("name");
+        String comment = matcher.group("comment");
+        if (sameIdentifier(oldColumn, newColumn) || !isSimpleIdentifier(unquoteIdentifier(table))
+                || comment.indexOf('\\') >= 0
+                || !checksMysqlColumn(matcher.group("oldCheck"), table, oldColumn)
+                || !checksMysqlColumn(matcher.group("newCheck"), table, newColumn)) {
+            return matcher.group();
+        }
+
+        String definition = normalizeMysqlDataTypes(makeImplicitMysqlColumnNullabilityExplicit(
+                collapseSqlWhitespaceOutsideQuotedText(matcher.group("definition"))));
+        String alterTable = "ALTER TABLE " + table;
+        String indent = lineIndentBefore(sql, matcher.start("change"));
+        // Keep the source name until all changes succeed so a retry still satisfies the guard.
+        return sql.substring(matcher.start(), matcher.start("change"))
+                + "EXECUTE IMMEDIATE " + sqlStringLiteral(alterTable + " MODIFY " + oldColumn + " " + definition)
+                + ";\n" + indent + "EXECUTE IMMEDIATE "
+                + sqlStringLiteral("COMMENT ON COLUMN " + table + "." + oldColumn + " IS " + comment)
+                + ";\n" + indent + "EXECUTE IMMEDIATE "
+                + sqlStringLiteral(alterTable + " RENAME COLUMN " + oldColumn + " TO " + newColumn) + ";";
+    }
+
+    private boolean checksMysqlColumn(String query, String table, String column) {
+        return unquoteIdentifier(table).equals(metadataPredicateLiteral(query, "TABLE_NAME"))
+                && unquoteIdentifier(column).equals(metadataPredicateLiteral(query, "COLUMN_NAME"));
     }
 
     private String makeImplicitMysqlModifyNullabilityExplicit(String sql) {
