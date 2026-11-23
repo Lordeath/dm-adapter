@@ -1,6 +1,7 @@
 package com.github.dmadapter.cli;
 
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
+import org.assertj.core.groups.Tuple;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -14,12 +15,14 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 @EnabledIfEnvironmentVariable(named = "DM_ADAPTER_RUN_INTEGRATION_TESTS", matches = "(?i)true")
 class DamengSqlScriptIntegrationTest {
@@ -399,6 +402,148 @@ class DamengSqlScriptIntegrationTest {
     }
 
     @Test
+    void executesGuardedMultiColumnAddBeforeBuildingDependentIndex() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "SAMPLE_QUEUE_" + suffix;
+        String addColumns = "SAMPLE_ADD_COLUMNS_" + suffix;
+        String addIndex = "SAMPLE_ADD_INDEX_" + suffix;
+        List<String> converted = migrateIntegrationFixture("queue.sql", """
+                DROP PROCEDURE IF EXISTS %2$s;
+                DELIMITER $$
+                CREATE PROCEDURE %2$s()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.COLUMNS
+                        WHERE table_schema = (SELECT DATABASE()) AND table_name = '%1$s'
+                          AND column_name = 'sample_status'
+                    ) THEN
+                        ALTER TABLE %1$s
+                            ADD COLUMN sample_status VARCHAR(20) DEFAULT NULL COMMENT '样例状态',
+                            ADD COLUMN sample_content TEXT COMMENT '样例内容',
+                            ADD COLUMN sample_available_at DATETIME DEFAULT NULL COMMENT '可用时间',
+                            ADD COLUMN sample_attempts INT DEFAULT 0 COMMENT '尝试次数',
+                            ADD COLUMN sample_expires_at DATETIME DEFAULT NULL COMMENT '失效时间',
+                            ADD COLUMN sample_source VARCHAR(16) DEFAULT NULL COMMENT '样例来源';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL %2$s();
+                DROP PROCEDURE IF EXISTS %2$s;
+
+                DROP PROCEDURE IF EXISTS %3$s;
+                DELIMITER $$
+                CREATE PROCEDURE %3$s()
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.STATISTICS
+                        WHERE table_schema = (SELECT DATABASE()) AND table_name = '%1$s'
+                          AND index_name = 'idx_sample_lookup'
+                    ) THEN
+                        ALTER TABLE %1$s ADD INDEX idx_sample_lookup
+                            (`sample_status`, `sample_available_at`, `sample_expires_at`, `id`);
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL %3$s();
+                DROP PROCEDURE IF EXISTS %3$s;
+                """.formatted(table, addColumns, addIndex), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute("CREATE TABLE " + table + " (id INT PRIMARY KEY)");
+                statement.execute("INSERT INTO " + table + " (id) VALUES (17)");
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+
+                try (ResultSet columns = statement.executeQuery("""
+                        SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS
+                        WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID) AND UPPER(TABLE_NAME) = '%s'
+                        ORDER BY COLUMN_ID
+                        """.formatted(table))) {
+                    List<String> names = new ArrayList<>();
+                    while (columns.next()) {
+                        names.add(columns.getString(1).toLowerCase(Locale.ROOT));
+                    }
+                    assertThat(names).containsExactly("id", "sample_status", "sample_content", "sample_available_at",
+                            "sample_attempts", "sample_expires_at", "sample_source");
+                }
+                try (ResultSet columns = statement.executeQuery("""
+                        SELECT COLUMN_NAME FROM ALL_IND_COLUMNS
+                        WHERE INDEX_OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)
+                          AND UPPER(INDEX_NAME) = '%s_IDX_SAMPLE_LOOKUP'
+                        ORDER BY COLUMN_POSITION
+                        """.formatted(table))) {
+                    List<String> names = new ArrayList<>();
+                    while (columns.next()) {
+                        names.add(columns.getString(1).toLowerCase(Locale.ROOT));
+                    }
+                    assertThat(names).containsExactly("sample_status", "sample_available_at", "sample_expires_at", "id");
+                }
+                statement.execute("INSERT INTO " + table + " (id) VALUES (18)");
+                try (ResultSet rows = statement.executeQuery("SELECT id, sample_attempts FROM " + table + " ORDER BY id")) {
+                    List<Tuple> values = new ArrayList<>();
+                    while (rows.next()) {
+                        values.add(tuple(rows.getInt(1), rows.getObject(2)));
+                    }
+                    assertThat(values).containsExactly(tuple(17, 0), tuple(18, 0));
+                }
+            } finally {
+                dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + addIndex);
+                dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + addColumns);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
+    void executesGuardedUtf8HexSeedInsertTwiceWithoutChangingDecodedValues() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "SAMPLE_LABEL_" + suffix;
+        String procedure = "SAMPLE_SEED_LABELS_" + suffix;
+        List<String> converted = migrateIntegrationFixture("labels.sql", """
+                DROP PROCEDURE IF EXISTS %2$s;
+                DELIMITER $$
+                CREATE PROCEDURE %2$s()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM %1$s LIMIT 1) THEN
+                        INSERT INTO %1$s (sample_code, sample_name, sample_parent, sample_kind) VALUES
+                            ('S001', CONVERT(0xe6a0b7e4be8be5b882 USING utf8mb4), NULL, 'SAMPLE'),
+                            ('S002', CONVERT(0xe6bc94e7a4bae58cba USING utf8mb4), 'S001', 'SAMPLE'),
+                            ('S003', CONVERT(0x274126425c USING utf8mb4), 'S001', 'SAMPLE');
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL %2$s();
+                DROP PROCEDURE IF EXISTS %2$s;
+                """.formatted(table, procedure), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute("CREATE TABLE " + table + " (sample_code VARCHAR(10) PRIMARY KEY, "
+                        + "sample_name VARCHAR(40 CHAR), sample_parent VARCHAR(10), sample_kind VARCHAR(10))");
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+                try (ResultSet rows = statement.executeQuery("SELECT sample_code, sample_name, sample_parent, sample_kind"
+                        + " FROM " + table + " ORDER BY sample_code")) {
+                    List<Tuple> values = new ArrayList<>();
+                    while (rows.next()) {
+                        values.add(tuple(rows.getString(1), rows.getString(2), rows.getString(3), rows.getString(4)));
+                    }
+                    assertThat(values).containsExactly(tuple("S001", "样例市", null, "SAMPLE"),
+                            tuple("S002", "演示区", "S001", "SAMPLE"), tuple("S003", "'A&B\\", "S001", "SAMPLE"));
+                }
+            } finally {
+                dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + procedure);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
     void executesMixedIdentityValuesTwiceWithExplicitAndGeneratedIds() throws Exception {
         String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
         String username = requiredEnvironment("DM_DB_USERNAME");
@@ -465,6 +610,25 @@ class DamengSqlScriptIntegrationTest {
                 dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
             }
         }
+    }
+
+    private List<String> migrateIntegrationFixture(String filename, String sql, String schema) throws Exception {
+        Path source = Files.createDirectories(tempDir.resolve("sql/v2"));
+        Path output = tempDir.resolve("sql/v2-dm");
+        Files.writeString(source.resolve(filename), sql);
+        var report = new SqlScriptMigrator(new MySqlToDmSqlConverter(),
+                (files, environment) -> SqlScriptValidationRun.notAttempted("integration fixture", List.of()))
+                .migrate(new SqlScriptMigrationRequest(tempDir, source, output, false, "", schema,
+                        DmValidationEnvironment.from(Map.of())));
+        assertThat(report.manualReviewItems()).isEmpty();
+        return SqlScriptParser.statements(Files.readString(output.resolve(filename)))
+                .stream().filter(SqlScriptParser::executable).toList();
+    }
+
+    private Connection integrationConnection() throws Exception {
+        Class.forName("dm.jdbc.driver.DmDriver");
+        return DriverManager.getConnection(requiredEnvironment("DM_JDBC_URL"),
+                requiredEnvironment("DM_DB_USERNAME"), requiredEnvironment("DM_DB_PASSWORD"));
     }
 
     private void executeStatements(Statement statement, List<String> statements) throws Exception {
