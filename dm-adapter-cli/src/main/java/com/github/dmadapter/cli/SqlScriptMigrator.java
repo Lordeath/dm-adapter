@@ -165,6 +165,7 @@ class SqlScriptMigrator {
     static final String MYSQL_GUARDED_COLUMN_CHANGE_TO_DM_RULE = "MYSQL_GUARDED_COLUMN_CHANGE_TO_DM";
     static final String MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT_RULE =
             "MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT";
+    static final String MYSQL_MULTI_ADD_COLUMN_TO_DM_RULE = "MYSQL_MULTI_ADD_COLUMN_TO_DM";
     static final String MYSQL_VARCHAR_LENGTH_SEMANTICS_RULE =
             "MYSQL_VARCHAR_LENGTH_SEMANTICS_TO_DM";
     static final String DM_PROCEDURE_RECOMPILE_AFTER_DDL_RULE =
@@ -274,6 +275,21 @@ class SqlScriptMigrator {
             "(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")(?:\\s*\\.\\s*(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + "))?";
     private static final String SQL_IDENTIFIER_TOKEN = "`[^`]+`|\"[^\"]+\"|[^\\s(]+";
     private static final String SQL_STRING_LITERAL_TOKEN = "'(?:''|\\\\.|[^'])*'";
+    private static final Pattern ALTER_TABLE_BODY_PATTERN = Pattern.compile(
+            "(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+(?<body>.+)$"
+    );
+    private static final Pattern ADD_COLUMN_PART_PATTERN = Pattern.compile(
+            "(?is)^ADD\\s+(?:COLUMN\\s+)?(?<column>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+(?<definition>.+)$"
+    );
+    private static final Pattern GROUPED_ADD_COLUMN_TYPE_PATTERN = Pattern.compile(
+            "(?i)^(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|DECIMAL|NUMERIC|NUMBER|FLOAT|DOUBLE|REAL"
+                    + "|CHAR|VARCHAR|VARCHAR2|NCHAR|NVARCHAR|NVARCHAR2|DATE|TIME|TIMESTAMP|DATETIME"
+                    + "|BIT|BOOLEAN|BINARY|VARBINARY|BLOB|CLOB)\\b"
+    );
+    private static final Set<String> ADD_NON_COLUMN_KEYWORDS = Set.of(
+            "CONSTRAINT", "CHECK", "PRIMARY", "UNIQUE", "FOREIGN", "INDEX", "KEY", "FULLTEXT", "SPATIAL",
+            "PARTITION", "SUBPARTITION", "PERIOD", "SUPPLEMENTAL"
+    );
     private static final String MYSQL_ALTER_COLUMN_CHANGE_HEAD =
             "\\bALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+"
                     + "CHANGE(?:\\s+COLUMN)?\\s+(?<old>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+"
@@ -8120,15 +8136,19 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_GROUP_BY_ALIAS_RULE);
         }
 
-        String procedureDdlSql = wrapProcedureDdlStatements(converted);
-        if (!procedureDdlSql.equals(converted)) {
+        SafeRuleConversion procedureDdl = wrapProcedureDdlStatements(converted);
+        if (!procedureDdl.manualReviewReason().isBlank() && manualReviewReason.isBlank()) {
+            manualReviewReason = procedureDdl.manualReviewReason();
+        }
+        if (procedureDdl.changed()) {
             if (!converted.contains("dm_equivalent_indexes")
-                    && procedureDdlSql.contains("dm_equivalent_indexes")) {
+                    && procedureDdl.sql().contains("dm_equivalent_indexes")) {
                 rules.add(MYSQL_CREATE_TABLE_INLINE_INDEX_TO_DM_RULE);
                 rules.add(MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE);
             }
-            converted = procedureDdlSql;
+            converted = procedureDdl.sql();
             rules.add(MYSQL_PROCEDURE_DDL_TO_EXECUTE_IMMEDIATE_RULE);
+            rules.addAll(procedureDdl.appliedRules());
         }
 
         InsertValuesColumnListRewrite insertValuesColumnListSql = addKnownInsertValuesColumnLists(
@@ -15038,28 +15058,18 @@ class SqlScriptMigrator {
         }
     }
 
-    private String wrapProcedureDdlStatements(String sql) {
-        int start = skipWhitespace(sql, 0);
-        if (!startsKeyword(sql, start, "CREATE")) {
-            return sql;
-        }
-        int cursor = skipWhitespace(sql, start + "CREATE".length());
-        if (startsKeyword(sql, cursor, "OR")) {
-            cursor = skipWhitespace(sql, cursor + "OR".length());
-            if (!startsKeyword(sql, cursor, "REPLACE")) {
-                return sql;
-            }
-            cursor = skipWhitespace(sql, cursor + "REPLACE".length());
-        }
-        if (!startsKeyword(sql, cursor, "PROCEDURE")) {
-            return sql;
+    private SafeRuleConversion wrapProcedureDdlStatements(String sql) {
+        if (!isCreateProcedureStatement(sql)) {
+            return new SafeRuleConversion(sql, false, List.of(), "");
         }
 
+        String originalSql = sql;
         sql = collapseMysqlIdentityColumnRemovalSequences(sql);
         Map<String, String> variableNames = procedureVariableNamesByLowercase(sql);
         LinkedHashMap<String, LinkedHashSet<String>> temporaryTableColumns = temporaryProcedureTableDefinitions(sql);
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
+        boolean groupedColumns = false;
         int index = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
@@ -15102,8 +15112,13 @@ class SqlScriptMigrator {
                     }
                     ProcedureStatement statement = ddlStatements.get(i);
                     if (statement.dynamic()) {
+                        RoutineStaticSqlConversion grouped = groupMysqlColumnAdds(statement.sql());
+                        if (!grouped.supported()) {
+                            return new SafeRuleConversion(originalSql, false, List.of(), grouped.reason());
+                        }
+                        groupedColumns |= !grouped.sql().equals(statement.sql());
                         converted.append("EXECUTE IMMEDIATE ")
-                                .append(dynamicSqlExpression(statement.sql(), variableNames));
+                                .append(dynamicSqlExpression(grouped.sql(), variableNames));
                     } else {
                         converted.append(statement.sql());
                     }
@@ -15126,7 +15141,9 @@ class SqlScriptMigrator {
             }
         }
         String convertedSql = changed ? converted.toString() : sql;
-        return addTemporaryInsertSelectColumnLists(convertedSql, temporaryTableColumns);
+        String output = addTemporaryInsertSelectColumnLists(convertedSql, temporaryTableColumns);
+        return new SafeRuleConversion(output, !output.equals(originalSql),
+                groupedColumns ? List.of(MYSQL_MULTI_ADD_COLUMN_TO_DM_RULE) : List.of(), "");
     }
 
     private String collapseMysqlIdentityColumnRemovalSequences(String sql) {
@@ -17192,6 +17209,38 @@ class SqlScriptMigrator {
                 .map(String::strip)
                 .map(part -> "ALTER TABLE " + table + " " + part)
                 .toList();
+    }
+
+    private RoutineStaticSqlConversion groupMysqlColumnAdds(String ddl) {
+        Matcher alter = ALTER_TABLE_BODY_PATTERN.matcher(ddl);
+        if (!alter.matches()) {
+            return RoutineStaticSqlConversion.supported(ddl);
+        }
+        List<String> parts = splitTopLevelComma(alter.group("body"));
+        if (parts.size() < 2) {
+            return RoutineStaticSqlConversion.supported(ddl);
+        }
+        int addColumns = 0;
+        List<String> columns = new ArrayList<>();
+        for (String part : parts) {
+            Matcher add = ADD_COLUMN_PART_PATTERN.matcher(part.strip());
+            if (!add.matches() || ADD_NON_COLUMN_KEYWORDS.contains(add.group("column").toUpperCase(Locale.ROOT))) {
+                continue;
+            }
+            addColumns++;
+            if (GROUPED_ADD_COLUMN_TYPE_PATTERN.matcher(add.group("definition")).find()) {
+                columns.add(collapseSqlWhitespaceOutsideQuotedText(add.group("column") + " " + add.group("definition")));
+            }
+        }
+        if (addColumns < 2) {
+            return RoutineStaticSqlConversion.supported(ddl);
+        }
+        if (columns.size() != parts.size() || containsSqlComment(ddl)) {
+            return RoutineStaticSqlConversion.unsupported(
+                    "同一 ALTER TABLE 中的多个 ADD COLUMN 包含无法安全合并的列定义、注释或其他操作，需人工确认。");
+        }
+        return RoutineStaticSqlConversion.supported(
+                "ALTER TABLE " + alter.group("table") + " ADD (" + String.join(", ", columns) + ")");
     }
 
     private List<String> splitTopLevelComma(String value) {

@@ -6814,6 +6814,71 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void groupsMultipleColumnAddsInsideProcedureDynamicDdl() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS sample_add_columns;
+                DELIMITER $$
+                CREATE PROCEDURE sample_add_columns()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = (SELECT DATABASE()) AND TABLE_NAME = 'sample_region'
+                          AND COLUMN_NAME = 'sample_area_id') THEN
+                        ALTER TABLE sample_region
+                            ADD COLUMN sample_area_id BIGINT NULL COMMENT 'sample identifier',
+                            ADD COLUMN sample_area_name VARCHAR(100) NULL COMMENT 'sample name',
+                            ADD COLUMN sample_note VARCHAR(500) NULL COMMENT 'sample note';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_add_columns;
+                DROP PROCEDURE IF EXISTS sample_add_columns;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).containsSubsequence("IF dm_adapter_exists = 0 THEN",
+                "EXECUTE IMMEDIATE 'ALTER TABLE sample_region ADD (sample_area_id BIGINT NULL, "
+                        + "sample_area_name VARCHAR(100 CHAR) NULL, sample_note VARCHAR(500 CHAR) NULL)'", "END IF;")
+                .doesNotContain("ADD COLUMN", "ADD sample_area_name", "ADD sample_note");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(SqlScriptMigrator.MYSQL_MULTI_ADD_COLUMN_TO_DM_RULE));
+    }
+
+    @Test
+    void preservesCommasInTypesAndDefaultsWhenGroupingColumnAdds() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_add_columns()
+                BEGIN
+                    ALTER TABLE sample_receipt ADD amount DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
+                        ADD COLUMN note VARCHAR(80) NULL DEFAULT 'sample, text';
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).contains("EXECUTE IMMEDIATE 'ALTER TABLE sample_receipt"
+                + " ADD (amount DECIMAL(12, 2) NOT NULL DEFAULT 0.00, note VARCHAR(80 CHAR) NULL DEFAULT ''sample, text'')'");
+    }
+
+    @Test
+    void retainsMultipleColumnAddsMixedWithIndexForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_add_columns()
+                BEGIN
+                    ALTER TABLE sample_receipt ADD COLUMN amount DECIMAL(12, 2),
+                        ADD COLUMN note VARCHAR(80), ADD INDEX idx_note (note);
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("多个 ADD COLUMN"));
+        assertThat(converted.sql()).contains("ADD COLUMN amount", "ADD COLUMN note", "ADD INDEX idx_note")
+                .doesNotContain("EXECUTE IMMEDIATE", "ADD (amount");
+    }
+
+    @Test
     void convertsGuardedIntegerColumnChangesWithRenameLast() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DROP PROCEDURE IF EXISTS sample_rename_columns;
