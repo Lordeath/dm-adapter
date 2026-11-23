@@ -110,6 +110,8 @@ class SqlScriptMigrator {
             "MYSQL_SCRIPT_USER_VARIABLE_SNAPSHOT_BLOCK";
     static final String MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE =
             "MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE";
+    static final String MYSQL_SCRIPT_CONDITIONAL_INSERT_SELECT_RULE =
+            "MYSQL_SCRIPT_CONDITIONAL_INSERT_SELECT_TO_EXECUTE_IMMEDIATE";
     static final String MYSQL_DROP_PROCEDURE_IF_EXISTS_RULE =
             "MYSQL_DROP_PROCEDURE_IF_EXISTS";
     static final String MYSQL_ORPHAN_ROUTINE_TERMINATOR_NOOP_RULE =
@@ -564,6 +566,7 @@ class SqlScriptMigrator {
             warnings.add("公共过程定义仅用于静态影响分析，未执行或部署：" + source);
         }
         ScriptProcedureEffectAnalyzer procedureAnalyzer = new ScriptProcedureEffectAnalyzer(procedureSourceStatements);
+        ConditionalPreparedBindings preparedBindings = ConditionalPreparedBindings.load(sqlRoot);
         Set<Path> preservedPaths = preservedSqlPaths(request);
         List<Path> discoveredSqlFiles = sqlFiles(sqlRoot);
         List<Path> sqlFiles = discoveredSqlFiles.stream()
@@ -619,6 +622,7 @@ class SqlScriptMigrator {
                     scriptSchemaStates,
                     request.rewriteConfig(),
                     procedureAnalyzer,
+                    preparedBindings,
                     manualReviewItems,
                     warnings
             );
@@ -3418,6 +3422,7 @@ class SqlScriptMigrator {
             Map<String, ScriptSchemaState> scriptSchemaStates,
             SqlRewriteConfig rewriteConfig,
             ScriptProcedureEffectAnalyzer procedureAnalyzer,
+            ConditionalPreparedBindings preparedBindings,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -3445,7 +3450,7 @@ class SqlScriptMigrator {
                 + ", elapsedMs=" + elapsedMillis(parseStartedAt));
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
-        ScriptDynamicDdlState scriptDynamicDdlState = scriptDynamicDdlState(originalStatements);
+        ScriptDynamicDdlState scriptDynamicDdlState = scriptDynamicDdlState(originalStatements, relative, preparedBindings);
         String schemaScope = (systemScript ? "system:" : "application:")
                 + targetSchema.toLowerCase(Locale.ROOT);
         ScriptSchemaState persistedSchemaState = scriptSchemaStates.computeIfAbsent(
@@ -4496,12 +4501,14 @@ class SqlScriptMigrator {
         return "";
     }
 
-    private ScriptDynamicDdlState scriptDynamicDdlState(List<String> statements) {
+    private ScriptDynamicDdlState scriptDynamicDdlState(
+            List<String> statements, Path relative, ConditionalPreparedBindings preparedBindings
+    ) {
         ScriptDynamicDdlState state = new ScriptDynamicDdlState();
         if (statements == null || statements.isEmpty()) {
             return state;
         }
-        planConditionalPreparedStatements(statements, state);
+        planConditionalPreparedStatements(statements, state, relative, preparedBindings);
         ScriptDynamicDdlState analysisState = new ScriptDynamicDdlState();
         List<ScriptIndexDdlAssignment> candidates = new ArrayList<>();
         LinkedHashMap<String, Integer> existenceVariableCounts = new LinkedHashMap<>();
@@ -4597,7 +4604,10 @@ class SqlScriptMigrator {
         ).matcher(deallocate).matches();
     }
 
-    private void planConditionalPreparedStatements(List<String> statements, ScriptDynamicDdlState state) {
+    private void planConditionalPreparedStatements(
+            List<String> statements, ScriptDynamicDdlState state,
+            Path relative, ConditionalPreparedBindings preparedBindings
+    ) {
         Pattern assignment = Pattern.compile("(?is)^SET\\s+@(?<variable>[A-Za-z_][A-Za-z0-9_$]*)"
                 + "\\s*(?::=|=)\\s*(?<expression>.+)$");
         for (int index = 0; index + 3 < statements.size(); index++) {
@@ -4616,12 +4626,48 @@ class SqlScriptMigrator {
                 continue;
             }
             List<ConditionalPreparedGuard> guards = conditionalPreparedGuards(arguments.get(0).strip());
-            String whenTrue = conditionalPreparedAction(arguments.get(1).strip());
-            String whenFalse = conditionalPreparedAction(arguments.get(2).strip());
-            if (guards.isEmpty() || whenTrue == null || whenFalse == null) {
+            String trueSql = conditionalPreparedLiteral(arguments.get(1).strip());
+            String falseSql = conditionalPreparedLiteral(arguments.get(2).strip());
+            if (guards.isEmpty() || trueSql == null || falseSql == null) {
+                continue;
+            }
+            boolean insertSelect = preparedInsertSelectHead(trueSql).lookingAt()
+                    || preparedInsertSelectHead(falseSql).lookingAt();
+            if (insertSelect && !isGuardedPreparedInsertSelect(arguments.get(0).strip(), trueSql, falseSql)) {
+                continue;
+            }
+            Map<String, PreparedValue> bindings = new LinkedHashMap<>();
+            List<String> unresolved = new ArrayList<>();
+            if (insertSelect) {
+                for (String name : preparedInsertSelectVariableNames(trueSql, falseSql)) {
+                    ConditionalPreparedBindings.ValueSource source = preparedBindings.source(relative, variable, name);
+                    if (source == null) {
+                        unresolved.add("@" + name);
+                    } else {
+                        bindings.put(name.toLowerCase(Locale.ROOT),
+                                new PreparedValue("dm_adapter_prepared_value_" + (bindings.size() + 1), source));
+                    }
+                }
+            }
+            if (!unresolved.isEmpty()) {
+                String reason = "条件动态 INSERT … SELECT 读取 MySQL 会话变量 "
+                        + String.join("、", unresolved)
+                        + "。请确认前序语句和共享过程执行后的取值来源，并在达梦脚本中显式传值。";
+                for (int offset = 0; offset < 4; offset++) {
+                    String original = statements.get(index + offset);
+                    state.conditionalPreparedConversions.put(index + offset + 1,
+                            new ScriptStatementConversion(original, original, original, false, true, reason, List.of()));
+                }
+                index += 3;
+                continue;
+            }
+            String whenTrue = conditionalPreparedAction(trueSql, bindings);
+            String whenFalse = conditionalPreparedAction(falseSql, bindings);
+            if (whenTrue == null || whenFalse == null) {
                 continue;
             }
             List<String> declarations = new ArrayList<>();
+            bindings.values().forEach(binding -> declarations.add(binding.local() + " BIGINT;"));
             List<String> queries = new ArrayList<>();
             List<String> comparisons = new ArrayList<>();
             for (int guardIndex = 0; guardIndex < guards.size(); guardIndex++) {
@@ -4644,7 +4690,8 @@ class SqlScriptMigrator {
                 // with no intervening SQL, and keep all four validation-plan entries.
                 ScriptStatementConversion conversion = offset == 2
                         ? new ScriptStatementConversion(original, prefix.prefix() + block, prefix.prefix() + block,
-                                true, false, "", List.of(MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE))
+                                true, false, "", List.of(insertSelect ? MYSQL_SCRIPT_CONDITIONAL_INSERT_SELECT_RULE
+                                        : MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE))
                         : dynamicDdlNoopConversion(original, prefix,
                                 "conditional prepared SQL is handled by its EXECUTE block");
                 state.conditionalPreparedConversions.put(index + offset + 1, conversion);
@@ -4798,15 +4845,22 @@ class SqlScriptMigrator {
         return guards.size() > 1 && guards.stream().anyMatch(guard -> !guard.metadata()) ? List.of() : guards;
     }
 
-    private String conditionalPreparedAction(String expression) {
+    private String conditionalPreparedLiteral(String expression) {
         // Nested literals depend on the source SQL mode; never guess backslash decoding.
         if (!expression.startsWith("'") || expression.indexOf('\\') >= 0
                 || skipSingleQuotedString(expression, 0) != expression.length()) {
             return null;
         }
-        String sql = singleQuotedSqlLiteralValue(expression).strip();
+        return singleQuotedSqlLiteralValue(expression).strip();
+    }
+
+    private String conditionalPreparedAction(String sql, Map<String, PreparedValue> bindings) {
         if (sql.matches("(?is)(?:SELECT\\s+1|DO\\s+0)")) {
             return "NULL;";
+        }
+        Matcher insert = preparedInsertSelectHead(sql);
+        if (insert.lookingAt()) {
+            return conditionalPreparedInsertSelect(sql, insert, bindings);
         }
         Matcher call = Pattern.compile("(?is)^CALL\\s+" + SQL_OBJECT_IDENTIFIER_TOKEN
                 + "\\s*\\((?<args>.*)\\)$").matcher(sql);
@@ -4835,6 +4889,107 @@ class SqlScriptMigrator {
             result += "\n        EXECUTE IMMEDIATE " + sqlStringLiteral(comment) + ";";
         }
         return result;
+    }
+
+    private Matcher preparedInsertSelectHead(String sql) {
+        return Pattern.compile("(?is)^INSERT\\s+INTO\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
+                + "\\s*\\((?<columns>[^()]*)\\)\\s*SELECT\\s+").matcher(sql);
+    }
+
+    private boolean isGuardedPreparedInsertSelect(String condition, String trueSql, String falseSql) {
+        Matcher insert = preparedInsertSelectHead(trueSql);
+        if (!insert.lookingAt() || !isSimpleIdentifier(insert.group("table"))
+                || !falseSql.matches("(?is)(?:SELECT\\s+1|DO\\s+0)")) {
+            return false;
+        }
+        Matcher guard = Pattern.compile("(?is)^EXISTS\\s*\\(\\s*SELECT\\s+1\\s+FROM\\s+"
+                + "information_schema\\.columns\\s+WHERE\\s+table_schema\\s*=\\s*DATABASE\\s*\\(\\s*\\)\\s+"
+                + "AND\\s+table_name\\s*=\\s*'(?<table>[A-Za-z_][A-Za-z0-9_$]*)'\\s+"
+                + "AND\\s+column_name\\s*=\\s*'(?<column>[A-Za-z_][A-Za-z0-9_$]*)'\\s*\\)$")
+                .matcher(condition);
+        return guard.matches() && normalizedTableKey(insert.group("table")).equals(normalizedTableKey(guard.group("table")))
+                && splitTopLevelComma(insert.group("columns")).stream().map(this::normalizedTableKey)
+                        .anyMatch(normalizedTableKey(guard.group("column"))::equals);
+    }
+
+    private List<String> preparedInsertSelectVariableNames(String first, String second) {
+        Map<String, String> names = new LinkedHashMap<>();
+        for (String sql : List.of(first, second)) {
+            if (preparedInsertSelectHead(sql).lookingAt()) {
+                mysqlUserVariableReferences(sql).forEach(reference ->
+                        names.putIfAbsent(reference.name().toLowerCase(Locale.ROOT), reference.name()));
+            }
+        }
+        return List.copyOf(names.values());
+    }
+
+    private String conditionalPreparedInsertSelect(String sql, Matcher insert, Map<String, PreparedValue> bindings) {
+        // Validate the unquoted payload as well as the enclosing generated block.
+        if (findStatementTerminator(sql, 0) != sql.length()
+                || !originalSqlSyntaxManualReviewReason(sql).isBlank()) {
+            return null;
+        }
+        String searchable = replaceIgnoredSqlWithSpaces(sql);
+        if (searchable.indexOf('?') >= 0
+                || Pattern.compile("(?is)\\b(?:FOR\\s+UPDATE|LOCK\\s+IN\\s+SHARE\\s+MODE|INTO\\s+(?:OUTFILE|DUMPFILE))\\b")
+                        .matcher(searchable).find()) {
+            return null;
+        }
+        List<String> columns = splitTopLevelComma(insert.group("columns"));
+        String select = sql.substring(insert.end());
+        int from = topLevelKeywordIndex(replaceIgnoredSqlWithSpaces(select), "FROM");
+        if (from < 0 || columns.isEmpty()
+                || columns.stream().anyMatch(column -> !isSimpleIdentifier(column.strip()))
+                || columns.stream().map(this::normalizedTableKey).distinct().count() != columns.size()) {
+            return null;
+        }
+        List<String> projections = splitTopLevelComma(select.substring(0, from));
+        if (projections.size() != columns.size() || projections.stream().anyMatch(
+                projection -> projection.isBlank() || projection.strip().matches("(?is)(?:.+\\.)?\\*"))) {
+            return null;
+        }
+
+        StringBuilder payload = new StringBuilder(sql.length());
+        List<String> parameters = new ArrayList<>();
+        Set<PreparedValue> used = new LinkedHashSet<>();
+        List<UserVariableReference> references = mysqlUserVariableReferences(sql);
+        if (hasUnsafeUserVariableAssignment(sql, references)) {
+            return null;
+        }
+        int start = 0;
+        for (UserVariableReference reference : references) {
+            PreparedValue binding = bindings.get(reference.name().toLowerCase(Locale.ROOT));
+            if (binding == null) {
+                return null;
+            }
+            payload.append(sql, start, reference.start()).append('?');
+            start = reference.end();
+            parameters.add(binding.local());
+            used.add(binding);
+        }
+        payload.append(sql, start, sql.length());
+
+        SqlConversionResult conversion = converter.convert(payload.toString());
+        String converted = conversion.convertedSql();
+        String encoded = encodePhysicalLineBreaksInSqlStringLiterals(converted);
+        if (conversion.manualReviewRequired() || !preparedInsertSelectHead(encoded).lookingAt()
+                || findStatementTerminator(encoded, 0) != encoded.length()
+                || !manualReviewReason(encoded).isBlank()
+                || !GeneratedSqlStaticInspector.manualReviewReason(encoded).isBlank()) {
+            return null;
+        }
+        String expression = dmTextExpression(encoded);
+        if (expression.getBytes(StandardCharsets.UTF_8).length > DM_DISQL_LONG_LITERAL_THRESHOLD_BYTES) {
+            return null;
+        }
+        String evaluation = used.stream()
+                .map(value -> "EXECUTE IMMEDIATE " + sqlStringLiteral(value.source().query()) + " INTO "
+                        + value.local() + ";\n        ")
+                .collect(Collectors.joining());
+        return evaluation + "EXECUTE IMMEDIATE (" + expression + ")" + routineUsingClause(parameters) + ";";
+    }
+
+    private record PreparedValue(String local, ConditionalPreparedBindings.ValueSource source) {
     }
 
     private record ConditionalPreparedGuard(String countQuery, String comparison, boolean metadata) {

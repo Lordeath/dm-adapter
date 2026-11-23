@@ -23,6 +23,97 @@ class ReportedSqlScriptCompatibilityTest {
     Path root;
 
     @Test
+    void convertsSingleConditionalInsertSelectAndPreservesItsVersionPredicate() throws Exception {
+        String original = conditionalCopyScript("7");
+        Converted converted = migrate(original, "001_system.sql");
+
+        assertFullyConverted(converted);
+        assertThat(SqlScriptParser.statements(converted.sql())).hasSize(4);
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(SqlScriptMigrator.MYSQL_SCRIPT_CONDITIONAL_INSERT_SELECT_RULE));
+        assertThat(converted.sql())
+                .contains("ALL_TAB_COLUMNS", "IF dm_adapter_guard_count > 0 THEN", "EXECUTE IMMEDIATE (",
+                        "SELECT src.sample_id, 7, ''备注 @literal''", "WHERE src.ver = 1",
+                        "NOT EXISTS", "dst.ver = 7", "ELSE\n        NULL;")
+                .doesNotContain("PREPARE sample_stmt", "EXECUTE sample_stmt");
+    }
+
+    @Test
+    void reportsTheEffectiveVersionVariableWithoutExecutingOrRewritingTheGroup() throws Exception {
+        String original = "CALL sample_shared();\n" + conditionalCopyScript("@sample_ver");
+        Converted converted = migrate(original, "001_system.sql");
+
+        assertThat(converted.report().manualReviewItems()).hasSize(4).allSatisfy(item ->
+                assertThat(item.reason()).contains("条件动态 INSERT", "@sample_ver", "共享过程")
+                        .doesNotContain("ROW_NUMBER", "@literal"));
+        assertThat(SqlScriptParser.statements(converted.sql()))
+                .containsExactlyElementsOf(SqlScriptParser.statements(original));
+    }
+
+    @Test
+    void readsTheConfiguredValueOnceInsideTheBranchAndBindsAllReferences() throws Exception {
+        Path sqlRoot = Files.createDirectories(root.resolve("sql/v2"));
+        Files.writeString(sqlRoot.resolve(ConditionalPreparedBindings.FILE_NAME),
+                "001_system.sql|SAMPLE_SQL|SAMPLE_VER=sample_versions,version_no,1\n");
+        String original = "CALL sample_shared();\n" + conditionalCopyScript("@sample_ver");
+        Converted converted = migrate(original, "001_system.sql");
+
+        assertFullyConverted(converted);
+        assertThat(SqlScriptParser.statements(converted.sql())).hasSize(5);
+        assertThat(converted.sql()).containsSubsequence(
+                        "CALL sample_shared()", "IF dm_adapter_guard_count > 0 THEN",
+                        "SELECT GREATEST(COALESCE(MAX(version_no), 1), 1) FROM sample_versions",
+                        "INTO dm_adapter_prepared_value_1;",
+                        "SELECT src.sample_id, ?, ''备注 @literal''",
+                        "dst.ver = ?", "USING dm_adapter_prepared_value_1, dm_adapter_prepared_value_1",
+                        "ELSE\n        NULL;")
+                .doesNotContain("@sample_ver", "PREPARE sample_stmt");
+        assertThat(Pattern.compile("MAX\\(version_no\\)").matcher(converted.sql()).results().count()).isEqualTo(1);
+
+        assertThat(migrate(original, "002_system.sql").report().manualReviewSqlCount()).isEqualTo(4);
+    }
+
+    @Test
+    void rejectsExecutableFragmentsInBindingConfiguration() throws Exception {
+        Path sqlRoot = Files.createDirectories(root.resolve("sql/v2"));
+        Files.writeString(sqlRoot.resolve(ConditionalPreparedBindings.FILE_NAME),
+                "001.sql|sample_sql|sample_ver=sample_versions; SELECT 1,version_no,1\n");
+
+        org.assertj.core.api.Assertions.assertThatIllegalArgumentException()
+                .isThrownBy(() -> migrate(conditionalCopyScript("@sample_ver"), "001.sql"))
+                .withMessageContaining("无效的条件动态 SQL 绑定");
+    }
+
+    @Test
+    void rejectsConditionalInsertSelectWithMoreThanOneStatementOrMismatchedProjection() throws Exception {
+        for (String original : List.of(
+                conditionalCopyScript("7").replace("dst.ver = 7)", "dst.ver = 7); DELETE FROM sample_menu"),
+                conditionalCopyScript("7").replace("table_name = 'sample_menu'", "table_name = 'different_table'"),
+                conditionalCopyScript("7").replace("SELECT src.sample_id, 7,", "SELECT src.sample_id,"))) {
+            Converted converted = migrate(original, "001.sql");
+            assertThat(converted.report().manualReviewSqlCount()).isPositive();
+            assertThat(converted.sql()).contains("PREPARE sample_stmt");
+        }
+    }
+
+    private String conditionalCopyScript(String version) {
+        return """
+                SET @sample_sql = IF(
+                    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE()
+                        AND table_name = 'sample_menu' AND column_name = 'ver'),
+                    'INSERT INTO sample_menu (sample_id, ver, note)
+                     SELECT src.sample_id, %1$s, ''备注 @literal'' FROM sample_menu src
+                     WHERE src.ver = 1 AND NOT EXISTS (
+                         SELECT 1 FROM sample_menu dst WHERE dst.sample_id = src.sample_id AND dst.ver = %1$s)',
+                    'SELECT 1'
+                );
+                PREPARE sample_stmt FROM @sample_sql;
+                EXECUTE sample_stmt;
+                DEALLOCATE PREPARE sample_stmt;
+                """.formatted(version);
+    }
+
+    @Test
     void assignsScalarSubqueryAtTheOuterSelect() throws Exception {
         Converted converted = migrate("""
                 DELIMITER $$
