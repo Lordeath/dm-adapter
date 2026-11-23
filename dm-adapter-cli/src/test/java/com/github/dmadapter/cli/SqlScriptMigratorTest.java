@@ -322,6 +322,31 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void decodesUtf8HexTextInGuardedMultiRowInsert() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS sample_init_regions;
+                DELIMITER $$
+                CREATE PROCEDURE sample_init_regions()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM sample_region LIMIT 1) THEN
+                        INSERT INTO sample_region (sample_code, sample_name, sample_parent, sample_kind) VALUES
+                            ('S001', CONVERT(0xe6a0b7e4be8be5b882 USING utf8mb4), NULL, 'SAMPLE'),
+                            ('S002', CONVERT(0xe6bc94e7a4bae58cba USING utf8mb4), 'S001', 'SAMPLE');
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_init_regions();
+                DROP PROCEDURE IF EXISTS sample_init_regions;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).containsSubsequence("DECLARE", "SELECT COUNT(*) INTO dm_adapter_exists",
+                        "IF dm_adapter_exists = 0 THEN", "INSERT INTO sample_region",
+                        "('S001', '样例市', NULL, 'SAMPLE')", "('S002', '演示区', 'S001', 'SAMPLE')", "END IF;")
+                .doesNotContain("CREATE OR REPLACE PROCEDURE", "USING utf8mb4");
+    }
+
+    @Test
     void dryRunDoesNotWriteOutputOrRunValidation() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");

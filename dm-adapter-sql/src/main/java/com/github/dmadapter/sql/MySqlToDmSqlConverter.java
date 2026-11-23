@@ -3,7 +3,11 @@ package com.github.dmadapter.sql;
 import com.github.dmadapter.core.SqlConversionResult;
 
 import java.math.BigInteger;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -99,6 +103,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             "SQLSERVER_CHARINDEX_TO_DM_INSTR";
     public static final String MYSQL_CONVERT_DECIMAL_RULE = "MYSQL_CONVERT_DECIMAL_TO_CAST";
     public static final String MYSQL_CONVERT_CHAR_RULE = "MYSQL_CONVERT_CHAR_TO_CAST";
+    public static final String MYSQL_UTF8MB4_HEX_CONVERT_RULE = "MYSQL_UTF8MB4_HEX_CONVERT_TO_TEXT";
     public static final String MYSQL_CONVERT_GBK_ORDER_RULE = "MYSQL_CONVERT_GBK_ORDER_TO_NLSSORT";
     public static final String MYSQL_SELECT_MODIFIER_REMOVAL_RULE = "MYSQL_SELECT_MODIFIER_REMOVED";
     public static final String MYSQL_UNUSED_USER_VARIABLE_SELECT_ITEM_RULE =
@@ -252,6 +257,9 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     private static final Pattern CHAR_TARGET_TYPE_PATTERN = Pattern.compile(
             "(?is)^\\s*CHAR(?:\\s*\\(\\s*\\d+\\s*\\))?\\s*$"
     );
+    private static final Pattern CONVERT_FUNCTION_PATTERN = Pattern.compile("(?i)\\bCONVERT\\s*\\(");
+    private static final Pattern USING_KEYWORD_PATTERN = Pattern.compile("(?i)\\bUSING\\b");
+    private static final Pattern MYSQL_HEX_LITERAL_PATTERN = Pattern.compile("(?:0x([0-9a-fA-F]+)|[xX]'([0-9a-fA-F]+)')");
     private static final Pattern MYSQL_INTERVAL_PATTERN = Pattern.compile(
             "(?is)^\\s*INTERVAL\\s+(.+?)\\s+(YEAR|MONTH|WEEK|DAY|HOUR|MINUTE|SECOND)\\s*$"
     );
@@ -1284,6 +1292,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             rules.add(MYSQL_TRAILING_SEMICOLON_REMOVAL_RULE);
         }
 
+        SqlConversionResult hexCharsetConversion = convertMysqlHexCharsetLiterals(converted);
+        if (hexCharsetConversion.manualReviewRequired()) {
+            return manualReviewResult(original, converted, rules, hexCharsetConversion.reason());
+        }
+        if (hexCharsetConversion.changed()) {
+            converted = hexCharsetConversion.convertedSql();
+            rules.addAll(hexCharsetConversion.appliedRules());
+        }
+
         String unsupportedReason = unsupportedReason(converted);
         if (!unsupportedReason.isBlank()) {
             return manualReviewResult(original, converted, rules, unsupportedReason);
@@ -1444,7 +1461,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         int protectedEnd = -1;
         int index = 0;
         while (index < sql.length()) {
-            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            int ignoredEnd = skipSqlIgnoredText(sql, index);
             if (ignoredEnd > index) {
                 index = ignoredEnd;
             } else if (startsKeyword(sql, index, "DIV")) {
@@ -1479,7 +1496,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         int index = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
-            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            int ignoredEnd = skipSqlIgnoredText(sql, index);
             if (ignoredEnd > index) {
                 index = ignoredEnd;
             } else if (current == '/') {
@@ -1540,7 +1557,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 && isSimpleArithmeticOperand(right.text());
     }
 
-    private int skipArithmeticIgnoredText(String sql, int index) {
+    private int skipSqlIgnoredText(String sql, int index) {
         char current = sql.charAt(index);
         if (sql.startsWith("<!--", index)) {
             int end = sql.indexOf("-->", index + 4);
@@ -1578,7 +1595,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         List<Integer> opens = new ArrayList<>();
         int index = 0;
         while (index <= closeIndex) {
-            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            int ignoredEnd = skipSqlIgnoredText(sql, index);
             if (ignoredEnd > index) {
                 index = ignoredEnd;
                 continue;
@@ -1601,7 +1618,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         int depth = 0;
         int index = openIndex;
         while (index < sql.length()) {
-            int ignoredEnd = skipArithmeticIgnoredText(sql, index);
+            int ignoredEnd = skipSqlIgnoredText(sql, index);
             if (ignoredEnd > index) {
                 index = ignoredEnd;
                 continue;
@@ -1652,7 +1669,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 continue;
             }
             hasDynamicFragment |= expression.startsWith("${", index);
-            int ignoredEnd = skipArithmeticIgnoredText(expression, index);
+            int ignoredEnd = skipSqlIgnoredText(expression, index);
             if (ignoredEnd > index) {
                 index = ignoredEnd;
                 continue;
@@ -5042,7 +5059,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         int index = 0;
         boolean afterQualifier = false;
         while (index < condition.length()) {
-            int ignored = skipArithmeticIgnoredText(condition, index);
+            int ignored = skipSqlIgnoredText(condition, index);
             if (ignored > index) {
                 char first = condition.charAt(index);
                 if (first == '"' || first == '`' || first == '\'') {
@@ -5491,6 +5508,85 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             return null;
         }
         return "CAST(" + expression + " AS BIGINT)";
+    }
+
+    private SqlConversionResult convertMysqlHexCharsetLiterals(String sql) {
+        if (!CONVERT_FUNCTION_PATTERN.matcher(sql).find() || !USING_KEYWORD_PATTERN.matcher(sql).find()) {
+            return SqlConversionResult.unchanged(sql);
+        }
+        List<TextReplacement> replacements = new ArrayList<>();
+        for (int index = 0; index < sql.length();) {
+            int ignoredEnd = skipSqlIgnoredText(sql, index);
+            if (ignoredEnd > index) {
+                index = ignoredEnd;
+                continue;
+            }
+            if (!startsFunction(sql, index, "CONVERT") || previousNonWhitespace(sql, index) == '.') {
+                index++;
+                continue;
+            }
+            FunctionCall call = readFunctionCall(sql, index, "CONVERT");
+            int using = call == null ? -1 : findTopLevelKeyword(call.body(), "USING", 0);
+            if (using < 0) {
+                index++;
+                continue;
+            }
+            String source = call.body().substring(0, using).strip();
+            String charset = call.body().substring(using + "USING".length()).strip();
+            boolean utf8mb4 = charset.equalsIgnoreCase("utf8mb4");
+            if (!utf8mb4 && !source.regionMatches(true, 0, "0x", 0, 2)
+                    && !source.regionMatches(true, 0, "X'", 0, 2)) {
+                index++;
+                continue;
+            }
+            Matcher literal = MYSQL_HEX_LITERAL_PATTERN.matcher(source);
+            String replacement = utf8mb4 && literal.matches()
+                    ? decodeMysqlUtf8Literal(literal.group(1) == null ? literal.group(2) : literal.group(1))
+                    : null;
+            if (replacement == null) {
+                return SqlConversionResult.manualReview(sql,
+                        "MySQL CONVERT(... USING ...) requires a valid utf8mb4 hex literal "
+                                + "without control characters or MyBatis placeholders for automatic Dameng rewrite.");
+            }
+            StringBuilder replacementWithAliasSpacing = new StringBuilder();
+            appendFunctionReplacement(replacementWithAliasSpacing, replacement, sql, call);
+            replacements.add(new TextReplacement(index, call.endIndex(), replacementWithAliasSpacing.toString()));
+            index = call.endIndex();
+        }
+        GenericConversion result = applyTextReplacements(sql, replacements);
+        return result.changed()
+                ? SqlConversionResult.changed(sql, result.convertedSql(), List.of(MYSQL_UTF8MB4_HEX_CONVERT_RULE))
+                : SqlConversionResult.unchanged(sql);
+    }
+
+    private String decodeMysqlUtf8Literal(String hex) {
+        String decoded;
+        try {
+            byte[] bytes = HexFormat.of().parseHex(hex);
+            decoded = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException | IllegalArgumentException e) {
+            return null;
+        }
+        if (decoded.codePoints().anyMatch(Character::isISOControl) || decoded.contains("#{") || decoded.contains("${")) {
+            return null;
+        }
+        List<String> parts = new ArrayList<>();
+        int start = 0;
+        for (int index = 0; index < decoded.length(); index++) {
+            char character = decoded.charAt(index);
+            if (character != '\\' && character != '&') {
+                continue;
+            }
+            if (index > start) {
+                parts.add("'" + decoded.substring(start, index).replace("'", "''") + "'");
+            }
+            parts.add("CHR(" + (int) character + ")");
+            start = index + 1;
+        }
+        if (start < decoded.length()) {
+            parts.add("'" + decoded.substring(start).replace("'", "''") + "'");
+        }
+        return parts.size() == 1 ? parts.get(0) : "(" + String.join(" || ", parts) + ")";
     }
 
     private GenericConversion convertDecimalConvertFunctions(String sql) {

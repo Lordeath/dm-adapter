@@ -28,6 +28,48 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void decodesUtf8mb4HexLiteralsAndPreservesQuotesAndBackslashes() {
+        SqlConversionResult result = converter.convert("""
+                SELECT CONVERT(X'E6A0B7E4BE8BF09F9982' USING UTF8MB4) AS sample_unicode,
+                       CONVERT(0x274126425c USING utf8mb4) AS sample_text
+                FROM dual
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql()).contains("'样例🙂' AS sample_unicode",
+                "('''A' || CHR(38) || 'B' || CHR(92)) AS sample_text");
+        assertThat(result.appliedRules()).contains(MySqlToDmSqlConverter.MYSQL_UTF8MB4_HEX_CONVERT_RULE);
+    }
+
+    @Test
+    void preservesUncertainHexCharsetConversionsForManualReview() {
+        for (String expression : List.of("CONVERT(0xff USING utf8mb4)", "CONVERT(0x123 USING utf8mb4)",
+                "CONVERT(0x00 USING utf8mb4)", "CONVERT(0x247b787d USING utf8mb4)",
+                "CONVERT(X'' USING utf8mb4)", "CONVERT(0x41 USING latin1)", "CONVERT(payload USING utf8mb4)")) {
+            String sql = "SELECT CONVERT(0x41 USING utf8mb4), " + expression + " FROM dual";
+            SqlConversionResult result = converter.convert(sql);
+
+            assertThat(result.manualReviewRequired()).as(expression).isTrue();
+            assertThat(result.convertedSql()).isEqualTo(sql);
+            assertThat(result.reason()).contains("valid utf8mb4 hex literal");
+        }
+    }
+
+    @Test
+    void ignoresHexCharsetConversionTextInStringsAndComments() {
+        String sql = """
+                SELECT 'CONVERT(0x41 USING utf8mb4)' AS sample_text, 0x41 AS sample_raw
+                FROM dual /* CONVERT(0x42 USING utf8mb4) */
+                -- CONVERT(0x43 USING utf8mb4)
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.changed()).isFalse();
+        assertThat(result.manualReviewRequired()).isFalse();
+    }
+
+    @Test
     void leavesIfnullAndNowNative() {
         SqlConversionResult result = converter.convert("select IFNULL(name, 'n/a'), NOW() from user");
 
