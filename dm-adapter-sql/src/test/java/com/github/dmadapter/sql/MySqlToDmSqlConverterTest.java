@@ -87,6 +87,22 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void stopsNullSafeEqualityAtWhereAfterJoin() {
+        SqlConversionResult result = converter.convert("""
+                SELECT old_row.id FROM sample_menu old_row
+                JOIN sample_menu new_row ON new_row.`parent_id` <=> old_row.`parent_id`
+                WHERE old_row.label = 'sample-old'
+                """);
+
+        assertThat(result.manualReviewRequired()).isFalse();
+        assertThat(result.convertedSql())
+                .contains("(new_row.`parent_id`) = (old_row.`parent_id`)")
+                .contains("(old_row.`parent_id`) IS NULL) THEN 1 ELSE 0 END = 1)\nWHERE old_row.label")
+                .containsOnlyOnce("WHERE old_row.label")
+                .doesNotContain("<=>");
+    }
+
+    @Test
     void convertsMysqlNullSafeEqualityWithArithmeticRightOperand() {
         SqlConversionResult result = converter.convert(
                 "SELECT 1 FROM dual WHERE mm.menu_order_index <=> IFNULL(target_last.menu_order_index, 0) + 1"

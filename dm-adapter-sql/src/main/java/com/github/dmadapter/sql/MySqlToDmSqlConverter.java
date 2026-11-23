@@ -7126,7 +7126,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             } else if (parenthesisDepth == 0 && caseDepth == 0
                     && (current == ',' || current == ';'
                     || startsKeyword(sql, index, "AND")
-                    || startsKeyword(sql, index, "OR"))) {
+                    || startsKeyword(sql, index, "OR")
+                    || startsNullSafeOperandClause(sql, index))) {
                 break;
             } else {
                 index++;
@@ -7138,6 +7139,15 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         String text = sql.substring(start, end);
         return text.isBlank() ? null : new Operand(start, end, text);
+    }
+
+    private boolean startsNullSafeOperandClause(String sql, int index) {
+        if (!startsSqlClauseBoundary(sql, index)
+                && !startsKeyword(sql, index, "FROM") && !startsKeyword(sql, index, "SET")) {
+            return false;
+        }
+        int previous = skipWhitespaceBackward(sql, index);
+        return previous == 0 || sql.charAt(previous - 1) != '.';
     }
 
     private int readDoubleQuotedIdentifierStartBackward(String sql, int endExclusive) {

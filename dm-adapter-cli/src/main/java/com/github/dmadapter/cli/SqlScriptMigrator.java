@@ -5145,9 +5145,14 @@ class SqlScriptMigrator {
     }
 
     private String convertSingleMysqlAlterTableIndex(String ddl) {
+        String original = ddl == null ? "" : ddl.strip();
+        String addIndexSql = convertMysqlAlterTableAddIndex(original);
+        if (!addIndexSql.equals(original)) {
+            return normalizeCreateIndexForDm(addIndexSql);
+        }
         Matcher matcher = Pattern.compile(
                 "(?is)^\\s*ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+(?<part>.+?)\\s*$"
-        ).matcher(ddl == null ? "" : ddl);
+        ).matcher(original);
         if (!matcher.matches()) {
             return "";
         }
@@ -7735,6 +7740,9 @@ class SqlScriptMigrator {
             converted = standaloneAddIndexSql;
             rules.add(MYSQL_SCHEMA_SCOPED_INDEX_NAME_RULE);
         }
+        if (manualReviewReason.isBlank() && hasUnsupportedMysqlAddIndexOptions(sql)) {
+            manualReviewReason = "MySQL ADD INDEX 包含无法等价转换的 ALGORITHM 或 LOCK 选项，需人工确认。";
+        }
 
         String alterModifySql = normalizeMysqlAlterModifySyntax(converted);
         if (!alterModifySql.equals(converted)) {
@@ -7840,6 +7848,14 @@ class SqlScriptMigrator {
         if (!controlFlowSql.equals(converted)) {
             converted = controlFlowSql;
             rules.add(MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE);
+        }
+
+        RoutineStaticSqlConversion repeatConversion = convertMysqlProcedureRepeat(converted);
+        if (repeatConversion.supported() && !repeatConversion.sql().equals(converted)) {
+            converted = repeatConversion.sql();
+            rules.add(MYSQL_PROCEDURE_CONTROL_FLOW_TO_DM_RULE);
+        } else if (!repeatConversion.supported() && manualReviewReason.isBlank()) {
+            manualReviewReason = repeatConversion.reason();
         }
 
         String unusedCursorHandlerSql = removeUnusedMysqlCursorHandlers(converted);
@@ -7975,6 +7991,14 @@ class SqlScriptMigrator {
             if (procedureLocalSetSql.contains("CAST(JSON_UNQUOTE(JSON_EXTRACT")) {
                 rules.add(MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE);
             }
+        }
+
+        RoutineStaticSqlConversion jsonScalarConversion = narrowNumericJsonScalarLocals(converted);
+        if (jsonScalarConversion.supported() && !jsonScalarConversion.sql().equals(converted)) {
+            converted = jsonScalarConversion.sql();
+            rules.add(MYSQL_PROCEDURE_JSON_TEXT_TYPE_RULE);
+        } else if (!jsonScalarConversion.supported() && manualReviewReason.isBlank()) {
+            manualReviewReason = jsonScalarConversion.reason();
         }
 
         ProcedureTrimConversion procedureTrim = convertMysqlProcedureMultiCharacterTrim(converted);
@@ -10352,6 +10376,108 @@ class SqlScriptMigrator {
                 Pattern.compile("(?is)\\bWHILE\\s+(.+?)\\s+DO\\b"),
                 matcher -> "WHILE " + matcher.group(1).strip() + " LOOP"
         );
+    }
+
+    private RoutineStaticSqlConversion convertMysqlProcedureRepeat(String sql) {
+        if (!isCreateRoutineStatement(sql) || !sql.toUpperCase(Locale.ROOT).contains("REPEAT")) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        String code = replaceIgnoredSqlWithSpaces(sql);
+        RoutineStaticSqlConversion unsupported = RoutineStaticSqlConversion.unsupported(
+                "MySQL REPEAT 循环包含标签、跳转或无法匹配的 UNTIL/END REPEAT，需人工转换。"
+        );
+        List<Integer> conditions = new ArrayList<>();
+        List<RoutineTextReplacement> replacements = new ArrayList<>();
+        int parenthesisDepth = 0;
+        int index = Math.max(0, firstProcedureBegin(sql));
+        while (index < code.length()) {
+            char current = code.charAt(index);
+            if (current == '"') {
+                index = skipDoubleQuotedText(code, index);
+                continue;
+            }
+            if (current == '`') {
+                index = skipBacktickIdentifier(code, index);
+                continue;
+            }
+            if (current == '(') {
+                parenthesisDepth++;
+            } else if (current == ')') {
+                parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+            } else if (parenthesisDepth == 0) {
+                int last = conditions.size() - 1;
+                if (startsKeyword(code, index, "END")) {
+                    int repeat = skipWhitespace(code, index + "END".length());
+                    if (startsKeyword(code, repeat, "REPEAT")) {
+                        int end = repeat + "REPEAT".length();
+                        int terminator = skipWhitespace(code, end);
+                        if (last < 0 || conditions.get(last) < 0 || terminator >= code.length()
+                                || code.charAt(terminator) != ';'
+                                || sql.substring(conditions.get(last), index).isBlank()) {
+                            return unsupported;
+                        }
+                        int conditionEnd = index;
+                        while (conditionEnd > conditions.get(last)
+                                && (sql.charAt(conditionEnd - 1) == ' ' || sql.charAt(conditionEnd - 1) == '\t')) {
+                            conditionEnd--;
+                        }
+                        int until = conditions.remove(last) - "UNTIL".length();
+                        replacements.add(new RoutineTextReplacement(conditionEnd, index,
+                                ";\n" + lineIndentBefore(sql, until)));
+                        replacements.add(new RoutineTextReplacement(repeat, end, "LOOP"));
+                        index = end;
+                        continue;
+                    }
+                }
+                boolean repeatKeyword = startsKeyword(code, index, "REPEAT");
+                boolean untilKeyword = last >= 0 && startsKeyword(code, index, "UNTIL");
+                boolean jumpKeyword = last >= 0 && (startsKeyword(code, index, "ITERATE")
+                        || startsKeyword(code, index, "LEAVE") || startsKeyword(code, index, "CONTINUE")
+                        || startsKeyword(code, index, "GOTO"));
+                if ((repeatKeyword || untilKeyword || jumpKeyword) && isMysqlProcedureIfControlFlowPosition(code, index)) {
+                    int previous = previousNonWhitespace(code, index - 1);
+                    if (repeatKeyword) {
+                        int bodyStart = skipWhitespace(code, index + "REPEAT".length());
+                        if (bodyStart < code.length() && code.charAt(bodyStart) == '(') {
+                            index = bodyStart;
+                            continue;
+                        }
+                        if (previous >= 0 && code.charAt(previous) == ':') {
+                            return unsupported;
+                        }
+                        conditions.add(-1);
+                        replacements.add(new RoutineTextReplacement(index, index + "REPEAT".length(), "LOOP"));
+                        index += "REPEAT".length();
+                        continue;
+                    }
+                    if (untilKeyword) {
+                        if (conditions.get(last) >= 0 || previous < 0 || code.charAt(previous) != ';') {
+                            return unsupported;
+                        }
+                        conditions.set(last, index + "UNTIL".length());
+                        replacements.add(new RoutineTextReplacement(index, index + "UNTIL".length(), "EXIT WHEN"));
+                        index += "UNTIL".length();
+                        continue;
+                    }
+                    if (jumpKeyword) {
+                        return unsupported;
+                    }
+                }
+                if (current == ';' && last >= 0 && conditions.get(last) >= 0) {
+                    return unsupported;
+                }
+            }
+            index++;
+        }
+        if (!conditions.isEmpty()) {
+            return unsupported;
+        }
+        StringBuilder converted = new StringBuilder(sql);
+        for (int position = replacements.size() - 1; position >= 0; position--) {
+            RoutineTextReplacement replacement = replacements.get(position);
+            converted.replace(replacement.start(), replacement.end(), replacement.replacement());
+        }
+        return RoutineStaticSqlConversion.supported(converted.toString());
     }
 
     private String convertProcedureClobEmptyStringChecks(String sql) {
@@ -12734,6 +12860,102 @@ class SqlScriptMigrator {
         }
         converted.append(expression.substring(cursor));
         return converted.toString();
+    }
+
+    private RoutineStaticSqlConversion narrowNumericJsonScalarLocals(String sql) {
+        if (!isCreateRoutineStatement(sql) || !sql.toUpperCase(Locale.ROOT).contains("CAST(JSON_UNQUOTE")) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        int begin = firstProcedureBegin(sql);
+        if (begin < 0) {
+            return RoutineStaticSqlConversion.supported(sql);
+        }
+        String code = replaceIgnoredSqlWithSpaces(sql);
+        Matcher declarations = Pattern.compile("(?im)^[\\t ]*(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")"
+                        + "[\\t ]+(?<type>CLOB)\\b(?<tail>[^\\r\\n;]*);")
+                .matcher(code.substring(0, begin));
+        String body = sql.substring(begin);
+        String bodyCode = code.substring(begin);
+        List<RoutineTextReplacement> replacements = new ArrayList<>();
+        while (declarations.find()) {
+            String reference = identifierReferencePattern(declarations.group("name"));
+            String numericCast = "\\bCAST\\s*\\(\\s*(?<numeric>" + reference + ")\\s+AS\\s+"
+                    + "(?:SIGNED(?:\\s+INTEGER)?|UNSIGNED(?:\\s+INTEGER)?|BIGINT)\\s*\\)";
+            if (!Pattern.compile("(?i)" + numericCast).matcher(bodyCode).find()) {
+                continue;
+            }
+            Matcher uses = Pattern.compile("(?i)" + numericCast
+                            + "|(?<assignment>" + reference + ")\\s*:="
+                            + "|(?<predicate>" + reference + ")\\s+(?:IS\\s+(?:NOT\\s+)?NULL\\b"
+                            + "|(?:NOT\\s+)?(?:REGEXP\\b|IN\\s*\\())"
+                            + "|\\b(?:CHAR_LENGTH|LENGTH|REGEXP_LIKE)\\s*\\(\\s*(?<argument>" + reference + ")\\s*[,)]")
+                    .matcher(bodyCode);
+            Set<Integer> recognizedReferences = new LinkedHashSet<>();
+            boolean boundedAssignment = false;
+            boolean otherAssignment = false;
+            while (uses.find()) {
+                if (uses.start("assignment") >= 0) {
+                    int end = findStatementTerminator(body, uses.end());
+                    boolean bounded = isBoundedJsonScalarText(body.substring(uses.end(), end).strip());
+                    boundedAssignment |= bounded;
+                    otherAssignment |= !bounded;
+                }
+                for (String group : List.of("numeric", "assignment", "predicate", "argument")) {
+                    if (uses.start(group) >= 0) {
+                        recognizedReferences.add(uses.start(group));
+                    }
+                }
+            }
+            if (!boundedAssignment) {
+                continue;
+            }
+            Matcher references = Pattern.compile("(?i)" + reference).matcher(bodyCode);
+            boolean unrecognized = references.results()
+                    .anyMatch(match -> !isQualifiedIdentifierPart(bodyCode, match.start(), match.end())
+                            && !recognizedReferences.contains(match.start()));
+            if (otherAssignment || unrecognized || !declarations.group("tail").isBlank()) {
+                return RoutineStaticSqlConversion.unsupported(
+                        "JSON 标量 CLOB 局部变量在数值转换之外还有无法确认的赋值或用法，需人工确认。");
+            }
+            replacements.add(new RoutineTextReplacement(declarations.start("type"), declarations.end("type"),
+                    "VARCHAR(4000)"));
+        }
+        StringBuilder converted = new StringBuilder(sql);
+        for (int position = replacements.size() - 1; position >= 0; position--) {
+            RoutineTextReplacement replacement = replacements.get(position);
+            converted.replace(replacement.start(), replacement.end(), replacement.replacement());
+        }
+        return RoutineStaticSqlConversion.supported(converted.toString());
+    }
+
+    private boolean isBoundedJsonScalarText(String expression) {
+        if (startsKeyword(expression, 0, "NULLIF")) {
+            int open = skipWhitespace(expression, "NULLIF".length());
+            if (open >= expression.length() || expression.charAt(open) != '('
+                    || findMatchingParen(expression, open) != expression.length() - 1) {
+                return false;
+            }
+            List<String> arguments = splitTopLevelComma(expression.substring(open + 1, expression.length() - 1));
+            if (arguments.size() != 2 || !arguments.get(1).strip().equals("'null'")) {
+                return false;
+            }
+            expression = arguments.get(0).strip();
+        }
+        String prefix = "CAST(JSON_UNQUOTE";
+        if (!expression.regionMatches(true, 0, prefix, 0, prefix.length())) {
+            return false;
+        }
+        int unquoteOpen = skipWhitespace(expression, prefix.length());
+        int extract = skipWhitespace(expression, unquoteOpen + 1);
+        if (unquoteOpen >= expression.length() || expression.charAt(unquoteOpen) != '('
+                || !startsKeyword(expression, extract, "JSON_EXTRACT")) {
+            return false;
+        }
+        int extractOpen = skipWhitespace(expression, extract + "JSON_EXTRACT".length());
+        int extractEnd = findMatchingParen(expression, extractOpen);
+        int unquoteEnd = findMatchingParen(expression, unquoteOpen);
+        return extractEnd > extractOpen && skipWhitespace(expression, extractEnd + 1) == unquoteEnd
+                && expression.substring(unquoteEnd + 1).matches("(?i)\\s+AS\\s+VARCHAR\\(4000\\)\\s*\\)");
     }
 
     private boolean isJsonTextExtractionExpression(String expression) {
@@ -16932,9 +17154,11 @@ class SqlScriptMigrator {
                 "(?is)^ALTER\\s+TABLE\\s+(?<table>" + SQL_IDENTIFIER_TOKEN + ")\\s+ADD\\s+"
                         + "(?<unique>UNIQUE\\s+)?(?:INDEX|KEY)\\s+"
                         + "(?:(?<index>" + SQL_IDENTIFIER_TOKEN + ")\\s*)?\\((?<columns>.*)\\)"
-                        + "\\s*(?:USING\\s+BTREE\\s*)?$"
+                        + "\\s*(?:USING\\s+BTREE\\s*)?"
+                        + "(?<online>,\\s*(?:ALGORITHM\\s*=\\s*INPLACE\\s*,\\s*LOCK\\s*=\\s*NONE"
+                        + "|LOCK\\s*=\\s*NONE\\s*,\\s*ALGORITHM\\s*=\\s*INPLACE)\\s*)?$"
         ).matcher(ddl);
-        if (!matcher.matches()) {
+        if (!matcher.matches() || findMatchingParen(ddl, matcher.start("columns") - 1) != matcher.end("columns")) {
             return ddl;
         }
         String index = matcher.group("index");
@@ -16951,7 +17175,31 @@ class SqlScriptMigrator {
                 + matcher.group("table")
                 + " ("
                 + convertMysqlIndexPrefixLengths(matcher.group("columns").strip())
-                + ")";
+                + ")"
+                + (matcher.group("online") == null ? "" : " ONLINE");
+    }
+
+    private boolean hasUnsupportedMysqlAddIndexOptions(String sql) {
+        if (!Pattern.compile("(?i)\\b(?:ALGORITHM|LOCK)\\s*=").matcher(sql).find()) {
+            return false;
+        }
+        String code = replaceIgnoredSqlWithSpaces(sql);
+        Matcher alterTable = Pattern.compile("(?is)\\bALTER\\s+TABLE\\s+(?:" + SQL_IDENTIFIER_TOKEN + ")\\s+")
+                .matcher(code);
+        Pattern addIndex = Pattern.compile("(?is)^\\s*ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b");
+        Pattern option = Pattern.compile("(?is)^\\s*(?:ALGORITHM|LOCK)\\s*=");
+        while (alterTable.find()) {
+            int end = findStatementTerminator(sql, alterTable.end());
+            List<String> parts = splitTopLevelComma(code.substring(alterTable.end(), end));
+            if (parts.stream().anyMatch(part -> addIndex.matcher(part).find())
+                    && parts.stream().anyMatch(part -> option.matcher(part).find())) {
+                String ddl = sql.substring(alterTable.start(), end).strip();
+                if (convertMysqlAlterTableAddIndex(ddl).equals(ddl)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private ProcedureStatement convertMysqlDropIndexOnTableToGuard(String ddl) {
@@ -16985,7 +17233,7 @@ class SqlScriptMigrator {
                         + "(?<index>" + SQL_IDENTIFIER_TOKEN + ")(?<middle>\\s+ON\\s+)"
                         + "(?<table>" + SQL_IDENTIFIER_TOKEN + ")"
                         + "(?<open>\\s*\\()(?<columns>.*)(?<close>\\))"
-                        + "\\s*(?:USING\\s+BTREE\\s*)?$"
+                        + "\\s*(?:USING\\s+BTREE\\s*|(?<online>ONLINE)\\s*)?$"
         ).matcher(ddl);
         if (!matcher.matches()) {
             return ddl;
@@ -16996,7 +17244,8 @@ class SqlScriptMigrator {
                 + matcher.group("table")
                 + " ("
                 + convertMysqlIndexPrefixLengths(matcher.group("columns").strip())
-                + matcher.group("close");
+                + matcher.group("close")
+                + (matcher.group("online") == null ? "" : " ONLINE");
     }
 
     private DamengCreateIndexDefinition damengCreateIndexDefinition(String ddl) {
@@ -17010,7 +17259,11 @@ class SqlScriptMigrator {
         }
         int openParen = matcher.end() - 1;
         int closeParen = findMatchingParen(ddl, openParen);
-        if (closeParen <= openParen || !ddl.substring(closeParen + 1).strip().isBlank()) {
+        if (closeParen <= openParen) {
+            return null;
+        }
+        String options = ddl.substring(closeParen + 1).strip();
+        if (!options.isEmpty() && !options.equalsIgnoreCase("ONLINE")) {
             return null;
         }
         List<DamengIndexColumn> columns = damengIndexColumns(ddl.substring(openParen + 1, closeParen));

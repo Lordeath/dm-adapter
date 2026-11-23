@@ -5444,6 +5444,45 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsGuardedMysqlOnlineAddIndexWithoutLosingDefinitionCheck() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_add_index()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.STATISTICS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_event'
+                          AND INDEX_NAME = 'idx_event') THEN
+                        ALTER TABLE sample_event ADD INDEX idx_event (tenant_id, kind, state, created_at DESC),
+                            ALGORITHM=INPLACE,
+                            LOCK=NONE;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_add_index();
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("EXECUTE IMMEDIATE 'CREATE INDEX sample_event_idx_event"
+                        + " ON sample_event (tenant_id, kind, state, created_at DESC) ONLINE'")
+                .contains("FROM ALL_IND_COLUMNS C", "C.COLUMN_POSITION = 4", "UPPER(C.DESCEND) = 'DESC'")
+                .doesNotContain("ADD INDEX", "ALGORITHM=", "LOCK=NONE", "INDEX_NAME = 'sample_event_idx_event'");
+    }
+
+    @Test
+    void preservesMysqlIndexOptionsWithoutAnEquivalentOnlineConversion() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                ALTER TABLE sample_event ADD INDEX idx_event (tenant_id), ALGORITHM=COPY, LOCK=SHARED;
+                ALTER TABLE sample_event ADD INDEX idx_x (kind), ADD INDEX idx_y (state), ALGORITHM=INPLACE, LOCK=NONE;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).hasSize(2).allSatisfy(item ->
+                assertThat(item.reason()).contains("ALGORITHM 或 LOCK"));
+        assertThat(converted.sql()).contains("ALGORITHM=COPY, LOCK=SHARED",
+                "ADD INDEX idx_y (state), ALGORITHM=INPLACE, LOCK=NONE").doesNotContain("CREATE INDEX");
+    }
+
+    @Test
     void convertsMysqlProcedureAddIndexUsingBtreeDdlToCreateIndex() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -6293,6 +6332,72 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void keepsJsonScalarVersionTextAsVarcharBeforeUnsignedCast() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_version(IN p_items JSON)
+                BEGIN
+                    DECLARE v_item LONGTEXT;
+                    DECLARE v_version_text TEXT;
+                    DECLARE v_confirm_text TEXT;
+                    DECLARE v_version INT;
+                    DECLARE v_confirm INT;
+                    SET v_item = JSON_EXTRACT(p_items, '$[0]');
+                    SET v_version_text = NULLIF(JSON_UNQUOTE(JSON_EXTRACT(v_item, '$.ver')), 'null');
+                    IF v_version_text IS NULL THEN
+                        SET v_version = 2;
+                    ELSE
+                        IF v_version_text NOT REGEXP '^[0-9]+$' OR CHAR_LENGTH(v_version_text) > 10
+                            OR CAST(v_version_text AS UNSIGNED) > 2147483647 THEN
+                            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid version';
+                        END IF;
+                        SET v_version = CAST(v_version_text AS UNSIGNED);
+                    END IF;
+                    SET v_confirm_text = NULLIF(JSON_UNQUOTE(JSON_EXTRACT(v_item, '$.confirm')), 'null');
+                    IF v_confirm_text IS NOT NULL AND v_confirm_text NOT IN ('0', '1') THEN
+                        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid confirmation';
+                    END IF;
+                    SET v_confirm = COALESCE(CAST(v_confirm_text AS UNSIGNED), 0);
+                    SELECT v_version AS sample_version, v_confirm AS sample_confirm;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql())
+                .contains("p_items IN JSON", "v_item CLOB;", "v_version_text VARCHAR(4000);", "v_confirm_text VARCHAR(4000);")
+                .contains("v_version_text := NULLIF(CAST(JSON_UNQUOTE(JSON_EXTRACT(v_item, '$.ver')) AS VARCHAR(4000)), 'null');")
+                .contains("v_version := 2;", "CAST(v_version_text AS BIGINT) > 2147483647",
+                        "v_version := CAST(v_version_text AS BIGINT);", "v_confirm_text NOT IN ('0', '1')",
+                        "v_confirm := COALESCE(CAST(v_confirm_text AS BIGINT), 0);")
+                .doesNotContain("v_version_text CLOB");
+    }
+
+    @Test
+    void preservesJsonScalarLocalWithAnotherWriteForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_version(IN p_items JSON, IN p_override LONGTEXT)
+                BEGIN
+                    DECLARE v_version_text TEXT;
+                    DECLARE v_version INT;
+                    SET v_version_text = NULLIF(JSON_UNQUOTE(JSON_EXTRACT(p_items, '$.ver')), 'null');
+                    IF p_override IS NOT NULL THEN
+                        SET v_version_text = p_override;
+                    END IF;
+                    SET v_version = CAST(v_version_text AS UNSIGNED);
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("JSON 标量 CLOB 局部变量"));
+        assertThat(converted.sql()).contains("DECLARE v_version_text TEXT;")
+                .contains("SET v_version_text = p_override;")
+                .doesNotContain("v_version_text VARCHAR(4000)");
+    }
+
+    @Test
     void formatsProcedureJsonSetTimestampValuesForDamengJsonSerialization() throws Exception {
         Path sqlRoot = tempDir.resolve("sql/v2");
         Path sqlRootOut = tempDir.resolve("sql/v2-dm");
@@ -6900,6 +7005,66 @@ class SqlScriptMigratorTest {
                 .contains("EXECUTE IMMEDIATE 'ALTER TABLE demo ALTER COLUMN code SET DEFAULT NULL'")
                 .doesNotContain("column_default")
                 .doesNotContain("numeric_precision");
+    }
+
+    @Test
+    void convertsMysqlRepeatWithExitTestAfterItsBody() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_batch(IN p_start INT)
+                BEGIN
+                    DECLARE v_batch_rows INT;
+                    DECLARE v_batches INT DEFAULT 0;
+                    SET v_batch_rows = p_start;
+                    REPEAT
+                        -- UNTIL test END REPEAT;
+                        SET v_batch_rows = CASE WHEN v_batch_rows > 0 THEN v_batch_rows - 1 ELSE 0 END;
+                        SET v_batches = v_batches + 1;
+                    UNTIL v_batch_rows = 0 END REPEAT;
+                    SELECT v_batches, 'END REPEAT';
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).containsSubsequence("LOOP", "-- UNTIL test END REPEAT;",
+                "v_batch_rows := CASE", "v_batches := v_batches + 1;", "EXIT WHEN v_batch_rows = 0;", "END LOOP;")
+                .contains("'END REPEAT'")
+                .doesNotContain("UNTIL v_batch_rows = 0 END REPEAT");
+    }
+
+    @Test
+    void preservesRepeatFunctionInProcedureCaseExpression() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_prefix(IN p_include INT)
+                BEGIN
+                    SELECT CASE WHEN p_include = 1 THEN REPEAT('x', 2) ELSE '' END;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewSqlCount()).isZero();
+        assertThat(converted.sql()).contains("THEN REPEAT('x', 2)");
+    }
+
+    @Test
+    void preservesLabeledMysqlRepeatForManualReview() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_batch()
+                BEGIN
+                    batch_label: REPEAT
+                        ITERATE batch_label;
+                    UNTIL 1 = 1 END REPEAT batch_label;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("MySQL REPEAT 循环"));
+        assertThat(converted.sql()).contains("batch_label: REPEAT", "ITERATE batch_label;")
+                .doesNotContain("EXIT WHEN");
     }
 
     @Test
