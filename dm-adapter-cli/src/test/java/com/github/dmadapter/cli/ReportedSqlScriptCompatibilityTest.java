@@ -50,28 +50,63 @@ class ReportedSqlScriptCompatibilityTest {
     }
 
     @Test
-    void retainsMixedDdlAndMultipleRenamesUnderASingleGuardForReview() throws Exception {
+    void retainsGuardedColumnAltersWithUnmatchedTablesOrUnsupportedActions() throws Exception {
         for (String body : List.of(
-                "ALTER TABLE sample_table CHANGE COLUMN old_value new_value DATETIME, ADD COLUMN extra_value INT;",
+                "ALTER TABLE sample_table CHANGE COLUMN old_value new_value DATETIME, ADD INDEX idx_value (new_value);",
                 "ALTER TABLE sample_table CHANGE COLUMN old_value new_value BIGINT;\n"
-                        + "ALTER TABLE sample_table CHANGE COLUMN old_name new_name VARCHAR(50);",
-                "ALTER TABLE sample_table ADD COLUMN first_value INT, ADD COLUMN second_value INT, DROP COLUMN old_value;")) {
-            Converted converted = migrate("""
-                    DELIMITER $$
-                    CREATE PROCEDURE sample_rename()
-                    BEGIN
-                        IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
-                            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_table'
-                              AND COLUMN_NAME = 'old_value') THEN
-                            %s
-                        END IF;
-                    END$$
-                    DELIMITER ;
-                    CALL sample_rename();
-                    """.formatted(body), "sample_change.sql");
+                        + "ALTER TABLE sample_other CHANGE COLUMN old_name new_name VARCHAR(50);",
+                "ALTER TABLE sample_table ADD COLUMN first_value INT, ADD COLUMN second_value INT, DROP COLUMN unrelated;")) {
+            Converted converted = migrate(guardedColumnAlters(body), "sample_change.sql");
             assertThat(converted.report().manualReviewItems()).hasSize(2);
             assertThat(converted.sql()).contains(body).doesNotContain("RENAME COLUMN", "EXECUTE IMMEDIATE");
         }
+    }
+
+    @Test
+    void keepsEachGroupOfColumnAltersUnderOneGuardInSourceOrder() throws Exception {
+        Converted addDrop = migrate(guardedColumnAlters("""
+                ALTER TABLE sample_table ADD COLUMN first_value VARCHAR(20) DEFAULT NULL COMMENT 'sample; first',
+                    ADD COLUMN second_value INT NULL, DROP COLUMN old_value;
+                """.strip()), "sample_change.sql");
+        assertFullyConverted(addDrop);
+        assertThat(addDrop.sql()).containsSubsequence("ADD (first_value VARCHAR(20 CHAR) DEFAULT NULL, second_value INT NULL)",
+                "COMMENT ON COLUMN sample_table.first_value IS ''sample; first''", "DROP COLUMN old_value")
+                .doesNotContain("UPDATE sample_table");
+
+        Converted renameAdd = migrate(guardedColumnAlters("""
+                ALTER TABLE sample_table CHANGE COLUMN old_value new_value DATETIME(0) NULL DEFAULT NULL,
+                    CHANGE COLUMN old_label new_label VARCHAR(40), ADD COLUMN optional_value DATETIME(0) NULL;
+                """.strip()), "sample_change.sql");
+        assertFullyConverted(renameAdd);
+        assertThat(renameAdd.sql()).containsSubsequence("RENAME COLUMN old_value TO new_value",
+                "RENAME COLUMN old_label TO new_label", "ADD (optional_value DATETIME(0) NULL)");
+
+        Converted repeatedRename = migrate(guardedColumnAlters("""
+                ALTER TABLE sample_table CHANGE COLUMN old_value new_value BIGINT DEFAULT NULL;
+                ALTER TABLE sample_table CHANGE COLUMN old_label new_label VARCHAR(40);
+                """.strip()), "sample_change.sql");
+        assertFullyConverted(repeatedRename);
+        assertThat(repeatedRename.sql()).containsSubsequence("RENAME COLUMN old_value TO new_value",
+                "RENAME COLUMN old_label TO new_label");
+        for (Converted converted : List.of(addDrop, renameAdd, repeatedRename)) {
+            assertThat(Pattern.compile("SELECT COUNT\\(\\*\\) INTO").matcher(converted.sql()).results().count()).isEqualTo(1);
+        }
+    }
+
+    private String guardedColumnAlters(String body) {
+        return """
+                DELIMITER $$
+                CREATE PROCEDURE sample_change_columns()
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_table'
+                          AND COLUMN_NAME = 'old_value') THEN
+                        %s
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_change_columns();
+                """.formatted(body);
     }
 
     @Test

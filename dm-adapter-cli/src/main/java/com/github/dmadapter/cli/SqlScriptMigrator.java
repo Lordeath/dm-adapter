@@ -308,10 +308,10 @@ class SqlScriptMigrator {
             "CONSTRAINT", "CHECK", "PRIMARY", "UNIQUE", "FOREIGN", "INDEX", "KEY", "FULLTEXT", "SPATIAL",
             "PARTITION", "SUBPARTITION", "PERIOD", "SUPPLEMENTAL"
     );
+    private static final String MYSQL_CHANGE_COLUMN_HEAD = "CHANGE(?:\\s+COLUMN)?\\s+(?<old>"
+            + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")";
     private static final String MYSQL_ALTER_COLUMN_CHANGE_HEAD =
-            "\\bALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+"
-                    + "CHANGE(?:\\s+COLUMN)?\\s+(?<old>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+"
-                    + "(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")";
+            "\\bALTER\\s+TABLE\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")\\s+" + MYSQL_CHANGE_COLUMN_HEAD;
     private static final Pattern MYSQL_ALTER_COLUMN_CHANGE_PATTERN =
             Pattern.compile("(?is)" + MYSQL_ALTER_COLUMN_CHANGE_HEAD + "(?=\\s)");
     private static final String MYSQL_CURRENT_SCHEMA_PREDICATE = "TABLE_SCHEMA\\s*=\\s*"
@@ -326,15 +326,35 @@ class SqlScriptMigrator {
             "(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|TIMESTAMP|DATETIME)(?:\\s*\\(\\s*\\d+\\s*\\))?"
                     + "|(?:VARCHAR|CHAR)\\s*\\(\\s*\\d+(?:\\s+CHAR)?\\s*\\)"
                     + "|TINYTEXT|MEDIUMTEXT|LONGTEXT|TEXT|CLOB";
-    private static final Pattern MYSQL_GUARDED_COLUMN_CHANGE_PATTERN = Pattern.compile(
-            "(?is)\\bIF\\s+EXISTS\\s*\\((?<oldCheck>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s*"
-                    + "(?:(?:AND|THEN\\s+IF)\\s+NOT\\s+EXISTS\\s*\\((?<newCheck>"
-                    + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s*)?"
-                    + "THEN\\s+(?<change>" + MYSQL_ALTER_COLUMN_CHANGE_HEAD + "\\s+"
-                    + "(?<definition>(?:" + MYSQL_CHANGE_COLUMN_TYPE + ")(?:\\s+(?:NOT\\s+)?NULL)?"
+    private static final String MYSQL_GUARDED_COLUMN_DEFINITION =
+            "\\s+(?<definition>(?:" + MYSQL_CHANGE_COLUMN_TYPE + ")(?:\\s+(?:NOT\\s+)?NULL)?"
                     + "(?:\\s+DEFAULT\\s+(?<defaultValue>NULL|[-+]?\\d+|" + SQL_STRING_LITERAL_TOKEN + "))?)"
                     + "(?:\\s+COMMENT\\s+(?<comment>" + SQL_STRING_LITERAL_TOKEN + "))?"
-                    + "(?:\\s+(?:FIRST|AFTER\\s+(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")))?\\s*);(?=\\s*END\\s+IF\\b)"
+                    + "(?:\\s+(?:FIRST|AFTER\\s+(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")))?\\s*";
+    private static final String MYSQL_GUARDED_OLD_COLUMN =
+            "(?is)\\bIF\\s+EXISTS\\s*\\((?<oldCheck>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s*";
+    private static final Pattern MYSQL_GUARDED_COLUMN_CHANGE_PATTERN = Pattern.compile(
+            MYSQL_GUARDED_OLD_COLUMN
+                    + "(?:(?:AND|THEN\\s+IF)\\s+NOT\\s+EXISTS\\s*\\((?<newCheck>"
+                    + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s*)?"
+                    + "THEN\\s+(?<change>" + MYSQL_ALTER_COLUMN_CHANGE_HEAD + MYSQL_GUARDED_COLUMN_DEFINITION
+                    + ");(?=\\s*END\\s+IF\\b)"
+    );
+    private static final String MYSQL_ALTER_TABLE_STATEMENT = "ALTER\\s+TABLE\\s+(?:"
+            + SQL_STRING_LITERAL_TOKEN + "|`[^`]+`|\"[^\"]+\"|[^;'`\"]++)*+;";
+    private static final Pattern MYSQL_GUARDED_COLUMN_ALTERS = Pattern.compile(
+            MYSQL_GUARDED_OLD_COLUMN + "THEN\\s+(?<body>" + MYSQL_ALTER_TABLE_STATEMENT
+                    + "(?:\\s*" + MYSQL_ALTER_TABLE_STATEMENT + ")*)(?=\\s*END\\s+IF\\b)"
+    );
+    private static final Pattern MYSQL_GROUPED_CHANGE_COLUMN = Pattern.compile(
+            "(?is)^" + MYSQL_CHANGE_COLUMN_HEAD + MYSQL_GUARDED_COLUMN_DEFINITION + "$"
+    );
+    private static final Pattern MYSQL_GROUPED_ADD_COLUMN = Pattern.compile(
+            "(?is)^ADD\\s+(?:COLUMN\\s+)?(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")"
+                    + MYSQL_GUARDED_COLUMN_DEFINITION + "$"
+    );
+    private static final Pattern MYSQL_GROUPED_DROP_COLUMN = Pattern.compile(
+            "(?is)^DROP\\s+COLUMN\\s+(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")$"
     );
     private static final Pattern SCRIPT_QUERY_SOURCE_TABLE_PATTERN = Pattern.compile(
             "(?is)\\b(?:FROM|JOIN)\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
@@ -9617,13 +9637,23 @@ class SqlScriptMigrator {
     }
 
     private RoutineStaticSqlConversion convertGuardedMysqlColumnChanges(String sql) {
-        if (!MYSQL_ALTER_COLUMN_CHANGE_PATTERN.matcher(sql).find()) {
+        boolean hasRename = MYSQL_ALTER_COLUMN_CHANGE_PATTERN.matcher(sql).find();
+        if (!hasRename && !(containsIgnoreCase(sql, "ADD") && containsIgnoreCase(sql, "DROP"))) {
             return RoutineStaticSqlConversion.supported(sql);
         }
-        String converted = isCreateProcedureStatement(sql)
-                ? replaceOutsideIgnoredText(sql, MYSQL_GUARDED_COLUMN_CHANGE_PATTERN,
-                        matcher -> renderGuardedMysqlColumnChange(sql, matcher))
-                : sql;
+        String converted = sql;
+        if (isCreateProcedureStatement(sql)) {
+            converted = replaceOutsideIgnoredText(sql, MYSQL_GUARDED_COLUMN_ALTERS,
+                    matcher -> renderGuardedMysqlColumnAlters(sql, matcher));
+            if (hasRename) {
+                String grouped = converted;
+                converted = replaceOutsideIgnoredText(grouped, MYSQL_GUARDED_COLUMN_CHANGE_PATTERN,
+                        matcher -> renderGuardedMysqlColumnChange(grouped, matcher));
+            }
+        }
+        if (!hasRename) {
+            return RoutineStaticSqlConversion.supported(converted);
+        }
         Matcher remaining = MYSQL_ALTER_COLUMN_CHANGE_PATTERN.matcher(replaceIgnoredSqlWithSpaces(converted));
         while (remaining.find()) {
             if (!sameIdentifier(remaining.group("old"), remaining.group("name"))) {
@@ -9634,23 +9664,94 @@ class SqlScriptMigrator {
         return RoutineStaticSqlConversion.supported(converted);
     }
 
+    private String renderGuardedMysqlColumnAlters(String sql, Matcher guard) {
+        String body = guard.group("body");
+        if (containsSqlComment(body)) {
+            return guard.group();
+        }
+        List<String> statements = SqlScriptParser.statements(body);
+        Matcher firstAlter = ALTER_TABLE_BODY_PATTERN.matcher(statements.get(0));
+        if (!firstAlter.matches() || !isSimpleIdentifier(unquoteIdentifier(firstAlter.group("table")))) {
+            return guard.group();
+        }
+        String table = firstAlter.group("table");
+        List<String> parts = new ArrayList<>();
+        for (String statement : statements) {
+            Matcher alter = ALTER_TABLE_BODY_PATTERN.matcher(statement);
+            if (!alter.matches() || !sameIdentifier(table, alter.group("table"))) {
+                return guard.group();
+            }
+            List<String> statementParts = splitTopLevelComma(alter.group("body"));
+            if (statements.size() > 1 && statementParts.size() != 1) {
+                return guard.group();
+            }
+            parts.addAll(statementParts);
+        }
+        if (parts.size() < 2) {
+            return guard.group();
+        }
+
+        List<String> ddl = new ArrayList<>();
+        List<String> addedColumns = new ArrayList<>();
+        List<String> addedComments = new ArrayList<>();
+        Set<String> columnNames = new LinkedHashSet<>();
+        String checkedColumn = null;
+        String droppedColumn = null;
+        for (int index = 0; index < parts.size(); index++) {
+            String part = parts.get(index).strip();
+            Matcher change = MYSQL_GROUPED_CHANGE_COLUMN.matcher(part);
+            Matcher add = MYSQL_GROUPED_ADD_COLUMN.matcher(part);
+            Matcher drop = MYSQL_GROUPED_DROP_COLUMN.matcher(part);
+            if (change.matches() && addedColumns.isEmpty() && part.indexOf('\\') < 0
+                    && columnNames.add(normalizedIdentifierKey(change.group("old")))
+                    && columnNames.add(normalizedIdentifierKey(change.group("name")))) {
+                if (checkedColumn == null) {
+                    checkedColumn = change.group("old");
+                }
+                appendMysqlColumnChangeDdl(ddl, table, change);
+            } else if (statements.size() == 1 && add.matches() && part.indexOf('\\') < 0
+                    && columnNames.add(normalizedIdentifierKey(add.group("name")))) {
+                String name = add.group("name");
+                addedColumns.add(name + " " + normalizeMysqlDataTypes(
+                        collapseSqlWhitespaceOutsideQuotedText(add.group("definition"))));
+                if (add.group("comment") != null) {
+                    addedComments.add("COMMENT ON COLUMN " + table + "." + name + " IS " + add.group("comment"));
+                }
+            } else if (statements.size() == 1 && drop.matches() && index == parts.size() - 1
+                    && ddl.isEmpty() && !addedColumns.isEmpty()
+                    && columnNames.add(normalizedIdentifierKey(drop.group("name")))) {
+                droppedColumn = drop.group("name");
+                checkedColumn = droppedColumn;
+            } else {
+                return guard.group();
+            }
+        }
+        if (checkedColumn == null || !checksMysqlColumn(guard.group("oldCheck"), table, checkedColumn)) {
+            return guard.group();
+        }
+        if (!addedColumns.isEmpty()) {
+            ddl.add("ALTER TABLE " + table + " ADD (" + String.join(", ", addedColumns) + ")");
+            ddl.addAll(addedComments);
+        }
+        if (droppedColumn != null) {
+            ddl.add("ALTER TABLE " + table + " DROP COLUMN " + droppedColumn);
+        }
+        return sql.substring(guard.start(), guard.start("body"))
+                + renderColumnAlterDdl(ddl, lineIndentBefore(sql, guard.start("body")));
+    }
+
     private String renderGuardedMysqlColumnChange(String sql, Matcher matcher) {
         String table = matcher.group("table");
         String oldColumn = matcher.group("old");
         String newColumn = matcher.group("name");
         String newCheck = matcher.group("newCheck");
-        String definition = matcher.group("definition");
-        String comment = Objects.requireNonNullElse(matcher.group("comment"), "''");
         if (sameIdentifier(oldColumn, newColumn) || !isSimpleIdentifier(unquoteIdentifier(table))
-                || definition.indexOf('\\') >= 0 || comment.indexOf('\\') >= 0
+                || matcher.group("change").indexOf('\\') >= 0
                 || !checksMysqlColumn(matcher.group("oldCheck"), table, oldColumn)
                 || (newCheck != null && !checksMysqlColumn(newCheck, table, newColumn))) {
             return matcher.group();
         }
 
-        definition = normalizeMysqlDataTypes(makeImplicitMysqlColumnNullabilityExplicit(
-                collapseSqlWhitespaceOutsideQuotedText(definition)));
-        String alterTable = "ALTER TABLE " + table;
         String indent = lineIndentBefore(sql, matcher.start("change"));
         StringBuilder rendered = new StringBuilder(sql.substring(matcher.start(), matcher.start("change")));
         if (newCheck == null) {
@@ -9662,19 +9763,28 @@ class SqlScriptMigrator {
                     .append(sqlStringLiteral("CHANGE COLUMN target already exists: " + unquoteIdentifier(newColumn)))
                     .append(");\n").append(indent).append("END IF;\n").append(indent);
         }
-        // Keep the source name until all changes succeed so a retry still satisfies the guard.
-        rendered.append("EXECUTE IMMEDIATE ").append(sqlStringLiteral(alterTable + " MODIFY " + oldColumn + " " + definition))
-                .append(";\n").append(indent);
-        if (matcher.group("defaultValue") == null) {
-            rendered.append("EXECUTE IMMEDIATE ")
-                    .append(sqlStringLiteral(alterTable + " ALTER COLUMN " + oldColumn + " DROP DEFAULT"))
-                    .append(";\n").append(indent);
+        List<String> ddl = new ArrayList<>();
+        appendMysqlColumnChangeDdl(ddl, table, matcher);
+        return rendered.append(renderColumnAlterDdl(ddl, indent)).toString();
+    }
+
+    private void appendMysqlColumnChangeDdl(List<String> ddl, String table, Matcher change) {
+        String oldColumn = change.group("old");
+        String alterTable = "ALTER TABLE " + table;
+        String definition = normalizeMysqlDataTypes(makeImplicitMysqlColumnNullabilityExplicit(
+                collapseSqlWhitespaceOutsideQuotedText(change.group("definition"))));
+        ddl.add(alterTable + " MODIFY " + oldColumn + " " + definition);
+        if (change.group("defaultValue") == null) {
+            ddl.add(alterTable + " ALTER COLUMN " + oldColumn + " DROP DEFAULT");
         }
-        return rendered.append("EXECUTE IMMEDIATE ")
-                .append(sqlStringLiteral("COMMENT ON COLUMN " + table + "." + oldColumn + " IS " + comment))
-                .append(";\n").append(indent).append("EXECUTE IMMEDIATE ")
-                .append(sqlStringLiteral(alterTable + " RENAME COLUMN " + oldColumn + " TO " + newColumn))
-                .append(';').toString();
+        ddl.add("COMMENT ON COLUMN " + table + "." + oldColumn + " IS "
+                + Objects.requireNonNullElse(change.group("comment"), "''"));
+        ddl.add(alterTable + " RENAME COLUMN " + oldColumn + " TO " + change.group("name"));
+    }
+
+    private String renderColumnAlterDdl(List<String> ddl, String indent) {
+        return String.join("\n" + indent,
+                ddl.stream().map(statement -> "EXECUTE IMMEDIATE " + sqlStringLiteral(statement) + ";").toList());
     }
 
     private boolean checksMysqlColumn(String query, String table, String column) {

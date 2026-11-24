@@ -712,6 +712,91 @@ class DamengSqlScriptIntegrationTest {
     }
 
     @Test
+    void executesGroupedColumnChangesUnderTheirOriginalGuards() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String header = "SAMPLE_HEADER_" + suffix;
+        String schedule = "SAMPLE_SCHEDULE_" + suffix;
+        String receipt = "SAMPLE_RECEIPT_" + suffix;
+        String procedure = "SAMPLE_GROUP_DDL_" + suffix;
+        List<String> converted = migrateIntegrationFixture("columns.sql", """
+                DELIMITER $$
+                CREATE PROCEDURE %4$s()
+                BEGIN
+                    IF EXISTS (SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE table_schema = (SELECT DATABASE())
+                        AND table_name = '%1$s' AND column_name = 'sample_text') THEN
+                        ALTER TABLE %1$s ADD COLUMN `sample_value` VARCHAR(255) DEFAULT NULL COMMENT '样例值',
+                            ADD COLUMN `sample_name` VARCHAR(255) DEFAULT NULL COMMENT '样例名', DROP COLUMN sample_text;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM information_schema.COLUMNS WHERE table_schema = (SELECT DATABASE())
+                        AND table_name = '%2$s' AND column_name = 'old_first') THEN
+                        ALTER TABLE %2$s CHANGE COLUMN old_first start_first DATETIME(0) NULL DEFAULT NULL COMMENT '样例开始' AFTER id,
+                            CHANGE COLUMN old_second start_second DATETIME(0) NULL DEFAULT NULL COMMENT '样例开始二' AFTER start_first,
+                            ADD COLUMN end_first DATETIME(0) NULL COMMENT '样例结束' AFTER start_second,
+                            ADD COLUMN end_second DATETIME(0) NULL COMMENT '样例结束二' AFTER end_first;
+                    END IF;
+                    IF EXISTS (SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE table_schema = (SELECT DATABASE())
+                        AND table_name = '%3$s' AND column_name = 'old_key') THEN
+                        ALTER TABLE %3$s CHANGE COLUMN old_key new_key BIGINT DEFAULT NULL COMMENT '样例编号';
+                        ALTER TABLE %3$s CHANGE COLUMN old_name new_name VARCHAR(50) DEFAULT NULL COMMENT '样例名称';
+                        ALTER TABLE %3$s CHANGE COLUMN old_time new_time TIMESTAMP DEFAULT NULL COMMENT '样例时间';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL %4$s();
+                DROP PROCEDURE IF EXISTS %4$s;
+                """.formatted(header, schedule, receipt, procedure), schema);
+        assertThat(String.join("\n", converted).split("SELECT COUNT\\(\\*\\) INTO", -1)).hasSize(4);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute("CREATE TABLE " + header + " (id INT, sample_text VARCHAR(255 CHAR))");
+                statement.execute("INSERT INTO " + header + " VALUES (1, '旧内容')");
+                statement.execute("CREATE TABLE " + schedule + " (id INT, old_first TIMESTAMP, old_second TIMESTAMP)");
+                statement.execute("INSERT INTO " + schedule + " VALUES (1, TIMESTAMP '2020-01-01 09:00:00',"
+                        + " TIMESTAMP '2020-01-02 09:00:00')");
+                statement.execute("CREATE TABLE " + receipt + " (new_key BIGINT, old_name VARCHAR(50 CHAR), old_time TIMESTAMP)");
+                statement.execute("INSERT INTO " + receipt + " VALUES (10, '样例', TIMESTAMP '2020-01-03 09:00:00')");
+                executeStatements(statement, converted);
+                try (ResultSet skipped = statement.executeQuery("SELECT old_name, old_time FROM " + receipt)) {
+                    assertThat(skipped.next()).isTrue();
+                    assertThat(skipped.getString(1)).isEqualTo("样例");
+                    assertThat(skipped.getTimestamp(2)).isNotNull();
+                }
+                statement.execute("ALTER TABLE " + receipt + " RENAME COLUMN new_key TO old_key");
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+
+                try (ResultSet rows = statement.executeQuery("SELECT * FROM " + header)) {
+                    assertThat(rows.getMetaData().getColumnCount()).isEqualTo(3);
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString("sample_value")).isNull();
+                    assertThat(rows.getString("sample_name")).isNull();
+                }
+                try (ResultSet rows = statement.executeQuery("SELECT * FROM " + schedule)) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getDate("start_first").toLocalDate().toString()).isEqualTo("2020-01-01");
+                    assertThat(rows.getDate("start_second").toLocalDate().toString()).isEqualTo("2020-01-02");
+                    assertThat(rows.getTimestamp("end_first")).isNull();
+                    assertThat(rows.getTimestamp("end_second")).isNull();
+                }
+                try (ResultSet rows = statement.executeQuery("SELECT * FROM " + receipt)) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong("new_key")).isEqualTo(10);
+                    assertThat(rows.getString("new_name")).isEqualTo("样例");
+                    assertThat(rows.getDate("new_time").toLocalDate().toString()).isEqualTo("2020-01-03");
+                }
+            } finally {
+                dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + procedure);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + receipt);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + schedule);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + header);
+            }
+        }
+    }
+
+    @Test
     void executesMixedIdentityValuesTwiceWithExplicitAndGeneratedIds() throws Exception {
         String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
         String username = requiredEnvironment("DM_DB_USERNAME");
