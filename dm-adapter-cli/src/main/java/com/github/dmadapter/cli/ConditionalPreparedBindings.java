@@ -18,10 +18,13 @@ final class ConditionalPreparedBindings {
         this.sources = Map.copyOf(sources);
     }
 
-    static ConditionalPreparedBindings load(Path sqlRoot) throws IOException {
-        Path file = sqlRoot.resolve(FILE_NAME);
-        if (!Files.exists(file)) {
+    static ConditionalPreparedBindings load(Path sqlRoot, Path configuredFile) throws IOException {
+        Path file = configuredFile == null ? sqlRoot.resolve(FILE_NAME) : configuredFile;
+        if (configuredFile == null && !Files.exists(file)) {
             return new ConditionalPreparedBindings(Map.of());
+        }
+        if (!Files.isRegularFile(file)) {
+            throw new IOException("条件动态 SQL 绑定文件不存在或不是普通文件：" + file);
         }
         Properties properties = new Properties() {
             @Override

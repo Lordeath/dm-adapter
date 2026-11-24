@@ -101,6 +101,9 @@ repositories:
         mode: REQUIRED
         sourceDir: "database/mysql"
         outputDir: "database/dameng"
+        schema: "sample-app"
+        systemSchema: "sample-system"
+        conditionalPreparedBindings: "bindings/service-b.properties"
 
   - name: temporarily-disabled
     url: "https://git.example.com/platform/temporarily-disabled.git"
@@ -116,6 +119,8 @@ repositories:
 - `projectSubdir` 指向仓库内 Maven 项目根目录，必须存在 `pom.xml`。
 - `mapperDir`、`rewriteConfig`、SQL 输入输出目录均相对仓库检出根目录，而不是相对 `projectSubdir`。
 - `sql.procedureSources` 可选配多个 MySQL/达梦 SQL 定义文件，用于增强公共过程的静态影响分析；路径可为绝对路径或相对 YAML 所在目录的路径。仓库级列表覆盖默认列表，`[]` 可取消继承。文件必须在该仓库开始转换前就存在，且内容与运行环境实际部署的过程一致；若引用其他仓库的检出文件，应先准备该仓库，不能依赖历史缓存碰巧存在。该配置不会克隆依赖仓库，也不会执行、部署或复制这些文件。未配置时，查询赋值变量不会仅因缺少外部过程定义而进入人工确认。
+- `sql.schema` 和 `sql.systemSchema` 分别为业务脚本和系统脚本指定离线转换使用的 schema。仓库级值覆盖 `migrationDefaults.sql` 中的默认值。转换器只移除与对应 schema 匹配的对象限定符。执行生成脚本时，由升级程序选择目标 schema。
+- `sql.conditionalPreparedBindings` 可指定条件动态 SQL 的 `.properties` 绑定文件。支持绝对路径和相对 YAML 所在目录的路径，文件由 Batch 只读加载。配置该字段时使用指定文件，否则继续查找 SQL 源目录中的 `conditional-prepared-bindings.properties`。仓库级值覆盖默认值。
 - 公共定义按列表顺序建立分析上下文，之后以脚本执行顺序跟踪 CREATE、DROP 和重建。未限定 schema 的公共定义属于当前脚本 schema，显式限定的名称仍按 schema 区分。查询赋值变量遇到单纯缺少外部定义的 CALL 时沿用兼容行为；显式删除或失效的本地定义、递归、动态 SQL、未知函数、OUT/INOUT 参数及已确认的相关变量/来源表修改仍保留人工确认。普通表达式变量仍把未知 CALL 作为阻断项。仅确认外部过程存在，不足以证明变量可安全内联。
 - `upsertKeys` 支持 `tables` 和 `methods`。表配置用于静态表名；方法配置键必须是 `namespace.statementId`，用于 `${tableName}` 等无法静态绑定 DDL 的动态写入。两者都只能填写已由业务 DDL 或业务约束确认的真实键，不能根据 `id`、`pk` 等字段名猜测。
 - `tables` 中每个表必须配置非空 `keyColumns`。`methods` 中的 `keyColumns` 表示普通 upsert 的唯一匹配键，`conflictKeyGroups` 表示 `INSERT IGNORE` 需要覆盖的全部可达主键/唯一键，组内为 AND、组间为 OR；每个方法必须至少配置其中一项。列名和键组不得为空或重复。
@@ -125,7 +130,7 @@ repositories:
 - SQL 表字段统一生成显式 `VARCHAR(n CHAR)` / `CHAR(n CHAR)`，不访问数据库，也不依赖目标库的 `LENGTH_IN_CHAR`。
 - 旧配置中的 `targetLengthSemantics` 会继续被接受，但其值不再生效；每次加载配置最多输出一条弃用告警，建议后续清理该字段。
 - 仓库 URL 不允许内嵌凭据。HTTP(S) 仓库必须同时配置全局 `username` 和 `password`；`file` URL 可不配凭据。
-- 当前 batch 模式故意不提供 schema 参数。它不会访问数据库，也不会生成 SQL 验证清单、调用验证器或输出 system-schema、外部存储过程未验证等数据库验证告警。
+- Batch 采用离线转换。schema 参数用于转换脚本和标注报告，各仓库的数据库试执行仍需在独立的验证流程中完成。
 - Batch 仍会阻止包含真实转换人工确认项的仓库提交和推送；数据库验证被静默不代表自动放行不确定 SQL。
 
 ## Git 与失败处理

@@ -209,6 +209,14 @@ final class BatchConfigLoader {
         List<Path> procedureSources = configuredSources.stream()
                 .map(path -> absoluteConfigPath(baseDir, path, "repositories[" + repository + "].migration.sql.procedureSources"))
                 .toList();
+        String schema = first(overrideSql == null ? null : overrideSql.schema(),
+                defaultSql == null ? null : defaultSql.schema());
+        String systemSchema = first(overrideSql == null ? null : overrideSql.systemSchema(),
+                defaultSql == null ? null : defaultSql.systemSchema());
+        String bindingsFile = first(overrideSql == null ? null : overrideSql.conditionalPreparedBindings(),
+                defaultSql == null ? null : defaultSql.conditionalPreparedBindings());
+        Path preparedBindings = bindingsFile == null ? null : absoluteConfigPath(
+                baseDir, bindingsFile, "repositories[" + repository + "].migration.sql.conditionalPreparedBindings");
         Map<String, MethodKeySettings> methodKeys = resolveMethodKeys(defaults, override, repository);
         return new ResolvedBatchConfig.Migration(
                 value(dmDriver),
@@ -226,7 +234,8 @@ final class BatchConfigLoader {
                                 Map.Entry::getKey,
                                 entry -> entry.getValue().conflictKeyGroups()
                         )),
-                new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, preserveSql, procedureSources)
+                new ResolvedBatchConfig.Sql(mode, sqlSource, sqlOutput, preserveSql, procedureSources,
+                        value(schema), value(systemSchema), preparedBindings)
         );
     }
 

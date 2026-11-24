@@ -103,6 +103,86 @@ class BatchCommandTest {
     }
 
     @Test
+    void batchPassesRepositorySchemaToGuardedColumnRenameConversion() throws Exception {
+        RemoteFixture remote = createRemote("qualified-columns", false);
+        String source = """
+                DELIMITER $$
+                CREATE PROCEDURE sample_rename()
+                BEGIN
+                    IF EXISTS (SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = (SELECT DATABASE()) AND TABLE_NAME = 'sample_table'
+                          AND COLUMN_NAME = 'old_label') THEN
+                        ALTER TABLE `sample-app`.sample_table CHANGE COLUMN old_label new_label VARCHAR(40);
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_rename();
+                """;
+        pushRemoteChange(remote, "sql/v2/sample.sql", source);
+        Path config = writeConfig(remote);
+        assertThat(execute(config)).isEqualTo(BatchExitCodes.MANUAL_REVIEW);
+
+        String defaults = Files.readString(config).replace("    mode: IF_PRESENT",
+                "    mode: IF_PRESENT\n    schema: sample-default");
+        Files.writeString(config, defaults + "    migration:\n      sql:\n        schema: sample-app\n");
+
+        assertThat(execute(config)).isZero();
+        assertThat(readRemoteFile(remote.remote(), "sql/v2-dm/sample.sql"))
+                .contains("ALTER TABLE sample_table RENAME COLUMN old_label TO new_label")
+                .doesNotContain("CHANGE COLUMN old_label", "sample-app");
+        assertThat(readRemoteFile(remote.remote(), "sql/v2/sample.sql")).isEqualTo(source);
+        JsonNode report = sqlReport("qualified-columns");
+        assertThat(report.path("files").get(0).path("schema").asText()).isEqualTo("sample-app");
+        assertThat(report.path("validationAttempted").asBoolean()).isFalse();
+    }
+
+    @Test
+    void batchUsesExternalConditionalPreparedBindingsForTheRepository() throws Exception {
+        RemoteFixture remote = createRemote("bound-sql", false);
+        String source = """
+                CALL sample_shared();
+                SET @sample_sql = IF(
+                    EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE()
+                        AND table_name = 'sample_records' AND column_name = 'ver'),
+                    'INSERT INTO sample_records (sample_id, ver)
+                     SELECT src.sample_id, @sample_ver FROM sample_records src WHERE src.ver = 1
+                       AND NOT EXISTS (SELECT 1 FROM sample_records dst
+                           WHERE dst.sample_id = src.sample_id AND dst.ver = @sample_ver)',
+                    'SELECT 1');
+                PREPARE sample_stmt FROM @sample_sql;
+                EXECUTE sample_stmt;
+                DEALLOCATE PREPARE sample_stmt;
+                """;
+        pushRemoteChange(remote, "sql/v2/sample_system.sql", source);
+        Path config = writeConfig(remote);
+        assertThat(execute(config)).isEqualTo(BatchExitCodes.MANUAL_REVIEW);
+        assertThat(sqlReport("bound-sql").path("manualReviewSqlCount").asInt()).isEqualTo(4);
+
+        Path bindings = Files.writeString(tempDir.resolve("sample-bindings.properties"),
+                "sample_system.sql|sample_sql|sample_ver=sample_versions,version_no,1\n");
+        Files.writeString(config, Files.readString(config) + "    migration:\n      sql:\n"
+                + "        systemSchema: sample-system\n"
+                + "        conditionalPreparedBindings: sample-bindings.properties\n");
+
+        assertThat(execute(config)).isZero();
+        assertThat(readRemoteFile(remote.remote(), "sql/v2-dm/sample_system.sql"))
+                .contains("MAX(version_no)", "USING dm_adapter_prepared_value_1, dm_adapter_prepared_value_1")
+                .doesNotContain("PREPARE sample_stmt", "@sample_ver");
+        assertThat(readRemoteFile(remote.remote(), "sql/v2/sample_system.sql")).isEqualTo(source);
+        assertThat(Files.readString(bindings)).isEqualTo("sample_system.sql|sample_sql|sample_ver=sample_versions,version_no,1\n");
+        JsonNode report = sqlReport("bound-sql");
+        assertThat(report.path("files").get(0).path("schema").asText()).isEqualTo("sample-system");
+        assertThat(report.path("validationAttempted").asBoolean()).isFalse();
+        assertThat(tempDir.resolve("workspace/repositories/bound-sql/sql/v2/conditional-prepared-bindings.properties"))
+                .doesNotExist();
+    }
+
+    private JsonNode sqlReport(String repository) throws Exception {
+        return new ObjectMapper().readTree(latestReportDir().resolve(repository)
+                .resolve("dm-adapter-sql-script-report.json").toFile());
+    }
+
+    @Test
     void batchSilentlySkipsDatabaseValidationForSqlScripts() throws Exception {
         RemoteFixture remote = createRemote("offline-sql", false);
         pushRemoteChange(remote, "sql/v2/20260807_system.sql", """

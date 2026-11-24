@@ -18,7 +18,8 @@ record SqlScriptMigrationRequest(
         DamengTargetCapabilities targetCapabilities,
         Path validationPlan,
         SqlRewriteConfig rewriteConfig,
-        List<Path> procedureSources
+        List<Path> procedureSources,
+        Path conditionalPreparedBindings
 ) {
     SqlScriptMigrationRequest {
         procedureSources = List.copyOf(procedureSources == null ? List.of() : procedureSources);
@@ -27,6 +28,16 @@ record SqlScriptMigrationRequest(
                 ? DamengTargetCapabilities.unknown()
                 : targetCapabilities;
         rewriteConfig = rewriteConfig == null ? SqlRewriteConfig.empty() : rewriteConfig;
+    }
+
+    SqlScriptMigrationRequest(
+            Path projectRoot, Path sqlRoot, Path sqlRootOut, boolean dryRun, String schema, String systemSchema,
+            List<Path> preservedSqlPaths, DmValidationEnvironment validationEnvironment,
+            DamengTargetCapabilities targetCapabilities, Path validationPlan, SqlRewriteConfig rewriteConfig,
+            List<Path> procedureSources
+    ) {
+        this(projectRoot, sqlRoot, sqlRootOut, dryRun, schema, systemSchema, preservedSqlPaths,
+                validationEnvironment, targetCapabilities, validationPlan, rewriteConfig, procedureSources, null);
     }
 
     SqlScriptMigrationRequest(

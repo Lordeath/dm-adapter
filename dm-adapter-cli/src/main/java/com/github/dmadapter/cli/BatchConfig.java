@@ -69,7 +69,10 @@ record BatchConfig(
             String outputDir,
             List<String> preserveSql,
             String targetLengthSemantics,
-            List<String> procedureSources
+            List<String> procedureSources,
+            String schema,
+            String systemSchema,
+            String conditionalPreparedBindings
     ) {
     }
 }

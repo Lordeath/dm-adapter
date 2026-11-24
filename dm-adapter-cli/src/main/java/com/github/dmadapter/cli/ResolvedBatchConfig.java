@@ -85,10 +85,13 @@ record ResolvedBatchConfig(
             Path sourceDir,
             Path outputDir,
             List<Path> preserveSql,
-            List<Path> procedureSources
+            List<Path> procedureSources,
+            String schema,
+            String systemSchema,
+            Path conditionalPreparedBindings
     ) {
         Sql(BatchSqlMode mode, Path sourceDir, Path outputDir, List<Path> preserveSql) {
-            this(mode, sourceDir, outputDir, preserveSql, List.of());
+            this(mode, sourceDir, outputDir, preserveSql, List.of(), "", "", null);
         }
 
         Sql {

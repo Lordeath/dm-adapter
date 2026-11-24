@@ -132,6 +132,8 @@ public class MigrateCommand implements Callable<Integer> {
     private MigrationReport lastMigrationReport;
     private SqlScriptMigrationReport lastSqlScriptMigrationReport;
     private boolean batchMode;
+    private String batchSqlSchema = "";
+    private Path batchConditionalPreparedBindings;
     private Map<String, List<String>> batchTableKeyColumns = Map.of();
     private Map<String, List<String>> batchMethodKeyColumns = Map.of();
     private Map<String, List<List<String>>> batchMethodConflictKeyGroups = Map.of();
@@ -897,14 +899,15 @@ public class MigrateCommand implements Callable<Integer> {
                 sqlRoot,
                 sqlRootOut,
                 context.dryRun(),
-                configuredSchema(context).orElse(""),
+                batchSqlSchema.isBlank() ? configuredSchema(context).orElse("") : batchSqlSchema,
                 systemSchema,
                 preservedSqlPaths,
                 validationEnvironment,
                 targetCapabilities,
                 context.reportDir().resolve(SqlScriptValidationPlanStore.DEFAULT_FILE_NAME),
                 rewriteConfig,
-                procedureSources
+                procedureSources,
+                batchConditionalPreparedBindings
         ));
         lastSqlScriptMigrationReport = report;
         ReportPaths reportPaths = reportWriter.writeSqlScriptMigrationReport(report, context.reportDir());
@@ -922,6 +925,9 @@ public class MigrateCommand implements Callable<Integer> {
         migration.sqlRootOut = request.sqlRootOut();
         migration.preservedSqlPaths = new ArrayList<>(request.preservedSqlPaths());
         migration.procedureSources = new ArrayList<>(request.procedureSources());
+        migration.batchSqlSchema = request.sqlSchema();
+        migration.systemSchema = request.systemSchema();
+        migration.batchConditionalPreparedBindings = request.conditionalPreparedBindings();
         migration.sqlScriptsOnly = request.sqlScriptsOnly();
         migration.batchTableKeyColumns = request.tableKeyColumns();
         migration.batchMethodKeyColumns = request.methodKeyColumns();

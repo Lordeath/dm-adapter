@@ -649,7 +649,8 @@ class SqlScriptMigrator {
             warnings.add("公共过程定义仅用于静态影响分析，未执行或部署：" + source);
         }
         ScriptProcedureEffectAnalyzer procedureAnalyzer = new ScriptProcedureEffectAnalyzer(procedureSourceStatements);
-        ConditionalPreparedBindings preparedBindings = ConditionalPreparedBindings.load(sqlRoot);
+        ConditionalPreparedBindings preparedBindings = ConditionalPreparedBindings.load(
+                sqlRoot, request.conditionalPreparedBindings());
         Set<Path> preservedPaths = preservedSqlPaths(request);
         List<Path> discoveredSqlFiles = sqlFiles(sqlRoot);
         List<Path> sqlFiles = discoveredSqlFiles.stream()

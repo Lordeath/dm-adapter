@@ -19,7 +19,10 @@ record BatchMigrationRequest(
         Map<String, List<String>> tableKeyColumns,
         Map<String, List<String>> methodKeyColumns,
         Map<String, List<List<String>>> methodConflictKeyGroups,
-        List<Path> procedureSources
+        List<Path> procedureSources,
+        String sqlSchema,
+        String systemSchema,
+        Path conditionalPreparedBindings
 ) {
     BatchMigrationRequest(
             Path projectRoot, Path reportDir, String dmDriver, Path mapperDir, Path rewriteConfig,
@@ -28,12 +31,13 @@ record BatchMigrationRequest(
             Map<String, List<List<String>>> methodConflictKeyGroups
     ) {
         this(projectRoot, reportDir, dmDriver, mapperDir, rewriteConfig, sqlRoot, sqlRootOut, preservedSqlPaths,
-                sqlScriptsOnly, tableKeyColumns, methodKeyColumns, methodConflictKeyGroups, List.of());
+                sqlScriptsOnly, tableKeyColumns, methodKeyColumns, methodConflictKeyGroups, List.of(), "", "", null);
     }
 
     BatchMigrationRequest {
         procedureSources = List.copyOf(procedureSources == null ? List.of() : procedureSources);
         preservedSqlPaths = List.copyOf(preservedSqlPaths == null ? List.of() : preservedSqlPaths);
+        sqlSchema = sqlSchema == null ? "" : sqlSchema;
         LinkedHashMap<String, List<String>> copied = new LinkedHashMap<>();
         if (tableKeyColumns != null) {
             tableKeyColumns.forEach((table, columns) -> copied.put(
