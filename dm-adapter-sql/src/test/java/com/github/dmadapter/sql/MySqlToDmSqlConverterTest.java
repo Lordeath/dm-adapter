@@ -1038,6 +1038,38 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void infersOnUpdatePrecisionFromEachTemporalColumn() {
+        SqlConversionResult result = converter.convert("""
+                CREATE TABLE sample_clock (
+                    `updated_at` DATETIME(0) NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    `sample,tick` TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP(),
+                    sample_precise TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+                    sample_day TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    sample_note VARCHAR(80) DEFAULT 'DATETIME(6) ON UPDATE CURRENT_TIMESTAMP'
+                )
+                """);
+
+        assertThat(result.convertedSql())
+                .contains("`updated_at` DATETIME(0) NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE NOW(0)")
+                .contains("`sample,tick` TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP ON UPDATE NOW(0)")
+                .contains("sample_precise TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE NOW(3)")
+                .contains("sample_day TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE NOW()")
+                .contains("DEFAULT 'DATETIME(6) ON UPDATE CURRENT_TIMESTAMP'");
+    }
+
+    @Test
+    void infersOnUpdatePrecisionFromTemporalColumnInAlterTable() {
+        SqlConversionResult result = converter.convert("""
+                ALTER TABLE sample_clock ADD COLUMN updated_at DATETIME(0) ON UPDATE CURRENT_TIMESTAMP,
+                    MODIFY COLUMN sample_tick TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+                """);
+
+        assertThat(result.convertedSql())
+                .contains("updated_at DATETIME(0) ON UPDATE NOW(0)")
+                .contains("sample_tick TIMESTAMP(3) ON UPDATE NOW(3)");
+    }
+
+    @Test
     void removesMysqlZerofillNumericAttributeFromCreateAndAlterTable() {
         SqlConversionResult createResult = converter.convert("""
                 CREATE TABLE ns_ipaas_interface_type (

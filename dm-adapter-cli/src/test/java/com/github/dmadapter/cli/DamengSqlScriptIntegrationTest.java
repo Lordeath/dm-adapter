@@ -712,6 +712,82 @@ class DamengSqlScriptIntegrationTest {
     }
 
     @Test
+    void executesGuardedColumnAndIndexAddTwice() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "SAMPLE_LOG_" + suffix;
+        String procedure = "SAMPLE_ADD_COLUMN_" + suffix;
+        List<String> converted = migrateIntegrationFixture("column_index.sql", """
+                DELIMITER $$
+                CREATE PROCEDURE %2$s()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = (SELECT DATABASE()) AND TABLE_NAME = '%1$s'
+                          AND COLUMN_NAME = 'sample_ref') THEN
+                        ALTER TABLE %1$s
+                            ADD COLUMN sample_ref BIGINT NULL DEFAULT NULL COMMENT 'sample reference' AFTER sample_content,
+                            ADD INDEX idx_ref (sample_ref);
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL %2$s();
+                DROP PROCEDURE IF EXISTS %2$s;
+                """.formatted(table, procedure), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute("CREATE TABLE " + table + " (id INT, sample_content VARCHAR(80 CHAR))");
+                statement.execute("INSERT INTO " + table + " VALUES (1, 'sample')");
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+                assertThat(indexCount(connection, schema, table, table + "_idx_ref")).isEqualTo(1);
+                try (ResultSet row = statement.executeQuery("SELECT sample_content, sample_ref FROM " + table)) {
+                    assertThat(row.next()).isTrue();
+                    assertThat(row.getString(1)).isEqualTo("sample");
+                    assertThat(row.getObject(2)).isNull();
+                }
+                statement.execute("DROP INDEX " + table + "_idx_ref");
+                executeStatements(statement, converted);
+                assertThat(indexCount(connection, schema, table, table + "_idx_ref")).isZero();
+            } finally {
+                dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + procedure);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
+    void refreshesDatetimeWithDeclaredPrecisionOnUpdate() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String table = "SAMPLE_CLOCK_" + Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        List<String> converted = migrateIntegrationFixture("clock.sql", """
+                CREATE TABLE %s (
+                    id INT PRIMARY KEY,
+                    sample_value INT,
+                    updated_at DATETIME(0) NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                );
+                """.formatted(table), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                executeStatements(statement, converted);
+                statement.execute("INSERT INTO " + table + " VALUES (1, 10, TIMESTAMP '2000-01-01 00:00:00')");
+                statement.execute("UPDATE " + table + " SET sample_value = 20 WHERE id = 1");
+                try (ResultSet rows = statement.executeQuery("SELECT updated_at FROM " + table + " WHERE id = 1")) {
+                    assertThat(rows.next()).isTrue();
+                    var updatedAt = rows.getTimestamp(1);
+                    assertThat(updatedAt).isAfter("2000-01-01T00:00:00");
+                    assertThat(updatedAt.getNanos()).isZero();
+                }
+            } finally {
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
     void executesGroupedColumnChangesUnderTheirOriginalGuards() throws Exception {
         String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
         String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);

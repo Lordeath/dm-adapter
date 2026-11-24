@@ -163,6 +163,7 @@ class SqlScriptMigrator {
     static final String MYSQL_ALTER_MODIFY_COLUMN_TO_DM_RULE =
             "MYSQL_ALTER_MODIFY_COLUMN_TO_DM";
     static final String MYSQL_GUARDED_COLUMN_CHANGE_TO_DM_RULE = "MYSQL_GUARDED_COLUMN_CHANGE_TO_DM";
+    static final String MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT_RULE = "MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT";
     static final String MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT_RULE =
             "MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT";
     static final String MYSQL_MULTI_ADD_COLUMN_TO_DM_RULE = "MYSQL_MULTI_ADD_COLUMN_TO_DM";
@@ -346,6 +347,12 @@ class SqlScriptMigrator {
             MYSQL_GUARDED_OLD_COLUMN + "THEN\\s+(?<body>" + MYSQL_ALTER_TABLE_STATEMENT
                     + "(?:\\s*" + MYSQL_ALTER_TABLE_STATEMENT + ")*)(?=\\s*END\\s+IF\\b)"
     );
+    private static final Pattern MYSQL_GUARDED_COLUMN_INDEX_ADD = Pattern.compile(
+            "(?is)\\bIF\\s+NOT\\s+EXISTS\\s*\\((?<check>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)"
+                    + "\\s*THEN\\s+(?<ddl>" + MYSQL_ALTER_TABLE_STATEMENT + ")"
+    );
+    private static final Pattern MYSQL_ADD_INDEX_PART_PREFIX =
+            Pattern.compile("(?is)^\\s*ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b");
     private static final Pattern MYSQL_GROUPED_CHANGE_COLUMN = Pattern.compile(
             "(?is)^" + MYSQL_CHANGE_COLUMN_HEAD + MYSQL_GUARDED_COLUMN_DEFINITION + "$"
     );
@@ -8115,6 +8122,14 @@ class SqlScriptMigrator {
             rules.add(MYSQL_PROCEDURE_DYNAMIC_PREPARE_TO_EXECUTE_IMMEDIATE_RULE);
         }
 
+        if (isCreateProcedureStatement(converted)) {
+            String splitColumnAndIndex = splitGuardedMysqlColumnAndIndexAdds(converted);
+            if (!splitColumnAndIndex.equals(converted)) {
+                converted = splitColumnAndIndex;
+                rules.add(MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT_RULE);
+            }
+        }
+
         RoutineStaticSqlConversion guardedColumnChange = convertGuardedMysqlColumnChanges(converted);
         if (guardedColumnChange.supported() && !guardedColumnChange.sql().equals(converted)) {
             converted = guardedColumnChange.sql();
@@ -9791,6 +9806,49 @@ class SqlScriptMigrator {
     private boolean checksMysqlColumn(String query, String table, String column) {
         return unquoteIdentifier(table).equals(metadataPredicateLiteral(query, "TABLE_NAME"))
                 && unquoteIdentifier(column).equalsIgnoreCase(metadataPredicateLiteral(query, "COLUMN_NAME"));
+    }
+
+    private String splitGuardedMysqlColumnAndIndexAdds(String sql) {
+        return replaceOutsideIgnoredText(sql, MYSQL_GUARDED_COLUMN_INDEX_ADD, guard -> {
+            int ddlStart = guard.start("ddl");
+            String ddl = sql.substring(ddlStart, guard.end("ddl") - 1);
+            Matcher alter = ALTER_TABLE_BODY_PATTERN.matcher(ddl);
+            if (!alter.matches() || containsSqlComment(ddl) || ddl.indexOf('\\') >= 0) {
+                return guard.group();
+            }
+            List<String> parts = splitTopLevelComma(alter.group("body"));
+            if (parts.size() != 2) {
+                return guard.group();
+            }
+            Matcher add = MYSQL_GROUPED_ADD_COLUMN.matcher(parts.get(0).strip());
+            if (!add.matches()) {
+                return guard.group();
+            }
+            String table = alter.group("table");
+            String column = add.group("name");
+            if (!isSimpleIdentifier(unquoteIdentifier(table)) || !checksMysqlColumn(guard.group("check"), table, column)) {
+                return guard.group();
+            }
+
+            String alterTable = "ALTER TABLE " + table + " ";
+            String indexDdl = normalizeCreateIndexForDm(
+                    convertMysqlAlterTableAddIndex(alterTable + parts.get(1).strip()));
+            DamengCreateIndexDefinition index = damengCreateIndexDefinition(indexDdl);
+            if (index == null || index.unique() || index.columns().size() != 1
+                    || !sameIdentifier(index.columns().get(0).columnName(), column)) {
+                return guard.group();
+            }
+
+            String definition = normalizeMysqlDataTypes(collapseSqlWhitespaceOutsideQuotedText(add.group("definition")));
+            List<String> statements = new ArrayList<>();
+            statements.add(alterTable + "ADD " + column + " " + definition);
+            if (add.group("comment") != null) {
+                statements.add("COMMENT ON COLUMN " + table + "." + column + " IS " + add.group("comment"));
+            }
+            statements.add(indexDdl);
+            return sql.substring(guard.start(), ddlStart)
+                    + renderColumnAlterDdl(statements, lineIndentBefore(sql, ddlStart));
+        });
     }
 
     private String makeImplicitMysqlModifyNullabilityExplicit(String sql) {
@@ -17520,6 +17578,10 @@ class SqlScriptMigrator {
             }
         }
         if (addColumns < 2) {
+            if (addColumns == 1 && parts.stream().anyMatch(part -> MYSQL_ADD_INDEX_PART_PREFIX.matcher(part).find())) {
+                return RoutineStaticSqlConversion.unsupported(
+                        "同一 ALTER TABLE 中的 ADD COLUMN 和 ADD INDEX 无法按原条件安全拆分，需人工确认。");
+            }
             return RoutineStaticSqlConversion.supported(ddl);
         }
         if (columns.size() != parts.size() || containsSqlComment(ddl)) {
@@ -17598,12 +17660,11 @@ class SqlScriptMigrator {
         String code = replaceIgnoredSqlWithSpaces(sql);
         Matcher alterTable = Pattern.compile("(?is)\\bALTER\\s+TABLE\\s+(?:" + SQL_IDENTIFIER_TOKEN + ")\\s+")
                 .matcher(code);
-        Pattern addIndex = Pattern.compile("(?is)^\\s*ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b");
         Pattern option = Pattern.compile("(?is)^\\s*(?:ALGORITHM|LOCK)\\s*=");
         while (alterTable.find()) {
             int end = findStatementTerminator(sql, alterTable.end());
             List<String> parts = splitTopLevelComma(code.substring(alterTable.end(), end));
-            if (parts.stream().anyMatch(part -> addIndex.matcher(part).find())
+            if (parts.stream().anyMatch(part -> MYSQL_ADD_INDEX_PART_PREFIX.matcher(part).find())
                     && parts.stream().anyMatch(part -> option.matcher(part).find())) {
                 String ddl = sql.substring(alterTable.start(), end).strip();
                 if (convertMysqlAlterTableAddIndex(ddl).equals(ddl)) {

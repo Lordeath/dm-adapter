@@ -3903,7 +3903,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private int skipLeadingWhitespaceAndComments(String value) {
-        int index = 0;
+        return skipWhitespaceAndComments(value, 0);
+    }
+
+    private int skipWhitespaceAndComments(String value, int index) {
         while (index < value.length()) {
             index = skipWhitespace(value, index);
             if (index == value.length()) {
@@ -3957,6 +3960,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private GenericConversion convertMysqlOnUpdateCurrentTimestamp(String sql) {
+        Map<Integer, String> declaredPrecisions = null;
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
         int index = 0;
@@ -3966,6 +3970,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = appendSingleQuotedString(sql, index, converted);
             } else if (current == '"') {
                 index = appendDoubleQuotedText(sql, index, converted);
+            } else if (current == '`') {
+                int end = skipSqlIgnoredText(sql, index);
+                converted.append(sql, index, end);
+                index = end;
             } else if (startsMyBatisPlaceholder(sql, index)) {
                 index = appendMyBatisPlaceholder(sql, index, converted);
             } else if (startsLineComment(sql, index)) {
@@ -3977,8 +3985,11 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 int timestampIndex = skipWhitespace(sql, updateIndex + "UPDATE".length());
                 if (startsKeyword(sql, updateIndex, "UPDATE")
                         && startsKeyword(sql, timestampIndex, "CURRENT_TIMESTAMP")) {
+                    if (declaredPrecisions == null) {
+                        declaredPrecisions = declaredOnUpdateTimestampPrecisions(sql);
+                    }
                     int cursor = skipWhitespace(sql, timestampIndex + "CURRENT_TIMESTAMP".length());
-                    String precision = "";
+                    String precision = declaredPrecisions.getOrDefault(index, "");
                     if (cursor < sql.length() && sql.charAt(cursor) == '(') {
                         int close = findMatchingParen(sql, cursor);
                         if (close > 0) {
@@ -4003,6 +4014,86 @@ public class MySqlToDmSqlConverter implements SqlConverter {
             }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
+    }
+
+    private Map<Integer, String> declaredOnUpdateTimestampPrecisions(String sql) {
+        int start = skipLeadingWhitespaceAndComments(sql);
+        boolean alter = startsKeyword(sql, start, "ALTER");
+        if (!alter && !startsKeyword(sql, start, "CREATE")) {
+            return Map.of();
+        }
+        int table = skipWhitespaceAndComments(sql, start + (alter ? "ALTER" : "CREATE").length());
+        if (!alter && startsKeyword(sql, table, "TEMPORARY")) {
+            table = skipWhitespaceAndComments(sql, table + "TEMPORARY".length());
+        }
+        if (!startsKeyword(sql, table, "TABLE")) {
+            return Map.of();
+        }
+        int name = skipWhitespaceAndComments(sql, table + "TABLE".length());
+        if (!alter && startsKeyword(sql, name, "IF")) {
+            int not = skipWhitespaceAndComments(sql, name + "IF".length());
+            int exists = skipWhitespaceAndComments(sql, not + "NOT".length());
+            if (!startsKeyword(sql, not, "NOT") || !startsKeyword(sql, exists, "EXISTS")) {
+                return Map.of();
+            }
+            name = skipWhitespaceAndComments(sql, exists + "EXISTS".length());
+        }
+        IdentifierToken identifier = readQualifiedIdentifierToken(sql, name);
+        if (identifier == null) {
+            return Map.of();
+        }
+        int bodyStart = skipWhitespaceAndComments(sql, identifier.endIndex());
+        int bodyEnd = sql.length();
+        if (!alter) {
+            if (bodyStart >= sql.length() || sql.charAt(bodyStart) != '(') {
+                return Map.of();
+            }
+            bodyEnd = findMatchingParen(sql, bodyStart);
+            if (bodyEnd < 0) {
+                return Map.of();
+            }
+            bodyStart++;
+        }
+
+        Map<Integer, String> precisions = new LinkedHashMap<>();
+        for (TopLevelArgument argument : splitTopLevelArguments(sql.substring(bodyStart, bodyEnd))) {
+            String definition = argument.text();
+            int columnStart = skipLeadingWhitespaceAndComments(definition);
+            if (alter) {
+                if (startsKeyword(definition, columnStart, "ADD")) {
+                    columnStart = skipWhitespaceAndComments(definition, columnStart + "ADD".length());
+                } else if (startsKeyword(definition, columnStart, "MODIFY")) {
+                    columnStart = skipWhitespaceAndComments(definition, columnStart + "MODIFY".length());
+                } else {
+                    continue;
+                }
+                if (startsKeyword(definition, columnStart, "COLUMN")) {
+                    columnStart = skipWhitespaceAndComments(definition, columnStart + "COLUMN".length());
+                }
+            }
+            IdentifierToken column = readIdentifierToken(definition, columnStart);
+            if (column == null) {
+                continue;
+            }
+            int type = skipWhitespaceAndComments(definition, column.endIndex());
+            if (!startsKeyword(definition, type, "DATETIME") && !startsKeyword(definition, type, "TIMESTAMP")) {
+                continue;
+            }
+            int open = skipWhitespaceAndComments(definition, readIdentifierToken(definition, type).endIndex());
+            if (open >= definition.length() || definition.charAt(open) != '(') {
+                continue;
+            }
+            int close = findMatchingParen(definition, open);
+            if (close < 0) {
+                continue;
+            }
+            String precision = definition.substring(open + 1, close).strip();
+            int on = findTopLevelKeyword(definition, "ON", close + 1);
+            if (on >= 0 && precision.matches("\\d+")) {
+                precisions.put(bodyStart + argument.startIndex() + on, precision);
+            }
+        }
+        return precisions;
     }
 
     private GenericConversion convertMysqlSessionVariableSetToNoop(String sql) {
@@ -12722,6 +12813,8 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = skipSingleQuotedString(body, index);
             } else if (current == '"') {
                 index = skipDoubleQuotedText(body, index);
+            } else if (current == '`') {
+                index = skipSqlIgnoredText(body, index);
             } else if (startsMyBatisPlaceholder(body, index)) {
                 index = skipMyBatisPlaceholder(body, index);
             } else if (startsLineComment(body, index)) {

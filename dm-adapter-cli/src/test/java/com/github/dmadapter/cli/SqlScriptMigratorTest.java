@@ -6861,6 +6861,56 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void splitsAddingOneColumnAndItsIndexInsideTheOriginalProcedureGuard() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_add_column()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = (SELECT DATABASE()) AND TABLE_NAME = 'sample_log'
+                          AND COLUMN_NAME = 'sample_ref') THEN
+                        ALTER TABLE sample_log
+                            ADD COLUMN sample_ref BIGINT NULL DEFAULT NULL COMMENT 'sample, reference' AFTER sample_content,
+                            ADD INDEX idx_ref (sample_ref);
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_add_column();
+                """);
+
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+        assertThat(converted.sql()).containsSubsequence("IF dm_adapter_exists = 0 THEN",
+                        "EXECUTE IMMEDIATE 'ALTER TABLE sample_log ADD sample_ref BIGINT NULL DEFAULT NULL';",
+                        "EXECUTE IMMEDIATE 'COMMENT ON COLUMN sample_log.sample_ref IS ''sample, reference''';",
+                        "EXECUTE IMMEDIATE 'CREATE INDEX sample_log_idx_ref ON sample_log (sample_ref)';",
+                        "END IF;")
+                .doesNotContain("ADD INDEX", " AFTER ");
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(SqlScriptMigrator.MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT_RULE));
+    }
+
+    @Test
+    void reportsColumnAndIndexAddWhenTheGuardChecksAnotherColumn() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DELIMITER $$
+                CREATE PROCEDURE sample_add_column()
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_log'
+                          AND COLUMN_NAME = 'some_other_column') THEN
+                        ALTER TABLE sample_log ADD COLUMN sample_ref BIGINT, ADD INDEX idx_ref (sample_ref);
+                    END IF;
+                END$$
+                DELIMITER ;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).singleElement().satisfies(item ->
+                assertThat(item.reason()).contains("ADD COLUMN 和 ADD INDEX"));
+        assertThat(converted.sql()).contains("ADD COLUMN sample_ref BIGINT, ADD INDEX idx_ref (sample_ref)")
+                .doesNotContain("EXECUTE IMMEDIATE");
+    }
+
+    @Test
     void retainsMultipleColumnAddsMixedWithIndexForManualReview() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DELIMITER $$
