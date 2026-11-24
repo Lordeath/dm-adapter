@@ -641,6 +641,77 @@ class DamengSqlScriptIntegrationTest {
     }
 
     @Test
+    void migratesGuardedColumnRenamesAndKeepsDataOnRetryOrConflict() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "SAMPLE_RENAME_" + suffix;
+        String procedure = "SAMPLE_CHANGE_" + suffix;
+        List<String> converted = migrateIntegrationFixture("rename_system.sql", """
+                DELIMITER $$
+                CREATE PROCEDURE %3$s()
+                BEGIN
+                    IF EXISTS (SELECT NULL FROM information_schema.COLUMNS
+                        WHERE table_name = '%2$s' AND table_schema = (SELECT DATABASE())
+                          AND column_name = 'old_label') THEN
+                        IF NOT EXISTS (SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                            WHERE table_schema = DATABASE() AND table_name = '%2$s'
+                              AND column_name = 'new_label')THEN
+                            ALTER TABLE %2$s CHANGE COLUMN old_label new_label VARCHAR(30)
+                                DEFAULT NULL COMMENT '样例名称' AFTER id;
+                        END IF;
+                    END IF;
+                    IF EXISTS (SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE table_schema = (SELECT DATABASE()) AND table_name = '%2$s'
+                          AND column_name = 'old_note') THEN
+                        ALTER TABLE `%1$s`.%2$s CHANGE old_note new_note TEXT;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE table_schema = DATABASE() AND table_name = '%2$s'
+                          AND column_name = 'old_date') THEN
+                        ALTER TABLE %2$s CHANGE old_date new_date TIMESTAMP;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL %3$s();
+                DROP PROCEDURE IF EXISTS %3$s;
+                """.formatted(schema, table, procedure), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute("CREATE TABLE " + table + " (id INT PRIMARY KEY, old_label VARCHAR(20 CHAR) NOT NULL,"
+                        + " old_note CLOB, old_date TIMESTAMP DEFAULT TIMESTAMP '2020-01-01 00:00:00')");
+                statement.execute("INSERT INTO " + table + " (id, old_label, old_note) VALUES (1, '样例', '旧内容')");
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+                statement.execute("INSERT INTO " + table + " (id) VALUES (2)");
+                try (ResultSet rows = statement.executeQuery("SELECT new_label, new_note, new_date FROM "
+                        + table + " ORDER BY id")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isEqualTo("样例");
+                    assertThat(rows.getString(2)).isEqualTo("旧内容");
+                    assertThat(rows.getTimestamp(3)).isNotNull();
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isNull();
+                    assertThat(rows.getTimestamp(3)).isNull();
+                }
+
+                statement.execute("ALTER TABLE " + table + " ADD old_date TIMESTAMP DEFAULT TIMESTAMP '2021-01-01 00:00:00'");
+                assertThatThrownBy(() -> executeStatements(statement, converted))
+                        .isInstanceOf(SQLException.class).hasMessageContaining("new_date");
+                statement.execute("INSERT INTO " + table + " (id) VALUES (3)");
+                try (ResultSet rows = statement.executeQuery("SELECT old_date FROM " + table + " WHERE id = 3")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getTimestamp(1)).isNotNull();
+                }
+            } finally {
+                dropQuietly(statement, "DROP PROCEDURE IF EXISTS " + procedure);
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
     void executesMixedIdentityValuesTwiceWithExplicitAndGeneratedIds() throws Exception {
         String jdbcUrl = requiredEnvironment("DM_JDBC_URL");
         String username = requiredEnvironment("DM_DB_USERNAME");

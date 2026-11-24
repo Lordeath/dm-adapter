@@ -314,18 +314,27 @@ class SqlScriptMigrator {
                     + "(?<name>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")";
     private static final Pattern MYSQL_ALTER_COLUMN_CHANGE_PATTERN =
             Pattern.compile("(?is)" + MYSQL_ALTER_COLUMN_CHANGE_HEAD + "(?=\\s)");
+    private static final String MYSQL_CURRENT_SCHEMA_PREDICATE = "TABLE_SCHEMA\\s*=\\s*"
+            + "(?:DATABASE\\s*\\(\\s*\\)|\\(\\s*SELECT\\s+DATABASE\\s*\\(\\s*\\)\\s*\\))";
+    private static final String MYSQL_TABLE_NAME_PREDICATE = "TABLE_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN;
     private static final String MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP =
-            "\\s*SELECT\\s+1\\s+FROM\\s+information_schema\\s*\\.\\s*COLUMNS\\s+"
-                    + "WHERE\\s+TABLE_SCHEMA\\s*=\\s*DATABASE\\s*\\(\\s*\\)\\s+"
-                    + "AND\\s+TABLE_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN + "\\s+"
-                    + "AND\\s+COLUMN_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN + "\\s*";
+            "\\s*SELECT\\s+(?:1|NULL|COLUMN_NAME)\\s+FROM\\s+information_schema\\s*\\.\\s*COLUMNS\\s+WHERE\\s+"
+                    + "(?:" + MYSQL_CURRENT_SCHEMA_PREDICATE + "\\s+AND\\s+" + MYSQL_TABLE_NAME_PREDICATE
+                    + "|" + MYSQL_TABLE_NAME_PREDICATE + "\\s+AND\\s+" + MYSQL_CURRENT_SCHEMA_PREDICATE + ")"
+                    + "\\s+AND\\s+COLUMN_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN + "\\s*";
+    private static final String MYSQL_CHANGE_COLUMN_TYPE =
+            "(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|TIMESTAMP|DATETIME)(?:\\s*\\(\\s*\\d+\\s*\\))?"
+                    + "|(?:VARCHAR|CHAR)\\s*\\(\\s*\\d+(?:\\s+CHAR)?\\s*\\)"
+                    + "|TINYTEXT|MEDIUMTEXT|LONGTEXT|TEXT|CLOB";
     private static final Pattern MYSQL_GUARDED_COLUMN_CHANGE_PATTERN = Pattern.compile(
-            "(?is)\\bIF\\s+EXISTS\\s*\\((?<oldCheck>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s+"
-                    + "AND\\s+NOT\\s+EXISTS\\s*\\((?<newCheck>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s+"
+            "(?is)\\bIF\\s+EXISTS\\s*\\((?<oldCheck>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s*"
+                    + "(?:(?:AND|THEN\\s+IF)\\s+NOT\\s+EXISTS\\s*\\((?<newCheck>"
+                    + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)\\s*)?"
                     + "THEN\\s+(?<change>" + MYSQL_ALTER_COLUMN_CHANGE_HEAD + "\\s+"
-                    + "(?<definition>(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT)(?:\\s*\\(\\s*\\d+\\s*\\))?"
-                    + "(?:\\s+(?:NOT\\s+)?NULL)?\\s+DEFAULT\\s+(?:NULL|[-+]?\\d+|'[-+]?\\d+'))"
-                    + "\\s+COMMENT\\s+(?<comment>" + SQL_STRING_LITERAL_TOKEN + ")\\s*);(?=\\s*END\\s+IF\\b)"
+                    + "(?<definition>(?:" + MYSQL_CHANGE_COLUMN_TYPE + ")(?:\\s+(?:NOT\\s+)?NULL)?"
+                    + "(?:\\s+DEFAULT\\s+(?<defaultValue>NULL|[-+]?\\d+|" + SQL_STRING_LITERAL_TOKEN + "))?)"
+                    + "(?:\\s+COMMENT\\s+(?<comment>" + SQL_STRING_LITERAL_TOKEN + "))?"
+                    + "(?:\\s+(?:FIRST|AFTER\\s+(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")))?\\s*);(?=\\s*END\\s+IF\\b)"
     );
     private static final Pattern SCRIPT_QUERY_SOURCE_TABLE_PATTERN = Pattern.compile(
             "(?is)\\b(?:FROM|JOIN)\\s+(?<table>" + SQL_OBJECT_IDENTIFIER_TOKEN + ")"
@@ -9629,30 +9638,48 @@ class SqlScriptMigrator {
         String table = matcher.group("table");
         String oldColumn = matcher.group("old");
         String newColumn = matcher.group("name");
-        String comment = matcher.group("comment");
+        String newCheck = matcher.group("newCheck");
+        String definition = matcher.group("definition");
+        String comment = Objects.requireNonNullElse(matcher.group("comment"), "''");
         if (sameIdentifier(oldColumn, newColumn) || !isSimpleIdentifier(unquoteIdentifier(table))
-                || comment.indexOf('\\') >= 0
+                || definition.indexOf('\\') >= 0 || comment.indexOf('\\') >= 0
                 || !checksMysqlColumn(matcher.group("oldCheck"), table, oldColumn)
-                || !checksMysqlColumn(matcher.group("newCheck"), table, newColumn)) {
+                || (newCheck != null && !checksMysqlColumn(newCheck, table, newColumn))) {
             return matcher.group();
         }
 
-        String definition = normalizeMysqlDataTypes(makeImplicitMysqlColumnNullabilityExplicit(
-                collapseSqlWhitespaceOutsideQuotedText(matcher.group("definition"))));
+        definition = normalizeMysqlDataTypes(makeImplicitMysqlColumnNullabilityExplicit(
+                collapseSqlWhitespaceOutsideQuotedText(definition)));
         String alterTable = "ALTER TABLE " + table;
         String indent = lineIndentBefore(sql, matcher.start("change"));
+        StringBuilder rendered = new StringBuilder(sql.substring(matcher.start(), matcher.start("change")));
+        if (newCheck == null) {
+            // A MySQL name collision fails before changing the old column's definition.
+            rendered.append("IF EXISTS (SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()")
+                    .append(" AND TABLE_NAME = ").append(sqlStringLiteral(unquoteIdentifier(table)))
+                    .append(" AND COLUMN_NAME = ").append(sqlStringLiteral(unquoteIdentifier(newColumn)))
+                    .append(") THEN\n").append(indent).append("    RAISE_APPLICATION_ERROR(-20000, ")
+                    .append(sqlStringLiteral("CHANGE COLUMN target already exists: " + unquoteIdentifier(newColumn)))
+                    .append(");\n").append(indent).append("END IF;\n").append(indent);
+        }
         // Keep the source name until all changes succeed so a retry still satisfies the guard.
-        return sql.substring(matcher.start(), matcher.start("change"))
-                + "EXECUTE IMMEDIATE " + sqlStringLiteral(alterTable + " MODIFY " + oldColumn + " " + definition)
-                + ";\n" + indent + "EXECUTE IMMEDIATE "
-                + sqlStringLiteral("COMMENT ON COLUMN " + table + "." + oldColumn + " IS " + comment)
-                + ";\n" + indent + "EXECUTE IMMEDIATE "
-                + sqlStringLiteral(alterTable + " RENAME COLUMN " + oldColumn + " TO " + newColumn) + ";";
+        rendered.append("EXECUTE IMMEDIATE ").append(sqlStringLiteral(alterTable + " MODIFY " + oldColumn + " " + definition))
+                .append(";\n").append(indent);
+        if (matcher.group("defaultValue") == null) {
+            rendered.append("EXECUTE IMMEDIATE ")
+                    .append(sqlStringLiteral(alterTable + " ALTER COLUMN " + oldColumn + " DROP DEFAULT"))
+                    .append(";\n").append(indent);
+        }
+        return rendered.append("EXECUTE IMMEDIATE ")
+                .append(sqlStringLiteral("COMMENT ON COLUMN " + table + "." + oldColumn + " IS " + comment))
+                .append(";\n").append(indent).append("EXECUTE IMMEDIATE ")
+                .append(sqlStringLiteral(alterTable + " RENAME COLUMN " + oldColumn + " TO " + newColumn))
+                .append(';').toString();
     }
 
     private boolean checksMysqlColumn(String query, String table, String column) {
         return unquoteIdentifier(table).equals(metadataPredicateLiteral(query, "TABLE_NAME"))
-                && unquoteIdentifier(column).equals(metadataPredicateLiteral(query, "COLUMN_NAME"));
+                && unquoteIdentifier(column).equalsIgnoreCase(metadataPredicateLiteral(query, "COLUMN_NAME"));
     }
 
     private String makeImplicitMysqlModifyNullabilityExplicit(String sql) {

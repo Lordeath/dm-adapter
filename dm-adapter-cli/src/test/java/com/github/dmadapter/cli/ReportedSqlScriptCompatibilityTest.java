@@ -23,6 +23,58 @@ class ReportedSqlScriptCompatibilityTest {
     Path root;
 
     @Test
+    void convertsColumnChangesOnlyWhenTheGuardAndDdlUseTheSameSchema() throws Exception {
+        String original = """
+                DELIMITER $$
+                CREATE PROCEDURE sample_rename()
+                BEGIN
+                    IF EXISTS (SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = (SELECT DATABASE()) AND TABLE_NAME = 'sample_table'
+                          AND COLUMN_NAME = 'sampleValue') THEN
+                        ALTER TABLE `%s`.sample_table CHANGE COLUMN SampleValue sample_value VARCHAR(100);
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_rename();
+                """;
+        Converted supported = migrate(original.formatted("test-app"), "sample_change.sql");
+        assertFullyConverted(supported);
+        assertThat(supported.sql()).containsSubsequence("target already exists: sample_value",
+                "MODIFY SampleValue VARCHAR(100 CHAR) NULL", "ALTER COLUMN SampleValue DROP DEFAULT",
+                "COMMENT ON COLUMN sample_table.SampleValue", "RENAME COLUMN SampleValue TO sample_value");
+
+        Converted foreign = migrate(original.formatted("other-schema"), "sample_change.sql");
+        assertThat(foreign.report().manualReviewItems()).hasSize(2);
+        assertThat(foreign.sql()).contains("ALTER TABLE `other-schema`.sample_table CHANGE COLUMN")
+                .doesNotContain("RENAME COLUMN");
+    }
+
+    @Test
+    void retainsMixedDdlAndMultipleRenamesUnderASingleGuardForReview() throws Exception {
+        for (String body : List.of(
+                "ALTER TABLE sample_table CHANGE COLUMN old_value new_value DATETIME, ADD COLUMN extra_value INT;",
+                "ALTER TABLE sample_table CHANGE COLUMN old_value new_value BIGINT;\n"
+                        + "ALTER TABLE sample_table CHANGE COLUMN old_name new_name VARCHAR(50);",
+                "ALTER TABLE sample_table ADD COLUMN first_value INT, ADD COLUMN second_value INT, DROP COLUMN old_value;")) {
+            Converted converted = migrate("""
+                    DELIMITER $$
+                    CREATE PROCEDURE sample_rename()
+                    BEGIN
+                        IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_table'
+                              AND COLUMN_NAME = 'old_value') THEN
+                            %s
+                        END IF;
+                    END$$
+                    DELIMITER ;
+                    CALL sample_rename();
+                    """.formatted(body), "sample_change.sql");
+            assertThat(converted.report().manualReviewItems()).hasSize(2);
+            assertThat(converted.sql()).contains(body).doesNotContain("RENAME COLUMN", "EXECUTE IMMEDIATE");
+        }
+    }
+
+    @Test
     void movesTheSingleMatchCountFilterOutsideEachDerivedQuery() throws Exception {
         Converted converted = migrate("""
                 -- sample parent update
