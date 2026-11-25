@@ -25,6 +25,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -70,6 +71,7 @@ class SqlScriptMigrator {
             "MYSQL_PROCEDURE_LOCAL_TEMPORARY_TABLE_TO_DM";
     static final String MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL_RULE =
             "MYSQL_PROCEDURE_USER_VARIABLE_TO_LOCAL";
+    static final String DM_SCRIPT_SESSION_VARIABLE_PACKAGE_RULE = "DM_SCRIPT_SESSION_VARIABLE_PACKAGE";
     static final String MYSQL_PROCEDURE_TRAILING_SELECT_INTO_TO_DM_RULE =
             "MYSQL_PROCEDURE_TRAILING_SELECT_INTO_TO_DM";
     static final String MYSQL_PROCEDURE_LOCAL_SET_TO_ASSIGNMENT_RULE =
@@ -714,6 +716,7 @@ class SqlScriptMigrator {
                     request.rewriteConfig(),
                     procedureAnalyzer,
                     preparedBindings,
+                    sessionVariablePackageName(projectRoot, relative),
                     manualReviewItems,
                     warnings
             );
@@ -2452,7 +2455,7 @@ class SqlScriptMigrator {
     }
 
     private ScriptDynamicDdlState copyScriptDynamicDdlState(ScriptDynamicDdlState source) {
-        ScriptDynamicDdlState copy = new ScriptDynamicDdlState();
+        ScriptDynamicDdlState copy = new ScriptDynamicDdlState(source.sessionPackage);
         copy.currentSchemaVariables.addAll(source.currentSchemaVariables);
         copy.dynamicDdlVariables.addAll(source.dynamicDdlVariables);
         copy.preparedDynamicDdlStatements.addAll(source.preparedDynamicDdlStatements);
@@ -2461,6 +2464,7 @@ class SqlScriptMigrator {
         copy.handledIndexExistenceVariables.addAll(source.handledIndexExistenceVariables);
         copy.combinedIndexDdlAssignments.addAll(source.combinedIndexDdlAssignments);
         copy.conditionalPreparedConversions.putAll(source.conditionalPreparedConversions);
+        copy.sessionVariables.addAll(source.sessionVariables);
         return copy;
     }
 
@@ -2593,7 +2597,8 @@ class SqlScriptMigrator {
     }
 
     private QueryUserVariableInlining inlineStableQueryBackedScriptVariables(
-            List<String> statements, ScriptProcedureEffectAnalyzer procedureAnalyzer, String schema, String scope
+            List<String> statements, ScriptProcedureEffectAnalyzer procedureAnalyzer, String schema, String scope,
+            Set<String> sessionVariables
     ) {
         // Use original definitions; even a single DROP/CALL changes the next file's context.
         Map<Integer, Effects> callEffects = procedureAnalyzer.analyzeForQueryVariables(
@@ -2626,6 +2631,10 @@ class SqlScriptMigrator {
             }
             ScriptUserVariableAssignment literalAssignment =
                     scriptUserVariableAssignment(splitLeadingSqlPrefix(statement).body());
+            if (!sessionVariables.isEmpty() && topLevelAssignedUserVariableNames(statement).stream()
+                    .anyMatch(name -> sessionVariables.contains(name.toLowerCase(Locale.ROOT)))) {
+                continue;
+            }
             if (literalAssignment != null) {
                 knownExpressions.put(
                         literalAssignment.name().toLowerCase(Locale.ROOT),
@@ -3223,7 +3232,9 @@ class SqlScriptMigrator {
         ).sql();
     }
 
-    private SnapshotUserVariableGrouping groupSnapshotUserVariableSequences(List<String> statements) {
+    private SnapshotUserVariableGrouping groupSnapshotUserVariableSequences(
+            List<String> statements, Set<String> sessionVariables
+    ) {
         if (statements == null || statements.size() < 2) {
             return new SnapshotUserVariableGrouping(
                     statements == null ? List.of() : statements,
@@ -3249,7 +3260,7 @@ class SqlScriptMigrator {
         for (int index = 0; index < statements.size();) {
             SnapshotUserVariableAssignment assignment =
                     snapshotUserVariableAssignment(statements.get(index));
-            if (assignment == null) {
+            if (assignment == null || sessionVariables.contains(assignment.name().toLowerCase(Locale.ROOT))) {
                 grouped.add(statements.get(index));
                 index++;
                 continue;
@@ -3514,6 +3525,7 @@ class SqlScriptMigrator {
             SqlRewriteConfig rewriteConfig,
             ScriptProcedureEffectAnalyzer procedureAnalyzer,
             ConditionalPreparedBindings preparedBindings,
+            String sessionPackage,
             List<SqlScriptManualReviewItem> manualReviewItems,
             List<String> warnings
     ) throws IOException {
@@ -3528,11 +3540,16 @@ class SqlScriptMigrator {
         String originalContent = readSqlScriptContent(sqlFile);
         long parseStartedAt = System.nanoTime();
         List<String> parsedStatements = SqlScriptParser.statements(originalContent);
+        // Reserve the variables before earlier optimizations consume their assignments.
+        ScriptDynamicDdlState sessionPlans = new ScriptDynamicDdlState(sessionPackage);
+        planConditionalPreparedStatements(parsedStatements, sessionPlans, relative, preparedBindings);
+        Set<String> sessionVariables = sessionPlans.sessionVariables;
         QueryUserVariableInlining queryUserVariableInlining =
                 inlineStableQueryBackedScriptVariables(parsedStatements, procedureAnalyzer, targetSchema,
-                        (systemScript ? "system:" : "application:") + targetSchema.toLowerCase(Locale.ROOT));
+                        (systemScript ? "system:" : "application:") + targetSchema.toLowerCase(Locale.ROOT),
+                        sessionVariables);
         SnapshotUserVariableGrouping snapshotUserVariableGrouping =
-                groupSnapshotUserVariableSequences(queryUserVariableInlining.statements());
+                groupSnapshotUserVariableSequences(queryUserVariableInlining.statements(), sessionVariables);
         List<String> originalStatements = snapshotUserVariableGrouping.statements();
         progress("Parsed SQL script: " + relative
                 + ", statements=" + parsedStatements.size()
@@ -3541,7 +3558,11 @@ class SqlScriptMigrator {
                 + ", elapsedMs=" + elapsedMillis(parseStartedAt));
         List<String> convertedStatements = new ArrayList<>();
         LinkedHashMap<String, String> scriptUserVariables = new LinkedHashMap<>();
-        ScriptDynamicDdlState scriptDynamicDdlState = scriptDynamicDdlState(originalStatements, relative, preparedBindings);
+        ScriptDynamicDdlState scriptDynamicDdlState = scriptDynamicDdlState(
+                originalStatements, relative, preparedBindings, sessionPackage);
+        if (!scriptDynamicDdlState.sessionVariables.isEmpty()) {
+            convertedStatements.add(sessionVariablePackage(scriptDynamicDdlState));
+        }
         String schemaScope = (systemScript ? "system:" : "application:")
                 + targetSchema.toLowerCase(Locale.ROOT);
         ScriptSchemaState persistedSchemaState = scriptSchemaStates.computeIfAbsent(
@@ -3590,7 +3611,8 @@ class SqlScriptMigrator {
                 CompletableFuture<ScriptStatementConversion> conversion;
                 CountSnapshotCandidate snapshot = countSnapshotConversions.containsKey(i) ? null
                         : adjacentCountSnapshot(originalStatements, i);
-                if (snapshot != null && originalSqlSchemaShapeManualReviewReason(
+                if (snapshot != null && !sessionVariables.contains(snapshot.name().toLowerCase(Locale.ROOT))
+                        && originalSqlSchemaShapeManualReviewReason(
                         splitLeadingSqlPrefix(snapshot.insert()).body(), scriptTableColumns, ignoredCreateColumns).isBlank()) {
                     // Convert both SQL statements before wrapping them: a whole-block
                     // SQL rewrite can misclassify DML keywords after a comment.
@@ -4380,6 +4402,17 @@ class SqlScriptMigrator {
         }
         ScriptUserVariableAssignment userVariableAssignment =
                 scriptUserVariableAssignment(leadingSqlPrefix.body());
+        if (!scriptDynamicDdlState.sessionVariables.isEmpty()) {
+            Matcher assignment = SESSION_INTEGER_ASSIGNMENT.matcher(leadingSqlPrefix.body().strip());
+            if (assignment.matches()
+                    && scriptDynamicDdlState.sessionVariables.contains(assignment.group("name").toLowerCase(Locale.ROOT))) {
+                String block = leadingSqlPrefix.prefix() + "BEGIN\n    "
+                        + scriptDynamicDdlState.sessionField(assignment.group("name"))
+                        + " := " + assignment.group("value") + ";\nEND";
+                return new ScriptStatementConversion(originalStatement, block, block, true, false, "",
+                        List.of(DM_SCRIPT_SESSION_VARIABLE_PACKAGE_RULE));
+            }
+        }
         if (userVariableAssignment != null) {
             scriptUserVariables.put(userVariableAssignment.name().toLowerCase(Locale.ROOT), userVariableAssignment.literal());
             String convertedSql = leadingSqlPrefix.prefix()
@@ -4427,7 +4460,8 @@ class SqlScriptMigrator {
                 scriptTableColumns,
                 scriptIdentityColumns,
                 targetSchema,
-                rewriteConfig
+                rewriteConfig,
+                scriptDynamicDdlState
         );
         InlineCreateTableIndexConversion inlineCreateTableIndexes =
                 convertMysqlCreateTableInlineIndexes(safeRuleConversion.sql());
@@ -4600,9 +4634,10 @@ class SqlScriptMigrator {
     }
 
     private ScriptDynamicDdlState scriptDynamicDdlState(
-            List<String> statements, Path relative, ConditionalPreparedBindings preparedBindings
+            List<String> statements, Path relative, ConditionalPreparedBindings preparedBindings,
+            String sessionPackage
     ) {
-        ScriptDynamicDdlState state = new ScriptDynamicDdlState();
+        ScriptDynamicDdlState state = new ScriptDynamicDdlState(sessionPackage);
         if (statements == null || statements.isEmpty()) {
             return state;
         }
@@ -4671,6 +4706,83 @@ class SqlScriptMigrator {
         return state;
     }
 
+    private String sessionVariablePackageName(Path projectRoot, Path relative) {
+        String identity = projectRoot.getFileName() + "/" + relative.toString().replace('\\', '/');
+        return "dm_adapter_session_" + UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8))
+                .toString().replace("-", "");
+    }
+
+    private String sessionVariablePackage(ScriptDynamicDdlState state) {
+        String fields = state.sessionVariables.stream()
+                .sorted()
+                .map(name -> "    v_" + name + " BIGINT;\n")
+                .collect(Collectors.joining());
+        return "CREATE OR REPLACE PACKAGE " + state.sessionPackage + " AS\n" + fields
+                + "END " + state.sessionPackage + ";";
+    }
+
+    private static final Pattern SESSION_INTEGER_ASSIGNMENT = Pattern.compile(
+            "(?i)\\bSET\\s+@(?<name>[A-Za-z_][A-Za-z0-9_$]*)\\s*(?::=|=)\\s*(?<value>[+-]?\\d+)\\s*(?=;|$)");
+
+    private boolean supportsIntegerSessionVariable(List<String> statements, int readIndex, String variable) {
+        boolean initialized = false;
+        Set<ProcedureKey> initializers = new LinkedHashSet<>();
+        for (int index = 0; index < statements.size(); index++) {
+            String sql = splitLeadingSqlPrefix(statements.get(index)).body().strip();
+            ProcedureReference procedure = procedureReferenceFromCreateProcedure(sql, "");
+            if (!initializers.isEmpty() && index < readIndex) {
+                ProcedureReference call = procedureReferenceFromCall(sql, "");
+                initialized |= call != null && initializers.contains(call.key());
+                ProcedureReference drop = procedureReferenceFromDropProcedure(sql, "");
+                if (drop != null) {
+                    initializers.remove(drop.key());
+                }
+                if (procedure != null) {
+                    initializers.remove(procedure.key());
+                }
+            }
+            List<UserVariableReference> references = mysqlUserVariableReferences(sql).stream()
+                    .filter(reference -> reference.name().equalsIgnoreCase(variable))
+                    .toList();
+            if (references.isEmpty()) {
+                continue;
+            }
+            boolean routine = isCreateRoutineStatement(sql);
+            if (hasUnsafeUserVariableAssignment(sql, references)) {
+                return false;
+            }
+            for (UserVariableReference reference : references) {
+                if (!routine || previousWordIsKeyword(sql, reference.start(), "SET")) {
+                    int start = 0;
+                    if (routine) {
+                        start = reference.start();
+                        while (Character.isWhitespace(sql.charAt(start - 1))) {
+                            start--;
+                        }
+                        start -= "SET".length();
+                    }
+                    Matcher assignment = SESSION_INTEGER_ASSIGNMENT.matcher(sql).region(start, sql.length());
+                    if (!(routine ? assignment.lookingAt() : assignment.matches())) {
+                        return false;
+                    }
+                    try {
+                        Long.parseLong(assignment.group("value"));
+                    } catch (NumberFormatException overflow) {
+                        return false;
+                    }
+                    if (index < readIndex) {
+                        if (procedure != null) {
+                            initializers.add(procedure.key());
+                        } else if (!routine) {
+                            initialized = true;
+                        }
+                    }
+                }
+            }
+        }
+        return initialized;
+    }
+
     private boolean hasCompleteScriptIndexDdlExecutionSequence(
             List<String> statements,
             int prepareIndex,
@@ -4735,14 +4847,20 @@ class SqlScriptMigrator {
                 continue;
             }
             Map<String, PreparedValue> bindings = new LinkedHashMap<>();
+            Set<String> sessionVariables = new LinkedHashSet<>();
             List<String> unresolved = new ArrayList<>();
             if (insertSelect) {
                 for (String name : preparedInsertSelectVariableNames(trueSql, falseSql)) {
                     ConditionalPreparedBindings.ValueSource source = preparedBindings.source(relative, variable, name);
-                    if (source == null) {
+                    String key = name.toLowerCase(Locale.ROOT);
+                    if (source == null && name.matches("[A-Za-z_][A-Za-z0-9_$]{0,79}")
+                            && supportsIntegerSessionVariable(statements, index, name)) {
+                        sessionVariables.add(key);
+                        bindings.put(key, new PreparedValue(state.sessionField(name), null));
+                    } else if (source == null) {
                         unresolved.add("@" + name);
                     } else {
-                        bindings.put(name.toLowerCase(Locale.ROOT),
+                        bindings.put(key,
                                 new PreparedValue("dm_adapter_prepared_value_" + (bindings.size() + 1), source));
                     }
                 }
@@ -4765,7 +4883,8 @@ class SqlScriptMigrator {
                 continue;
             }
             List<String> declarations = new ArrayList<>();
-            bindings.values().forEach(binding -> declarations.add(binding.local() + " BIGINT;"));
+            bindings.values().stream().filter(binding -> binding.source() != null)
+                    .forEach(binding -> declarations.add(binding.parameter() + " BIGINT;"));
             List<String> queries = new ArrayList<>();
             List<String> comparisons = new ArrayList<>();
             for (int guardIndex = 0; guardIndex < guards.size(); guardIndex++) {
@@ -4781,6 +4900,13 @@ class SqlScriptMigrator {
             if (!manualReviewReason(block).isBlank() || !GeneratedSqlStaticInspector.manualReviewReason(block).isBlank()) {
                 continue;
             }
+            state.sessionVariables.addAll(sessionVariables);
+            List<String> rules = new ArrayList<>();
+            rules.add(insertSelect ? MYSQL_SCRIPT_CONDITIONAL_INSERT_SELECT_RULE
+                    : MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE);
+            if (!sessionVariables.isEmpty()) {
+                rules.add(DM_SCRIPT_SESSION_VARIABLE_PACKAGE_RULE);
+            }
             for (int offset = 0; offset < 4; offset++) {
                 String original = statements.get(index + offset);
                 LeadingSqlPrefix prefix = splitLeadingSqlPrefix(original);
@@ -4788,8 +4914,7 @@ class SqlScriptMigrator {
                 // with no intervening SQL, and keep all four validation-plan entries.
                 ScriptStatementConversion conversion = offset == 2
                         ? new ScriptStatementConversion(original, prefix.prefix() + block, prefix.prefix() + block,
-                                true, false, "", List.of(insertSelect ? MYSQL_SCRIPT_CONDITIONAL_INSERT_SELECT_RULE
-                                        : MYSQL_SCRIPT_DYNAMIC_DDL_TO_EXECUTE_IMMEDIATE_RULE))
+                                true, false, "", rules)
                         : dynamicDdlNoopConversion(original, prefix,
                                 "conditional prepared SQL is handled by its EXECUTE block");
                 state.conditionalPreparedConversions.put(index + offset + 1, conversion);
@@ -5062,7 +5187,7 @@ class SqlScriptMigrator {
             }
             payload.append(sql, start, reference.start()).append('?');
             start = reference.end();
-            parameters.add(binding.local());
+            parameters.add(binding.parameter());
             used.add(binding);
         }
         payload.append(sql, start, sql.length());
@@ -5081,13 +5206,14 @@ class SqlScriptMigrator {
             return null;
         }
         String evaluation = used.stream()
+                .filter(value -> value.source() != null)
                 .map(value -> "EXECUTE IMMEDIATE " + sqlStringLiteral(value.source().query()) + " INTO "
-                        + value.local() + ";\n        ")
+                        + value.parameter() + ";\n        ")
                 .collect(Collectors.joining());
         return evaluation + "EXECUTE IMMEDIATE (" + expression + ")" + routineUsingClause(parameters) + ";";
     }
 
-    private record PreparedValue(String local, ConditionalPreparedBindings.ValueSource source) {
+    private record PreparedValue(String parameter, ConditionalPreparedBindings.ValueSource source) {
     }
 
     private record ConditionalPreparedGuard(String countQuery, String comparison, boolean metadata) {
@@ -7884,7 +8010,8 @@ class SqlScriptMigrator {
             Map<String, LinkedHashSet<String>> scriptTableColumns,
             Map<String, String> scriptIdentityColumns,
             String targetSchema,
-            SqlRewriteConfig rewriteConfig
+            SqlRewriteConfig rewriteConfig,
+            ScriptDynamicDdlState scriptState
     ) {
         if (sql == null || sql.isBlank()) {
             return new SafeRuleConversion(sql == null ? "" : sql, false, List.of(), "");
@@ -8027,6 +8154,11 @@ class SqlScriptMigrator {
             rules.add(MYSQL_CREATE_FUNCTION_TO_DM_RULE);
         }
 
+        String sessionSql = convertProcedureSessionVariables(converted, scriptState);
+        if (!sessionSql.equals(converted)) {
+            converted = sessionSql;
+            rules.add(DM_SCRIPT_SESSION_VARIABLE_PACKAGE_RULE);
+        }
         String procedureUserVariableSql = convertMysqlProcedureUserVariables(converted);
         if (!procedureUserVariableSql.equals(converted)) {
             converted = procedureUserVariableSql;
@@ -14165,6 +14297,27 @@ class SqlScriptMigrator {
         return new VariableDeclarationParts(names, type, defaultValue);
     }
 
+    private String convertProcedureSessionVariables(String sql, ScriptDynamicDdlState state) {
+        if (state.sessionVariables.isEmpty() || !isCreateRoutineStatement(sql)) {
+            return sql;
+        }
+        List<UserVariableReference> references = mysqlUserVariableReferences(sql).stream()
+                .filter(reference -> state.sessionVariables.contains(reference.name().toLowerCase(Locale.ROOT)))
+                .toList();
+        if (references.isEmpty() || hasUnsafeUserVariableAssignment(sql, references)) {
+            return sql;
+        }
+        Map<String, String> fields = new LinkedHashMap<>();
+        for (String name : state.sessionVariables) {
+            fields.put(name, state.sessionField(name));
+        }
+        String qualified = replaceMysqlUserVariables(sql, references, fields);
+        return replaceOutsideIgnoredText(qualified,
+                Pattern.compile("(?i)\\bSET\\s+(?<field>" + Pattern.quote(state.sessionPackage)
+                        + "\\.v_[A-Za-z0-9_$]+)\\s*(?::=|=)"),
+                matcher -> matcher.group("field") + " :=");
+    }
+
     private String convertMysqlProcedureUserVariables(String sql) {
         if (!isCreateRoutineStatement(sql)) {
             return sql;
@@ -14267,7 +14420,8 @@ class SqlScriptMigrator {
                 int fromIndex = topLevelKeywordIndex(searchable, "FROM");
                 Matcher output = Pattern.compile(
                         "(?is)(?<into>\\bINTO\\b|\"into\")\\s+"
-                                + "(?<variables>[A-Za-z_][A-Za-z0-9_$]*(?:\\s*,\\s*[A-Za-z_][A-Za-z0-9_$]*)*)\\s*$"
+                                + "(?<variables>" + SQL_OBJECT_IDENTIFIER_TOKEN + "(?:\\s*,\\s*"
+                                + SQL_OBJECT_IDENTIFIER_TOKEN + ")*)\\s*$"
                 ).matcher(withoutComments);
                 if (output.find()) {
                     int intoIndex = output.start("into");
@@ -20788,6 +20942,8 @@ class SqlScriptMigrator {
 
     private static final class ScriptDynamicDdlState {
         private final Map<Integer, ScriptStatementConversion> conditionalPreparedConversions = new LinkedHashMap<>();
+        private final Set<String> sessionVariables = new LinkedHashSet<>();
+        private final String sessionPackage;
         private final LinkedHashSet<String> currentSchemaVariables = new LinkedHashSet<>();
         private final LinkedHashSet<String> dynamicDdlVariables = new LinkedHashSet<>();
         private final LinkedHashSet<String> preparedDynamicDdlStatements = new LinkedHashSet<>();
@@ -20798,6 +20954,18 @@ class SqlScriptMigrator {
         private final LinkedHashSet<String> handledIndexExistenceVariables = new LinkedHashSet<>();
         private final LinkedHashSet<ScriptIndexDdlAssignment> combinedIndexDdlAssignments =
                 new LinkedHashSet<>();
+
+        private ScriptDynamicDdlState() {
+            this("");
+        }
+
+        private ScriptDynamicDdlState(String sessionPackage) {
+            this.sessionPackage = sessionPackage;
+        }
+
+        private String sessionField(String name) {
+            return sessionPackage + ".v_" + name.toLowerCase(Locale.ROOT);
+        }
     }
 
     private record ScriptIndexExistenceCheck(

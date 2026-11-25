@@ -1,7 +1,9 @@
 package com.github.dmadapter.cli;
 
+import com.github.dmadapter.core.DamengTargetCapabilities;
 import com.github.dmadapter.core.SqlScriptManualReviewItem;
 import com.github.dmadapter.core.SqlScriptMigrationReport;
+import com.github.dmadapter.mybatis.SqlRewriteConfig;
 import com.github.dmadapter.sql.MySqlToDmSqlConverter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -213,6 +215,79 @@ class ReportedSqlScriptCompatibilityTest {
                         .doesNotContain("ROW_NUMBER", "@literal"));
         assertThat(SqlScriptParser.statements(converted.sql()))
                 .containsExactlyElementsOf(SqlScriptParser.statements(original));
+    }
+
+    @Test
+    void preservesSessionVariableFromProcedureThroughPreparedInsert() throws Exception {
+        String original = """
+                DELIMITER $$
+                CREATE PROCEDURE sample_seed()
+                BEGIN
+                    SET @sample_ver = 1;
+                    SELECT COALESCE((SELECT version_no FROM sample_versions LIMIT 1), 1) INTO @sample_ver;
+                    SET @sample_local = 0;
+                END$$
+                DELIMITER ;
+                CALL sample_seed();
+                DROP PROCEDURE IF EXISTS sample_seed;
+                CALL sample_shared();
+                """ + conditionalCopyScript("@sample_ver");
+
+        Converted converted = migrate(original, "001_system.sql");
+
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+        var name = Pattern.compile("CREATE OR REPLACE PACKAGE (dm_adapter_session_[0-9a-f]+) AS")
+                .matcher(converted.sql());
+        assertThat(name.find()).isTrue();
+        String field = name.group(1) + ".v_sample_ver";
+        assertThat(converted.sql()).containsSubsequence("v_sample_ver BIGINT;", field + " := 1;", "INTO " + field,
+                        "CALL sample_seed()", "DROP PROCEDURE IF EXISTS sample_seed", "CALL sample_shared()",
+                        "IF dm_adapter_guard_count > 0 THEN",
+                        "SELECT src.sample_id, ?, ''备注 @literal''", "dst.ver = ?", "USING " + field + ", " + field)
+                .doesNotContain("PREPARE sample_stmt", "MAX(version_no)", "@sample_ver", "dm_sample_ver BIGINT");
+    }
+
+    @Test
+    void reviewsSessionVariableWithAStringAssignment() throws Exception {
+        String original = """
+                DELIMITER $$
+                CREATE PROCEDURE sample_seed()
+                BEGIN
+                    SET @sample_ver = 1;
+                    SET @sample_ver = 'sample';
+                END$$
+                DELIMITER ;
+                CALL sample_seed();
+                """ + conditionalCopyScript("@sample_ver");
+
+        Converted converted = migrate(original, "001_system.sql");
+
+        assertThat(converted.report().manualReviewItems()).anySatisfy(item ->
+                assertThat(item.reason()).contains("条件动态 INSERT", "@sample_ver"));
+        assertThat(converted.sql()).doesNotContain("CREATE OR REPLACE PACKAGE");
+    }
+
+    @Test
+    void preservesExplicitBindingAndReviewsUnknownSessionVariableSources() throws Exception {
+        String original = """
+                DELIMITER $$
+                CREATE PROCEDURE sample_not_called()
+                BEGIN
+                    SET @sample_ver = 1;
+                END$$
+                DELIMITER ;
+                CALL sample_shared();
+                """ + conditionalCopyScript("@sample_ver");
+        Converted unresolved = migrate(original, "001_system.sql");
+        assertThat(unresolved.report().manualReviewSqlCount()).isEqualTo(4);
+        assertThat(unresolved.sql()).doesNotContain("CREATE OR REPLACE PACKAGE");
+
+        Files.writeString(root.resolve("sql/v2").resolve(ConditionalPreparedBindings.FILE_NAME),
+                "001_system.sql|sample_sql|sample_ver=sample_versions,version_no,1\n");
+        Converted configured = migrate(original, "001_system.sql");
+        assertFullyConverted(configured);
+        assertThat(configured.sql()).contains("SELECT GREATEST(COALESCE(MAX(version_no), 1), 1) FROM sample_versions")
+                .doesNotContain("CREATE OR REPLACE PACKAGE");
     }
 
     @Test
@@ -651,7 +726,8 @@ class ReportedSqlScriptCompatibilityTest {
         Files.writeString(source, sql);
         SqlScriptMigrationReport report = migrator().migrate(new SqlScriptMigrationRequest(
                 root, source.getParent(), outputRoot, false, "test-app", "test-system",
-                DmValidationEnvironment.from(Map.of())));
+                List.of(), DmValidationEnvironment.from(Map.of()), DamengTargetCapabilities.unknown(),
+                null, SqlRewriteConfig.empty(), List.of()));
         assertThat(Files.readString(source)).isEqualTo(sql);
         assertThat(report.validationAttempted()).isFalse();
         return new Converted(report, Files.readString(outputRoot.resolve(filename)));

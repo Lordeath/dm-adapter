@@ -712,6 +712,66 @@ class DamengSqlScriptIntegrationTest {
     }
 
     @Test
+    void executesPreparedCopyWithConnectionScopedPackageValues() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "SAMPLE_COPY_" + suffix;
+        String procedure = "SAMPLE_WRITE_" + suffix;
+        List<String> converted = migrateIntegrationFixture("copy_system.sql", """
+                DELIMITER $$
+                CREATE PROCEDURE %2$s(IN p_version INT)
+                BEGIN
+                    SET @sample_ver = 1;
+                    SELECT p_version INTO @sample_ver;
+                END$$
+                DELIMITER ;
+                CALL %2$s(7);
+                SET @sample_sql = IF(EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = '%1$s' AND column_name = 'ver'),
+                    'INSERT INTO %1$s (sample_id, ver) SELECT src.sample_id, @sample_ver FROM %1$s src
+                     WHERE src.ver = 1 AND NOT EXISTS (SELECT 1 FROM %1$s dst
+                        WHERE dst.sample_id = src.sample_id AND dst.ver = @sample_ver)', 'SELECT 1');
+                PREPARE sample_stmt FROM @sample_sql;
+                EXECUTE sample_stmt;
+                DEALLOCATE PREPARE sample_stmt;
+                """.formatted(table, procedure), schema);
+        String packageName = converted.get(0).split("\\s+")[4];
+        assertThat(packageName).startsWith("dm_adapter_session_");
+        String copy = converted.stream().filter(sql -> sql.contains("USING " + packageName)).findFirst().orElseThrow();
+
+        try (Connection first = integrationConnection(); Connection second = integrationConnection();
+             Statement writer = first.createStatement(); Statement other = second.createStatement()) {
+            writer.execute("SET SCHEMA \"" + schema + "\"");
+            other.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                writer.execute("CREATE TABLE " + table + " (sample_id INT, ver INT, PRIMARY KEY (sample_id, ver))");
+                writer.execute("INSERT INTO " + table + " VALUES (1, 1)");
+                executeStatements(writer, converted);
+                first.commit();
+                other.execute("CALL " + procedure + "(9)");
+                other.execute(copy);
+                second.commit();
+                writer.execute(copy);
+                try (ResultSet rows = writer.executeQuery("SELECT ver FROM " + table + " ORDER BY ver")) {
+                    List<Integer> versions = new ArrayList<>();
+                    while (rows.next()) {
+                        versions.add(rows.getInt(1));
+                    }
+                    assertThat(versions).containsExactly(1, 7, 9);
+                }
+                try (ResultSet rows = writer.executeQuery("SELECT " + packageName + ".v_sample_ver FROM DUAL")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getInt(1)).isEqualTo(7);
+                }
+            } finally {
+                dropQuietly(writer, "DROP PROCEDURE IF EXISTS " + procedure);
+                dropQuietly(writer, "DROP PACKAGE " + packageName);
+                dropQuietly(writer, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
     void executesGuardedColumnAndIndexAddTwice() throws Exception {
         String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
         String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
