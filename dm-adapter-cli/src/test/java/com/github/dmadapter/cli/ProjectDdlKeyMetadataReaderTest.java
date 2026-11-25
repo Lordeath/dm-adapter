@@ -81,6 +81,36 @@ class ProjectDdlKeyMetadataReaderTest {
     }
 
     @Test
+    void keepsImplicitZeroEvidenceOnlyForIntegralColumnsWithoutADefaultOrLaterChange() throws Exception {
+        Files.writeString(tempDir.resolve("schema.sql"), """
+                CREATE TABLE sample_detail (
+                    id BIGINT(20) NOT NULL COMMENT 'sample default identifier',
+                    sample_generated INT AUTO_INCREMENT,
+                    sample_default INT DEFAULT 7,
+                    sample_changed BIGINT NOT NULL,
+                    sample_text VARCHAR(30),
+                    PRIMARY KEY (id), UNIQUE KEY sample_generated_key (sample_generated)
+                );
+                ALTER TABLE sample_detail ALTER COLUMN sample_changed SET DEFAULT 9;
+                """);
+
+        Map<String, TableKeyMetadata> metadata = reader.readTableKeys(tempDir, List.of("sample_detail"));
+
+        assertThat(metadata.get("sample_detail").implicitZeroColumns()).containsExactly("id");
+    }
+
+    @Test
+    void doesNotInferMysqlDefaultsFromGeneratedDamengSql() throws Exception {
+        Path output = Files.createDirectories(tempDir.resolve("sql/v2-dm"));
+        Files.writeString(output.resolve("schema.sql"), "CREATE TABLE sample_detail (id BIGINT PRIMARY KEY);");
+
+        TableKeyMetadata metadata = reader.readTableKeys(tempDir, List.of("sample_detail")).get("sample_detail");
+
+        assertThat(metadata.primaryKeys()).hasSize(1);
+        assertThat(metadata.implicitZeroColumns()).isEmpty();
+    }
+
+    @Test
     void readsSchemaQualifiedTableAndCaseSensitiveColumnSpelling() throws Exception {
         Path ddl = tempDir.resolve("sql/schema.sql");
         Files.createDirectories(ddl.getParent());

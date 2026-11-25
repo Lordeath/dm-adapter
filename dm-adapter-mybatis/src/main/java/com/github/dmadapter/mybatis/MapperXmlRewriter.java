@@ -53,6 +53,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_INSERT_IGNORE_TO_DM_MERGE";
     public static final String MYBATIS_BATCH_INSERT_IGNORE_TO_DM_BLOCK_RULE =
             "MYBATIS_BATCH_INSERT_IGNORE_TO_DM_DUPLICATE_HANDLER_BLOCK";
+    public static final String MYBATIS_SELECTIVE_INSERT_IGNORE_TO_DM_BLOCK_RULE =
+            "MYBATIS_SELECTIVE_INSERT_IGNORE_TO_DM_DUPLICATE_HANDLER_BLOCK";
     public static final String MYBATIS_DYNAMIC_INSERT_SELECT_TO_DM_MERGE_RULE =
             "MYBATIS_DYNAMIC_INSERT_SELECT_TO_DM_CURSOR_MERGE";
     public static final String MYBATIS_INSERT_SELECT_FOR_UPDATE_TO_DM_TABLE_LOCK_RULE =
@@ -346,6 +348,9 @@ public class MapperXmlRewriter {
                     + "(?<valuesTrim><trim\\b[^>]*>[\\s\\S]*?</trim>)"
                     + "(?<trailing>;?\\s*)$"
     );
+    private static final Pattern SIMPLE_INSERT_IDENTIFIER = Pattern.compile(
+            "(?:[A-Za-z_][A-Za-z0-9_$]*|`[A-Za-z_][A-Za-z0-9_$]*`|\"[A-Za-z_][A-Za-z0-9_$]*\")"
+    );
     private static final Pattern DYNAMIC_FOREACH_INSERT_IGNORE_PREFIX_PATTERN = Pattern.compile(
             "(?is)^(?<leading>\\s*)insert\\s+ignore\\s+into\\s+"
                     + "(?<table>"
@@ -413,6 +418,12 @@ public class MapperXmlRewriter {
     );
     private static final Pattern SIMPLE_MYBATIS_PARAMETER_PATTERN = Pattern.compile(
             "(?is)^#\\{\\s*([A-Za-z_][A-Za-z0-9_$.]*)\\s*(?:,[^}]*)?}$"
+    );
+    private static final Pattern GROUP_CONCAT_MAPPED_CASE_PATTERN = Pattern.compile(
+            "(?is)GROUP_CONCAT\\s*\\(\\s*DISTINCT\\s+(?<value>CASE\\s+WHEN\\s*"
+                    + "<include\\s+refid\\s*=\\s*(?<quote>['\"])(?<ref>[A-Za-z_][A-Za-z0-9_.]*)\\k<quote>\\s*/>"
+                    + "\\s*THEN\\s+(?<column>\\$\\{(?:[A-Za-z_][A-Za-z0-9_]*\\.)+columns\\.[A-Za-z_][A-Za-z0-9_]*})"
+                    + "\\s+ELSE\\s+NULL\\s+END)\\s*\\)"
     );
     private static final Pattern DYNAMIC_XML_TAG_PATTERN = Pattern.compile(
             "(?is)<\\s*/?\\s*(if|foreach|choose|when|otherwise|trim|where|set)\\b"
@@ -1439,15 +1450,7 @@ public class MapperXmlRewriter {
                 if (!ref.matches("[A-Za-z_][A-Za-z0-9_]*") || !visiting.add(ref)) {
                     return null;
                 }
-                Element fragment = null;
-                for (Element candidate : statementElements(document)) {
-                    if ("sql".equals(candidate.getTagName()) && ref.equals(candidate.getAttribute("id"))) {
-                        if (fragment != null || candidate.hasAttribute("databaseId")) {
-                            return null;
-                        }
-                        fragment = candidate;
-                    }
-                }
+                Element fragment = localSqlFragment(document, ref);
                 String expanded = fragment == null ? null : staticIncludedSql(fragment, document, namespace, visiting);
                 visiting.remove(ref);
                 if (expanded == null || expanded.contains("${")) {
@@ -1459,6 +1462,19 @@ public class MapperXmlRewriter {
             }
         }
         return sql.toString();
+    }
+
+    private Element localSqlFragment(Document document, String id) {
+        Element fragment = null;
+        for (Element candidate : statementElements(document)) {
+            if ("sql".equals(candidate.getTagName()) && id.equals(candidate.getAttribute("id"))) {
+                if (fragment != null || candidate.hasAttribute("databaseId")) {
+                    return null;
+                }
+                fragment = candidate;
+            }
+        }
+        return fragment;
     }
 
     private boolean hasElementChild(Element statement) {
@@ -1486,6 +1502,12 @@ public class MapperXmlRewriter {
             }
             cursor = close + 1;
             String expression = body.substring(functions.start(), cursor);
+            String mappedCase = convertGroupConcatMappedCase(expression, document, namespace);
+            if (mappedCase != null) {
+                replacements.add(new TextReplacement(functions.start(), cursor, mappedCase));
+                addAppliedRules(rules, List.of(MySqlToDmSqlConverter.MYSQL_GROUP_CONCAT_TO_DM_LISTAGG_RULE));
+                continue;
+            }
             if (expression.contains("${") || expression.contains("dm_adapter_xml_")) {
                 continue;
             }
@@ -1516,6 +1538,21 @@ public class MapperXmlRewriter {
         }
         TextRewrite rewrite = applyTextReplacements(body, replacements);
         return new DynamicBodyConversion(body, rewrite.text(), rules, List.of(), rewrite.changed());
+    }
+
+    private String convertGroupConcatMappedCase(String expression, Document document, String namespace) {
+        Matcher matcher = GROUP_CONCAT_MAPPED_CASE_PATTERN.matcher(expression);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String ref = matcher.group("ref");
+        String localId = ref.startsWith(namespace + ".") ? ref.substring(namespace.length() + 1) : ref;
+        if (localId.contains(".") || localSqlFragment(document, localId) == null) {
+            return null;
+        }
+        // LISTAGG omits the NULL rows. Sorting the retained values by the column avoids replaying the predicate.
+        return "LISTAGG(DISTINCT " + matcher.group("value") + ", ',') WITHIN GROUP (ORDER BY "
+                + matcher.group("column") + ")";
     }
 
     private String aggregateSqlWithProtectedMarkup(
@@ -2334,6 +2371,12 @@ public class MapperXmlRewriter {
         if (!foreachMerge.equals(converted)) {
             appliedRules.add(MySqlToDmSqlConverter.MYSQL_ON_DUPLICATE_KEY_UPDATE_TO_DM_MERGE_RULE);
             converted = foreachMerge;
+        }
+
+        String selectiveInsert = convertMixedTrimInsertIgnore(converted, statementKey, rewriteConfig);
+        if (!selectiveInsert.equals(converted)) {
+            appliedRules.add(MYBATIS_SELECTIVE_INSERT_IGNORE_TO_DM_BLOCK_RULE);
+            converted = selectiveInsert;
         }
 
         String insertIgnoreMerge = convertBatchInsertIgnore(converted, statementKey, rewriteConfig);
@@ -6573,6 +6616,118 @@ public class MapperXmlRewriter {
         return wrapper == null ? converted : wrapper.wrap(converted);
     }
 
+    private String convertMixedTrimInsertIgnore(String body, String statementKey, SqlRewriteConfig config) {
+        Matcher insert = INSERT_IGNORE_TRIM_COLUMNS_VALUES_PATTERN.matcher(body);
+        if (!insert.matches() || !SIMPLE_INSERT_IDENTIFIER.matcher(insert.group("table")).matches()) {
+            return body;
+        }
+        String table = insert.group("table");
+        Matcher columnsTrim = TRIM_TAG_PATTERN.matcher(insert.group("columnsTrim"));
+        Matcher valuesTrim = TRIM_TAG_PATTERN.matcher(insert.group("valuesTrim"));
+        if (!matchesInsertListTrim(columnsTrim, "(") || !matchesInsertListTrim(valuesTrim, "values (")) {
+            return body;
+        }
+        List<ConditionalTrimItem> columns = mixedTrimItems(columnsTrim.group("body"));
+        List<ConditionalTrimItem> values = mixedTrimItems(valuesTrim.group("body"));
+        if (columns.size() != values.size() || columns.stream().noneMatch(item -> item.test().isEmpty())
+                || columns.stream().allMatch(item -> item.test().isEmpty())) {
+            return body;
+        }
+
+        Set<String> keys = new LinkedHashSet<>(normalizeIdentifiers(config.keyColumnsFor(statementKey, table)));
+        config.conflictKeyGroupsFor(statementKey).forEach(group -> keys.addAll(normalizeIdentifiers(group)));
+        String implicitZeroKey = config.implicitZeroPrimaryKeys().get(normalizeIdentifier(table));
+        if (implicitZeroKey != null) {
+            keys.add(implicitZeroKey);
+        }
+        if (keys.isEmpty()) {
+            return body;
+        }
+        List<String> columnItems = new ArrayList<>();
+        List<String> valueItems = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (int index = 0; index < columns.size(); index++) {
+            ConditionalTrimItem column = columns.get(index);
+            ConditionalTrimItem value = values.get(index);
+            String name = normalizeIdentifier(column.content());
+            String parameter = simpleMyBatisParameterName(value.content());
+            if (!SIMPLE_INSERT_IDENTIFIER.matcher(column.content()).matches() || parameter.isBlank()
+                    || !column.test().equals(value.test()) || !seen.add(name)) {
+                return body;
+            }
+            if (keys.contains(name) && !column.test().isEmpty()) {
+                if (!name.equals(implicitZeroKey) || !parameter.equals(simpleNullTestProperty(column.test()))) {
+                    return body;
+                }
+                columnItems.add(dmIdentifier(column.content()) + ",");
+                String when = value.opening().replaceFirst("(?i)^<if\\b", "<when");
+                valueItems.add("<choose>" + when + value.content() + "</when>"
+                        + "<otherwise>0</otherwise></choose>,");
+            } else {
+                columnItems.add(renderTrimInsertItem(column, dmIdentifier(column.content())));
+                valueItems.add(renderTrimInsertItem(value, value.content()));
+            }
+        }
+        if (!seen.containsAll(keys)) {
+            return body;
+        }
+        String indent = indentationOfLastLine(insert.group("leading"));
+        String inner = indent + "    ";
+        String itemIndent = inner + "    ";
+        return insert.group("leading") + "BEGIN\n"
+                + inner + "INSERT INTO " + table + "\n"
+                + inner + columnsTrim.group("opening") + "\n" + itemIndent
+                + String.join("\n" + itemIndent, columnItems) + "\n" + inner + "</trim>\n"
+                + inner + valuesTrim.group("opening") + "\n" + itemIndent
+                + String.join("\n" + itemIndent, valueItems) + "\n" + inner + "</trim>;\n"
+                + indent + "EXCEPTION\n" + inner + "WHEN DUP_VAL_ON_INDEX THEN NULL;\n"
+                + indent + "END;" + insert.group("trailing").replaceFirst("^;", "");
+    }
+
+    private boolean matchesInsertListTrim(Matcher trim, String prefix) {
+        if (!trim.matches()) {
+            return false;
+        }
+        String tag = trim.group("opening");
+        return prefix.equalsIgnoreCase(defaultString(xmlAttribute(tag, "prefix")).strip().replaceAll("\\s+", " "))
+                && ")".equals(xmlAttribute(tag, "suffix"))
+                && ",".equals(xmlAttribute(tag, "suffixOverrides"))
+                && defaultString(xmlAttribute(tag, "prefixOverrides")).isBlank();
+    }
+
+    private List<ConditionalTrimItem> mixedTrimItems(String body) {
+        List<ConditionalTrimItem> items = new ArrayList<>();
+        Matcher conditional = IF_BLOCK_PATTERN.matcher(body);
+        int start = 0;
+        while (conditional.find()) {
+            String fixed = body.substring(start, conditional.start()).strip();
+            String content = conditional.group("body").strip();
+            String opening = conditional.group("opening");
+            String test = defaultString(xmlAttribute(opening, "test")).strip();
+            if ((!fixed.isEmpty() && !fixed.endsWith(",")) || !addFixedTrimItems(items, fixed)
+                    || test.isEmpty() || !content.endsWith(",")) {
+                return List.of();
+            }
+            items.add(new ConditionalTrimItem(opening, test, stripTrailingComma(content)));
+            start = conditional.end();
+        }
+        return addFixedTrimItems(items, body.substring(start).strip()) ? items : List.of();
+    }
+
+    private boolean addFixedTrimItems(List<ConditionalTrimItem> items, String text) {
+        for (String value : splitTopLevelComma(stripTrailingComma(text))) {
+            if (value.isBlank()) {
+                return false;
+            }
+            items.add(new ConditionalTrimItem("", "", value.strip()));
+        }
+        return true;
+    }
+
+    private String renderTrimInsertItem(ConditionalTrimItem item, String value) {
+        return item.test().isEmpty() ? value + "," : item.opening() + value + ",</if>";
+    }
+
     private String convertNestedDynamicBatchOnDuplicateKeyUpdate(
             String body,
             String statementKey,
@@ -9300,11 +9455,16 @@ public class MapperXmlRewriter {
     }
 
     private int skipMyBatisPlaceholder(String value, int start) {
-        int index = start + 2;
-        while (index < value.length() && value.charAt(index) != '}') {
-            index++;
+        int depth = 1;
+        for (int index = start + 2; index < value.length(); index++) {
+            if (startsMyBatisPlaceholder(value, index)) {
+                depth++;
+                index++;
+            } else if (value.charAt(index) == '}' && --depth == 0) {
+                return index + 1;
+            }
         }
-        return index < value.length() ? index + 1 : value.length();
+        return value.length();
     }
 
     private List<BatchUpdateAssignment> updateAssignments(String updateClause) {

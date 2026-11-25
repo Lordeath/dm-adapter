@@ -16,7 +16,8 @@ public record SqlRewriteConfig(
         Set<String> identityInsertTables,
         Map<String, String> upsertKeyResolutions,
         Map<String, List<List<String>>> methodConflictKeyGroups,
-        Map<String, List<String>> verifiedSingleConflictKeys
+        Map<String, List<String>> verifiedSingleConflictKeys,
+        Map<String, String> implicitZeroPrimaryKeys
 ) {
     public static final String ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY =
             "ORIGINAL_SQL_NO_USABLE_CONFLICT_KEY";
@@ -24,6 +25,22 @@ public record SqlRewriteConfig(
             "KEY_METADATA_UNAVAILABLE";
     public static final String MANUAL_KEY_COLUMNS_REQUIRED =
             "MANUAL_KEY_COLUMNS_REQUIRED";
+
+    public SqlRewriteConfig(
+            Map<String, List<String>> tableKeyColumns,
+            Map<String, List<String>> methodKeyColumns,
+            Set<String> ignoredMissingTables,
+            Set<String> ignoredMissingColumns,
+            Set<String> ignoredMissingSchemas,
+            Set<String> identityInsertTables,
+            Map<String, String> upsertKeyResolutions,
+            Map<String, List<List<String>>> methodConflictKeyGroups,
+            Map<String, List<String>> verifiedSingleConflictKeys
+    ) {
+        this(tableKeyColumns, methodKeyColumns, ignoredMissingTables, ignoredMissingColumns,
+                ignoredMissingSchemas, identityInsertTables, upsertKeyResolutions, methodConflictKeyGroups,
+                verifiedSingleConflictKeys, Map.of());
+    }
 
     public SqlRewriteConfig(
             Map<String, List<String>> tableKeyColumns,
@@ -117,9 +134,10 @@ public record SqlRewriteConfig(
         ignoredMissingColumns = normalizeColumns(ignoredMissingColumns);
         ignoredMissingSchemas = normalizeSchemas(ignoredMissingSchemas);
         identityInsertTables = normalizeTables(identityInsertTables);
-        upsertKeyResolutions = normalizeMethodResolutions(upsertKeyResolutions);
+        upsertKeyResolutions = normalizeStringEntries(upsertKeyResolutions);
         methodConflictKeyGroups = normalizeMethodConflictKeyGroups(methodConflictKeyGroups);
         verifiedSingleConflictKeys = normalizeMethodKeys(verifiedSingleConflictKeys);
+        implicitZeroPrimaryKeys = normalizeStringEntries(implicitZeroPrimaryKeys);
     }
 
     public static SqlRewriteConfig empty() {
@@ -135,7 +153,8 @@ public record SqlRewriteConfig(
                 && identityInsertTables.isEmpty()
                 && upsertKeyResolutions.isEmpty()
                 && methodConflictKeyGroups.isEmpty()
-                && verifiedSingleConflictKeys.isEmpty();
+                && verifiedSingleConflictKeys.isEmpty()
+                && implicitZeroPrimaryKeys.isEmpty();
     }
 
     public List<String> keyColumnsFor(String methodKey, String tableName) {
@@ -259,17 +278,14 @@ public record SqlRewriteConfig(
         return Map.copyOf(normalized);
     }
 
-    private static Map<String, String> normalizeMethodResolutions(Map<String, String> resolutions) {
-        if (resolutions == null || resolutions.isEmpty()) {
+    private static Map<String, String> normalizeStringEntries(Map<String, String> values) {
+        if (values == null || values.isEmpty()) {
             return Map.of();
         }
         Map<String, String> normalized = new LinkedHashMap<>();
-        resolutions.forEach((method, resolution) -> {
-            if (method != null
-                    && !method.isBlank()
-                    && resolution != null
-                    && !resolution.isBlank()) {
-                normalized.put(method.trim(), resolution.trim());
+        values.forEach((method, value) -> {
+            if (method != null && !method.isBlank() && value != null && !value.isBlank()) {
+                normalized.put(method.trim(), value.trim());
             }
         });
         return Map.copyOf(normalized);

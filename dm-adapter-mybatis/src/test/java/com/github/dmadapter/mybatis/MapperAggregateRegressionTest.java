@@ -63,6 +63,61 @@ class MapperAggregateRegressionTest {
     }
 
     @Test
+    void convertsDistinctCaseAggregateWithDynamicLocalPredicateAndColumn() throws Exception {
+        Migration migration = migrate("""
+                <sql id="dateRange">
+                    <if test="${range}.start != null">
+                        AND d.event_day &gt;= #{${range}.start,jdbcType=INTEGER}
+                    </if>
+                </sql>
+                <sql id="window">
+                    1 = 1
+                    <include refid="dateRange"><property name="range" value="query.window"/></include>
+                </sql>
+                <sql id="projection">
+                    <choose>
+                        <when test="query.detail">d.label</when>
+                        <otherwise>
+                            COUNT(*) AS item_count
+                            <if test="query.includeLabels">
+                                , GROUP_CONCAT(DISTINCT CASE WHEN <include refid="window"/>
+                                    THEN ${source.columns.label} ELSE NULL END) AS labels
+                            </if>
+                        </otherwise>
+                    </choose>
+                </sql>
+                <select id="query" resultType="map">
+                    SELECT <include refid="projection"/> FROM sample_detail d WHERE tenant_id = #{tenantId}
+                </select>
+                <select id="stream" resultType="map">
+                    SELECT <include refid="projection"/> FROM sample_detail d WHERE tenant_id = #{tenantId}
+                </select>
+                """);
+
+        assertThat(migration.result().manualReviewItems()).isEmpty();
+        assertThat(migration.sql()).contains("<include refid=\"window\"/>", "WITHIN GROUP (ORDER BY ${source.columns.label})")
+                .doesNotContain("GROUP_CONCAT(");
+        Configuration configuration = read(migration.output());
+        for (String method : List.of("query", "stream")) {
+            for (boolean detail : List.of(false, true)) {
+                var args = Map.of("source", Map.of("columns", Map.of("label", "d.label")), "tenantId", 7,
+                        "query", Map.of("detail", detail, "includeLabels", true, "window", Map.of("start", 10)));
+                BoundSql bound = configuration.getMappedStatement("com.example.SampleMapper." + method).getBoundSql(args);
+                if (detail) {
+                    assertThat(bound.getSql()).doesNotContain("LISTAGG");
+                    assertThat(bound.getParameterMappings()).extracting(mapping -> mapping.getProperty())
+                            .containsExactly("tenantId");
+                } else {
+                    assertThat(bound.getSql()).contains("LISTAGG(DISTINCT CASE WHEN", "d.event_day >= ?",
+                            "THEN d.label ELSE NULL END", "WITHIN GROUP (ORDER BY d.label)");
+                    assertThat(bound.getParameterMappings()).extracting(mapping -> mapping.getProperty())
+                            .containsExactly("query.window.start", "tenantId");
+                }
+            }
+        }
+    }
+
+    @Test
     void expandsMultipleAggregateAliasesInsideChooseHavingWithoutMovingThemToWhere() throws Exception {
         Migration migration = migrate("""
                 <select id="query" resultType="map">

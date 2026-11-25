@@ -1,5 +1,7 @@
 package com.github.dmadapter.cli;
 
+import org.apache.ibatis.builder.xml.XMLMapperBuilder;
+import org.apache.ibatis.session.Configuration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -16,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -703,6 +706,63 @@ class DmAdapterCliTest {
                 .contains("INSERT INTO ns_bank_file")
                 .doesNotContain("INSERT IGNORE")
                 .doesNotContain("MERGE INTO");
+    }
+
+    @Test
+    void migratesMixedTrimInsertIgnoreWithAnOmittedIntegralPrimaryKey() throws Exception {
+        writeDemoProject();
+        Path source = writeFile("src/main/resources/mapper/UserMapper.xml", """
+                <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+                        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+                <mapper namespace="com.example.SampleMapper">
+                    <update id="insertSelective" parameterType="map">
+                        INSERT IGNORE INTO sample_detail
+                        <trim prefix="(" suffix=")" suffixOverrides=",">
+                            sample_label, sample_owner,
+                            <if test="id != null">sample_id,</if>
+                            <if test="status != null">sample_status,</if>
+                        </trim>
+                        <trim prefix="VALUES (" suffix=")" suffixOverrides=",">
+                            #{label,jdbcType=VARCHAR}, #{owner,jdbcType=VARCHAR},
+                            <if test="id != null">#{id},</if>
+                            <if test="status != null">#{status,jdbcType=INTEGER},</if>
+                        </trim>
+                    </update>
+                </mapper>
+                """);
+        String sourceXml = Files.readString(source);
+        writeFile("sql/schema.sql", """
+                CREATE TABLE sample_detail (
+                    sample_id BIGINT(20) NOT NULL COMMENT 'sample identifier',
+                    sample_label VARCHAR(50), sample_owner VARCHAR(50), sample_status INT DEFAULT 8,
+                    PRIMARY KEY (sample_id)
+                ) ENGINE=InnoDB;
+                """);
+
+        assertThat(execute("migrate", "--project", tempDir.toString())).isZero();
+        Path output = tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml");
+        assertThat(Files.readString(source)).isEqualTo(sourceXml);
+        assertThat(Files.readString(output)).contains("WHEN DUP_VAL_ON_INDEX THEN NULL")
+                .doesNotContainIgnoringCase("INSERT IGNORE");
+        Configuration configuration = new Configuration();
+        try (var input = Files.newInputStream(output)) {
+            new XMLMapperBuilder(input, configuration, output.toString(), configuration.getSqlFragments()).parse();
+        }
+        var statement = configuration.getMappedStatement("com.example.SampleMapper.insertSelective");
+        var present = statement.getBoundSql(Map.of("id", 17L, "label", "item", "owner", "sample", "status", 1));
+        assertThat(present.getSql().replaceAll("\\s+", " "))
+                .matches("(?is).*INSERT INTO sample_detail\\s*\\(\\s*sample_label,\\s*sample_owner,\\s*sample_id,"
+                        + "\\s*sample_status\\s*\\)\\s*VALUES\\s*\\(\\s*\\?,\\s*\\?,\\s*\\?,\\s*\\?\\s*\\).*");
+        assertThat(present.getParameterMappings()).extracting(mapping -> mapping.getProperty())
+                .containsExactly("label", "owner", "id", "status");
+        var omitted = statement.getBoundSql(Map.of("label", "item", "owner", "sample"));
+        assertThat(omitted.getSql().replaceAll("\\s+", " "))
+                .matches("(?is).*\\(\\s*sample_label,\\s*sample_owner,\\s*sample_id\\s*\\)"
+                        + "\\s*VALUES\\s*\\(\\s*\\?,\\s*\\?,\\s*0\\s*\\).*");
+        assertThat(omitted.getParameterMappings()).extracting(mapping -> mapping.getProperty())
+                .containsExactly("label", "owner");
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
+                .doesNotContain("INSERT IGNORE 需要配置 keyColumns");
     }
 
     @Test

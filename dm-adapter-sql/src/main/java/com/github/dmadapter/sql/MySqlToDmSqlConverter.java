@@ -13132,8 +13132,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
     }
 
     private int skipMyBatisPlaceholder(String sql, int start) {
-        int end = sql.indexOf('}', start + 2);
-        return end < 0 ? sql.length() : end + 1;
+        int depth = 1;
+        for (int index = start + 2; index < sql.length(); index++) {
+            if (startsMyBatisPlaceholder(sql, index)) {
+                depth++;
+                index++;
+            } else if (sql.charAt(index) == '}' && --depth == 0) {
+                return index + 1;
+            }
+        }
+        return sql.length();
     }
 
     private int skipUntilLineEnd(String sql, int start) {
