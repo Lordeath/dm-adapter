@@ -166,6 +166,7 @@ class SqlScriptMigrator {
             "MYSQL_ALTER_MODIFY_COLUMN_TO_DM";
     static final String MYSQL_GUARDED_COLUMN_CHANGE_TO_DM_RULE = "MYSQL_GUARDED_COLUMN_CHANGE_TO_DM";
     static final String MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT_RULE = "MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT";
+    static final String MYSQL_GUARDED_COLUMN_ADD_COMMENT_RULE = "MYSQL_GUARDED_COLUMN_ADD_COMMENT_TO_DM";
     static final String MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT_RULE =
             "MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT";
     static final String MYSQL_MULTI_ADD_COLUMN_TO_DM_RULE = "MYSQL_MULTI_ADD_COLUMN_TO_DM";
@@ -327,6 +328,7 @@ class SqlScriptMigrator {
                     + "\\s+AND\\s+COLUMN_NAME\\s*=\\s*" + SQL_STRING_LITERAL_TOKEN + "\\s*";
     private static final String MYSQL_CHANGE_COLUMN_TYPE =
             "(?:TINYINT|SMALLINT|INT|INTEGER|BIGINT|TIMESTAMP|DATETIME)(?:\\s*\\(\\s*\\d+\\s*\\))?"
+                    + "|(?:DECIMAL|NUMERIC)\\s*\\(\\s*\\d+\\s*,\\s*\\d+\\s*\\)"
                     + "|(?:VARCHAR|CHAR)\\s*\\(\\s*\\d+(?:\\s+CHAR)?\\s*\\)"
                     + "|TINYTEXT|MEDIUMTEXT|LONGTEXT|TEXT|CLOB";
     private static final String MYSQL_GUARDED_COLUMN_DEFINITION =
@@ -1559,7 +1561,7 @@ class SqlScriptMigrator {
                     "动态 DDL 对象名无法静态解析"
             );
         }
-        if (containsUnsupportedRoutineVersionControlFlow(sql)) {
+        if (containsUnsupportedRoutineVersionControlFlow(sql, dynamicDdl.events())) {
             return RoutineSameObjectRewrite.unsafe(
                     sql,
                     riskyTables,
@@ -1635,9 +1637,22 @@ class SqlScriptMigrator {
         return false;
     }
 
-    private boolean containsUnsupportedRoutineVersionControlFlow(String sql) {
-        String searchable = replaceIgnoredSqlWithSpaces(sql);
-        return Pattern.compile("(?is)\\b(?:LOOP|GOTO|EXCEPTION)\\b").matcher(searchable).find();
+    private boolean containsUnsupportedRoutineVersionControlFlow(String sql, List<DynamicDdlEvent> events) {
+        String code = replaceIgnoredSqlWithSpaces(sql);
+        Matcher flow = Pattern.compile("(?i)\\b(?:END\\s+LOOP|WHILE|LOOP|GOTO|EXCEPTION|HANDLER)\\b")
+                .matcher(code);
+        if (!flow.find()) {
+            return false;
+        }
+        int whileStart = flow.start();
+        // A single WHILE cannot return to the DDL when every DDL precedes its header.
+        return !flow.group().equalsIgnoreCase("WHILE")
+                || !flow.find() || !flow.group().equalsIgnoreCase("LOOP")
+                || !flow.find() || !flow.group().matches("(?i)END\\s+LOOP")
+                || flow.find()
+                || events.stream().anyMatch(event -> event.index() >= whileStart)
+                || Pattern.compile("(?i)\\b(?:EXECUTE\\s+IMMEDIATE|CALL|ALTER|CREATE|DROP|TRUNCATE)\\b")
+                        .matcher(code).region(whileStart, code.length()).find();
     }
 
     private List<RoutineSqlStatement> routineSqlStatements(String sql) {
@@ -8260,6 +8275,11 @@ class SqlScriptMigrator {
                 converted = splitColumnAndIndex;
                 rules.add(MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT_RULE);
             }
+            String withColumnComments = preserveGuardedMysqlAddColumnComment(converted);
+            if (!withColumnComments.equals(converted)) {
+                converted = withColumnComments;
+                rules.add(MYSQL_GUARDED_COLUMN_ADD_COMMENT_RULE);
+            }
         }
 
         RoutineStaticSqlConversion guardedColumnChange = convertGuardedMysqlColumnChanges(converted);
@@ -9980,6 +10000,32 @@ class SqlScriptMigrator {
             statements.add(indexDdl);
             return sql.substring(guard.start(), ddlStart)
                     + renderColumnAlterDdl(statements, lineIndentBefore(sql, ddlStart));
+        });
+    }
+
+    private String preserveGuardedMysqlAddColumnComment(String sql) {
+        return replaceOutsideIgnoredText(sql, MYSQL_GUARDED_COLUMN_INDEX_ADD, guard -> {
+            int ddlStart = guard.start("ddl");
+            String ddl = sql.substring(ddlStart, guard.end("ddl") - 1);
+            if (containsSqlComment(ddl) || ddl.indexOf('\\') >= 0) {
+                return guard.group();
+            }
+            Matcher alter = ALTER_TABLE_BODY_PATTERN.matcher(ddl);
+            if (!alter.matches() || splitTopLevelComma(alter.group("body")).size() != 1) {
+                return guard.group();
+            }
+            Matcher add = MYSQL_GROUPED_ADD_COLUMN.matcher(alter.group("body").strip());
+            String table = alter.group("table");
+            if (!add.matches() || add.group("comment") == null || !isSimpleIdentifier(unquoteIdentifier(table))
+                    || !checksMysqlColumn(guard.group("check"), table, add.group("name"))) {
+                return guard.group();
+            }
+            String column = add.group("name");
+            String definition = normalizeMysqlDataTypes(collapseSqlWhitespaceOutsideQuotedText(add.group("definition")));
+            return sql.substring(guard.start(), ddlStart) + renderColumnAlterDdl(List.of(
+                    "ALTER TABLE " + table + " ADD " + column + " " + definition,
+                    "COMMENT ON COLUMN " + table + "." + column + " IS " + add.group("comment")),
+                    lineIndentBefore(sql, ddlStart));
         });
     }
 

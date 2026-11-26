@@ -11023,6 +11023,58 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void bindsBatchQueriesAndUpdateAfterGuardedDdlOutsideWhileLoop() throws Exception {
+        ConvertedScript converted = migrateSingleScript("""
+                DROP PROCEDURE IF EXISTS sample_backfill;
+                DELIMITER $$
+                CREATE PROCEDURE sample_backfill()
+                BEGIN
+                    DECLARE last_id BIGINT DEFAULT 0;
+                    DECLARE max_id BIGINT DEFAULT 0;
+                    DECLARE batch_end_id BIGINT;
+                    IF EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_amount'
+                          AND COLUMN_NAME = 'source_amount') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.COLUMNS
+                            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sample_amount'
+                              AND COLUMN_NAME = 'target_amount') THEN
+                            ALTER TABLE sample_amount ADD COLUMN target_amount DECIMAL(12,2) DEFAULT NULL
+                                COMMENT '样例金额' AFTER source_amount;
+                        END IF;
+                        SELECT COALESCE(MAX(id), 0) INTO max_id FROM sample_amount;
+                        amount_batches: WHILE last_id < max_id DO
+                            SELECT MAX(batch_ids.id) INTO batch_end_id
+                            FROM (SELECT id FROM sample_amount
+                                  WHERE id > last_id AND id <= max_id ORDER BY id LIMIT 1000) AS batch_ids;
+                            IF batch_end_id IS NULL THEN
+                                LEAVE amount_batches;
+                            END IF;
+                            UPDATE sample_amount SET target_amount = source_amount
+                            WHERE id > last_id AND id <= batch_end_id
+                              AND target_amount IS NULL AND source_amount IS NOT NULL;
+                            SET last_id = batch_end_id;
+                        END WHILE amount_batches;
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL sample_backfill();
+                DROP PROCEDURE IF EXISTS sample_backfill;
+                """);
+
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+        assertThat(converted.sql()).containsSubsequence(
+                "EXECUTE IMMEDIATE", "ALTER TABLE sample_amount", "ADD target_amount DECIMAL(12,2) DEFAULT NULL",
+                "COMMENT ON COLUMN sample_amount.target_amount", "样例金额", "END IF;",
+                "EXECUTE IMMEDIATE 'SELECT COALESCE(MAX(id), 0) FROM sample_amount' INTO max_id;",
+                "<<amount_batches>>", "WHILE last_id < max_id LOOP",
+                "WHERE id > ? AND id <= ? ORDER BY id LIMIT 1000",
+                "INTO batch_end_id USING last_id, max_id", "EXIT amount_batches;",
+                "UPDATE sample_amount SET target_amount = source_amount", "WHERE id > ? AND id <= ?",
+                "AND target_amount IS NULL AND source_amount IS NOT NULL",
+                "USING last_id, batch_end_id", "last_id := batch_end_id;", "END LOOP amount_batches;");
+    }
+
+    @Test
     void keepsLoopWithSameObjectDdlForManualReview() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 CREATE PROCEDURE change_demo()

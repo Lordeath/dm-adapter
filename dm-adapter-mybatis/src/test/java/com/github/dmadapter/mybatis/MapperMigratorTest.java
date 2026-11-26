@@ -6457,14 +6457,14 @@ class MapperMigratorTest {
     }
 
     @Test
-    void dynamicHavingInsideIfRetainsAggregateAliasThatAlsoReferencesUngroupedColumns() throws Exception {
+    void keepsMixedHavingForReviewWhenGroupedProjectionHasDuplicateLabels() throws Exception {
         String originalXml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
                         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
                 <mapper namespace="com.example.BillMapper">
                     <select id="getConfirmAccountList">
-                        select p.id,
+                        select p.id, c.id,
                                case
                                    when p.account_total - ifnull(sum(c.paid_amount), 0) = 0 then 2
                                    when p.account_total &gt; ifnull(sum(c.paid_amount), 0) then 3

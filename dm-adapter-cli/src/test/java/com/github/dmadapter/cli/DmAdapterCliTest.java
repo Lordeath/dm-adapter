@@ -572,6 +572,47 @@ class DmAdapterCliTest {
     }
 
     @Test
+    void migrateFiltersMixedHavingAliasOnGroupedRowsWithoutKeyMetadata() throws Exception {
+        writeDemoProject();
+        String xml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <mapper namespace="com.example.UserMapper">
+                    <select id="summarize">
+                        SELECT p.id, GROUP_CONCAT(c.label) AS labels
+                        <choose>
+                            <when test="detail">, p.created_at AS display_date</when>
+                            <otherwise>, p.updated_at AS display_date</otherwise>
+                        </choose>
+                        , CASE WHEN p.total - IFNULL(SUM(c.amount), 0) = 0 THEN 2
+                               WHEN p.total &gt; IFNULL(SUM(c.amount), 0) THEN 3 ELSE 0 END AS sample_status
+                        FROM sample_parent p LEFT JOIN sample_child c ON p.id = c.parent_id
+                        WHERE p.active = 1
+                        GROUP BY p.id
+                        <if test="statuses != null">
+                            HAVING sample_status IN
+                            <foreach collection="statuses" item="status" open="(" separator="," close=")">
+                                #{status}
+                            </foreach>
+                        </if>
+                        ORDER BY LENGTH(p.id) DESC, p.id
+                    </select>
+                </mapper>
+                """;
+        writeFile("src/main/resources/mapper/UserMapper.xml", xml);
+        assertThat(execute("migrate", "--project", tempDir.toString())).isZero();
+
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper-dm/UserMapper.xml")))
+                .containsSubsequence("SELECT dm_adapter_grouped.*", "FROM (", "LISTAGG",
+                        "<choose>", "GROUP BY p.id", ") dm_adapter_grouped",
+                        "<if test=\"statuses != null\">", "WHERE dm_adapter_grouped.sample_status IN",
+                        "#{status}", "ORDER BY LENGTH(dm_adapter_grouped.id) DESC, dm_adapter_grouped.id")
+                .doesNotContain("GROUP BY p.id,", "HAVING sample_status IN");
+        assertThat(Files.readString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"))).isEqualTo(xml);
+        assertThat(Files.readString(tempDir.resolve(".dm-adapter/dm-adapter-report.md")))
+                .doesNotContain("mixes aggregate output with non-aggregate column references");
+    }
+
+    @Test
     void migrateKeepsDamengNativeSingleTargetDynamicUpdateJoin() throws Exception {
         writeDemoProject();
         Files.writeString(tempDir.resolve("src/main/resources/mapper/UserMapper.xml"), """

@@ -15,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -77,6 +78,8 @@ public class MapperXmlRewriter {
             "MYBATIS_DYNAMIC_HAVING_SELECT_ALIAS_TO_EXPRESSION";
     public static final String MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION_RULE =
             "MYBATIS_DYNAMIC_GROUP_BY_SELECT_ALIAS_TO_EXPRESSION";
+    public static final String MYBATIS_GROUPED_HAVING_ALIAS_TO_OUTER_WHERE_RULE =
+            "MYBATIS_GROUPED_HAVING_ALIAS_TO_OUTER_WHERE";
     public static final String MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE =
             "MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE";
     public static final String MYBATIS_DYNAMIC_DAMENG_KEYWORD_ALIAS_REFERENCE_RULE =
@@ -214,6 +217,10 @@ public class MapperXmlRewriter {
     );
     private static final Pattern TRAILING_COMMA_BEFORE_PAREN_PATTERN = Pattern.compile(",(\\s*\\))");
     private static final String DM_IDENTIFIER = "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[^\"]+\"|`[^`]+`|\\$\\{[^}]+})";
+    private static final String GROUPED_QUERY_LABEL =
+            "(?:[A-Za-z_][A-Za-z0-9_$]*|\"[A-Za-z_][A-Za-z0-9_$]*\"|`[A-Za-z_][A-Za-z0-9_$]*`)";
+    private static final String GROUPED_QUERY_REFERENCE =
+            GROUPED_QUERY_LABEL + "(?:\\s*\\.\\s*" + GROUPED_QUERY_LABEL + ")*";
     private static final String SIMPLE_IDENTIFIER = "[A-Za-z_][A-Za-z0-9_$]*";
     private static final String SIMPLE_RELATION =
             DM_IDENTIFIER + "(?:\\s*\\.\\s*" + DM_IDENTIFIER + ")?";
@@ -3784,6 +3791,11 @@ public class MapperXmlRewriter {
             String havingContent = body.substring(havingStart, enclosingHavingIf.closingStart());
             String unsafeAliasReason = unsafeAggregateHavingAliasReason(havingContent, unsafeAggregateAliases);
             if (!unsafeAliasReason.isBlank()) {
+                ScopeHavingConversion outerFilter = moveGroupedHavingAliasToOuterWhere(
+                        body, scope, enclosingHavingIf, selectList, unsafeAggregateAliases);
+                if (outerFilter.changed()) {
+                    return outerFilter;
+                }
                 return ScopeHavingConversion.manualReview(body, unsafeAliasReason);
             }
             ScopeHavingConversion enclosedConversion = moveEnclosedHavingIfBeforeGroupBy(
@@ -3906,6 +3918,142 @@ public class MapperXmlRewriter {
             rules.add(MYBATIS_DYNAMIC_HAVING_SIMPLE_CONDITION_TO_WHERE_RULE);
         }
         return new ScopeHavingConversion(converted, rules, true);
+    }
+
+    private ScopeHavingConversion moveGroupedHavingAliasToOuterWhere(
+            String body, SelectScope scope, XmlBlock filter, String selectList, Map<String, SelectAlias> unsafeAliases
+    ) {
+        String grouping = body.substring(scope.groupIndex(), filter.openingStart());
+        if (!sqlView(body.substring(0, scope.selectIndex())).text().isBlank()
+                || !openXmlTagsAt(body, scope.selectIndex()).isEmpty()
+                || !openXmlTagsAt(body, scope.groupIndex()).isEmpty()
+                || openXmlTagsAt(body, filter.openingStart()).stream()
+                        .anyMatch(tag -> tag.startIndex() < filter.openingStart())
+                || !grouping.matches("(?is)GROUP\\s+BY\\s+" + GROUPED_QUERY_REFERENCE
+                        + "(?:\\s*,\\s*" + GROUPED_QUERY_REFERENCE + ")*\\s*")) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        int havingStart = scope.havingIndex() + "HAVING".length();
+        String condition = body.substring(havingStart, filter.closingStart());
+        Matcher in = Pattern.compile("(?is)^\\s*([A-Za-z_][A-Za-z0-9_$]*)\\s+IN\\s*(?=<foreach\\b)")
+                .matcher(condition);
+        if (!in.find() || !unsafeAliases.containsKey(identifierKey(in.group(1)))) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        XmlElementRange foreach = readXmlElementAt(condition, in.end());
+        if (foreach == null || !condition.substring(foreach.end()).isBlank()) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        String opening = condition.substring(foreach.start(), foreach.openingEnd());
+        String itemBody = condition.substring(foreach.openingEnd(), foreach.closingStart()).strip();
+        if (!"(".equals(xmlAttribute(opening, "open")) || !")".equals(xmlAttribute(opening, "close"))
+                || !",".equals(xmlAttribute(opening, "separator")) || !itemBody.matches("[#\\$]\\{[^{}]+}")) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+
+        List<Map<String, String>> projections = groupedSelectProjectionReferences(selectList, in.group(1));
+        if (projections.isEmpty()) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        String statusKey = identifierKey(in.group(1));
+        String statusLabel = projections.get(0).get(statusKey);
+        if (projections.stream().anyMatch(projection -> !statusLabel.equals(projection.get(statusKey)))) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        String relation = "dm_adapter_grouped";
+        String order = groupedOuterOrderBy(body.substring(filter.closingEnd()), relation, projections);
+        if (order == null) {
+            return ScopeHavingConversion.unchanged(body);
+        }
+        String converted = body.substring(0, scope.selectIndex()) + "SELECT " + relation + ".*\nFROM (\n"
+                + body.substring(scope.selectIndex(), filter.openingStart()).stripTrailing() + "\n) " + relation + "\n"
+                + body.substring(filter.openingStart(), scope.havingIndex()) + "WHERE " + relation + "." + statusLabel
+                + condition.substring(in.end(1)) + body.substring(filter.closingStart(), filter.closingEnd()) + order;
+        return new ScopeHavingConversion(converted, List.of(MYBATIS_GROUPED_HAVING_ALIAS_TO_OUTER_WHERE_RULE), true);
+    }
+
+    private List<Map<String, String>> groupedSelectProjectionReferences(String selectList, String statusAlias) {
+        List<String> variants = List.of(selectList);
+        int tagStart = selectList.indexOf('<');
+        if (tagStart >= 0) {
+            XmlElementRange choose = readXmlElementAt(selectList, tagStart);
+            if (choose == null || !"choose".equalsIgnoreCase(choose.name())) {
+                return List.of();
+            }
+            List<String> branches = completeChooseBranchBodies(selectList,
+                    new XmlBlock(choose.start(), choose.openingEnd(), choose.closingStart(), choose.end()));
+            if (branches == null) {
+                return List.of();
+            }
+            variants = branches.stream().map(branch -> selectList.substring(0, choose.start())
+                    + branch + selectList.substring(choose.end())).toList();
+        }
+
+        List<Map<String, String>> projections = new ArrayList<>();
+        for (String variant : variants) {
+            if (variant.contains("<") || variant.contains("${")) {
+                return List.of();
+            }
+            Map<String, String> labels = new LinkedHashMap<>();
+            Map<String, String> references = new LinkedHashMap<>();
+            for (String item : splitTopLevelComma(variant)) {
+                String expression = item.strip();
+                SelectAlias alias = selectAlias(expression);
+                if (alias != null) {
+                    expression = alias.expression();
+                } else if (!expression.matches(GROUPED_QUERY_REFERENCE)) {
+                    return List.of();
+                }
+                String label = alias == null ? expression.substring(expression.lastIndexOf('.') + 1).strip() : alias.alias();
+                if (!label.matches(GROUPED_QUERY_LABEL) || labels.putIfAbsent(identifierKey(label), label) != null) {
+                    return List.of();
+                }
+                if (expression.matches(GROUPED_QUERY_REFERENCE)) {
+                    references.putIfAbsent(groupedQueryReferenceKey(expression), label);
+                }
+            }
+            if (!labels.containsKey(identifierKey(statusAlias))) {
+                return List.of();
+            }
+            references.putAll(labels);
+            projections.add(references);
+        }
+        return projections;
+    }
+
+    private String groupedOuterOrderBy(String tail, String relation, List<Map<String, String>> projections) {
+        if (tail.isBlank()) {
+            return tail;
+        }
+        Matcher order = Pattern.compile("(?is)^\\s*ORDER\\s+BY\\s+(.+?)\\s*$").matcher(tail);
+        if (!order.matches()) {
+            return null;
+        }
+        List<String> results = new ArrayList<>();
+        Pattern orderItem = Pattern.compile("(?is)(?:LENGTH\\s*\\(\\s*(?<argument>" + GROUPED_QUERY_REFERENCE + ")\\s*\\)"
+                + "|(?<column>" + GROUPED_QUERY_REFERENCE + "))(?<direction>\\s+(?:ASC|DESC))?");
+        for (String item : splitTopLevelComma(order.group(1))) {
+            Matcher term = orderItem.matcher(item.strip());
+            if (!term.matches()) {
+                return null;
+            }
+            boolean length = term.group("argument") != null;
+            String key = groupedQueryReferenceKey(term.group(length ? "argument" : "column"));
+            String label = projections.get(0).get(key);
+            if (label == null || projections.stream().anyMatch(projection -> !label.equals(projection.get(key)))) {
+                return null;
+            }
+            String column = relation + "." + label;
+            String direction = defaultString(term.group("direction"));
+            results.add((length ? "LENGTH(" + column + ")" : column)
+                    + direction);
+        }
+        return "\nORDER BY " + String.join(", ", results) + "\n";
+    }
+
+    private String groupedQueryReferenceKey(String reference) {
+        return Arrays.stream(reference.split("\\."))
+                .map(part -> identifierKey(part.strip())).collect(Collectors.joining("."));
     }
 
     private HavingAggregateAliasExpansion expandAggregateAliasesInAllHavingClauses(String body) {
