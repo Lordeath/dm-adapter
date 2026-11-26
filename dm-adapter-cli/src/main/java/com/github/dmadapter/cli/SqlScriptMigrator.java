@@ -167,6 +167,7 @@ class SqlScriptMigrator {
     static final String MYSQL_GUARDED_COLUMN_CHANGE_TO_DM_RULE = "MYSQL_GUARDED_COLUMN_CHANGE_TO_DM";
     static final String MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT_RULE = "MYSQL_GUARDED_COLUMN_INDEX_ADD_SPLIT";
     static final String MYSQL_GUARDED_COLUMN_ADD_COMMENT_RULE = "MYSQL_GUARDED_COLUMN_ADD_COMMENT_TO_DM";
+    static final String DM_GUARDED_BIGINT_TO_CLOB_RULE = "DM_GUARDED_BIGINT_TO_CLOB";
     static final String MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT_RULE =
             "MYSQL_MULTI_MODIFY_ALTER_TABLE_SPLIT";
     static final String MYSQL_MULTI_ADD_COLUMN_TO_DM_RULE = "MYSQL_MULTI_ADD_COLUMN_TO_DM";
@@ -354,6 +355,21 @@ class SqlScriptMigrator {
     private static final Pattern MYSQL_GUARDED_COLUMN_INDEX_ADD = Pattern.compile(
             "(?is)\\bIF\\s+NOT\\s+EXISTS\\s*\\((?<check>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP + ")\\)"
                     + "\\s*THEN\\s+(?<ddl>" + MYSQL_ALTER_TABLE_STATEMENT + ")"
+    );
+    private static final Pattern MYSQL_GUARDED_LONGTEXT_MODIFY = Pattern.compile(
+            "(?is)^IF\\s+NOT\\s+EXISTS\\s*\\((?<check>" + MYSQL_CURRENT_SCHEMA_COLUMN_LOOKUP
+                    + "\\s+AND\\s+DATA_TYPE\\s*=\\s*'longtext'\\s*)\\)\\s*THEN\\s+"
+                    + "ALTER\\s+TABLE\\s+(?<table>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+"
+                    + "MODIFY\\s+(?:COLUMN\\s+)?(?<column>" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+LONGTEXT"
+                    + "(?:\\s+NULL)?(?:\\s+DEFAULT\\s+NULL)?"
+                    + "(?:\\s+COMMENT\\s+(?<comment>" + SQL_STRING_LITERAL_TOKEN + "))?"
+                    + "\\s*;\\s*END\\s+IF\\s*;\\s*(?=END\\s*;?\\s*$)"
+    );
+    private static final Pattern MYSQL_PLAIN_BIGINT_COLUMN = Pattern.compile(
+            "(?is)^(?:" + SQL_SIMPLE_IDENTIFIER_TOKEN + ")\\s+BIGINT(?:\\s*\\(\\s*\\d+\\s*\\))?"
+                    + "(?:\\s+SIGNED)?(?:\\s+(?:NOT\\s+)?NULL)?"
+                    + "(?:\\s+DEFAULT\\s+(?:NULL|[-+]?\\d+|" + SQL_STRING_LITERAL_TOKEN + "))?"
+                    + "(?:\\s+COMMENT\\s+" + SQL_STRING_LITERAL_TOKEN + ")?\\s*$"
     );
     private static final Pattern MYSQL_ADD_INDEX_PART_PREFIX =
             Pattern.compile("(?is)^\\s*ADD\\s+(?:UNIQUE\\s+)?(?:INDEX|KEY)\\b");
@@ -2480,6 +2496,7 @@ class SqlScriptMigrator {
         copy.combinedIndexDdlAssignments.addAll(source.combinedIndexDdlAssignments);
         copy.conditionalPreparedConversions.putAll(source.conditionalPreparedConversions);
         copy.sessionVariables.addAll(source.sessionVariables);
+        copy.historicalBigintColumns.putAll(source.historicalBigintColumns);
         return copy;
     }
 
@@ -3582,8 +3599,10 @@ class SqlScriptMigrator {
                 + targetSchema.toLowerCase(Locale.ROOT);
         ScriptSchemaState persistedSchemaState = scriptSchemaStates.computeIfAbsent(
                 schemaScope,
-                ignored -> new ScriptSchemaState(new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>())
+                ignored -> new ScriptSchemaState(new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashMap<>(),
+                        new LinkedHashMap<>())
         );
+        scriptDynamicDdlState.historicalBigintColumns.putAll(persistedSchemaState.historicalBigintColumns());
         LinkedHashMap<String, LinkedHashSet<String>> scriptTableColumns =
                 copyScriptTableColumns(persistedSchemaState.tableColumns());
         LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumns =
@@ -3712,7 +3731,8 @@ class SqlScriptMigrator {
                 collectScriptCreateTableDefinitionColumns(
                         originalStatement,
                         scriptTableColumns,
-                        scriptIdentityColumns
+                        scriptIdentityColumns,
+                        scriptDynamicDdlState.historicalBigintColumns
                 );
                 collectScriptAlterTableAddColumns(originalStatement, scriptTableColumns);
                 updateIgnoredCreateColumns(
@@ -3792,6 +3812,7 @@ class SqlScriptMigrator {
         persistedSchemaState.tableColumns().putAll(copyScriptTableColumns(scriptTableColumns));
         persistedSchemaState.ignoredCreateColumns().clear();
         persistedSchemaState.ignoredCreateColumns().putAll(copyScriptTableColumns(ignoredCreateColumns));
+        persistedSchemaState.historicalBigintColumns().putAll(scriptDynamicDdlState.historicalBigintColumns);
 
         MetadataSchemaBinding metadataSchemaBinding =
                 bindMetadataSchemaAtProcedureCalls(convertedStatements);
@@ -6391,10 +6412,19 @@ class SqlScriptMigrator {
             LinkedHashMap<String, LinkedHashSet<String>> tableColumns,
             LinkedHashMap<String, String> identityColumns
     ) {
+        collectScriptCreateTableDefinitionColumns(sql, tableColumns, identityColumns, null);
+    }
+
+    private void collectScriptCreateTableDefinitionColumns(
+            String sql,
+            LinkedHashMap<String, LinkedHashSet<String>> tableColumns,
+            LinkedHashMap<String, String> identityColumns,
+            Map<String, Set<String>> historicalBigintColumns
+    ) {
         LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
         String body = leadingSqlPrefix.body();
         Matcher matcher = Pattern.compile(
-                "(?is)^\\s*CREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+"
+                "(?is)^\\s*CREATE\\s+(?<temporary>TEMPORARY\\s+)?TABLE\\s+"
                         + "(?<guard>IF\\s+NOT\\s+EXISTS\\s+)?"
                         + "(?<table>(?:" + SQL_IDENTIFIER_TOKEN + "))\\s*\\("
         ).matcher(body);
@@ -6414,6 +6444,9 @@ class SqlScriptMigrator {
         if (targetColumns == null) {
             targetColumns = temporaryTableColumnsFor(tableColumns, tableName);
         }
+        boolean trackBigint = historicalBigintColumns != null && matcher.group("temporary") == null
+                && isSimpleIdentifier(unquoteIdentifier(tableName));
+        Set<String> bigintColumns = trackBigint ? new LinkedHashSet<>() : Set.of();
         for (String part : splitTopLevelComma(body.substring(openParen + 1, closeParen))) {
             String definition = part.strip();
             String columnName = createTableColumnDefinitionName(definition);
@@ -6422,7 +6455,13 @@ class SqlScriptMigrator {
                     identityColumns.put(normalizedTableKey(tableName), columnName);
                 }
                 addColumnIfAbsentIgnoreCase(targetColumns, columnName);
+                if (trackBigint && MYSQL_PLAIN_BIGINT_COLUMN.matcher(definition).matches()) {
+                    bigintColumns.add(normalizedIdentifierKey(columnName));
+                }
             }
+        }
+        if (trackBigint) {
+            historicalBigintColumns.put(normalizedTableKey(tableName), Set.copyOf(bigintColumns));
         }
     }
 
@@ -8270,6 +8309,11 @@ class SqlScriptMigrator {
         }
 
         if (isCreateProcedureStatement(converted)) {
+            String bigintToClob = convertGuardedBigintToClob(converted, scriptState.historicalBigintColumns);
+            if (!bigintToClob.equals(converted)) {
+                converted = bigintToClob;
+                rules.add(DM_GUARDED_BIGINT_TO_CLOB_RULE);
+            }
             String splitColumnAndIndex = splitGuardedMysqlColumnAndIndexAdds(converted);
             if (!splitColumnAndIndex.equals(converted)) {
                 converted = splitColumnAndIndex;
@@ -9953,6 +9997,71 @@ class SqlScriptMigrator {
     private String renderColumnAlterDdl(List<String> ddl, String indent) {
         return String.join("\n" + indent,
                 ddl.stream().map(statement -> "EXECUTE IMMEDIATE " + sqlStringLiteral(statement) + ";").toList());
+    }
+
+    private String convertGuardedBigintToClob(String sql, Map<String, Set<String>> historicalBigintColumns) {
+        if (historicalBigintColumns.isEmpty() || !containsIgnoreCase(sql, "LONGTEXT")) {
+            return sql;
+        }
+        int beginIndex = firstProcedureBegin(sql);
+        if (beginIndex < 0) {
+            return sql;
+        }
+        int bodyStart = beginIndex + "BEGIN".length();
+        LeadingSqlPrefix body = splitLeadingSqlPrefix(sql.substring(bodyStart));
+        Matcher guard = MYSQL_GUARDED_LONGTEXT_MODIFY.matcher(body.body());
+        if (!guard.find()) {
+            return sql;
+        }
+        String table = guard.group("table");
+        String column = guard.group("column");
+        if (!historicalBigintColumns.getOrDefault(normalizedTableKey(table), Set.of())
+                .contains(normalizedIdentifierKey(column)) || !checksMysqlColumn(guard.group("check"), table, column)) {
+            return sql;
+        }
+
+        LinkedHashSet<String> names = procedureNamesInScope(sql, beginIndex);
+        String columnCount = uniqueProcedureLocalName("dm_adapter_column_count", names);
+        String columnType = uniqueProcedureLocalName("dm_adapter_column_type", names);
+        String alter = "ALTER TABLE " + table + " MODIFY " + column;
+        List<String> finishDdl = new ArrayList<>();
+        if (guard.group("comment") != null) {
+            String comment = readSingleQuotedStringContent(guard.group("comment"), 0).rawContent();
+            // Write the comment before the final type so a retry can finish both steps.
+            finishDdl.add("COMMENT ON COLUMN " + table + "." + column + " IS "
+                    + sqlStringLiteral(decodeMysqlBackslashEscapedString(comment)));
+        }
+        finishDdl.add(alter + " CLOB NULL");
+
+        String tableName = sqlStringLiteral(unquoteIdentifier(table).toUpperCase(Locale.ROOT));
+        String columnName = sqlStringLiteral(unquoteIdentifier(column).toUpperCase(Locale.ROOT));
+        String diagnostic = sqlStringLiteral("Column " + unquoteIdentifier(table).toUpperCase(Locale.ROOT) + "."
+                + unquoteIdentifier(column).toUpperCase(Locale.ROOT));
+        String block = """
+                SELECT COUNT(*), MAX(CASE
+                    WHEN UPPER(DATA_TYPE) IN ('VARCHAR', 'VARCHAR2') AND CHAR_USED = 'C' AND CHAR_LENGTH = 32
+                      AND NULLABLE = 'Y' AND COALESCE(UPPER(TRIM(DATA_DEFAULT)), 'NULL') = 'NULL'
+                    THEN 'VARCHAR_BRIDGE' ELSE UPPER(DATA_TYPE) END)
+                INTO %1$s, %2$s
+                FROM ALL_TAB_COLUMNS
+                WHERE OWNER = %3$s AND UPPER(TABLE_NAME) = %4$s AND UPPER(COLUMN_NAME) = %5$s;
+                IF %1$s <> 1 THEN
+                    RAISE_APPLICATION_ERROR(-20000, %6$s || ' expected one column in the current schema, found ' || TO_CHAR(%1$s));
+                ELSIF %2$s IN ('BIGINT', 'VARCHAR_BRIDGE') THEN
+                    IF %2$s = 'BIGINT' THEN
+                        %7$s
+                    END IF;
+                    %8$s
+                ELSIF %2$s <> 'CLOB' THEN
+                    RAISE_APPLICATION_ERROR(-20000, %6$s || ' has unsupported type for this migration: ' || %2$s);
+                END IF;
+                """.formatted(columnCount, columnType, DM_CURRENT_SCHEMA_EXPRESSION, tableName, columnName, diagnostic,
+                        renderColumnAlterDdl(List.of(alter + " VARCHAR(32 CHAR) NULL DEFAULT NULL"), ""),
+                        renderColumnAlterDdl(finishDdl, "    "));
+        int declarations = procedureUserVariableDeclarationInsertIndex(sql, beginIndex);
+        return sql.substring(0, declarations)
+                + "    " + columnCount + " INT;\n    " + columnType + " VARCHAR(128);\n"
+                + sql.substring(declarations, bodyStart) + body.prefix() + block + body.body().substring(guard.end());
     }
 
     private boolean checksMysqlColumn(String query, String table, String column) {
@@ -20740,7 +20849,8 @@ class SqlScriptMigrator {
     private record ScriptSchemaState(
             LinkedHashMap<String, LinkedHashSet<String>> tableColumns,
             LinkedHashMap<String, LinkedHashSet<String>> ignoredCreateColumns,
-            LinkedHashMap<ProcedureKey, ProcedureSignature> procedureSignatures
+            LinkedHashMap<ProcedureKey, ProcedureSignature> procedureSignatures,
+            Map<String, Set<String>> historicalBigintColumns
     ) {
     }
 
@@ -20989,6 +21099,7 @@ class SqlScriptMigrator {
     private static final class ScriptDynamicDdlState {
         private final Map<Integer, ScriptStatementConversion> conditionalPreparedConversions = new LinkedHashMap<>();
         private final Set<String> sessionVariables = new LinkedHashSet<>();
+        private final Map<String, Set<String>> historicalBigintColumns = new LinkedHashMap<>();
         private final String sessionPackage;
         private final LinkedHashSet<String> currentSchemaVariables = new LinkedHashSet<>();
         private final LinkedHashSet<String> dynamicDdlVariables = new LinkedHashSet<>();

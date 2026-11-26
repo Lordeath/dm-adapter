@@ -11236,6 +11236,61 @@ class SqlScriptMigratorTest {
     }
 
     @Test
+    void convertsGuardedLongtextFromEarlierBigintDefinitionWithOneMetadataRead() throws Exception {
+        Path sqlRoot = tempDir.resolve("sql/v2");
+        Path sqlRootOut = tempDir.resolve("sql/v2-dm");
+        write(sqlRoot.resolve("001.sql"), """
+                CREATE TABLE IF NOT EXISTS `sample_amount` (id BIGINT PRIMARY KEY,
+                    `sample_value` BIGINT NOT NULL DEFAULT '0' COMMENT '旧值');
+                CREATE TABLE IF NOT EXISTS sample_text (id BIGINT PRIMARY KEY,
+                    sample_value VARCHAR(64) NOT NULL);
+                """);
+        write(sqlRoot.resolve("002.sql"), guardedLongtextChange("sample_amount", "sample_upgrade")
+                + guardedLongtextChange("sample_text", "sample_text_upgrade"));
+
+        var report = migrator(new RecordingValidator()).migrate(new SqlScriptMigrationRequest(
+                tempDir, sqlRoot, sqlRootOut, false, "", "", DmValidationEnvironment.from(Map.of())));
+
+        assertThat(report.manualReviewItems()).isEmpty();
+        assertThat(SqlScriptParser.statements(Files.readString(sqlRootOut.resolve("002.sql"))))
+                .hasSize(2).satisfiesExactly(bigint -> {
+                    assertThat(bigint).containsSubsequence("SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID)",
+                            "FROM ALL_TAB_COLUMNS", "OWNER = dm_adapter_schema",
+                            "IF dm_adapter_column_type = 'BIGINT' THEN",
+                            "MODIFY sample_value VARCHAR(32 CHAR) NULL DEFAULT NULL",
+                            "COMMENT ON COLUMN sample_amount.sample_value IS ''样例值''",
+                            "MODIFY sample_value CLOB NULL")
+                            .contains("VARCHAR_BRIDGE", "'CLOB'", "RAISE_APPLICATION_ERROR");
+                    assertThat(bigint.split("FROM ALL_TAB_COLUMNS", -1)).hasSize(2);
+                }, varchar -> assertThat(varchar).contains("MODIFY sample_value CLOB NULL")
+                        .doesNotContain("VARCHAR_BRIDGE", "VARCHAR(32 CHAR) NULL DEFAULT NULL"));
+    }
+
+    static String guardedLongtextChange(String table, String procedure) {
+        return """
+                DROP PROCEDURE IF EXISTS %2$s;
+                DELIMITER $$
+                CREATE PROCEDURE %2$s()
+                BEGIN
+                    -- 样例迁移，跳过已扩容列。
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.COLUMNS
+                        WHERE table_schema = DATABASE()
+                          AND table_name = '%1$s'
+                          AND column_name = 'sample_value'
+                          AND data_type = 'longtext'
+                    ) THEN
+                        ALTER TABLE %1$s
+                            MODIFY COLUMN sample_value LONGTEXT NULL COMMENT '样例值';
+                    END IF;
+                END$$
+                DELIMITER ;
+                CALL %2$s();
+                DROP PROCEDURE IF EXISTS %2$s;
+                """.formatted(table, procedure);
+    }
+
+    @Test
     void usesRuntimeSchemaAndDamengTypeInLiteralLongtextMetadataGuard() throws Exception {
         ConvertedScript converted = migrateSingleScript("""
                 DROP PROCEDURE IF EXISTS alter_interface_call_details_columns;

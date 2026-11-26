@@ -772,6 +772,79 @@ class DamengSqlScriptIntegrationTest {
     }
 
     @Test
+    void upgradesBigintToClobAndResumesFromTheIntermediateType() throws Exception {
+        String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
+        String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
+        String table = "SAMPLE_VALUE_" + suffix;
+        String procedure = "SAMPLE_EXPAND_" + suffix;
+        String baseline = "CREATE TABLE " + table + " (id BIGINT PRIMARY KEY,"
+                + " sample_value BIGINT NOT NULL DEFAULT '0')";
+        Path source = Files.createDirectories(tempDir.resolve("sql/v2"));
+        Files.writeString(source.resolve("001_system.sql"), baseline + ";");
+        List<String> converted = migrateIntegrationFixture("002_system.sql",
+                SqlScriptMigratorTest.guardedLongtextChange(table, procedure), schema);
+
+        try (Connection connection = integrationConnection(); Statement statement = connection.createStatement()) {
+            statement.execute("SET SCHEMA \"" + schema + "\"");
+            try {
+                statement.execute(baseline);
+                statement.execute("INSERT INTO " + table + " (id) VALUES (1)");
+                statement.execute("INSERT INTO " + table + " VALUES (2, 9223372036854775807), (3, -9223372036854775808)");
+                connection.commit();
+                executeStatements(statement, converted);
+                executeStatements(statement, converted);
+                statement.execute("INSERT INTO " + table + " (id) VALUES (4)");
+                try (ResultSet rows = statement.executeQuery("SELECT sample_value FROM " + table + " ORDER BY id")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isEqualTo("0");
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isEqualTo("9223372036854775807");
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isEqualTo("-9223372036854775808");
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isNull();
+                }
+                try (ResultSet rows = statement.executeQuery("SELECT comments FROM USER_COL_COMMENTS "
+                        + "WHERE UPPER(TABLE_NAME) = '" + table + "' AND UPPER(COLUMN_NAME) = 'SAMPLE_VALUE'")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isEqualTo("样例值");
+                }
+
+                statement.execute("DROP TABLE " + table);
+                statement.execute("CREATE TABLE " + table + " (id BIGINT PRIMARY KEY,"
+                        + " sample_value VARCHAR(32 CHAR) NULL DEFAULT NULL)");
+                statement.execute("INSERT INTO " + table + " VALUES (1, '9876543210123')");
+                connection.commit();
+                executeStatements(statement, converted);
+                try (ResultSet rows = statement.executeQuery("SELECT UPPER(DATA_TYPE), NULLABLE FROM ALL_TAB_COLUMNS "
+                        + "WHERE OWNER = SF_GET_SCHEMA_NAME_BY_ID(CURRENT_SCHID) AND UPPER(TABLE_NAME) = '"
+                        + table + "' AND UPPER(COLUMN_NAME) = 'SAMPLE_VALUE'")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isEqualTo("CLOB");
+                    assertThat(rows.getString(2)).isEqualTo("Y");
+                }
+                try (ResultSet rows = statement.executeQuery("SELECT sample_value FROM " + table)) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getString(1)).isEqualTo("9876543210123");
+                }
+
+                statement.execute("DROP TABLE " + table);
+                statement.execute("CREATE TABLE " + table + " (id BIGINT PRIMARY KEY, sample_value INT)");
+                assertThatThrownBy(() -> executeStatements(statement, converted))
+                        .isInstanceOf(SQLException.class).hasMessageContaining("SAMPLE_VALUE").hasMessageContaining("INT");
+                statement.execute("ALTER TABLE " + table + " MODIFY sample_value VARCHAR(64 CHAR) NULL DEFAULT NULL");
+                assertThatThrownBy(() -> executeStatements(statement, converted))
+                        .isInstanceOf(SQLException.class).hasMessageContaining("VARCHAR");
+                statement.execute("DROP TABLE " + table);
+                assertThatThrownBy(() -> executeStatements(statement, converted))
+                        .isInstanceOf(SQLException.class).hasMessageContaining("SAMPLE_VALUE").hasMessageContaining("found 0");
+            } finally {
+                dropQuietly(statement, "DROP TABLE IF EXISTS " + table);
+            }
+        }
+    }
+
+    @Test
     void executesGuardedColumnAndIndexAddTwice() throws Exception {
         String schema = requiredEnvironment("DM_ADAPTER_INTEGRATION_SCHEMA");
         String suffix = Long.toHexString(System.nanoTime()).toUpperCase(Locale.ROOT);
