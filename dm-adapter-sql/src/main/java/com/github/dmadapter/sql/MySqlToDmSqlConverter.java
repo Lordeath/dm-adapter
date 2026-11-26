@@ -11240,6 +11240,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         }
         StringBuilder converted = new StringBuilder(sql.length());
         boolean changed = false;
+        char previousSqlChar = '\0';
         int index = 0;
         while (index < sql.length()) {
             char current = sql.charAt(index);
@@ -11251,8 +11252,10 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 index = appendMyBatisPlaceholder(sql, index, converted);
             } else if (startsLineComment(sql, index)) {
                 index = appendUntilLineEnd(sql, index, converted);
+                continue;
             } else if (startsBlockComment(sql, index)) {
                 index = appendUntilBlockCommentEnd(sql, index, converted);
+                continue;
             } else if (current == '`') {
                 BacktickIdentifier identifier = readBacktickIdentifier(sql, index);
                 if (!identifier.closed()) {
@@ -11268,7 +11271,7 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                     end++;
                 }
                 String identifier = sql.substring(index, end);
-                String quoted = quoteDamengKeywordIdentifierIfNeeded(sql, index, identifier);
+                String quoted = quoteDamengKeywordIdentifierIfNeeded(sql, index, identifier, previousSqlChar);
                 converted.append(quoted);
                 changed = changed || !quoted.equals(identifier);
                 index = end;
@@ -11276,11 +11279,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
                 converted.append(current);
                 index++;
             }
+            if (!Character.isWhitespace(current)) {
+                previousSqlChar = current;
+            }
         }
         return new GenericConversion(changed ? converted.toString() : sql, changed);
     }
 
-    private String quoteDamengKeywordIdentifierIfNeeded(String sql, int startIndex, String identifier) {
+    private String quoteDamengKeywordIdentifierIfNeeded(
+            String sql, int startIndex, String identifier, char previousSqlChar
+    ) {
         String upper = identifier.toUpperCase(Locale.ROOT);
         if ("AUDIT".equals(upper)) {
             return quoteDamengIdentifier(identifier);
@@ -11291,16 +11299,16 @@ public class MySqlToDmSqlConverter implements SqlConverter {
         if ("PERCENT".equals(upper)) {
             return quoteDamengIdentifier(identifier);
         }
-        if ("DESC".equals(upper) && previousNonWhitespace(sql, startIndex) == '.') {
+        if ("DESC".equals(upper) && previousSqlChar == '.') {
             return "\"DESC\"";
         }
-        if ("DISTINCT".equals(upper) && previousNonWhitespace(sql, startIndex) == ',') {
+        if ("DISTINCT".equals(upper) && previousSqlChar == ',') {
             return quoteDamengIdentifier(identifier);
         }
         if ("REVERSE".equals(upper) && nextNonWhitespace(sql, startIndex + identifier.length()) != '(') {
             return quoteDamengIdentifier(identifier);
         }
-        if (previousNonWhitespace(sql, startIndex) == '.' && isDamengKeywordRequiringQuotes(identifier)) {
+        if (previousSqlChar == '.' && isDamengKeywordRequiringQuotes(identifier)) {
             return quoteDamengIdentifier(identifier);
         }
         return identifier;

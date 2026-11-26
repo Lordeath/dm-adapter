@@ -2993,6 +2993,47 @@ class MySqlToDmSqlConverterTest {
     }
 
     @Test
+    void preservesInsertKeywordAfterLineCommentEndingInPeriod() {
+        String sql = """
+                CREATE OR REPLACE PROCEDURE sample_seed() AS
+                BEGIN
+                    -- Sample description.
+                    INSERT INTO sample_button (id, label) VALUES (1, 'sample.');
+                END;
+                """.replace("\n", "\r\n");
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.convertedSql()).isEqualTo(sql);
+        assertThat(result.appliedRules()).doesNotContain(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+    }
+
+    @Test
+    void preservesDistinctKeywordAfterLineCommentEndingInComma() {
+        String sql = """
+                SELECT -- Sample comment containing a comma,
+                    DISTINCT id FROM sample_button
+                """;
+
+        SqlConversionResult result = converter.convert(sql);
+
+        assertThat(result.convertedSql()).isEqualTo(sql);
+        assertThat(result.appliedRules()).doesNotContain(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+    }
+
+    @Test
+    void quotesQualifiedKeywordAcrossInterveningComments() {
+        SqlConversionResult result = converter.convert("""
+                SELECT s. /* Sample column */ INSERT FROM sample_button s
+                """);
+
+        assertThat(result.convertedSql()).isEqualTo("""
+                SELECT s. /* Sample column */ "INSERT" FROM sample_button s
+                """);
+        assertThat(result.appliedRules()).containsExactly(MySqlToDmSqlConverter.DAMENG_KEYWORD_IDENTIFIER_QUOTE_RULE);
+    }
+
+    @Test
     void removesAsFromTableAliasesOnly() {
         SqlConversionResult result = converter.convert("""
                 SELECT
