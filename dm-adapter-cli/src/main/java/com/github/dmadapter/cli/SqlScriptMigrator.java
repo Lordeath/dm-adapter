@@ -19560,8 +19560,9 @@ class SqlScriptMigrator {
     }
 
     private LongLiteralCompatibility convertLongLiteralCompatibility(String sql) {
+        LeadingSqlPrefix prefix = splitLeadingSqlPrefix(sql == null ? "" : sql);
         LongDmlClobRewrite dynamicSqlRewrite =
-                convertLongProcedureDynamicSqlLiteralsToVarcharVariables(sql);
+                convertLongProcedureDynamicSqlLiteralsToVarcharVariables(prefix.body());
         if (!dynamicSqlRewrite.manualReviewReason().isBlank()) {
             return LongLiteralCompatibility.manual(sql, dynamicSqlRewrite.manualReviewReason());
         }
@@ -19576,7 +19577,7 @@ class SqlScriptMigrator {
             return LongLiteralCompatibility.manual(sql, directDmlRewrite.manualReviewReason());
         }
         return new LongLiteralCompatibility(
-                directDmlRewrite.sql(),
+                prefix.prefix() + directDmlRewrite.sql(),
                 dynamicSqlRewrite.changed(),
                 procedureClobRewrite.changed(),
                 directDmlRewrite.changed(),
@@ -20181,26 +20182,21 @@ class SqlScriptMigrator {
         assignments.append(indent);
     }
 
-    private LongDmlClobRewrite convertLongDirectDmlLiteralsToClobBlock(String sql) {
-        if (sql == null || sql.isBlank()) {
-            return LongDmlClobRewrite.unchanged(sql == null ? "" : sql);
-        }
-        LeadingSqlPrefix leadingSqlPrefix = splitLeadingSqlPrefix(sql);
-        String body = leadingSqlPrefix.body();
+    private LongDmlClobRewrite convertLongDirectDmlLiteralsToClobBlock(String body) {
         List<DmStringLiteral> longLiterals = longDmStringLiterals(body);
         if (longLiterals.isEmpty()) {
-            return LongDmlClobRewrite.unchanged(sql);
+            return LongDmlClobRewrite.unchanged(body);
         }
         int start = skipWhitespace(body, 0);
         boolean update = startsKeyword(body, start, "UPDATE");
         boolean insert = startsKeyword(body, start, "INSERT");
         boolean merge = startsKeyword(body, start, "MERGE");
         if (!update && !insert && !merge) {
-            return LongDmlClobRewrite.manual(sql, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
+            return LongDmlClobRewrite.manual(body, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
         }
         if (dmTopLevelKeywordIndexAfter(body, "RETURNING", start) >= 0) {
             return LongDmlClobRewrite.manual(
-                    sql,
+                    body,
                     "SQL 包含 RETURNING 和超过 3000 字节的字符串，无法安全包装为 DIsql CLOB 匿名块；"
                             + "已保留原 SQL，请人工确认。"
             );
@@ -20219,12 +20215,12 @@ class SqlScriptMigrator {
         for (DmStringLiteral literal : longLiterals) {
             if (literal.utf8Bytes() > DM_DISQL_LONG_LITERAL_MAX_AUTO_BYTES) {
                 return LongDmlClobRewrite.manual(
-                        sql,
+                        body,
                         "SQL 单个字符串超过 20MB，超出自动 CLOB 拆分上限；已保留原 SQL，请人工处理。"
                 );
             }
             if (!directLiteralRanges.contains(new TextRange(literal.start(), literal.end()))) {
-                return LongDmlClobRewrite.manual(sql, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
+                return LongDmlClobRewrite.manual(body, DM_DISQL_LONG_LITERAL_MANUAL_REVIEW_REASON);
             }
         }
 
@@ -20241,8 +20237,8 @@ class SqlScriptMigrator {
         if (executableSql.endsWith(";")) {
             executableSql = executableSql.substring(0, executableSql.length() - 1).stripTrailing();
         }
-        StringBuilder block = new StringBuilder(sql.length() + 512);
-        block.append(leadingSqlPrefix.prefix()).append("DECLARE\n");
+        StringBuilder block = new StringBuilder(body.length() + 512);
+        block.append("DECLARE\n");
         for (LongDmlClobValue value : values) {
             block.append("    ").append(value.variableName()).append(" CLOB;\n");
         }

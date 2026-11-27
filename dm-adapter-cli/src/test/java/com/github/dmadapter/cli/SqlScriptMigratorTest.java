@@ -4836,6 +4836,7 @@ class SqlScriptMigratorTest {
         String secondDynamicSql = "CREATE TABLE demo_dynamic_b AS SELECT ''"
                 + secondPayload + "'' AS payload FROM dual";
         ConvertedScript converted = migrateSingleScript("""
+                /* Sample dynamic SQL. */
                 CREATE OR REPLACE PROCEDURE demo_long_dynamic_sql() AS
                 BEGIN
                     IF 1 = 1 THEN
@@ -4850,6 +4851,7 @@ class SqlScriptMigratorTest {
 
         assertThat(converted.report().manualReviewSqlCount()).isZero();
         assertThat(converted.sql())
+                .startsWith("/* Sample dynamic SQL. */\nCREATE OR REPLACE PROCEDURE")
                 .contains("dm_adapter_dynamic_sql_1 VARCHAR(32767);")
                 .contains("dm_adapter_dynamic_sql_2 VARCHAR(32767);")
                 .contains("IF 1 = 1 THEN\n        dm_adapter_dynamic_sql_1 := '")
@@ -4966,6 +4968,35 @@ class SqlScriptMigratorTest {
         ).matcher(converted);
         assertThat(callVariable.find()).isTrue();
         assertThat(decodedClobAssignmentValue(converted, callVariable.group(1))).isEqualTo(callValue);
+    }
+
+    @Test
+    void preservesLeadingCommentWhenSplittingLongProcedureClobLiteral() throws Exception {
+        String payload = "{\r\n  \"sample\": \"O'Reilly 🙂 " + "中".repeat(1_100) + "\"\r\n}";
+        ConvertedScript converted = migrateSingleScript("""
+                -- Sample configuration.
+                DELIMITER $$
+                CREATE PROCEDURE sample_seed()
+                BEGIN
+                    SET @payload = '%s';
+                    INSERT INTO sample_config(id, payload) VALUES (1, @payload);
+                END$$
+                DELIMITER ;
+                CALL sample_seed();
+                """.formatted(payload.replace("'", "''")));
+
+        assertThat(converted.report().manualReviewItems()).isEmpty();
+        assertThat(converted.sql())
+                .startsWith("-- Sample configuration.\nCREATE OR REPLACE PROCEDURE")
+                .contains("dm_payload CLOB;")
+                .contains("INSERT INTO sample_config(id, payload) VALUES (1, dm_payload)")
+                .contains("CALL sample_seed()")
+                .doesNotContain(payload);
+        assertThat(decodedClobAssignmentValue(converted.sql(), "dm_payload")).isEqualTo(payload);
+        assertThat(converted.report().files()).singleElement().satisfies(file ->
+                assertThat(file.appliedRules()).contains(
+                        SqlScriptMigrator.DM_PROCEDURE_LONG_LITERAL_TO_CLOB_VARIABLE_RULE
+                ));
     }
 
     @Test
